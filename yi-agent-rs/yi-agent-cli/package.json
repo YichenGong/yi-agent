@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "A coding agent CLI",
   "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/gongyichen/yi-agent"

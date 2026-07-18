@@ -36,3 +36,7 @@ if (!existsSync(binPath)) {
 const { spawn } = require('child_process');
 const child = spawn(binPath, process.argv.slice(2), { stdio: 'inherit' });
 child.on('close', (code) => process.exit(code ?? 1));
+child.on('error', (e) => {
+  console.error(`Failed to launch yi-agent: ${e.message}`);
+  process.exit(1);
+});
