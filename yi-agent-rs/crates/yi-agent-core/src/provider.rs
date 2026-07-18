@@ -53,7 +53,7 @@ pub struct ProviderResponse {
 }
 
 /// Errors from a provider.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     #[error("network error: {0}")]
     Network(String),
