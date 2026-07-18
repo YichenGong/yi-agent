@@ -30,3 +30,6 @@
   - [ ] 首次端到端验证
   - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
   - [-] crates.io 发布 — YAGNI，暂不做
+- **tooling** → [详情](./tooling.md)
+  - [x] 项目进度追踪系统（docs/project-management/）
+  - [x] 进度同步 Hook（Stop 事件触发，检测代码改动后提醒更新进度表格）
