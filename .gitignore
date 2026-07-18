@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+
+# Rust backup files
+*.rs.bk
+*.rs.orig
+
+# Cargo.lock is committed for binary crates, ignored for library crates.
+# Since this is a CLI (binary), we keep Cargo.lock tracked.
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs / runtime
+*.log
+
+
+# Added by cargo
+
+/target
