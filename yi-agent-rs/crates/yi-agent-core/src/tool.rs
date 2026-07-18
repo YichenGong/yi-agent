@@ -1,6 +1,6 @@
 //! Tool trait and registry.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -80,7 +80,7 @@ pub trait Tool: Send + Sync {
 /// Registry of tools keyed by name.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -88,6 +88,7 @@ impl ToolRegistry {
         Self::default()
     }
 
+    /// Register a tool. If a tool with the same name already exists, it is replaced.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
     }
