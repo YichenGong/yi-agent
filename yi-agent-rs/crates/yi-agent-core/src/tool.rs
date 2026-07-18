@@ -34,7 +34,10 @@ impl ToolResult {
 
     /// Multiple content blocks, not an error.
     pub fn with_content(content: Vec<ContentBlock>) -> Self {
-        Self { content, is_error: false }
+        Self {
+            content,
+            is_error: false,
+        }
     }
 }
 
@@ -52,8 +55,12 @@ pub struct ToolMetadata {
 pub enum ToolSource {
     #[default]
     Builtin,
-    Mcp { server_name: String },
-    Plugin { name: String },
+    Mcp {
+        server_name: String,
+    },
+    Plugin {
+        name: String,
+    },
 }
 
 /// Tool schema passed to the LLM.
@@ -125,11 +132,15 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &str { "echo" }
+        fn name(&self) -> &str {
+            "echo"
+        }
         fn schema(&self) -> Value {
             serde_json::json!({"type": "object", "properties": {"msg": {"type": "string"}}})
         }
-        fn description(&self) -> &str { "Echoes input" }
+        fn description(&self) -> &str {
+            "Echoes input"
+        }
         async fn call(&self, args: Value) -> ToolResult {
             ToolResult::text(args.to_string())
         }
@@ -154,7 +165,10 @@ mod tests {
 
     #[test]
     fn tool_result_with_content() {
-        let blocks = vec![ContentBlock::Text("a".into()), ContentBlock::Text("b".into())];
+        let blocks = vec![
+            ContentBlock::Text("a".into()),
+            ContentBlock::Text("b".into()),
+        ];
         let r = ToolResult::with_content(blocks);
         assert!(!r.is_error);
         assert_eq!(r.content.len(), 2);

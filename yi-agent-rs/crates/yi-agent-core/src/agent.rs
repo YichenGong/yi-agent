@@ -7,7 +7,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::message::{ContentBlock, Message};
-use crate::provider::{GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason};
+use crate::provider::{
+    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason,
+};
 use crate::tool::{ToolRegistry, ToolResult};
 
 /// In-memory message container. No persistence.
@@ -73,9 +75,18 @@ pub struct Agent {
 pub enum AgentEvent {
     Start,
     AssistantText(String),
-    ToolCall { id: String, name: String, input: Value },
-    ToolResult { id: String, result: ToolResult },
-    Done { reason: DoneReason },
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        id: String,
+        result: ToolResult,
+    },
+    Done {
+        reason: DoneReason,
+    },
     Error(AgentError),
 }
 
@@ -92,11 +103,7 @@ pub enum AgentError {
 }
 
 impl Agent {
-    pub fn new(
-        provider: Arc<dyn Provider>,
-        tools: Arc<ToolRegistry>,
-        config: AgentConfig,
-    ) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>, config: AgentConfig) -> Self {
         Self {
             provider,
             tools,
@@ -158,7 +165,9 @@ async fn run_loop(
         if let Some(max) = config.max_turns {
             if turn > max {
                 if tx
-                    .send(AgentEvent::Done { reason: DoneReason::MaxTurns })
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::MaxTurns,
+                    })
                     .await
                     .is_err()
                 {
@@ -179,7 +188,11 @@ async fn run_loop(
         let stream = match provider.call_stream(req).await {
             Ok(s) => s,
             Err(e) => {
-                if tx.send(AgentEvent::Error(AgentError::Provider(e))).await.is_err() {
+                if tx
+                    .send(AgentEvent::Error(AgentError::Provider(e)))
+                    .await
+                    .is_err()
+                {
                     return; // Receiver dropped, stop the loop
                 }
                 return;
@@ -216,7 +229,9 @@ async fn run_loop(
 
         if tool_uses.is_empty() {
             if tx
-                .send(AgentEvent::Done { reason: DoneReason::EndTurn })
+                .send(AgentEvent::Done {
+                    reason: DoneReason::EndTurn,
+                })
                 .await
                 .is_err()
             {
@@ -288,11 +303,10 @@ async fn accumulate_provider_stream(
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
     let tx = tx.clone();
-    let (content, stop_reason) =
-        crate::provider::accumulate_stream(stream, move |s| {
-            let _ = tx.try_send(AgentEvent::AssistantText(s));
-        })
-        .await?;
+    let (content, stop_reason) = crate::provider::accumulate_stream(stream, move |s| {
+        let _ = tx.try_send(AgentEvent::AssistantText(s));
+    })
+    .await?;
     Ok((content, stop_reason))
 }
 
@@ -300,9 +314,7 @@ async fn accumulate_provider_stream(
 mod tests {
     use super::*;
     use crate::message::Message;
-    use crate::provider::{
-        Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason,
-    };
+    use crate::provider::{Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason};
     use crate::tool::{Tool, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
@@ -388,9 +400,11 @@ mod tests {
         let events = collect_events(stream);
 
         assert!(matches!(events.first(), Some(AgentEvent::Start)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::AssistantText(t) if t == "Hello")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AssistantText(t) if t == "Hello"))
+        );
         assert!(matches!(
             events.last(),
             Some(AgentEvent::Done {
@@ -435,12 +449,16 @@ mod tests {
         let stream = agent.run("uppercase hi".into()).await.unwrap();
         let events = collect_events(stream);
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "upper")));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if !result.is_error)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "upper"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if !result.is_error))
+        );
         assert!(matches!(
             events.last(),
             Some(AgentEvent::Done {
@@ -479,31 +497,31 @@ mod tests {
         let stream = agent.run("call ghost".into()).await.unwrap();
         let events = collect_events(stream);
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if result.is_error)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if result.is_error))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_respects_max_turns() {
         // Provider always emits a tool call -> would infinite loop without cap.
         // With max_turns=1: turn 1 executes tool, turn 2 > max -> MaxTurns.
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ProviderEvent::ToolUseStart {
-                    id: "t1".into(),
-                    name: "upper".into(),
-                },
-                ProviderEvent::ToolUseDelta {
-                    id: "t1".into(),
-                    partial_json: r#"{"text":"x"}"#.into(),
-                },
-                ProviderEvent::ToolUseEnd { id: "t1".into() },
-                ProviderEvent::Stop {
-                    reason: StopReason::EndTurn,
-                },
-            ],
-        ]);
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "upper".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: r#"{"text":"x"}"#.into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
@@ -515,11 +533,12 @@ mod tests {
         let stream = agent.run("loop".into()).await.unwrap();
         let events = collect_events(stream);
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Done {
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
                 reason: DoneReason::MaxTurns
-            })));
+            }
+        )));
     }
 
     #[tokio::test(flavor = "multi_thread")]

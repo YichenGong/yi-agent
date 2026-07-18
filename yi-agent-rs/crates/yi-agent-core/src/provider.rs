@@ -1,8 +1,8 @@
 //! Provider trait for LLM backends.
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 
 use crate::message::ContentBlock;
 use crate::message::Message;
@@ -103,10 +103,9 @@ where
             }
             ProviderEvent::ToolUseEnd { id } => {
                 if let Some((name, json)) = tool_uses.remove(&id) {
-                    let input: serde_json::Value = serde_json::from_str(&json)
-                        .map_err(|e| ProviderError::Stream(
-                            format!("malformed tool use JSON for id {id}: {e}")
-                        ))?;
+                    let input: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
+                        ProviderError::Stream(format!("malformed tool use JSON for id {id}: {e}"))
+                    })?;
                     content.push(ContentBlock::ToolUse { id, name, input });
                 }
             }
@@ -131,13 +130,13 @@ pub trait Provider: Send + Sync {
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError>;
 
     /// Convenience: accumulate stream into full response.
-    async fn call(
-        &self,
-        req: ProviderRequest,
-    ) -> Result<ProviderResponse, ProviderError> {
+    async fn call(&self, req: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let stream = self.call_stream(req).await?;
         let (content, stop_reason) = accumulate_stream(stream, |_| {}).await?;
-        Ok(ProviderResponse { content, stop_reason })
+        Ok(ProviderResponse {
+            content,
+            stop_reason,
+        })
     }
 }
 
@@ -172,15 +171,20 @@ mod tests {
             events: vec![
                 text_event("Hello"),
                 text_event(" world"),
-                ProviderEvent::Stop { reason: StopReason::EndTurn },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
             ],
         };
-        let resp = provider.call(ProviderRequest {
-            system: None,
-            messages: vec![],
-            tools: vec![],
-            params: GenParams::default(),
-        }).await.unwrap();
+        let resp = provider
+            .call(ProviderRequest {
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         assert_eq!(resp.content, vec![ContentBlock::Text("Hello world".into())]);
     }
@@ -190,19 +194,33 @@ mod tests {
         let provider = MockProvider {
             events: vec![
                 text_event("I'll read the file"),
-                ProviderEvent::ToolUseStart { id: "t1".into(), name: "read".into() },
-                ProviderEvent::ToolUseDelta { id: "t1".into(), partial_json: r#"{"path":"#.to_string() },
-                ProviderEvent::ToolUseDelta { id: "t1".into(), partial_json: r#""main.rs"}"#.to_string() },
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "read".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"path":"#.to_string(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#""main.rs"}"#.to_string(),
+                },
                 ProviderEvent::ToolUseEnd { id: "t1".into() },
-                ProviderEvent::Stop { reason: StopReason::EndTurn },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
             ],
         };
-        let resp = provider.call(ProviderRequest {
-            system: None,
-            messages: vec![],
-            tools: vec![],
-            params: GenParams::default(),
-        }).await.unwrap();
+        let resp = provider
+            .call(ProviderRequest {
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
         assert_eq!(resp.content.len(), 2);
         match &resp.content[0] {
             ContentBlock::Text(s) => assert_eq!(s, "I'll read the file"),
@@ -223,15 +241,20 @@ mod tests {
         let provider = MockProvider {
             events: vec![
                 text_event("truncated"),
-                ProviderEvent::Stop { reason: StopReason::MaxTokens },
+                ProviderEvent::Stop {
+                    reason: StopReason::MaxTokens,
+                },
             ],
         };
-        let resp = provider.call(ProviderRequest {
-            system: None,
-            messages: vec![],
-            tools: vec![],
-            params: GenParams::default(),
-        }).await.unwrap();
+        let resp = provider
+            .call(ProviderRequest {
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
         assert_eq!(resp.stop_reason, StopReason::MaxTokens);
     }
 
@@ -241,15 +264,20 @@ mod tests {
             events: vec![
                 text_event("a"),
                 text_event("b"),
-                ProviderEvent::Stop { reason: StopReason::EndTurn },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
             ],
         };
-        let mut stream = provider.call_stream(ProviderRequest {
-            system: None,
-            messages: vec![],
-            tools: vec![],
-            params: GenParams::default(),
-        }).await.unwrap();
+        let mut stream = provider
+            .call_stream(ProviderRequest {
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
         let mut collected = Vec::new();
         while let Some(e) = stream.next().await {
             collected.push(e);

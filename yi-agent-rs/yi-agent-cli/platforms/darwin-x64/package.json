@@ -1,0 +1,9 @@
+{
+  "name": "@yi-agent/yi-agent-darwin-x64",
+  "version": "0.1.0",
+  "description": "yi-agent binary for darwin-x64",
+  "license": "MIT",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["binaries/"]
+}

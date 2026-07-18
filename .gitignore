@@ -32,3 +32,6 @@
 # Added by cargo
 
 /target
+
+# npm package binaries (构建时填充,不入版本控制)
+yi-agent-rs/yi-agent-cli/platforms/*/binaries/

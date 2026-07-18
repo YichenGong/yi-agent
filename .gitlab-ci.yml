@@ -1,0 +1,46 @@
+# GitLab CI 配置
+# push 到分支时在 Mac mini self-hosted runner 上跑
+# MR 走云端 runner(不进 Mac mini,安全考虑)
+
+stages:
+  - check
+
+variables:
+  CARGO_TERM_COLOR: "always"
+
+# 缓存 cargo registry(只读并发安全)和 target 目录(编译产物)
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - ~/.cargo/registry/
+    - ~/.cargo/git/
+    - ~/cargo-target/  # CARGO_TARGET_DIR 输出目录
+
+# push 到分支时跑(Mac mini self-hosted)
+ci-push:
+  stage: check
+  tags:
+    - mac-mini
+  variables:
+    # target 目录隔离,避免与 GitHub Actions runner 并发写冲突
+    CARGO_TARGET_DIR: "$HOME/cargo-target/gitlab"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+  script:
+    - cd yi-agent-rs
+    - rustup default stable
+    - rustup update stable
+    - just --version || cargo install just --locked --quiet
+    - just ci
+
+# MR(Merge Request)走云端 runner
+ci-mr:
+  stage: check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  image: rust:latest
+  before_script:
+    - cd yi-agent-rs
+    - curl -sSf https://just.systems/install.sh | sh -s -- --to /usr/local/bin
+  script:
+    - just ci

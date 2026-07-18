@@ -1,0 +1,3 @@
+binaries/
+platforms/*/binaries/
+node_modules/
