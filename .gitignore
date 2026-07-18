@@ -25,6 +25,9 @@
 # Logs / runtime
 *.log
 
+# Git worktrees (isolated workspaces)
+.worktrees/
+
 
 # Added by cargo
 
