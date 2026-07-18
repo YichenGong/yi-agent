@@ -1,0 +1,12 @@
+[package]
+name = "codex-store"
+description = "Session persistence layer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+codex-core = { workspace = true }

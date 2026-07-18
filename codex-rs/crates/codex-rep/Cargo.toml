@@ -1,0 +1,20 @@
+[package]
+name = "codex-rep"
+description = "A coding agent CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "codex"
+path = "src/main.rs"
+
+[dependencies]
+codex-core = { workspace = true }
+codex-llm = { workspace = true }
+codex-tools = { workspace = true }
+codex-mcp = { workspace = true }
+codex-store = { workspace = true }

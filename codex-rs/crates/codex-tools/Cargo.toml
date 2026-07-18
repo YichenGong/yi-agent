@@ -1,0 +1,12 @@
+[package]
+name = "codex-tools"
+description = "Built-in tools: filesystem, shell, web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+codex-core = { workspace = true }
