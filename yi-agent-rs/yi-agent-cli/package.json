@@ -1,0 +1,19 @@
+{
+  "name": "@gongyichen/yi-agent",
+  "version": "0.1.0",
+  "description": "A coding agent CLI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gongyichen/yi-agent"
+  },
+  "bin": {
+    "yi-agent": "entry.js"
+  },
+  "optionalDependencies": {
+    "@gongyichen/yi-agent-darwin-x64": "0.1.0",
+    "@gongyichen/yi-agent-darwin-arm64": "0.1.0",
+    "@gongyichen/yi-agent-linux-x64": "0.1.0"
+  },
+  "files": ["entry.js"]
+}
