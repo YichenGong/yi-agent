@@ -1,6 +1,6 @@
 [package]
-name = "codex-tools"
-description = "Built-in tools: filesystem, shell, web"
+name = "yi-agent-llm"
+description = "LLM provider implementations"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,4 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-codex-core = { workspace = true }
+yi-agent-core = { workspace = true }

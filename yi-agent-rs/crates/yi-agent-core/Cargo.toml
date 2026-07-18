@@ -1,6 +1,6 @@
 [package]
-name = "codex-store"
-description = "Session persistence layer"
+name = "yi-agent-core"
+description = "Core agent loop, session management, and trait definitions"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,5 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[dependencies]
-codex-core = { workspace = true }
+[lib]
+path = "src/lib.rs"
