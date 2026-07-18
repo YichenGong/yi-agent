@@ -1,0 +1,66 @@
+name: Release
+
+# tag 推送时触发,跑在 Mac mini self-hosted runner
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: self-hosted  # Mac mini 上注册的 GitHub Actions runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Install zig
+        run: brew install zig
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: yi-agent-rs
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Set CARGO_TARGET_DIR (isolate from GitLab runner)
+        run: echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> $GITHUB_ENV
+
+      - name: Build & package all platforms
+        working-directory: yi-agent-rs
+        run: just package-all
+
+      - name: Upload artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            yi-agent-rs/dist/*.tar.gz
+            yi-agent-rs/dist/*.sha256
+          generate_release_notes: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish to npm
+        working-directory: yi-agent-rs
+        run: just npm-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Update Homebrew tap
+        env:
+          TAP_REPO_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
+          ./.github/scripts/update-homebrew-tap.sh "${{ github.ref_name }}" "$VERSION"
