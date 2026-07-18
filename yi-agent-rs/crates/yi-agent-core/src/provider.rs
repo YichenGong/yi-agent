@@ -69,6 +69,58 @@ pub enum ProviderError {
     Stream(String),
 }
 
+/// Accumulate a provider stream into content blocks + stop reason.
+/// `on_text` is called for each text delta (used by agent to emit AgentEvent::AssistantText).
+pub async fn accumulate_stream<F>(
+    mut stream: BoxStream<'static, ProviderEvent>,
+    mut on_text: F,
+) -> Result<(Vec<ContentBlock>, StopReason), ProviderError>
+where
+    F: FnMut(String),
+{
+    let mut content = Vec::new();
+    let mut current_text = String::new();
+    let mut tool_uses: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut stop_reason = StopReason::EndTurn;
+
+    while let Some(event) = stream.next().await {
+        match event {
+            ProviderEvent::TextDelta(s) => {
+                current_text.push_str(&s);
+                on_text(s);
+            }
+            ProviderEvent::ToolUseStart { id, name } => {
+                if !current_text.is_empty() {
+                    content.push(ContentBlock::Text(std::mem::take(&mut current_text)));
+                }
+                tool_uses.insert(id, (name, String::new()));
+            }
+            ProviderEvent::ToolUseDelta { id, partial_json } => {
+                if let Some((_, json)) = tool_uses.get_mut(&id) {
+                    json.push_str(&partial_json);
+                }
+            }
+            ProviderEvent::ToolUseEnd { id } => {
+                if let Some((name, json)) = tool_uses.remove(&id) {
+                    let input: serde_json::Value = serde_json::from_str(&json)
+                        .map_err(|e| ProviderError::Stream(
+                            format!("malformed tool use JSON for id {id}: {e}")
+                        ))?;
+                    content.push(ContentBlock::ToolUse { id, name, input });
+                }
+            }
+            ProviderEvent::Stop { reason } => {
+                stop_reason = reason;
+            }
+        }
+    }
+    if !current_text.is_empty() {
+        content.push(ContentBlock::Text(current_text));
+    }
+    Ok((content, stop_reason))
+}
+
 /// LLM provider trait.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -83,44 +135,8 @@ pub trait Provider: Send + Sync {
         &self,
         req: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        let mut stream = self.call_stream(req).await?;
-        let mut content = Vec::new();
-        let mut current_text = String::new();
-        let mut tool_uses: std::collections::HashMap<String, (String, String)> =
-            std::collections::HashMap::new();
-        let mut stop_reason = StopReason::EndTurn;
-
-        while let Some(event) = stream.next().await {
-            match event {
-                ProviderEvent::TextDelta(s) => current_text.push_str(&s),
-                ProviderEvent::ToolUseStart { id, name } => {
-                    if !current_text.is_empty() {
-                        content.push(ContentBlock::Text(std::mem::take(&mut current_text)));
-                    }
-                    tool_uses.insert(id, (name, String::new()));
-                }
-                ProviderEvent::ToolUseDelta { id, partial_json } => {
-                    if let Some((_, json)) = tool_uses.get_mut(&id) {
-                        json.push_str(&partial_json);
-                    }
-                }
-                ProviderEvent::ToolUseEnd { id } => {
-                    if let Some((name, json)) = tool_uses.remove(&id) {
-                        let input: serde_json::Value = serde_json::from_str(&json)
-                            .map_err(|e| ProviderError::Stream(
-                                format!("malformed tool use JSON for id {id}: {e}")
-                            ))?;
-                        content.push(ContentBlock::ToolUse { id, name, input });
-                    }
-                }
-                ProviderEvent::Stop { reason } => {
-                    stop_reason = reason;
-                }
-            }
-        }
-        if !current_text.is_empty() {
-            content.push(ContentBlock::Text(current_text));
-        }
+        let stream = self.call_stream(req).await?;
+        let (content, stop_reason) = accumulate_stream(stream, |_| {}).await?;
         Ok(ProviderResponse { content, stop_reason })
     }
 }

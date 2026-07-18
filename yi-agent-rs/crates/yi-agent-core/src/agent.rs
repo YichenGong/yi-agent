@@ -1,6 +1,6 @@
 //! Agent loop: think -> act -> observe.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::Value;
@@ -64,7 +64,7 @@ impl Default for AgentConfig {
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
-    session: Session,
+    session: Arc<Mutex<Session>>,
     config: AgentConfig,
 }
 
@@ -89,8 +89,6 @@ pub enum DoneReason {
 pub enum AgentError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
-    #[error("max turns exceeded")]
-    MaxTurnsExceeded,
 }
 
 impl Agent {
@@ -102,18 +100,20 @@ impl Agent {
         Self {
             provider,
             tools,
-            session: Session::new(),
+            session: Arc::new(Mutex::new(Session::new())),
             config,
         }
     }
 
-    pub fn with_session(mut self, session: Session) -> Self {
-        self.session = session;
-        self
+    pub fn with_session(self, session: Session) -> Self {
+        Self {
+            session: Arc::new(Mutex::new(session)),
+            ..self
+        }
     }
 
-    pub fn session(&self) -> &Session {
-        &self.session
+    pub fn session(&self) -> Session {
+        self.session.lock().unwrap().clone()
     }
 
     /// Run the agent loop, returning a stream of events.
@@ -121,17 +121,22 @@ impl Agent {
         &mut self,
         user_prompt: String,
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
-        self.session.push(Message::user(user_prompt));
+        self.session
+            .lock()
+            .unwrap()
+            .push(Message::user(user_prompt));
 
         let provider = self.provider.clone();
         let tools = self.tools.clone();
         let config = self.config.clone();
-        let messages = self.session.messages().to_vec();
+        let session = self.session.clone();
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
-            let _ = tx.send(AgentEvent::Start).await;
-            run_loop(tx, provider, tools, messages, config).await;
+            if tx.send(AgentEvent::Start).await.is_err() {
+                return; // Receiver dropped, stop the loop
+            }
+            run_loop(tx, provider, tools, session, config).await;
         });
 
         Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
@@ -142,16 +147,23 @@ async fn run_loop(
     tx: mpsc::Sender<AgentEvent>,
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
-    mut messages: Vec<Message>,
+    session: Arc<Mutex<Session>>,
     config: AgentConfig,
 ) {
+    let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
 
     loop {
         turn += 1;
         if let Some(max) = config.max_turns {
             if turn > max {
-                let _ = tx.send(AgentEvent::Done { reason: DoneReason::MaxTurns }).await;
+                if tx
+                    .send(AgentEvent::Done { reason: DoneReason::MaxTurns })
+                    .await
+                    .is_err()
+                {
+                    return; // Receiver dropped, stop the loop
+                }
                 return;
             }
         }
@@ -167,20 +179,28 @@ async fn run_loop(
         let stream = match provider.call_stream(req).await {
             Ok(s) => s,
             Err(e) => {
-                let _ = tx.send(AgentEvent::Error(AgentError::Provider(e))).await;
+                if tx.send(AgentEvent::Error(AgentError::Provider(e))).await.is_err() {
+                    return; // Receiver dropped, stop the loop
+                }
                 return;
             }
         };
 
-        let (content, stop_reason) = match accumulate_provider_stream(stream, &tx).await {
+        let (content, _stop_reason) = match accumulate_provider_stream(stream, &tx).await {
             Ok(v) => v,
             Err(e) => {
-                let _ = tx.send(AgentEvent::Error(e)).await;
+                if tx.send(AgentEvent::Error(e)).await.is_err() {
+                    return; // Receiver dropped, stop the loop
+                }
                 return;
             }
         };
 
         messages.push(Message::assistant(content.clone()));
+        session
+            .lock()
+            .unwrap()
+            .push(Message::assistant(content.clone()));
 
         // 2. Termination check
         let tool_uses: Vec<(String, String, Value)> = content
@@ -194,8 +214,14 @@ async fn run_loop(
             })
             .collect();
 
-        if tool_uses.is_empty() || stop_reason != StopReason::EndTurn {
-            let _ = tx.send(AgentEvent::Done { reason: DoneReason::EndTurn }).await;
+        if tool_uses.is_empty() {
+            if tx
+                .send(AgentEvent::Done { reason: DoneReason::EndTurn })
+                .await
+                .is_err()
+            {
+                return; // Receiver dropped, stop the loop
+            }
             return;
         }
 
@@ -206,27 +232,35 @@ async fn run_loop(
                 let tools = tools.clone();
                 let tx = tx.clone();
                 async move {
-                    let _ = tx
+                    if tx
                         .send(AgentEvent::ToolCall {
                             id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return (id.clone(), None);
+                    }
 
                     let result = match tools.get(name) {
                         Some(tool) => tool.call(input.clone()).await,
                         None => ToolResult::error(format!("tool not found: {}", name)),
                     };
 
-                    let _ = tx
+                    if tx
                         .send(AgentEvent::ToolResult {
                             id: id.clone(),
                             result: result.clone(),
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return (id.clone(), None);
+                    }
 
-                    (id.clone(), result)
+                    (id.clone(), Some(result))
                 }
             })
             .collect();
@@ -235,61 +269,30 @@ async fn run_loop(
         // 4. OBSERVE - feed results back in tool_use_id order
         let tool_results: Vec<ContentBlock> = results
             .into_iter()
-            .map(|(id, result)| ContentBlock::ToolResult {
-                tool_use_id: id,
-                content: result.content,
-                is_error: result.is_error,
+            .filter_map(|(id, result)| {
+                result.map(|r| ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content: r.content,
+                    is_error: r.is_error,
+                })
             })
             .collect();
-        messages.push(Message::tool_results(tool_results));
+        let tool_results_msg = Message::tool_results(tool_results);
+        messages.push(tool_results_msg.clone());
+        session.lock().unwrap().push(tool_results_msg);
     }
 }
 
 async fn accumulate_provider_stream(
-    mut stream: BoxStream<'static, ProviderEvent>,
+    stream: BoxStream<'static, ProviderEvent>,
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
-    let mut content = Vec::new();
-    let mut current_text = String::new();
-    let mut tool_uses: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    let mut stop_reason = StopReason::EndTurn;
-
-    while let Some(event) = stream.next().await {
-        match event {
-            ProviderEvent::TextDelta(s) => {
-                current_text.push_str(&s);
-                let _ = tx.send(AgentEvent::AssistantText(s)).await;
-            }
-            ProviderEvent::ToolUseStart { id, name } => {
-                if !current_text.is_empty() {
-                    content.push(ContentBlock::Text(std::mem::take(&mut current_text)));
-                }
-                tool_uses.insert(id, (name, String::new()));
-            }
-            ProviderEvent::ToolUseDelta { id, partial_json } => {
-                if let Some((_, json)) = tool_uses.get_mut(&id) {
-                    json.push_str(&partial_json);
-                }
-            }
-            ProviderEvent::ToolUseEnd { id } => {
-                if let Some((name, json)) = tool_uses.remove(&id) {
-                    let input: Value = serde_json::from_str(&json).map_err(|e| {
-                        AgentError::Provider(ProviderError::Stream(format!(
-                            "malformed tool use JSON for id {id}: {e}"
-                        )))
-                    })?;
-                    content.push(ContentBlock::ToolUse { id, name, input });
-                }
-            }
-            ProviderEvent::Stop { reason } => {
-                stop_reason = reason;
-            }
-        }
-    }
-    if !current_text.is_empty() {
-        content.push(ContentBlock::Text(current_text));
-    }
+    let tx = tx.clone();
+    let (content, stop_reason) =
+        crate::provider::accumulate_stream(stream, move |s| {
+            let _ = tx.try_send(AgentEvent::AssistantText(s));
+        })
+        .await?;
     Ok((content, stop_reason))
 }
 
@@ -534,7 +537,11 @@ mod tests {
             Agent::new(Arc::new(provider), tools, AgentConfig::default()).with_session(session);
 
         assert_eq!(agent.session().len(), 1); // restored
-        let _stream = agent.run("next".into()).await.unwrap();
-        assert_eq!(agent.session().len(), 2); // restored + new user prompt
+        let stream = agent.run("next".into()).await.unwrap();
+        // Consume all events to ensure the spawned task completes.
+        let events = collect_events(stream);
+        // restored(1) + user_prompt(1) + assistant(1) = 3
+        assert_eq!(agent.session().len(), 3);
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
     }
 }
