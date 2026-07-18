@@ -106,8 +106,10 @@ pub trait Provider: Send + Sync {
                 }
                 ProviderEvent::ToolUseEnd { id } => {
                     if let Some((name, json)) = tool_uses.remove(&id) {
-                        let input: serde_json::Value =
-                            serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                        let input: serde_json::Value = serde_json::from_str(&json)
+                            .map_err(|e| ProviderError::Stream(
+                                format!("malformed tool use JSON for id {id}: {e}")
+                            ))?;
                         content.push(ContentBlock::ToolUse { id, name, input });
                     }
                 }
