@@ -9,13 +9,28 @@ on:
 jobs:
   release:
     runs-on: self-hosted  # Mac mini 上注册的 GitHub Actions runner
+    permissions:
+      contents: write  # softprops/action-gh-release 需要写权限创建 Release
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG_VERSION="${{ github.ref_name }}"
+          CARGO_VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
+          if [ "v$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: Git tag ($TAG_VERSION) does not match Cargo.toml version (v$CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Version match: $TAG_VERSION"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu
+
+      - name: Set CARGO_TARGET_DIR (isolate from GitLab runner)
+        run: echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> $GITHUB_ENV
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
@@ -30,9 +45,6 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@v2
-
-      - name: Set CARGO_TARGET_DIR (isolate from GitLab runner)
-        run: echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> $GITHUB_ENV
 
       - name: Build & package all platforms
         working-directory: yi-agent-rs
