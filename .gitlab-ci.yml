@@ -7,21 +7,23 @@ stages:
 
 variables:
   CARGO_TERM_COLOR: "always"
-  # target 目录隔离,避免与 GitHub Actions runner 并发写冲突
-  CARGO_TARGET_DIR: "$HOME/cargo-target/gitlab"
 
-# 缓存 cargo registry(只读并发安全)
+# 缓存 cargo registry(只读并发安全)和 target 目录(编译产物)
 cache:
   key: ${CI_COMMIT_REF_SLUG}
   paths:
     - ~/.cargo/registry/
     - ~/.cargo/git/
+    - ~/cargo-target/  # CARGO_TARGET_DIR 输出目录
 
 # push 到分支时跑(Mac mini self-hosted)
 ci-push:
   stage: check
   tags:
     - mac-mini
+  variables:
+    # target 目录隔离,避免与 GitHub Actions runner 并发写冲突
+    CARGO_TARGET_DIR: "$HOME/cargo-target/gitlab"
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"
   script:
@@ -39,6 +41,6 @@ ci-mr:
   image: rust:latest
   before_script:
     - cd yi-agent-rs
-    - cargo install just --locked --quiet
+    - curl -sSf https://just.systems/install.sh | sh -s -- --to /usr/local/bin
   script:
     - just ci
