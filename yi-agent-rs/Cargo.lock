@@ -3,44 +3,44 @@
 version = 4
 
 [[package]]
-name = "codex-core"
-version = "0.1.0"
-
-[[package]]
-name = "codex-llm"
+name = "yi-agent"
 version = "0.1.0"
 dependencies = [
- "codex-core",
+ "yi-agent-core",
+ "yi-agent-llm",
+ "yi-agent-mcp",
+ "yi-agent-store",
+ "yi-agent-tools",
 ]
 
 [[package]]
-name = "codex-mcp"
+name = "yi-agent-core"
+version = "0.1.0"
+
+[[package]]
+name = "yi-agent-llm"
 version = "0.1.0"
 dependencies = [
- "codex-core",
+ "yi-agent-core",
 ]
 
 [[package]]
-name = "codex-rep"
+name = "yi-agent-mcp"
 version = "0.1.0"
 dependencies = [
- "codex-core",
- "codex-llm",
- "codex-mcp",
- "codex-store",
- "codex-tools",
+ "yi-agent-core",
 ]
 
 [[package]]
-name = "codex-store"
+name = "yi-agent-store"
 version = "0.1.0"
 dependencies = [
- "codex-core",
+ "yi-agent-core",
 ]
 
 [[package]]
-name = "codex-tools"
+name = "yi-agent-tools"
 version = "0.1.0"
 dependencies = [
- "codex-core",
+ "yi-agent-core",
 ]

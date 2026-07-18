@@ -1,0 +1,119 @@
+# justfile (位于 yi-agent-rs/)
+
+# 默认列出所有任务
+default:
+    @just --list
+
+# === 日常开发 ===
+
+# 格式化代码
+fmt:
+    cargo fmt --all
+
+# 检查格式但不修改
+fmt-check:
+    cargo fmt --all -- --check
+
+# 跑 clippy（警告当错误）
+lint:
+    cargo clippy --all-targets --all-features -- -D warnings
+
+# 跑全部测试
+test:
+    cargo test --all-features --workspace
+
+# 构建（debug）
+build:
+    cargo build --workspace
+
+# 构建（release）
+build-release:
+    cargo build --workspace --release
+
+# === CI 入口 ===
+
+# CI 流水线入口（push 用）
+ci: fmt-check lint test build
+    @echo "CI passed"
+
+# === Release ===
+
+# 三平台目标列表
+targets := "x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu"
+
+# 版本号（从 Cargo.toml workspace 读）
+version := `grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}'`
+
+# npm 包目录
+npm-dir := "yi-agent-cli"
+
+# 平台子包目录名列表
+platform-dirs := "darwin-x64 darwin-arm64 linux-x64"
+
+# 交叉编译单个目标
+build-target target:
+    @if echo "{{target}}" | grep -q "linux"; then \
+        cargo zigbuild --release --target {{target}}; \
+    else \
+        cargo build --release --target {{target}}; \
+    fi
+
+# 交叉编译三平台
+build-all-targets:
+    @for target in {{targets}}; do \
+        echo "Building $$target..."; \
+        just build-target $$target; \
+    done
+
+# 打包单个目标为 tarball + SHA256
+package-target target:
+    @mkdir -p dist
+    @tar -czf dist/yi-agent-{{target}}.tar.gz \
+        -C target/{{target}}/release yi-agent
+    @shasum -a 256 dist/yi-agent-{{target}}.tar.gz \
+        | awk '{print $$1}' > dist/yi-agent-{{target}}.tar.gz.sha256
+
+# 打包三平台
+package-all: build-all-targets
+    @for target in {{targets}}; do \
+        just package-target $$target; \
+    done
+
+# 组装 npm 包（填充子包二进制 + 同步版本号）
+npm-pack: package-all
+    @for dir in {{platform-dirs}}; do \
+        target=$(case $$dir in \
+            darwin-x64) echo "x86_64-apple-darwin";; \
+            darwin-arm64) echo "aarch64-apple-darwin";; \
+            linux-x64) echo "x86_64-unknown-linux-gnu";; \
+        esac); \
+        mkdir -p {{npm-dir}}/platforms/$$dir/binaries; \
+        cp target/$$target/release/yi-agent \
+            {{npm-dir}}/platforms/$$dir/binaries/yi-agent; \
+    done
+    @# 同步版本号到主包
+    @sed -i.bak 's/"version": ".*"/"version": "{{version}}"/' \
+        {{npm-dir}}/package.json && rm {{npm-dir}}/package.json.bak
+    @# 同步版本号到所有子包
+    @for dir in {{platform-dirs}}; do \
+        sed -i.bak 's/"version": ".*"/"version": "{{version}}"/' \
+            {{npm-dir}}/platforms/$$dir/package.json \
+            && rm {{npm-dir}}/platforms/$$dir/package.json.bak; \
+    done
+
+# 发布到 npm（CI 调用，子包先发）
+npm-publish: npm-pack
+    @for dir in {{platform-dirs}}; do \
+        echo "Publishing $$dir..."; \
+        cd {{npm-dir}}/platforms/$$dir && npm publish --access public && cd -; \
+    done
+    cd {{npm-dir}} && npm publish --access public
+
+# Release 流水线入口（CI 调用）
+release: clean package-all npm-pack
+    @echo "Release artifacts ready in dist/"
+
+# 清理
+clean:
+    cargo clean
+    rm -rf dist
