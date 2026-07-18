@@ -6,9 +6,9 @@ const platform = process.platform;
 const arch = process.arch;
 
 const platformMap = {
-  'darwin-x64': '@gongyichen/yi-agent-darwin-x64',
-  'darwin-arm64': '@gongyichen/yi-agent-darwin-arm64',
-  'linux-x64': '@gongyichen/yi-agent-linux-x64',
+  'darwin-x64': '@yi-agent/yi-agent-darwin-x64',
+  'darwin-arm64': '@yi-agent/yi-agent-darwin-arm64',
+  'linux-x64': '@yi-agent/yi-agent-linux-x64',
 };
 
 const key = `${platform}-${arch}`;

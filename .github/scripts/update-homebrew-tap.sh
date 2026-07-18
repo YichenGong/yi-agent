@@ -5,8 +5,8 @@ set -euo pipefail
 # 示例: update-homebrew-tap.sh v0.1.0 0.1.0
 TAG="$1"
 VERSION="$2"
-TAP_REPO="gongyichen/homebrew-yi-agent"
-REPO="gongyichen/yi-agent"
+TAP_REPO="YichenGong/homebrew-yi-agent"
+REPO="YichenGong/yi-agent"
 
 : "${TAP_REPO_TOKEN:?需要设置 TAP_REPO_TOKEN 环境变量}"
 

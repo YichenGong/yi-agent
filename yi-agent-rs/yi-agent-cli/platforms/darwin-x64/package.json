@@ -1,5 +1,5 @@
 {
-  "name": "@gongyichen/yi-agent-darwin-x64",
+  "name": "@yi-agent/yi-agent-darwin-x64",
   "version": "0.1.0",
   "description": "yi-agent binary for darwin-x64",
   "license": "MIT",
