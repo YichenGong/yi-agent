@@ -6,10 +6,7 @@ pub fn is_blocked(cmd: &str) -> Option<&'static str> {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         vec![
-            (
-                Regex::new(r"rm\s+-rf?\s+/\s*(--)?\s*$").unwrap(),
-                "rm -rf /",
-            ),
+            (Regex::new(r"rm\s+-rf?\s+/\s*(--)?").unwrap(), "rm -rf /"),
             (Regex::new(r"rm\s+-rf?\s+~/").unwrap(), "rm -rf ~"),
             (Regex::new(r"rm\s+-rf?\s+\$HOME").unwrap(), "rm -rf $HOME"),
             (Regex::new(r":\(\)\{\s*:\|:&\s*\};:").unwrap(), "fork bomb"),
@@ -90,6 +87,12 @@ mod tests {
     fn blocks_rm_rf_root() {
         assert_eq!(is_blocked("rm -rf /"), Some("rm -rf /"));
         assert_eq!(is_blocked("rm -rf / --"), Some("rm -rf /"));
+    }
+
+    #[test]
+    fn blocks_rm_rf_root_with_trailing_args() {
+        assert_eq!(is_blocked("rm -rf / somefile"), Some("rm -rf /"));
+        assert_eq!(is_blocked("rm -rf / && echo done"), Some("rm -rf /"));
     }
 
     #[test]
