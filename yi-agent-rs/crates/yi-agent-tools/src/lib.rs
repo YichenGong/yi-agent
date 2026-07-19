@@ -11,3 +11,4 @@ pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::ReadTool;
 pub use fs::WriteTool;
+pub use fs::EditTool;
