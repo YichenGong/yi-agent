@@ -24,7 +24,11 @@ ci-push:
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"
   script:
-    - source "$HOME/.cargo/env"  # 加载 rustup 环境(shell executor 非交互式不加载 .bashrc)
+    # 加载 rustup 环境(shell executor 非交互式不加载 .bashrc)
+    - source "$HOME/.cargo/env" 2>/dev/null || true
+    # rustup 缺失则自动安装(self-healing,兼容新 runner 用户)
+    - command -v rustup >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    - source "$HOME/.cargo/env"
     - export CARGO_TARGET_DIR="$HOME/cargo-target/gitlab"
     - mkdir -p "$CARGO_TARGET_DIR"
     - cd yi-agent-rs
