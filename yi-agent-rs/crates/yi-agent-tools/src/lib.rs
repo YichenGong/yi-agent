@@ -4,5 +4,7 @@
 //! 通过实现 `yi-agent-core` 的 `Tool` trait 接入 agent。
 
 mod context;
+mod error;
 
 pub use context::ToolsContext;
+pub use error::ToolsError;
