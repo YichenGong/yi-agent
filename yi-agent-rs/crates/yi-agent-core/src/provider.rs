@@ -11,6 +11,8 @@ use crate::tool::ToolSchema;
 /// Request to a provider.
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
+    /// Model identifier (e.g. "claude-sonnet-4-5"). Interpreted by the provider.
+    pub model: String,
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSchema>,
@@ -178,6 +180,7 @@ mod tests {
         };
         let resp = provider
             .call(ProviderRequest {
+                model: "claude-sonnet-4-5".to_string(),
                 system: None,
                 messages: vec![],
                 tools: vec![],
@@ -214,6 +217,7 @@ mod tests {
         };
         let resp = provider
             .call(ProviderRequest {
+                model: "claude-sonnet-4-5".to_string(),
                 system: None,
                 messages: vec![],
                 tools: vec![],
@@ -248,6 +252,7 @@ mod tests {
         };
         let resp = provider
             .call(ProviderRequest {
+                model: "claude-sonnet-4-5".to_string(),
                 system: None,
                 messages: vec![],
                 tools: vec![],
@@ -271,6 +276,7 @@ mod tests {
         };
         let mut stream = provider
             .call_stream(ProviderRequest {
+                model: "claude-sonnet-4-5".to_string(),
                 system: None,
                 messages: vec![],
                 tools: vec![],

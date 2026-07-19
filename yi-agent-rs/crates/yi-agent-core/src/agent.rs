@@ -179,6 +179,8 @@ async fn run_loop(
 
         // 1. THINK
         let req = ProviderRequest {
+            // TODO: replace with config.model.clone() in Task 2
+            model: "claude-sonnet-4-5".to_string(),
             system: config.system_prompt.clone(),
             messages: messages.clone(),
             tools: tools.schemas(),
