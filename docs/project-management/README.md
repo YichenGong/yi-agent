@@ -20,14 +20,14 @@
 - **ci-cd** → [详情](./ci-cd.md)
   - [x] CI/CD 设计文档
   - [x] CI/CD 实现计划
-  - [ ] justfile 与 rust-toolchain.toml
-  - [ ] npm 包结构（主包 + 平台子包）
-  - [ ] Homebrew tap 自动更新脚本
-  - [ ] GitLab CI 配置
-  - [ ] GitHub Actions CI 配置（PR 触发）
-  - [ ] GitHub Actions Release 配置（tag 触发）
-  - [ ] Mac mini runner 配置
-  - [ ] 首次端到端验证
+  - [x] justfile 与 rust-toolchain.toml
+  - [x] npm 包结构（主包 + 平台子包）
+  - [x] Homebrew tap 自动更新脚本
+  - [x] GitLab CI 配置
+  - [x] GitHub Actions CI 配置（PR 触发）
+  - [x] GitHub Actions Release 配置（tag 触发）
+  - [x] Mac mini runner 配置
+  - [x] 首次端到端验证
   - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
   - [-] crates.io 发布 — YAGNI，暂不做
 - **tooling** → [详情](./tooling.md)
