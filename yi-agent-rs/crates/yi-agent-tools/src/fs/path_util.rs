@@ -8,7 +8,6 @@ use crate::error::ToolsError;
 /// - Relative paths are joined to root.
 /// - Parent directories that don't exist yet cause an error (callers should
 ///   create them first when writing).
-#[allow(dead_code)]
 pub fn resolve_and_check(root: &Path, path: &str) -> Result<PathBuf, ToolsError> {
     let canonical_root = root.canonicalize().map_err(ToolsError::Io)?;
 
@@ -74,7 +73,6 @@ pub fn resolve_and_check(root: &Path, path: &str) -> Result<PathBuf, ToolsError>
 /// Lexically normalize a path by resolving `.` and `..` components
 /// without touching the filesystem. Used as a fallback check when
 /// `canonicalize()` fails because the path doesn't exist.
-#[allow(dead_code)]
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
