@@ -25,6 +25,12 @@
   - [ ] 本地模型 (Ollama) provider
   - [ ] Bedrock / Vertex AI 适配
   - [ ] 重试与流断连重连
+- **yi-agent-tools** → [详情](./yi-agent-tools.md)
+  - [ ] FS 工具：Read/Write/Edit/Glob/Grep（单一 root 限制）
+  - [ ] Shell 工具：Bash（sh -c + 黑名单 + timeout + 输出截断）
+  - [ ] 工具注册 API：register_builtin_tools()
+  - [ ] Sandbox（跨平台进程隔离）— 延后单独设计
+  - [ ] Web 工具（搜索/抓取）— 延后单独一轮
 - **ci-cd** → [详情](./ci-cd.md)
   - [x] CI/CD 设计文档
   - [x] CI/CD 实现计划
