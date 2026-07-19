@@ -27,8 +27,14 @@ jobs:
       - name: Setup Rust toolchain
         run: |
           source "$HOME/.cargo/env"
-          rustup default stable
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu
+          rustup default stable >/dev/null 2>&1
+          # 检测 target 是否已装,已装就跳过(避免每次 release 都联网检查)
+          for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+            if ! rustup target list --installed 2>/dev/null | grep -q "^$target$"; then
+              rustup target add "$target"
+            fi
+          done
+          rustup target list --installed
         env:
           PATH: /opt/homebrew/bin:/Users/agenticlabs/.local/bin:/Users/agenticlabs/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
