@@ -26,6 +26,7 @@ jobs:
 
       - name: Setup Rust toolchain
         run: |
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
           source "$HOME/.cargo/env"
           rustup default stable
           rustup target add x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu
@@ -34,10 +35,12 @@ jobs:
         run: echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> $GITHUB_ENV
 
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+        run: |
+          source "$HOME/.cargo/env"
+          command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild --locked
 
-      - name: Install zig
-        run: brew install zig
+      - name: Verify zig
+        run: zig version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
