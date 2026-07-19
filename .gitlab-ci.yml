@@ -21,12 +21,11 @@ ci-push:
   stage: check
   tags:
     - mac-mini
-  variables:
-    # target 目录隔离,避免与 GitHub Actions runner 并发写冲突
-    CARGO_TARGET_DIR: "$HOME/cargo-target/gitlab"
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"
   script:
+    - export CARGO_TARGET_DIR="$HOME/cargo-target/gitlab"
+    - mkdir -p "$CARGO_TARGET_DIR"
     - cd yi-agent-rs
     - rustup default stable
     - rustup update stable
