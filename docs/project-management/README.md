@@ -13,10 +13,18 @@
   - [x] Tool trait 与 ToolRegistry
   - [x] Provider trait 与 ProviderEvent
   - [x] Agent loop、Session、AgentEvent（并行工具执行）
+  - [x] ProviderRequest / AgentConfig 加 model 字段（请求级模型选择）
   - [ ] 流式输出与中断处理
   - [ ] Token 计数（扩展 AgentEvent::Done）
   - [ ] 图片工具（ContentBlock::Image 已留类型）
   - [ ] 插件系统（基于 ToolSource::Plugin）
+- **yi-agent-llm** → [详情](./yi-agent-llm.md)
+  - [x] AnthropicProvider 设计
+  - [x] AnthropicProvider 实现（types + stream + client + 测试）
+  - [ ] OpenAI provider
+  - [ ] 本地模型 (Ollama) provider
+  - [ ] Bedrock / Vertex AI 适配
+  - [ ] 重试与流断连重连
 - **ci-cd** → [详情](./ci-cd.md)
   - [x] CI/CD 设计文档
   - [x] CI/CD 实现计划
