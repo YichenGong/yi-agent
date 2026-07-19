@@ -28,6 +28,9 @@
 # Git worktrees (isolated workspaces)
 .worktrees/
 
+# Claude Code hook state (记录上次检查到的 commit,用于增量检测代码变化)
+.claude/.last-checked-commit
+
 
 # Added by cargo
 
