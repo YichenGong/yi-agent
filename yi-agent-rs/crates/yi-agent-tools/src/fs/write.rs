@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::Value;
-use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
 use crate::fs::path_util::resolve_for_write;
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::Value;
+use std::sync::Arc;
+use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
 pub struct WriteTool {
     ctx: Arc<ToolsContext>,
@@ -94,7 +94,9 @@ mod tests {
     async fn write_new_file() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({"path": "out.txt", "content": "hello"})).await;
+        let result = tool
+            .call(serde_json::json!({"path": "out.txt", "content": "hello"}))
+            .await;
         assert!(!result.is_error);
         let written = fs::read_to_string(tmp.path().join("out.txt")).unwrap();
         assert_eq!(written, "hello");
@@ -104,10 +106,12 @@ mod tests {
     async fn write_creates_parent_dirs() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({
-            "path": "sub/dir/file.txt",
-            "content": "nested"
-        })).await;
+        let result = tool
+            .call(serde_json::json!({
+                "path": "sub/dir/file.txt",
+                "content": "nested"
+            }))
+            .await;
         assert!(!result.is_error);
         let written = fs::read_to_string(tmp.path().join("sub/dir/file.txt")).unwrap();
         assert_eq!(written, "nested");
@@ -118,7 +122,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "old").unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({"path": "file.txt", "content": "new"})).await;
+        let result = tool
+            .call(serde_json::json!({"path": "file.txt", "content": "new"}))
+            .await;
         assert!(!result.is_error);
         let written = fs::read_to_string(tmp.path().join("file.txt")).unwrap();
         assert_eq!(written, "new");

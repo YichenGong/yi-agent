@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use crate::error::ToolsError;
+use std::path::{Path, PathBuf};
 
 /// Resolve `path` relative to `root`, then verify the canonicalized path
 /// is still inside `root`. Prevents `../` escapes and symlink escapes.
@@ -93,8 +93,24 @@ pub fn resolve_for_write(root: &Path, path: &str) -> Result<PathBuf, ToolsError>
         return Ok(full_canonical);
     }
 
-    // Path doesn't exist (or parent doesn't). Use lexical normalization to
-    // verify the path stays within root without touching the filesystem.
+    // Path doesn't exist - try canonicalizing parent to catch symlink escapes
+    // in intermediate directories (e.g., evil_dir -> /etc, then writing
+    // evil_dir/passwd would escape via the symlinked parent).
+    if let Some(parent) = candidate.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                if !canonical_parent.starts_with(&canonical_root) {
+                    return Err(ToolsError::PathEscapesRoot(candidate));
+                }
+                // Parent exists and is inside root - safe to write here
+                let file_name = candidate.file_name().unwrap_or_default();
+                return Ok(canonical_parent.join(file_name));
+            }
+        }
+    }
+
+    // Parent doesn't exist either - use lexical normalization as last resort
+    // to verify the path stays within root without touching the filesystem.
     let normalized = lexical_normalize(&candidate);
     if !normalized.starts_with(&canonical_root) {
         return Err(ToolsError::PathEscapesRoot(candidate));
@@ -134,7 +150,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "hi").unwrap();
         let resolved = resolve_and_check(tmp.path(), "file.txt").unwrap();
-        assert_eq!(resolved, tmp.path().join("file.txt").canonicalize().unwrap());
+        assert_eq!(
+            resolved,
+            tmp.path().join("file.txt").canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -143,7 +162,10 @@ mod tests {
         fs::create_dir(tmp.path().join("sub")).unwrap();
         fs::write(tmp.path().join("sub/file.txt"), "hi").unwrap();
         let resolved = resolve_and_check(tmp.path(), "sub/file.txt").unwrap();
-        assert_eq!(resolved, tmp.path().join("sub/file.txt").canonicalize().unwrap());
+        assert_eq!(
+            resolved,
+            tmp.path().join("sub/file.txt").canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -220,6 +242,18 @@ mod tests {
         std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
 
         let result = resolve_for_write(tmp.path(), "evil_link");
+        assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_for_write_rejects_symlink_dir_escape() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        // Create a symlink dir inside root pointing outside
+        symlink(outside.path(), tmp.path().join("evil_dir")).unwrap();
+        let result = resolve_for_write(tmp.path(), "evil_dir/passwd");
         assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
     }
 }

@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::Value;
-use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
 use crate::fs::path_util::resolve_and_check;
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::Value;
+use std::sync::Arc;
+use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
 pub struct EditTool {
     ctx: Arc<ToolsContext>,
@@ -53,10 +53,16 @@ impl Tool for EditTool {
         };
 
         if args.old_string.is_empty() {
-            return ToolsError::EditFailed { reason: "old_string is empty".into() }.into();
+            return ToolsError::EditFailed {
+                reason: "old_string is empty".into(),
+            }
+            .into();
         }
         if args.old_string == args.new_string {
-            return ToolsError::EditFailed { reason: "old_string equals new_string".into() }.into();
+            return ToolsError::EditFailed {
+                reason: "old_string equals new_string".into(),
+            }
+            .into();
         }
 
         let resolved = match resolve_and_check(self.ctx.root(), &args.path) {
@@ -89,7 +95,9 @@ fn edit_file(path: &std::path::Path, old_string: &str, new_string: &str) -> Resu
 
     let count = content.matches(old_string).count();
     match count {
-        0 => Err(ToolsError::EditFailed { reason: "old_string not found".into() }),
+        0 => Err(ToolsError::EditFailed {
+            reason: "old_string not found".into(),
+        }),
         1 => {
             let new_content = content.replacen(old_string, new_string, 1);
             std::fs::write(path, new_content)?;
@@ -116,11 +124,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "hello world").unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({
-            "path": "file.txt",
-            "old_string": "hello",
-            "new_string": "goodbye"
-        })).await;
+        let result = tool
+            .call(serde_json::json!({
+                "path": "file.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await;
         assert!(!result.is_error);
         let written = fs::read_to_string(tmp.path().join("file.txt")).unwrap();
         assert_eq!(written, "goodbye world");
@@ -131,11 +141,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "hello world").unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({
-            "path": "file.txt",
-            "old_string": "missing",
-            "new_string": "x"
-        })).await;
+        let result = tool
+            .call(serde_json::json!({
+                "path": "file.txt",
+                "old_string": "missing",
+                "new_string": "x"
+            }))
+            .await;
         assert!(result.is_error);
     }
 
@@ -144,11 +156,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "foo foo foo").unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({
-            "path": "file.txt",
-            "old_string": "foo",
-            "new_string": "bar"
-        })).await;
+        let result = tool
+            .call(serde_json::json!({
+                "path": "file.txt",
+                "old_string": "foo",
+                "new_string": "bar"
+            }))
+            .await;
         assert!(result.is_error);
     }
 
@@ -157,11 +171,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "hi").unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({
-            "path": "file.txt",
-            "old_string": "",
-            "new_string": "x"
-        })).await;
+        let result = tool
+            .call(serde_json::json!({
+                "path": "file.txt",
+                "old_string": "",
+                "new_string": "x"
+            }))
+            .await;
         assert!(result.is_error);
     }
 
@@ -170,11 +186,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "hi").unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({
-            "path": "file.txt",
-            "old_string": "hi",
-            "new_string": "hi"
-        })).await;
+        let result = tool
+            .call(serde_json::json!({
+                "path": "file.txt",
+                "old_string": "hi",
+                "new_string": "hi"
+            }))
+            .await;
         assert!(result.is_error);
     }
 }

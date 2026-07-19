@@ -11,7 +11,10 @@ pub struct ToolsContext {
 impl ToolsContext {
     pub fn new(root: PathBuf) -> Self {
         let cwd = root.clone();
-        Self { root, cwd: Mutex::new(cwd) }
+        Self {
+            root,
+            cwd: Mutex::new(cwd),
+        }
     }
 
     pub fn root(&self) -> &Path {

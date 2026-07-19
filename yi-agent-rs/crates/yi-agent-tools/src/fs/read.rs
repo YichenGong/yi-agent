@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::Value;
-use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
 use crate::fs::path_util::resolve_and_check;
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::Value;
+use std::sync::Arc;
+use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
 pub struct ReadTool {
     ctx: Arc<ToolsContext>,
@@ -86,7 +86,11 @@ impl Tool for ReadTool {
     }
 }
 
-fn read_file(path: &std::path::Path, offset: Option<usize>, limit: Option<usize>) -> Result<String, ToolsError> {
+fn read_file(
+    path: &std::path::Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, ToolsError> {
     let metadata = std::fs::metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ToolsError::NotFound(path.to_path_buf())
@@ -109,6 +113,8 @@ fn read_file(path: &std::path::Path, offset: Option<usize>, limit: Option<usize>
     let offset = offset.unwrap_or(1).saturating_sub(1);
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
+    // Clamp offset to total to prevent slice panic when offset > total
+    let offset = offset.min(total);
     let end = (offset + limit).min(total);
     let shown: Vec<String> = lines[offset..end]
         .iter()
@@ -118,7 +124,11 @@ fn read_file(path: &std::path::Path, offset: Option<usize>, limit: Option<usize>
 
     let mut output = shown.join("\n");
     if end < total {
-        output.push_str(&format!("\n[truncated: showed {} of {} lines]", end - offset, total));
+        output.push_str(&format!(
+            "\n[truncated: showed {} of {} lines]",
+            end - offset,
+            total
+        ));
     }
 
     Ok(output)
@@ -189,7 +199,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.call(serde_json::json!({"path": "file.txt", "offset": 2, "limit": 2})).await;
+        let result = tool
+            .call(serde_json::json!({"path": "file.txt", "offset": 2, "limit": 2}))
+            .await;
         assert!(!result.is_error);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
             assert!(s.contains("2\tl2"));
@@ -198,5 +210,17 @@ mod tests {
         } else {
             panic!("expected text block");
         }
+    }
+
+    #[tokio::test]
+    async fn read_offset_beyond_end() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("file.txt"), "l1\nl2\nl3\n").unwrap();
+        let tool = make_tool(&tmp);
+        let result = tool
+            .call(serde_json::json!({"path": "file.txt", "offset": 100}))
+            .await;
+        // Should not panic; should return success with empty content
+        assert!(!result.is_error);
     }
 }
