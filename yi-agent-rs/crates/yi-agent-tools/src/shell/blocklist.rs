@@ -2,7 +2,6 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// Returns Some(reason) if the command is blocked, None otherwise.
-#[allow(dead_code)] // used by BashTool (Task 11)
 pub fn is_blocked(cmd: &str) -> Option<&'static str> {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
