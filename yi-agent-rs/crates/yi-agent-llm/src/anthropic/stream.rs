@@ -15,7 +15,6 @@ use yi_agent_core::{ProviderError, ProviderEvent, StopReason};
 
 /// One SSE frame parsed from the byte stream.
 struct SseFrame {
-    event: String,
     data: String,
 }
 
@@ -55,9 +54,9 @@ impl SseLineParser {
             if line.is_empty() {
                 // Empty line = event boundary. Emit a frame if we have data.
                 if !self.current_data_lines.is_empty() {
-                    let event = std::mem::take(&mut self.current_event);
+                    let _event = std::mem::take(&mut self.current_event);
                     let data = std::mem::take(&mut self.current_data_lines).join("\n");
-                    frames.push(SseFrame { event, data });
+                    frames.push(SseFrame { data });
                 }
                 continue;
             }

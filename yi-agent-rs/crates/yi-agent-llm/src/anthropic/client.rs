@@ -39,6 +39,16 @@ pub struct AnthropicProvider {
     timeout: Duration,
 }
 
+impl std::fmt::Debug for AnthropicProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicProvider")
+            .field("base_url", &self.base_url)
+            .field("api_version", &self.api_version)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AnthropicProvider {
     /// Construct a provider.
     ///
