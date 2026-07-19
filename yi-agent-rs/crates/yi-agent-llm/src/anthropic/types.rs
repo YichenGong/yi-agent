@@ -139,7 +139,13 @@ impl From<yi_agent_core::GenParams> for AnthropicGenParams {
     }
 }
 
-/// Role label mapping. `Role::Tool` and `Role::System` are special-cased elsewhere.
+/// Role label mapping for the Anthropic `role` field.
+///
+/// `Role::System` is handled specially in `From<ProviderRequest>` (pulled out
+/// to the top-level `system` field) and never reaches this function in
+/// practice; the arm exists only for exhaustiveness. `Role::Tool` maps to
+/// `"user"` because Anthropic's API requires tool results to be sent in a
+/// `user`-role message.
 fn role_label(role: Role) -> &'static str {
     match role {
         Role::User | Role::Tool => "user",
@@ -158,6 +164,9 @@ impl From<ProviderRequest> for AnthropicRequest {
         for m in req.messages {
             match m.role {
                 Role::System => {
+                    // The Anthropic API's top-level `system` field accepts only
+                    // text, so non-text blocks (e.g. Image) are silently dropped.
+                    // `Message::system()` only produces text blocks in practice.
                     for block in m.content {
                         if let ContentBlock::Text(t) = block {
                             system_parts.push(t);

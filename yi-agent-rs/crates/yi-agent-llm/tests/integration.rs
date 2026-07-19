@@ -153,6 +153,12 @@ async fn streams_tool_use_deltas_correctly() {
         e,
         ProviderEvent::ToolUseEnd { id } if id == "toolu_01"
     )));
+    // The SSE fixture includes a `message_delta` with `stop_reason: "end_turn"`,
+    // so the stream should also contain a `Stop` event.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Stop { reason: StopReason::EndTurn }
+    )));
 }
 
 #[tokio::test]
@@ -279,4 +285,83 @@ async fn sends_system_message_as_top_level_system() {
     };
     let _ = provider.call_stream(req).await.expect("stream ok");
     // The mock only responds 200 if the body contained `"system":"be helpful"`.
+}
+
+#[tokio::test]
+async fn returns_invalid_request_error_on_400() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let result = provider.call_stream(simple_request()).await;
+    assert!(matches!(result, Err(ProviderError::InvalidRequest(_))));
+}
+
+#[tokio::test]
+async fn mid_stream_sse_error_becomes_terminal_stop() {
+    // Verify that an SSE `error` event mid-stream is mapped to a terminal
+    // `ProviderEvent::Stop { reason: StopReason::Other(_) }` and that no
+    // further events arrive after it (the stream terminates).
+    let server = MockServer::start().await;
+    let body = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+                event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"should-not-arrive\"}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let events = collect_events(stream).await;
+
+    // First event: the text delta before the error.
+    assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "partial"));
+    // Second event: the error converted to a terminal Stop.
+    match &events[1] {
+        ProviderEvent::Stop { reason: StopReason::Other(msg) } => {
+            assert!(msg.contains("overloaded"), "unexpected message: {msg}");
+        }
+        _ => panic!("expected Stop{{Other}} for mid-stream error, got: {:?}", events[1]),
+    }
+    // No further events after the terminal Stop.
+    assert_eq!(events.len(), 2, "stream should terminate after Stop");
+}
+
+#[tokio::test]
+async fn trims_trailing_slash_in_base_url() {
+    // A base_url with a trailing slash should not produce `//v1/messages`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(AnthropicProviderOpts {
+        // Intentionally add a trailing slash.
+        base_url: Some(format!("{}/", server.uri())),
+        api_key: Some("test-key".to_string()),
+        api_version: None,
+        timeout: Some(Duration::from_secs(5)),
+    })
+    .expect("provider construction");
+    // If trailing slash weren't trimmed, the path would become `//v1/messages`
+    // and wiremock would not match the `path("/v1/messages")` matcher — the
+    // request would 404. The mock only responds 200 if the path is exactly
+    // `/v1/messages`, so this passing verifies the trim works.
+    let _ = provider.call_stream(simple_request()).await.expect("stream ok");
 }

@@ -64,7 +64,9 @@ impl AnthropicProvider {
         let base_url = opts
             .base_url
             .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
 
         let api_version = opts
             .api_version
@@ -115,12 +117,27 @@ impl Provider for AnthropicProvider {
         let event_stream = AnthropicStream::new(byte_stream);
         // Map Result<ProviderEvent, ProviderError> → ProviderEvent.
         // Mid-stream errors become a terminal Stop event with the error message.
-        let mapped = event_stream.map(|item| match item {
-            Ok(event) => event,
-            Err(e) => ProviderEvent::Stop {
-                reason: StopReason::Other(format!("stream error: {e}")),
-            },
-        });
+        //
+        // `scan` carries a `Some(())` token that is consumed when the first
+        // `Stop` event is seen; once consumed (state becomes `None`), the
+        // stream yields `None` forever. This guarantees the stream terminates
+        // after the first Stop — whether from `message_delta` or from a
+        // converted mid-stream error — preventing spurious events from
+        // arriving after an error or natural termination.
+        let mapped = event_stream
+            .map(|item| match item {
+                Ok(event) => event,
+                Err(e) => ProviderEvent::Stop {
+                    reason: StopReason::Other(format!("stream error: {e}")),
+                },
+            })
+            .scan(Some(()), |state, event| {
+                let yield_event = state.is_some();
+                if matches!(event, ProviderEvent::Stop { .. }) {
+                    *state = None;
+                }
+                std::future::ready(if yield_event { Some(event) } else { None })
+            });
         Ok(mapped.boxed())
     }
 }

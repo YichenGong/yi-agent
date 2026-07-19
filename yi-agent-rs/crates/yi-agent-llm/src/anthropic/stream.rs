@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt, stream::BoxStream};
+use futures::{Stream, StreamExt};
 use serde_json::Value;
 
 use yi_agent_core::{ProviderError, ProviderEvent, StopReason};
@@ -19,32 +19,51 @@ struct SseFrame {
 }
 
 /// Parses raw byte chunks into SSE frames.
+///
+/// Buffers raw bytes (not a `String`) so that TCP chunk boundaries splitting a
+/// multi-byte UTF-8 character do not cause data loss. Bytes are only decoded to
+/// UTF-8 once a complete line (terminated by `\n`) is available.
 struct SseLineParser {
-    buf: String,
-    current_event: String,
+    buf: Vec<u8>,
     current_data_lines: Vec<String>,
 }
 
 impl SseLineParser {
     fn new() -> Self {
         Self {
-            buf: String::new(),
-            current_event: String::new(),
+            buf: Vec::new(),
             current_data_lines: Vec::new(),
         }
     }
 
     /// Feed a chunk of bytes. Returns completed SSE frames.
     fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
-        self.buf.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        self.buf.extend_from_slice(chunk);
         let mut frames = Vec::new();
 
         loop {
-            let Some(nl) = self.buf.find('\n') else {
+            // Find the next newline in the buffer.
+            let Some(nl) = self.buf.iter().position(|&b| b == b'\n') else {
                 break;
             };
-            let mut line = self.buf[..nl].to_string();
-            self.buf = self.buf[nl + 1..].to_string();
+            // Extract the line (without the `\n`) and remove it from the buffer.
+            let line_bytes: Vec<u8> = self.buf.drain(..=nl).collect();
+            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
+
+            // Decode the complete line to UTF-8. A complete SSE line is always
+            // valid UTF-8 from Anthropic; if it isn't, we surface the error
+            // rather than silently dropping bytes.
+            let mut line = match std::str::from_utf8(line_bytes) {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    // Drop the malformed line but keep going; surface the error
+                    // via a synthetic frame so the caller can decide.
+                    frames.push(SseFrame {
+                        data: format!("{{\"type\":\"__parse_error\",\"error\":\"invalid UTF-8 in SSE line: {e}\"}}"),
+                    });
+                    continue;
+                }
+            };
 
             // Strip trailing \r if present (CRLF)
             if line.ends_with('\r') {
@@ -54,21 +73,20 @@ impl SseLineParser {
             if line.is_empty() {
                 // Empty line = event boundary. Emit a frame if we have data.
                 if !self.current_data_lines.is_empty() {
-                    let _event = std::mem::take(&mut self.current_event);
                     let data = std::mem::take(&mut self.current_data_lines).join("\n");
                     frames.push(SseFrame { data });
                 }
                 continue;
             }
 
-            if let Some(rest) = line.strip_prefix("event:") {
-                self.current_event = rest.trim().to_string();
-            } else if let Some(rest) = line.strip_prefix("data:") {
+            if let Some(rest) = line.strip_prefix("data:") {
                 self.current_data_lines.push(rest.trim().to_string());
             } else if line.starts_with(':') {
                 // Comment, ignore.
             } else {
-                // Unknown field — ignore per SSE spec.
+                // Unknown field (including `event:`) — we dispatch on the JSON
+                // `type` field in the data payload, so the SSE `event:` line
+                // is not needed.
             }
         }
 
@@ -113,6 +131,13 @@ where
             .unwrap_or("");
 
         match event_type {
+            "__parse_error" => {
+                let msg = data
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("invalid UTF-8 in SSE line");
+                Err(ProviderError::Stream(msg.to_string()))
+            }
             "content_block_start" => {
                 let index = data
                     .get("index")
@@ -249,14 +274,6 @@ where
     }
 }
 
-/// Convenience: box a stream for return from `Provider::call_stream`.
-pub fn boxed<S>(stream: AnthropicStream<S>) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
-where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
-{
-    stream.boxed()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,22 +295,16 @@ mod tests {
         out
     }
 
-    fn sse(body: &str) -> String {
-        body.to_string()
-    }
-
     #[tokio::test]
     async fn parses_text_delta_sequence() {
-        let body = sse(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
+        let body = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
              event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
              event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n\
              event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n\
              event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
              event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
-             event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-        );
-        let bytes = body.into_bytes();
+             event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let bytes = body.to_string().into_bytes();
         let events = collect_events(vec![bytes.as_slice()]).await;
 
         let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
@@ -307,18 +318,16 @@ mod tests {
 
     #[tokio::test]
     async fn parses_tool_use_with_partial_json() {
-        let body = sse(
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"read\",\"input\":{}}}\n\n\
+        let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"read\",\"input\":{}}}\n\n\
              event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n\
              event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"main.rs\\\"}\"}}\n\n\
              event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
-             event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
-        );
-        let bytes = body.into_bytes();
+             event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let bytes = body.to_string().into_bytes();
         let events = collect_events(vec![bytes.as_slice()]).await;
 
         let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
-        // 4 events: ToolUseStart, 2x ToolUseDelta, ToolUseEnd. (message_delta Stop is the 5th.)
+        // 5 events: ToolUseStart, 2x ToolUseDelta, ToolUseEnd, Stop.
         assert_eq!(events.len(), 5);
         match &events[0] {
             ProviderEvent::ToolUseStart { id, name } => {
@@ -367,6 +376,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handles_chunk_split_inside_multibyte_utf8() {
+        // "你好" is 6 bytes in UTF-8: E4 BD A0 E5 A5 BD.
+        // Split after 3 bytes (inside the first character) to simulate TCP fragmentation.
+        let text = "你好";
+        let text_bytes = text.as_bytes();
+        // Build an SSE event containing "你好" in the text field.
+        let full = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\n",
+            text
+        );
+        let full_bytes = full.into_bytes();
+        // Find where "你好" starts in the full byte stream and split in the middle of it.
+        let text_start = full_bytes
+            .windows(text_bytes.len())
+            .position(|w| w == text_bytes)
+            .expect("text bytes should be present");
+        let split_at = text_start + 3; // middle of first character (3 bytes)
+        let part1 = &full_bytes[..split_at];
+        let part2 = &full_bytes[split_at..];
+
+        let events = collect_events(vec![part1, part2]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(events.len(), 1, "expected exactly one event");
+        match &events[0] {
+            ProviderEvent::TextDelta(t) => assert_eq!(t, "你好", "text should be intact"),
+            _ => panic!("expected TextDelta"),
+        }
+    }
+
+    #[tokio::test]
     async fn maps_stop_reasons_correctly() {
         for (input, expected) in [
             ("end_turn", StopReason::EndTurn),
@@ -391,19 +430,17 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_ping_and_message_start() {
-        let body = sse(
-            "event: ping\ndata: {\"type\":\"ping\"}\n\n\
-             event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n",
-        );
-        let bytes = body.into_bytes();
+        let body = "event: ping\ndata: {\"type\":\"ping\"}\n\n\
+             event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n";
+        let bytes = body.to_string().into_bytes();
         let events = collect_events(vec![bytes.as_slice()]).await;
         assert!(events.is_empty());
     }
 
     #[tokio::test]
     async fn surfaces_sse_error_event() {
-        let body = sse("event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n");
-        let bytes = body.into_bytes();
+        let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n";
+        let bytes = body.to_string().into_bytes();
         let events = collect_events(vec![bytes.as_slice()]).await;
         assert_eq!(events.len(), 1);
         match &events[0] {
