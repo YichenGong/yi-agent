@@ -34,7 +34,9 @@ ci-push:
     - cd yi-agent-rs
     - rustup default stable
     - rustup update stable
-    - just --version || cargo install just --locked --quiet
+    - export PATH="$HOME/.local/bin:$PATH"
+    - just --version 2>/dev/null || curl -sSf https://just.systems/install.sh | sh -s -- --to "$HOME/.local/bin"
+    - just --version
     - just ci
 
 # MR(Merge Request)走云端 runner
