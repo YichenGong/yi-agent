@@ -14,15 +14,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify tag matches Cargo.toml version
-        run: |
-          TAG_VERSION="${{ github.ref_name }}"
-          CARGO_VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
-          if [ "v$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: Git tag ($TAG_VERSION) does not match Cargo.toml version (v$CARGO_VERSION)"
-            exit 1
-          fi
-          echo "Version match: $TAG_VERSION"
+      # TODO: 测试模式下临时禁用版本一致性检查,验证通过后恢复
+      # - name: Verify tag matches Cargo.toml version
+      #   run: |
+      #     TAG_VERSION="${{ github.ref_name }}"
+      #     CARGO_VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
+      #     if [ "v$CARGO_VERSION" != "$TAG_VERSION" ]; then
+      #       echo "ERROR: Git tag ($TAG_VERSION) does not match Cargo.toml version (v$CARGO_VERSION)"
+      #       exit 1
+      #     fi
+      #     echo "Version match: $TAG_VERSION"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -58,21 +59,23 @@ jobs:
             yi-agent-rs/dist/*.sha256
           generate_release_notes: true
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Publish to npm
-        working-directory: yi-agent-rs
-        run: just npm-publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Update Homebrew tap
-        env:
-          TAP_REPO_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
-          ./.github/scripts/update-homebrew-tap.sh "${{ github.ref_name }}" "$VERSION"
+      # TODO: 测试模式下临时禁用 npm publish 和 Homebrew tap 更新
+      # 验证通过后恢复,然后打真正的 v0.1.0 tag
+      # - name: Setup Node.js
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: "20"
+      #     registry-url: "https://registry.npmjs.org"
+      #
+      # - name: Publish to npm
+      #   working-directory: yi-agent-rs
+      #   run: just npm-publish
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      #
+      # - name: Update Homebrew tap
+      #   env:
+      #     TAP_REPO_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      #   run: |
+      #     VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
+      #     ./.github/scripts/update-homebrew-tap.sh "${{ github.ref_name }}" "$VERSION"
