@@ -47,6 +47,8 @@ impl Session {
 /// Agent configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Model identifier passed to the provider (e.g. "claude-sonnet-4-5").
+    pub model: String,
     pub system_prompt: Option<String>,
     pub max_turns: Option<u32>,
     pub gen_params: GenParams,
@@ -55,6 +57,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            model: "claude-sonnet-4-5".to_string(),
             system_prompt: None,
             max_turns: Some(100),
             gen_params: Default::default(),
@@ -179,6 +182,7 @@ async fn run_loop(
 
         // 1. THINK
         let req = ProviderRequest {
+            model: config.model.clone(),
             system: config.system_prompt.clone(),
             messages: messages.clone(),
             tools: tools.schemas(),
