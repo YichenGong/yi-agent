@@ -91,9 +91,9 @@ jobs:
 
       - name: Publish to npm
         working-directory: yi-agent-rs
-        run: just npm-publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: just npm-publish
 
       - name: Update Homebrew tap
         env:
