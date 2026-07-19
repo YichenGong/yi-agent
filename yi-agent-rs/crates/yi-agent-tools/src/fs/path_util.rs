@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 use crate::error::ToolsError;
 
 /// Resolve `path` relative to `root`, then verify the canonicalized path
-/// is still inside `root`. Prevents `../` escapes.
+/// is still inside `root`. Prevents `../` escapes and symlink escapes.
 ///
 /// - Absolute paths are interpreted as-is (but must still be inside root).
 /// - Relative paths are joined to root.
 /// - Parent directories that don't exist yet cause an error (callers should
 ///   create them first when writing).
+#[allow(dead_code)]
 pub fn resolve_and_check(root: &Path, path: &str) -> Result<PathBuf, ToolsError> {
     let canonical_root = root.canonicalize().map_err(ToolsError::Io)?;
 
@@ -20,7 +21,17 @@ pub fn resolve_and_check(root: &Path, path: &str) -> Result<PathBuf, ToolsError>
     // For paths that don't exist yet, canonicalize the parent.
     let (parent, file_name) = match candidate.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => (parent, candidate.file_name()),
-        _ => return Ok(candidate),
+        _ => {
+            // Root path bypass: candidate.parent() is None or empty
+            // (e.g. path == "/"). Canonicalize and verify containment.
+            if let Ok(full_canonical) = candidate.canonicalize() {
+                if !full_canonical.starts_with(&canonical_root) {
+                    return Err(ToolsError::PathEscapesRoot(candidate));
+                }
+                return Ok(full_canonical);
+            }
+            return Ok(candidate);
+        }
     };
 
     let canonical_parent = match parent.canonicalize() {
@@ -47,12 +58,23 @@ pub fn resolve_and_check(root: &Path, path: &str) -> Result<PathBuf, ToolsError>
         None => canonical_parent,
     };
 
+    // If the resolved path exists, verify it doesn't escape via symlink.
+    // The parent-canonicalize above only checks the parent directory; a
+    // symlink as the final component could still point outside root.
+    if let Ok(full_canonical) = resolved.canonicalize() {
+        if !full_canonical.starts_with(&canonical_root) {
+            return Err(ToolsError::PathEscapesRoot(candidate));
+        }
+        return Ok(full_canonical);
+    }
+
     Ok(resolved)
 }
 
 /// Lexically normalize a path by resolving `.` and `..` components
 /// without touching the filesystem. Used as a fallback check when
 /// `canonicalize()` fails because the path doesn't exist.
+#[allow(dead_code)]
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
@@ -60,11 +82,8 @@ fn lexical_normalize(path: &Path) -> PathBuf {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 // Only pop normal components; never pop past root.
-                match components.last() {
-                    Some(std::path::Component::Normal(_)) => {
-                        components.pop();
-                    }
-                    _ => {}
+                if let Some(std::path::Component::Normal(_)) = components.last() {
+                    components.pop();
                 }
             }
             c => components.push(c),
@@ -110,5 +129,30 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = resolve_and_check(tmp.path(), "nonexistent/file.txt");
         assert!(matches!(result, Err(ToolsError::NotFound(_))));
+    }
+
+    #[test]
+    fn rejects_absolute_path_outside_root() {
+        let tmp = TempDir::new().unwrap();
+        let result = resolve_and_check(tmp.path(), "/etc/passwd");
+        assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        let tmp = TempDir::new().unwrap();
+        // Create a file outside root to target via symlink.
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+
+        // Create a symlink inside root pointing to the outside file.
+        let link_path = tmp.path().join("evil_link");
+        std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+
+        // The symlink is inside root lexically, but canonicalizes outside.
+        let result = resolve_and_check(tmp.path(), "evil_link");
+        assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
     }
 }
