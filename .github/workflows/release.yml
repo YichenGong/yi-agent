@@ -26,13 +26,17 @@ jobs:
 
       - name: Setup Rust toolchain
         run: |
-          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
           source "$HOME/.cargo/env"
           rustup default stable
           rustup target add x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu
+        env:
+          PATH: /opt/homebrew/bin:/Users/agenticlabs/.local/bin:/Users/agenticlabs/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
       - name: Set CARGO_TARGET_DIR (isolate from GitLab runner)
         run: echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> $GITHUB_ENV
+
+      - name: Add brew to GITHUB_PATH
+        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo-zigbuild
         run: |
@@ -48,11 +52,15 @@ jobs:
           workspaces: yi-agent-rs
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        run: |
+          command -v just >/dev/null 2>&1 || curl -sSf https://just.systems/install.sh | sh -s -- --to "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build & package all platforms
         working-directory: yi-agent-rs
-        run: just package-all
+        run: |
+          source "$HOME/.cargo/env"
+          just package-all
 
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
