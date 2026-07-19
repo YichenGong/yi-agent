@@ -5,6 +5,7 @@
 
 mod context;
 mod error;
+mod fs;
 
 pub use context::ToolsContext;
 pub use error::ToolsError;
