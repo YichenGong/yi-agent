@@ -6,15 +6,25 @@ on:
     tags:
       - "v*.*.*"
 
+# 防止误推两次 tag 时并发跑两个 release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: self-hosted  # Mac mini 上注册的 GitHub Actions runner
     permissions:
       contents: write  # softprops/action-gh-release 需要写权限创建 Release
+    env:
+      # 统一 PATH,所有 step 自动继承(self-hosted runner 非 interactive shell,默认 PATH 缺东西)
+      PATH: /opt/homebrew/bin:/Users/agenticlabs/.local/bin:/Users/agenticlabs/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+      CARGO_TARGET_DIR: /Users/agenticlabs/cargo-target/github
     steps:
       - uses: actions/checkout@v4
 
       - name: Verify tag matches Cargo.toml version
+        id: version
         run: |
           TAG_VERSION="${{ github.ref_name }}"
           CARGO_VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
@@ -23,11 +33,13 @@ jobs:
             exit 1
           fi
           echo "Version match: $TAG_VERSION"
+          # 供后续 step 复用
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Setup Rust toolchain
         run: |
           source "$HOME/.cargo/env"
-          rustup default stable >/dev/null 2>&1
+          rustup default stable 2>/dev/null || true
           # 检测 target 是否已装,已装就跳过(避免每次 release 都联网检查)
           for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu; do
             if ! rustup target list --installed 2>/dev/null | grep -q "^$target$"; then
@@ -35,32 +47,27 @@ jobs:
             fi
           done
           rustup target list --installed
-        env:
-          PATH: /opt/homebrew/bin:/Users/agenticlabs/.local/bin:/Users/agenticlabs/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
-      - name: Set CARGO_TARGET_DIR (isolate from GitLab runner)
-        run: echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> $GITHUB_ENV
-
-      - name: Add brew to GITHUB_PATH
-        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
-
-      - name: Install cargo-zigbuild
+      - name: Ensure cargo-zigbuild installed
         run: |
           source "$HOME/.cargo/env"
           command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild --locked
 
-      - name: Verify zig
-        run: zig version
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: yi-agent-rs
-
-      - name: Install just
+      - name: Ensure zig available
         run: |
-          command -v just >/dev/null 2>&1 || curl -sSf https://just.systems/install.sh | sh -s -- --to "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if ! command -v zig >/dev/null 2>&1; then
+            echo "ERROR: zig not found. Install with: brew install zig"
+            exit 1
+          fi
+          zig version
+
+      - name: Ensure just installed
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v just >/dev/null 2>&1; then
+            curl -sSf https://just.systems/install.sh | sh -s -- --to "$HOME/.local/bin"
+          fi
+          just --version
 
       - name: Build & package all platforms
         working-directory: yi-agent-rs
@@ -91,6 +98,6 @@ jobs:
       - name: Update Homebrew tap
         env:
           TAP_REPO_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=$(grep '^version' yi-agent-rs/Cargo.toml | head -1 | awk -F'"' '{print $2}')
           ./.github/scripts/update-homebrew-tap.sh "${{ github.ref_name }}" "$VERSION"
