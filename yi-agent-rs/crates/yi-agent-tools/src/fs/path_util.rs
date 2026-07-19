@@ -70,6 +70,39 @@ pub fn resolve_and_check(root: &Path, path: &str) -> Result<PathBuf, ToolsError>
     Ok(resolved)
 }
 
+/// Like `resolve_and_check` but allows the target path (and parent dirs) to
+/// not exist yet. Used by WriteTool which creates parent directories as needed.
+/// Security is enforced via lexical normalization: `../` escapes are still
+/// rejected, and if the path *does* exist, symlink escapes are caught via
+/// canonicalize.
+pub fn resolve_for_write(root: &Path, path: &str) -> Result<PathBuf, ToolsError> {
+    let canonical_root = root.canonicalize().map_err(ToolsError::Io)?;
+
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        canonical_root.join(path)
+    };
+
+    // If the full path already exists, canonicalize and verify containment.
+    // This catches symlink escapes on the final component.
+    if let Ok(full_canonical) = candidate.canonicalize() {
+        if !full_canonical.starts_with(&canonical_root) {
+            return Err(ToolsError::PathEscapesRoot(candidate));
+        }
+        return Ok(full_canonical);
+    }
+
+    // Path doesn't exist (or parent doesn't). Use lexical normalization to
+    // verify the path stays within root without touching the filesystem.
+    let normalized = lexical_normalize(&candidate);
+    if !normalized.starts_with(&canonical_root) {
+        return Err(ToolsError::PathEscapesRoot(candidate));
+    }
+
+    Ok(normalized)
+}
+
 /// Lexically normalize a path by resolving `.` and `..` components
 /// without touching the filesystem. Used as a fallback check when
 /// `canonicalize()` fails because the path doesn't exist.
@@ -151,6 +184,42 @@ mod tests {
 
         // The symlink is inside root lexically, but canonicalizes outside.
         let result = resolve_and_check(tmp.path(), "evil_link");
+        assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
+    }
+
+    #[test]
+    fn resolve_for_write_allows_nonexistent_parent() {
+        let tmp = TempDir::new().unwrap();
+        let result = resolve_for_write(tmp.path(), "nonexistent/dir/file.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolve_for_write_rejects_dotdot_escape() {
+        let tmp = TempDir::new().unwrap();
+        let result = resolve_for_write(tmp.path(), "sub/../../etc/passwd");
+        assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
+    }
+
+    #[test]
+    fn resolve_for_write_rejects_absolute_outside_root() {
+        let tmp = TempDir::new().unwrap();
+        let result = resolve_for_write(tmp.path(), "/etc/passwd");
+        assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_for_write_rejects_symlink_escape() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+
+        let link_path = tmp.path().join("evil_link");
+        std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+
+        let result = resolve_for_write(tmp.path(), "evil_link");
         assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
     }
 }
