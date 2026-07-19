@@ -8,7 +8,8 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use yi_agent_core::{
-    GenParams, Message, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason,
+    ContentBlock, GenParams, Message, Provider, ProviderError, ProviderEvent, ProviderRequest,
+    ProviderResponse, StopReason,
 };
 use yi_agent_llm::{AnthropicProvider, AnthropicProviderOpts};
 
@@ -364,4 +365,202 @@ async fn trims_trailing_slash_in_base_url() {
     // request would 404. The mock only responds 200 if the path is exactly
     // `/v1/messages`, so this passing verifies the trim works.
     let _ = provider.call_stream(simple_request()).await.expect("stream ok");
+}
+
+#[tokio::test]
+async fn call_accumulates_full_response_end_to_end() {
+    // Verify the full `Provider::call` path: the provider streams events,
+    // core's `accumulate_stream` stitches them into a `ProviderResponse`
+    // with `content: Vec<ContentBlock>` and `stop_reason`. This exercises
+    // the integration between yi-agent-llm (streaming) and yi-agent-core
+    // (accumulation), which no other test covers.
+    let server = MockServer::start().await;
+    let body = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
+                event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n\
+                event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_42\",\"name\":\"search\",\"input\":{}}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"rust\\\"}\"}}\n\n\
+                event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+                event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+                event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    // Use `call` (not `call_stream`) — this drives `accumulate_stream` in core.
+    let resp: ProviderResponse = provider
+        .call(simple_request())
+        .await
+        .expect("call ok");
+
+    assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    assert_eq!(resp.content.len(), 2, "expected text + tool_use");
+    match &resp.content[0] {
+        ContentBlock::Text(t) => assert_eq!(t, "Hello world"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+    match &resp.content[1] {
+        ContentBlock::ToolUse { id, name, input } => {
+            assert_eq!(id, "toolu_42");
+            assert_eq!(name, "search");
+            assert_eq!(input, &serde_json::json!({"q":"rust"}));
+        }
+        other => panic!("expected ToolUse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mixed_text_and_tool_use_in_one_response() {
+    // A single SSE response containing both a text block (index 0) and a
+    // tool_use block (index 1). Verify events arrive in order and the
+    // text/tool boundaries are correctly tracked.
+    let server = MockServer::start().await;
+    let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"thinking\"}}\n\n\
+                event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_99\",\"name\":\"write\",\"input\":{}}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+                event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+                event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let events = collect_events(stream).await;
+
+    // Expected order:
+    //   TextDelta("thinking"), ToolUseStart{id:"toolu_99", name:"write"},
+    //   ToolUseDelta{id:"toolu_99", partial_json:"{}"},
+    //   ToolUseEnd{id:"toolu_99"}, Stop{EndTurn}
+    assert_eq!(events.len(), 5, "events: {events:?}");
+    assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "thinking"));
+    assert!(matches!(
+        &events[1],
+        ProviderEvent::ToolUseStart { id, name } if id == "toolu_99" && name == "write"
+    ));
+    assert!(matches!(
+        &events[2],
+        ProviderEvent::ToolUseDelta { id, partial_json } if id == "toolu_99" && partial_json == "{}"
+    ));
+    assert!(matches!(
+        &events[3],
+        ProviderEvent::ToolUseEnd { id } if id == "toolu_99"
+    ));
+    assert!(matches!(
+        &events[4],
+        ProviderEvent::Stop { reason: StopReason::EndTurn }
+    ));
+}
+
+#[tokio::test]
+async fn multiple_tool_use_blocks_in_one_response() {
+    // Two separate tool_use blocks (index 0 and index 1) in a single
+    // response. Verifies `block_ids` cache correctly isolates ids across
+    // blocks and both ToolUseEnd events fire with the right id.
+    let server = MockServer::start().await;
+    let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"read\",\"input\":{}}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"p\\\":1}\"}}\n\n\
+                event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"write\",\"input\":{}}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"p\\\":2}\"}}\n\n\
+                event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+                event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let events = collect_events(stream).await;
+
+    // Expected: StartA, DeltaA, EndA, StartB, DeltaB, EndB, Stop
+    assert_eq!(events.len(), 7, "events: {events:?}");
+    assert!(matches!(
+        &events[0],
+        ProviderEvent::ToolUseStart { id, name } if id == "toolu_a" && name == "read"
+    ));
+    assert!(matches!(
+        &events[1],
+        ProviderEvent::ToolUseDelta { id, partial_json } if id == "toolu_a" && partial_json == "{\"p\":1}"
+    ));
+    assert!(matches!(
+        &events[2],
+        ProviderEvent::ToolUseEnd { id } if id == "toolu_a"
+    ));
+    assert!(matches!(
+        &events[3],
+        ProviderEvent::ToolUseStart { id, name } if id == "toolu_b" && name == "write"
+    ));
+    assert!(matches!(
+        &events[4],
+        ProviderEvent::ToolUseDelta { id, partial_json } if id == "toolu_b" && partial_json == "{\"p\":2}"
+    ));
+    assert!(matches!(
+        &events[5],
+        ProviderEvent::ToolUseEnd { id } if id == "toolu_b"
+    ));
+    assert!(matches!(
+        &events[6],
+        ProviderEvent::Stop { reason: StopReason::EndTurn }
+    ));
+}
+
+#[tokio::test]
+async fn stop_sequence_stop_reason_end_to_end() {
+    // The unit test `maps_stop_reasons_correctly` covers the string mapping in
+    // isolation; this test verifies the full provider path emits
+    // `Stop { reason: StopReason::StopSequence }` when the SSE stream contains
+    // a `stop_reason: "stop_sequence"` in `message_delta`.
+    let server = MockServer::start().await;
+    let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stopped early\"}}\n\n\
+                event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"\\nUser:\"}}\n\n\
+                event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let events = collect_events(stream).await;
+
+    // Last event should be Stop{StopSequence} (not EndTurn or Other).
+    let stop = events.iter().find(|e| matches!(e, ProviderEvent::Stop { .. }));
+    assert!(stop.is_some(), "no Stop event in: {events:?}");
+    match stop.unwrap() {
+        ProviderEvent::Stop { reason } => {
+            assert_eq!(*reason, StopReason::StopSequence, "events: {events:?}");
+        }
+        _ => unreachable!(),
+    }
 }
