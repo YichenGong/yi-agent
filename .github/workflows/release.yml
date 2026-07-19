@@ -24,10 +24,11 @@ jobs:
           fi
           echo "Version match: $TAG_VERSION"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu
+      - name: Setup Rust toolchain
+        run: |
+          source "$HOME/.cargo/env"
+          rustup default stable
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu
 
       - name: Set CARGO_TARGET_DIR (isolate from GitLab runner)
         run: echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> $GITHUB_ENV
