@@ -41,11 +41,8 @@ impl SseLineParser {
         self.buf.extend_from_slice(chunk);
         let mut frames = Vec::new();
 
-        loop {
-            // Find the next newline in the buffer.
-            let Some(nl) = self.buf.iter().position(|&b| b == b'\n') else {
-                break;
-            };
+        // Process each complete line while leaving a partial trailing line buffered.
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             // Extract the line (without the `\n`) and remove it from the buffer.
             let line_bytes: Vec<u8> = self.buf.drain(..=nl).collect();
             let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
