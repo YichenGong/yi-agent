@@ -20,8 +20,8 @@ yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统
 
 ## Features
 
-- [ ] FS 工具：Read/Write/Edit/Glob/Grep（单一 root 限制）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
-- [ ] Shell 工具：Bash（sh -c + 黑名单 + timeout + 输出截断）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
-- [ ] 工具注册 API：register_builtin_tools() — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
+- [x] FS 工具：Read/Write/Edit/Glob/Grep（单一 root 限制）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
+- [x] Shell 工具：Bash（sh -c + 黑名单 + timeout + 输出截断）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
+- [x] 工具注册 API：register_builtin_tools() — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
 - [ ] Sandbox（跨平台进程隔离，Linux seccomp/bubblewrap + macOS sandbox-exec）— 延后单独设计
 - [ ] Web 工具（搜索/抓取）— 延后单独一轮
