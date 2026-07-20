@@ -72,7 +72,9 @@ impl AnthropicProvider {
             .api_version
             .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
 
-        let timeout = opts.timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        let timeout = opts
+            .timeout
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
 
         let client = reqwest::Client::builder()
             .timeout(timeout)

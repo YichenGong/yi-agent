@@ -114,9 +114,11 @@ async fn streams_text_deltas_correctly() {
         })
         .collect();
     assert_eq!(text, "Hello world");
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, ProviderEvent::Stop { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ProviderEvent::Stop { .. }))
+    );
 }
 
 #[tokio::test]
@@ -158,7 +160,9 @@ async fn streams_tool_use_deltas_correctly() {
     // so the stream should also contain a `Stop` event.
     assert!(events.iter().any(|e| matches!(
         e,
-        ProviderEvent::Stop { reason: StopReason::EndTurn }
+        ProviderEvent::Stop {
+            reason: StopReason::EndTurn
+        }
     )));
 }
 
@@ -265,13 +269,13 @@ async fn sends_system_message_as_top_level_system() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .and(wiremock::matchers::body_string_contains("\"system\":\"be helpful\""))
+        .and(wiremock::matchers::body_string_contains(
+            "\"system\":\"be helpful\"",
+        ))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-                ),
+                .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
         )
         .mount(&server)
         .await;
@@ -322,17 +326,25 @@ async fn mid_stream_sse_error_becomes_terminal_stop() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
 
     // First event: the text delta before the error.
     assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "partial"));
     // Second event: the error converted to a terminal Stop.
     match &events[1] {
-        ProviderEvent::Stop { reason: StopReason::Other(msg) } => {
+        ProviderEvent::Stop {
+            reason: StopReason::Other(msg),
+        } => {
             assert!(msg.contains("overloaded"), "unexpected message: {msg}");
         }
-        _ => panic!("expected Stop{{Other}} for mid-stream error, got: {:?}", events[1]),
+        _ => panic!(
+            "expected Stop{{Other}} for mid-stream error, got: {:?}",
+            events[1]
+        ),
     }
     // No further events after the terminal Stop.
     assert_eq!(events.len(), 2, "stream should terminate after Stop");
@@ -364,7 +376,10 @@ async fn trims_trailing_slash_in_base_url() {
     // and wiremock would not match the `path("/v1/messages")` matcher — the
     // request would 404. The mock only responds 200 if the path is exactly
     // `/v1/messages`, so this passing verifies the trim works.
-    let _ = provider.call_stream(simple_request()).await.expect("stream ok");
+    let _ = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
 }
 
 #[tokio::test]
@@ -397,10 +412,7 @@ async fn call_accumulates_full_response_end_to_end() {
 
     let provider = provider_for(&server);
     // Use `call` (not `call_stream`) — this drives `accumulate_stream` in core.
-    let resp: ProviderResponse = provider
-        .call(simple_request())
-        .await
-        .expect("call ok");
+    let resp: ProviderResponse = provider.call(simple_request()).await.expect("call ok");
 
     assert_eq!(resp.stop_reason, StopReason::EndTurn);
     assert_eq!(resp.content.len(), 2, "expected text + tool_use");
@@ -442,7 +454,10 @@ async fn mixed_text_and_tool_use_in_one_response() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
 
     // Expected order:
@@ -465,7 +480,9 @@ async fn mixed_text_and_tool_use_in_one_response() {
     ));
     assert!(matches!(
         &events[4],
-        ProviderEvent::Stop { reason: StopReason::EndTurn }
+        ProviderEvent::Stop {
+            reason: StopReason::EndTurn
+        }
     ));
 }
 
@@ -493,7 +510,10 @@ async fn multiple_tool_use_blocks_in_one_response() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
 
     // Expected: StartA, DeltaA, EndA, StartB, DeltaB, EndB, Stop
@@ -524,7 +544,9 @@ async fn multiple_tool_use_blocks_in_one_response() {
     ));
     assert!(matches!(
         &events[6],
-        ProviderEvent::Stop { reason: StopReason::EndTurn }
+        ProviderEvent::Stop {
+            reason: StopReason::EndTurn
+        }
     ));
 }
 
@@ -551,11 +573,16 @@ async fn stop_sequence_stop_reason_end_to_end() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
 
     // Last event should be Stop{StopSequence} (not EndTurn or Other).
-    let stop = events.iter().find(|e| matches!(e, ProviderEvent::Stop { .. }));
+    let stop = events
+        .iter()
+        .find(|e| matches!(e, ProviderEvent::Stop { .. }));
     assert!(stop.is_some(), "no Stop event in: {events:?}");
     match stop.unwrap() {
         ProviderEvent::Stop { reason } => {

@@ -29,7 +29,9 @@ pub struct AnthropicMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -40,7 +42,9 @@ pub enum AnthropicContentBlock {
         content: Vec<AnthropicContentBlock>,
         is_error: bool,
     },
-    Image { source: AnthropicImageSource },
+    Image {
+        source: AnthropicImageSource,
+    },
 }
 
 #[derive(Serialize)]
@@ -106,13 +110,21 @@ impl From<ContentBlock> for AnthropicContentBlock {
     fn from(b: ContentBlock) -> Self {
         match b {
             ContentBlock::Text(text) => AnthropicContentBlock::Text { text },
-            ContentBlock::ToolUse { id, name, input } => AnthropicContentBlock::ToolUse { id, name, input },
-            ContentBlock::ToolResult { tool_use_id, content, is_error } => AnthropicContentBlock::ToolResult {
+            ContentBlock::ToolUse { id, name, input } => {
+                AnthropicContentBlock::ToolUse { id, name, input }
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => AnthropicContentBlock::ToolResult {
                 tool_use_id,
                 content: content.into_iter().map(Into::into).collect(),
                 is_error,
             },
-            ContentBlock::Image { source } => AnthropicContentBlock::Image { source: source.into() },
+            ContentBlock::Image { source } => AnthropicContentBlock::Image {
+                source: source.into(),
+            },
         }
     }
 }
@@ -232,10 +244,7 @@ mod tests {
         let req = ProviderRequest {
             model: "claude-sonnet-4-5".to_string(),
             system: None,
-            messages: vec![
-                Message::system("be helpful"),
-                Message::user("hi"),
-            ],
+            messages: vec![Message::system("be helpful"), Message::user("hi")],
             tools: vec![],
             params: GenParams::default(),
         };
@@ -250,15 +259,15 @@ mod tests {
         let req = ProviderRequest {
             model: "claude-sonnet-4-5".to_string(),
             system: Some("base prompt".to_string()),
-            messages: vec![
-                Message::system("extra instructions"),
-                Message::user("hi"),
-            ],
+            messages: vec![Message::system("extra instructions"), Message::user("hi")],
             tools: vec![],
             params: GenParams::default(),
         };
         let a: AnthropicRequest = req.into();
-        assert_eq!(a.system.as_deref(), Some("base prompt\n\nextra instructions"));
+        assert_eq!(
+            a.system.as_deref(),
+            Some("base prompt\n\nextra instructions")
+        );
     }
 
     #[test]

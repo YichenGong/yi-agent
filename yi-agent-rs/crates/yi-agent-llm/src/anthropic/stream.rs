@@ -125,10 +125,7 @@ where
             ProviderError::Stream(format!("invalid SSE JSON: {e}; data: {}", frame.data))
         })?;
 
-        let event_type = data
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let event_type = data.get("type").and_then(Value::as_str).unwrap_or("");
 
         match event_type {
             "__parse_error" => {
@@ -139,11 +136,9 @@ where
                 Err(ProviderError::Stream(msg.to_string()))
             }
             "content_block_start" => {
-                let index = data
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| ProviderError::Stream("content_block_start missing index".into()))?
-                    as usize;
+                let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    ProviderError::Stream("content_block_start missing index".into())
+                })? as usize;
                 let block = data.get("content_block").cloned().unwrap_or(Value::Null);
                 let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
 
@@ -164,17 +159,19 @@ where
                 Ok(None)
             }
             "content_block_delta" => {
-                let index = data
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| ProviderError::Stream("content_block_delta missing index".into()))?
-                    as usize;
+                let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    ProviderError::Stream("content_block_delta missing index".into())
+                })? as usize;
                 let delta = data.get("delta").cloned().unwrap_or(Value::Null);
                 let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
 
                 match delta_type {
                     "text_delta" => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                        let text = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         Ok(Some(ProviderEvent::TextDelta(text)))
                     }
                     "input_json_delta" => {
@@ -183,26 +180,20 @@ where
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        let id = self
-                            .block_ids
-                            .get(&index)
-                            .cloned()
-                            .ok_or_else(|| {
-                                ProviderError::Stream(format!(
-                                    "input_json_delta for unknown block index {index}"
-                                ))
-                            })?;
+                        let id = self.block_ids.get(&index).cloned().ok_or_else(|| {
+                            ProviderError::Stream(format!(
+                                "input_json_delta for unknown block index {index}"
+                            ))
+                        })?;
                         Ok(Some(ProviderEvent::ToolUseDelta { id, partial_json }))
                     }
                     _ => Ok(None),
                 }
             }
             "content_block_stop" => {
-                let index = data
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| ProviderError::Stream("content_block_stop missing index".into()))?
-                    as usize;
+                let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    ProviderError::Stream("content_block_stop missing index".into())
+                })? as usize;
                 if let Some(id) = self.block_ids.remove(&index) {
                     Ok(Some(ProviderEvent::ToolUseEnd { id }))
                 } else {
@@ -243,10 +234,7 @@ where
 {
     type Item = Result<ProviderEvent, ProviderError>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             // First, drain any pending frames from a previous chunk.
             while let Some(frame) = self.pending_frames.pop_front() {
@@ -313,7 +301,12 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "Hello"));
         assert!(matches!(&events[1], ProviderEvent::TextDelta(t) if t == " world"));
-        assert!(matches!(&events[2], ProviderEvent::Stop { reason: StopReason::EndTurn }));
+        assert!(matches!(
+            &events[2],
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn
+            }
+        ));
     }
 
     #[tokio::test]
@@ -355,7 +348,9 @@ mod tests {
             _ => panic!("expected ToolUseEnd"),
         }
         match &events[4] {
-            ProviderEvent::Stop { reason: StopReason::EndTurn } => {}
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            } => {}
             _ => panic!("expected Stop{{EndTurn}}"),
         }
     }
@@ -439,7 +434,8 @@ mod tests {
 
     #[tokio::test]
     async fn surfaces_sse_error_event() {
-        let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n";
+        let body =
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n";
         let bytes = body.to_string().into_bytes();
         let events = collect_events(vec![bytes.as_slice()]).await;
         assert_eq!(events.len(), 1);
