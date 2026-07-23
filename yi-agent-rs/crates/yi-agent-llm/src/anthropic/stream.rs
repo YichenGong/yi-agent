@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 
+use yi_agent_core::provider::TokenUsage;
 use yi_agent_core::{ProviderError, ProviderEvent, StopReason};
 
 /// One SSE frame parsed from the byte stream.
@@ -211,7 +212,35 @@ where
                     Ok(None)
                 }
             }
-            "message_start" | "message_stop" | "ping" => Ok(None),
+            "message_start" => {
+                let usage = data
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if usage.is_null() {
+                    return Ok(None);
+                }
+                let input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                let cache_creation_input_tokens = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32);
+                let cache_read_input_tokens = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32);
+                Ok(Some(ProviderEvent::Usage(TokenUsage {
+                    input_tokens,
+                    output_tokens: 0,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                })))
+            }
+            "message_stop" | "ping" => Ok(None),
             "error" => {
                 let msg = data
                     .get("error")
@@ -439,6 +468,41 @@ mod tests {
         match &events[0] {
             Err(ProviderError::Stream(msg)) => assert_eq!(msg, "overloaded"),
             _ => panic!("expected Stream error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_message_start_usage() {
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":120,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ProviderEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 120);
+                assert_eq!(u.output_tokens, 0);
+                assert_eq!(u.cache_creation_input_tokens, Some(10));
+                assert_eq!(u.cache_read_input_tokens, Some(5));
+            }
+            _ => panic!("expected Usage event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_message_start_usage_no_cache_fields() {
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ProviderEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 50);
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            _ => panic!("expected Usage event"),
         }
     }
 }
