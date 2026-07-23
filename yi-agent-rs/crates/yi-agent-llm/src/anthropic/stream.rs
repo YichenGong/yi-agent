@@ -101,6 +101,9 @@ pub struct AnthropicStream<S> {
     pending_frames: VecDeque<SseFrame>,
     /// Maps content block index → tool_use_id (set on content_block_start, read on delta/stop).
     block_ids: HashMap<usize, String>,
+    /// Queued Stop event from a message_delta that carried both usage and stop_reason.
+    /// Emitted on the next `poll_next` call, after the Usage event.
+    pending_stop: Option<StopReason>,
 }
 
 impl<S> AnthropicStream<S>
@@ -113,6 +116,7 @@ where
             inner,
             pending_frames: VecDeque::new(),
             block_ids: HashMap::new(),
+            pending_stop: None,
         }
     }
 
@@ -200,13 +204,35 @@ where
             }
             "message_delta" => {
                 let delta = data.get("delta").cloned().unwrap_or(Value::Null);
-                if let Some(reason_str) = delta.get("stop_reason").and_then(Value::as_str) {
-                    let reason = match reason_str {
-                        "end_turn" => StopReason::EndTurn,
-                        "max_tokens" => StopReason::MaxTokens,
-                        "stop_sequence" => StopReason::StopSequence,
-                        other => StopReason::Other(other.to_string()),
-                    };
+                let usage = data.get("usage").cloned();
+                let stop_reason =
+                    delta
+                        .get("stop_reason")
+                        .and_then(Value::as_str)
+                        .map(|reason_str| match reason_str {
+                            "end_turn" => StopReason::EndTurn,
+                            "max_tokens" => StopReason::MaxTokens,
+                            "stop_sequence" => StopReason::StopSequence,
+                            other => StopReason::Other(other.to_string()),
+                        });
+
+                // If we have usage, emit Usage first and queue Stop for next poll.
+                if let Some(u) = usage {
+                    let output_tokens =
+                        u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    if let Some(reason) = stop_reason {
+                        self.pending_stop = Some(reason);
+                    }
+                    return Ok(Some(ProviderEvent::Usage(TokenUsage {
+                        input_tokens: 0,
+                        output_tokens,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    })));
+                }
+
+                // No usage — just emit Stop if present.
+                if let Some(reason) = stop_reason {
                     Ok(Some(ProviderEvent::Stop { reason }))
                 } else {
                     Ok(None)
@@ -262,7 +288,14 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            // First, drain any pending frames from a previous chunk.
+            // First, emit any pending Stop event (from a message_delta that had
+            // both usage + stop_reason).  This must be checked BEFORE draining
+            // pending_frames so that the Stop event comes after the Usage event.
+            if let Some(reason) = self.pending_stop.take() {
+                return Poll::Ready(Some(Ok(ProviderEvent::Stop { reason })));
+            }
+
+            // Then, drain any pending frames from a previous chunk.
             while let Some(frame) = self.pending_frames.pop_front() {
                 match self.parse_frame(frame) {
                     Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
@@ -504,5 +537,29 @@ mod tests {
             }
             _ => panic!("expected Usage event"),
         }
+    }
+
+    #[tokio::test]
+    async fn parses_message_delta_usage() {
+        let body = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":45}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ProviderEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 0);
+                assert_eq!(u.output_tokens, 45);
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            _ => panic!("expected Usage event first"),
+        }
+        assert!(matches!(
+            &events[1],
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn
+            }
+        ));
     }
 }
