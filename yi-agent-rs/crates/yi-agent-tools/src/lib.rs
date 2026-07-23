@@ -18,7 +18,9 @@ pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use shell::BashTool;
-pub use web::{SearchResult, WebSearchProvider};
+pub use web::{
+    BochaSearchProvider, SearchResult, WebFetchTool, WebSearchProvider, WebSearchTool,
+};
 
 /// Register all builtin tools into the given registry.
 ///
