@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::message::{ContentBlock, Message};
 use crate::provider::{
-    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason,
+    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, TokenUsage,
 };
 use crate::tool::{ToolRegistry, ToolResult};
 
@@ -71,6 +72,7 @@ pub struct Agent {
     tools: Arc<ToolRegistry>,
     session: Arc<Mutex<Session>>,
     config: AgentConfig,
+    cancel_token: CancellationToken,
 }
 
 /// Events emitted during agent loop.
@@ -87,9 +89,11 @@ pub enum AgentEvent {
         id: String,
         result: ToolResult,
     },
+    Usage(TokenUsage),
     Done {
         reason: DoneReason,
     },
+    Cancelled,
     Error(AgentError),
 }
 
@@ -112,6 +116,7 @@ impl Agent {
             tools,
             session: Arc::new(Mutex::new(Session::new())),
             config,
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -124,6 +129,16 @@ impl Agent {
 
     pub fn session(&self) -> Session {
         self.session.lock().unwrap().clone()
+    }
+
+    /// Trigger cancellation. The run loop will exit at the nearest check point.
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    /// Get a clone of the cancellation token.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
     }
 
     /// Run the agent loop, returning a stream of events.
@@ -140,13 +155,14 @@ impl Agent {
         let tools = self.tools.clone();
         let config = self.config.clone();
         let session = self.session.clone();
+        let cancel_token = self.cancel_token.clone();
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             if tx.send(AgentEvent::Start).await.is_err() {
                 return; // Receiver dropped, stop the loop
             }
-            run_loop(tx, provider, tools, session, config).await;
+            run_loop(tx, provider, tools, session, config, cancel_token).await;
         });
 
         Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
@@ -159,11 +175,18 @@ async fn run_loop(
     tools: Arc<ToolRegistry>,
     session: Arc<Mutex<Session>>,
     config: AgentConfig,
+    cancel_token: CancellationToken,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
 
     loop {
+        // Check 1: THINK 前
+        if cancel_token.is_cancelled() {
+            let _ = tx.send(AgentEvent::Cancelled).await;
+            return;
+        }
+
         turn += 1;
         if let Some(max) = config.max_turns {
             if turn > max {
@@ -203,12 +226,19 @@ async fn run_loop(
             }
         };
 
-        let (content, _stop_reason) = match accumulate_provider_stream(stream, &tx).await {
-            Ok(v) => v,
-            Err(e) => {
-                if tx.send(AgentEvent::Error(e)).await.is_err() {
-                    return; // Receiver dropped, stop the loop
+        // Check 2: THINK 中 — select! between accumulate and cancel
+        let (content, _stop_reason) = tokio::select! {
+            result = accumulate_provider_stream(stream, &tx) => match result {
+                Ok(v) => v,
+                Err(e) => {
+                    if tx.send(AgentEvent::Error(e)).await.is_err() {
+                        return;
+                    }
+                    return;
                 }
+            },
+            _ = cancel_token.cancelled() => {
+                let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }
         };
@@ -283,7 +313,15 @@ async fn run_loop(
                 }
             })
             .collect();
-        let results = futures::future::join_all(futures).await;
+
+        // Check 3: ACT 中 — select! between join_all and cancel
+        let results = tokio::select! {
+            r = futures::future::join_all(futures) => r,
+            _ = cancel_token.cancelled() => {
+                let _ = tx.send(AgentEvent::Cancelled).await;
+                return;
+            }
+        };
 
         // 4. OBSERVE - feed results back in tool_use_id order
         let tool_results: Vec<ContentBlock> = results
@@ -307,10 +345,17 @@ async fn accumulate_provider_stream(
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
     let tx = tx.clone();
-    let (content, stop_reason) = crate::provider::accumulate_stream(stream, move |s| {
-        let _ = tx.try_send(AgentEvent::AssistantText(s));
-    })
-    .await?;
+    let (content, stop_reason) =
+        crate::provider::accumulate_stream(stream, move |event| match event {
+            ProviderEvent::TextDelta(s) => {
+                let _ = tx.try_send(AgentEvent::AssistantText(s));
+            }
+            ProviderEvent::Usage(u) => {
+                let _ = tx.try_send(AgentEvent::Usage(u));
+            }
+            _ => {}
+        })
+        .await?;
     Ok((content, stop_reason))
 }
 
@@ -566,5 +611,168 @@ mod tests {
         // restored(1) + user_prompt(1) + assistant(1) = 3
         assert_eq!(agent.session().len(), 3);
         assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_forwards_usage_events() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Usage(crate::provider::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        let usage_events: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage_events.len(), 1);
+        assert_eq!(usage_events[0].input_tokens, 10);
+        assert_eq!(usage_events[0].output_tokens, 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_token_is_cancellable() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let token = agent.cancel_token();
+        assert!(!token.is_cancelled());
+        agent.cancel();
+        assert!(token.is_cancelled());
+    }
+
+    /// Provider whose stream never produces events (simulates a long LLM call).
+    struct HangingProvider;
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            // A stream that never yields — pending forever.
+            let pending = futures::stream::pending();
+            Ok(pending.boxed())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_during_think_emits_cancelled() {
+        let provider = Arc::new(HangingProvider);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+        let cancel_token = agent.cancel_token();
+        let _handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_token.cancel();
+        });
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "should have Cancelled event"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
+            "should NOT have Done event"
+        );
+    }
+
+    /// Tool that never completes (simulates a long-running tool).
+    struct HangingTool;
+
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hang"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn description(&self) -> &str {
+            "A tool that hangs forever"
+        }
+        async fn call(&self, _args: serde_json::Value) -> ToolResult {
+            // Never returns
+            std::future::pending::<()>().await;
+            ToolResult::text("unreachable")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_during_act_emits_cancelled() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "hang".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangingTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let cancel_token = agent.cancel_token();
+        let _handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_token.cancel();
+        });
+
+        let stream = agent.run("hang".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "should have Cancelled event"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { .. })),
+            "should NOT have ToolResult (tool was still running)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_drop_receiver_does_not_panic() {
+        let provider = HangingProvider;
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        // Drop the stream immediately without consuming.
+        drop(stream);
+        // Give the spawned task time to notice the dropped receiver.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // No panic means success.
     }
 }
