@@ -699,4 +699,80 @@ mod tests {
             "should NOT have Done event"
         );
     }
+
+    /// Tool that never completes (simulates a long-running tool).
+    struct HangingTool;
+
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hang"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn description(&self) -> &str {
+            "A tool that hangs forever"
+        }
+        async fn call(&self, _args: serde_json::Value) -> ToolResult {
+            // Never returns
+            std::future::pending::<()>().await;
+            ToolResult::text("unreachable")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_during_act_emits_cancelled() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "hang".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangingTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let cancel_token = agent.cancel_token();
+        let _handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_token.cancel();
+        });
+
+        let stream = agent.run("hang".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "should have Cancelled event"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { .. })),
+            "should NOT have ToolResult (tool was still running)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_drop_receiver_does_not_panic() {
+        let provider = HangingProvider;
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        // Drop the stream immediately without consuming.
+        drop(stream);
+        // Give the spawned task time to notice the dropped receiver.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // No panic means success.
+    }
 }
