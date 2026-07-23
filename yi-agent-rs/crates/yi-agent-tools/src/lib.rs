@@ -7,6 +7,7 @@ mod context;
 mod error;
 mod fs;
 mod shell;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use shell::BashTool;
+pub use web::{SearchResult, WebSearchProvider};
 
 /// Register all builtin tools into the given registry.
 ///
