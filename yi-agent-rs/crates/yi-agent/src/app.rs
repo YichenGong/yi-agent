@@ -83,12 +83,6 @@ impl App {
                                 }
                             }
                         }
-                        UserCommand::Interrupt => {
-                            if current_stream.is_some() {
-                                current_stream = None;
-                                self.renderer.render_system("已中断");
-                            }
-                        }
                         UserCommand::Quit => {
                             drop(current_stream.take());
                             break;
@@ -192,10 +186,8 @@ fn run_esc_listener(esc_tx: mpsc::Sender<()>) {
         }
         if let Ok(true) = event::poll(Duration::from_millis(0)) {
             if let Ok(Event::Key(key)) = event::read() {
-                if key.code == KeyCode::Esc {
-                    if esc_tx.blocking_send(()).is_err() {
-                        break; // receiver dropped
-                    }
+                if key.code == KeyCode::Esc && esc_tx.blocking_send(()).is_err() {
+                    break; // receiver dropped
                 }
             }
         }

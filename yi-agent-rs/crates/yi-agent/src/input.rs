@@ -5,8 +5,6 @@
 pub enum UserCommand {
     /// 普通 prompt，发送给 agent
     Prompt(String),
-    /// 中断当前 agent 运行
-    Interrupt,
     /// 退出程序
     Quit,
     /// 清空对话上下文
