@@ -155,13 +155,14 @@ impl Agent {
         let tools = self.tools.clone();
         let config = self.config.clone();
         let session = self.session.clone();
+        let cancel_token = self.cancel_token.clone();
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             if tx.send(AgentEvent::Start).await.is_err() {
                 return; // Receiver dropped, stop the loop
             }
-            run_loop(tx, provider, tools, session, config).await;
+            run_loop(tx, provider, tools, session, config, cancel_token).await;
         });
 
         Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
@@ -174,11 +175,18 @@ async fn run_loop(
     tools: Arc<ToolRegistry>,
     session: Arc<Mutex<Session>>,
     config: AgentConfig,
+    cancel_token: CancellationToken,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
 
     loop {
+        // Check 1: THINK 前
+        if cancel_token.is_cancelled() {
+            let _ = tx.send(AgentEvent::Cancelled).await;
+            return;
+        }
+
         turn += 1;
         if let Some(max) = config.max_turns {
             if turn > max {
@@ -218,12 +226,19 @@ async fn run_loop(
             }
         };
 
-        let (content, _stop_reason) = match accumulate_provider_stream(stream, &tx).await {
-            Ok(v) => v,
-            Err(e) => {
-                if tx.send(AgentEvent::Error(e)).await.is_err() {
-                    return; // Receiver dropped, stop the loop
+        // Check 2: THINK 中 — select! between accumulate and cancel
+        let (content, _stop_reason) = tokio::select! {
+            result = accumulate_provider_stream(stream, &tx) => match result {
+                Ok(v) => v,
+                Err(e) => {
+                    if tx.send(AgentEvent::Error(e)).await.is_err() {
+                        return;
+                    }
+                    return;
                 }
+            },
+            _ = cancel_token.cancelled() => {
+                let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }
         };
@@ -298,7 +313,15 @@ async fn run_loop(
                 }
             })
             .collect();
-        let results = futures::future::join_all(futures).await;
+
+        // Check 3: ACT 中 — select! between join_all and cancel
+        let results = tokio::select! {
+            r = futures::future::join_all(futures) => r,
+            _ = cancel_token.cancelled() => {
+                let _ = tx.send(AgentEvent::Cancelled).await;
+                return;
+            }
+        };
 
         // 4. OBSERVE - feed results back in tool_use_id order
         let tool_results: Vec<ContentBlock> = results
@@ -636,5 +659,44 @@ mod tests {
         assert!(!token.is_cancelled());
         agent.cancel();
         assert!(token.is_cancelled());
+    }
+
+    /// Provider whose stream never produces events (simulates a long LLM call).
+    struct HangingProvider;
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            // A stream that never yields — pending forever.
+            let pending = futures::stream::pending();
+            Ok(pending.boxed())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_during_think_emits_cancelled() {
+        let provider = Arc::new(HangingProvider);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+        let cancel_token = agent.cancel_token();
+        let _handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_token.cancel();
+        });
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "should have Cancelled event"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
+            "should NOT have Done event"
+        );
     }
 }
