@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::message::{ContentBlock, Message};
 use crate::provider::{
-    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason,
+    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, TokenUsage,
 };
 use crate::tool::{ToolRegistry, ToolResult};
 
@@ -87,9 +87,11 @@ pub enum AgentEvent {
         id: String,
         result: ToolResult,
     },
+    Usage(TokenUsage),
     Done {
         reason: DoneReason,
     },
+    Cancelled,
     Error(AgentError),
 }
 
@@ -307,12 +309,17 @@ async fn accumulate_provider_stream(
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
     let tx = tx.clone();
-    let (content, stop_reason) = crate::provider::accumulate_stream(stream, move |ev| {
-        if let ProviderEvent::TextDelta(s) = ev {
-            let _ = tx.try_send(AgentEvent::AssistantText(s));
-        }
-    })
-    .await?;
+    let (content, stop_reason) =
+        crate::provider::accumulate_stream(stream, move |event| match event {
+            ProviderEvent::TextDelta(s) => {
+                let _ = tx.try_send(AgentEvent::AssistantText(s));
+            }
+            ProviderEvent::Usage(u) => {
+                let _ = tx.try_send(AgentEvent::Usage(u));
+            }
+            _ => {}
+        })
+        .await?;
     Ok((content, stop_reason))
 }
 
@@ -568,5 +575,36 @@ mod tests {
         // restored(1) + user_prompt(1) + assistant(1) = 3
         assert_eq!(agent.session().len(), 3);
         assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_forwards_usage_events() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Usage(crate::provider::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        let usage_events: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage_events.len(), 1);
+        assert_eq!(usage_events[0].input_tokens, 10);
+        assert_eq!(usage_events[0].output_tokens, 5);
     }
 }
