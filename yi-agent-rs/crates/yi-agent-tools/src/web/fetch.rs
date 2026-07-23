@@ -70,8 +70,11 @@ impl Tool for WebFetchTool {
         let url = match reqwest::Url::parse(&args.url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u,
             Ok(u) => {
-                return ToolsError::UnsupportedContentType(format!("unsupported scheme: {}", u.scheme()))
-                    .into();
+                return ToolsError::UnsupportedContentType(format!(
+                    "unsupported scheme: {}",
+                    u.scheme()
+                ))
+                .into();
             }
             Err(e) => return ToolsError::Http(format!("invalid URL: {}", e)).into(),
         };
@@ -131,11 +134,11 @@ fn process_content(content_type: &str, body: &[u8]) -> Result<String, ToolsError
         let html = std::str::from_utf8(body)
             .map_err(|e| ToolsError::Http(format!("invalid UTF-8 in HTML: {}", e)))?;
         Ok(html2md::parse_html(html))
-    } else if ct.contains("text/plain") {
-        Ok(String::from_utf8_lossy(body).to_string())
-    } else if ct.contains("application/json") {
-        Ok(String::from_utf8_lossy(body).to_string())
-    } else if ct.contains("application/xml") || ct.contains("text/xml") {
+    } else if ct.contains("text/plain")
+        || ct.contains("application/json")
+        || ct.contains("application/xml")
+        || ct.contains("text/xml")
+    {
         Ok(String::from_utf8_lossy(body).to_string())
     } else {
         Err(ToolsError::UnsupportedContentType(content_type.to_string()))
