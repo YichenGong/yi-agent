@@ -23,7 +23,7 @@ yi-agent-core 是 yi-agent 的核心库，定义消息模型、工具系统、Pr
 - [x] Provider trait 与 ProviderEvent — [设计](../plans/2026-07-18-yi-agent-core-design.md)
 - [x] Agent loop、Session、AgentEvent（并行工具执行）— [实现](../plans/2026-07-18-yi-agent-core-impl.md)
 - [x] ProviderRequest / AgentConfig 加 model 字段（请求级模型选择）
-- [ ] 流式输出与中断处理
-- [ ] Token 计数（扩展 AgentEvent::Done）
+- [x] 流式输出与中断处理 — [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
+- [x] Token 计数（AgentEvent::Usage + ProviderEvent::Usage）— [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
 - [ ] 图片工具（ContentBlock::Image 已留类型）
 - [ ] 插件系统（基于 ToolSource::Plugin）
