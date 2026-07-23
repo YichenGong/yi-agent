@@ -83,15 +83,7 @@ fn format_results(results: &[SearchResult]) -> String {
     results
         .iter()
         .enumerate()
-        .map(|(i, r)| {
-            format!(
-                "{}. {}\n   {}\n   {}",
-                i + 1,
-                r.title,
-                r.url,
-                r.snippet
-            )
-        })
+        .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.snippet))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -102,6 +94,7 @@ mod tests {
 
     struct MockProvider {
         results: Vec<SearchResult>,
+        last_count: std::sync::Mutex<Option<usize>>,
     }
 
     #[async_trait]
@@ -112,14 +105,20 @@ mod tests {
         async fn search(
             &self,
             _query: &str,
-            _count: usize,
+            count: usize,
         ) -> Result<Vec<SearchResult>, ToolsError> {
+            *self.last_count.lock().unwrap() = Some(count);
             Ok(self.results.clone())
         }
     }
 
-    fn make_tool(results: Vec<SearchResult>) -> WebSearchTool {
-        WebSearchTool::new(Arc::new(MockProvider { results }))
+    fn make_tool(results: Vec<SearchResult>) -> (WebSearchTool, std::sync::Arc<MockProvider>) {
+        let provider = std::sync::Arc::new(MockProvider {
+            results,
+            last_count: std::sync::Mutex::new(None),
+        });
+        let tool = WebSearchTool::new(provider.clone());
+        (tool, provider)
     }
 
     #[tokio::test]
@@ -136,7 +135,7 @@ mod tests {
                 snippet: "Snippet two".to_string(),
             },
         ];
-        let tool = make_tool(results);
+        let (tool, _provider) = make_tool(results);
         let result = tool.call(serde_json::json!({"query": "test"})).await;
         assert!(!result.is_error);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
@@ -151,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_no_results() {
-        let tool = make_tool(vec![]);
+        let (tool, _provider) = make_tool(vec![]);
         let result = tool.call(serde_json::json!({"query": "nothing"})).await;
         assert!(!result.is_error);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
@@ -163,8 +162,9 @@ mod tests {
 
     #[tokio::test]
     async fn search_uses_default_count() {
-        let tool = make_tool(vec![]);
-        let result = tool.call(serde_json::json!({"query": "test"})).await;
-        assert!(!result.is_error);
+        let (tool, provider) = make_tool(vec![]);
+        tool.call(serde_json::json!({"query": "test"})).await;
+        let captured = provider.last_count.lock().unwrap();
+        assert_eq!(*captured, Some(25), "default count should be 25");
     }
 }

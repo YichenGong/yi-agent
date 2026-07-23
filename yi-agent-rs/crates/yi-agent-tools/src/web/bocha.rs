@@ -126,7 +126,10 @@ impl WebSearchProvider for BochaSearchProvider {
             return Err(ToolsError::SearchEngine(format!("server error: {}", body)));
         }
         if !resp.status().is_success() {
-            return Err(ToolsError::SearchEngine(format!("unexpected status: {}", status)));
+            return Err(ToolsError::SearchEngine(format!(
+                "unexpected status: {}",
+                status
+            )));
         }
 
         let bocha_resp: BochaResponse = resp

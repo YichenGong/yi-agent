@@ -147,16 +147,19 @@ fn process_content(content_type: &str, body: &[u8]) -> Result<String, ToolsError
 
 fn truncate_content(content: &str, max_length: usize) -> String {
     if content.len() <= max_length {
-        content.to_string()
-    } else {
-        let truncated = &content[..max_length];
-        format!(
-            "[truncated: showed {} of {} bytes]\n{}",
-            max_length,
-            content.len(),
-            truncated
-        )
+        return content.to_string();
     }
+    let mut end = max_length;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = &content[..end];
+    format!(
+        "[truncated: showed {} of {} bytes]\n{}",
+        end,
+        content.len(),
+        truncated
+    )
 }
 
 #[cfg(test)]
@@ -347,5 +350,15 @@ mod tests {
         } else {
             panic!("expected text block");
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_truncates_multibyte_safely() {
+        // Create content with multi-byte UTF-8 characters that exceeds max_length
+        // The key is that the truncation point falls in the middle of a multi-byte char
+        let content = "你好世界".repeat(1000); // Each char is 3 bytes in UTF-8
+        let result = truncate_content(&content, 100); // 100 bytes, likely mid-char
+        assert!(result.contains("[truncated:"));
+        assert!(!result.is_empty());
     }
 }
