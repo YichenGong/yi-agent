@@ -103,6 +103,13 @@ impl Renderer for InlineRenderer {
                     }
                 }
             }
+            AgentEvent::Usage(_) => {
+                // token 计数事件不打印
+            }
+            AgentEvent::Cancelled => {
+                self.finish_streaming_line();
+                println!("{COLOR_DIM}· 已取消{COLOR_RESET}");
+            }
             AgentEvent::Error(err) => {
                 self.finish_streaming_line();
                 self.render_error(err);

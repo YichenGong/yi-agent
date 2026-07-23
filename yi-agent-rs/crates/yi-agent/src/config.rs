@@ -81,11 +81,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
     let workdir = cli
         .workdir
         .clone()
-        .or_else(|| {
-            std::env::var("YI_AGENT_WORKDIR")
-                .ok()
-                .map(PathBuf::from)
-        })
+        .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     // 验证工作目录存在

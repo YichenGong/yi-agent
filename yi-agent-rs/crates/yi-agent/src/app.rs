@@ -119,7 +119,7 @@ impl App {
                     }
                 }, if current_stream.is_some() => {
                     match event {
-                        Some(AgentEvent::Done { .. }) => {
+                        Some(AgentEvent::Done { .. }) | Some(AgentEvent::Cancelled) => {
                             current_stream = None;
                         }
                         Some(e) => {
