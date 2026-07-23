@@ -108,7 +108,7 @@ impl Renderer for InlineRenderer {
             }
             AgentEvent::Cancelled => {
                 self.finish_streaming_line();
-                println!("{COLOR_DIM}· 已取消{COLOR_RESET}");
+                println!("{COLOR_DIM}· 已中断{COLOR_RESET}");
             }
             AgentEvent::Error(err) => {
                 self.finish_streaming_line();

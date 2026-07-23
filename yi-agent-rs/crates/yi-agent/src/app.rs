@@ -45,8 +45,8 @@ impl App {
     /// 2. agent 事件流（BoxStream<AgentEvent>）
     /// 3. Ctrl+C / ESC 中断信号
     ///
-    /// 中断通过 drop stream 实现——Agent 内部 task 在 channel send
-    /// 失败时自动退出。
+    /// 中断通过 `agent.cancel()` 触发 CancellationToken，Agent 在
+    /// 下一个检查点退出并发出 `AgentEvent::Cancelled`，由 renderer 渲染。
     pub async fn run(mut self) -> Result<()> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<UserCommand>(16);
 
@@ -70,8 +70,11 @@ impl App {
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         UserCommand::Prompt(text) => {
-                            // drop 旧 stream（如果有），中断旧 agent 运行
-                            current_stream = None;
+                            // 如果有正在运行的 agent，先中断
+                            if current_stream.is_some() {
+                                self.agent.cancel();
+                                current_stream = None;
+                            }
 
                             self.renderer.render_user_input(&text);
                             match self.agent.run(text).await {
@@ -103,13 +106,13 @@ impl App {
                 }
                 // ESC 键（仅在 agent 运行时作为中断）
                 Some(()) = esc_rx.recv(), if current_stream.is_some() => {
-                    current_stream = None;
-                    self.renderer.render_system("已中断");
+                    self.agent.cancel();
+                    // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
                 }
                 // Ctrl+C 信号（仅在 agent 运行时中断，不退出程序）
                 _ = tokio::signal::ctrl_c(), if current_stream.is_some() => {
-                    current_stream = None;
-                    self.renderer.render_system("已中断");
+                    self.agent.cancel();
+                    // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
                 }
                 // agent 事件流有新事件
                 event = async {
