@@ -82,13 +82,13 @@ pub enum ProviderError {
 }
 
 /// Accumulate a provider stream into content blocks + stop reason.
-/// `on_text` is called for each text delta (used by agent to emit AgentEvent::AssistantText).
+/// `on_event` is called for each provider event (text delta, usage, etc.).
 pub async fn accumulate_stream<F>(
     mut stream: BoxStream<'static, ProviderEvent>,
-    mut on_text: F,
+    mut on_event: F,
 ) -> Result<(Vec<ContentBlock>, StopReason), ProviderError>
 where
-    F: FnMut(String),
+    F: FnMut(ProviderEvent),
 {
     let mut content = Vec::new();
     let mut current_text = String::new();
@@ -100,7 +100,7 @@ where
         match event {
             ProviderEvent::TextDelta(s) => {
                 current_text.push_str(&s);
-                on_text(s);
+                on_event(ProviderEvent::TextDelta(s));
             }
             ProviderEvent::ToolUseStart { id, name } => {
                 if !current_text.is_empty() {
@@ -124,8 +124,8 @@ where
             ProviderEvent::Stop { reason } => {
                 stop_reason = reason;
             }
-            ProviderEvent::Usage(_) => {
-                // Usage events are ignored by accumulate_stream.
+            ProviderEvent::Usage(u) => {
+                on_event(ProviderEvent::Usage(u));
             }
         }
     }
@@ -330,5 +330,47 @@ mod tests {
         };
         let e = ProviderEvent::Usage(u.clone());
         assert!(matches!(e, ProviderEvent::Usage(_)));
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_forwards_usage_via_callback() {
+        let events = vec![
+            text_event("hi"),
+            ProviderEvent::Usage(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+
+        let mut received_text = Vec::new();
+        let mut received_usage = Vec::new();
+        let (content, stop) = accumulate_stream(stream, |ev| match ev {
+            ProviderEvent::TextDelta(s) => received_text.push(s),
+            ProviderEvent::Usage(u) => received_usage.push(u),
+            _ => {}
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(content, vec![ContentBlock::Text("hi".into())]);
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(received_text, vec!["hi".to_string()]);
+        assert_eq!(received_usage.len(), 1);
+        assert_eq!(received_usage[0].input_tokens, 10);
     }
 }

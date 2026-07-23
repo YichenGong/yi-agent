@@ -307,8 +307,10 @@ async fn accumulate_provider_stream(
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
     let tx = tx.clone();
-    let (content, stop_reason) = crate::provider::accumulate_stream(stream, move |s| {
-        let _ = tx.try_send(AgentEvent::AssistantText(s));
+    let (content, stop_reason) = crate::provider::accumulate_stream(stream, move |ev| {
+        if let ProviderEvent::TextDelta(s) = ev {
+            let _ = tx.try_send(AgentEvent::AssistantText(s));
+        }
     })
     .await?;
     Ok((content, stop_reason))
