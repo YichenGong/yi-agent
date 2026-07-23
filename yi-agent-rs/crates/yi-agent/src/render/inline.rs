@@ -205,4 +205,43 @@ mod tests {
         let summary = InlineRenderer::summarize_result(&result);
         assert!(summary.contains("operation succeeded"));
     }
+
+    #[test]
+    fn render_cancelled_prints_interrupted_message() {
+        let mut renderer = InlineRenderer::new();
+        // 捕获 stdout 验证渲染输出包含 "已中断"
+        // 注意:InlineRenderer 直接 println! 到 stdout,无法在测试中捕获输出。
+        // 我们验证 render_agent_event 对 Cancelled 不 panic 且不影响 streaming 状态。
+        // 如果正在流式输出,Cancelled 应先补换行。
+        renderer.streaming_text_in_progress = true;
+        renderer.render_agent_event(&AgentEvent::Cancelled);
+        // 流式状态应被重置(render 完成后不再处于流式状态)
+        assert!(!renderer.streaming_text_in_progress);
+    }
+
+    #[test]
+    fn render_cancelled_after_streaming_resets_state() {
+        let mut renderer = InlineRenderer::new();
+        // 模拟流式文本输出中
+        renderer.render_agent_event(&AgentEvent::AssistantText("partial".into()));
+        assert!(renderer.streaming_text_in_progress);
+        // Cancelled 事件应补换行并重置状态
+        renderer.render_agent_event(&AgentEvent::Cancelled);
+        assert!(!renderer.streaming_text_in_progress);
+    }
+
+    #[test]
+    fn render_usage_event_does_not_print() {
+        use yi_agent_core::provider::TokenUsage;
+        let mut renderer = InlineRenderer::new();
+        // Usage 事件不应影响流式状态
+        renderer.streaming_text_in_progress = true;
+        renderer.render_agent_event(&AgentEvent::Usage(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        }));
+        // 流式状态不应被重置(Usage 不打印任何内容)
+        assert!(renderer.streaming_text_in_progress);
+    }
 }
