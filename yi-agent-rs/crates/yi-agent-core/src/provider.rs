@@ -28,6 +28,15 @@ pub struct GenParams {
     pub stop_sequences: Option<Vec<String>>,
 }
 
+/// Token usage from a provider response.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_creation_input_tokens: Option<u32>,
+    pub cache_read_input_tokens: Option<u32>,
+}
+
 /// Streaming event from a provider.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderEvent {
@@ -36,6 +45,7 @@ pub enum ProviderEvent {
     ToolUseDelta { id: String, partial_json: String },
     ToolUseEnd { id: String },
     Stop { reason: StopReason },
+    Usage(TokenUsage),
 }
 
 /// Why generation stopped.
@@ -113,6 +123,9 @@ where
             }
             ProviderEvent::Stop { reason } => {
                 stop_reason = reason;
+            }
+            ProviderEvent::Usage(_) => {
+                // Usage events are ignored by accumulate_stream.
             }
         }
     }
@@ -296,5 +309,26 @@ mod tests {
         let p = GenParams::default();
         assert!(p.temperature.is_none());
         assert!(p.max_tokens.is_none());
+    }
+
+    #[test]
+    fn token_usage_default_has_no_cache() {
+        let u = TokenUsage::default();
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, None);
+        assert_eq!(u.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn provider_event_usage_variant_exists() {
+        let u = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: Some(10),
+            cache_read_input_tokens: None,
+        };
+        let e = ProviderEvent::Usage(u.clone());
+        assert!(matches!(e, ProviderEvent::Usage(_)));
     }
 }
