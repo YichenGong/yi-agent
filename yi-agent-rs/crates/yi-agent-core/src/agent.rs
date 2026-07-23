@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::message::{ContentBlock, Message};
 use crate::provider::{
@@ -71,6 +72,7 @@ pub struct Agent {
     tools: Arc<ToolRegistry>,
     session: Arc<Mutex<Session>>,
     config: AgentConfig,
+    cancel_token: CancellationToken,
 }
 
 /// Events emitted during agent loop.
@@ -114,6 +116,7 @@ impl Agent {
             tools,
             session: Arc::new(Mutex::new(Session::new())),
             config,
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -126,6 +129,16 @@ impl Agent {
 
     pub fn session(&self) -> Session {
         self.session.lock().unwrap().clone()
+    }
+
+    /// Trigger cancellation. The run loop will exit at the nearest check point.
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    /// Get a clone of the cancellation token.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
     }
 
     /// Run the agent loop, returning a stream of events.
@@ -606,5 +619,22 @@ mod tests {
         assert_eq!(usage_events.len(), 1);
         assert_eq!(usage_events[0].input_tokens, 10);
         assert_eq!(usage_events[0].output_tokens, 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_token_is_cancellable() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let token = agent.cancel_token();
+        assert!(!token.is_cancelled());
+        agent.cancel();
+        assert!(token.is_cancelled());
     }
 }
