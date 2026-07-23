@@ -28,6 +28,11 @@ glob = "0.3"
 walkdir = "2"
 regex = "1"
 
+# Web 工具
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+html2md = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

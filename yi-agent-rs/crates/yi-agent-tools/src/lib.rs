@@ -7,6 +7,7 @@ mod context;
 mod error;
 mod fs;
 mod shell;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,18 +18,31 @@ pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use shell::BashTool;
+pub use web::{BochaSearchProvider, SearchResult, WebFetchTool, WebSearchProvider, WebSearchTool};
 
 /// Register all builtin tools into the given registry.
 ///
 /// `root` constrains FS tool operations to the given directory.
 /// Shell tools use it as initial cwd but do not restrict `sh -c` operations
 /// to within root (system-level isolation requires sandbox, which is future work).
+///
+/// Web tools:
+/// - WebFetchTool is always registered.
+/// - WebSearchTool is only registered if BOCHA_API_KEY env var is set.
 pub fn register_builtin_tools(registry: &mut ToolRegistry, root: PathBuf) {
     let ctx = Arc::new(ToolsContext::new(root));
+    // FS + Shell tools
     registry.register(Arc::new(ReadTool::new(ctx.clone())));
     registry.register(Arc::new(WriteTool::new(ctx.clone())));
     registry.register(Arc::new(EditTool::new(ctx.clone())));
     registry.register(Arc::new(GlobTool::new(ctx.clone())));
     registry.register(Arc::new(GrepTool::new(ctx.clone())));
     registry.register(Arc::new(BashTool::new(ctx)));
+
+    // Web tools
+    registry.register(Arc::new(WebFetchTool::new()));
+    if let Some(bocha) = BochaSearchProvider::from_env() {
+        registry.register(Arc::new(WebSearchTool::new(Arc::new(bocha))));
+    }
+    // BOCHA_API_KEY not set: WebSearchTool not registered
 }

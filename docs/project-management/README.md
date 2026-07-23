@@ -29,7 +29,7 @@
   - [x] FS 工具：Read/Write/Edit/Glob/Grep（单一 root 限制）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
   - [x] Shell 工具：Bash（sh -c + 黑名单 + timeout + 输出截断）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
   - [x] 工具注册 API：register_builtin_tools() — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
-  - [ ] Web 工具：WebFetch + WebSearch（Bocha）— [设计](../plans/2026-07-19-yi-agent-web-tools-design.md)
+  - [x] Web 工具：WebFetch + WebSearch（Bocha）— [设计](../plans/2026-07-19-yi-agent-web-tools-design.md)
   - [ ] Sandbox（跨平台进程隔离）— 延后单独设计
 - **ci-cd** → [详情](./ci-cd.md)
   - [x] CI/CD 设计文档

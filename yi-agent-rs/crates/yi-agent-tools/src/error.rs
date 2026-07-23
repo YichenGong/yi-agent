@@ -32,6 +32,21 @@ pub enum ToolsError {
 
     #[error("args parse error: {0}")]
     ArgsParse(#[from] serde_json::Error),
+
+    #[error("http error: {0}")]
+    Http(String),
+
+    #[error("unsupported content type: {0}")]
+    UnsupportedContentType(String),
+
+    #[error("response too large: {0} bytes")]
+    ResponseTooLarge(usize),
+
+    #[error("search engine error: {0}")]
+    SearchEngine(String),
+
+    #[error("BOCHA_API_KEY not set")]
+    MissingApiKey,
 }
 
 impl From<ToolsError> for ToolResult {
