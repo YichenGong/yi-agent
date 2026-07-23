@@ -18,3 +18,11 @@ yi-agent-llm = { workspace = true }
 yi-agent-tools = { workspace = true }
 yi-agent-mcp = { workspace = true }
 yi-agent-store = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+reedline = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
