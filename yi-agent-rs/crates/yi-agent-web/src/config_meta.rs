@@ -172,7 +172,16 @@ mod tests {
     #[test]
     fn groups_are_ordered() {
         let g = groups();
-        assert_eq!(g, vec!["Provider", "Agent", "Anthropic Provider", "OpenAI Provider", "Tools"]);
+        assert_eq!(
+            g,
+            vec![
+                "Provider",
+                "Agent",
+                "Anthropic Provider",
+                "OpenAI Provider",
+                "Tools"
+            ]
+        );
     }
 
     #[test]
@@ -191,7 +200,11 @@ mod tests {
     fn select_vars_have_options() {
         for var in ALL_VARS {
             if var.var_type == VarType::Select {
-                assert!(!var.options.is_empty(), "{} is Select but has no options", var.key);
+                assert!(
+                    !var.options.is_empty(),
+                    "{} is Select but has no options",
+                    var.key
+                );
             }
         }
     }
@@ -200,7 +213,11 @@ mod tests {
     fn secret_vars_have_no_options() {
         for var in ALL_VARS {
             if var.var_type == VarType::Secret {
-                assert!(var.options.is_empty(), "{} is Secret but has options", var.key);
+                assert!(
+                    var.options.is_empty(),
+                    "{} is Secret but has options",
+                    var.key
+                );
             }
         }
     }

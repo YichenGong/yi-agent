@@ -24,19 +24,29 @@ async fn get_config_returns_all_groups() {
     let app = test_app(env_path);
 
     let response = app
-        .oneshot(Request::builder().uri("/api/config").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     let groups = json["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 5); // Provider, Agent, Anthropic, OpenAI, Tools
 
     // 验证包含所有 14 个变量
-    let total_vars: usize = groups.iter().map(|g| g["vars"].as_array().unwrap().len()).sum();
+    let total_vars: usize = groups
+        .iter()
+        .map(|g| g["vars"].as_array().unwrap().len())
+        .sum();
     assert_eq!(total_vars, 14);
 }
 
@@ -48,11 +58,18 @@ async fn get_config_masks_secret_values() {
     let app = test_app(env_path);
 
     let response = app
-        .oneshot(Request::builder().uri("/api/config").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     // 找到 MODEL_API_KEY
@@ -134,7 +151,9 @@ async fn index_html_returns_html() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("<html") || html.contains("<!DOCTYPE"));
 }

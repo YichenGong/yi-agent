@@ -173,7 +173,12 @@ mod tests {
         let mut current = HashMap::new();
         current.insert("YI_AGENT_MODEL".to_string(), "old-model".to_string());
 
-        write(tmp.path(), &current, &[("YI_AGENT_MODEL".to_string(), "new-model".to_string())]).unwrap();
+        write(
+            tmp.path(),
+            &current,
+            &[("YI_AGENT_MODEL".to_string(), "new-model".to_string())],
+        )
+        .unwrap();
         let map = read(tmp.path()).unwrap();
         assert_eq!(map.get("YI_AGENT_MODEL").unwrap(), "new-model");
     }
@@ -184,7 +189,12 @@ mod tests {
         let mut current = HashMap::new();
         current.insert("YI_AGENT_MODEL".to_string(), "keep-this".to_string());
 
-        write(tmp.path(), &current, &[("YI_AGENT_MAX_TURNS".to_string(), "50".to_string())]).unwrap();
+        write(
+            tmp.path(),
+            &current,
+            &[("YI_AGENT_MAX_TURNS".to_string(), "50".to_string())],
+        )
+        .unwrap();
         let map = read(tmp.path()).unwrap();
         assert_eq!(map.get("YI_AGENT_MODEL").unwrap(), "keep-this");
         assert_eq!(map.get("YI_AGENT_MAX_TURNS").unwrap(), "50");

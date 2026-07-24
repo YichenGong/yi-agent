@@ -82,8 +82,17 @@ pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
     cli.workdir
         .as_ref()
         .map(|w| w.join(".env"))
-        .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(PathBuf::from).map(|p| p.join(".env")))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".env"))
+        .or_else(|| {
+            std::env::var("YI_AGENT_WORKDIR")
+                .ok()
+                .map(PathBuf::from)
+                .map(|p| p.join(".env"))
+        })
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".env")
+        })
 }
 
 /// 从 CLI 参数 + 环境变量加载配置。
@@ -94,7 +103,11 @@ pub fn load(cli: &Cli) -> Result<Config> {
     let env_path = resolve_env_path(cli);
     if let Err(e) = dotenvy::from_path(&env_path) {
         if !e.not_found() {
-            eprintln!("warning: failed to load .env from {}: {}", env_path.display(), e);
+            eprintln!(
+                "warning: failed to load .env from {}: {}",
+                env_path.display(),
+                e
+            );
         }
     }
 
@@ -365,7 +378,9 @@ mod tests {
         assert_eq!(config.api_key, "from-dotenv-file");
 
         // 清理
-        unsafe { std::env::remove_var("MODEL_API_KEY"); }
+        unsafe {
+            std::env::remove_var("MODEL_API_KEY");
+        }
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 

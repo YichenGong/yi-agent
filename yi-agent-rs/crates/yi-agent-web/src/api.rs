@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config_meta::{ALL_VARS, VarType, groups};
 use crate::env_file;
@@ -39,11 +39,12 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         let mut var_list: Vec<Value> = Vec::new();
         for var in ALL_VARS.iter().filter(|v| v.group == group_name) {
             let raw_value = vars.get(var.key).cloned().unwrap_or_default();
-            let (display_value, masked) = if var.var_type == VarType::Secret && !raw_value.is_empty() {
-                (env_file::mask(&raw_value), true)
-            } else {
-                (raw_value.clone(), false)
-            };
+            let (display_value, masked) =
+                if var.var_type == VarType::Secret && !raw_value.is_empty() {
+                    (env_file::mask(&raw_value), true)
+                } else {
+                    (raw_value.clone(), false)
+                };
             var_list.push(json!({
                 "key": var.key,
                 "value": display_value,
