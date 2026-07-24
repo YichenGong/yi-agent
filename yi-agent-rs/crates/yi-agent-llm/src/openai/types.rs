@@ -228,7 +228,9 @@ impl From<ProviderRequest> for OpenaiRequest {
             messages,
             tools: req.tools.into_iter().map(Into::into).collect(),
             stream: true,
-            stream_options: OpenaiStreamOptions { include_usage: true },
+            stream_options: OpenaiStreamOptions {
+                include_usage: true,
+            },
             params: OpenaiGenParams {
                 temperature: req.params.temperature,
                 max_tokens: req.params.max_tokens,
@@ -342,7 +344,10 @@ mod tests {
         assert_eq!(o.messages.len(), 1);
         assert_eq!(o.messages[0].role, "tool");
         match &o.messages[0].content {
-            Some(OpenaiContent::ToolResult { tool_call_id, content }) => {
+            Some(OpenaiContent::ToolResult {
+                tool_call_id,
+                content,
+            }) => {
                 assert_eq!(tool_call_id, "call_01");
                 assert!(content.contains("ok"));
             }
