@@ -1,4 +1,4 @@
-//! 14 个环境变量的元数据定义。
+//! 15 个环境变量的元数据定义。
 
 /// 字段类型。
 #[derive(Debug, Clone, PartialEq)]
@@ -22,39 +22,79 @@ pub struct VarMeta {
     pub options: &'static [&'static str],
 }
 
-/// 所有 14 个环境变量的元数据，按分组排列。
+/// 所有 15 个环境变量的元数据，按分组排列。
 pub static ALL_VARS: &[VarMeta] = &[
-    // === Provider ===
+    // === Model Provider ===
     VarMeta {
         key: "YI_AGENT_PROVIDER",
         default: Some("anthropic"),
         var_type: VarType::Select,
-        group: "Provider",
+        group: "Model Provider",
         description: "LLM provider backend",
         options: &["anthropic", "openai"],
+    },
+    VarMeta {
+        key: "YI_AGENT_MODEL",
+        default: None,
+        var_type: VarType::Text,
+        group: "Model Provider",
+        description: "Model identifier string",
+        options: &[],
+    },
+    VarMeta {
+        key: "YI_AGENT_MODEL_CONTEXT_LENGTH",
+        default: None,
+        var_type: VarType::Number,
+        group: "Model Provider",
+        description: "Model max context length in tokens (fallback: 200000)",
+        options: &[],
     },
     VarMeta {
         key: "MODEL_API_KEY",
         default: None,
         var_type: VarType::Secret,
-        group: "Provider",
-        description: "API key for the LLM provider",
+        group: "Model Provider",
+        description: "API key (overrides provider-specific key)",
         options: &[],
     },
     VarMeta {
         key: "MODEL_API_URL",
         default: None,
         var_type: VarType::Text,
-        group: "Provider",
-        description: "API endpoint URL override",
+        group: "Model Provider",
+        description: "API endpoint URL (overrides provider-specific URL)",
         options: &[],
     },
     VarMeta {
-        key: "YI_AGENT_MODEL",
+        key: "ANTHROPIC_API_KEY",
         default: None,
+        var_type: VarType::Secret,
+        group: "Model Provider",
+        description: "Anthropic provider API key",
+        options: &[],
+    },
+    VarMeta {
+        key: "ANTHROPIC_BASE_URL",
+        default: Some("https://api.anthropic.com"),
         var_type: VarType::Text,
-        group: "Provider",
-        description: "Model identifier string",
+        group: "Model Provider",
+        description: "Anthropic API base URL",
+        options: &[],
+    },
+    VarMeta {
+        key: "OPENAI_API_KEY",
+        default: None,
+        var_type: VarType::Secret,
+        group: "Model Provider",
+        description: "OpenAI provider API key",
+        options: &[],
+    },
+    VarMeta {
+        key: "OPENAI_BASE_URL",
+        default: Some("https://api.openai.com"),
+        var_type: VarType::Text,
+        group: "Model Provider",
+        description: "OpenAI API base URL",
         options: &[],
     },
     // === Agent ===
@@ -83,11 +123,11 @@ pub static ALL_VARS: &[VarMeta] = &[
         options: &[],
     },
     VarMeta {
-        key: "YI_AGENT_COMPACT_THRESHOLD",
-        default: Some("100000"),
+        key: "YI_AGENT_COMPACT_RATIO",
+        default: Some("80"),
         var_type: VarType::Number,
         group: "Agent",
-        description: "Token threshold for auto-compact",
+        description: "Percentage of context length triggering auto-compact",
         options: &[],
     },
     VarMeta {
@@ -96,40 +136,6 @@ pub static ALL_VARS: &[VarMeta] = &[
         var_type: VarType::Number,
         group: "Agent",
         description: "Turns retained during compaction",
-        options: &[],
-    },
-    // === Anthropic Provider ===
-    VarMeta {
-        key: "ANTHROPIC_API_KEY",
-        default: None,
-        var_type: VarType::Secret,
-        group: "Anthropic Provider",
-        description: "Anthropic provider API key",
-        options: &[],
-    },
-    VarMeta {
-        key: "ANTHROPIC_BASE_URL",
-        default: Some("https://api.anthropic.com"),
-        var_type: VarType::Text,
-        group: "Anthropic Provider",
-        description: "Anthropic API base URL",
-        options: &[],
-    },
-    // === OpenAI Provider ===
-    VarMeta {
-        key: "OPENAI_API_KEY",
-        default: None,
-        var_type: VarType::Secret,
-        group: "OpenAI Provider",
-        description: "OpenAI provider API key",
-        options: &[],
-    },
-    VarMeta {
-        key: "OPENAI_BASE_URL",
-        default: Some("https://api.openai.com"),
-        var_type: VarType::Text,
-        group: "OpenAI Provider",
-        description: "OpenAI API base URL",
         options: &[],
     },
     // === Tools ===
@@ -165,8 +171,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_vars_count_is_14() {
-        assert_eq!(ALL_VARS.len(), 14);
+    fn all_vars_count_is_15() {
+        assert_eq!(ALL_VARS.len(), 15);
+    }
+
+    #[test]
+    fn groups_count_is_3() {
+        assert_eq!(groups().len(), 3);
     }
 
     #[test]
@@ -174,13 +185,7 @@ mod tests {
         let g = groups();
         assert_eq!(
             g,
-            vec![
-                "Provider",
-                "Agent",
-                "Anthropic Provider",
-                "OpenAI Provider",
-                "Tools"
-            ]
+            vec!["Model Provider", "Agent", "Tools"]
         );
     }
 
@@ -229,5 +234,17 @@ mod tests {
         let before = keys.len();
         keys.dedup();
         assert_eq!(keys.len(), before, "duplicate keys found");
+    }
+
+    #[test]
+    fn context_length_has_no_default() {
+        let m = find("YI_AGENT_MODEL_CONTEXT_LENGTH").unwrap();
+        assert!(m.default.is_none());
+    }
+
+    #[test]
+    fn compact_ratio_default_is_80() {
+        let m = find("YI_AGENT_COMPACT_RATIO").unwrap();
+        assert_eq!(m.default, Some("80"));
     }
 }
