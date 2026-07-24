@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     let renderer = Box::new(InlineRenderer::new());
 
-    let app = App::new(agent, provider, tools, agent_config, renderer);
+    let app = App::new(agent, provider, tools, agent_config, config.workdir.clone(), renderer);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(app.run())?;
