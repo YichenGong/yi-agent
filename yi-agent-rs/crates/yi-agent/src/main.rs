@@ -61,7 +61,8 @@ fn main() -> Result<()> {
         agent_config.clone(),
     );
 
-    let renderer = Box::new(InlineRenderer::new());
+    let printer = reedline::ExternalPrinter::default();
+    let renderer = Box::new(InlineRenderer::with_printer(printer.sender()));
 
     let app = App::new(
         agent,
@@ -73,7 +74,7 @@ fn main() -> Result<()> {
     );
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(app.run())?;
+    rt.block_on(app.run(printer))?;
 
     Ok(())
 }

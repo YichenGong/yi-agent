@@ -1,6 +1,10 @@
-//! InlineRenderer：流式打印到 stdout，用 ANSI 颜色区分角色。
+//! InlineRenderer：通过 reedline external_printer 通道输出文本，用 ANSI 颜色区分角色。
+//!
+//! 核心约束：reedline 的 `external_messages()` 会对每条消息按 `\n` 拆行，
+//! 每行单独打印在 prompt 上方。因此流式文本必须缓冲，只在遇到完整行
+//! （以 `\n` 结尾）时才发送，避免每个 chunk 各占一行。
 
-use std::io::{self, Write};
+use crossbeam_channel::Sender;
 
 use yi_agent_core::{AgentError, AgentEvent, ContentBlock, DoneReason, ToolResult};
 
@@ -20,25 +24,82 @@ const SUMMARY_MAX_LEN: usize = 80;
 
 /// 内联流式渲染器。
 ///
-/// 维护"当前行是否正在流式输出助手文本"的状态，
-/// 以便在切换到其他事件时补换行。
+/// 输出通过 reedline 的 `external_printer` 通道发送，由 reedline 事件循环
+/// 负责在 prompt 上方安全地打印，保持光标跟踪一致。
+///
+/// 流式文本（`AssistantText`）会在 `streaming_buffer` 中缓冲，只在遇到
+/// 完整行时发送，确保多个 chunk 不会被拆成多行。
 pub struct InlineRenderer {
-    /// true 表示上一行是助手流式文本，可能还没换行
+    /// reedline external_printer 的发送端；None 时回退到直接 stdout（测试用）
+    printer_sender: Option<Sender<String>>,
+    /// true 表示上一行是助手流式文本，可能还有缓冲未发送
     streaming_text_in_progress: bool,
+    /// 流式文本缓冲区：累积未遇到 `\n` 的文本
+    streaming_buffer: String,
 }
 
 impl InlineRenderer {
+    /// 创建一个直接输出到 stdout 的渲染器（无 reedline 通道）。
+    ///
+    /// 仅用于测试或不使用 reedline 的场景。生产代码应使用 [`with_printer`](Self::with_printer)。
     pub fn new() -> Self {
         Self {
+            printer_sender: None,
             streaming_text_in_progress: false,
+            streaming_buffer: String::new(),
         }
     }
 
-    /// 如果上一行是未完成的流式文本，补一个换行
+    /// 创建一个通过 reedline external_printer 通道输出的渲染器。
+    pub fn with_printer(sender: Sender<String>) -> Self {
+        Self {
+            printer_sender: Some(sender),
+            streaming_text_in_progress: false,
+            streaming_buffer: String::new(),
+        }
+    }
+
+    /// 如果上一行是未完成的流式文本，通过通道发送剩余缓冲并补换行。
     fn finish_streaming_line(&mut self) {
         if self.streaming_text_in_progress {
-            println!();
+            if let Some(sender) = &self.printer_sender {
+                if !self.streaming_buffer.is_empty() {
+                    let _ = sender.send(format!("{}\n", self.streaming_buffer));
+                    self.streaming_buffer.clear();
+                }
+            } else {
+                // 回退：直接 stdout 模式
+                println!();
+            }
             self.streaming_text_in_progress = false;
+        }
+    }
+
+    /// 发送一条完整消息行（非流式）通过通道，或回退到 println!。
+    fn send_line(&self, text: &str) {
+        if let Some(sender) = &self.printer_sender {
+            let _ = sender.send(text.to_string());
+        } else {
+            println!("{text}");
+        }
+    }
+
+    /// 处理流式文本 chunk：缓冲并按完整行发送。
+    fn send_streaming_chunk(&mut self, text: &str) {
+        if let Some(sender) = &self.printer_sender {
+            self.streaming_buffer.push_str(text);
+            // 发送所有完整行，保留最后一个 `\n` 之后的残余
+            if let Some(last_newline) = self.streaming_buffer.rfind('\n') {
+                let complete: String = self.streaming_buffer[..=last_newline].to_string();
+                let remainder: String = self.streaming_buffer[last_newline + 1..].to_string();
+                let _ = sender.send(complete);
+                self.streaming_buffer = remainder;
+            }
+        } else {
+            // 回退：直接 stdout 流式打印
+            use std::io::Write;
+            print!("{text}");
+            std::io::stdout().flush().ok();
         }
     }
 
@@ -64,7 +125,7 @@ impl Default for InlineRenderer {
 impl Renderer for InlineRenderer {
     fn render_user_input(&mut self, text: &str) {
         self.finish_streaming_line();
-        println!("{COLOR_USER_BG} 你: {text} {COLOR_RESET}");
+        self.send_line(&format!("{COLOR_USER_BG} 你: {text} {COLOR_RESET}"));
     }
 
     fn render_agent_event(&mut self, event: &AgentEvent) {
@@ -73,23 +134,26 @@ impl Renderer for InlineRenderer {
                 // 不打印
             }
             AgentEvent::AssistantText(text) => {
-                // 流式追加：不加前缀，不换行
-                print!("{text}");
-                io::stdout().flush().ok();
+                // 流式追加：缓冲并按完整行发送
+                self.send_streaming_chunk(text);
                 self.streaming_text_in_progress = true;
             }
             AgentEvent::ToolCall { name, input, .. } => {
                 self.finish_streaming_line();
                 let summary = Self::summarize_input(input);
-                println!("  {COLOR_YELLOW}⚙{COLOR_RESET} {name}({summary})");
+                self.send_line(&format!("  {COLOR_YELLOW}⚙{COLOR_RESET} {name}({summary})"));
             }
             AgentEvent::ToolResult { result, .. } => {
                 self.finish_streaming_line();
                 let summary = Self::summarize_result(result);
                 if result.is_error {
-                    println!("  {COLOR_RED}↳{COLOR_RESET} {COLOR_DIM}{summary}{COLOR_RESET}");
+                    self.send_line(&format!(
+                        "  {COLOR_RED}↳{COLOR_RESET} {COLOR_DIM}{summary}{COLOR_RESET}"
+                    ));
                 } else {
-                    println!("  {COLOR_GREEN}↳{COLOR_RESET} {COLOR_DIM}{summary}{COLOR_RESET}");
+                    self.send_line(&format!(
+                        "  {COLOR_GREEN}↳{COLOR_RESET} {COLOR_DIM}{summary}{COLOR_RESET}"
+                    ));
                 }
             }
             AgentEvent::Done { reason } => {
@@ -99,7 +163,7 @@ impl Renderer for InlineRenderer {
                         // 正常完成，不额外打印
                     }
                     DoneReason::MaxTurns => {
-                        println!("{COLOR_DIM}· 达到最大轮数限制{COLOR_RESET}");
+                        self.send_line(&format!("{COLOR_DIM}· 达到最大轮数限制{COLOR_RESET}"));
                     }
                 }
             }
@@ -108,7 +172,7 @@ impl Renderer for InlineRenderer {
             }
             AgentEvent::Cancelled => {
                 self.finish_streaming_line();
-                println!("{COLOR_DIM}· 已中断{COLOR_RESET}");
+                self.send_line(&format!("{COLOR_DIM}· 已中断{COLOR_RESET}"));
             }
             AgentEvent::Error(err) => {
                 self.finish_streaming_line();
@@ -119,12 +183,12 @@ impl Renderer for InlineRenderer {
 
     fn render_error(&mut self, err: &AgentError) {
         self.finish_streaming_line();
-        println!("{COLOR_RED_BOLD}✗ {err}{COLOR_RESET}");
+        self.send_line(&format!("{COLOR_RED_BOLD}✗ {err}{COLOR_RESET}"));
     }
 
     fn render_system(&mut self, msg: &str) {
         self.finish_streaming_line();
-        println!("{COLOR_DIM}· {msg}{COLOR_RESET}");
+        self.send_line(&format!("{COLOR_DIM}· {msg}{COLOR_RESET}"));
     }
 }
 
@@ -160,6 +224,13 @@ fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_channel::unbounded;
+
+    /// 构建一个带通道的渲染器，返回 (renderer, receiver)
+    fn renderer_with_channel() -> (InlineRenderer, crossbeam_channel::Receiver<String>) {
+        let (tx, rx) = unbounded();
+        (InlineRenderer::with_printer(tx), rx)
+    }
 
     #[test]
     fn truncate_short_string() {
@@ -207,25 +278,18 @@ mod tests {
     }
 
     #[test]
-    fn render_cancelled_prints_interrupted_message() {
+    fn render_cancelled_resets_streaming_state() {
         let mut renderer = InlineRenderer::new();
-        // 捕获 stdout 验证渲染输出包含 "已中断"
-        // 注意:InlineRenderer 直接 println! 到 stdout,无法在测试中捕获输出。
-        // 我们验证 render_agent_event 对 Cancelled 不 panic 且不影响 streaming 状态。
-        // 如果正在流式输出,Cancelled 应先补换行。
         renderer.streaming_text_in_progress = true;
         renderer.render_agent_event(&AgentEvent::Cancelled);
-        // 流式状态应被重置(render 完成后不再处于流式状态)
         assert!(!renderer.streaming_text_in_progress);
     }
 
     #[test]
     fn render_cancelled_after_streaming_resets_state() {
         let mut renderer = InlineRenderer::new();
-        // 模拟流式文本输出中
         renderer.render_agent_event(&AgentEvent::AssistantText("partial".into()));
         assert!(renderer.streaming_text_in_progress);
-        // Cancelled 事件应补换行并重置状态
         renderer.render_agent_event(&AgentEvent::Cancelled);
         assert!(!renderer.streaming_text_in_progress);
     }
@@ -234,14 +298,132 @@ mod tests {
     fn render_usage_event_does_not_print() {
         use yi_agent_core::provider::TokenUsage;
         let mut renderer = InlineRenderer::new();
-        // Usage 事件不应影响流式状态
         renderer.streaming_text_in_progress = true;
         renderer.render_agent_event(&AgentEvent::Usage(TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
             ..Default::default()
         }));
-        // 流式状态不应被重置(Usage 不打印任何内容)
         assert!(renderer.streaming_text_in_progress);
+    }
+
+    // --- 通道模式测试 ---
+
+    #[test]
+    fn assistant_text_sends_through_channel() {
+        let (mut renderer, rx) = renderer_with_channel();
+        // 完整行（含换行）应立即发送
+        renderer.render_agent_event(&AgentEvent::AssistantText("hello\n".into()));
+        assert_eq!(rx.try_recv(), Ok("hello\n".to_string()));
+        // 通道中不应有多余消息
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn assistant_text_partial_line_buffers_until_finish() {
+        let (mut renderer, rx) = renderer_with_channel();
+        // 不含换行的 chunk 应缓冲，不发送
+        renderer.render_agent_event(&AgentEvent::AssistantText("partial".into()));
+        assert!(rx.try_recv().is_err());
+        assert!(renderer.streaming_text_in_progress);
+        // finish_streaming_line（由下一个事件触发）应发送缓冲 + 换行
+        renderer.render_agent_event(&AgentEvent::Cancelled);
+        assert_eq!(rx.try_recv(), Ok("partial\n".to_string()));
+        // Cancelled 本身也发送消息
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn assistant_text_multiple_chunks_concatenate() {
+        let (mut renderer, rx) = renderer_with_channel();
+        // 多个不含换行的 chunk 应拼接，最终作为一条消息发送
+        renderer.render_agent_event(&AgentEvent::AssistantText("Hello".into()));
+        renderer.render_agent_event(&AgentEvent::AssistantText(", ".into()));
+        renderer.render_agent_event(&AgentEvent::AssistantText("world!".into()));
+        // 都应缓冲，不发送
+        assert!(rx.try_recv().is_err());
+        // 触发 flush
+        renderer.finish_streaming_line();
+        assert_eq!(rx.try_recv(), Ok("Hello, world!\n".to_string()));
+    }
+
+    #[test]
+    fn assistant_text_multi_line_chunk_splits_correctly() {
+        let (mut renderer, rx) = renderer_with_channel();
+        // 含多个换行的 chunk：完整行立即发送，残余缓冲
+        renderer.render_agent_event(&AgentEvent::AssistantText("line1\nline2\npartial".into()));
+        assert_eq!(rx.try_recv(), Ok("line1\nline2\n".to_string()));
+        // partial 仍在缓冲中
+        assert!(rx.try_recv().is_err());
+        // flush
+        renderer.finish_streaming_line();
+        assert_eq!(rx.try_recv(), Ok("partial\n".to_string()));
+    }
+
+    #[test]
+    fn tool_call_sends_formatted_line_through_channel() {
+        let (mut renderer, rx) = renderer_with_channel();
+        let input = serde_json::json!({"path": "/tmp/test"});
+        renderer.render_agent_event(&AgentEvent::ToolCall {
+            name: "read_file".into(),
+            input: input.clone(),
+            id: "t1".into(),
+        });
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.contains("read_file"));
+        assert!(msg.contains("⚙"));
+    }
+
+    #[test]
+    fn tool_result_sends_formatted_line_through_channel() {
+        let (mut renderer, rx) = renderer_with_channel();
+        let result = ToolResult::text("success");
+        renderer.render_agent_event(&AgentEvent::ToolResult {
+            result: result.clone(),
+            id: "t1".into(),
+        });
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.contains("↳"));
+        assert!(msg.contains("success"));
+    }
+
+    #[test]
+    fn finish_streaming_line_sends_newline_for_buffered_text() {
+        let (mut renderer, rx) = renderer_with_channel();
+        renderer.render_agent_event(&AgentEvent::AssistantText("buffered".into()));
+        renderer.finish_streaming_line();
+        assert_eq!(rx.try_recv(), Ok("buffered\n".to_string()));
+        // 再次 finish 不应发送任何内容
+        renderer.finish_streaming_line();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn finish_streaming_line_noop_when_buffer_empty() {
+        let (mut renderer, rx) = renderer_with_channel();
+        // 完整行已发送，buffer 为空
+        renderer.render_agent_event(&AgentEvent::AssistantText("complete\n".into()));
+        let _ = rx.try_recv(); // drain "complete\n"
+        renderer.finish_streaming_line();
+        // buffer 为空，不应发送额外消息
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn render_system_sends_through_channel() {
+        let (mut renderer, rx) = renderer_with_channel();
+        renderer.render_system("test message");
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.contains("test message"));
+        assert!(msg.contains("·"));
+    }
+
+    #[test]
+    fn render_user_input_sends_through_channel() {
+        let (mut renderer, rx) = renderer_with_channel();
+        renderer.render_user_input("hello agent");
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.contains("hello agent"));
+        assert!(msg.contains("你:"));
     }
 }

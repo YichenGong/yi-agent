@@ -91,6 +91,10 @@ impl App {
 
     /// 运行 App 主循环。
     ///
+    /// `printer` 是 reedline 的 external_printer，用于将渲染器输出安全地
+    /// 传递到 reedline 事件循环（保持光标跟踪一致）。其 sender 在 `main`
+    /// 中已传给 `InlineRenderer`。
+    ///
     /// 三个并发源通过 tokio::select! 协调：
     /// 1. 用户输入（reedline via spawn_blocking → mpsc channel）
     /// 2. agent 事件流（BoxStream<AgentEvent>）
@@ -103,13 +107,13 @@ impl App {
     /// 通过 `UserCommand::Interrupt` 走 cmd channel。不使用独立的 crossterm
     /// 监听线程——那会与 reedline 竞争 crossterm 的 singleton event reader，
     /// 导致按键丢失。
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self, printer: reedline::ExternalPrinter<String>) -> Result<()> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<UserCommand>(16);
 
         // Task 1: 输入循环（reedline 是同步阻塞的，放到 spawn_blocking）
         let cmd_tx_clone = cmd_tx.clone();
         tokio::task::spawn_blocking(move || {
-            run_input_loop(cmd_tx_clone);
+            run_input_loop(cmd_tx_clone, printer);
         });
 
         let mut current_stream: Option<BoxStream<'static, AgentEvent>> = None;
@@ -295,7 +299,10 @@ impl App {
 ///
 /// ESC 键通过 reedline keybinding 绑定到 `ReedlineEvent::CtrlC`，
 /// 返回 `Signal::CtrlC` 后发送 `UserCommand::Interrupt`。
-fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>) {
+///
+/// `printer` 来自 reedline 的 `ExternalPrinter`，其 sender 已传给
+/// `InlineRenderer`，使渲染输出通过 reedline 事件循环安全打印。
+fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>, printer: reedline::ExternalPrinter<String>) {
     use crossterm::event::{KeyCode, KeyModifiers};
     use reedline::{DefaultPrompt, Emacs, Reedline};
 
@@ -307,7 +314,9 @@ fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>) {
         reedline::ReedlineEvent::CtrlC,
     );
 
-    let mut line_editor = Reedline::create().with_edit_mode(Box::new(Emacs::new(keybindings)));
+    let mut line_editor = Reedline::create()
+        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_external_printer(printer);
     let prompt = DefaultPrompt::default();
 
     loop {
