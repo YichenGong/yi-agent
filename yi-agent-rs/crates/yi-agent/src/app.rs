@@ -249,10 +249,15 @@ impl App {
                     self.agent.cancel();
                     // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
                 }
-                // Ctrl+C 信号（仅在 agent 运行时中断，不退出程序）
-                _ = tokio::signal::ctrl_c(), if current_stream.is_some() => {
-                    self.agent.cancel();
-                    // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
+                // Ctrl+C 信号：agent 运行时中断当前任务，空闲时退出程序
+                _ = tokio::signal::ctrl_c() => {
+                    if current_stream.is_some() {
+                        self.agent.cancel();
+                        // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
+                    } else {
+                        drop(current_stream.take());
+                        break;
+                    }
                 }
                 // agent 事件流有新事件
                 event = async {
