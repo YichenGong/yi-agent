@@ -7,6 +7,7 @@ use futures::stream::{BoxStream, StreamExt};
 use tokio::sync::mpsc;
 use yi_agent_core::{Agent, AgentConfig, AgentEvent, Provider, Session, ToolRegistry};
 
+use crate::compact::compact_session;
 use crate::file_ref::expand_file_refs;
 use crate::input::{self, UserCommand, help_text};
 use crate::render::Renderer;
@@ -112,6 +113,28 @@ impl App {
                                 current_stream = None;
                             }
 
+                            // 自动 compact 检查
+                            let threshold = self.config.compact_threshold.unwrap_or(100_000);
+                            if self.usage_stats.session_token_count() > threshold {
+                                self.renderer.render_system("上下文接近上限，正在自动压缩...");
+                                let keep_turns = self.config.compact_keep_turns.unwrap_or(4);
+                                let session = self.agent.session();
+                                match compact_session(&self.provider, &self.config, &session, keep_turns).await {
+                                    Ok(new_session) => {
+                                        self.agent = Agent::new(
+                                            Arc::clone(&self.provider),
+                                            Arc::clone(&self.tools),
+                                            self.config.clone(),
+                                        )
+                                        .with_session(new_session);
+                                        self.usage_stats.reset_session();
+                                    }
+                                    Err(e) => {
+                                        self.renderer.render_error(&e);
+                                    }
+                                }
+                            }
+
                             // 展开 @path 文件引用
                             let expanded = match expand_file_refs(&text, &self.workdir) {
                                 Ok(text) => text,
@@ -175,7 +198,26 @@ impl App {
                             );
                         }
                         UserCommand::Compact => {
-                            self.renderer.render_system("对话压缩尚未实现");
+                            let before_msgs = self.agent.session().len();
+                            let keep_turns = self.config.compact_keep_turns.unwrap_or(4);
+                            let session = self.agent.session();
+                            match compact_session(&self.provider, &self.config, &session, keep_turns).await {
+                                Ok(new_session) => {
+                                    let after_msgs = new_session.len();
+                                    self.agent = Agent::new(
+                                        Arc::clone(&self.provider),
+                                        Arc::clone(&self.tools),
+                                        self.config.clone(),
+                                    )
+                                    .with_session(new_session);
+                                    self.usage_stats.reset_session();
+                                    self.renderer
+                                        .render_system(&format!("对话已压缩：{before_msgs} 条消息 → {after_msgs} 条消息"));
+                                }
+                                Err(e) => {
+                                    self.renderer.render_error(&e);
+                                }
+                            }
                         }
                         UserCommand::Config => {
                             self.renderer.render_system(&format_config(&self.config));
@@ -331,5 +373,19 @@ mod tests {
         let session_clone = session.clone();
         assert_eq!(session_clone.len(), 1);
         assert_eq!(session_clone.messages().len(), 1);
+    }
+
+    #[test]
+    fn should_trigger_compact_above_threshold() {
+        let threshold = 100_000u32;
+        let current_tokens = 120_000u32;
+        assert!(current_tokens > threshold);
+    }
+
+    #[test]
+    fn should_not_trigger_compact_below_threshold() {
+        let threshold = 100_000u32;
+        let current_tokens = 50_000u32;
+        assert!(current_tokens <= threshold);
     }
 }
