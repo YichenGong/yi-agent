@@ -79,14 +79,28 @@ async fn streams_text_deltas_correctly() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
 
-    let text: String = events.iter().filter_map(|e| {
-        if let ProviderEvent::TextDelta(t) = e { Some(t.clone()) } else { None }
-    }).collect();
+    let text: String = events
+        .iter()
+        .filter_map(|e| {
+            if let ProviderEvent::TextDelta(t) = e {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     assert_eq!(text, "Hello world");
-    assert!(events.iter().any(|e| matches!(e, ProviderEvent::Stop { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ProviderEvent::Stop { .. }))
+    );
 }
 
 #[tokio::test]
@@ -103,21 +117,30 @@ async fn streams_tool_use_deltas_correctly() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
 
     assert!(events.iter().any(|e| matches!(
         e, ProviderEvent::ToolUseStart { id, name } if id == "call_01" && name == "read"
     )));
     assert_eq!(
-        events.iter().filter(|e| matches!(e, ProviderEvent::ToolUseDelta { .. })).count(),
+        events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::ToolUseDelta { .. }))
+            .count(),
         2
     );
     assert!(events.iter().any(|e| matches!(
         e, ProviderEvent::ToolUseEnd { id } if id == "call_01"
     )));
     assert!(events.iter().any(|e| matches!(
-        e, ProviderEvent::Stop { reason: StopReason::EndTurn }
+        e,
+        ProviderEvent::Stop {
+            reason: StopReason::EndTurn
+        }
     )));
 }
 
@@ -135,10 +158,16 @@ async fn maps_stop_reason_max_tokens() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
     assert!(events.iter().any(|e| matches!(
-        e, ProviderEvent::Stop { reason: StopReason::MaxTokens }
+        e,
+        ProviderEvent::Stop {
+            reason: StopReason::MaxTokens
+        }
     )));
 }
 
@@ -243,7 +272,10 @@ async fn trims_trailing_slash_in_base_url() {
         timeout: Some(Duration::from_secs(5)),
     })
     .expect("provider construction");
-    let _ = provider.call_stream(simple_request()).await.expect("stream ok");
+    let _ = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
 }
 
 #[tokio::test]
@@ -288,7 +320,9 @@ async fn sends_system_message_as_role_system() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(wiremock::matchers::body_string_contains("\"role\":\"system\""))
+        .and(wiremock::matchers::body_string_contains(
+            "\"role\":\"system\"",
+        ))
         .and(wiremock::matchers::body_string_contains("be helpful"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -326,12 +360,17 @@ async fn mid_stream_error_becomes_terminal_stop() {
         .await;
 
     let provider = provider_for(&server);
-    let stream = provider.call_stream(simple_request()).await.expect("stream ok");
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
     let events = collect_events(stream).await;
 
     assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "partial"));
     match &events[1] {
-        ProviderEvent::Stop { reason: StopReason::Other(msg) } => {
+        ProviderEvent::Stop {
+            reason: StopReason::Other(msg),
+        } => {
             assert!(msg.contains("invalid SSE JSON") || msg.contains("stream error"));
         }
         _ => panic!("expected Stop{{Other}}, got: {:?}", events[1]),

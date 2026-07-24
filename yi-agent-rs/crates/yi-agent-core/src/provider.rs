@@ -621,14 +621,8 @@ mod tests {
     fn stop_reason_eq_variants() {
         assert_eq!(StopReason::EndTurn, StopReason::EndTurn);
         assert_ne!(StopReason::EndTurn, StopReason::MaxTokens);
-        assert_eq!(
-            StopReason::Other("x".into()),
-            StopReason::Other("x".into())
-        );
-        assert_ne!(
-            StopReason::Other("x".into()),
-            StopReason::Other("y".into())
-        );
+        assert_eq!(StopReason::Other("x".into()), StopReason::Other("x".into()));
+        assert_ne!(StopReason::Other("x".into()), StopReason::Other("y".into()));
     }
 
     #[test]

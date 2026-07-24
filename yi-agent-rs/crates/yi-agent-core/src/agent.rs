@@ -1068,9 +1068,12 @@ mod tests {
         let stream = agent.run("hi".into()).await.unwrap();
         let events = collect_events(stream);
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Done { reason: DoneReason::MaxTurns })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                reason: DoneReason::MaxTurns
+            }
+        )));
         // Should not have any assistant text since provider was never called
         assert!(
             !events
