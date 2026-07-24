@@ -38,25 +38,21 @@ pub struct OpenaiMessage {
     pub tool_call_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 #[serde(untagged)]
 pub enum OpenaiContent {
     Text(String),
     ToolCalls(Vec<OpenaiToolCall>),
-    ToolResult {
-        tool_call_id: String,
-        content: String,
-    },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct OpenaiToolCall {
     pub id: String,
     pub r#type: String,
     pub function: OpenaiToolCallFunction,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct OpenaiToolCallFunction {
     pub name: String,
     pub arguments: String,
@@ -210,10 +206,7 @@ impl From<ProviderRequest> for OpenaiRequest {
                             messages.push(OpenaiMessage {
                                 role: "tool".to_string(),
                                 name: None,
-                                content: Some(OpenaiContent::ToolResult {
-                                    tool_call_id: tool_use_id.clone(),
-                                    content: body,
-                                }),
+                                content: Some(OpenaiContent::Text(body)),
                                 tool_calls: None,
                                 tool_call_id: Some(tool_use_id),
                             });
@@ -343,16 +336,57 @@ mod tests {
         let o: OpenaiRequest = req.into();
         assert_eq!(o.messages.len(), 1);
         assert_eq!(o.messages[0].role, "tool");
+        // OpenAI requires tool message content to be a string, with
+        // tool_call_id as a top-level field (not nested in content).
         match &o.messages[0].content {
-            Some(OpenaiContent::ToolResult {
-                tool_call_id,
-                content,
-            }) => {
-                assert_eq!(tool_call_id, "call_01");
-                assert!(content.contains("ok"));
-            }
-            _ => panic!("expected ToolResult content"),
+            Some(OpenaiContent::Text(t)) => assert_eq!(t, "ok"),
+            other => panic!("expected Text content, got {other:?}"),
         }
+        assert_eq!(o.messages[0].tool_call_id.as_deref(), Some("call_01"));
+    }
+
+    #[test]
+    fn tool_result_message_serializes_content_as_string() {
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "call_01".into(),
+            content: vec![ContentBlock::Text("ok".into())],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".to_string(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        let msg = &json["messages"][0];
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["content"], "ok", "content must be a string");
+        assert_eq!(msg["tool_call_id"], "call_01");
+    }
+
+    #[test]
+    fn tool_result_error_message_serializes_with_error_prefix() {
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "call_02".into(),
+            content: vec![ContentBlock::Text("boom".into())],
+            is_error: true,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".to_string(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        let msg = &json["messages"][0];
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["content"], "error: boom");
+        assert_eq!(msg["tool_call_id"], "call_02");
     }
 
     #[test]
