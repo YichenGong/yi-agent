@@ -7,6 +7,7 @@ use futures::stream::{BoxStream, StreamExt};
 use tokio::sync::mpsc;
 use yi_agent_core::{Agent, AgentConfig, AgentEvent, Provider, Session, ToolRegistry};
 
+use crate::file_ref::expand_file_refs;
 use crate::input::{self, UserCommand, help_text};
 use crate::render::Renderer;
 
@@ -48,6 +49,7 @@ pub struct App {
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
     config: AgentConfig,
+    workdir: std::path::PathBuf,
     renderer: Box<dyn Renderer>,
     usage_stats: UsageStats,
 }
@@ -58,6 +60,7 @@ impl App {
         provider: Arc<dyn Provider>,
         tools: Arc<ToolRegistry>,
         config: AgentConfig,
+        workdir: std::path::PathBuf,
         renderer: Box<dyn Renderer>,
     ) -> Self {
         Self {
@@ -65,6 +68,7 @@ impl App {
             provider,
             tools,
             config,
+            workdir,
             renderer,
             usage_stats: UsageStats::default(),
         }
@@ -108,8 +112,23 @@ impl App {
                                 current_stream = None;
                             }
 
+                            // 展开 @path 文件引用
+                            let expanded = match expand_file_refs(&text, &self.workdir) {
+                                Ok(text) => text,
+                                Err(e) => {
+                                    self.renderer.render_error(
+                                        &yi_agent_core::AgentError::Provider(
+                                            yi_agent_core::ProviderError::InvalidRequest(
+                                                e.to_string(),
+                                            ),
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+
                             self.renderer.render_user_input(&text);
-                            match self.agent.run(text).await {
+                            match self.agent.run(expanded).await {
                                 Ok(stream) => {
                                     current_stream = Some(stream);
                                 }
