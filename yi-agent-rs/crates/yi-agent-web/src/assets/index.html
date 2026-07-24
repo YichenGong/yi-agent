@@ -25,8 +25,8 @@
     background: var(--bg);
     color: var(--text);
     line-height: 1.6;
-    padding: 2rem 1rem;
-    max-width: 800px;
+    padding: 1.5rem;
+    max-width: 900px;
     margin: 0 auto;
   }
   h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
@@ -34,12 +34,45 @@
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 0.85rem;
     color: var(--text-dim);
-    margin-bottom: 2rem;
+    margin-bottom: 1.5rem;
     padding: 0.5rem 0.75rem;
     background: var(--surface);
     border-radius: var(--radius);
     border: 1px solid var(--border);
     word-break: break-all;
+  }
+  .layout {
+    display: flex;
+    gap: 1.5rem;
+    min-height: 400px;
+  }
+  .sidebar {
+    width: 180px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .tab {
+    padding: 0.6rem 0.9rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 0.9rem;
+    text-align: left;
+    transition: all 0.15s;
+  }
+  .tab:hover { color: var(--text); border-color: var(--accent); }
+  .tab.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: var(--surface-hover);
+  }
+  .main {
+    flex: 1;
+    min-width: 0;
   }
   .group {
     background: var(--surface);
@@ -54,6 +87,31 @@
     margin-bottom: 1rem;
     padding-bottom: 0.5rem;
     border-bottom: 1px solid var(--border);
+  }
+  .section { margin-bottom: 1rem; }
+  .section:last-child { margin-bottom: 0; }
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    padding: 0.5rem 0;
+    font-size: 0.9rem;
+    color: var(--text);
+    font-weight: 600;
+    user-select: none;
+  }
+  .section-header:hover { color: var(--accent); }
+  .section-arrow {
+    display: inline-block;
+    transition: transform 0.15s;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }
+  .section.collapsed .section-arrow { transform: rotate(-90deg); }
+  .section.collapsed .section-body { display: none; }
+  .section-body {
+    padding-top: 0.5rem;
   }
   .field { margin-bottom: 1rem; }
   .field:last-child { margin-bottom: 0; }
@@ -159,7 +217,11 @@
 
 <h1>yi-agent 配置</h1>
 <div class="env-path" id="envPath">加载中...</div>
-<div id="groups"></div>
+
+<div class="layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main" id="main"></div>
+</div>
 
 <div class="actions">
   <button class="save-btn" id="saveBtn" disabled>保存</button>
@@ -169,94 +231,191 @@
 <div class="toast" id="toast"></div>
 
 <script>
+  let allVars = [];
   let originalValues = {};
   let currentValues = {};
+  let activeTab = 'Model Provider';
+  let collapsedSections = { 'Provider Credentials': true };
+
+  // 定义 sections：仅 Model Provider tab 使用
+  const modelProviderSections = [
+    { name: 'General', vars: ['YI_AGENT_PROVIDER', 'YI_AGENT_MODEL', 'YI_AGENT_MODEL_CONTEXT_LENGTH', 'MODEL_API_KEY', 'MODEL_API_URL'] },
+    { name: 'Provider Credentials', dynamic: true },
+  ];
+
+  function getProviderCredentialVars(provider) {
+    if (provider === 'openai') return ['OPENAI_API_KEY', 'OPENAI_BASE_URL'];
+    return ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'];
+  }
 
   async function loadConfig() {
     const resp = await fetch('/api/config');
     const data = await resp.json();
     document.getElementById('envPath').textContent = data.envPath;
 
-    const container = document.getElementById('groups');
-    container.innerHTML = '';
-
+    // 扁平化所有变量
+    allVars = [];
     for (const group of data.groups) {
-      const groupEl = document.createElement('div');
-      groupEl.className = 'group';
-      groupEl.innerHTML = `<h2>${group.name}</h2>`;
-
       for (const v of group.vars) {
+        allVars.push(v);
         originalValues[v.key] = v.value;
         currentValues[v.key] = v.value;
-
-        const field = document.createElement('div');
-        field.className = 'field';
-
-        const label = document.createElement('label');
-        label.innerHTML = `${v.key} <span class="desc">${v.description}</span>`;
-
-        let inputEl;
-        if (v.type === 'select') {
-          inputEl = document.createElement('select');
-          for (const opt of v.options) {
-            const o = document.createElement('option');
-            o.value = opt;
-            o.textContent = opt;
-            if (opt === v.value) o.selected = true;
-            inputEl.appendChild(o);
-          }
-        } else {
-          inputEl = document.createElement('input');
-          inputEl.type = v.type === 'secret' ? 'password' : (v.type === 'number' ? 'number' : 'text');
-          inputEl.value = v.value;
-          inputEl.placeholder = v.default || '(none)';
-        }
-
-        inputEl.dataset.key = v.key;
-        inputEl.dataset.type = v.type;
-        inputEl.dataset.masked = v.masked;
-        inputEl.addEventListener('input', onFieldChange);
-        inputEl.addEventListener('change', onFieldChange);
-
-        if (v.type === 'secret') {
-          const wrapper = document.createElement('div');
-          wrapper.className = 'secret-wrapper';
-
-          // 点击 secret 字段时清空掩码值以便编辑
-          inputEl.addEventListener('focus', () => {
-            if (inputEl.dataset.masked === 'true' && inputEl.value.includes('***')) {
-              inputEl.value = '';
-              inputEl.dataset.masked = 'false';
-            }
-          });
-
-          const toggle = document.createElement('button');
-          toggle.className = 'toggle-btn';
-          toggle.textContent = '显示';
-          toggle.type = 'button';
-          toggle.addEventListener('click', () => {
-            if (inputEl.type === 'password') {
-              inputEl.type = 'text';
-              toggle.textContent = '隐藏';
-            } else {
-              inputEl.type = 'password';
-              toggle.textContent = '显示';
-            }
-          });
-
-          wrapper.appendChild(inputEl);
-          wrapper.appendChild(toggle);
-          field.appendChild(wrapper);
-        } else {
-          field.appendChild(inputEl);
-        }
-
-        field.insertBefore(label, field.firstChild);
-        groupEl.appendChild(field);
       }
-      container.appendChild(groupEl);
     }
+
+    renderSidebar();
+    renderMain();
     updateSaveButton();
+  }
+
+  function renderSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    sidebar.innerHTML = '';
+    const tabs = ['Model Provider', 'Agent', 'Tools'];
+    for (const tab of tabs) {
+      const btn = document.createElement('button');
+      btn.className = 'tab' + (tab === activeTab ? ' active' : '');
+      btn.textContent = tab;
+      btn.addEventListener('click', () => {
+        activeTab = tab;
+        renderSidebar();
+        renderMain();
+      });
+      sidebar.appendChild(btn);
+    }
+  }
+
+  function renderMain() {
+    const main = document.getElementById('main');
+    main.innerHTML = '';
+
+    if (activeTab === 'Model Provider') {
+      renderModelProviderTab(main);
+    } else {
+      renderFlatTab(main, activeTab);
+    }
+  }
+
+  function renderModelProviderTab(main) {
+    const groupEl = document.createElement('div');
+    groupEl.className = 'group';
+    groupEl.innerHTML = '<h2>Model Provider</h2>';
+
+    for (const section of modelProviderSections) {
+      const sectionEl = document.createElement('div');
+      sectionEl.className = 'section' + (collapsedSections[section.name] ? ' collapsed' : '');
+      sectionEl.dataset.section = section.name;
+
+      const header = document.createElement('div');
+      header.className = 'section-header';
+      header.innerHTML = `<span class="section-arrow">▼</span> ${section.name}`;
+      header.addEventListener('click', () => {
+        collapsedSections[section.name] = !collapsedSections[section.name];
+        sectionEl.classList.toggle('collapsed');
+      });
+
+      const body = document.createElement('div');
+      body.className = 'section-body';
+
+      let varsToRender;
+      if (section.dynamic) {
+        const provider = currentValues['YI_AGENT_PROVIDER'] || 'anthropic';
+        varsToRender = getProviderCredentialVars(provider);
+      } else {
+        varsToRender = section.vars;
+      }
+
+      for (const key of varsToRender) {
+        const v = allVars.find(x => x.key === key);
+        if (v) renderField(body, v);
+      }
+
+      sectionEl.appendChild(header);
+      sectionEl.appendChild(body);
+      groupEl.appendChild(sectionEl);
+    }
+
+    main.appendChild(groupEl);
+  }
+
+  function renderFlatTab(main, tabName) {
+    const groupEl = document.createElement('div');
+    groupEl.className = 'group';
+    groupEl.innerHTML = `<h2>${tabName}</h2>`;
+
+    for (const v of allVars) {
+      if (v.group === tabName) {
+        renderField(groupEl, v);
+      }
+    }
+
+    main.appendChild(groupEl);
+  }
+
+  function renderField(container, v) {
+    const field = document.createElement('div');
+    field.className = 'field';
+
+    const label = document.createElement('label');
+    label.innerHTML = `${v.key} <span class="desc">${v.description}</span>`;
+
+    let inputEl;
+    if (v.type === 'select') {
+      inputEl = document.createElement('select');
+      for (const opt of v.options) {
+        const o = document.createElement('option');
+        o.value = opt;
+        o.textContent = opt;
+        if (opt === v.value) o.selected = true;
+        inputEl.appendChild(o);
+      }
+    } else {
+      inputEl = document.createElement('input');
+      inputEl.type = v.type === 'secret' ? 'password' : (v.type === 'number' ? 'number' : 'text');
+      inputEl.value = v.value;
+      inputEl.placeholder = v.default || '(none)';
+    }
+
+    inputEl.dataset.key = v.key;
+    inputEl.dataset.type = v.type;
+    inputEl.dataset.masked = v.masked;
+    inputEl.addEventListener('input', onFieldChange);
+    inputEl.addEventListener('change', onFieldChange);
+
+    if (v.type === 'secret') {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'secret-wrapper';
+
+      inputEl.addEventListener('focus', () => {
+        if (inputEl.dataset.masked === 'true' && inputEl.value.includes('***')) {
+          inputEl.value = '';
+          inputEl.dataset.masked = 'false';
+        }
+      });
+
+      const toggle = document.createElement('button');
+      toggle.className = 'toggle-btn';
+      toggle.textContent = '显示';
+      toggle.type = 'button';
+      toggle.addEventListener('click', () => {
+        if (inputEl.type === 'password') {
+          inputEl.type = 'text';
+          toggle.textContent = '隐藏';
+        } else {
+          inputEl.type = 'password';
+          toggle.textContent = '显示';
+        }
+      });
+
+      wrapper.appendChild(inputEl);
+      wrapper.appendChild(toggle);
+      field.appendChild(wrapper);
+    } else {
+      field.appendChild(inputEl);
+    }
+
+    field.insertBefore(label, field.firstChild);
+    container.appendChild(field);
   }
 
   function onFieldChange(e) {
@@ -270,6 +429,12 @@
     } else {
       e.target.classList.remove('modified');
     }
+
+    // 若 provider 变化，重渲染 Model Provider tab 的 credentials section
+    if (key === 'YI_AGENT_PROVIDER') {
+      renderMain();
+    }
+
     updateSaveButton();
   }
 
