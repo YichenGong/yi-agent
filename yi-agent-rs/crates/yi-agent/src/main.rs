@@ -15,10 +15,24 @@ use render::InlineRenderer;
 use yi_agent_core::Provider;
 
 use crate::app::App;
-use crate::config::Cli;
+use crate::config::{Cli, Command};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Web { ref host, ref port }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let env_path = config::resolve_env_path(&cli);
+                yi_agent_web::serve(host, *port, env_path).await
+            })
+        }
+        None => run_agent(cli),
+    }
+}
+
+fn run_agent(cli: Cli) -> Result<()> {
     let config = config::load(&cli)?;
 
     let provider: Arc<dyn Provider> = match config.provider.as_str() {

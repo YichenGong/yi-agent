@@ -22,6 +22,9 @@ pub struct Config {
 #[derive(clap::Parser, Debug)]
 #[command(name = "yi-agent", version, about = "Interactive AI agent CLI")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// LLM provider: "anthropic" or "openai" (overrides YI_AGENT_PROVIDER)
     #[arg(long)]
     pub provider: Option<String>,
@@ -59,10 +62,55 @@ pub struct Cli {
     pub compact_keep_turns: Option<u32>,
 }
 
+/// 子命令
+#[derive(clap::Subcommand, Debug)]
+pub enum Command {
+    /// Start web config UI
+    Web {
+        /// Host to bind
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to bind
+        #[arg(long, default_value = "7292")]
+        port: u16,
+    },
+}
+
+/// 解析 .env 文件路径：优先 workdir CLI 参数，否则 YI_AGENT_WORKDIR 环境变量，否则当前目录。
+pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
+    cli.workdir
+        .as_ref()
+        .map(|w| w.join(".env"))
+        .or_else(|| {
+            std::env::var("YI_AGENT_WORKDIR")
+                .ok()
+                .map(PathBuf::from)
+                .map(|p| p.join(".env"))
+        })
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".env")
+        })
+}
+
 /// 从 CLI 参数 + 环境变量加载配置。
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
 pub fn load(cli: &Cli) -> Result<Config> {
+    // 从工作目录的 .env 文件加载环境变量（不覆盖已存在的）
+    let env_path = resolve_env_path(cli);
+    if let Err(e) = dotenvy::from_path(&env_path) {
+        if !e.not_found() {
+            eprintln!(
+                "warning: failed to load .env from {}: {}",
+                env_path.display(),
+                e
+            );
+        }
+    }
+
     let provider = cli
         .provider
         .clone()
@@ -168,6 +216,7 @@ mod tests {
             std::env::remove_var("MODEL_API_URL");
         }
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: None,
@@ -190,6 +239,7 @@ mod tests {
     #[test]
     fn load_loads_from_cli_args() {
         let cli = Cli {
+            command: None,
             provider: Some("openai".into()),
             api_url: Some("https://example.com".into()),
             api_key: Some("test-key".into()),
@@ -211,6 +261,7 @@ mod tests {
     #[test]
     fn load_defaults_api_url_and_model() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -231,6 +282,7 @@ mod tests {
     #[test]
     fn load_includes_compact_defaults() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -249,6 +301,7 @@ mod tests {
     #[test]
     fn load_rejects_nonexistent_workdir() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -266,6 +319,7 @@ mod tests {
     #[test]
     fn load_defaults_provider_to_anthropic() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -283,6 +337,7 @@ mod tests {
     #[test]
     fn load_defaults_openai_provider() {
         let cli = Cli {
+            command: None,
             provider: Some("openai".into()),
             api_url: None,
             api_key: Some("test-key".into()),
@@ -297,5 +352,68 @@ mod tests {
         assert_eq!(config.provider, "openai");
         assert_eq!(config.api_url, "https://api.openai.com");
         assert_eq!(config.model, "gpt-4o");
+    }
+
+    #[test]
+    fn load_reads_dotenv_file() {
+        // 创建临时目录和 .env 文件
+        let temp_dir = std::env::temp_dir().join(".env_test_dotenv_dir");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let env_path = temp_dir.join(".env");
+        std::fs::write(&env_path, "MODEL_API_KEY=from-dotenv-file\n").unwrap();
+
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: None,
+            model: None,
+            max_turns: None,
+            workdir: Some(temp_dir.clone()),
+            system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.api_key, "from-dotenv-file");
+
+        // 清理
+        unsafe {
+            std::env::remove_var("MODEL_API_KEY");
+        }
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn cli_parses_web_subcommand() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "web", "--host", "0.0.0.0", "--port", "9999"]);
+        match cli.command {
+            Some(Command::Web { host, port }) => {
+                assert_eq!(host, "0.0.0.0");
+                assert_eq!(port, 9999);
+            }
+            other => panic!("expected Web command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_web_subcommand_defaults() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "web"]);
+        match cli.command {
+            Some(Command::Web { host, port }) => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 7292);
+            }
+            other => panic!("expected Web command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_no_subcommand_has_none_command() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
+        assert!(cli.command.is_none());
     }
 }
