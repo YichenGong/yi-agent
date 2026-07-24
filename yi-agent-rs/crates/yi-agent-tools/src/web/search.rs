@@ -55,9 +55,11 @@ impl Tool for WebSearchTool {
         };
 
         let count = args.count.unwrap_or(DEFAULT_COUNT);
+        tracing::info!(tool = "web_search", query = %args.query, count, "search start");
 
         match self.engine.search(&args.query, count).await {
             Ok(results) => {
+                tracing::info!(tool = "web_search", result_count = results.len(), "search done");
                 if results.is_empty() {
                     ToolResult::text("no results")
                 } else {
@@ -65,7 +67,10 @@ impl Tool for WebSearchTool {
                     ToolResult::text(formatted)
                 }
             }
-            Err(e) => e.into(),
+            Err(e) => {
+                tracing::warn!(tool = "web_search", error = %e, "search failed");
+                e.into()
+            }
         }
     }
 

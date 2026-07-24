@@ -6,6 +6,7 @@ mod config;
 mod file_ref;
 mod input;
 mod render;
+mod tracing_init;
 
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use crate::app::App;
 use crate::config::{Cli, Command};
 
 fn main() -> Result<()> {
+    let _trace_guard = tracing_init::init();
     let cli = Cli::parse();
 
     match cli.command {

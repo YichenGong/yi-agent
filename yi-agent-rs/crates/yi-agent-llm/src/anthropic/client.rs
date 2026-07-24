@@ -97,6 +97,10 @@ impl Provider for AnthropicProvider {
         &self,
         req: ProviderRequest,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        let model = req.model.clone();
+        let msg_count = req.messages.len();
+        tracing::info!(provider = "anthropic", model = %model, msg_count, "sending request");
+
         let body: AnthropicRequest = req.into();
 
         let resp = self
@@ -109,9 +113,16 @@ impl Provider for AnthropicProvider {
             .timeout(self.timeout)
             .send()
             .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+            .map_err(|e| {
+                tracing::warn!(provider = "anthropic", error = %e, "request failed");
+                ProviderError::Network(e.to_string())
+            })?;
+
+        let status = resp.status();
+        tracing::info!(provider = "anthropic", status = %status, "response received");
 
         if !resp.status().is_success() {
+            tracing::warn!(provider = "anthropic", status = %status, "error response");
             return Err(map_status_error(resp).await);
         }
 

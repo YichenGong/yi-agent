@@ -92,15 +92,20 @@ pub async fn compact_session(
     keep_turns: u32,
 ) -> Result<Session, AgentError> {
     let messages = session.messages();
+    tracing::info!(msg_count = messages.len(), keep_turns, "compact: starting");
 
     // 找到安全拆分点：保留最近 keep_turns 个用户提示及其后的所有消息。
     // 拆分点必须落在 User 提示消息上，避免割裂 tool_use/tool_result 对。
     let split_point = match find_safe_split_point(messages, keep_turns) {
-        Some(0) | None => return Ok(session.clone()),
+        Some(0) | None => {
+            tracing::info!("compact: not enough messages, skipping");
+            return Ok(session.clone());
+        }
         Some(idx) => idx,
     };
 
     let (old_messages, recent_messages) = messages.split_at(split_point);
+    tracing::info!(old_count = old_messages.len(), recent_count = recent_messages.len(), "compact: split point found");
 
     let summary_prompt = build_summary_prompt(old_messages);
 
@@ -130,6 +135,7 @@ pub async fn compact_session(
         new_session.push(msg.clone());
     }
 
+    tracing::info!(new_msg_count = new_session.len(), summary_len = summary_text.len(), "compact: done");
     Ok(new_session)
 }
 

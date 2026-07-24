@@ -38,3 +38,8 @@ crossterm = "0.28"
 crossbeam-channel = "0.5"
 axum = "0.8"
 dotenvy = "0.15"
+
+# tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"

@@ -32,6 +32,9 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 html2md = "0.1"
 
+# tracing
+tracing = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
