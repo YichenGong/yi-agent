@@ -40,9 +40,20 @@ impl UsageStats {
 }
 
 /// Format AgentConfig for /config display.
-fn format_config(config: &AgentConfig) -> String {
-    let max_turns = config.max_turns.unwrap_or(0);
-    format!("模型: {}\n最大轮数: {}", config.model, max_turns)
+fn format_config(config: &AgentConfig, workdir: &std::path::Path) -> String {
+    let max_turns = config
+        .max_turns
+        .map_or("无限制".to_string(), |n| n.to_string());
+    let threshold = config.compact_threshold.unwrap_or(100_000);
+    let keep_turns = config.compact_keep_turns.unwrap_or(4);
+    format!(
+        "模型: {}\n工作目录: {}\n最大轮数: {}\nCompact 阈值: {} tokens\nCompact 保留轮数: {}",
+        config.model,
+        workdir.display(),
+        max_turns,
+        threshold,
+        keep_turns
+    )
 }
 
 /// 应用运行时状态。
@@ -229,7 +240,7 @@ impl App {
                             }
                         }
                         UserCommand::Config => {
-                            self.renderer.render_system(&format_config(&self.config));
+                            self.renderer.render_system(&format_config(&self.config, &self.workdir));
                         }
                     }
                 }
@@ -391,11 +402,28 @@ mod tests {
         let config = AgentConfig {
             model: "test-model".to_string(),
             max_turns: Some(42),
+            compact_threshold: Some(80_000),
+            compact_keep_turns: Some(6),
             ..Default::default()
         };
-        let s = format_config(&config);
+        let workdir = std::path::Path::new("/tmp/project");
+        let s = format_config(&config, workdir);
         assert!(s.contains("test-model"));
         assert!(s.contains("42"));
+        assert!(s.contains("/tmp/project"));
+        assert!(s.contains("80000"));
+        assert!(s.contains("6"));
+    }
+
+    #[test]
+    fn format_config_unlimited_turns() {
+        let config = AgentConfig {
+            model: "m".to_string(),
+            max_turns: None,
+            ..Default::default()
+        };
+        let s = format_config(&config, std::path::Path::new("/tmp"));
+        assert!(s.contains("无限制"));
     }
 
     #[test]
