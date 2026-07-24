@@ -183,10 +183,7 @@ mod tests {
     #[test]
     fn groups_are_ordered() {
         let g = groups();
-        assert_eq!(
-            g,
-            vec!["Model Provider", "Agent", "Tools"]
-        );
+        assert_eq!(g, vec!["Model Provider", "Agent", "Tools"]);
     }
 
     #[test]

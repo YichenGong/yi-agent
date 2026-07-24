@@ -177,13 +177,11 @@ pub fn load(cli: &Cli) -> Result<Config> {
         .or_else(|| std::env::var("YI_AGENT_SYSTEM_PROMPT").ok())
         .filter(|s| !s.is_empty());
 
-    let model_context_length = cli
-        .model_context_length
-        .or_else(|| {
-            std::env::var("YI_AGENT_MODEL_CONTEXT_LENGTH")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        });
+    let model_context_length = cli.model_context_length.or_else(|| {
+        std::env::var("YI_AGENT_MODEL_CONTEXT_LENGTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    });
 
     let compact_ratio = cli
         .compact_ratio
