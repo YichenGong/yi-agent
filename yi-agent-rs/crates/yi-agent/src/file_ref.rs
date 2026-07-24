@@ -24,7 +24,10 @@ impl std::fmt::Display for FileRefError {
             FileRefError::IsDirectory(p) => write!(f, "路径是目录: {p}"),
             FileRefError::OutsideWorkdir(p) => write!(f, "路径超出工作目录范围: {p}"),
             FileRefError::TooLarge { path, lines } => {
-                write!(f, "文件过大({lines} 行)，请让 agent 用 read 工具分段读取: {path}")
+                write!(
+                    f,
+                    "文件过大({lines} 行)，请让 agent 用 read 工具分段读取: {path}"
+                )
             }
             FileRefError::ReadFailed(msg) => write!(f, "读取文件失败: {msg}"),
         }
@@ -106,8 +109,8 @@ fn read_file_ref(path_str: &str, workdir: &Path) -> Result<String, FileRefError>
         return Err(FileRefError::IsDirectory(path_str.to_string()));
     }
 
-    let content = std::fs::read_to_string(&canonical)
-        .map_err(|e| FileRefError::ReadFailed(e.to_string()))?;
+    let content =
+        std::fs::read_to_string(&canonical).map_err(|e| FileRefError::ReadFailed(e.to_string()))?;
 
     let lines = content.lines().count();
     let bytes = content.len();
