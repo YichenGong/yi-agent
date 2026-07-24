@@ -1,5 +1,332 @@
 <!DOCTYPE html>
 <html lang="zh">
-<head><meta charset="UTF-8"><title>yi-agent 配置</title></head>
-<body><p>Loading...</p></body>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>yi-agent 配置</title>
+<style>
+  :root {
+    --bg: #1a1b26;
+    --surface: #24283b;
+    --surface-hover: #2f334d;
+    --border: #3b4261;
+    --text: #c0caf5;
+    --text-dim: #565f89;
+    --accent: #7aa2f7;
+    --accent-hover: #89b4fa;
+    --success: #9ece6a;
+    --warning: #e0af68;
+    --error: #f7768e;
+    --radius: 8px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem 1rem;
+    max-width: 800px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+  .env-path {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    margin-bottom: 2rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    word-break: break-all;
+  }
+  .group {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.25rem;
+    margin-bottom: 1.5rem;
+  }
+  .group h2 {
+    font-size: 1rem;
+    color: var(--accent);
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .field { margin-bottom: 1rem; }
+  .field:last-child { margin-bottom: 0; }
+  .field label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.85rem;
+    color: var(--text);
+    margin-bottom: 0.35rem;
+  }
+  .field .desc {
+    font-family: -apple-system, sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    font-weight: normal;
+  }
+  .field input, .field select {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.85rem;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .field input:focus, .field select:focus {
+    border-color: var(--accent);
+  }
+  .field input.modified, .field select.modified {
+    border-color: var(--warning);
+  }
+  .secret-wrapper {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+  .secret-wrapper input { flex: 1; }
+  .toggle-btn {
+    padding: 0.5rem 0.75rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .toggle-btn:hover { color: var(--text); border-color: var(--accent); }
+  .actions {
+    position: sticky;
+    bottom: 0;
+    background: var(--bg);
+    padding: 1rem 0;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+  .save-btn {
+    padding: 0.6rem 2rem;
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .save-btn:hover:not(:disabled) { background: var(--accent-hover); }
+  .save-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .status {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+  .status.unsaved { color: var(--warning); }
+  .status.saved { color: var(--success); }
+  .toast {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    padding: 0.75rem 1.25rem;
+    background: var(--success);
+    color: var(--bg);
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    font-weight: 600;
+    opacity: 0;
+    transform: translateY(-10px);
+    transition: all 0.3s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.error { background: var(--error); }
+</style>
+</head>
+<body>
+
+<h1>yi-agent 配置</h1>
+<div class="env-path" id="envPath">加载中...</div>
+<div id="groups"></div>
+
+<div class="actions">
+  <button class="save-btn" id="saveBtn" disabled>保存</button>
+  <span class="status" id="status"></span>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  let originalValues = {};
+  let currentValues = {};
+
+  async function loadConfig() {
+    const resp = await fetch('/api/config');
+    const data = await resp.json();
+    document.getElementById('envPath').textContent = data.envPath;
+
+    const container = document.getElementById('groups');
+    container.innerHTML = '';
+
+    for (const group of data.groups) {
+      const groupEl = document.createElement('div');
+      groupEl.className = 'group';
+      groupEl.innerHTML = `<h2>${group.name}</h2>`;
+
+      for (const v of group.vars) {
+        originalValues[v.key] = v.value;
+        currentValues[v.key] = v.value;
+
+        const field = document.createElement('div');
+        field.className = 'field';
+
+        const label = document.createElement('label');
+        label.innerHTML = `${v.key} <span class="desc">${v.description}</span>`;
+
+        let inputEl;
+        if (v.type === 'select') {
+          inputEl = document.createElement('select');
+          for (const opt of v.options) {
+            const o = document.createElement('option');
+            o.value = opt;
+            o.textContent = opt;
+            if (opt === v.value) o.selected = true;
+            inputEl.appendChild(o);
+          }
+        } else {
+          inputEl = document.createElement('input');
+          inputEl.type = v.type === 'secret' ? 'password' : (v.type === 'number' ? 'number' : 'text');
+          inputEl.value = v.value;
+          inputEl.placeholder = v.default || '(none)';
+        }
+
+        inputEl.dataset.key = v.key;
+        inputEl.dataset.type = v.type;
+        inputEl.dataset.masked = v.masked;
+        inputEl.addEventListener('input', onFieldChange);
+        inputEl.addEventListener('change', onFieldChange);
+
+        if (v.type === 'secret') {
+          const wrapper = document.createElement('div');
+          wrapper.className = 'secret-wrapper';
+
+          // 点击 secret 字段时清空掩码值以便编辑
+          inputEl.addEventListener('focus', () => {
+            if (inputEl.dataset.masked === 'true' && inputEl.value.includes('***')) {
+              inputEl.value = '';
+              inputEl.dataset.masked = 'false';
+            }
+          });
+
+          const toggle = document.createElement('button');
+          toggle.className = 'toggle-btn';
+          toggle.textContent = '显示';
+          toggle.type = 'button';
+          toggle.addEventListener('click', () => {
+            if (inputEl.type === 'password') {
+              inputEl.type = 'text';
+              toggle.textContent = '隐藏';
+            } else {
+              inputEl.type = 'password';
+              toggle.textContent = '显示';
+            }
+          });
+
+          wrapper.appendChild(inputEl);
+          wrapper.appendChild(toggle);
+          field.appendChild(wrapper);
+        } else {
+          field.appendChild(inputEl);
+        }
+
+        field.insertBefore(label, field.firstChild);
+        groupEl.appendChild(field);
+      }
+      container.appendChild(groupEl);
+    }
+    updateSaveButton();
+  }
+
+  function onFieldChange(e) {
+    const key = e.target.dataset.key;
+    const newValue = e.target.value;
+    currentValues[key] = newValue;
+
+    const original = originalValues[key];
+    if (newValue !== original) {
+      e.target.classList.add('modified');
+    } else {
+      e.target.classList.remove('modified');
+    }
+    updateSaveButton();
+  }
+
+  function updateSaveButton() {
+    let hasChanges = false;
+    for (const key in currentValues) {
+      if (currentValues[key] !== originalValues[key]) {
+        hasChanges = true;
+        break;
+      }
+    }
+    const btn = document.getElementById('saveBtn');
+    const status = document.getElementById('status');
+    btn.disabled = !hasChanges;
+    if (hasChanges) {
+      status.className = 'status unsaved';
+      status.textContent = '有未保存的修改';
+    } else {
+      status.className = 'status';
+      status.textContent = '';
+    }
+  }
+
+  async function save() {
+    const updates = [];
+    for (const key in currentValues) {
+      if (currentValues[key] !== originalValues[key]) {
+        updates.push({ key, value: currentValues[key] });
+      }
+    }
+    if (updates.length === 0) return;
+
+    const resp = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates }),
+    });
+
+    if (resp.ok) {
+      showToast('已保存', false);
+      await loadConfig();
+    } else {
+      const data = await resp.json().catch(() => ({}));
+      showToast(data.error || '保存失败', true);
+    }
+  }
+
+  function showToast(msg, isError) {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.className = 'toast show' + (isError ? ' error' : '');
+    setTimeout(() => toast.className = 'toast', 2500);
+  }
+
+  document.getElementById('saveBtn').addEventListener('click', save);
+  loadConfig();
+</script>
+
+</body>
 </html>
