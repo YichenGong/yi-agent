@@ -458,14 +458,16 @@ mod tests {
         // Build a session with real messages
         let mut session = Session::new();
         session.push(Message::user("hello"));
-        session.push(Message::assistant(vec![yi_agent_core::ContentBlock::Text("hi".into())]));
+        session.push(Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+            "hi".into(),
+        )]));
         assert_eq!(session.len(), 2);
 
         // Simulate /model hot-swap: rebuild agent with new model, preserve session
         let mut new_config = config.clone();
         new_config.model = "model-b".to_string();
-        let agent = Agent::new(Arc::clone(&provider), Arc::clone(&tools), new_config)
-            .with_session(session);
+        let agent =
+            Agent::new(Arc::clone(&provider), Arc::clone(&tools), new_config).with_session(session);
 
         // The new agent must have the same messages
         let restored = agent.session();

@@ -281,7 +281,9 @@ mod tests {
             content: vec![ContentBlock::Text("file content".into())],
             is_error: false,
         }]));
-        session.push(Message::assistant(vec![ContentBlock::Text("done 1".into())]));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "done 1".into(),
+        )]));
         session.push(Message::user("prompt 2"));
         session.push(Message::assistant(vec![ContentBlock::ToolUse {
             id: "t2".into(),
@@ -293,7 +295,9 @@ mod tests {
             content: vec![ContentBlock::Text("content b".into())],
             is_error: false,
         }]));
-        session.push(Message::assistant(vec![ContentBlock::Text("done 2".into())]));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "done 2".into(),
+        )]));
 
         let provider: Arc<dyn Provider> = Arc::new(SummaryProvider);
         let config = AgentConfig::default();
