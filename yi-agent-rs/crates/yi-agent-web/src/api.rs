@@ -71,8 +71,14 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
+pub struct UpdateItem {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Deserialize)]
 pub struct PutConfigRequest {
-    pub updates: Vec<(String, String)>,
+    pub updates: Vec<UpdateItem>,
 }
 
 /// PUT /api/config — 接收部分更新，写入 .env
@@ -92,14 +98,14 @@ pub async fn put_config(
 
     // 过滤掉掩码值（secret 字段未修改时前端会发回掩码值）
     let mut filtered_updates: Vec<(String, String)> = Vec::new();
-    for (key, value) in req.updates {
-        if let Some(meta) = crate::config_meta::find(&key) {
-            if meta.var_type == VarType::Secret && env_file::is_masked(&value) {
+    for item in req.updates {
+        if let Some(meta) = crate::config_meta::find(&item.key) {
+            if meta.var_type == VarType::Secret && env_file::is_masked(&item.value) {
                 // 掩码值跳过，不写入
                 continue;
             }
         }
-        filtered_updates.push((key, value));
+        filtered_updates.push((item.key, item.value));
     }
 
     match env_file::write(&state.env_path, &current, &filtered_updates) {

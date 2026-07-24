@@ -93,7 +93,7 @@ async fn put_config_writes_updates() {
 
     let body = json!({
         "updates": [
-            ["YI_AGENT_MODEL", "test-model-123"]
+            { "key": "YI_AGENT_MODEL", "value": "test-model-123" }
         ]
     });
     let request = Request::builder()
@@ -121,7 +121,7 @@ async fn put_config_skips_masked_secrets() {
     // 发送掩码值（应被跳过）
     let body = json!({
         "updates": [
-            ["MODEL_API_KEY", "sk-a***2345"]
+            { "key": "MODEL_API_KEY", "value": "sk-a***2345" }
         ]
     });
     let request = Request::builder()
