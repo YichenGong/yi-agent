@@ -34,11 +34,26 @@
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 0.85rem;
     color: var(--text-dim);
-    margin-bottom: 1.5rem;
+    margin-bottom: 0.5rem;
     padding: 0.5rem 0.75rem;
     background: var(--surface);
     border-radius: var(--radius);
     border: 1px solid var(--border);
+    word-break: break-all;
+  }
+  .env-example {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 1.5rem;
+    padding: 0.4rem 0.75rem;
+    background: var(--surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+  }
+  .env-example .label { margin-right: 0.4rem; }
+  .env-example code {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: var(--accent);
     word-break: break-all;
   }
   .layout {
@@ -217,6 +232,10 @@
 
 <h1>yi-agent 配置</h1>
 <div class="env-path" id="envPath">加载中...</div>
+<div class="env-example" id="envExample" style="display:none;">
+  <span class="label">模板:</span>
+  <code id="envExamplePath"></code>
+</div>
 
 <div class="layout">
   <div class="sidebar" id="sidebar"></div>
@@ -252,6 +271,12 @@
     const resp = await fetch('/api/config');
     const data = await resp.json();
     document.getElementById('envPath').textContent = data.envPath;
+
+    // 显示 .env.example 模板路径
+    if (data.envExamplePath) {
+      document.getElementById('envExamplePath').textContent = data.envExamplePath;
+      document.getElementById('envExample').style.display = '';
+    }
 
     // 扁平化所有变量
     allVars = [];
@@ -360,19 +385,20 @@
     label.innerHTML = `${v.key} <span class="desc">${v.description}</span>`;
 
     let inputEl;
+    const currentValue = currentValues[v.key] !== undefined ? currentValues[v.key] : v.value;
     if (v.type === 'select') {
       inputEl = document.createElement('select');
       for (const opt of v.options) {
         const o = document.createElement('option');
         o.value = opt;
         o.textContent = opt;
-        if (opt === v.value) o.selected = true;
+        if (opt === currentValue) o.selected = true;
         inputEl.appendChild(o);
       }
     } else {
       inputEl = document.createElement('input');
       inputEl.type = v.type === 'secret' ? 'password' : (v.type === 'number' ? 'number' : 'text');
-      inputEl.value = v.value;
+      inputEl.value = currentValue;
       inputEl.placeholder = v.default || '(none)';
     }
 
