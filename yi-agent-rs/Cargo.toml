@@ -34,3 +34,5 @@ reedline = { version = "0.38", features = ["external_printer"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 crossbeam-channel = "0.5"
+axum = "0.8"
+dotenvy = "0.15"
