@@ -21,13 +21,26 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = config::load(&cli)?;
 
-    let provider: Arc<dyn Provider> = Arc::new(yi_agent_llm::AnthropicProvider::new(
-        yi_agent_llm::AnthropicProviderOpts {
-            base_url: Some(config.api_url.clone()),
-            api_key: Some(config.api_key.clone()),
-            ..Default::default()
-        },
-    )?);
+    let provider: Arc<dyn Provider> = match config.provider.as_str() {
+        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
+            yi_agent_llm::AnthropicProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
+            yi_agent_llm::OpenaiProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        other => anyhow::bail!(
+            "unknown provider '{}': expected 'anthropic' or 'openai'",
+            other
+        ),
+    };
 
     let mut registry = yi_agent_core::ToolRegistry::new();
     yi_agent_tools::register_builtin_tools(&mut registry, config.workdir.clone());

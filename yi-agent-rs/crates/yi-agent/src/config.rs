@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 /// 运行时配置，由 CLI 参数和环境变量合并而来。
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub provider: String,
     pub api_url: String,
     pub api_key: String,
     pub model: String,
@@ -21,6 +22,10 @@ pub struct Config {
 #[derive(clap::Parser, Debug)]
 #[command(name = "yi-agent", version, about = "Interactive AI agent CLI")]
 pub struct Cli {
+    /// LLM provider: "anthropic" or "openai" (overrides YI_AGENT_PROVIDER)
+    #[arg(long)]
+    pub provider: Option<String>,
+
     /// API endpoint URL (overrides MODEL_API_URL)
     #[arg(long)]
     pub api_url: Option<String>,
@@ -58,6 +63,12 @@ pub struct Cli {
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
 pub fn load(cli: &Cli) -> Result<Config> {
+    let provider = cli
+        .provider
+        .clone()
+        .or_else(|| std::env::var("YI_AGENT_PROVIDER").ok())
+        .unwrap_or_else(|| "anthropic".to_string());
+
     let api_key = cli
         .api_key
         .clone()
@@ -67,17 +78,26 @@ pub fn load(cli: &Cli) -> Result<Config> {
         bail!("API key is empty: set MODEL_API_KEY or use --api-key");
     }
 
+    let default_api_url = match provider.as_str() {
+        "openai" => "https://api.openai.com",
+        _ => "https://api.anthropic.com",
+    };
+    let default_model = match provider.as_str() {
+        "openai" => "gpt-4o",
+        _ => "claude-sonnet-4-20250514",
+    };
+
     let api_url = cli
         .api_url
         .clone()
         .or_else(|| std::env::var("MODEL_API_URL").ok())
-        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+        .unwrap_or_else(|| default_api_url.to_string());
 
     let model = cli
         .model
         .clone()
         .or_else(|| std::env::var("YI_AGENT_MODEL").ok())
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+        .unwrap_or_else(|| default_model.to_string());
 
     let max_turns = cli
         .max_turns
@@ -124,6 +144,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
         .unwrap_or(4);
 
     Ok(Config {
+        provider,
         api_url,
         api_key,
         model,
@@ -147,6 +168,7 @@ mod tests {
             std::env::remove_var("MODEL_API_URL");
         }
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: None,
             model: None,
@@ -168,6 +190,7 @@ mod tests {
     #[test]
     fn load_loads_from_cli_args() {
         let cli = Cli {
+            provider: Some("openai".into()),
             api_url: Some("https://example.com".into()),
             api_key: Some("test-key".into()),
             model: Some("test-model".into()),
@@ -188,6 +211,7 @@ mod tests {
     #[test]
     fn load_defaults_api_url_and_model() {
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -207,6 +231,7 @@ mod tests {
     #[test]
     fn load_includes_compact_defaults() {
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -224,6 +249,7 @@ mod tests {
     #[test]
     fn load_rejects_nonexistent_workdir() {
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -235,5 +261,41 @@ mod tests {
         };
         let result = load(&cli);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_defaults_provider_to_anthropic() {
+        let cli = Cli {
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.provider, "anthropic");
+    }
+
+    #[test]
+    fn load_defaults_openai_provider() {
+        let cli = Cli {
+            provider: Some("openai".into()),
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.api_url, "https://api.openai.com");
+        assert_eq!(config.model, "gpt-4o");
     }
 }
