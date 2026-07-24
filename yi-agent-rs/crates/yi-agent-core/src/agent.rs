@@ -13,6 +13,8 @@ use crate::provider::{
 };
 use crate::tool::{ToolRegistry, ToolResult};
 
+use tracing::{info, info_span, warn, Instrument};
+
 /// In-memory message container. No persistence.
 #[derive(Debug, Clone, Default)]
 pub struct Session {
@@ -186,9 +188,14 @@ async fn run_loop(
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
 
+    let model = config.model.clone();
+    let loop_span = info_span!("agent_loop", model = %model, msg_count = messages.len());
+    let _loop_enter = loop_span.enter();
+
     loop {
         // Check 1: THINK 前
         if cancel_token.is_cancelled() {
+            info!(turn, "agent loop cancelled before think");
             let _ = tx.send(AgentEvent::Cancelled).await;
             return;
         }
@@ -196,6 +203,7 @@ async fn run_loop(
         turn += 1;
         if let Some(max) = config.max_turns {
             if turn > max {
+                info!(turn, max, "agent loop reached max turns");
                 if tx
                     .send(AgentEvent::Done {
                         reason: DoneReason::MaxTurns,
@@ -209,6 +217,8 @@ async fn run_loop(
             }
         }
 
+        info!(turn, msg_count = messages.len(), "think: calling provider");
+
         // 1. THINK
         let req = ProviderRequest {
             model: config.model.clone(),
@@ -221,6 +231,7 @@ async fn run_loop(
         let stream = match provider.call_stream(req).await {
             Ok(s) => s,
             Err(e) => {
+                warn!(turn, error = %e, "provider call failed");
                 if tx
                     .send(AgentEvent::Error(AgentError::Provider(e)))
                     .await
@@ -237,6 +248,7 @@ async fn run_loop(
             result = accumulate_provider_stream(stream, &tx) => match result {
                 Ok(v) => v,
                 Err(e) => {
+                    warn!(turn, error = %e, "provider stream error");
                     if tx.send(AgentEvent::Error(e)).await.is_err() {
                         return;
                     }
@@ -244,6 +256,7 @@ async fn run_loop(
                 }
             },
             _ = cancel_token.cancelled() => {
+                info!(turn, "agent loop cancelled during think");
                 let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }
@@ -268,6 +281,7 @@ async fn run_loop(
             .collect();
 
         if tool_uses.is_empty() {
+            info!(turn, "agent loop done: end_turn");
             if tx
                 .send(AgentEvent::Done {
                     reason: DoneReason::EndTurn,
@@ -281,12 +295,17 @@ async fn run_loop(
         }
 
         // 3. ACT - parallel execution
+        info!(turn, tool_count = tool_uses.len(), tools = ?tool_uses.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(), "act: executing tools");
         let futures: Vec<_> = tool_uses
             .iter()
             .map(|(id, name, input)| {
                 let tools = tools.clone();
                 let tx = tx.clone();
                 async move {
+                    let tool_span = info_span!("tool_call", tool = %name, id = %id);
+                    let _enter = tool_span.enter();
+                    info!(input = %input, "tool call start");
+
                     if tx
                         .send(AgentEvent::ToolCall {
                             id: id.clone(),
@@ -304,6 +323,8 @@ async fn run_loop(
                         None => ToolResult::error(format!("tool not found: {}", name)),
                     };
 
+                    info!(is_error = result.is_error, "tool call done");
+
                     if tx
                         .send(AgentEvent::ToolResult {
                             id: id.clone(),
@@ -317,6 +338,7 @@ async fn run_loop(
 
                     (id.clone(), Some(result))
                 }
+                .instrument(info_span!("tool", name = %name, id = %id))
             })
             .collect();
 
@@ -324,6 +346,7 @@ async fn run_loop(
         let results = tokio::select! {
             r = futures::future::join_all(futures) => r,
             _ = cancel_token.cancelled() => {
+                info!(turn, "agent loop cancelled during act");
                 let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }

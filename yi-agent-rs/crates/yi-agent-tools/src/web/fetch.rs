@@ -66,22 +66,31 @@ impl Tool for WebFetchTool {
             Err(e) => return ToolsError::ArgsParse(e).into(),
         };
 
+        tracing::info!(tool = "web_fetch", url = %args.url, "fetch start");
+
         // Validate URL scheme
         let url = match reqwest::Url::parse(&args.url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u,
             Ok(u) => {
+                tracing::warn!(tool = "web_fetch", scheme = u.scheme(), "unsupported scheme");
                 return ToolsError::UnsupportedContentType(format!(
                     "unsupported scheme: {}",
                     u.scheme()
                 ))
                 .into();
             }
-            Err(e) => return ToolsError::Http(format!("invalid URL: {}", e)).into(),
+            Err(e) => {
+                tracing::warn!(tool = "web_fetch", error = %e, "invalid URL");
+                return ToolsError::Http(format!("invalid URL: {}", e)).into();
+            }
         };
 
         let resp = match self.client.get(url).send().await {
             Ok(r) => r,
-            Err(e) => return ToolsError::Http(e.to_string()).into(),
+            Err(e) => {
+                tracing::warn!(tool = "web_fetch", error = %e, "request failed");
+                return ToolsError::Http(e.to_string()).into();
+            }
         };
 
         let content_type = resp
@@ -91,29 +100,42 @@ impl Tool for WebFetchTool {
             .unwrap_or("")
             .to_string();
 
+        let status = resp.status();
+        tracing::info!(tool = "web_fetch", status = %status, content_type = %content_type, "response received");
+
         // Check body size before reading
         if let Some(len) = resp.content_length() {
             if len > MAX_BODY_SIZE as u64 {
+                tracing::warn!(tool = "web_fetch", size = len, "response too large");
                 return ToolsError::ResponseTooLarge(len as usize).into();
             }
         }
 
         let body = match resp.bytes().await {
             Ok(b) => b,
-            Err(e) => return ToolsError::Http(e.to_string()).into(),
+            Err(e) => {
+                tracing::warn!(tool = "web_fetch", error = %e, "body read failed");
+                return ToolsError::Http(e.to_string()).into();
+            }
         };
 
         if body.len() > MAX_BODY_SIZE {
+            tracing::warn!(tool = "web_fetch", size = body.len(), "body too large");
             return ToolsError::ResponseTooLarge(body.len()).into();
         }
 
         let content = match process_content(&content_type, &body) {
             Ok(c) => c,
-            Err(e) => return e.into(),
+            Err(e) => {
+                tracing::warn!(tool = "web_fetch", error = %e, "content processing failed");
+                return e.into();
+            }
         };
 
         let max_length = args.max_length.unwrap_or(DEFAULT_MAX_LENGTH);
         let content = truncate_content(&content, max_length);
+
+        tracing::info!(tool = "web_fetch", content_len = content.len(), "fetch done");
 
         ToolResult::text(content)
     }

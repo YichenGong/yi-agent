@@ -30,5 +30,9 @@ crossterm = { workspace = true }
 crossbeam-channel = { workspace = true }
 dotenvy = { workspace = true }
 
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
 [dev-dependencies]
 async-trait = "0.1"

@@ -59,7 +59,10 @@ impl Tool for BashTool {
             Err(e) => return ToolsError::ArgsParse(e).into(),
         };
 
+        tracing::info!(tool = "bash", command = %args.command, timeout = args.timeout, "executing");
+
         if let Some(reason) = is_blocked(&args.command) {
+            tracing::warn!(tool = "bash", reason = %reason, "command blocked");
             return ToolsError::CommandBlocked(reason.to_string()).into();
         }
 

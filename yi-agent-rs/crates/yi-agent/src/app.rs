@@ -124,8 +124,10 @@ impl App {
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         UserCommand::Prompt(text) => {
+                            tracing::info!(prompt_len = text.len(), "user prompt received");
                             // 如果有正在运行的 agent，先中断
                             if current_stream.is_some() {
+                                tracing::info!("cancelling current agent run for new prompt");
                                 self.agent.cancel();
                                 current_stream = None;
                             }
@@ -179,19 +181,23 @@ impl App {
                             }
                         }
                         UserCommand::Quit => {
+                            tracing::info!("user quit");
                             drop(current_stream.take());
                             break;
                         }
                         UserCommand::Interrupt => {
                             if current_stream.is_some() {
+                                tracing::info!("user interrupt: cancelling agent");
                                 self.agent.cancel();
                                 // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
                             } else {
+                                tracing::info!("user interrupt: no running agent, quitting");
                                 drop(current_stream.take());
                                 break;
                             }
                         }
                         UserCommand::Clear => {
+                            tracing::info!("user clear session");
                             current_stream = None;
                             self.usage_stats.reset_session();
                             self.agent = Agent::new(
@@ -205,6 +211,7 @@ impl App {
                             self.renderer.render_system(help_text());
                         }
                         UserCommand::Model(name) => {
+                            tracing::info!(model = %name, "user model swap");
                             current_stream = None;
                             let session = self.agent.session();
                             self.config.model = name.clone();
@@ -274,7 +281,16 @@ impl App {
                     }
                 }, if current_stream.is_some() => {
                     match event {
-                        Some(AgentEvent::Done { .. }) | Some(AgentEvent::Cancelled) => {
+                        Some(AgentEvent::Done { reason }) => {
+                            tracing::info!(?reason, "agent done");
+                            current_stream = None;
+                        }
+                        Some(AgentEvent::Cancelled) => {
+                            tracing::info!("agent cancelled");
+                            current_stream = None;
+                        }
+                        Some(AgentEvent::Error(e)) => {
+                            tracing::warn!(error = %e, "agent error");
                             current_stream = None;
                         }
                         Some(e) => {
@@ -285,6 +301,7 @@ impl App {
                         }
                         None => {
                             // stream 意外结束
+                            tracing::warn!("agent stream ended unexpectedly");
                             current_stream = None;
                         }
                     }

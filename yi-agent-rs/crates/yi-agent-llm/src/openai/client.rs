@@ -88,6 +88,10 @@ impl Provider for OpenaiProvider {
         &self,
         req: ProviderRequest,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        let model = req.model.clone();
+        let msg_count = req.messages.len();
+        tracing::info!(provider = "openai", model = %model, msg_count, "sending request");
+
         let body: OpenaiRequest = req.into();
 
         let resp = self
@@ -99,9 +103,16 @@ impl Provider for OpenaiProvider {
             .timeout(self.timeout)
             .send()
             .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+            .map_err(|e| {
+                tracing::warn!(provider = "openai", error = %e, "request failed");
+                ProviderError::Network(e.to_string())
+            })?;
+
+        let status = resp.status();
+        tracing::info!(provider = "openai", status = %status, "response received");
 
         if !resp.status().is_success() {
+            tracing::warn!(provider = "openai", status = %status, "error response");
             return Err(map_status_error(resp).await);
         }
 
