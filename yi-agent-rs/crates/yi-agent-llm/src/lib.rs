@@ -8,3 +8,6 @@ pub mod openai;
 
 pub use anthropic::client::AnthropicProvider;
 pub use anthropic::client::AnthropicProviderOpts;
+
+pub use openai::client::OpenaiProvider;
+pub use openai::client::OpenaiProviderOpts;
