@@ -7,6 +7,8 @@ pub enum UserCommand {
     Prompt(String),
     /// 退出程序
     Quit,
+    /// 中断当前 agent 运行；若 agent 空闲则退出程序
+    Interrupt,
     /// 清空对话上下文
     Clear,
     /// 切换模型
@@ -69,6 +71,22 @@ pub fn help_text() -> &'static str {
   <其他文本>    发送给 agent 作为 prompt
 
 Ctrl+C 或 ESC 可中断当前 agent 运行。"
+}
+
+/// 将 reedline 的 `Signal` 映射为 `UserCommand`。
+///
+/// - `Success(line)` → 解析为 slash 命令或普通 prompt（沿用 `parse_user_input`）
+/// - `CtrlC` → `Interrupt`（中断 agent 运行，或空闲时退出）
+/// - `CtrlD` → `Quit`（EOF，直接退出）
+///
+/// 返回 `None` 表示该信号不应产生命令（例如空行）。
+pub fn map_reedline_signal(sig: Result<reedline::Signal, std::io::Error>) -> Option<UserCommand> {
+    match sig {
+        Ok(reedline::Signal::Success(line)) => parse_user_input(&line),
+        Ok(reedline::Signal::CtrlC) => Some(UserCommand::Interrupt),
+        Ok(reedline::Signal::CtrlD) => Some(UserCommand::Quit),
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -176,5 +194,44 @@ mod tests {
             parse_user_input("/config").unwrap(),
             UserCommand::Config
         ));
+    }
+
+    #[test]
+    fn map_signal_ctrl_c_returns_interrupt() {
+        let cmd = map_reedline_signal(Ok(reedline::Signal::CtrlC));
+        assert!(matches!(cmd, Some(UserCommand::Interrupt)));
+    }
+
+    #[test]
+    fn map_signal_ctrl_d_returns_quit() {
+        let cmd = map_reedline_signal(Ok(reedline::Signal::CtrlD));
+        assert!(matches!(cmd, Some(UserCommand::Quit)));
+    }
+
+    #[test]
+    fn map_signal_success_with_text_returns_prompt() {
+        let cmd = map_reedline_signal(Ok(reedline::Signal::Success("hello".to_string())));
+        match cmd {
+            Some(UserCommand::Prompt(text)) => assert_eq!(text, "hello"),
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_signal_success_with_slash_quit_returns_quit() {
+        let cmd = map_reedline_signal(Ok(reedline::Signal::Success("/quit".to_string())));
+        assert!(matches!(cmd, Some(UserCommand::Quit)));
+    }
+
+    #[test]
+    fn map_signal_success_with_empty_line_returns_none() {
+        let cmd = map_reedline_signal(Ok(reedline::Signal::Success("   ".to_string())));
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn map_signal_error_returns_none() {
+        let cmd = map_reedline_signal(Err(std::io::Error::other("test")));
+        assert!(cmd.is_none());
     }
 }

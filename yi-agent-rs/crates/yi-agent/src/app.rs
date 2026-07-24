@@ -179,6 +179,15 @@ impl App {
                             drop(current_stream.take());
                             break;
                         }
+                        UserCommand::Interrupt => {
+                            if current_stream.is_some() {
+                                self.agent.cancel();
+                                // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
+                            } else {
+                                drop(current_stream.take());
+                                break;
+                            }
+                        }
                         UserCommand::Clear => {
                             current_stream = None;
                             self.usage_stats.reset_session();
@@ -249,16 +258,6 @@ impl App {
                     self.agent.cancel();
                     // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
                 }
-                // Ctrl+C 信号：agent 运行时中断当前任务，空闲时退出程序
-                _ = tokio::signal::ctrl_c() => {
-                    if current_stream.is_some() {
-                        self.agent.cancel();
-                        // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
-                    } else {
-                        drop(current_stream.take());
-                        break;
-                    }
-                }
                 // agent 事件流有新事件
                 event = async {
                     match &mut current_stream {
@@ -290,33 +289,21 @@ impl App {
 
 /// reedline 输入循环（运行在 spawn_blocking 中）。
 fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>) {
-    use reedline::{DefaultPrompt, Reedline, Signal};
+    use reedline::{DefaultPrompt, Reedline};
 
     let mut line_editor = Reedline::create();
     let prompt = DefaultPrompt::default();
 
     loop {
         let sig = line_editor.read_line(&prompt);
-        match sig {
-            Ok(Signal::Success(line)) => {
-                if let Some(cmd) = input::parse_user_input(&line) {
-                    if cmd_tx.blocking_send(cmd).is_err() {
-                        break; // receiver dropped, exit
-                    }
+        match input::map_reedline_signal(sig) {
+            Some(cmd) => {
+                if cmd_tx.blocking_send(cmd).is_err() {
+                    break; // receiver dropped, exit
                 }
             }
-            Ok(Signal::CtrlC) => {
-                // reedline 的 CtrlC 默认清空当前行，不退出
-                // 我们在主循环里单独监听 tokio::signal::ctrl_c()
-            }
-            Ok(Signal::CtrlD) => {
-                // EOF: 退出
-                let _ = cmd_tx.blocking_send(UserCommand::Quit);
-                break;
-            }
-            Err(_) => {
-                // 读取出错，尝试继续
-                eprintln!("输入读取错误，请重试");
+            None => {
+                // 空行或读取出错，继续
             }
         }
     }
