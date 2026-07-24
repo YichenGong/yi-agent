@@ -12,27 +12,30 @@ use crate::file_ref::expand_file_refs;
 use crate::input::{self, UserCommand, help_text};
 use crate::render::Renderer;
 
-/// Tracks cumulative token usage for /cost display.
+/// Tracks token usage: cumulative for /cost, last context size for auto-compact.
 #[derive(Debug, Clone, Default)]
 pub struct UsageStats {
-    pub total_input_tokens: u32,
-    pub total_output_tokens: u32,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub last_input_tokens: u64,
 }
 
 impl UsageStats {
     pub fn add_usage(&mut self, usage: yi_agent_core::TokenUsage) {
-        self.total_input_tokens += usage.input_tokens;
-        self.total_output_tokens += usage.output_tokens;
+        self.total_input_tokens += usage.input_tokens as u64;
+        self.total_output_tokens += usage.output_tokens as u64;
+        self.last_input_tokens = usage.input_tokens as u64;
     }
 
     pub fn reset_session(&mut self) {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
+        self.last_input_tokens = 0;
     }
 
-    #[allow(dead_code)]
-    pub fn session_token_count(&self) -> u32 {
-        self.total_input_tokens
+    /// Last API call's input token count — approximates current context size.
+    pub fn last_context_tokens(&self) -> u64 {
+        self.last_input_tokens
     }
 }
 
@@ -113,9 +116,10 @@ impl App {
                                 current_stream = None;
                             }
 
-                            // 自动 compact 检查
-                            let threshold = self.config.compact_threshold.unwrap_or(100_000);
-                            if self.usage_stats.session_token_count() > threshold {
+                            // 自动 compact 检查：用最近一次 API 调用的 input_tokens
+                            // 近似当前上下文大小（而非累计值，累计值会二次增长导致过早触发）
+                            let threshold = self.config.compact_threshold.unwrap_or(100_000) as u64;
+                            if self.usage_stats.last_context_tokens() > threshold {
                                 self.renderer.render_system("上下文接近上限，正在自动压缩...");
                                 let keep_turns = self.config.compact_keep_turns.unwrap_or(4);
                                 let session = self.agent.session();
@@ -193,8 +197,9 @@ impl App {
                         UserCommand::Cost => {
                             let input = self.usage_stats.total_input_tokens;
                             let output = self.usage_stats.total_output_tokens;
+                            let ctx = self.usage_stats.last_input_tokens;
                             self.renderer.render_system(
-                                &format!("累计用量：input {input} tokens / output {output} tokens")
+                                &format!("累计用量：input {input} tokens / output {output} tokens\n当前上下文：{ctx} tokens")
                             );
                         }
                         UserCommand::Compact => {
@@ -343,6 +348,7 @@ mod tests {
         });
         assert_eq!(stats.total_input_tokens, 300);
         assert_eq!(stats.total_output_tokens, 125);
+        assert_eq!(stats.last_input_tokens, 200);
     }
 
     #[test]
@@ -356,6 +362,28 @@ mod tests {
         stats.reset_session();
         assert_eq!(stats.total_input_tokens, 0);
         assert_eq!(stats.total_output_tokens, 0);
+        assert_eq!(stats.last_input_tokens, 0);
+    }
+
+    #[test]
+    fn last_context_tokens_tracks_most_recent_api_call() {
+        let mut stats = UsageStats::default();
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            ..Default::default()
+        });
+        // First call: context is 10K
+        assert_eq!(stats.last_context_tokens(), 10_000);
+
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 15_000,
+            output_tokens: 800,
+            ..Default::default()
+        });
+        // Second call: context grew to 15K (not 25K cumulative)
+        assert_eq!(stats.last_context_tokens(), 15_000);
+        assert_eq!(stats.total_input_tokens, 25_000); // cumulative still tracks for /cost
     }
 
     #[test]
