@@ -25,6 +25,7 @@ yi-agent-llm = { path = "crates/yi-agent-llm" }
 yi-agent-tools = { path = "crates/yi-agent-tools" }
 yi-agent-mcp = { path = "crates/yi-agent-mcp" }
 yi-agent-store = { path = "crates/yi-agent-store" }
+yi-agent-web = { path = "crates/yi-agent-web" }
 
 # 共享公共依赖
 tokio = { version = "1", features = ["full"] }

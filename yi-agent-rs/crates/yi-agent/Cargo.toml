@@ -18,6 +18,7 @@ yi-agent-llm = { workspace = true }
 yi-agent-tools = { workspace = true }
 yi-agent-mcp = { workspace = true }
 yi-agent-store = { workspace = true }
+yi-agent-web = { workspace = true }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }

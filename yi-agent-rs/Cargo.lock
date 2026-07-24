@@ -2696,6 +2696,7 @@ dependencies = [
  "yi-agent-mcp",
  "yi-agent-store",
  "yi-agent-tools",
+ "yi-agent-web",
 ]
 
 [[package]]

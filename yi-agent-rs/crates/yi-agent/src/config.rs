@@ -22,6 +22,9 @@ pub struct Config {
 #[derive(clap::Parser, Debug)]
 #[command(name = "yi-agent", version, about = "Interactive AI agent CLI")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// LLM provider: "anthropic" or "openai" (overrides YI_AGENT_PROVIDER)
     #[arg(long)]
     pub provider: Option<String>,
@@ -57,6 +60,21 @@ pub struct Cli {
     /// Number of recent turns to keep during compact
     #[arg(long)]
     pub compact_keep_turns: Option<u32>,
+}
+
+/// 子命令
+#[derive(clap::Subcommand, Debug)]
+pub enum Command {
+    /// Start web config UI
+    Web {
+        /// Host to bind
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to bind
+        #[arg(long, default_value = "7292")]
+        port: u16,
+    },
 }
 
 /// 从 CLI 参数 + 环境变量加载配置。
@@ -181,6 +199,7 @@ mod tests {
             std::env::remove_var("MODEL_API_URL");
         }
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: None,
@@ -203,6 +222,7 @@ mod tests {
     #[test]
     fn load_loads_from_cli_args() {
         let cli = Cli {
+            command: None,
             provider: Some("openai".into()),
             api_url: Some("https://example.com".into()),
             api_key: Some("test-key".into()),
@@ -224,6 +244,7 @@ mod tests {
     #[test]
     fn load_defaults_api_url_and_model() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -244,6 +265,7 @@ mod tests {
     #[test]
     fn load_includes_compact_defaults() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -262,6 +284,7 @@ mod tests {
     #[test]
     fn load_rejects_nonexistent_workdir() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -279,6 +302,7 @@ mod tests {
     #[test]
     fn load_defaults_provider_to_anthropic() {
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
@@ -296,6 +320,7 @@ mod tests {
     #[test]
     fn load_defaults_openai_provider() {
         let cli = Cli {
+            command: None,
             provider: Some("openai".into()),
             api_url: None,
             api_key: Some("test-key".into()),
@@ -321,6 +346,7 @@ mod tests {
         std::fs::write(&env_path, "MODEL_API_KEY=from-dotenv-file\n").unwrap();
 
         let cli = Cli {
+            command: None,
             provider: None,
             api_url: None,
             api_key: None,
