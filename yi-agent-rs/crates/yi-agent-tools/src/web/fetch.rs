@@ -72,7 +72,11 @@ impl Tool for WebFetchTool {
         let url = match reqwest::Url::parse(&args.url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u,
             Ok(u) => {
-                tracing::warn!(tool = "web_fetch", scheme = u.scheme(), "unsupported scheme");
+                tracing::warn!(
+                    tool = "web_fetch",
+                    scheme = u.scheme(),
+                    "unsupported scheme"
+                );
                 return ToolsError::UnsupportedContentType(format!(
                     "unsupported scheme: {}",
                     u.scheme()
@@ -135,7 +139,11 @@ impl Tool for WebFetchTool {
         let max_length = args.max_length.unwrap_or(DEFAULT_MAX_LENGTH);
         let content = truncate_content(&content, max_length);
 
-        tracing::info!(tool = "web_fetch", content_len = content.len(), "fetch done");
+        tracing::info!(
+            tool = "web_fetch",
+            content_len = content.len(),
+            "fetch done"
+        );
 
         ToolResult::text(content)
     }

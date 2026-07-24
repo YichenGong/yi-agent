@@ -13,7 +13,7 @@ use crate::provider::{
 };
 use crate::tool::{ToolRegistry, ToolResult};
 
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{Instrument, info, info_span, warn};
 
 /// In-memory message container. No persistence.
 #[derive(Debug, Clone, Default)]
