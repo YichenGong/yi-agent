@@ -87,8 +87,9 @@ pub fn mask(value: &str) -> String {
     if value.len() < 12 {
         return "***".to_string();
     }
-    let prefix = &value[..4];
-    let suffix = &value[value.len() - 4..];
+    let chars: Vec<char> = value.chars().collect();
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
     format!("{}***{}", prefix, suffix)
 }
 
@@ -204,6 +205,15 @@ mod tests {
     fn mask_exact_12_chars() {
         let m = mask("123456789012");
         assert_eq!(m, "1234***9012");
+    }
+
+    #[test]
+    fn mask_handles_multibyte_utf8() {
+        // 9 bytes = 3 Chinese chars, byte len < 12 so returns "***"
+        assert_eq!(mask("你好世"), "***");
+        // 24 bytes = 8 Chinese chars, masks first/last 4 chars without panic
+        let m = mask("你好世界你好世界");
+        assert_eq!(m, "你好世界***你好世界");
     }
 
     #[test]
