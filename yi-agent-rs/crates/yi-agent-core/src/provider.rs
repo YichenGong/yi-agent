@@ -373,4 +373,274 @@ mod tests {
         assert_eq!(received_usage.len(), 1);
         assert_eq!(received_usage[0].input_tokens, 10);
     }
+
+    #[tokio::test]
+    async fn accumulate_stream_multiple_tool_uses_in_order() {
+        let events = vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "read".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: r#"{"p":"a"}"#.into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::ToolUseStart {
+                id: "t2".into(),
+                name: "write".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t2".into(),
+                partial_json: r#"{"p":"b"}"#.into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t2".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+        let (content, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        assert_eq!(content.len(), 2);
+        match &content[0] {
+            ContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "t1");
+                assert_eq!(name, "read");
+            }
+            _ => panic!("expected ToolUse t1"),
+        }
+        match &content[1] {
+            ContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "t2");
+                assert_eq!(name, "write");
+            }
+            _ => panic!("expected ToolUse t2"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_malformed_json_returns_error() {
+        let events = vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "read".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "not valid json".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+        let result = accumulate_stream(stream, |_| {}).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProviderError::Stream(msg) => assert!(msg.contains("malformed tool use JSON")),
+            other => panic!("expected Stream error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_text_after_tool_use() {
+        let events = vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "read".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::TextDelta("after tool".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+        let (content, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(matches!(content[0], ContentBlock::ToolUse { .. }));
+        match &content[1] {
+            ContentBlock::Text(s) => assert_eq!(s, "after tool"),
+            _ => panic!("expected Text after tool"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_orphan_delta_no_panic() {
+        // Delta without a preceding Start — should be silently ignored, no panic.
+        let events = vec![
+            ProviderEvent::ToolUseDelta {
+                id: "ghost".into(),
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "ghost".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+        let (content, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        assert!(content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_empty_yields_default() {
+        let provider = MockProvider { events: vec![] };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+        let (content, stop) = accumulate_stream(stream, |_| {}).await.unwrap();
+        assert!(content.is_empty());
+        assert_eq!(stop, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_stop_sequence_reason() {
+        let events = vec![
+            text_event("stopped"),
+            ProviderEvent::Stop {
+                reason: StopReason::StopSequence,
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+        let (_, stop) = accumulate_stream(stream, |_| {}).await.unwrap();
+        assert_eq!(stop, StopReason::StopSequence);
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_other_stop_reason() {
+        let events = vec![
+            text_event("content"),
+            ProviderEvent::Stop {
+                reason: StopReason::Other("custom".into()),
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+        let (_, stop) = accumulate_stream(stream, |_| {}).await.unwrap();
+        assert_eq!(stop, StopReason::Other("custom".into()));
+    }
+
+    #[test]
+    fn provider_error_display_messages() {
+        assert_eq!(
+            ProviderError::Network("conn refused".into()).to_string(),
+            "network error: conn refused"
+        );
+        assert_eq!(
+            ProviderError::Auth("bad key".into()).to_string(),
+            "authentication failed: bad key"
+        );
+        assert_eq!(ProviderError::RateLimited.to_string(), "rate limited");
+        assert_eq!(
+            ProviderError::InvalidRequest("bad".into()).to_string(),
+            "invalid request: bad"
+        );
+        assert_eq!(
+            ProviderError::Server("500".into()).to_string(),
+            "server error: 500"
+        );
+        assert_eq!(
+            ProviderError::Stream("broken".into()).to_string(),
+            "stream error: broken"
+        );
+    }
+
+    #[test]
+    fn stop_reason_eq_variants() {
+        assert_eq!(StopReason::EndTurn, StopReason::EndTurn);
+        assert_ne!(StopReason::EndTurn, StopReason::MaxTokens);
+        assert_eq!(
+            StopReason::Other("x".into()),
+            StopReason::Other("x".into())
+        );
+        assert_ne!(
+            StopReason::Other("x".into()),
+            StopReason::Other("y".into())
+        );
+    }
+
+    #[test]
+    fn token_usage_with_cache_fields() {
+        let u = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: Some(20),
+            cache_read_input_tokens: Some(10),
+        };
+        assert_eq!(u.cache_creation_input_tokens, Some(20));
+        assert_eq!(u.cache_read_input_tokens, Some(10));
+        assert_eq!(u.input_tokens + u.output_tokens, 150);
+    }
 }

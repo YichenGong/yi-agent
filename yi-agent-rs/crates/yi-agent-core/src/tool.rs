@@ -209,4 +209,91 @@ mod tests {
         assert!(!meta.read_only);
         assert!(meta.version.is_none());
     }
+
+    #[test]
+    fn registry_replaces_same_name_tool() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        assert_eq!(reg.len(), 1);
+
+        // Register a different tool with the same name — should replace, not add.
+        reg.register(Arc::new(EchoTool));
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn registry_is_empty() {
+        let reg = ToolRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn registry_multiple_tools_schemas() {
+        struct ToolA;
+        #[async_trait]
+        impl Tool for ToolA {
+            fn name(&self) -> &str { "a" }
+            fn schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+            fn description(&self) -> &str { "Tool A" }
+            async fn call(&self, _: Value) -> ToolResult { ToolResult::text("a") }
+        }
+        struct ToolB;
+        #[async_trait]
+        impl Tool for ToolB {
+            fn name(&self) -> &str { "b" }
+            fn schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+            fn description(&self) -> &str { "Tool B" }
+            async fn call(&self, _: Value) -> ToolResult { ToolResult::text("b") }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ToolA));
+        reg.register(Arc::new(ToolB));
+        let schemas = reg.schemas();
+        assert_eq!(schemas.len(), 2);
+        // BTreeMap keeps keys sorted — "a" before "b"
+        assert_eq!(schemas[0].name, "a");
+        assert_eq!(schemas[1].name, "b");
+    }
+
+    #[test]
+    fn tool_source_mcp_variant() {
+        let source = ToolSource::Mcp { server_name: "fs".into() };
+        assert_eq!(source, ToolSource::Mcp { server_name: "fs".into() });
+        assert_ne!(source, ToolSource::Builtin);
+    }
+
+    #[test]
+    fn tool_source_plugin_variant() {
+        let source = ToolSource::Plugin { name: "my-plugin".into() };
+        assert_eq!(source, ToolSource::Plugin { name: "my-plugin".into() });
+        assert_ne!(source, ToolSource::Builtin);
+    }
+
+    #[test]
+    fn tool_metadata_with_custom_fields() {
+        let meta = ToolMetadata {
+            source: ToolSource::Mcp { server_name: "remote".into() },
+            requires_confirmation: true,
+            read_only: false,
+            version: Some("1.0.0".into()),
+        };
+        assert_eq!(meta.source, ToolSource::Mcp { server_name: "remote".into() });
+        assert!(meta.requires_confirmation);
+        assert!(!meta.read_only);
+        assert_eq!(meta.version, Some("1.0.0".into()));
+    }
+
+    #[tokio::test]
+    async fn tool_result_error_content_has_error_prefix() {
+        let r = ToolResult::error("disk full");
+        match &r.content[0] {
+            ContentBlock::Text(s) => {
+                assert!(s.contains("error:"));
+                assert!(s.contains("disk full"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
 }

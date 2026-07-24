@@ -368,8 +368,10 @@ async fn accumulate_provider_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
-    use crate::provider::{Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason};
+    use crate::message::{Message, Role};
+    use crate::provider::{
+        GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason,
+    };
     use crate::tool::{Tool, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
@@ -787,5 +789,343 @@ mod tests {
         // Give the spawned task time to notice the dropped receiver.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // No panic means success.
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_executes_parallel_tools_in_single_turn() {
+        // Provider emits two tool calls in one turn; both should execute.
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::ToolUseStart {
+                    id: "t2".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t2".into(),
+                    partial_json: r#"{"text":"b"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t2".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let stream = agent.run("parallel".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        let tool_calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCall { id, name, .. } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 2);
+
+        let tool_results: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { id, result } => Some((id.clone(), result.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 2);
+        // Both results should be successful
+        assert!(tool_results.iter().all(|(_, r)| !r.is_error));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_multi_turn_loop_three_turns() {
+        // Turn 1: tool call -> Turn 2: tool call -> Turn 3: final text
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"first"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t2".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t2".into(),
+                    partial_json: r#"{"text":"second"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t2".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("final answer".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let stream = agent.run("multi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        // Should have 2 ToolCall events
+        let tool_calls = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall { .. }))
+            .count();
+        assert_eq!(tool_calls, 2);
+
+        // Should end with Done(EndTurn)
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_propagates_provider_error() {
+        struct ErrorProvider;
+        #[async_trait]
+        impl Provider for ErrorProvider {
+            async fn call_stream(
+                &self,
+                _req: ProviderRequest,
+            ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+                Err(ProviderError::Auth("invalid key".into()))
+            }
+        }
+
+        let provider = ErrorProvider;
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Error(AgentError::Provider(ProviderError::Auth(_)))
+            )),
+            "should have Provider Auth error event"
+        );
+        // Should NOT have a Done event
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
+            "should NOT have Done event after error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_session_history_after_multi_turn() {
+        // After 2 tool turns + final text:
+        // user(1) + assistant_turn1(1) + tool_results(1) + assistant_turn2(1) + tool_results(1) + assistant_final(1) = 6
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("final".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let stream = agent.run("start".into()).await.unwrap();
+        let _ = collect_events(stream);
+
+        let session = agent.session();
+        // user(1) + assistant(1) + tool_results(1) + assistant(1) = 4
+        assert_eq!(session.len(), 4);
+        assert_eq!(session.messages()[0].role, Role::User);
+        assert_eq!(session.messages()[1].role, Role::Assistant);
+        assert_eq!(session.messages()[2].role, Role::Tool);
+        assert_eq!(session.messages()[3].role, Role::Assistant);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_sequential_runs_accumulate_session() {
+        // First run: text only -> user + assistant = 2 messages
+        // Second run: text only -> + user + assistant = 4 messages
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::TextDelta("first".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("second".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        // First run
+        let stream1 = agent.run("prompt1".into()).await.unwrap();
+        let _ = collect_events(stream1);
+        assert_eq!(agent.session().len(), 2);
+
+        // Second run — session should accumulate
+        let stream2 = agent.run("prompt2".into()).await.unwrap();
+        let _ = collect_events(stream2);
+        assert_eq!(agent.session().len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_assistant_text_event_preserves_content() {
+        // Verify AssistantText events carry the full text from provider.
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("Hello ".into()),
+            ProviderEvent::TextDelta("World".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::AssistantText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello World");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_max_turns_zero_immediate_done() {
+        // With max_turns=0: turn 1 > 0 immediately -> MaxTurns before any provider call.
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("unreachable".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let config = AgentConfig {
+            max_turns: Some(0),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Arc::new(provider), tools, config);
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { reason: DoneReason::MaxTurns })));
+        // Should not have any assistant text since provider was never called
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AssistantText(_))),
+            "should NOT have AssistantText with max_turns=0"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_before_run_emits_cancelled() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        // Cancel before run starts
+        agent.cancel();
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "should have Cancelled event when pre-cancelled"
+        );
+    }
+
+    #[test]
+    fn agent_config_default_model() {
+        let config = AgentConfig::default();
+        assert_eq!(config.model, "claude-sonnet-4-5");
+        assert_eq!(config.max_turns, Some(100));
+        assert!(config.system_prompt.is_none());
+    }
+
+    #[test]
+    fn agent_config_custom_values() {
+        let config = AgentConfig {
+            model: "custom-model".into(),
+            system_prompt: Some("be brief".into()),
+            max_turns: Some(50),
+            gen_params: GenParams {
+                temperature: Some(0.7),
+                max_tokens: Some(4096),
+                ..Default::default()
+            },
+            compact_threshold: Some(50_000),
+            compact_keep_turns: Some(2),
+        };
+        assert_eq!(config.model, "custom-model");
+        assert_eq!(config.max_turns, Some(50));
+        assert_eq!(config.gen_params.temperature, Some(0.7));
     }
 }
