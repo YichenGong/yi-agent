@@ -63,6 +63,15 @@ pub struct Cli {
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
 pub fn load(cli: &Cli) -> Result<Config> {
+    // 从工作目录的 .env 文件加载环境变量（不覆盖已存在的）
+    let env_path = cli
+        .workdir
+        .as_ref()
+        .map(|w| w.join(".env"))
+        .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(PathBuf::from).map(|p| p.join(".env")))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".env"));
+    let _ = dotenvy::from_path(&env_path);
+
     let provider = cli
         .provider
         .clone()
@@ -297,5 +306,37 @@ mod tests {
         assert_eq!(config.provider, "openai");
         assert_eq!(config.api_url, "https://api.openai.com");
         assert_eq!(config.model, "gpt-4o");
+    }
+
+    #[test]
+    fn load_reads_dotenv_file() {
+        use std::io::Write;
+        // 创建临时 .env 文件
+        let temp_dir = std::env::temp_dir();
+        let env_path = temp_dir.join(".env_test_dotenv_loading");
+        let mut f = std::fs::File::create(&env_path).unwrap();
+        writeln!(f, "MODEL_API_KEY=from-dotenv-file").unwrap();
+        drop(f);
+
+        // 加载 .env
+        let _ = dotenvy::from_path(&env_path);
+
+        let cli = Cli {
+            provider: None,
+            api_url: None,
+            api_key: None,
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.api_key, "from-dotenv-file");
+
+        // 清理
+        unsafe { std::env::remove_var("MODEL_API_KEY"); }
+        std::fs::remove_file(&env_path).ok();
     }
 }

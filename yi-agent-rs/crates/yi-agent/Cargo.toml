@@ -27,6 +27,7 @@ reedline = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }
 crossbeam-channel = { workspace = true }
+dotenvy = { workspace = true }
 
 [dev-dependencies]
 async-trait = "0.1"
