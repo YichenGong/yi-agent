@@ -10,6 +10,30 @@ use yi_agent_core::{Agent, AgentConfig, AgentEvent, Provider, Session, ToolRegis
 use crate::input::{self, UserCommand, help_text};
 use crate::render::Renderer;
 
+/// Tracks cumulative token usage for /cost display.
+#[derive(Debug, Clone, Default)]
+pub struct UsageStats {
+    pub total_input_tokens: u32,
+    pub total_output_tokens: u32,
+}
+
+impl UsageStats {
+    pub fn add_usage(&mut self, usage: yi_agent_core::TokenUsage) {
+        self.total_input_tokens += usage.input_tokens;
+        self.total_output_tokens += usage.output_tokens;
+    }
+
+    pub fn reset_session(&mut self) {
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
+    }
+
+    #[allow(dead_code)]
+    pub fn session_token_count(&self) -> u32 {
+        self.total_input_tokens
+    }
+}
+
 /// 应用运行时状态。
 ///
 /// 额外持有 provider/tools/config 的 Arc，用于 `/clear` 时重建 Agent。
@@ -19,6 +43,7 @@ pub struct App {
     tools: Arc<ToolRegistry>,
     config: AgentConfig,
     renderer: Box<dyn Renderer>,
+    usage_stats: UsageStats,
 }
 
 impl App {
@@ -35,6 +60,7 @@ impl App {
             tools,
             config,
             renderer,
+            usage_stats: UsageStats::default(),
         }
     }
 
@@ -92,6 +118,7 @@ impl App {
                         }
                         UserCommand::Clear => {
                             current_stream = None;
+                            self.usage_stats.reset_session();
                             self.agent = Agent::new(
                                 Arc::clone(&self.provider),
                                 Arc::clone(&self.tools),
@@ -107,7 +134,11 @@ impl App {
                                 .render_system(&format!("切换模型到 {name}（尚未实现）"));
                         }
                         UserCommand::Cost => {
-                            self.renderer.render_system("token 用量统计尚未实现");
+                            let input = self.usage_stats.total_input_tokens;
+                            let output = self.usage_stats.total_output_tokens;
+                            self.renderer.render_system(
+                                &format!("累计用量：input {input} tokens / output {output} tokens")
+                            );
                         }
                         UserCommand::Compact => {
                             self.renderer.render_system("对话压缩尚未实现");
@@ -139,6 +170,9 @@ impl App {
                             current_stream = None;
                         }
                         Some(e) => {
+                            if let AgentEvent::Usage(u) = &e {
+                                self.usage_stats.add_usage(u.clone());
+                            }
                             self.renderer.render_agent_event(&e);
                         }
                         None => {
@@ -207,5 +241,40 @@ fn run_esc_listener(esc_tx: mpsc::Sender<()>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_tracks_token_usage() {
+        let mut stats = UsageStats::default();
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        });
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 200,
+            output_tokens: 75,
+            ..Default::default()
+        });
+        assert_eq!(stats.total_input_tokens, 300);
+        assert_eq!(stats.total_output_tokens, 125);
+    }
+
+    #[test]
+    fn usage_stats_session_reset() {
+        let mut stats = UsageStats::default();
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 500,
+            output_tokens: 100,
+            ..Default::default()
+        });
+        stats.reset_session();
+        assert_eq!(stats.total_input_tokens, 0);
+        assert_eq!(stats.total_output_tokens, 0);
     }
 }

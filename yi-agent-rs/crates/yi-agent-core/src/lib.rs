@@ -10,6 +10,6 @@ pub use agent::{Agent, AgentConfig, AgentError, AgentEvent, DoneReason, Session}
 pub use message::{ContentBlock, ImageSource, Message, Role};
 pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
-    StopReason,
+    StopReason, TokenUsage,
 };
 pub use tool::{Tool, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource};
