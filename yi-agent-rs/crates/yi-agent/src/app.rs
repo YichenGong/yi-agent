@@ -198,6 +198,10 @@ impl App {
                             );
                         }
                         UserCommand::Compact => {
+                            if current_stream.is_some() {
+                                self.agent.cancel();
+                                current_stream = None;
+                            }
                             let before_msgs = self.agent.session().len();
                             let keep_turns = self.config.compact_keep_turns.unwrap_or(4);
                             let session = self.agent.session();
