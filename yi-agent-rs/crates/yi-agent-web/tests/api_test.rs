@@ -40,14 +40,14 @@ async fn get_config_returns_all_groups() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     let groups = json["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 5); // Provider, Agent, Anthropic, OpenAI, Tools
+    assert_eq!(groups.len(), 3); // Model Provider, Agent, Tools
 
-    // 验证包含所有 14 个变量
+    // 验证包含所有 15 个变量
     let total_vars: usize = groups
         .iter()
         .map(|g| g["vars"].as_array().unwrap().len())
         .sum();
-    assert_eq!(total_vars, 14);
+    assert_eq!(total_vars, 15);
 }
 
 #[tokio::test]

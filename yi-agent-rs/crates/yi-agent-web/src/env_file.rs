@@ -45,7 +45,7 @@ fn strip_quotes(s: &str) -> String {
     s.to_string()
 }
 
-/// 将所有 14 个变量写入 .env 文件，带分组注释。
+/// 将所有 15 个变量写入 .env 文件，带分组注释。
 /// `current` 是当前已有的值，`updates` 是要覆盖的值。
 pub fn write(
     path: &Path,
@@ -163,7 +163,7 @@ mod tests {
         for var in ALL_VARS {
             assert!(content.contains(var.key), "missing {} in output", var.key);
         }
-        assert!(content.contains("# === Provider ==="));
+        assert!(content.contains("# === Model Provider ==="));
         assert!(content.contains("# === Agent ==="));
     }
 
