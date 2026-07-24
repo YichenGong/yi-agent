@@ -70,7 +70,11 @@ pub fn load(cli: &Cli) -> Result<Config> {
         .map(|w| w.join(".env"))
         .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(PathBuf::from).map(|p| p.join(".env")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".env"));
-    let _ = dotenvy::from_path(&env_path);
+    if let Err(e) = dotenvy::from_path(&env_path) {
+        if !e.not_found() {
+            eprintln!("warning: failed to load .env from {}: {}", env_path.display(), e);
+        }
+    }
 
     let provider = cli
         .provider
@@ -310,16 +314,11 @@ mod tests {
 
     #[test]
     fn load_reads_dotenv_file() {
-        use std::io::Write;
-        // 创建临时 .env 文件
-        let temp_dir = std::env::temp_dir();
-        let env_path = temp_dir.join(".env_test_dotenv_loading");
-        let mut f = std::fs::File::create(&env_path).unwrap();
-        writeln!(f, "MODEL_API_KEY=from-dotenv-file").unwrap();
-        drop(f);
-
-        // 加载 .env
-        let _ = dotenvy::from_path(&env_path);
+        // 创建临时目录和 .env 文件
+        let temp_dir = std::env::temp_dir().join(".env_test_dotenv_dir");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let env_path = temp_dir.join(".env");
+        std::fs::write(&env_path, "MODEL_API_KEY=from-dotenv-file\n").unwrap();
 
         let cli = Cli {
             provider: None,
@@ -327,7 +326,7 @@ mod tests {
             api_key: None,
             model: None,
             max_turns: None,
-            workdir: Some(PathBuf::from(".")),
+            workdir: Some(temp_dir.clone()),
             system_prompt: None,
             compact_threshold: None,
             compact_keep_turns: None,
@@ -337,6 +336,6 @@ mod tests {
 
         // 清理
         unsafe { std::env::remove_var("MODEL_API_KEY"); }
-        std::fs::remove_file(&env_path).ok();
+        std::fs::remove_dir_all(&temp_dir).ok();
     }
 }
