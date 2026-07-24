@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 /// 运行时配置，由 CLI 参数和环境变量合并而来。
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub provider: String,
     pub api_url: String,
     pub api_key: String,
     pub model: String,
@@ -21,6 +22,10 @@ pub struct Config {
 #[derive(clap::Parser, Debug)]
 #[command(name = "yi-agent", version, about = "Interactive AI agent CLI")]
 pub struct Cli {
+    /// LLM provider: "anthropic" or "openai" (overrides YI_AGENT_PROVIDER)
+    #[arg(long)]
+    pub provider: Option<String>,
+
     /// API endpoint URL (overrides MODEL_API_URL)
     #[arg(long)]
     pub api_url: Option<String>,
@@ -58,6 +63,12 @@ pub struct Cli {
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
 pub fn load(cli: &Cli) -> Result<Config> {
+    let provider = cli
+        .provider
+        .clone()
+        .or_else(|| std::env::var("YI_AGENT_PROVIDER").ok())
+        .unwrap_or_else(|| "anthropic".to_string());
+
     let api_key = cli
         .api_key
         .clone()
@@ -124,6 +135,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
         .unwrap_or(4);
 
     Ok(Config {
+        provider,
         api_url,
         api_key,
         model,
@@ -147,6 +159,7 @@ mod tests {
             std::env::remove_var("MODEL_API_URL");
         }
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: None,
             model: None,
@@ -168,6 +181,7 @@ mod tests {
     #[test]
     fn load_loads_from_cli_args() {
         let cli = Cli {
+            provider: Some("openai".into()),
             api_url: Some("https://example.com".into()),
             api_key: Some("test-key".into()),
             model: Some("test-model".into()),
@@ -188,6 +202,7 @@ mod tests {
     #[test]
     fn load_defaults_api_url_and_model() {
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -207,6 +222,7 @@ mod tests {
     #[test]
     fn load_includes_compact_defaults() {
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -224,6 +240,7 @@ mod tests {
     #[test]
     fn load_rejects_nonexistent_workdir() {
         let cli = Cli {
+            provider: None,
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -235,5 +252,22 @@ mod tests {
         };
         let result = load(&cli);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_defaults_provider_to_anthropic() {
+        let cli = Cli {
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.provider, "anthropic");
     }
 }
