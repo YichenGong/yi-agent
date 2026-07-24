@@ -19,6 +19,8 @@ pub enum UserCommand {
     Config,
     /// 显示帮助
     Help,
+    /// 中断当前 agent 运行（来自 reedline 的 ESC/Ctrl+C 信号）
+    Interrupt,
 }
 
 /// 将一行输入解析为 UserCommand。
