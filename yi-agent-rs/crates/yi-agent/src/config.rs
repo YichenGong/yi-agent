@@ -78,17 +78,26 @@ pub fn load(cli: &Cli) -> Result<Config> {
         bail!("API key is empty: set MODEL_API_KEY or use --api-key");
     }
 
+    let default_api_url = match provider.as_str() {
+        "openai" => "https://api.openai.com",
+        _ => "https://api.anthropic.com",
+    };
+    let default_model = match provider.as_str() {
+        "openai" => "gpt-4o",
+        _ => "claude-sonnet-4-20250514",
+    };
+
     let api_url = cli
         .api_url
         .clone()
         .or_else(|| std::env::var("MODEL_API_URL").ok())
-        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+        .unwrap_or_else(|| default_api_url.to_string());
 
     let model = cli
         .model
         .clone()
         .or_else(|| std::env::var("YI_AGENT_MODEL").ok())
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+        .unwrap_or_else(|| default_model.to_string());
 
     let max_turns = cli
         .max_turns
@@ -269,5 +278,24 @@ mod tests {
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "anthropic");
+    }
+
+    #[test]
+    fn load_defaults_openai_provider() {
+        let cli = Cli {
+            provider: Some("openai".into()),
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.api_url, "https://api.openai.com");
+        assert_eq!(config.model, "gpt-4o");
     }
 }
