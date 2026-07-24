@@ -12,34 +12,48 @@ use crate::file_ref::expand_file_refs;
 use crate::input::{self, UserCommand, help_text};
 use crate::render::Renderer;
 
-/// Tracks cumulative token usage for /cost display.
+/// Tracks token usage: cumulative for /cost, last context size for auto-compact.
 #[derive(Debug, Clone, Default)]
 pub struct UsageStats {
-    pub total_input_tokens: u32,
-    pub total_output_tokens: u32,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub last_input_tokens: u64,
 }
 
 impl UsageStats {
     pub fn add_usage(&mut self, usage: yi_agent_core::TokenUsage) {
-        self.total_input_tokens += usage.input_tokens;
-        self.total_output_tokens += usage.output_tokens;
+        self.total_input_tokens += usage.input_tokens as u64;
+        self.total_output_tokens += usage.output_tokens as u64;
+        self.last_input_tokens = usage.input_tokens as u64;
     }
 
     pub fn reset_session(&mut self) {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
+        self.last_input_tokens = 0;
     }
 
-    #[allow(dead_code)]
-    pub fn session_token_count(&self) -> u32 {
-        self.total_input_tokens
+    /// Last API call's input token count — approximates current context size.
+    pub fn last_context_tokens(&self) -> u64 {
+        self.last_input_tokens
     }
 }
 
 /// Format AgentConfig for /config display.
-fn format_config(config: &AgentConfig) -> String {
-    let max_turns = config.max_turns.unwrap_or(0);
-    format!("模型: {}\n最大轮数: {}", config.model, max_turns)
+fn format_config(config: &AgentConfig, workdir: &std::path::Path) -> String {
+    let max_turns = config
+        .max_turns
+        .map_or("无限制".to_string(), |n| n.to_string());
+    let threshold = config.compact_threshold.unwrap_or(100_000);
+    let keep_turns = config.compact_keep_turns.unwrap_or(4);
+    format!(
+        "模型: {}\n工作目录: {}\n最大轮数: {}\nCompact 阈值: {} tokens\nCompact 保留轮数: {}",
+        config.model,
+        workdir.display(),
+        max_turns,
+        threshold,
+        keep_turns
+    )
 }
 
 /// 应用运行时状态。
@@ -113,9 +127,10 @@ impl App {
                                 current_stream = None;
                             }
 
-                            // 自动 compact 检查
-                            let threshold = self.config.compact_threshold.unwrap_or(100_000);
-                            if self.usage_stats.session_token_count() > threshold {
+                            // 自动 compact 检查：用最近一次 API 调用的 input_tokens
+                            // 近似当前上下文大小（而非累计值，累计值会二次增长导致过早触发）
+                            let threshold = self.config.compact_threshold.unwrap_or(100_000) as u64;
+                            if self.usage_stats.last_context_tokens() > threshold {
                                 self.renderer.render_system("上下文接近上限，正在自动压缩...");
                                 let keep_turns = self.config.compact_keep_turns.unwrap_or(4);
                                 let session = self.agent.session();
@@ -193,11 +208,16 @@ impl App {
                         UserCommand::Cost => {
                             let input = self.usage_stats.total_input_tokens;
                             let output = self.usage_stats.total_output_tokens;
+                            let ctx = self.usage_stats.last_input_tokens;
                             self.renderer.render_system(
-                                &format!("累计用量：input {input} tokens / output {output} tokens")
+                                &format!("累计用量：input {input} tokens / output {output} tokens\n当前上下文：{ctx} tokens")
                             );
                         }
                         UserCommand::Compact => {
+                            if current_stream.is_some() {
+                                self.agent.cancel();
+                                current_stream = None;
+                            }
                             let before_msgs = self.agent.session().len();
                             let keep_turns = self.config.compact_keep_turns.unwrap_or(4);
                             let session = self.agent.session();
@@ -220,7 +240,7 @@ impl App {
                             }
                         }
                         UserCommand::Config => {
-                            self.renderer.render_system(&format_config(&self.config));
+                            self.renderer.render_system(&format_config(&self.config, &self.workdir));
                         }
                     }
                 }
@@ -324,6 +344,21 @@ fn run_esc_listener(esc_tx: mpsc::Sender<()>) {
 mod tests {
     use super::*;
 
+    /// No-op provider for testing Agent construction without API calls.
+    struct NoopProvider;
+    #[async_trait::async_trait]
+    impl yi_agent_core::Provider for NoopProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::ProviderEvent>,
+            yi_agent_core::ProviderError,
+        > {
+            unimplemented!("NoopProvider is for construction-only tests")
+        }
+    }
+
     #[test]
     fn app_tracks_token_usage() {
         let mut stats = UsageStats::default();
@@ -339,6 +374,7 @@ mod tests {
         });
         assert_eq!(stats.total_input_tokens, 300);
         assert_eq!(stats.total_output_tokens, 125);
+        assert_eq!(stats.last_input_tokens, 200);
     }
 
     #[test]
@@ -352,6 +388,28 @@ mod tests {
         stats.reset_session();
         assert_eq!(stats.total_input_tokens, 0);
         assert_eq!(stats.total_output_tokens, 0);
+        assert_eq!(stats.last_input_tokens, 0);
+    }
+
+    #[test]
+    fn last_context_tokens_tracks_most_recent_api_call() {
+        let mut stats = UsageStats::default();
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            ..Default::default()
+        });
+        // First call: context is 10K
+        assert_eq!(stats.last_context_tokens(), 10_000);
+
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 15_000,
+            output_tokens: 800,
+            ..Default::default()
+        });
+        // Second call: context grew to 15K (not 25K cumulative)
+        assert_eq!(stats.last_context_tokens(), 15_000);
+        assert_eq!(stats.total_input_tokens, 25_000); // cumulative still tracks for /cost
     }
 
     #[test]
@@ -359,33 +417,85 @@ mod tests {
         let config = AgentConfig {
             model: "test-model".to_string(),
             max_turns: Some(42),
+            compact_threshold: Some(80_000),
+            compact_keep_turns: Some(6),
             ..Default::default()
         };
-        let s = format_config(&config);
+        let workdir = std::path::Path::new("/tmp/project");
+        let s = format_config(&config, workdir);
         assert!(s.contains("test-model"));
         assert!(s.contains("42"));
+        assert!(s.contains("/tmp/project"));
+        assert!(s.contains("80000"));
+        assert!(s.contains("6"));
+    }
+
+    #[test]
+    fn format_config_unlimited_turns() {
+        let config = AgentConfig {
+            model: "m".to_string(),
+            max_turns: None,
+            ..Default::default()
+        };
+        let s = format_config(&config, std::path::Path::new("/tmp"));
+        assert!(s.contains("无限制"));
     }
 
     #[test]
     fn model_swap_preserves_session() {
+        // Verify Agent::new().with_session(session) actually retains messages.
+        // This tests the real code path used by /model hot-swap, not just
+        // Session::clone().
+        use yi_agent_core::{Agent, Message, ToolRegistry};
+
+        let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+        let tools = Arc::new(ToolRegistry::new());
+        let config = AgentConfig {
+            model: "model-a".to_string(),
+            ..Default::default()
+        };
+
+        // Build a session with real messages
         let mut session = Session::new();
-        session.push(yi_agent_core::Message::user("hello"));
-        let session_clone = session.clone();
-        assert_eq!(session_clone.len(), 1);
-        assert_eq!(session_clone.messages().len(), 1);
+        session.push(Message::user("hello"));
+        session.push(Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+            "hi".into(),
+        )]));
+        assert_eq!(session.len(), 2);
+
+        // Simulate /model hot-swap: rebuild agent with new model, preserve session
+        let mut new_config = config.clone();
+        new_config.model = "model-b".to_string();
+        let agent =
+            Agent::new(Arc::clone(&provider), Arc::clone(&tools), new_config).with_session(session);
+
+        // The new agent must have the same messages
+        let restored = agent.session();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.messages()[0].role, yi_agent_core::Role::User);
+        assert_eq!(restored.messages()[1].role, yi_agent_core::Role::Assistant);
     }
 
     #[test]
-    fn should_trigger_compact_above_threshold() {
-        let threshold = 100_000u32;
-        let current_tokens = 120_000u32;
-        assert!(current_tokens > threshold);
-    }
+    fn auto_compact_triggers_when_context_exceeds_threshold() {
+        // Test the actual trigger logic: last_context_tokens > threshold
+        let mut stats = UsageStats::default();
+        let threshold = 100_000u64;
 
-    #[test]
-    fn should_not_trigger_compact_below_threshold() {
-        let threshold = 100_000u32;
-        let current_tokens = 50_000u32;
-        assert!(current_tokens <= threshold);
+        // Below threshold — no compact
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        });
+        assert!(stats.last_context_tokens() <= threshold);
+
+        // Above threshold — should trigger
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 120_000,
+            output_tokens: 2_000,
+            ..Default::default()
+        });
+        assert!(stats.last_context_tokens() > threshold);
     }
 }
