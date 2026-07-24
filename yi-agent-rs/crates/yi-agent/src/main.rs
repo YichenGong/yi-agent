@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod file_ref;
 mod input;
 mod render;
 
@@ -35,6 +36,8 @@ fn main() -> Result<()> {
         model: config.model.clone(),
         system_prompt: config.system_prompt.clone(),
         max_turns: Some(config.max_turns),
+        compact_threshold: Some(config.compact_threshold),
+        compact_keep_turns: Some(config.compact_keep_turns),
         ..Default::default()
     };
 

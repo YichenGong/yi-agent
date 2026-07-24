@@ -13,6 +13,8 @@ pub struct Config {
     pub max_turns: u32,
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
+    pub compact_threshold: u32,
+    pub compact_keep_turns: u32,
 }
 
 /// clap CLI 参数定义。
@@ -42,6 +44,14 @@ pub struct Cli {
     /// Custom system prompt
     #[arg(long)]
     pub system_prompt: Option<String>,
+
+    /// Token threshold for auto-compact
+    #[arg(long)]
+    pub compact_threshold: Option<u32>,
+
+    /// Number of recent turns to keep during compact
+    #[arg(long)]
+    pub compact_keep_turns: Option<u32>,
 }
 
 /// 从 CLI 参数 + 环境变量加载配置。
@@ -95,6 +105,24 @@ pub fn load(cli: &Cli) -> Result<Config> {
         .or_else(|| std::env::var("YI_AGENT_SYSTEM_PROMPT").ok())
         .filter(|s| !s.is_empty());
 
+    let compact_threshold = cli
+        .compact_threshold
+        .or_else(|| {
+            std::env::var("YI_AGENT_COMPACT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(100_000);
+
+    let compact_keep_turns = cli
+        .compact_keep_turns
+        .or_else(|| {
+            std::env::var("YI_AGENT_COMPACT_KEEP_TURNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(4);
+
     Ok(Config {
         api_url,
         api_key,
@@ -102,6 +130,8 @@ pub fn load(cli: &Cli) -> Result<Config> {
         max_turns,
         workdir,
         system_prompt,
+        compact_threshold,
+        compact_keep_turns,
     })
 }
 
@@ -123,6 +153,8 @@ mod tests {
             max_turns: None,
             workdir: None,
             system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -142,6 +174,8 @@ mod tests {
             max_turns: Some(5),
             workdir: Some(PathBuf::from(".")),
             system_prompt: Some("custom prompt".into()),
+            compact_threshold: None,
+            compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://example.com");
@@ -160,12 +194,31 @@ mod tests {
             max_turns: None,
             workdir: Some(PathBuf::from(".")),
             system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
         assert_eq!(config.model, "claude-sonnet-4-20250514");
         assert_eq!(config.max_turns, 20);
         assert!(config.system_prompt.is_none());
+    }
+
+    #[test]
+    fn load_includes_compact_defaults() {
+        let cli = Cli {
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.compact_threshold, 100_000);
+        assert_eq!(config.compact_keep_turns, 4);
     }
 
     #[test]
@@ -177,6 +230,8 @@ mod tests {
             max_turns: None,
             workdir: Some(PathBuf::from("/nonexistent/path/that/should/not/exist")),
             system_prompt: None,
+            compact_threshold: None,
+            compact_keep_turns: None,
         };
         let result = load(&cli);
         assert!(result.is_err());

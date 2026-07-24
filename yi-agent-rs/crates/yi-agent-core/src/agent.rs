@@ -53,6 +53,10 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     pub max_turns: Option<u32>,
     pub gen_params: GenParams,
+    /// Token count threshold to trigger auto-compact.
+    pub compact_threshold: Option<u32>,
+    /// Number of recent turns to keep during compact.
+    pub compact_keep_turns: Option<u32>,
 }
 
 impl Default for AgentConfig {
@@ -62,6 +66,8 @@ impl Default for AgentConfig {
             system_prompt: None,
             max_turns: Some(100),
             gen_params: Default::default(),
+            compact_threshold: Some(100_000),
+            compact_keep_turns: Some(4),
         }
     }
 }
@@ -760,6 +766,13 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::ToolResult { .. })),
             "should NOT have ToolResult (tool was still running)"
         );
+    }
+
+    #[test]
+    fn agent_config_has_compact_fields() {
+        let config = AgentConfig::default();
+        assert!(config.compact_threshold.is_some());
+        assert!(config.compact_keep_turns.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]
