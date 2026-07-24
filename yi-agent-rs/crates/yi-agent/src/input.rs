@@ -9,6 +9,14 @@ pub enum UserCommand {
     Quit,
     /// 清空对话上下文
     Clear,
+    /// 切换模型
+    Model(String),
+    /// 显示 token 用量
+    Cost,
+    /// 手动压缩对话
+    Compact,
+    /// 显示当前配置
+    Config,
     /// 显示帮助
     Help,
 }
@@ -32,6 +40,16 @@ pub fn parse_user_input(line: &str) -> Option<UserCommand> {
     match command {
         "quit" | "q" | "exit" => Some(UserCommand::Quit),
         "clear" => Some(UserCommand::Clear),
+        "model" => {
+            if let Some(name) = parts.get(1) {
+                Some(UserCommand::Model(name.to_string()))
+            } else {
+                Some(UserCommand::Prompt(trimmed.to_string()))
+            }
+        }
+        "cost" => Some(UserCommand::Cost),
+        "compact" => Some(UserCommand::Compact),
+        "config" => Some(UserCommand::Config),
         "help" | "h" | "?" => Some(UserCommand::Help),
         _ => Some(UserCommand::Prompt(trimmed.to_string())), // 未知 / 命令当普通输入
     }
@@ -43,6 +61,10 @@ pub fn help_text() -> &'static str {
 可用命令：
   /quit, /q    退出
   /clear       清空对话上下文
+  /model <name>  切换模型
+  /cost        显示 token 用量
+  /compact     手动压缩对话
+  /config      显示当前配置
   /help, /h    显示此帮助
   <其他文本>    发送给 agent 作为 prompt
 
@@ -112,5 +134,47 @@ mod tests {
     fn parse_trims_whitespace() {
         let cmd = parse_user_input("  /quit  ").unwrap();
         assert!(matches!(cmd, UserCommand::Quit));
+    }
+
+    #[test]
+    fn parse_model_command() {
+        let cmd = parse_user_input("/model claude-sonnet-4-5").unwrap();
+        match cmd {
+            UserCommand::Model(name) => assert_eq!(name, "claude-sonnet-4-5"),
+            _ => panic!("expected Model"),
+        }
+    }
+
+    #[test]
+    fn parse_model_command_no_arg_returns_prompt() {
+        let cmd = parse_user_input("/model").unwrap();
+        match cmd {
+            UserCommand::Prompt(_) => {}
+            _ => panic!("expected Prompt for /model without arg"),
+        }
+    }
+
+    #[test]
+    fn parse_cost_command() {
+        assert!(matches!(
+            parse_user_input("/cost").unwrap(),
+            UserCommand::Cost
+        ));
+    }
+
+    #[test]
+    fn parse_compact_command() {
+        assert!(matches!(
+            parse_user_input("/compact").unwrap(),
+            UserCommand::Compact
+        ));
+    }
+
+    #[test]
+    fn parse_config_command() {
+        assert!(matches!(
+            parse_user_input("/config").unwrap(),
+            UserCommand::Config
+        ));
     }
 }

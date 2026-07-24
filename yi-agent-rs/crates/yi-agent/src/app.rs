@@ -102,6 +102,19 @@ impl App {
                         UserCommand::Help => {
                             self.renderer.render_system(help_text());
                         }
+                        UserCommand::Model(name) => {
+                            self.renderer
+                                .render_system(&format!("切换模型到 {name}（尚未实现）"));
+                        }
+                        UserCommand::Cost => {
+                            self.renderer.render_system("token 用量统计尚未实现");
+                        }
+                        UserCommand::Compact => {
+                            self.renderer.render_system("对话压缩尚未实现");
+                        }
+                        UserCommand::Config => {
+                            self.renderer.render_system("配置显示尚未实现");
+                        }
                     }
                 }
                 // ESC 键（仅在 agent 运行时作为中断）
