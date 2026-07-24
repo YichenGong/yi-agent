@@ -26,3 +26,6 @@ serde_json = { workspace = true }
 reedline = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }
+
+[dev-dependencies]
+async-trait = "0.1"

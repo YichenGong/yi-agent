@@ -1,6 +1,7 @@
 //! yi-agent CLI 入口。
 
 mod app;
+mod compact;
 mod config;
 mod file_ref;
 mod input;
