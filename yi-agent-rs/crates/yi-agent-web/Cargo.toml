@@ -1,0 +1,18 @@
+[package]
+name = "yi-agent-web"
+description = "WebUI for yi-agent configuration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
