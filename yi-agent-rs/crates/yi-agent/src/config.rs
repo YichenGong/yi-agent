@@ -77,17 +77,21 @@ pub enum Command {
     },
 }
 
+/// 解析 .env 文件路径：优先 workdir CLI 参数，否则 YI_AGENT_WORKDIR 环境变量，否则当前目录。
+pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
+    cli.workdir
+        .as_ref()
+        .map(|w| w.join(".env"))
+        .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(PathBuf::from).map(|p| p.join(".env")))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".env"))
+}
+
 /// 从 CLI 参数 + 环境变量加载配置。
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
 pub fn load(cli: &Cli) -> Result<Config> {
     // 从工作目录的 .env 文件加载环境变量（不覆盖已存在的）
-    let env_path = cli
-        .workdir
-        .as_ref()
-        .map(|w| w.join(".env"))
-        .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(PathBuf::from).map(|p| p.join(".env")))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".env"));
+    let env_path = resolve_env_path(cli);
     if let Err(e) = dotenvy::from_path(&env_path) {
         if !e.not_found() {
             eprintln!("warning: failed to load .env from {}: {}", env_path.display(), e);
@@ -363,5 +367,38 @@ mod tests {
         // 清理
         unsafe { std::env::remove_var("MODEL_API_KEY"); }
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn cli_parses_web_subcommand() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "web", "--host", "0.0.0.0", "--port", "9999"]);
+        match cli.command {
+            Some(Command::Web { host, port }) => {
+                assert_eq!(host, "0.0.0.0");
+                assert_eq!(port, 9999);
+            }
+            other => panic!("expected Web command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_web_subcommand_defaults() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "web"]);
+        match cli.command {
+            Some(Command::Web { host, port }) => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 7292);
+            }
+            other => panic!("expected Web command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_no_subcommand_has_none_command() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
+        assert!(cli.command.is_none());
     }
 }

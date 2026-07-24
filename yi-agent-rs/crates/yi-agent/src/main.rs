@@ -21,17 +21,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Web { host, port }) => {
+        Some(Command::Web { ref host, ref port }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                // 确定 .env 路径：优先 workdir CLI 参数，否则当前目录
-                let workdir = cli
-                    .workdir
-                    .clone()
-                    .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(std::path::PathBuf::from))
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
-                let env_path = workdir.join(".env");
-                yi_agent_web::serve(&host, port, env_path).await
+                let env_path = config::resolve_env_path(&cli);
+                yi_agent_web::serve(host, *port, env_path).await
             })
         }
         None => run_agent(cli),
