@@ -14,7 +14,9 @@ pub struct Config {
     pub max_turns: u32,
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
-    pub compact_threshold: u32,
+    pub model_context_length: Option<u32>,
+    pub compact_ratio: u32,
+    pub compact_threshold: u32, // computed: context_length * ratio / 100
     pub compact_keep_turns: u32,
 }
 
@@ -53,9 +55,13 @@ pub struct Cli {
     #[arg(long)]
     pub system_prompt: Option<String>,
 
-    /// Token threshold for auto-compact
+    /// Model max context length in tokens (fallback: 200000)
     #[arg(long)]
-    pub compact_threshold: Option<u32>,
+    pub model_context_length: Option<u32>,
+
+    /// Percentage of context length triggering auto-compact (default: 80)
+    #[arg(long)]
+    pub compact_ratio: Option<u32>,
 
     /// Number of recent turns to keep during compact
     #[arg(long)]
@@ -173,14 +179,25 @@ pub fn load(cli: &Cli) -> Result<Config> {
         .or_else(|| std::env::var("YI_AGENT_SYSTEM_PROMPT").ok())
         .filter(|s| !s.is_empty());
 
-    let compact_threshold = cli
-        .compact_threshold
+    let model_context_length = cli
+        .model_context_length
         .or_else(|| {
-            std::env::var("YI_AGENT_COMPACT_THRESHOLD")
+            std::env::var("YI_AGENT_MODEL_CONTEXT_LENGTH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        });
+
+    let compact_ratio = cli
+        .compact_ratio
+        .or_else(|| {
+            std::env::var("YI_AGENT_COMPACT_RATIO")
                 .ok()
                 .and_then(|s| s.parse().ok())
         })
-        .unwrap_or(100_000);
+        .unwrap_or(80);
+
+    let effective_context_length = model_context_length.unwrap_or(200_000);
+    let compact_threshold = effective_context_length * compact_ratio / 100;
 
     let compact_keep_turns = cli
         .compact_keep_turns
@@ -199,6 +216,8 @@ pub fn load(cli: &Cli) -> Result<Config> {
         max_turns,
         workdir,
         system_prompt,
+        model_context_length,
+        compact_ratio,
         compact_threshold,
         compact_keep_turns,
     })
@@ -224,7 +243,8 @@ mod tests {
             max_turns: None,
             workdir: None,
             system_prompt: None,
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let result = load(&cli);
@@ -247,7 +267,8 @@ mod tests {
             max_turns: Some(5),
             workdir: Some(PathBuf::from(".")),
             system_prompt: Some("custom prompt".into()),
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
@@ -269,7 +290,8 @@ mod tests {
             max_turns: None,
             workdir: Some(PathBuf::from(".")),
             system_prompt: None,
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
@@ -290,12 +312,52 @@ mod tests {
             max_turns: None,
             workdir: Some(PathBuf::from(".")),
             system_prompt: None,
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
-        assert_eq!(config.compact_threshold, 100_000);
-        assert_eq!(config.compact_keep_turns, 4);
+        assert_eq!(config.compact_ratio, 80);
+        assert_eq!(config.model_context_length, None);
+        assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
+    }
+
+    #[test]
+    fn load_computes_threshold_from_context_and_ratio() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            model_context_length: Some(100_000),
+            compact_ratio: Some(50),
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.compact_threshold, 50_000); // 100000 * 50 / 100
+    }
+
+    #[test]
+    fn load_falls_back_to_default_context_length() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: Some(80),
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
     }
 
     #[test]
@@ -309,7 +371,8 @@ mod tests {
             max_turns: None,
             workdir: Some(PathBuf::from("/nonexistent/path/that/should/not/exist")),
             system_prompt: None,
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let result = load(&cli);
@@ -327,7 +390,8 @@ mod tests {
             max_turns: None,
             workdir: Some(PathBuf::from(".")),
             system_prompt: None,
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
@@ -345,7 +409,8 @@ mod tests {
             max_turns: None,
             workdir: Some(PathBuf::from(".")),
             system_prompt: None,
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
@@ -371,7 +436,8 @@ mod tests {
             max_turns: None,
             workdir: Some(temp_dir.clone()),
             system_prompt: None,
-            compact_threshold: None,
+            model_context_length: None,
+            compact_ratio: None,
             compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
