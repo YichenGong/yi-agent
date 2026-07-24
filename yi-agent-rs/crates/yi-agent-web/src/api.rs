@@ -11,10 +11,11 @@ use serde_json::{Value, json};
 use crate::config_meta::{ALL_VARS, VarType, groups};
 use crate::env_file;
 
-/// 共享状态：.env 文件路径
+/// 共享状态：.env 文件路径 + .env.example 模板路径
 #[derive(Clone)]
 pub struct AppState {
     pub env_path: PathBuf,
+    pub env_example_path: Option<PathBuf>,
 }
 
 /// GET / — 返回内嵌 HTML 页面
@@ -50,6 +51,7 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
                 "value": display_value,
                 "default": var.default,
                 "type": format!("{:?}", var.var_type).to_lowercase(),
+                "group": var.group,
                 "description": var.description,
                 "options": var.options,
                 "masked": masked,
@@ -61,11 +63,23 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         }));
     }
 
+    let env_example_path = state
+        .env_example_path
+        .as_ref()
+        .map(|p| p.display().to_string());
+
+    let env_example_content = state
+        .env_example_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+
     (
         StatusCode::OK,
         Json(json!({
             "groups": group_list,
             "envPath": state.env_path.display().to_string(),
+            "envExamplePath": env_example_path,
+            "envExampleContent": env_example_content,
         })),
     )
 }

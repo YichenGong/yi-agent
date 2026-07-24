@@ -18,10 +18,7 @@ pub fn init() -> tracing_appender::non_blocking::WorkerGuard {
     let trace_dir = trace_dir();
     let _ = std::fs::create_dir_all(&trace_dir);
 
-    let filename = format!(
-        "session-{}.jsonl",
-        chrono_local_timestamp()
-    );
+    let filename = format!("session-{}.jsonl", chrono_local_timestamp());
     let filepath = trace_dir.join(filename);
 
     let file: File = OpenOptions::new()
@@ -29,7 +26,10 @@ pub fn init() -> tracing_appender::non_blocking::WorkerGuard {
         .append(true)
         .open(&filepath)
         .unwrap_or_else(|e| {
-            eprintln!("warning: failed to open trace file {}: {e}", filepath.display());
+            eprintln!(
+                "warning: failed to open trace file {}: {e}",
+                filepath.display()
+            );
             File::create(std::path::Path::new("/dev/null")).unwrap()
         });
 

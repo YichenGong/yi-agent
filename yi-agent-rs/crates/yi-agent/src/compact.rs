@@ -105,7 +105,11 @@ pub async fn compact_session(
     };
 
     let (old_messages, recent_messages) = messages.split_at(split_point);
-    tracing::info!(old_count = old_messages.len(), recent_count = recent_messages.len(), "compact: split point found");
+    tracing::info!(
+        old_count = old_messages.len(),
+        recent_count = recent_messages.len(),
+        "compact: split point found"
+    );
 
     let summary_prompt = build_summary_prompt(old_messages);
 
@@ -135,7 +139,11 @@ pub async fn compact_session(
         new_session.push(msg.clone());
     }
 
-    tracing::info!(new_msg_count = new_session.len(), summary_len = summary_text.len(), "compact: done");
+    tracing::info!(
+        new_msg_count = new_session.len(),
+        summary_len = summary_text.len(),
+        "compact: done"
+    );
     Ok(new_session)
 }
 
