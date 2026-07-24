@@ -14,8 +14,6 @@ pub struct Config {
     pub max_turns: u32,
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
-    pub model_context_length: Option<u32>,
-    pub compact_ratio: u32,
     pub compact_threshold: u32, // computed: context_length * ratio / 100
     pub compact_keep_turns: u32,
 }
@@ -216,8 +214,6 @@ pub fn load(cli: &Cli) -> Result<Config> {
         max_turns,
         workdir,
         system_prompt,
-        model_context_length,
-        compact_ratio,
         compact_threshold,
         compact_keep_turns,
     })
@@ -317,9 +313,8 @@ mod tests {
             compact_keep_turns: None,
         };
         let config = load(&cli).unwrap();
-        assert_eq!(config.compact_ratio, 80);
-        assert_eq!(config.model_context_length, None);
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
+        assert_eq!(config.compact_keep_turns, 4);
     }
 
     #[test]
