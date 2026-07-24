@@ -94,10 +94,15 @@ impl App {
     /// 三个并发源通过 tokio::select! 协调：
     /// 1. 用户输入（reedline via spawn_blocking → mpsc channel）
     /// 2. agent 事件流（BoxStream<AgentEvent>）
-    /// 3. Ctrl+C / ESC 中断信号
+    /// 3. Ctrl+C 信号（tokio::signal::ctrl_c()）
     ///
     /// 中断通过 `agent.cancel()` 触发 CancellationToken，Agent 在
     /// 下一个检查点退出并发出 `AgentEvent::Cancelled`，由 renderer 渲染。
+    ///
+    /// 注意：ESC 键由 reedline 自身处理（绑定到 `ReedlineEvent::CtrlC`），
+    /// 通过 `UserCommand::Interrupt` 走 cmd channel。不使用独立的 crossterm
+    /// 监听线程——那会与 reedline 竞争 crossterm 的 singleton event reader，
+    /// 导致按键丢失。
     pub async fn run(mut self) -> Result<()> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<UserCommand>(16);
 
@@ -105,12 +110,6 @@ impl App {
         let cmd_tx_clone = cmd_tx.clone();
         tokio::task::spawn_blocking(move || {
             run_input_loop(cmd_tx_clone);
-        });
-
-        // ESC 监听 task（仅在 agent 运行时生效）
-        let (esc_tx, mut esc_rx) = mpsc::channel::<()>(1);
-        tokio::task::spawn_blocking(move || {
-            run_esc_listener(esc_tx);
         });
 
         let mut current_stream: Option<BoxStream<'static, AgentEvent>> = None;
@@ -253,10 +252,15 @@ impl App {
                         }
                     }
                 }
-                // ESC 键（仅在 agent 运行时作为中断）
-                Some(()) = esc_rx.recv(), if current_stream.is_some() => {
-                    self.agent.cancel();
-                    // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
+                // Ctrl+C 信号：agent 运行时中断当前任务，空闲时退出程序
+                _ = tokio::signal::ctrl_c() => {
+                    if current_stream.is_some() {
+                        self.agent.cancel();
+                        // Cancelled 事件会通过 stream 流出，由下方事件分支渲染
+                    } else {
+                        drop(current_stream.take());
+                        break;
+                    }
                 }
                 // agent 事件流有新事件
                 event = async {
@@ -288,10 +292,22 @@ impl App {
 }
 
 /// reedline 输入循环（运行在 spawn_blocking 中）。
+///
+/// ESC 键通过 reedline keybinding 绑定到 `ReedlineEvent::CtrlC`，
+/// 返回 `Signal::CtrlC` 后发送 `UserCommand::Interrupt`。
 fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>) {
-    use reedline::{DefaultPrompt, Reedline};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use reedline::{DefaultPrompt, Emacs, Reedline};
 
-    let mut line_editor = Reedline::create();
+    let mut keybindings = reedline::default_emacs_keybindings();
+    // 将 ESC 绑定到 CtrlC 事件：清空当前行并返回 Signal::CtrlC
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Esc,
+        reedline::ReedlineEvent::CtrlC,
+    );
+
+    let mut line_editor = Reedline::create().with_edit_mode(Box::new(Emacs::new(keybindings)));
     let prompt = DefaultPrompt::default();
 
     loop {
@@ -304,29 +320,6 @@ fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>) {
             }
             None => {
                 // 空行或读取出错，继续
-            }
-        }
-    }
-}
-
-/// ESC 键监听器（运行在 spawn_blocking 中）。
-///
-/// 使用 crossterm 的 event poll 监听 ESC 键。
-/// 只在 agent 运行时由主循环消费（主循环用 `if current_stream.is_some()` 守卫）。
-fn run_esc_listener(esc_tx: mpsc::Sender<()>) {
-    use crossterm::event::{self, Event, KeyCode};
-    use std::time::Duration;
-
-    loop {
-        // 每 100ms 轮询一次，避免持续阻塞导致 task 无法退出
-        if event::poll(Duration::from_millis(100)).is_err() {
-            break;
-        }
-        if let Ok(true) = event::poll(Duration::from_millis(0)) {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.code == KeyCode::Esc && esc_tx.blocking_send(()).is_err() {
-                    break; // receiver dropped
-                }
             }
         }
     }
