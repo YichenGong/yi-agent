@@ -2767,9 +2767,12 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
+ "http-body-util",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]
