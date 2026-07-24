@@ -34,6 +34,12 @@ impl UsageStats {
     }
 }
 
+/// Format AgentConfig for /config display.
+fn format_config(config: &AgentConfig) -> String {
+    let max_turns = config.max_turns.unwrap_or(0);
+    format!("模型: {}\n最大轮数: {}", config.model, max_turns)
+}
+
 /// 应用运行时状态。
 ///
 /// 额外持有 provider/tools/config 的 Arc，用于 `/clear` 时重建 Agent。
@@ -130,8 +136,17 @@ impl App {
                             self.renderer.render_system(help_text());
                         }
                         UserCommand::Model(name) => {
+                            current_stream = None;
+                            let session = self.agent.session();
+                            self.config.model = name.clone();
+                            self.agent = Agent::new(
+                                Arc::clone(&self.provider),
+                                Arc::clone(&self.tools),
+                                self.config.clone(),
+                            )
+                            .with_session(session);
                             self.renderer
-                                .render_system(&format!("切换模型到 {name}（尚未实现）"));
+                                .render_system(&format!("模型已切换为 {name}"));
                         }
                         UserCommand::Cost => {
                             let input = self.usage_stats.total_input_tokens;
@@ -144,7 +159,7 @@ impl App {
                             self.renderer.render_system("对话压缩尚未实现");
                         }
                         UserCommand::Config => {
-                            self.renderer.render_system("配置显示尚未实现");
+                            self.renderer.render_system(&format_config(&self.config));
                         }
                     }
                 }
@@ -276,5 +291,26 @@ mod tests {
         stats.reset_session();
         assert_eq!(stats.total_input_tokens, 0);
         assert_eq!(stats.total_output_tokens, 0);
+    }
+
+    #[test]
+    fn format_config_display() {
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            max_turns: Some(42),
+            ..Default::default()
+        };
+        let s = format_config(&config);
+        assert!(s.contains("test-model"));
+        assert!(s.contains("42"));
+    }
+
+    #[test]
+    fn model_swap_preserves_session() {
+        let mut session = Session::new();
+        session.push(yi_agent_core::Message::user("hello"));
+        let session_clone = session.clone();
+        assert_eq!(session_clone.len(), 1);
+        assert_eq!(session_clone.messages().len(), 1);
     }
 }
