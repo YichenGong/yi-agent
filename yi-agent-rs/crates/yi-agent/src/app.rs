@@ -344,6 +344,21 @@ fn run_esc_listener(esc_tx: mpsc::Sender<()>) {
 mod tests {
     use super::*;
 
+    /// No-op provider for testing Agent construction without API calls.
+    struct NoopProvider;
+    #[async_trait::async_trait]
+    impl yi_agent_core::Provider for NoopProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::ProviderEvent>,
+            yi_agent_core::ProviderError,
+        > {
+            unimplemented!("NoopProvider is for construction-only tests")
+        }
+    }
+
     #[test]
     fn app_tracks_token_usage() {
         let mut stats = UsageStats::default();
@@ -428,24 +443,57 @@ mod tests {
 
     #[test]
     fn model_swap_preserves_session() {
+        // Verify Agent::new().with_session(session) actually retains messages.
+        // This tests the real code path used by /model hot-swap, not just
+        // Session::clone().
+        use yi_agent_core::{Agent, Message, ToolRegistry};
+
+        let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+        let tools = Arc::new(ToolRegistry::new());
+        let config = AgentConfig {
+            model: "model-a".to_string(),
+            ..Default::default()
+        };
+
+        // Build a session with real messages
         let mut session = Session::new();
-        session.push(yi_agent_core::Message::user("hello"));
-        let session_clone = session.clone();
-        assert_eq!(session_clone.len(), 1);
-        assert_eq!(session_clone.messages().len(), 1);
+        session.push(Message::user("hello"));
+        session.push(Message::assistant(vec![yi_agent_core::ContentBlock::Text("hi".into())]));
+        assert_eq!(session.len(), 2);
+
+        // Simulate /model hot-swap: rebuild agent with new model, preserve session
+        let mut new_config = config.clone();
+        new_config.model = "model-b".to_string();
+        let agent = Agent::new(Arc::clone(&provider), Arc::clone(&tools), new_config)
+            .with_session(session);
+
+        // The new agent must have the same messages
+        let restored = agent.session();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.messages()[0].role, yi_agent_core::Role::User);
+        assert_eq!(restored.messages()[1].role, yi_agent_core::Role::Assistant);
     }
 
     #[test]
-    fn should_trigger_compact_above_threshold() {
-        let threshold = 100_000u32;
-        let current_tokens = 120_000u32;
-        assert!(current_tokens > threshold);
-    }
+    fn auto_compact_triggers_when_context_exceeds_threshold() {
+        // Test the actual trigger logic: last_context_tokens > threshold
+        let mut stats = UsageStats::default();
+        let threshold = 100_000u64;
 
-    #[test]
-    fn should_not_trigger_compact_below_threshold() {
-        let threshold = 100_000u32;
-        let current_tokens = 50_000u32;
-        assert!(current_tokens <= threshold);
+        // Below threshold — no compact
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        });
+        assert!(stats.last_context_tokens() <= threshold);
+
+        // Above threshold — should trigger
+        stats.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 120_000,
+            output_tokens: 2_000,
+            ..Default::default()
+        });
+        assert!(stats.last_context_tokens() > threshold);
     }
 }
