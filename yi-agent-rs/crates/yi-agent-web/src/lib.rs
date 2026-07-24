@@ -1,5 +1,7 @@
 //! yi-agent WebUI：通过 Web 页面管理环境变量配置。
 
+pub mod config_meta;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
