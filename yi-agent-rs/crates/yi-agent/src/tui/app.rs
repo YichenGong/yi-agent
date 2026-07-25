@@ -28,6 +28,7 @@ pub fn run_tui(
     mut agent_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::Sender<String>,
     interrupt_tx: tokio::sync::mpsc::Sender<()>,
+    decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
@@ -46,6 +47,7 @@ pub fn run_tui(
         &mut input,
         &input_tx,
         &interrupt_tx,
+        &decision_tx,
         &is_running,
         &CrosstermEventSource,
     );
@@ -82,11 +84,12 @@ pub fn run_tui_with_backend<B: Backend>(
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
-    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, is_running, &CrosstermEventSource)
+    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, decision_tx, is_running, &CrosstermEventSource)
 }
 
 /// Testable variant: accepts a custom EventSource for injecting fake key events.
@@ -95,12 +98,13 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
-    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, is_running, events)
+    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, decision_tx, is_running, events)
 }
 
 fn run_loop<B: Backend, E: EventSource>(
@@ -110,6 +114,7 @@ fn run_loop<B: Backend, E: EventSource>(
     input: &mut InputLine,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
 ) -> std::io::Result<()> {
@@ -145,7 +150,7 @@ fn run_loop<B: Backend, E: EventSource>(
 
         // Poll for key events with timeout
         if let Some(Event::Key(key)) = events.poll(Duration::from_millis(50))? {
-            match handle_key(key, input, history, input_tx, interrupt_tx, &mut pending_quit) {
+            match handle_key(key, input, history, input_tx, interrupt_tx, decision_tx, &mut pending_quit) {
                 KeyOutcome::Quit => break,
                 KeyOutcome::Submit(text) => {
                     pending_quit = false;
@@ -172,8 +177,33 @@ fn handle_key(
     history: &mut HistoryState,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     pending_quit: &mut bool,
 ) -> KeyOutcome {
+    // Check if there's a pending permission request
+    if let Some((request_id, _tool_name, prefix_suggestion, kind)) = history.pending_permission_info() {
+        let decision = match key.code {
+            KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
+            KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
+            KeyCode::Char('3') => prefix_suggestion.map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
+            KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
+            KeyCode::Enter => {
+                let default = match kind {
+                    yi_agent_core::permission::PermissionKind::Blacklisted(_) => yi_agent_core::permission::Decision::Deny,
+                    _ => yi_agent_core::permission::Decision::AllowOnce,
+                };
+                Some(default)
+            }
+            _ => None,
+        };
+        if let Some(d) = decision {
+            let _ = decision_tx.blocking_send((request_id, d));
+            return KeyOutcome::None;
+        }
+        // For other keys while permission pending, ignore (don't let user type input)
+        return KeyOutcome::None;
+    }
+
     // Global keys first
     match key.code {
         KeyCode::Esc => {
@@ -301,6 +331,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Ctrl+C then Ctrl+Q: if first Ctrl+C quit, Ctrl+Q would be unreachable.
@@ -312,7 +343,7 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &decision_tx, &is_running, &source,
         ).unwrap();
 
         // After Ctrl+C, the input row should show the confirm message
@@ -333,6 +364,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let events = Rc::new(RefCell::new(vec![
@@ -342,7 +374,7 @@ mod tests {
         let source = ScriptedEvents { events };
 
         let result = run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &decision_tx, &is_running, &source,
         );
         assert!(result.is_ok(), "two Ctrl+C should quit cleanly, got: {:?}", result);
     }
@@ -355,6 +387,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // First Esc alone should not quit
@@ -365,7 +398,7 @@ mod tests {
         let source = ScriptedEvents { events };
 
         let result = run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &decision_tx, &is_running, &source,
         );
         assert!(result.is_ok(), "two Esc should quit cleanly, got: {:?}", result);
     }
@@ -378,6 +411,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let events = Rc::new(RefCell::new(vec![
@@ -386,7 +420,7 @@ mod tests {
         let source = ScriptedEvents { events };
 
         let result = run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &decision_tx, &is_running, &source,
         );
         assert!(result.is_ok(), "Ctrl+Q should quit directly, got: {:?}", result);
     }
@@ -400,6 +434,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Script: type "hi", then Ctrl+Q to quit (don't submit, so input stays on screen)
@@ -415,6 +450,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         ).unwrap();
@@ -439,6 +475,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Send an assistant message before starting
@@ -455,6 +492,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         ).unwrap();

@@ -234,7 +234,7 @@ fn run_tui_agent(
 
         // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)
         let tui_handle = tokio::task::spawn_blocking(move || {
-            crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, is_running)
+            crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, decision_tx, is_running)
         });
 
         let result = match tui_handle.await {
@@ -246,9 +246,6 @@ fn run_tui_agent(
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
-
-        // Drop decision_tx to close the channel (cleanup)
-        drop(decision_tx);
 
         result
     });
