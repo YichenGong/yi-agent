@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod message;
+pub mod permission;
 pub mod provider;
 pub mod tool;
 
