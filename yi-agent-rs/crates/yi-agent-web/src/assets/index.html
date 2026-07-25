@@ -211,12 +211,52 @@
   }
   .toast.show { opacity: 1; transform: translateY(0); }
   .toast.error { background: var(--error); }
+  .scope-toggle {
+    display: inline-flex;
+    gap: 0;
+    margin-bottom: 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .scope-toggle button {
+    padding: 0.5rem 1.25rem;
+    background: var(--surface);
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.15s;
+  }
+  .scope-toggle button.active {
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 600;
+  }
+  .scope-toggle button:hover:not(.active) { color: var(--text); }
+  .source-label {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    margin-left: 0.5rem;
+    font-family: -apple-system, sans-serif;
+    font-weight: normal;
+  }
+  .source-local { background: var(--accent); color: var(--bg); }
+  .source-global { background: var(--success); color: var(--bg); }
+  .source-default { background: var(--surface-hover); color: var(--text-dim); }
 </style>
 </head>
 <body>
 
 <h1>yi-agent 配置</h1>
 <div class="env-path" id="envPath">加载中...</div>
+<div class="env-path" id="globalEnvPath" style="display:none;"></div>
+
+<div class="scope-toggle" id="scopeToggle">
+  <button id="scopeLocal" class="active">本地</button>
+  <button id="scopeGlobal">全局</button>
+</div>
 
 <div class="layout">
   <div class="sidebar" id="sidebar"></div>
@@ -236,6 +276,8 @@
   let currentValues = {};
   let activeTab = 'Model Provider';
   let collapsedSections = { 'Provider Credentials': true };
+  let currentScope = 'local'; // 'local' or 'global'
+  let hasGlobal = false; // whether global path is available
 
   // 定义 sections：仅 Model Provider tab 使用
   const modelProviderSections = [
@@ -248,10 +290,29 @@
     return ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'];
   }
 
+  function sourceLabel(source) {
+    if (source === 'local') return '<span class="source-label source-local">本地</span>';
+    if (source === 'global') return '<span class="source-label source-global">全局</span>';
+    if (source === 'default') return '<span class="source-label source-default">默认</span>';
+    return '';
+  }
+
   async function loadConfig() {
     const resp = await fetch('/api/config');
     const data = await resp.json();
-    document.getElementById('envPath').textContent = data.envPath;
+    document.getElementById('envPath').textContent = '本地: ' + data.envPath;
+
+    hasGlobal = !!data.globalEnvPath;
+    const globalEl = document.getElementById('globalEnvPath');
+    const scopeToggle = document.getElementById('scopeToggle');
+    if (hasGlobal) {
+      globalEl.textContent = '全局: ' + data.globalEnvPath;
+      globalEl.style.display = '';
+      scopeToggle.style.display = '';
+    } else {
+      globalEl.style.display = 'none';
+      scopeToggle.style.display = 'none';
+    }
 
     // 扁平化所有变量
     allVars = [];
@@ -357,7 +418,7 @@
     field.className = 'field';
 
     const label = document.createElement('label');
-    label.innerHTML = `${v.key} <span class="desc">${v.description}</span>`;
+    label.innerHTML = `${v.key} <span class="desc">${v.description}</span> ${sourceLabel(v.source)}`;
 
     let inputEl;
     const currentValue = currentValues[v.key] !== undefined ? currentValues[v.key] : v.value;
@@ -471,7 +532,7 @@
     const resp = await fetch('/api/config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ updates }),
+      body: JSON.stringify({ scope: currentScope, updates }),
     });
 
     if (resp.ok) {
@@ -491,6 +552,20 @@
   }
 
   document.getElementById('saveBtn').addEventListener('click', save);
+
+  document.getElementById('scopeLocal').addEventListener('click', () => {
+    currentScope = 'local';
+    document.getElementById('scopeLocal').classList.add('active');
+    document.getElementById('scopeGlobal').classList.remove('active');
+  });
+
+  document.getElementById('scopeGlobal').addEventListener('click', () => {
+    if (!hasGlobal) return;
+    currentScope = 'global';
+    document.getElementById('scopeGlobal').classList.add('active');
+    document.getElementById('scopeLocal').classList.remove('active');
+  });
+
   loadConfig();
 </script>
 

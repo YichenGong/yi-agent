@@ -135,7 +135,7 @@ fn load_one_env(path: &Path) {
 }
 
 /// 解析全局 .env 路径:~/.yi-agent/.env
-fn resolve_global_env_path() -> Option<PathBuf> {
+pub fn resolve_global_env_path() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(PathBuf::from)
@@ -143,7 +143,7 @@ fn resolve_global_env_path() -> Option<PathBuf> {
 }
 
 /// 判断是否为显式指定 workdir(CLI 参数或环境变量)
-fn is_workdir_explicit(cli: &Cli) -> bool {
+pub fn is_workdir_explicit(cli: &Cli) -> bool {
     cli.workdir.is_some()
         || std::env::var("YI_AGENT_WORKDIR")
             .ok()
