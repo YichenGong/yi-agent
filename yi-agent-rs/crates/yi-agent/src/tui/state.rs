@@ -12,6 +12,10 @@ pub enum TaskStatus {
     Done,
     Failed,
     Timeout,
+    /// Task was aborted because the agent turn ended (Done/Cancelled/Error)
+    /// without a matching ToolExit. Distinguishes "we never heard back" from
+    /// a genuine timeout or failure.
+    Aborted,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +116,18 @@ impl RunningTaskRegistry {
             t.end_time = Some(Instant::now());
             t.exit_code = None;
             t.status = TaskStatus::Timeout;
+        }
+    }
+
+    /// Abort all currently-running tasks. Used when a turn ends
+    /// (Done/Cancelled/Error) without per-tool ToolExit events.
+    pub fn abort_all_running(&mut self) {
+        for t in self.tasks.values_mut() {
+            if t.status == TaskStatus::Running {
+                t.end_time = Some(Instant::now());
+                t.exit_code = None;
+                t.status = TaskStatus::Aborted;
+            }
         }
     }
 
@@ -216,5 +232,40 @@ mod tests {
         let list = r.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].command, "b");
+    }
+
+    #[test]
+    fn test_abort_all_running_freezes_running_task() {
+        let mut r = RunningTaskRegistry::new();
+        r.on_tool_call("t1", "bash", "sleep 10", 120);
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Running);
+        assert!(r.get("t1").unwrap().end_time.is_none());
+        r.abort_all_running();
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Aborted);
+        assert!(r.get("t1").unwrap().end_time.is_some());
+        // Calling again is a no-op for already-aborted tasks.
+        let end = r.get("t1").unwrap().end_time.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        r.abort_all_running();
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Aborted);
+        assert_eq!(r.get("t1").unwrap().end_time.unwrap(), end);
+    }
+
+    #[test]
+    fn test_abort_all_running_aborts_only_running() {
+        let mut r = RunningTaskRegistry::new();
+        r.on_tool_call("a", "bash", "cmd_a", 120);
+        r.on_tool_call("b", "bash", "cmd_b", 120);
+        r.on_tool_call("c", "bash", "cmd_c", 120);
+        // Finalize "a" normally, leave "b" and "c" running.
+        r.on_exit("a", Some(0));
+        assert_eq!(r.running_count(), 2);
+        r.abort_all_running();
+        assert_eq!(r.running_count(), 0);
+        assert_eq!(r.get("a").unwrap().status, TaskStatus::Done);
+        assert_eq!(r.get("b").unwrap().status, TaskStatus::Aborted);
+        assert_eq!(r.get("c").unwrap().status, TaskStatus::Aborted);
+        assert!(r.get("b").unwrap().end_time.is_some());
+        assert!(r.get("c").unwrap().end_time.is_some());
     }
 }

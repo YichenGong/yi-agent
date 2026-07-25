@@ -469,6 +469,17 @@ fn route_event(
         AgentEvent::ToolTimeout { id } => {
             registry.on_timeout(id);
         }
+        // Turn-end events finalize any still-running tasks. This is a
+        // defense-in-depth cleanup: in the happy path each ToolCall gets a
+        // matching ToolExit before Done arrives. But ToolExit can be missed
+        // when (a) the bash tool early-returns on a blocked/parse/spawn
+        // error without emitting ToolEvent::Exit, (b) the user cancels
+        // mid-tool and the call_stream future is dropped, or (c) the
+        // forwarder task silently drops the event on a full/closed channel.
+        // Without this cleanup the status-bar timer would tick forever.
+        AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_) => {
+            registry.abort_all_running();
+        }
         AgentEvent::Usage(u) => {
             statusbar.set_token_target(u.input_tokens as u64, u.output_tokens as u64);
         }
@@ -1076,6 +1087,165 @@ mod tests {
             &AgentEvent::ToolTimeout { id: "t".into() },
         );
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
+    }
+
+    /// Regression: a ToolCall that never receives a ToolExit (e.g. bash tool
+    /// early-returned on a blocked command, or the ToolExit event was dropped)
+    /// must be finalized when the turn ends with Done so the status-bar timer
+    /// stops ticking.
+    #[test]
+    fn test_route_event_done_aborts_running_tasks() {
+        use yi_agent_core::DoneReason;
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"echo hi","expected_timeout_sec":30}),
+            },
+        );
+        // Simulate elapsed time so we can verify the timer freezes.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let before = registry.get("t1").unwrap().elapsed();
+        // Turn ends without a ToolExit for t1.
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+        );
+        let task = registry.get("t1").unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Aborted,
+            "Done without ToolExit should abort the running task"
+        );
+        let after = registry.get("t1").unwrap().elapsed();
+        // Timer must be frozen: later reads should not advance.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let after2 = registry.get("t1").unwrap().elapsed();
+        assert_eq!(
+            after, after2,
+            "Aborted task timer should be frozen, not still ticking"
+        );
+        assert!(
+            after >= before,
+            "Aborted end_time should be >= the pre-Done reading"
+        );
+    }
+
+    /// Regression: when a user cancels mid-tool (Ctrl+C), the running bash
+    /// task must be aborted so the timer stops.
+    #[test]
+    fn test_route_event_cancelled_aborts_running_tasks() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"sleep 10","expected_timeout_sec":30}),
+            },
+        );
+        route_event(&mut registry, &mut sb, &AgentEvent::Cancelled);
+        assert_eq!(
+            registry.get("t1").unwrap().status,
+            TaskStatus::Aborted,
+            "Cancelled should abort the running task"
+        );
+        assert!(registry.get("t1").unwrap().end_time.is_some());
+    }
+
+    /// Regression: an agent error mid-tool must also abort running tasks.
+    #[test]
+    fn test_route_event_error_aborts_running_tasks() {
+        use yi_agent_core::AgentError;
+        use yi_agent_core::provider::ProviderError;
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"sleep 10","expected_timeout_sec":30}),
+            },
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::Error(AgentError::Provider(ProviderError::Auth("boom".into()))),
+        );
+        assert_eq!(
+            registry.get("t1").unwrap().status,
+            TaskStatus::Aborted,
+            "Error should abort the running task"
+        );
+    }
+
+    /// Done/Cancelled/Error must NOT touch already-finalized tasks.
+    #[test]
+    fn test_route_event_done_does_not_modify_finalized_tasks() {
+        use yi_agent_core::DoneReason;
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolCall {
+                id: "done_task".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"echo hi","expected_timeout_sec":30}),
+            },
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolExit {
+                id: "done_task".into(),
+                code: Some(0),
+            },
+        );
+        let done_end = registry.get("done_task").unwrap().end_time.unwrap();
+        // Another task still running when Done arrives.
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolCall {
+                id: "stuck_task".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"sleep 99","expected_timeout_sec":30}),
+            },
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+        );
+        assert_eq!(
+            registry.get("done_task").unwrap().status,
+            TaskStatus::Done,
+            "Already-done task should not be touched by Done cleanup"
+        );
+        assert_eq!(
+            registry.get("done_task").unwrap().end_time.unwrap(),
+            done_end,
+            "Already-done end_time should not be overwritten"
+        );
+        assert_eq!(
+            registry.get("stuck_task").unwrap().status,
+            TaskStatus::Aborted,
+            "Still-running task should be aborted by Done cleanup"
+        );
     }
 
     #[test]

@@ -112,6 +112,7 @@ pub fn render_list_popup<'a>(
                 TaskStatus::Done => ("✓", Color::Green),
                 TaskStatus::Failed => ("✗", Color::Red),
                 TaskStatus::Timeout => ("✗", Color::Red),
+                TaskStatus::Aborted => ("■", Color::DarkGray),
             };
             let style = if i == popup.selected {
                 Style::new().bg(Color::Blue).fg(Color::White)
@@ -124,6 +125,7 @@ pub fn render_list_popup<'a>(
                 TaskStatus::Done => "done",
                 TaskStatus::Failed => "failed",
                 TaskStatus::Timeout => "timeout",
+                TaskStatus::Aborted => "aborted",
             };
             Line::styled(
                 format!(
@@ -154,6 +156,7 @@ pub fn render_detail_popup<'a>(popup: &'a DetailPopup, task: &'a TaskState) -> P
         TaskStatus::Done => ("✓", Color::Green),
         TaskStatus::Failed => ("✗", Color::Red),
         TaskStatus::Timeout => ("✗", Color::Red),
+        TaskStatus::Aborted => ("■", Color::DarkGray),
     };
     let secs = task.elapsed().as_secs_f32();
     let status_word = match task.status {
@@ -161,6 +164,7 @@ pub fn render_detail_popup<'a>(popup: &'a DetailPopup, task: &'a TaskState) -> P
         TaskStatus::Done => "done",
         TaskStatus::Failed => "failed",
         TaskStatus::Timeout => "timeout",
+        TaskStatus::Aborted => "aborted",
     };
     let header = format!(
         " bash {} {} {:.1}s (expected {}s)",

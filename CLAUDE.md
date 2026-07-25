@@ -26,4 +26,24 @@
   正确写法是在 `run()` 之后捕获 token。
 - 单独跑一个卡住的测试名(如 `cargo test -p yi-agent-core --lib <test_name>`)
   通常秒级返回;如果一个测试卡但其它测试不卡,基本是测试代码问题而非环境问题。
+- **被中断的 `cargo test` 会留下僵尸测试二进制进程**(进程名形如
+  `yi_agent_tools-<hash>`),即使 cargo 本身已退出,这些子进程仍在后台持有
+  target 目录锁,导致后续 `cargo test` 立即卡死或 exit 137。复现步骤:
+  跑 `cargo test -p yi-agent-tools --lib`,若被中断,下次再跑会立即卡住。
+  修复:`ps aux | grep -v grep | grep -E "cargo|rustc|yi_agent"`
+  找出残留进程并 `kill <pid>`,必要时 `find target -name "*.lock" -type f -delete`
+  清理 incremental lock 文件(空的 mutex 文件,删了 cargo 会重建)。
+- **定位卡住的测试**:不要靠猜,直接用 macOS `sample` 工具抓取卡住进程的
+  调用栈。步骤:(1) `ps aux | grep -v grep | grep yi_agent` 找到卡住的测试
+  二进制 PID;(2) `sample <pid> 2` 抓 2 秒样本;(3) 看 `Call graph` 里的线程名
+  和栈顶函数——线程名通常会显示 `shell::bash::tests::<test_name>`,直接定位
+  是哪个测试死锁。比逐个 `--test <name>` 排查快得多。
+- **避免 `cargo test --workspace` 全量跑**:workspace 全量编译 + 全量测试
+  会同时启动多个 crate 的测试二进制,容易触发 OOM(exit 137)或死锁级联。
+  优先按 crate 跑:`cargo test -p yi-agent`、`cargo test -p yi-agent-core`、
+  `cargo test -p yi-agent-tools`。确需全量跑时,用 `--jobs 2` 降低并行度,
+  并先 `ps aux | grep cargo` 确认没有残留进程。
+- **编译与运行分离排查**:`cargo test --no-run` 只编译不跑,秒级完成说明
+  编译没问题,卡住的是测试运行;`target/debug/deps/<test_binary>` 直接跑
+  测试二进制可以绕过 cargo 的进程管理,配合 `sample` 定位死锁测试。
 
