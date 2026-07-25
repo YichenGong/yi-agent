@@ -153,7 +153,6 @@ fn run_loop<B: Backend, E: EventSource>(
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
 ) -> std::io::Result<()> {
-    let _ = is_running;
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();

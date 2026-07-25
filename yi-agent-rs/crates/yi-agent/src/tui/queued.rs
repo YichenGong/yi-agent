@@ -8,7 +8,6 @@ use ratatui::text::{Line, Span};
 /// - 标题行:`⌛ 排队中 (N)`,dim,N = 总数
 /// - 每条消息:`  ↳ ` 前缀,dim + italic
 /// - 最多显示 3 行,超出显示 `… 还有 X 条` 计数行
-#[allow(dead_code)]
 pub fn render_queued_preview(queued: &VecDeque<String>, _width: u16) -> Vec<Line<'static>> {
     if queued.is_empty() {
         return Vec::new();
