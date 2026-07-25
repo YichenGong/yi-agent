@@ -27,7 +27,12 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let env_path = config::resolve_env_path(&cli);
-                yi_agent_web::serve(host, *port, env_path).await
+                let global_env_path = if config::is_workdir_explicit(&cli) {
+                    None
+                } else {
+                    config::resolve_global_env_path()
+                };
+                yi_agent_web::serve(host, *port, env_path, global_env_path).await
             })
         }
         None => run_agent(cli),
