@@ -162,8 +162,21 @@ fn run_loop<B: Backend, E: EventSource>(
         // Drain all pending agent events
         let width = terminal.size()?.width;
         while let Ok(event) = agent_rx.try_recv() {
+            let is_turn_end = matches!(
+                event,
+                AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
+            );
             history.push_event(event, width);
+            // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
+            if is_turn_end {
+                if let Some(text) = queued.pop_front() {
+                    history.push(HistoryCell::UserMessage { text });
+                }
+            }
         }
+
+        let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
+        let queued_height = queued_lines.len() as u16;
 
         terminal.draw(|f| {
             let area = f.area();
@@ -177,10 +190,11 @@ fn run_loop<B: Backend, E: EventSource>(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(3),               // history
-                    Constraint::Length(popup_height), // popup (0 when none)
-                    Constraint::Length(1),            // blank gap
-                    Constraint::Length(input_height), // input (wraps up to 6 lines)
+                    Constraint::Min(3),                // history
+                    Constraint::Length(popup_height),  // popup (0 when none)
+                    Constraint::Length(1),             // blank gap
+                    Constraint::Length(queued_height), // queued preview
+                    Constraint::Length(input_height),  // input (wraps up to 6 lines)
                 ])
                 .split(area);
 
@@ -198,8 +212,13 @@ fn run_loop<B: Backend, E: EventSource>(
                 }
             }
 
-            let input_line = build_input_line(input, pending_quit, chunks[3].width);
-            f.render_widget(input_line, chunks[3]);
+            // Render queued messages preview
+            if queued_height > 0 {
+                f.render_widget(Paragraph::new(queued_lines.clone()), chunks[3]);
+            }
+
+            let input_line = build_input_line(input, pending_quit, chunks[4].width);
+            f.render_widget(input_line, chunks[4]);
         })?;
 
         // Poll for key events with timeout
@@ -218,10 +237,8 @@ fn run_loop<B: Backend, E: EventSource>(
                 &mut popup,
             ) {
                 KeyOutcome::Quit => break,
-                KeyOutcome::Submit(text) => {
+                KeyOutcome::Submit(_) => {
                     pending_quit = false;
-                    history.push(HistoryCell::UserMessage { text: text.clone() });
-                    let _ = input_tx.blocking_send(text);
                 }
                 KeyOutcome::None => {}
             }
@@ -250,7 +267,7 @@ fn handle_key(
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    _queued: &mut std::collections::VecDeque<String>,
+    queued: &mut std::collections::VecDeque<String>,
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
 ) -> KeyOutcome {
@@ -451,6 +468,12 @@ fn handle_key(
                 }
             }
             *popup = None;
+            if is_running.load(std::sync::atomic::Ordering::SeqCst) {
+                queued.push_back(text.clone());
+            } else {
+                history.push(HistoryCell::UserMessage { text: text.clone() });
+            }
+            let _ = input_tx.blocking_send(text.clone());
             KeyOutcome::Submit(text)
         }
         _ => KeyOutcome::None,
@@ -2317,5 +2340,98 @@ mod tests {
             &mut popup,
         );
         assert_eq!(result, KeyOutcome::Quit);
+    }
+
+    // ----- handle_key Submit 分流 tests -----
+
+    #[test]
+    fn submit_while_running_goes_to_queue_not_history() {
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued: VecDeque<String> = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        input.buffer = "queued msg".to_string();
+        input.cursor = input.buffer.len();
+
+        let result = handle_key(
+            make_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        match result {
+            KeyOutcome::Submit(text) => {
+                assert_eq!(text, "queued msg");
+                assert_eq!(queued.len(), 1);
+                assert_eq!(queued[0], "queued msg");
+                assert!(
+                    history.cells.is_empty(),
+                    "history should be empty when agent running"
+                );
+                let received = input_rx.try_recv();
+                assert!(received.is_ok());
+                assert_eq!(received.unwrap(), "queued msg");
+            }
+            _ => panic!("expected Submit"),
+        }
+    }
+
+    #[test]
+    fn submit_while_idle_goes_to_history_not_queue() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued: VecDeque<String> = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        input.buffer = "idle msg".to_string();
+        input.cursor = input.buffer.len();
+
+        let result = handle_key(
+            make_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        match result {
+            KeyOutcome::Submit(text) => {
+                assert_eq!(text, "idle msg");
+                assert!(queued.is_empty());
+                assert_eq!(history.cells.len(), 1);
+                match &history.cells[0] {
+                    HistoryCell::UserMessage { text } => assert_eq!(text, "idle msg"),
+                    _ => panic!("expected UserMessage"),
+                }
+            }
+            _ => panic!("expected Submit"),
+        }
     }
 }
