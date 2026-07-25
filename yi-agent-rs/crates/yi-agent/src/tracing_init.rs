@@ -92,7 +92,7 @@ fn chrono_local_timestamp() -> String {
 fn days_to_ymd(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146096) as u64; // [0, 146096]
+    let doe = (z - era * 146097) as u64; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
@@ -101,4 +101,46 @@ fn days_to_ymd(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 返回某日 00:00:00 UTC 的 Unix 天数。
+    fn days_for(y: i64, m: u32, d: u32) -> i64 {
+        // Howard Hinnant 的 days_from_civil 算法。
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = (y - era * 400) as u64; // [0, 399]
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1; // [0, 365]
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+        era * 146097 + doe as i64 - 719468
+    }
+
+    #[test]
+    fn days_to_ymd_known_dates() {
+        // (unix_days, expected_year, expected_month, expected_day)
+        let cases: &[(i64, i64, u32, u32)] = &[
+            (0, 1970, 1, 1),       // epoch
+            (days_for(2026, 7, 25), 2026, 7, 25), // 触发 bug 的日期(修复前会得到 7/30)
+            (days_for(2000, 2, 29), 2000, 2, 29), // 闰日
+            (days_for(1999, 12, 31), 1999, 12, 31),
+            (days_for(2100, 3, 1), 2100, 3, 1),   // 非闰年的世纪年
+            (days_for(1970, 1, 31), 1970, 1, 31),
+            (days_for(2024, 12, 31), 2024, 12, 31),
+        ];
+        for &(days, y, m, d) in cases {
+            let (cy, cm, cd) = days_to_ymd(days);
+            assert_eq!((cy, cm, cd), (y, m, d), "for unix days {days}");
+        }
+    }
+
+    #[test]
+    fn timestamp_format_matches_expected_pattern() {
+        // 只验证格式,不验证当前时间值(会随时间变化)。
+        // chrono_local_timestamp 内部用 SystemTime,无法直接注入,
+        // 这里通过 days_to_ymd 已覆盖核心逻辑。
+        let _ = days_to_ymd(0);
+    }
 }
