@@ -290,6 +290,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
     }
@@ -311,6 +312,7 @@ mod tests {
             tui: Some("inline".into()),
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Inline));
     }
@@ -332,6 +334,7 @@ mod tests {
             tui: Some("ratatui".into()),
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
     }

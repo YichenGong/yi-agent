@@ -17,6 +17,8 @@ pub struct Config {
     pub compact_threshold: u32, // computed: context_length * ratio / 100
     pub compact_keep_turns: u32,
     pub yolo: bool,
+    pub skills_catalog_budget: usize,
+    pub skills_catalog_budget_explicit: bool,
 }
 
 /// clap CLI 参数定义。
@@ -77,6 +79,10 @@ pub struct Cli {
     /// Alias for --yolo
     #[arg(long = "dangerously-skip-permissions")]
     pub skip_permissions: bool,
+
+    /// Maximum bytes for the skills catalog in the system prompt (default: 8192)
+    #[arg(long)]
+    pub skills_catalog_budget: Option<usize>,
 }
 
 /// 子命令
@@ -288,6 +294,17 @@ pub fn load(cli: &Cli) -> Result<Config> {
             .map(|v| v == "true")
             .unwrap_or(false);
 
+    let skills_catalog_budget_explicit = cli.skills_catalog_budget.is_some()
+        || std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET").is_ok();
+    let skills_catalog_budget = cli
+        .skills_catalog_budget
+        .or_else(|| {
+            std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(8192);
+
     Ok(Config {
         provider,
         api_url,
@@ -299,6 +316,8 @@ pub fn load(cli: &Cli) -> Result<Config> {
         compact_threshold,
         compact_keep_turns,
         yolo,
+        skills_catalog_budget,
+        skills_catalog_budget_explicit,
     })
 }
 
@@ -332,6 +351,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -359,6 +379,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://example.com");
@@ -385,6 +406,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
@@ -410,6 +432,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -433,6 +456,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 50_000); // 100000 * 50 / 100
@@ -455,6 +479,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -477,6 +502,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -499,6 +525,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "anthropic");
@@ -521,6 +548,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "openai");
@@ -553,6 +581,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_key, "from-dotenv-file");
@@ -581,6 +610,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-project/.yi-agent/.env"));
@@ -607,6 +637,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
@@ -770,6 +801,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let result = load(&cli);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
@@ -808,6 +840,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert!(
@@ -913,6 +946,7 @@ mod tests {
             tui: None,
             yolo: true,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert!(config.yolo);
@@ -935,6 +969,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: true,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert!(config.yolo);
@@ -957,6 +992,7 @@ mod tests {
             tui: None,
             yolo: false,
             skip_permissions: false,
+            skills_catalog_budget: None,
         };
         let config = load(&cli).unwrap();
         assert!(!config.yolo);
