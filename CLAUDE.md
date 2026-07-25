@@ -7,6 +7,9 @@
 - **不要**在 commit message 里写 `Co-Authored-By: Claude ...` 行
 - Commit message 用 conventional commits 风格(`feat:`, `fix:`, `ci:`, `docs:` 等)
 - 首行简短(<=72 字符),空行后可选写正文说明"为什么"
+- **提交前必须跑 `cargo fmt --all`**(在 `yi-agent-rs/` 下),保证代码格式
+  通过 `just fmt-check`。`git commit` 前的 hook 不自动跑 fmt,所以需要手动
+  执行或在 commit 前先 `cargo fmt --all && git add ...`。
 
 ## cargo test 执行
 
