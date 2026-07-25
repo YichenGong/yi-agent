@@ -72,6 +72,23 @@ impl HistoryCell {
             _ => {}
         }
     }
+
+    /// Create an AssistantMessage cell from a text chunk.
+    pub fn from_assistant_text(text: &str, width: u16) -> Self {
+        let rendered = super::markdown::render_markdown(text, width);
+        Self::AssistantMessage {
+            markdown: text.to_string(),
+            rendered_lines: rendered,
+        }
+    }
+
+    /// Append more text to an existing AssistantMessage, re-rendering.
+    pub fn append_assistant_text(&mut self, more: &str, width: u16) {
+        if let Self::AssistantMessage { markdown, rendered_lines } = self {
+            markdown.push_str(more);
+            *rendered_lines = super::markdown::render_markdown(markdown, width);
+        }
+    }
 }
 
 // --- Renderers ---
@@ -273,5 +290,16 @@ mod tests {
             state: CallState::Success, expanded: false,
         };
         assert!(cell.is_foldable());
+    }
+
+    #[test]
+    fn assistant_text_creates_new_cell() {
+        let cell = HistoryCell::from_assistant_text("hello", 80);
+        match cell {
+            HistoryCell::AssistantMessage { markdown, .. } => {
+                assert_eq!(markdown, "hello");
+            }
+            _ => panic!("expected AssistantMessage"),
+        }
     }
 }

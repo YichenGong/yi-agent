@@ -3,6 +3,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 
+use yi_agent_core::{AgentEvent, DoneReason};
+
 use super::cell::HistoryCell;
 
 /// State for the scrollable history area.
@@ -65,6 +67,74 @@ impl HistoryState {
     /// Scroll down by `n` lines.
     pub fn scroll_down(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+}
+
+impl HistoryState {
+    /// Process an AgentEvent and update the cell list accordingly.
+    pub fn push_event(&mut self, event: AgentEvent, width: u16) {
+        match event {
+            AgentEvent::Start => {}
+            AgentEvent::AssistantText(text) => {
+                match self.cells.last_mut() {
+                    Some(HistoryCell::AssistantMessage { .. }) => {
+                        self.cells.last_mut().unwrap().append_assistant_text(&text, width);
+                    }
+                    _ => {
+                        self.push(HistoryCell::from_assistant_text(&text, width));
+                    }
+                }
+            }
+            AgentEvent::ToolCall { id, name, input } => {
+                self.push(HistoryCell::ToolCall {
+                    id, name, input,
+                    state: super::cell::CallState::Running,
+                    expanded: false,
+                });
+            }
+            AgentEvent::ToolResult { id, result } => {
+                let is_error = result.is_error;
+                let result_text = result.content.iter()
+                    .filter_map(|b| match b {
+                        yi_agent_core::ContentBlock::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for cell in self.cells.iter_mut() {
+                    if let HistoryCell::ToolCall { id: cid, state, .. } = cell {
+                        if cid == &id {
+                            *state = if is_error {
+                                super::cell::CallState::Failed
+                            } else {
+                                super::cell::CallState::Success
+                            };
+                            break;
+                        }
+                    }
+                }
+                self.push(HistoryCell::ToolResult {
+                    id, result_text, is_error, expanded: false,
+                });
+            }
+            AgentEvent::Done { reason } => {
+                match reason {
+                    DoneReason::EndTurn => {
+                        self.push(HistoryCell::Separator { label: None });
+                    }
+                    DoneReason::MaxTurns => {
+                        self.push(HistoryCell::Separator { label: Some("Max turns".into()) });
+                    }
+                }
+            }
+            AgentEvent::Usage(_) => {}
+            AgentEvent::Cancelled => {
+                self.push(HistoryCell::Separator { label: Some("Interrupted".into()) });
+            }
+            AgentEvent::Error(err) => {
+                self.push(HistoryCell::Separator { label: Some(format!("Error: {err}")) });
+            }
+        }
     }
 }
 
@@ -161,5 +231,57 @@ mod tests {
         s.push(HistoryCell::UserMessage { text: "hello".into() });
         s.push(HistoryCell::Separator { label: None });
         assert_eq!(s.total_lines(80), 2);
+    }
+
+    use yi_agent_core::{AgentEvent, DoneReason, ToolResult};
+
+    #[test]
+    fn push_event_assistant_text_appends_to_existing() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("hello".into()), 80);
+        s.push_event(AgentEvent::AssistantText(" world".into()), 80);
+        assert_eq!(s.cells.len(), 1, "two text chunks should merge into 1 cell");
+        match &s.cells[0] {
+            HistoryCell::AssistantMessage { markdown, .. } => assert_eq!(*markdown, "hello world"),
+            _ => panic!("expected AssistantMessage"),
+        }
+    }
+
+    #[test]
+    fn push_event_tool_call_creates_separate_cell() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("text".into()), 80);
+        s.push_event(AgentEvent::ToolCall {
+            id: "1".into(), name: "read".into(), input: serde_json::json!({}),
+        }, 80);
+        assert_eq!(s.cells.len(), 2);
+    }
+
+    #[test]
+    fn push_event_done_endturn_adds_separator() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::Done { reason: DoneReason::EndTurn }, 80);
+        assert_eq!(s.cells.len(), 1);
+        assert!(matches!(s.cells[0], HistoryCell::Separator { .. }));
+    }
+
+    #[test]
+    fn push_event_tool_result_updates_tool_call_state() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::ToolCall {
+            id: "1".into(), name: "read".into(), input: serde_json::json!({}),
+        }, 80);
+        s.push_event(AgentEvent::ToolResult {
+            id: "1".into(),
+            result: ToolResult {
+                content: vec![yi_agent_core::ContentBlock::Text("ok".into())],
+                is_error: false,
+            },
+        }, 80);
+        assert!(matches!(
+            &s.cells[0],
+            HistoryCell::ToolCall { state: crate::tui::cell::CallState::Success, .. }
+        ));
+        assert!(matches!(s.cells.get(1), Some(HistoryCell::ToolResult { .. })));
     }
 }
