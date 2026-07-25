@@ -312,6 +312,53 @@ impl App {
     }
 }
 
+/// ANSI gray background (256-color index 240, matches `InlineRenderer::COLOR_USER_BG`).
+const PROMPT_BG: &str = "\x1b[48;5;240m";
+
+/// Codex-style prompt: `> ` on gray background, no workdir, no datetime.
+struct CodexPrompt;
+
+impl reedline::Prompt for CodexPrompt {
+    fn render_prompt_left(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("")
+    }
+    fn render_prompt_right(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _mode: reedline::PromptEditMode) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!("{PROMPT_BG}> "))
+    }
+    fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(" ")
+    }
+    fn render_prompt_history_search_indicator(
+        &self,
+        search: reedline::PromptHistorySearch,
+    ) -> std::borrow::Cow<'_, str> {
+        let prefix = match search.status {
+            reedline::PromptHistorySearchStatus::Passing => "",
+            reedline::PromptHistorySearchStatus::Failing => "failing ",
+        };
+        std::borrow::Cow::Owned(format!(
+            "{PROMPT_BG}({prefix}reverse-search: {}) ",
+            search.term
+        ))
+    }
+}
+
+/// Highlighter that wraps user's typed text in gray background to extend
+/// the prompt's gray bg across the full input line.
+struct CodexHighlighter;
+
+impl reedline::Highlighter for CodexHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> reedline::StyledText {
+        let style = nu_ansi_term::Style::new().on(nu_ansi_term::Color::Fixed(240));
+        let mut styled = reedline::StyledText::new();
+        styled.push((style, line.to_string()));
+        styled
+    }
+}
+
 /// reedline 输入循环（运行在 spawn_blocking 中）。
 ///
 /// ESC 键通过 reedline keybinding 绑定到 `ReedlineEvent::CtrlC`，
@@ -508,5 +555,55 @@ mod tests {
             ..Default::default()
         });
         assert!(stats.last_context_tokens() > threshold);
+    }
+
+    // --- CodexPrompt / CodexHighlighter tests ---
+
+    #[test]
+    fn codex_prompt_left_is_empty() {
+        use reedline::Prompt;
+        let prompt = super::CodexPrompt;
+        assert_eq!(prompt.render_prompt_left().as_ref(), "");
+    }
+
+    #[test]
+    fn codex_prompt_right_is_empty() {
+        use reedline::Prompt;
+        let prompt = super::CodexPrompt;
+        assert_eq!(prompt.render_prompt_right().as_ref(), "");
+    }
+
+    #[test]
+    fn codex_prompt_indicator_starts_with_gray_bg_and_gt() {
+        use reedline::{Prompt, PromptEditMode};
+        let prompt = super::CodexPrompt;
+        let indicator = prompt.render_prompt_indicator(PromptEditMode::Emacs);
+        let s = indicator.as_ref();
+        assert!(
+            s.starts_with("\x1b[48;5;240m"),
+            "indicator should start with gray bg ANSI code, got: {s:?}"
+        );
+        assert!(
+            s.contains('>'),
+            "indicator should contain > character, got: {s:?}"
+        );
+    }
+
+    #[test]
+    fn codex_highlighter_wraps_input_with_gray_bg() {
+        use reedline::Highlighter;
+        let highlighter = super::CodexHighlighter;
+        let styled = highlighter.highlight("hello world", 0);
+        assert_eq!(
+            styled.buffer.len(),
+            1,
+            "should produce exactly one styled segment"
+        );
+        let (style, text) = &styled.buffer[0];
+        assert_eq!(text, "hello world");
+        assert!(
+            style.background.is_some(),
+            "style should have a background color set"
+        );
     }
 }
