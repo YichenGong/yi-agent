@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct PermissionsConfig {
@@ -71,10 +74,6 @@ pub enum CheckResult {
     Deny,
 }
 
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-
 pub type BlocklistFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 pub struct PermissionChecker {
@@ -112,7 +111,7 @@ impl PermissionChecker {
             return self.check_blacklist_then_allow(tool_name, tool_input);
         }
 
-        let config = self.config.lock().unwrap();
+        let config = self.config.lock().unwrap_or_else(|e| e.into_inner());
         // 第一层:工具类型
         if Self::tool_level_allows(&config, tool_name) {
             return self.check_blacklist_then_allow(tool_name, tool_input);
@@ -216,6 +215,7 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn default_config_is_all_false_and_empty() {
@@ -286,11 +286,6 @@ bash = true
             _ => panic!("expected Blacklisted"),
         }
     }
-
-    use crate::permission::{
-        BlocklistFn, CheckResult, Decision, PermissionChecker, PermissionKind,
-    };
-    use std::sync::Arc;
 
     fn checker_with(config: PermissionsConfig, yolo: bool) -> PermissionChecker {
         let blocklist: BlocklistFn = Arc::new(|cmd: &str| {
@@ -438,6 +433,30 @@ bash = true
             checker.check("edit", &input),
             CheckResult::Allow
         ));
+    }
+
+    #[test]
+    fn check_bash_missing_command_field() {
+        let checker = checker_with(PermissionsConfig::default(), false);
+        assert!(matches!(checker.check("bash", &serde_json::json!({})), CheckResult::NeedConfirm(_)));
+    }
+
+    #[test]
+    fn check_bash_non_string_command() {
+        let checker = checker_with(PermissionsConfig::default(), false);
+        assert!(matches!(checker.check("bash", &serde_json::json!({"command": 42})), CheckResult::NeedConfirm(_)));
+    }
+
+    #[test]
+    fn check_write_missing_path_field() {
+        let checker = checker_with(PermissionsConfig::default(), false);
+        assert!(matches!(checker.check("write", &serde_json::json!({})), CheckResult::NeedConfirm(_)));
+    }
+
+    #[test]
+    fn check_write_non_string_path() {
+        let checker = checker_with(PermissionsConfig::default(), false);
+        assert!(matches!(checker.check("write", &serde_json::json!({"path": 123})), CheckResult::NeedConfirm(_)));
     }
 
     #[test]
