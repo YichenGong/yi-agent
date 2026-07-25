@@ -68,3 +68,22 @@ async fn test_bash_stream_expected_timeout_allows_long_output() {
     ).await;
     assert!(!result.is_error, "should complete despite exceeding expected_timeout, because output resets watchdog");
 }
+
+#[tokio::test]
+async fn test_bash_stream_emits_truncated_event() {
+    let tool = make_tool();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ToolEvent>(256);
+    // ~200KB stdout, MAX_OUTPUT_BYTES is 100KB
+    let result = tool.call_stream(
+        serde_json::json!({"command": "yes hello | head -c 200000"}),
+        tx,
+    ).await;
+    assert!(!result.is_error);
+    let mut got_truncated = false;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, ToolEvent::Truncated { stream: OutputStream::Stdout, .. }) {
+            got_truncated = true;
+        }
+    }
+    assert!(got_truncated, "expected Truncated event for stdout");
+}

@@ -200,13 +200,14 @@ impl Tool for BashTool {
                             }).await;
 
                             // Accumulate with truncation tracking.
+                            let was_truncated = stdout_truncated;
                             append_with_truncation(
                                 &mut stdout_buf,
                                 &mut stdout_truncated,
                                 &mut stdout_skipped,
                                 &data,
                             );
-                            if stdout_truncated && stdout_skipped == data.len() {
+                            if !was_truncated && stdout_truncated {
                                 // Just crossed the threshold — send Truncated event.
                                 let _ = tx.send(ToolEvent::Truncated {
                                     stream: OutputStream::Stdout,
@@ -233,13 +234,14 @@ impl Tool for BashTool {
                                 text,
                             }).await;
 
+                            let was_truncated = stderr_truncated;
                             append_with_truncation(
                                 &mut stderr_buf,
                                 &mut stderr_truncated,
                                 &mut stderr_skipped,
                                 &data,
                             );
-                            if stderr_truncated && stderr_skipped == data.len() {
+                            if !was_truncated && stderr_truncated {
                                 let _ = tx.send(ToolEvent::Truncated {
                                     stream: OutputStream::Stderr,
                                     skipped_bytes: stderr_skipped,
