@@ -1,5 +1,4 @@
 use yi_agent_core::{OutputStream, Tool, ToolEvent, ToolResult};
-use futures::StreamExt;
 use serde_json::json;
 
 struct EchoTool;
