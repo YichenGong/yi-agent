@@ -19,3 +19,4 @@ yi-agent 项目的辅助工具与开发流程配置，包括进度追踪、hook 
 
 - [x] 项目进度追踪系统（docs/project-management/）— [设计](../plans/2026-07-19-project-management-design.md)
 - [x] 进度同步 Hook（Stop 事件触发，检测代码改动后提醒更新进度表格）— [设计](../plans/2026-07-19-progress-sync-hook-design.md)
+- [x] Git worktree 工作流（feature 分支隔离开发，`.worktrees/` 目录）
