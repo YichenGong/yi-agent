@@ -1,6 +1,7 @@
 //! ratatui-based TUI with structured history cells.
 
 pub mod app;
+pub mod bash_popup;
 pub mod cell;
 pub mod history;
 pub mod input;
