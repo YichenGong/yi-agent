@@ -7,6 +7,7 @@ mod context;
 mod error;
 mod fs;
 mod shell;
+mod skill_tool;
 mod web;
 
 use std::path::PathBuf;
@@ -19,6 +20,7 @@ pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use shell::BashTool;
 pub use shell::blocklist;
+pub use skill_tool::SkillTool;
 pub use web::{BochaSearchProvider, SearchResult, WebFetchTool, WebSearchProvider, WebSearchTool};
 
 /// Register all builtin tools into the given registry.

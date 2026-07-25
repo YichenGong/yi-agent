@@ -8,6 +8,7 @@ members = [
     "crates/yi-agent-mcp",
     "crates/yi-agent-store",
     "crates/yi-agent-web",
+    "crates/yi-agent-skills",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ yi-agent-tools = { path = "crates/yi-agent-tools" }
 yi-agent-mcp = { path = "crates/yi-agent-mcp" }
 yi-agent-store = { path = "crates/yi-agent-store" }
 yi-agent-web = { path = "crates/yi-agent-web" }
+yi-agent-skills = { path = "crates/yi-agent-skills" }
 
 # 共享公共依赖
 tokio = { version = "1", features = ["full"] }

@@ -75,6 +75,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent: Agent,
         provider: Arc<dyn Provider>,

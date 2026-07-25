@@ -250,17 +250,17 @@ fn render_permission_request(
 
     let option_lines = match prefix_suggestion {
         Some(p) => vec![
-            Span::styled("  [1] Allow once", menu_style.clone()),
+            Span::styled("  [1] Allow once", menu_style),
         ].into_iter().chain(vec![
-            Span::styled("  [2] Always allow tool", menu_style.clone()),
+            Span::styled("  [2] Always allow tool", menu_style),
         ]).chain(vec![
-            Span::styled(format!("  [3] Always allow prefix: {p}"), menu_style.clone()),
+            Span::styled(format!("  [3] Always allow prefix: {p}"), menu_style),
         ]).chain(vec![
             Span::styled("  [4] Deny", menu_style),
         ]).collect::<Vec<_>>(),
         None => vec![
-            Span::styled("  [1] Allow once", menu_style.clone()),
-            Span::styled("  [2] Always allow tool", menu_style.clone()),
+            Span::styled("  [1] Allow once", menu_style),
+            Span::styled("  [2] Always allow tool", menu_style),
             Span::styled("  [4] Deny", menu_style),
         ],
     };
