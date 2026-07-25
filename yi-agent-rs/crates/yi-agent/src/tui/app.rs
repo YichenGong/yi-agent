@@ -174,6 +174,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 event,
                 AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
             );
+            route_event(&mut task_registry, &mut statusbar_state, &event);
             history.push_event(event, width);
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
@@ -263,6 +264,46 @@ fn run_loop<B: Backend, E: EventSource>(
     }
 
     Ok(())
+}
+
+/// Route agent events to the task registry + status bar before they reach
+/// history. Streaming events (ToolOutputDelta/ToolExit/ToolTimeout) are
+/// consumed here and not pushed to history (history ignores them anyway).
+fn route_event(
+    registry: &mut RunningTaskRegistry,
+    statusbar: &mut StatusBarState,
+    event: &AgentEvent,
+) {
+    match event {
+        AgentEvent::Start => {
+            statusbar.reset_for_new_call();
+        }
+        AgentEvent::ToolCall { id, name, input } => {
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let exp = input
+                .get("expected_timeout_sec")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120) as u32;
+            registry.on_tool_call(id, name, &cmd, exp);
+        }
+        AgentEvent::ToolOutputDelta { id, stream, text } => {
+            registry.on_output_delta(id, *stream, text);
+        }
+        AgentEvent::ToolExit { id, code } => {
+            registry.on_exit(id, *code);
+        }
+        AgentEvent::ToolTimeout { id } => {
+            registry.on_timeout(id);
+        }
+        AgentEvent::Usage(u) => {
+            statusbar.set_token_target(u.input_tokens as u64, u.output_tokens as u64);
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -761,6 +802,7 @@ fn wrap_input_buffer(
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::tui::state::TaskStatus;
     use ratatui::backend::TestBackend;
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -768,6 +810,83 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::mpsc;
+    use yi_agent_core::OutputStream;
+
+    #[test]
+    fn test_route_event_full_flow() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        // Start resets per-call status.
+        route_event(&mut registry, &mut sb, &AgentEvent::Start);
+        sb.tick();
+        assert_eq!(sb.display_input_tokens(), 0);
+
+        // ToolCall registers a task.
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"echo hi","expected_timeout_sec":30}),
+            },
+        );
+        assert_eq!(registry.running_count(), 1);
+        assert_eq!(registry.get("t1").unwrap().expected_timeout_sec, 30);
+
+        // OutputDelta appends to the registry.
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolOutputDelta {
+                id: "t1".into(),
+                stream: OutputStream::Stdout,
+                text: "hi\n".into(),
+            },
+        );
+        assert!(registry.get("t1").unwrap().stdout.windows(2).any(|w| w == b"hi"));
+
+        // Exit finalizes the task.
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolExit {
+                id: "t1".into(),
+                code: Some(0),
+            },
+        );
+        assert_eq!(registry.get("t1").unwrap().status, TaskStatus::Done);
+
+        // Usage updates the status bar target.
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::Usage(yi_agent_core::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            }),
+        );
+        sb.tick();
+        assert!(sb.display_input_tokens() > 0);
+    }
+
+    #[test]
+    fn test_route_event_tool_timeout() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolCall {
+                id: "t".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"sleep 10","expected_timeout_sec":1}),
+            },
+        );
+        route_event(&mut registry, &mut sb, &AgentEvent::ToolTimeout { id: "t".into() });
+        assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
+    }
 
     /// Fake event source that plays back a scripted sequence of events,
     /// then returns None (timeout) forever. Used to test the loop deterministically.
