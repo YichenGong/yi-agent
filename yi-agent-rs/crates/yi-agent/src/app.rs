@@ -358,6 +358,11 @@ impl reedline::Highlighter for CodexHighlighter {
         let style = nu_ansi_term::Style::new().on(nu_ansi_term::Color::Fixed(240));
         let mut styled = reedline::StyledText::new();
         styled.push((style, line.to_string()));
+        // Append ANSI "erase to end of line" (\x1b[K) with the same gray
+        // background so the entire input line is filled with gray, not just
+        // the portion covered by typed text. \x1b[K is stripped by reedline's
+        // line-width calculations, so it won't affect wrapping or cursor pos.
+        styled.push((style, "\x1b[K".to_string()));
         styled
     }
 }
@@ -598,16 +603,24 @@ mod tests {
         use reedline::Highlighter;
         let highlighter = super::CodexHighlighter;
         let styled = highlighter.highlight("hello world", 0);
+        // Two segments: the typed text, plus the trailing `\x1b[K` that fills
+        // the rest of the line with the gray background.
         assert_eq!(
             styled.buffer.len(),
-            1,
-            "should produce exactly one styled segment"
+            2,
+            "should produce text + trailing clear-to-end segments"
         );
-        let (style, text) = &styled.buffer[0];
+        let (text_style, text) = &styled.buffer[0];
         assert_eq!(text, "hello world");
         assert!(
-            style.background.is_some(),
-            "style should have a background color set"
+            text_style.background.is_some(),
+            "text style should have a background color set"
+        );
+        let (clear_style, clear_seq) = &styled.buffer[1];
+        assert_eq!(clear_seq, "\x1b[K", "trailing segment should be ANSI clear-to-end");
+        assert!(
+            clear_style.background.is_some(),
+            "clear-to-end style should carry the gray background"
         );
     }
 }
