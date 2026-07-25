@@ -163,7 +163,12 @@ pub fn load(cli: &Cli) -> Result<Config> {
     let workdir = cli
         .workdir
         .clone()
-        .or_else(|| std::env::var("YI_AGENT_WORKDIR").ok().map(PathBuf::from))
+        .or_else(|| {
+            std::env::var("YI_AGENT_WORKDIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     // 验证工作目录存在
@@ -441,6 +446,36 @@ mod tests {
             std::env::remove_var("MODEL_API_KEY");
         }
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn load_falls_back_to_current_dir_when_workdir_env_empty() {
+        // 设置空字符串环境变量,应该 fallback 到 current_dir 而非变成空路径
+        unsafe {
+            std::env::set_var("YI_AGENT_WORKDIR", "");
+        }
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: None,
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: None,
+            compact_keep_turns: None,
+        };
+        let config = load(&cli).unwrap();
+        assert!(
+            config.workdir.is_absolute(),
+            "workdir should be a valid absolute path (current_dir fallback), got: {}",
+            config.workdir.display()
+        );
+        unsafe {
+            std::env::remove_var("YI_AGENT_WORKDIR");
+        }
     }
 
     #[test]
