@@ -1,6 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 /// One unit of conversation history displayed in the history area.
 #[derive(Debug, Clone)]
@@ -320,20 +321,51 @@ fn wrap_with_prefix(
     cont_prefix: &str,
 ) -> Vec<Line<'static>> {
     let max_w = width as usize;
-    // 段内自动换行的辅助函数：按宽度把单词拼到 current 里
+    // 段内自动换行的辅助函数：按显示宽度把单词拼到 current 里。
+    // 单个"词"超过行宽时（CJK 无空格文本常见），按字符拆分。
     let wrap_segment = |seg: &str, out: &mut Vec<String>| {
         let mut current = String::new();
         for word in seg.split_whitespace() {
             // 首行有 first_prefix（2 字符），后续行有 cont_prefix
-            let prefix_len = if out.is_empty() { 2 } else { cont_prefix.len() };
-            if current.is_empty() {
+            let prefix_len = if out.is_empty() && current.is_empty() {
+                2
+            } else {
+                cont_prefix.len()
+            };
+            let current_w = UnicodeWidthStr::width(current.as_str());
+            let word_w = UnicodeWidthStr::width(word);
+            if current.is_empty() && word_w + prefix_len <= max_w {
                 current = word.to_string();
-            } else if current.len() + 1 + word.len() + prefix_len <= max_w {
+            } else if !current.is_empty() && current_w + 1 + word_w + prefix_len <= max_w {
                 current.push(' ');
                 current.push_str(word);
-            } else {
+            } else if word_w + prefix_len <= max_w {
+                // Word fits on its own line; start new line
                 out.push(std::mem::take(&mut current));
                 current = word.to_string();
+            } else {
+                // Single word exceeds available width: break char-by-char.
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                let avail = max_w.saturating_sub(prefix_len).max(1);
+                let mut chunk = String::new();
+                let mut chunk_w: usize = 0;
+                for ch in word.chars() {
+                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if ch_w == 0 {
+                        continue;
+                    }
+                    if chunk_w + ch_w > avail && !chunk.is_empty() {
+                        out.push(std::mem::take(&mut chunk));
+                        chunk_w = 0;
+                    }
+                    chunk.push(ch);
+                    chunk_w += ch_w;
+                }
+                if !chunk.is_empty() {
+                    current = chunk;
+                }
             }
         }
         out.push(std::mem::take(&mut current));
@@ -557,7 +589,7 @@ mod tests {
             let w: usize = line
                 .spans
                 .iter()
-                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_str()))
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
             assert!(
                 w <= 10,

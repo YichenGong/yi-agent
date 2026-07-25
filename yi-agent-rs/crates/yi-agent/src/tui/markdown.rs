@@ -1,6 +1,7 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// Render a markdown string into ratatui Lines, wrapped at `width`.
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
@@ -141,7 +142,9 @@ impl LineBuilder {
         } else {
             let spans = std::mem::take(&mut self.current_spans);
             let max_w = self.width as usize;
-            // Word-wrap: split spans into words, accumulate until width exceeded
+            // Word-wrap: split spans into words, accumulate until display width exceeded.
+            // If a single word exceeds max_w (common for CJK text without spaces),
+            // break it character-by-character.
             let mut current: Vec<Span<'static>> = Vec::new();
             let mut current_width: usize = 0;
             for span in spans {
@@ -150,20 +153,48 @@ impl LineBuilder {
                 // Split span into words preserving spaces
                 let mut words: Vec<&str> = span_text.split(' ').collect();
                 for (i, word) in words.drain(..).enumerate() {
-                    let word_width = word.chars().count();
+                    let word_width = UnicodeWidthStr::width(word);
                     let sep = if i == 0 && current.is_empty() { 0 } else { 1 }; // space before word
-                    if current_width + sep + word_width <= max_w || current.is_empty() {
+                    if current_width + sep + word_width <= max_w {
                         // Fits on current line
                         if sep == 1 && !current.is_empty() {
                             current.push(Span::raw(" "));
                         }
                         current.push(Span::styled(word.to_string(), span_style));
                         current_width += sep + word_width;
-                    } else {
-                        // Start new line
+                    } else if word_width <= max_w {
+                        // Word fits on its own line; start new line
                         self.lines.push(Line::from(std::mem::take(&mut current)));
                         current.push(Span::styled(word.to_string(), span_style));
                         current_width = word_width;
+                    } else {
+                        // Single word exceeds max_w: break character-by-character.
+                        // Flush whatever is on the current line first.
+                        if !current.is_empty() {
+                            self.lines.push(Line::from(std::mem::take(&mut current)));
+                            current_width = 0;
+                        }
+                        let mut chunk = String::new();
+                        let mut chunk_width: usize = 0;
+                        for ch in word.chars() {
+                            let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                            if ch_w == 0 {
+                                continue;
+                            }
+                            if chunk_width + ch_w > max_w && !chunk.is_empty() {
+                                self.lines.push(Line::from(vec![Span::styled(
+                                    std::mem::take(&mut chunk),
+                                    span_style,
+                                )]));
+                                chunk_width = 0;
+                            }
+                            chunk.push(ch);
+                            chunk_width += ch_w;
+                        }
+                        if !chunk.is_empty() {
+                            current.push(Span::styled(chunk, span_style));
+                            current_width = chunk_width;
+                        }
                     }
                 }
             }
@@ -291,7 +322,7 @@ mod tests {
             let w: usize = line
                 .spans
                 .iter()
-                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_str()))
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
             assert!(
                 w <= 10,
@@ -317,7 +348,7 @@ mod tests {
             let w: usize = line
                 .spans
                 .iter()
-                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_str()))
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
             assert!(
                 w <= 15,
