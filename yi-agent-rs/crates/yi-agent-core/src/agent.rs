@@ -81,6 +81,9 @@ pub struct Agent {
     session: Arc<Mutex<Session>>,
     config: AgentConfig,
     cancel_token: CancellationToken,
+    permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
+    decision_rx:
+        Option<Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>>,
 }
 
 /// Events emitted during agent loop.
@@ -136,6 +139,8 @@ impl Agent {
             session: Arc::new(Mutex::new(Session::new())),
             config,
             cancel_token: CancellationToken::new(),
+            permission_checker: None,
+            decision_rx: None,
         }
     }
 
@@ -144,6 +149,17 @@ impl Agent {
             session: Arc::new(Mutex::new(session)),
             ..self
         }
+    }
+
+    /// Attach a permission checker and decision channel for tool gating.
+    pub fn with_permission(
+        mut self,
+        checker: Arc<crate::permission::PermissionChecker>,
+        decision_rx: mpsc::Receiver<(u64, crate::permission::Decision)>,
+    ) -> Self {
+        self.permission_checker = Some(checker);
+        self.decision_rx = Some(Arc::new(tokio::sync::Mutex::new(decision_rx)));
+        self
     }
 
     pub fn session(&self) -> Session {
@@ -175,13 +191,25 @@ impl Agent {
         let config = self.config.clone();
         let session = self.session.clone();
         let cancel_token = self.cancel_token.clone();
+        let permission_checker = self.permission_checker.clone();
+        let decision_rx = self.decision_rx.clone();
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             if tx.send(AgentEvent::Start).await.is_err() {
                 return; // Receiver dropped, stop the loop
             }
-            run_loop(tx, provider, tools, session, config, cancel_token).await;
+            run_loop(
+                tx,
+                provider,
+                tools,
+                session,
+                config,
+                cancel_token,
+                permission_checker,
+                decision_rx,
+            )
+            .await;
         });
 
         Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
@@ -195,6 +223,8 @@ async fn run_loop(
     session: Arc<Mutex<Session>>,
     config: AgentConfig,
     cancel_token: CancellationToken,
+    permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
+    decision_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>>,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
@@ -305,9 +335,131 @@ async fn run_loop(
             return;
         }
 
-        // 3. ACT - parallel execution
+        // 3. ACT - permission check + parallel execution
         info!(turn, tool_count = tool_uses.len(), tools = ?tool_uses.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(), "act: executing tools");
-        let futures: Vec<_> = tool_uses
+
+        // 权限检查阶段: 在并行执行前逐个检查,过滤被拒绝的工具
+        let mut checked_uses: Vec<(String, String, Value)> = Vec::new();
+        for (id, name, input) in tool_uses {
+            if let Some(checker) = &permission_checker {
+                let check_result = checker.check(&name, &input);
+                match check_result {
+                    crate::permission::CheckResult::Allow => {
+                        checked_uses.push((id, name, input));
+                    }
+                    crate::permission::CheckResult::Deny => {
+                        let _ = tx
+                            .send(AgentEvent::ToolResult {
+                                id: id.clone(),
+                                result: ToolResult::error("permission denied"),
+                            })
+                            .await;
+                    }
+                    crate::permission::CheckResult::NeedConfirm(req) => {
+                        if let Some(decision_rx) = &decision_rx {
+                            let _ = tx
+                                .send(AgentEvent::PermissionRequest {
+                                    request_id: req.request_id,
+                                    tool_name: req.tool_name.clone(),
+                                    tool_input: req.tool_input.clone(),
+                                    prefix_suggestion: req.prefix_suggestion.clone(),
+                                    kind: req.kind.clone(),
+                                })
+                                .await;
+                            let decision =
+                                wait_for_decision(decision_rx, req.request_id).await;
+                            let _ = tx
+                                .send(AgentEvent::PermissionResolved {
+                                    request_id: req.request_id,
+                                    decision: decision.clone(),
+                                })
+                                .await;
+                            match decision {
+                                crate::permission::Decision::AllowOnce
+                                | crate::permission::Decision::AlwaysAllowTool
+                                | crate::permission::Decision::AlwaysAllowPrefix(_) => {
+                                    let _ =
+                                        checker.apply_decision(&name, &input, &decision).await;
+                                    checked_uses.push((id, name, input));
+                                }
+                                crate::permission::Decision::Deny => {
+                                    let _ = tx
+                                        .send(AgentEvent::ToolResult {
+                                            id: id.clone(),
+                                            result: ToolResult::error("user denied"),
+                                        })
+                                        .await;
+                                }
+                            }
+                        } else {
+                            // No decision channel - deny by default
+                            let _ = tx
+                                .send(AgentEvent::ToolResult {
+                                    id: id.clone(),
+                                    result: ToolResult::error(
+                                        "permission required but no decision channel",
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+                    crate::permission::CheckResult::Blacklisted(req) => {
+                        if let Some(decision_rx) = &decision_rx {
+                            let _ = tx
+                                .send(AgentEvent::PermissionRequest {
+                                    request_id: req.request_id,
+                                    tool_name: req.tool_name.clone(),
+                                    tool_input: req.tool_input.clone(),
+                                    prefix_suggestion: req.prefix_suggestion.clone(),
+                                    kind: req.kind.clone(),
+                                })
+                                .await;
+                            let decision =
+                                wait_for_decision(decision_rx, req.request_id).await;
+                            let _ = tx
+                                .send(AgentEvent::PermissionResolved {
+                                    request_id: req.request_id,
+                                    decision: decision.clone(),
+                                })
+                                .await;
+                            match decision {
+                                crate::permission::Decision::AllowOnce
+                                | crate::permission::Decision::AlwaysAllowTool
+                                | crate::permission::Decision::AlwaysAllowPrefix(_) => {
+                                    let _ =
+                                        checker.apply_decision(&name, &input, &decision).await;
+                                    checked_uses.push((id, name, input));
+                                }
+                                crate::permission::Decision::Deny => {
+                                    let _ = tx
+                                        .send(AgentEvent::ToolResult {
+                                            id: id.clone(),
+                                            result: ToolResult::error(
+                                                "user denied blacklisted command",
+                                            ),
+                                        })
+                                        .await;
+                                }
+                            }
+                        } else {
+                            let _ = tx
+                                .send(AgentEvent::ToolResult {
+                                    id: id.clone(),
+                                    result: ToolResult::error(
+                                        "blacklisted command requires confirmation",
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            } else {
+                // No permission checker - allow all (backward compatible)
+                checked_uses.push((id, name, input));
+            }
+        }
+
+        let futures: Vec<_> = checked_uses
             .iter()
             .map(|(id, name, input)| {
                 let tools = tools.clone();
@@ -377,6 +529,23 @@ async fn run_loop(
         let tool_results_msg = Message::tool_results(tool_results);
         messages.push(tool_results_msg.clone());
         session.lock().unwrap().push(tool_results_msg);
+    }
+}
+
+/// Wait for a user decision matching `expected_id` on the decision channel.
+/// Discards any mismatched messages (defensive) and returns `Deny` if the
+/// channel is closed.
+async fn wait_for_decision(
+    decision_rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>,
+    expected_id: u64,
+) -> crate::permission::Decision {
+    let mut rx = decision_rx.lock().await;
+    loop {
+        match rx.recv().await {
+            Some((id, d)) if id == expected_id => return d,
+            Some(_) => continue,
+            None => return crate::permission::Decision::Deny,
+        }
     }
 }
 
@@ -1205,5 +1374,264 @@ mod tests {
             }
             _ => panic!("expected PermissionResolved"),
         }
+    }
+
+    #[test]
+    fn agent_with_permission_builder_sets_fields() {
+        let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
+        let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
+            crate::permission::PermissionsConfig::default(),
+            false,
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        ));
+        let (_tx, rx) = mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let provider = ScriptedProvider::new(vec![]);
+        let tools = Arc::new(ToolRegistry::new());
+        let agent = Agent::new(Arc::new(provider), tools, AgentConfig::default())
+            .with_permission(checker, rx);
+        assert!(agent.permission_checker.is_some());
+        assert!(agent.decision_rx.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_with_permission_allow_executes_tool() {
+        // PermissionChecker with yolo=true allows all bash commands (no blacklist match).
+        let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
+        let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
+            crate::permission::PermissionsConfig::default(),
+            true, // yolo: allow all (except blacklist, which is empty)
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        ));
+        let (_decision_tx, decision_rx) =
+            mpsc::channel::<(u64, crate::permission::Decision)>(16);
+
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"hi"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default())
+            .with_permission(checker, decision_rx);
+
+        let stream = agent.run("test".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        // "upper" tool is not bash/write/edit, so check() returns Allow immediately.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if !result.is_error)),
+            "tool should execute and return success"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_with_permission_need_confirm_user_denies() {
+        // No whitelist, no yolo -> bash tool call triggers NeedConfirm.
+        // User sends Deny -> tool result is an error.
+        let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
+        let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
+            crate::permission::PermissionsConfig::default(),
+            false, // not yolo
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        ));
+        let (decision_tx, decision_rx) =
+            mpsc::channel::<(u64, crate::permission::Decision)>(16);
+
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"command":"ls"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("ok".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default())
+            .with_permission(checker, decision_rx);
+
+        // Spawn a task to respond with Deny when a PermissionRequest arrives.
+        let _handle = tokio::spawn(async move {
+            // Wait for the request_id from the channel, then send Deny.
+            // The receiver is in the agent, so we just send a decision for any request_id.
+            // We need to know the request_id. It starts at 1.
+            decision_tx
+                .send((1, crate::permission::Decision::Deny))
+                .await
+                .ok();
+        });
+
+        let stream = agent.run("test".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        // Should have a PermissionRequest event
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PermissionRequest { .. })),
+            "should emit PermissionRequest event"
+        );
+        // Should have a PermissionResolved event with Deny
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::PermissionResolved {
+                    decision: crate::permission::Decision::Deny,
+                    ..
+                }
+            )),
+            "should emit PermissionResolved with Deny"
+        );
+        // Should have a ToolResult with error (denied)
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if result.is_error)),
+            "should have an error ToolResult for denied tool"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_with_permission_need_confirm_user_allows() {
+        // No whitelist, no yolo -> bash tool call triggers NeedConfirm.
+        // User sends AllowOnce -> tool executes normally.
+        let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
+        let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
+            crate::permission::PermissionsConfig::default(),
+            false,
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        ));
+        let (decision_tx, decision_rx) =
+            mpsc::channel::<(u64, crate::permission::Decision)>(16);
+
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"command":"ls"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        // Register a tool named "bash" that just echoes.
+        struct BashEchoTool;
+        #[async_trait]
+        impl Tool for BashEchoTool {
+            fn name(&self) -> &str {
+                "bash"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
+            }
+            fn description(&self) -> &str {
+                "Echoes the command back"
+            }
+            async fn call(&self, args: serde_json::Value) -> ToolResult {
+                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                ToolResult::text(format!("ran: {}", cmd))
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(BashEchoTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default())
+            .with_permission(checker, decision_rx);
+
+        let _handle = tokio::spawn(async move {
+            decision_tx
+                .send((1, crate::permission::Decision::AllowOnce))
+                .await
+                .ok();
+        });
+
+        let stream = agent.run("test".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        // Should have PermissionRequest and PermissionResolved events
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PermissionRequest { .. })),
+            "should emit PermissionRequest event"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::PermissionResolved {
+                    decision: crate::permission::Decision::AllowOnce,
+                    ..
+                }
+            )),
+            "should emit PermissionResolved with AllowOnce"
+        );
+        // Should have a successful ToolResult
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if !result.is_error)),
+            "should have a successful ToolResult for allowed tool"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
     }
 }
