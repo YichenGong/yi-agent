@@ -13,4 +13,6 @@ pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
     StopReason, TokenUsage,
 };
-pub use tool::{Tool, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource};
+pub use tool::{
+    OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,
+};

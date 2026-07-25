@@ -8,6 +8,34 @@ use serde_json::Value;
 
 use crate::message::ContentBlock;
 
+/// Output stream type for tool streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Streaming events emitted by `Tool::call_stream`.
+#[derive(Debug, Clone)]
+pub enum ToolEvent {
+    /// Incremental output from the tool process.
+    OutputDelta {
+        stream: OutputStream,
+        text: String,
+    },
+    /// Process exited with optional code (None = killed).
+    Exit {
+        code: Option<i32>,
+    },
+    /// Watchdog killed the process (no output within expected window).
+    Timeout,
+    /// A stream was truncated at the output cap.
+    Truncated {
+        stream: OutputStream,
+        skipped_bytes: usize,
+    },
+}
+
 /// Result of tool execution, fed back to the LLM.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolResult {
@@ -78,9 +106,18 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> Value;
     fn description(&self) -> &str;
     async fn call(&self, args: Value) -> ToolResult;
-
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata::default()
+    }
+
+    /// Streaming variant. Default implementation just calls `call` with no stream events.
+    /// Tools that produce incremental output should override this.
+    async fn call_stream(
+        &self,
+        args: Value,
+        _tx: tokio::sync::mpsc::Sender<ToolEvent>,
+    ) -> ToolResult {
+        self.call(args).await
     }
 }
 
