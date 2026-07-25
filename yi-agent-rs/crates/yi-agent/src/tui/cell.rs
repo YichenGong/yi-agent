@@ -540,6 +540,38 @@ mod tests {
     }
 
     #[test]
+    fn user_message_cjk_wraps_at_display_width() {
+        // CJK chars are 2 display columns. With width=10 and 2-char prefix,
+        // available width is 8 cols = 4 CJK chars per continuation line.
+        let cell = HistoryCell::UserMessage {
+            text: "一二三四五六七八九十".into(),
+        };
+        let lines = cell.lines(10);
+        assert!(
+            lines.len() > 1,
+            "expected CJK user message to wrap at width 10, got {} lines",
+            lines.len()
+        );
+        // Verify no line exceeds 10 display columns
+        for (i, line) in lines.iter().enumerate() {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_str()))
+                .sum();
+            assert!(
+                w <= 10,
+                "line {} display width {w} exceeds 10: {:?}",
+                i,
+                line.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn assistant_text_creates_new_cell() {
         let cell = HistoryCell::from_assistant_text("hello", 80);
         match cell {

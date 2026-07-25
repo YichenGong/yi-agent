@@ -274,4 +274,69 @@ mod tests {
             assert!(w <= 20, "line width {w} exceeds 20: {:?}", spans_text(line));
         }
     }
+
+    #[test]
+    fn cjk_text_wraps_at_display_width() {
+        // Each CJK char is 2 display columns wide. With width=10, we should
+        // fit at most 5 CJK chars per line.
+        let src = "一二三四五六七八九十";
+        let lines = render_markdown(src, 10);
+        assert!(
+            lines.len() > 1,
+            "expected CJK text to wrap at display width 10, got {} lines",
+            lines.len()
+        );
+        // Verify no line exceeds 10 display columns
+        for (i, line) in lines.iter().enumerate() {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_str()))
+                .sum();
+            assert!(
+                w <= 10,
+                "line {} display width {w} exceeds 10: {:?}",
+                i,
+                spans_text(line)
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_mixed_with_ascii_wraps_correctly() {
+        // Mixed CJK + ASCII: "编写或修改代码" is 14 display cols + "hello" is 5 = 19 cols
+        // With width=15, this should wrap.
+        let src = "编写或修改代码 hello world";
+        let lines = render_markdown(src, 15);
+        assert!(
+            lines.len() > 1,
+            "expected mixed CJK/ASCII to wrap at width 15, got {} lines",
+            lines.len()
+        );
+        for (i, line) in lines.iter().enumerate() {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_str()))
+                .sum();
+            assert!(
+                w <= 15,
+                "line {} display width {w} exceeds 15: {:?}",
+                i,
+                spans_text(line)
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_width_counts_as_two() {
+        // 📝 has display width 2. With width=5, "📝📝📝" (6 cols) should wrap.
+        let src = "📝📝📝";
+        let lines = render_markdown(src, 5);
+        assert!(
+            lines.len() > 1,
+            "expected emoji to wrap at width 5, got {} lines",
+            lines.len()
+        );
+    }
 }
