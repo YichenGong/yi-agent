@@ -93,9 +93,7 @@ impl HistoryCell {
                 *resolved,
                 width,
             ),
-            Self::PermissionResolved { decision } => {
-                render_permission_resolved(decision)
-            }
+            Self::PermissionResolved { decision } => render_permission_resolved(decision),
         }
     }
 
@@ -241,23 +239,27 @@ fn render_permission_request(
     ];
 
     // Menu options
-    let blacklisted = matches!(kind, yi_agent_core::permission::PermissionKind::Blacklisted(_));
+    let blacklisted = matches!(
+        kind,
+        yi_agent_core::permission::PermissionKind::Blacklisted(_)
+    );
     if blacklisted {
-        lines.push(Line::from(vec![
-            Span::styled("  [!] Blacklisted command", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "  [!] Blacklisted command",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]));
     }
 
     let option_lines = match prefix_suggestion {
-        Some(p) => vec![
-            Span::styled("  [1] Allow once", menu_style),
-        ].into_iter().chain(vec![
-            Span::styled("  [2] Always allow tool", menu_style),
-        ]).chain(vec![
-            Span::styled(format!("  [3] Always allow prefix: {p}"), menu_style),
-        ]).chain(vec![
-            Span::styled("  [4] Deny", menu_style),
-        ]).collect::<Vec<_>>(),
+        Some(p) => vec![Span::styled("  [1] Allow once", menu_style)]
+            .into_iter()
+            .chain(vec![Span::styled("  [2] Always allow tool", menu_style)])
+            .chain(vec![Span::styled(
+                format!("  [3] Always allow prefix: {p}"),
+                menu_style,
+            )])
+            .chain(vec![Span::styled("  [4] Deny", menu_style)])
+            .collect::<Vec<_>>(),
         None => vec![
             Span::styled("  [1] Allow once", menu_style),
             Span::styled("  [2] Always allow tool", menu_style),
@@ -278,11 +280,15 @@ fn render_permission_request(
     lines
 }
 
-fn render_permission_resolved(decision: &yi_agent_core::permission::Decision) -> Vec<Line<'static>> {
+fn render_permission_resolved(
+    decision: &yi_agent_core::permission::Decision,
+) -> Vec<Line<'static>> {
     let (label, color) = match decision {
         yi_agent_core::permission::Decision::AllowOnce => ("allowed (once)", Color::Green),
         yi_agent_core::permission::Decision::AlwaysAllowTool => ("allowed (always)", Color::Green),
-        yi_agent_core::permission::Decision::AlwaysAllowPrefix(_) => ("allowed (prefix)", Color::Green),
+        yi_agent_core::permission::Decision::AlwaysAllowPrefix(_) => {
+            ("allowed (prefix)", Color::Green)
+        }
         yi_agent_core::permission::Decision::Deny => ("denied", Color::Red),
     };
     vec![Line::from(vec![
@@ -314,31 +320,40 @@ fn wrap_with_prefix(
     cont_prefix: &str,
 ) -> Vec<Line<'static>> {
     let max_w = width as usize;
-    let mut lines = vec![];
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let prefix_len = if lines.is_empty() {
-            2
-        } else {
-            cont_prefix.len()
-        };
-        if current.is_empty() {
-            current = word.to_string();
-        } else if current.len() + 1 + word.len() + prefix_len <= max_w {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current = word.to_string();
+    // 段内自动换行的辅助函数：按宽度把单词拼到 current 里
+    let wrap_segment = |seg: &str, out: &mut Vec<String>| {
+        let mut current = String::new();
+        for word in seg.split_whitespace() {
+            // 首行有 first_prefix（2 字符），后续行有 cont_prefix
+            let prefix_len = if out.is_empty() { 2 } else { cont_prefix.len() };
+            if current.is_empty() {
+                current = word.to_string();
+            } else if current.len() + 1 + word.len() + prefix_len <= max_w {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current = word.to_string();
+            }
         }
+        out.push(std::mem::take(&mut current));
+    };
+
+    let mut raw_lines: Vec<String> = Vec::new();
+    // 先按 \n 切分，保留显式换行（包括空行）
+    for seg in text.split('\n') {
+        wrap_segment(seg, &mut raw_lines);
     }
-    if !current.is_empty() {
-        lines.push(current);
+    // 移除末尾 wrap_segment 产生的空行（当 text 不以 \n 结尾时不会有；
+    // 当 text 以 \n 结尾时 split 会多产出一个空段，这里保留它以维持尾空行）
+    // 注：split('\n') 对 "a\n" 会产出 ["a", ""]，两个段都会生成一行，
+    // 因此末尾的空行会被保留；这与预期一致。
+
+    if raw_lines.is_empty() {
+        raw_lines.push(String::new());
     }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
+
+    raw_lines
         .into_iter()
         .enumerate()
         .map(|(i, text)| {
@@ -472,6 +487,56 @@ mod tests {
             expanded: false,
         };
         assert!(cell.is_foldable());
+    }
+
+    #[test]
+    fn user_message_preserves_explicit_newlines() {
+        let cell = HistoryCell::UserMessage {
+            text: "line1\nline2\nline3".into(),
+        };
+        let lines = cell.lines(80);
+        assert_eq!(
+            lines.len(),
+            3,
+            "three explicit lines should render as 3 lines, got {}: {:?}",
+            lines.len(),
+            lines
+                .iter()
+                .map(|l| l
+                    .spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn user_message_empty_line_between_text() {
+        let cell = HistoryCell::UserMessage {
+            text: "para1\n\npara2".into(),
+        };
+        let lines = cell.lines(80);
+        assert_eq!(lines.len(), 3, "blank line should be preserved");
+    }
+
+    #[test]
+    fn user_message_multiline_with_long_line_wraps() {
+        let cell = HistoryCell::UserMessage {
+            text: "short\nthis is a very long line that should wrap when terminal is narrow".into(),
+        };
+        let lines = cell.lines(20);
+        assert!(
+            lines.len() >= 3,
+            "should preserve newline AND wrap long line"
+        );
+        // First line is "short"
+        let first: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(first.contains("short"));
     }
 
     #[test]
