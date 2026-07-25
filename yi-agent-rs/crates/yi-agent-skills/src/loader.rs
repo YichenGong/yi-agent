@@ -27,7 +27,7 @@ pub fn parse_skill_md(
             "missing YAML frontmatter".to_string(),
         ))?;
 
-    let fm: Frontmatter = serde_yaml::from_str(&frontmatter_text)
+    let fm: Frontmatter = serde_yaml::from_str(frontmatter_text)
         .map_err(|e| SkillError::ParseError(path.to_path_buf(), e.to_string()))?;
 
     if !is_valid_skill_name(&fm.name) {

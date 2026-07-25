@@ -35,7 +35,7 @@ fn write_dir_recursive(dir: &Dir, target: &Path) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let content = file.contents();
-        if let Some(existing) = std::fs::read(&dest).ok() {
+        if let Ok(existing) = std::fs::read(&dest) {
             if hash(&existing) == hash(content) {
                 continue; // same content, skip
             }

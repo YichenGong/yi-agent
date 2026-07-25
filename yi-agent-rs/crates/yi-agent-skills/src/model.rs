@@ -35,7 +35,7 @@ pub fn is_valid_skill_name(name: &str) -> bool {
     }
     let mut chars = name.chars().peekable();
     let mut prev_was_hyphen = true; // disallow leading hyphen
-    while let Some(c) = chars.next() {
+    for c in chars.by_ref() {
         if c == '-' {
             if prev_was_hyphen {
                 return false; // no leading or consecutive hyphens
