@@ -131,6 +131,9 @@ impl Provider for OpenaiProvider {
                 if matches!(event, ProviderEvent::Stop { .. }) {
                     *state = None;
                 }
+                // Usage can arrive after Stop (OpenAI sends it in a final chunk).
+                // Always yield it even after Stop so token counts are captured.
+                let yield_event = yield_event || matches!(event, ProviderEvent::Usage(_));
                 std::future::ready(if yield_event { Some(event) } else { None })
             });
         Ok(mapped.boxed())
