@@ -103,6 +103,17 @@ pub enum AgentEvent {
     },
     Cancelled,
     Error(AgentError),
+    PermissionRequest {
+        request_id: u64,
+        tool_name: String,
+        tool_input: Value,
+        prefix_suggestion: Option<String>,
+        kind: crate::permission::PermissionKind,
+    },
+    PermissionResolved {
+        request_id: u64,
+        decision: crate::permission::Decision,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +403,7 @@ async fn accumulate_provider_stream(
 mod tests {
     use super::*;
     use crate::message::{Message, Role};
+    use crate::permission::{Decision, PermissionKind};
     use crate::provider::{
         GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason,
     };
@@ -1153,5 +1165,45 @@ mod tests {
         assert_eq!(config.model, "custom-model");
         assert_eq!(config.max_turns, Some(50));
         assert_eq!(config.gen_params.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn permission_request_event_constructs() {
+        let ev = AgentEvent::PermissionRequest {
+            request_id: 1,
+            tool_name: "bash".to_string(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            prefix_suggestion: Some("ls".to_string()),
+            kind: PermissionKind::Normal,
+        };
+        match ev {
+            AgentEvent::PermissionRequest {
+                request_id,
+                tool_name,
+                ..
+            } => {
+                assert_eq!(request_id, 1);
+                assert_eq!(tool_name, "bash");
+            }
+            _ => panic!("expected PermissionRequest"),
+        }
+    }
+
+    #[test]
+    fn permission_resolved_event_constructs() {
+        let ev = AgentEvent::PermissionResolved {
+            request_id: 1,
+            decision: Decision::AllowOnce,
+        };
+        match ev {
+            AgentEvent::PermissionResolved {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, 1);
+                assert_eq!(decision, Decision::AllowOnce);
+            }
+            _ => panic!("expected PermissionResolved"),
+        }
     }
 }
