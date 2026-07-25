@@ -204,6 +204,68 @@ impl PermissionChecker {
             kind,
         }
     }
+
+    pub async fn apply_decision(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        decision: &Decision,
+    ) -> Result<(), String> {
+        match decision {
+            Decision::AllowOnce | Decision::Deny => {}
+            Decision::AlwaysAllowTool => {
+                let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+                match tool_name {
+                    "bash" => config.tool_level.bash = true,
+                    "write" => config.tool_level.write = true,
+                    "edit" => config.tool_level.edit = true,
+                    _ => {}
+                }
+                self.save_config(&config).map_err(|e| e.to_string())?;
+            }
+            Decision::AlwaysAllowPrefix(prefix) => {
+                let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+                match tool_name {
+                    "bash" => {
+                        if !config.prefix_level.bash.prefixes.contains(prefix) {
+                            config.prefix_level.bash.prefixes.push(prefix.clone());
+                        }
+                    }
+                    "write" => {
+                        if !config.prefix_level.write.paths.contains(prefix) {
+                            config.prefix_level.write.paths.push(prefix.clone());
+                        }
+                    }
+                    "edit" => {
+                        if !config.prefix_level.edit.paths.contains(prefix) {
+                            config.prefix_level.edit.paths.push(prefix.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                self.save_config(&config).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn save_config(&self, config: &PermissionsConfig) -> std::io::Result<()> {
+        let dir = self.workdir.join(".yi-agent");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("permissions.toml");
+        let toml_str = toml::to_string(config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, toml_str)
+    }
+
+    pub async fn load(workdir: &std::path::Path) -> Result<PermissionsConfig, String> {
+        let path = workdir.join(".yi-agent").join("permissions.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => toml::from_str(&content).map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PermissionsConfig::default()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 fn glob_match(pattern: &str, path: &str) -> bool {
@@ -477,5 +539,142 @@ bash = true
             checker.check("write", &input),
             CheckResult::Allow
         ));
+    }
+
+    #[tokio::test]
+    async fn apply_always_allow_tool_bash_updates_config_and_saves() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+
+        checker
+            .apply_decision("bash", &bash_input("ls"), &Decision::AlwaysAllowTool)
+            .await
+            .unwrap();
+
+        let loaded = PermissionChecker::load(&workdir).await.unwrap();
+        assert!(loaded.tool_level.bash);
+        assert!(!loaded.tool_level.write);
+    }
+
+    #[tokio::test]
+    async fn apply_always_allow_prefix_bash_adds_prefix() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+
+        checker
+            .apply_decision("bash", &bash_input("git push"), &Decision::AlwaysAllowPrefix("git push".to_string()))
+            .await
+            .unwrap();
+
+        let loaded = PermissionChecker::load(&workdir).await.unwrap();
+        assert_eq!(loaded.prefix_level.bash.prefixes, vec!["git push".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn apply_allow_once_does_not_save() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+
+        checker
+            .apply_decision("bash", &bash_input("ls"), &Decision::AllowOnce)
+            .await
+            .unwrap();
+
+        let loaded = PermissionChecker::load(&workdir).await.unwrap();
+        assert!(!loaded.tool_level.bash);
+        assert!(loaded.prefix_level.bash.prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_deny_does_not_save() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+
+        checker
+            .apply_decision("bash", &bash_input("ls"), &Decision::Deny)
+            .await
+            .unwrap();
+
+        let loaded = PermissionChecker::load(&workdir).await.unwrap();
+        assert!(!loaded.tool_level.bash);
+    }
+
+    #[tokio::test]
+    async fn apply_always_allow_tool_write_updates_config() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+
+        checker
+            .apply_decision("write", &serde_json::json!({"path": "a.rs"}), &Decision::AlwaysAllowTool)
+            .await
+            .unwrap();
+
+        let loaded = PermissionChecker::load(&workdir).await.unwrap();
+        assert!(loaded.tool_level.write);
+        assert!(!loaded.tool_level.bash);
+    }
+
+    #[tokio::test]
+    async fn apply_always_allow_prefix_edit_adds_path() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+
+        checker
+            .apply_decision("edit", &serde_json::json!({"path": "a.rs"}), &Decision::AlwaysAllowPrefix("src/**".to_string()))
+            .await
+            .unwrap();
+
+        let loaded = PermissionChecker::load(&workdir).await.unwrap();
+        assert_eq!(loaded.prefix_level.edit.paths, vec!["src/**".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn load_nonexistent_returns_default() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let loaded = PermissionChecker::load(tmpdir.path()).await.unwrap();
+        assert_eq!(loaded, PermissionsConfig::default());
+    }
+
+    #[tokio::test]
+    async fn apply_always_allow_prefix_bash_no_duplicate() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+
+        let config = PermissionsConfig {
+            prefix_level: PrefixLevelConfig {
+                bash: BashPrefixConfig { prefixes: vec!["git push".to_string()] },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(config, false, workdir.clone(), blocklist);
+
+        // Apply same prefix again
+        checker
+            .apply_decision("bash", &bash_input("git push"), &Decision::AlwaysAllowPrefix("git push".to_string()))
+            .await
+            .unwrap();
+
+        let loaded = PermissionChecker::load(&workdir).await.unwrap();
+        assert_eq!(loaded.prefix_level.bash.prefixes.len(), 1, "should not duplicate existing prefix");
     }
 }
