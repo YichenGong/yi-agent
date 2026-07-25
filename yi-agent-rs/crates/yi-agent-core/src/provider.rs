@@ -112,6 +112,7 @@ where
                 if let Some((_, json)) = tool_uses.get_mut(&id) {
                     json.push_str(&partial_json);
                 }
+                on_event(ProviderEvent::ToolUseDelta { id, partial_json });
             }
             ProviderEvent::ToolUseEnd { id } => {
                 if let Some((name, json)) = tool_uses.remove(&id) {
@@ -394,6 +395,61 @@ mod tests {
         assert_eq!(received_text, vec!["hi".to_string()]);
         assert_eq!(received_usage.len(), 1);
         assert_eq!(received_usage[0].input_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_forwards_tool_use_delta_via_callback() {
+        let events = vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "search".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "{\"q\":".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "\"weather\"}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let provider = MockProvider { events };
+        let stream = provider
+            .call_stream(ProviderRequest {
+                model: "test".into(),
+                system: None,
+                messages: vec![],
+                tools: vec![],
+                params: GenParams::default(),
+            })
+            .await
+            .unwrap();
+
+        let mut received_deltas = Vec::new();
+        let (content, _stop) = accumulate_stream(stream, |ev| {
+            if let ProviderEvent::ToolUseDelta { partial_json, .. } = ev {
+                received_deltas.push(partial_json);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            received_deltas,
+            vec!["{\"q\":".to_string(), "\"weather\"}".to_string()]
+        );
+        assert_eq!(content.len(), 1);
+        match &content[0] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "weather"}));
+            }
+            _ => panic!("expected ToolUse"),
+        }
     }
 
     #[tokio::test]

@@ -1078,6 +1078,48 @@ mod tests {
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
     }
 
+    #[test]
+    fn test_route_event_decode_delta_accumulates() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        // Simulate streamed tool-call argument deltas.
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::DecodeDelta("{\"q\":".into()),
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::DecodeDelta("\"weather\"}".into()),
+        );
+        // {"q": = 5 chars, "weather"} = 9 chars → 14 ascii → 14/4 = 3 tokens
+        assert_eq!(sb.display_output_tokens(), 0); // display lags via tick
+        assert_eq!(
+            sb.target_output_tokens(),
+            3,
+            "two DecodeDelta events should accumulate"
+        );
+    }
+
+    #[test]
+    fn test_route_event_assistant_text_accumulates() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::AssistantText("hello".into()),
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::AssistantText("world".into()),
+        );
+        // 10 ascii chars → 10/4 = 2 tokens
+        assert_eq!(sb.target_output_tokens(), 2);
+    }
+
     /// Fake event source that plays back a scripted sequence of events,
     /// then returns None (timeout) forever. Used to test the loop deterministically.
     struct ScriptedEvents {
