@@ -65,12 +65,33 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: "claude-sonnet-4-5".to_string(),
-            system_prompt: None,
+            system_prompt: Some(Self::default_system_prompt()),
             max_turns: Some(100),
             gen_params: Default::default(),
             compact_threshold: Some(100_000),
             compact_keep_turns: Some(4),
         }
+    }
+}
+
+impl AgentConfig {
+    /// Built-in system prompt encouraging batch tool calls.
+    /// Used when the user does not provide a custom `system_prompt`.
+    pub fn default_system_prompt() -> String {
+        r#"You are yi-agent. You are a helpful general purpose agent designed by Gong Yichen (宫一尘). You have logical thinking, aim for the best, execute perfectly and always speak with evidence.
+
+You work efficiently by minimizing round-trips. Tool use strategy:
+- Independent operations (reading multiple files, parallel searches): issue
+  MULTIPLE tool calls in a single response. They will be executed in parallel.
+- Dependent operations that must run in sequence (create dir → write file →
+  run tests): combine them into ONE bash call using && so the whole sequence
+  completes in a single step.
+- Only split work across turns when a later step genuinely depends on the
+  RESULT of an earlier step.
+
+Example: instead of 3 turns (mkdir, write, test), use one bash call:
+  mkdir -p src/utils && echo '...' > src/utils/mod.rs && cargo test"#
+            .to_string()
     }
 }
 
@@ -1351,7 +1372,34 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.model, "claude-sonnet-4-5");
         assert_eq!(config.max_turns, Some(100));
-        assert!(config.system_prompt.is_none());
+    }
+
+    #[test]
+    fn default_system_prompt_contains_identity_and_strategy() {
+        let prompt = AgentConfig::default_system_prompt();
+        assert!(prompt.contains("yi-agent"));
+        assert!(prompt.contains("Gong Yichen"));
+        assert!(prompt.contains("minimizing round-trips"));
+        assert!(prompt.contains("MULTIPLE tool calls"));
+        assert!(prompt.contains("&&"));
+    }
+
+    #[test]
+    fn agent_config_default_uses_default_system_prompt() {
+        let config = AgentConfig::default();
+        assert_eq!(
+            config.system_prompt.as_deref(),
+            Some(AgentConfig::default_system_prompt().as_str())
+        );
+    }
+
+    #[test]
+    fn agent_config_custom_system_prompt_overrides_default() {
+        let config = AgentConfig {
+            system_prompt: Some("be brief".into()),
+            ..Default::default()
+        };
+        assert_eq!(config.system_prompt.as_deref(), Some("be brief"));
     }
 
     #[test]

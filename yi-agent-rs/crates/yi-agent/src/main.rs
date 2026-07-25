@@ -90,7 +90,7 @@ fn run_agent(cli: Cli) -> Result<()> {
 
     let agent_config = yi_agent_core::AgentConfig {
         model: config.model.clone(),
-        system_prompt: config.system_prompt.clone(),
+        system_prompt: resolve_system_prompt(config.system_prompt.clone()),
         max_turns: Some(config.max_turns),
         compact_threshold: Some(config.compact_threshold),
         compact_keep_turns: Some(config.compact_keep_turns),
@@ -261,6 +261,12 @@ fn run_tui_agent(
     Ok(())
 }
 
+/// Resolve the effective system prompt: fall back to the built-in default
+/// when the user did not provide one.
+fn resolve_system_prompt(user: Option<String>) -> Option<String> {
+    user.or_else(|| Some(yi_agent_core::AgentConfig::default_system_prompt()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +333,17 @@ mod tests {
             skip_permissions: false,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
+    }
+
+    #[test]
+    fn resolve_system_prompt_none_uses_default() {
+        let resolved = resolve_system_prompt(None);
+        assert_eq!(resolved.as_deref(), Some(yi_agent_core::AgentConfig::default_system_prompt().as_str()));
+    }
+
+    #[test]
+    fn resolve_system_prompt_custom_overrides_default() {
+        let resolved = resolve_system_prompt(Some("custom".into()));
+        assert_eq!(resolved.as_deref(), Some("custom"));
     }
 }

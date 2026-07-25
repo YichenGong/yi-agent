@@ -39,7 +39,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command via sh -c. Subject to blocklist + timeout. cwd persists across calls."
+        "Execute a shell command via sh -c. Subject to blocklist + timeout. cwd persists across calls. Prefer combining dependent steps with && into a single call (e.g. `mkdir -p foo && touch foo/bar.txt && ls foo`) rather than splitting across turns."
     }
 
     fn schema(&self) -> Value {
@@ -318,5 +318,16 @@ mod tests {
     fn parse_cd_target_none() {
         let cwd = std::path::Path::new("/root");
         assert!(parse_cd_target("ls -la", cwd).is_none());
+    }
+
+    #[test]
+    fn bash_description_encourages_combining_steps() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+        let desc = tool.description();
+        assert!(
+            desc.contains("&&"),
+            "description should guide combining dependent steps with &&, got: {desc}"
+        );
     }
 }
