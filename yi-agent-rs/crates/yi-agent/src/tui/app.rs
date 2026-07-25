@@ -114,6 +114,7 @@ fn run_loop<B: Backend, E: EventSource>(
     events: &E,
 ) -> std::io::Result<()> {
     let _ = is_running;
+    let mut pending_quit = false;
 
     loop {
         // Drain all pending agent events
@@ -138,15 +139,16 @@ fn run_loop<B: Backend, E: EventSource>(
             };
             f.render_widget(history_view, chunks[0]);
 
-            let input_line = build_input_line(input);
+            let input_line = build_input_line(input, pending_quit);
             f.render_widget(input_line, chunks[2]);
         })?;
 
         // Poll for key events with timeout
         if let Some(Event::Key(key)) = events.poll(Duration::from_millis(50))? {
-            match handle_key(key, input, history, input_tx, interrupt_tx) {
+            match handle_key(key, input, history, input_tx, interrupt_tx, &mut pending_quit) {
                 KeyOutcome::Quit => break,
                 KeyOutcome::Submit(text) => {
+                    pending_quit = false;
                     history.push(super::cell::HistoryCell::UserMessage { text: text.clone() });
                     let _ = input_tx.blocking_send(text);
                 }
@@ -170,42 +172,57 @@ fn handle_key(
     history: &mut HistoryState,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    pending_quit: &mut bool,
 ) -> KeyOutcome {
     // Global keys first
     match key.code {
         KeyCode::Esc => {
-            let _ = interrupt_tx.blocking_send(());
+            if *pending_quit {
+                return KeyOutcome::Quit;
+            }
+            *pending_quit = true;
             return KeyOutcome::None;
         }
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-            let _ = interrupt_tx.blocking_send(());
+            if *pending_quit {
+                return KeyOutcome::Quit;
+            }
+            *pending_quit = true;
             return KeyOutcome::None;
         }
         KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => {
             return KeyOutcome::Quit;
         }
         KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
+            *pending_quit = false;
             history.toggle_fold_selected();
             return KeyOutcome::None;
         }
         KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
+            *pending_quit = false;
             history.select_up();
             return KeyOutcome::None;
         }
         KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
+            *pending_quit = false;
             history.select_down();
             return KeyOutcome::None;
         }
         KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+            *pending_quit = false;
             history.scroll_up(10);
             return KeyOutcome::None;
         }
         KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            *pending_quit = false;
             history.scroll_down(10);
             return KeyOutcome::None;
         }
         _ => {}
     }
+
+    // Any other key cancels pending quit
+    *pending_quit = false;
 
     // Input handling
     match input.handle_key(key) {
@@ -217,10 +234,19 @@ fn handle_key(
     }
 }
 
-fn build_input_line(input: &InputLine) -> Paragraph<'static> {
+fn build_input_line(input: &InputLine, pending_quit: bool) -> Paragraph<'static> {
     let prefix = Span::styled("> ", Style::new().add_modifier(Modifier::BOLD | Modifier::DIM));
-    let text = Span::raw(input.buffer.clone());
-    let line = Line::from(vec![prefix, text]);
+    let line = if pending_quit {
+        Line::from(vec![
+            prefix,
+            Span::styled(
+                "再按 Ctrl+C 或 Esc 退出",
+                Style::new().fg(Color::Yellow),
+            ),
+        ])
+    } else {
+        Line::from(vec![prefix, Span::raw(input.buffer.clone())])
+    };
     Paragraph::new(line).style(Style::new().bg(Color::Indexed(240)))
 }
 
@@ -264,6 +290,105 @@ mod tests {
             handle.await.unwrap();
             assert_eq!(input_rx.recv().await.unwrap(), "hello");
         });
+    }
+
+    /// Test that first Ctrl+C does NOT quit but shows a confirm prompt,
+    /// and any other key cancels the pending quit.
+    #[test]
+    fn first_ctrl_c_does_not_quit() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Ctrl+C then Ctrl+Q: if first Ctrl+C quit, Ctrl+Q would be unreachable.
+        // We verify the terminal buffer shows the confirm prompt after Ctrl+C.
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+        ).unwrap();
+
+        // After Ctrl+C, the input row should show the confirm message
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let row_text: String = (0..80)
+            .map(|x| buffer[(x, input_row)].symbol())
+            .collect();
+        assert!(row_text.contains("Ctrl") || row_text.contains("退出"),
+            "expected confirm prompt, got: {row_text:?}");
+    }
+
+    /// Test that two Ctrl+C presses quit the TUI.
+    #[test]
+    fn two_ctrl_c_quits() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        let result = run_tui_with_backend_and_events(
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+        );
+        assert!(result.is_ok(), "two Ctrl+C should quit cleanly, got: {:?}", result);
+    }
+
+    /// Test that Esc behaves the same as Ctrl+C (confirm first, quit on second).
+    #[test]
+    fn esc_same_as_ctrl_c() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // First Esc alone should not quit
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        let result = run_tui_with_backend_and_events(
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+        );
+        assert!(result.is_ok(), "two Esc should quit cleanly, got: {:?}", result);
+    }
+
+    /// Test that Ctrl+Q quits directly (no confirm needed).
+    #[test]
+    fn ctrl_q_quits_directly() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        let result = run_tui_with_backend_and_events(
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+        );
+        assert!(result.is_ok(), "Ctrl+Q should quit directly, got: {:?}", result);
     }
 
     /// Test that typing characters updates the input buffer and renders them
