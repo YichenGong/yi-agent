@@ -33,7 +33,6 @@ pub fn discover_skills(roots: &[SkillRoot]) -> Vec<SkillMetadata> {
 fn discover_one(root: &SkillRoot, out: &mut Vec<SkillMetadata>) {
     let mut dir_count = 0usize;
     let mut entry_count = 0usize;
-    let mut stop = false;
 
     let root_path = root.path.clone();
     for entry in WalkDir::new(&root.path)
@@ -45,9 +44,6 @@ fn discover_one(root: &SkillRoot, out: &mut Vec<SkillMetadata>) {
             e.path() == root_path || !is_hidden(e.file_name())
         })
     {
-        if stop {
-            break;
-        }
         let Ok(entry) = entry else { continue };
 
         entry_count += 1;
@@ -66,8 +62,7 @@ fn discover_one(root: &SkillRoot, out: &mut Vec<SkillMetadata>) {
                     "skill discovery: root {} exceeded max dirs ({}), stopping",
                     root.path.display(), MAX_DIRS
                 );
-                stop = true;
-                continue;
+                break;
             }
             continue;
         }

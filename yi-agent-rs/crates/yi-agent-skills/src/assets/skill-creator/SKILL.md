@@ -5,4 +5,4 @@ description: Guide for creating effective skills. Use when users want to create 
 
 # Skill Creator
 
-Placeholder. Full content will be written in Task 10.
+Placeholder. Full content will be written in a later task.

@@ -33,9 +33,8 @@ pub fn is_valid_skill_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
     }
-    let mut chars = name.chars().peekable();
     let mut prev_was_hyphen = true; // disallow leading hyphen
-    for c in chars.by_ref() {
+    for c in name.chars() {
         if c == '-' {
             if prev_was_hyphen {
                 return false; // no leading or consecutive hyphens

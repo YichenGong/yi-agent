@@ -5,4 +5,4 @@ description: Guide for installing skills from external sources like GitHub repos
 
 # Skill Installer
 
-Placeholder. Full content will be written in Task 10.
+Placeholder. Full content will be written in a later task.

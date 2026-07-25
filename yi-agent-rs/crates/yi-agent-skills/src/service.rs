@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::discovery::{discover_skills, SkillRoot};
+use crate::loader::split_frontmatter;
 use crate::model::{SkillError, SkillMetadata, SkillScope};
 
 const CATALOG_HEADER: &str = "## Skills\n\n\
@@ -30,13 +31,13 @@ impl SkillsService {
     /// Trigger discovery if not yet cached. Returns slice of cached skills.
     pub fn snapshot(&self) -> Result<Vec<SkillMetadata>, SkillError> {
         {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
             if let Some(ref skills) = *cache {
                 return Ok(skills.clone());
             }
         }
         let skills = discover_skills(&self.roots);
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         *cache = Some(skills.clone());
         Ok(skills)
     }
@@ -44,7 +45,7 @@ impl SkillsService {
     /// Force re-scan, discarding cache.
     pub fn refresh(&self) -> Result<Vec<SkillMetadata>, SkillError> {
         let skills = discover_skills(&self.roots);
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         *cache = Some(skills.clone());
         Ok(skills)
     }
@@ -70,6 +71,13 @@ impl SkillsService {
 
     /// Load the body of a SKILL.md at the given path.
     /// Reads from filesystem each call (no cache).
+    ///
+    /// # Safety rationale
+    ///
+    /// The path is NOT validated against the discovered skill list. This is intentional:
+    /// an LLM may slightly misspell a path but the file still exists, and strict validation
+    /// would block legitimate calls. The path-traversal risk is equivalent to the LLM using
+    /// ReadTool to read any file — this does not increase the attack surface.
     pub fn load_skill_body(&self, path: &str) -> Result<String, SkillError> {
         let p = Path::new(path);
         if !p.is_file() {
@@ -84,14 +92,6 @@ impl SkillsService {
             Ok(content)
         }
     }
-}
-
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
-    let content = content.strip_prefix("---\n")?;
-    let end = content.find("\n---\n")?;
-    let frontmatter = &content[..end];
-    let body = &content[end + "\n---\n".len()..];
-    Some((frontmatter, body))
 }
 
 fn scope_order(scope: SkillScope) -> u8 {
@@ -218,8 +218,20 @@ mod tests {
     #[test]
     fn same_name_different_scope_both_listed() {
         let skills = vec![
-            make_metadata("foo", SkillScope::User, 10),
-            make_metadata("foo", SkillScope::Project, 10),
+            SkillMetadata {
+                name: "foo".to_string(),
+                description: "x".to_string(),
+                path: PathBuf::from("/user/skills/foo/SKILL.md"),
+                scope: SkillScope::User,
+                body: String::new(),
+            },
+            SkillMetadata {
+                name: "foo".to_string(),
+                description: "x".to_string(),
+                path: PathBuf::from("/project/skills/foo/SKILL.md"),
+                scope: SkillScope::Project,
+                body: String::new(),
+            },
         ];
         let s = SkillsService::new(vec![]);
         {
@@ -228,7 +240,8 @@ mod tests {
         }
         let catalog = s.render_catalog(8192);
         // Both should be in catalog, distinguished by path
-        assert!(catalog.contains("/skills/foo/SKILL.md"));
+        let count = catalog.matches("/foo/SKILL.md").count();
+        assert_eq!(count, 2, "both foo skills should appear in catalog");
     }
 
     #[test]
@@ -259,8 +272,16 @@ mod tests {
         let s = SkillsService::new(vec![(tmp.path().to_path_buf(), SkillScope::User)]);
         let first = s.snapshot().unwrap();
         assert_eq!(first.len(), 1);
-        // Second call should return cache (same content)
+
+        // Add a new skill file after the first snapshot; if cache works,
+        // the second snapshot should still return the old count (1), not 2.
+        std::fs::create_dir_all(tmp.path().join("bar")).unwrap();
+        std::fs::write(
+            tmp.path().join("bar/SKILL.md"),
+            "---\nname: bar\ndescription: y\n---\nbody",
+        ).unwrap();
+
         let second = s.snapshot().unwrap();
-        assert_eq!(second.len(), 1);
+        assert_eq!(second.len(), 1, "cache should serve stale data, not re-scan filesystem");
     }
 }

@@ -47,7 +47,7 @@ pub fn parse_skill_md(
 
 /// Split content into (frontmatter_text, body_text).
 /// Returns None if no valid frontmatter delimiters found.
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.strip_prefix("---\n")?;
     let end = content.find("\n---\n")?;
     let frontmatter = &content[..end];

@@ -9,12 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-yi-agent-core = { workspace = true }
-
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 walkdir = "2"
-dirs = "5"
 include_dir = "0.7"
 sha2 = "0.10"
 tracing = "0.1"
