@@ -40,6 +40,37 @@ pub struct PathPrefixConfig {
     pub paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionKind {
+    Normal,
+    Blacklisted(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    AllowOnce,
+    AlwaysAllowTool,
+    AlwaysAllowPrefix(String),
+    Deny,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionRequest {
+    pub request_id: u64,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub prefix_suggestion: Option<String>,
+    pub kind: PermissionKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum CheckResult {
+    Allow,
+    NeedConfirm(PermissionRequest),
+    Blacklisted(PermissionRequest),
+    Deny,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +125,23 @@ bash = true
         assert!(parsed.tool_level.bash);
         assert!(!parsed.tool_level.write);
         assert!(parsed.prefix_level.bash.prefixes.is_empty());
+    }
+
+    #[test]
+    fn decision_variants_construct() {
+        assert_eq!(Decision::AllowOnce, Decision::AllowOnce);
+        assert_eq!(
+            Decision::AlwaysAllowPrefix("git push".to_string()),
+            Decision::AlwaysAllowPrefix("git push".to_string())
+        );
+    }
+
+    #[test]
+    fn permission_kind_blacklisted_carries_reason() {
+        let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
+        match kind {
+            PermissionKind::Blacklisted(r) => assert_eq!(r, "rm -rf /"),
+            _ => panic!("expected Blacklisted"),
+        }
     }
 }
