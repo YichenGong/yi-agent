@@ -90,7 +90,7 @@ mod tests {
         // Run again; should overwrite
         install_system_skills(tmp.path()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("Placeholder")); // back to bundled content
+        assert!(content.contains("Skill Creator")); // back to bundled content
     }
 
     #[test]
