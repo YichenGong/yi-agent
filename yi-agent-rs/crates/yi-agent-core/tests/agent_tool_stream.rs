@@ -1,12 +1,12 @@
-use yi_agent_core::provider::{
-    Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, TokenUsage,
-};
-use yi_agent_core::{Agent, AgentConfig, AgentEvent, OutputStream, Tool, ToolEvent, ToolRegistry};
-use yi_agent_core::ToolResult;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
+use yi_agent_core::ToolResult;
+use yi_agent_core::provider::{
+    Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, TokenUsage,
+};
+use yi_agent_core::{Agent, AgentConfig, AgentEvent, OutputStream, Tool, ToolEvent, ToolRegistry};
 
 struct DummyProvider;
 
@@ -89,9 +89,7 @@ async fn test_agent_forwards_tool_output_delta() {
             AgentEvent::ToolOutputDelta { text, .. } if text.contains("hi") => {
                 saw_output_delta = true;
             }
-            AgentEvent::ToolExit {
-                code: Some(0), ..
-            } => {
+            AgentEvent::ToolExit { code: Some(0), .. } => {
                 saw_exit = true;
             }
             _ => {}

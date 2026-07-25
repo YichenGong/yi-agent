@@ -19,14 +19,9 @@ pub enum OutputStream {
 #[derive(Debug, Clone)]
 pub enum ToolEvent {
     /// Incremental output from the tool process.
-    OutputDelta {
-        stream: OutputStream,
-        text: String,
-    },
+    OutputDelta { stream: OutputStream, text: String },
     /// Process exited with optional code (None = killed).
-    Exit {
-        code: Option<i32>,
-    },
+    Exit { code: Option<i32> },
     /// Watchdog killed the process (no output within expected window).
     Timeout,
     /// A stream was truncated at the output cap.

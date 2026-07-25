@@ -10,18 +10,13 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 /// Top-level popup state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum BashPopup {
+    #[default]
     None,
     List(ListPopup),
     Detail(DetailPopup),
     ConfirmKill(ConfirmKill),
-}
-
-impl Default for BashPopup {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// List of tasks, newest first.
@@ -51,6 +46,7 @@ impl ListPopup {
     pub fn selected_id(&self) -> Option<&str> {
         self.task_ids.get(self.selected).map(|s| s.as_str())
     }
+    #[allow(dead_code)]
     pub fn selected_index(&self) -> usize {
         self.selected
     }

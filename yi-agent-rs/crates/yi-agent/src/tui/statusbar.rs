@@ -69,6 +69,7 @@ impl StatusBarState {
     pub fn display_output_tokens(&self) -> u64 {
         self.display_output
     }
+    #[allow(dead_code)]
     pub fn spinner_hue(&self) -> u32 {
         self.spinner_phase
     }

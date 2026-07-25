@@ -31,12 +31,8 @@ impl UsageStats {
             // Within a call, track the latest reported prefill/decode counts.
             // Providers may emit multiple Usage events per call (streaming);
             // we take the max as the high-water mark for this call.
-            self.current_input_tokens = self
-                .current_input_tokens
-                .max(usage.input_tokens as u64);
-            self.current_output_tokens = self
-                .current_output_tokens
-                .max(usage.output_tokens as u64);
+            self.current_input_tokens = self.current_input_tokens.max(usage.input_tokens as u64);
+            self.current_output_tokens = self.current_output_tokens.max(usage.output_tokens as u64);
         }
         self.last_input_tokens = usage.input_tokens as u64;
         self.total_input_tokens += usage.input_tokens as u64;
@@ -71,11 +67,13 @@ impl UsageStats {
     }
 
     /// Current call's prefill (input) token count, for status bar display.
+    #[allow(dead_code)]
     pub fn current_input_tokens(&self) -> u64 {
         self.current_input_tokens
     }
 
     /// Current call's decode (output) token count, for status bar display.
+    #[allow(dead_code)]
     pub fn current_output_tokens(&self) -> u64 {
         self.current_output_tokens
     }

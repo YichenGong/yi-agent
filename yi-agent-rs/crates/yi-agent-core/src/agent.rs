@@ -542,8 +542,7 @@ async fn run_loop(
                     };
 
                     // Set up streaming channel + forwarder
-                    let (event_tx, mut event_rx) =
-                        mpsc::channel::<ToolEvent>(64);
+                    let (event_tx, mut event_rx) = mpsc::channel::<ToolEvent>(64);
                     let fwd_tx = tx.clone();
                     let fwd_id = id.clone();
                     tokio::spawn(async move {
@@ -560,9 +559,9 @@ async fn run_loop(
                                     id: fwd_id.clone(),
                                     code,
                                 },
-                                ToolEvent::Timeout => AgentEvent::ToolTimeout {
-                                    id: fwd_id.clone(),
-                                },
+                                ToolEvent::Timeout => {
+                                    AgentEvent::ToolTimeout { id: fwd_id.clone() }
+                                }
                                 ToolEvent::Truncated { .. } => continue,
                             };
                             let _ = fwd_tx.send(agent_ev).await;

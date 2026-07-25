@@ -16,13 +16,13 @@ use unicode_width::UnicodeWidthStr;
 
 use yi_agent_core::AgentEvent;
 
+use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 use super::cell::HistoryCell;
 use super::history::{HistoryState, HistoryView};
 use super::input::{InputAction, InputLine};
 use super::slash::{CommandPopup, SlashCommand};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
-use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 
 /// Run the ratatui TUI main loop with the real terminal.
 ///
@@ -260,7 +260,10 @@ fn run_loop<B: Backend, E: EventSource>(
                     if let Some(task) = task_registry.get(&p.task_id) {
                         let detail_area = chunks[0];
                         f.render_widget(Clear, detail_area);
-                        f.render_widget(super::bash_popup::render_detail_popup(p, task), detail_area);
+                        f.render_widget(
+                            super::bash_popup::render_detail_popup(p, task),
+                            detail_area,
+                        );
                     }
                 }
                 BashPopup::ConfirmKill(ck) => {
@@ -269,7 +272,10 @@ fn run_loop<B: Backend, E: EventSource>(
                         let detail_area = chunks[0];
                         f.render_widget(Clear, detail_area);
                         let detail = DetailPopup::new(ck.task_id.clone());
-                        f.render_widget(super::bash_popup::render_detail_popup(&detail, task), detail_area);
+                        f.render_widget(
+                            super::bash_popup::render_detail_popup(&detail, task),
+                            detail_area,
+                        );
                     }
                     // Confirm box centered in the upper portion.
                     let box_w = 40u16.min(chunks[0].width.saturating_sub(4));
@@ -383,8 +389,9 @@ fn handle_bash_popup_key(
                     .map(|t| t.status == super::state::TaskStatus::Running)
                     .unwrap_or(false);
                 if is_running {
-                    *bash_popup =
-                        BashPopup::ConfirmKill(ConfirmKill { task_id: d.task_id.clone() });
+                    *bash_popup = BashPopup::ConfirmKill(ConfirmKill {
+                        task_id: d.task_id.clone(),
+                    });
                 }
             }
             KeyCode::Up => {
@@ -964,8 +971,8 @@ fn wrap_input_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use crate::tui::state::TaskStatus;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -1007,7 +1014,14 @@ mod tests {
                 text: "hi\n".into(),
             },
         );
-        assert!(registry.get("t1").unwrap().stdout.windows(2).any(|w| w == b"hi"));
+        assert!(
+            registry
+                .get("t1")
+                .unwrap()
+                .stdout
+                .windows(2)
+                .any(|w| w == b"hi")
+        );
 
         // Exit finalizes the task.
         route_event(
@@ -1047,7 +1061,11 @@ mod tests {
                 input: serde_json::json!({"command":"sleep 10","expected_timeout_sec":1}),
             },
         );
-        route_event(&mut registry, &mut sb, &AgentEvent::ToolTimeout { id: "t".into() });
+        route_event(
+            &mut registry,
+            &mut sb,
+            &AgentEvent::ToolTimeout { id: "t".into() },
+        );
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
     }
 

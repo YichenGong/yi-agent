@@ -1,5 +1,5 @@
-use yi_agent_core::{OutputStream, Tool, ToolEvent, ToolResult};
 use serde_json::json;
+use yi_agent_core::{OutputStream, Tool, ToolEvent, ToolResult};
 
 struct EchoTool;
 

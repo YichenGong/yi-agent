@@ -1,7 +1,7 @@
 //! Running task registry: tracks bash tool calls for status bar + popup.
 
-use yi_agent_core::OutputStream;
 use std::time::Instant;
+use yi_agent_core::OutputStream;
 
 /// Per-stream cap for retained output (last 64KB).
 const MAX_STREAM_BYTES: usize = 64 * 1024;
@@ -115,6 +115,7 @@ impl RunningTaskRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn running_count(&self) -> usize {
         self.tasks
             .values()
