@@ -1,5 +1,6 @@
 //! ratatui-based TUI with structured history cells.
 
+pub mod app;
 pub mod cell;
 pub mod history;
 pub mod input;
