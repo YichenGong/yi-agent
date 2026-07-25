@@ -39,6 +39,33 @@ pub fn run_tui(
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
 
+    let result = run_loop(
+        &mut terminal,
+        &mut agent_rx,
+        &mut history,
+        &mut input,
+        &input_tx,
+        &interrupt_tx,
+        &is_running,
+    );
+
+    // Always restore terminal state, even on error
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    result
+}
+
+fn run_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    history: &mut HistoryState,
+    input: &mut InputLine,
+    input_tx: &tokio::sync::mpsc::Sender<String>,
+    interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    let _ = is_running;
+
     loop {
         // Drain all pending agent events
         let width = terminal.size()?.width;
@@ -58,35 +85,39 @@ pub fn run_tui(
 
             // History area
             let history_view = HistoryView {
-                state: &history,
+                state: history,
                 width: chunks[0].width,
             };
             f.render_widget(history_view, chunks[0]);
 
             // Input area (gray bg, "> " prefix)
-            let input_line = build_input_line(&input);
+            let input_line = build_input_line(input);
             f.render_widget(input_line, chunks[2]);
         })?;
 
         // Poll for key events with timeout
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                match handle_key(key, &mut input, &mut history, &input_tx, &interrupt_tx, &is_running) {
+                match handle_key(key, input, history, input_tx, interrupt_tx) {
                     KeyOutcome::Quit => break,
-                    _ => {}
+                    KeyOutcome::Submit(text) => {
+                        // Show user message in history before sending to agent
+                        history.push(super::cell::HistoryCell::UserMessage { text: text.clone() });
+                        let _ = input_tx.blocking_send(text);
+                    }
+                    KeyOutcome::None => {}
                 }
             }
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
 }
 
 enum KeyOutcome {
     None,
     Quit,
+    Submit(String),
 }
 
 fn handle_key(
@@ -95,12 +126,13 @@ fn handle_key(
     history: &mut HistoryState,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
-    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> KeyOutcome {
-    let _ = is_running; // suppress unused warning; will be used in Task 7
-
     // Global keys first
     match key.code {
+        KeyCode::Esc => {
+            let _ = interrupt_tx.blocking_send(());
+            return KeyOutcome::None;
+        }
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
             let _ = interrupt_tx.blocking_send(());
             return KeyOutcome::None;
@@ -135,12 +167,10 @@ fn handle_key(
     match input.handle_key(key) {
         InputAction::Submit => {
             let text = input.take_submitted();
-            let _ = input_tx.blocking_send(text);
+            KeyOutcome::Submit(text)
         }
-        _ => {}
+        _ => KeyOutcome::None,
     }
-
-    KeyOutcome::None
 }
 
 fn build_input_line(input: &InputLine) -> Paragraph<'static> {

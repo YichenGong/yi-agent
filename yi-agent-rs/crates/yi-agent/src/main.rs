@@ -139,7 +139,7 @@ fn run_tui_agent(
                 // Wait for user input
                 let Some(text) = input_rx.recv().await else { break };
 
-                // Handle interrupt if pending
+                // Clear any stale interrupt signal
                 let _ = interrupt_rx.try_recv();
 
                 // Run agent
@@ -147,9 +147,28 @@ fn run_tui_agent(
                 match agent.run(text).await {
                     Ok(stream) => {
                         let mut stream = Box::pin(stream);
-                        while let Some(event) = stream.next().await {
-                            if agent_tx.send(event).await.is_err() {
-                                break;
+                        loop {
+                            // Concurrently forward events and listen for interrupt
+                            tokio::select! {
+                                event = stream.next() => {
+                                    match event {
+                                        Some(ev) => {
+                                            if agent_tx.send(ev).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        None => break, // stream ended
+                                    }
+                                }
+                                _ = interrupt_rx.recv() => {
+                                    // User pressed Ctrl+C/Esc: cancel agent
+                                    agent.cancel();
+                                    // Drain remaining events until Cancelled/Done
+                                    while let Some(ev) = stream.next().await {
+                                        if agent_tx.send(ev).await.is_err() { break; }
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
