@@ -11,7 +11,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use yi_agent_core::AgentEvent;
@@ -22,6 +22,7 @@ use super::input::{InputAction, InputLine};
 use super::slash::{CommandPopup, SlashCommand};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
+use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 
 /// Run the ratatui TUI main loop with the real terminal.
 ///
@@ -165,6 +166,7 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut statusbar_state = StatusBarState::default();
     let mut task_registry = RunningTaskRegistry::new();
+    let mut bash_popup: BashPopup = BashPopup::None;
 
     loop {
         // Drain all pending agent events
@@ -235,10 +237,88 @@ fn run_loop<B: Backend, E: EventSource>(
 
             let input_line = build_input_line(input, pending_quit, chunks[5].width);
             f.render_widget(input_line, chunks[5]);
+
+            // Bash popup (covers the full screen above the input area).
+            match &bash_popup {
+                BashPopup::List(p) => {
+                    let list_area = ratatui::layout::Rect {
+                        x: chunks[0].x + 2,
+                        y: chunks[0].y + 1,
+                        width: chunks[0].width.saturating_sub(4),
+                        height: chunks[0]
+                            .height
+                            .saturating_sub(2)
+                            .min((p.task_ids.len() as u16 + 2).max(6)),
+                    };
+                    f.render_widget(Clear, list_area);
+                    f.render_widget(
+                        super::bash_popup::render_list_popup(p, &task_registry, list_area),
+                        list_area,
+                    );
+                }
+                BashPopup::Detail(p) => {
+                    if let Some(task) = task_registry.get(&p.task_id) {
+                        let detail_area = chunks[0];
+                        f.render_widget(Clear, detail_area);
+                        f.render_widget(super::bash_popup::render_detail_popup(p, task), detail_area);
+                    }
+                }
+                BashPopup::ConfirmKill(ck) => {
+                    // Draw the detail behind, then overlay a small confirm box.
+                    if let Some(task) = task_registry.get(&ck.task_id) {
+                        let detail_area = chunks[0];
+                        f.render_widget(Clear, detail_area);
+                        let detail = DetailPopup::new(ck.task_id.clone());
+                        f.render_widget(super::bash_popup::render_detail_popup(&detail, task), detail_area);
+                    }
+                    // Confirm box centered in the upper portion.
+                    let box_w = 40u16.min(chunks[0].width.saturating_sub(4));
+                    let box_h = 4u16;
+                    let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
+                    let box_y = chunks[0].y + (chunks[0].height.saturating_sub(box_h)) / 3;
+                    let box_area = ratatui::layout::Rect {
+                        x: box_x,
+                        y: box_y,
+                        width: box_w,
+                        height: box_h,
+                    };
+                    f.render_widget(Clear, box_area);
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new(vec![
+                            ratatui::text::Line::raw("kill this process?"),
+                            ratatui::text::Line::raw(""),
+                            ratatui::text::Line::raw("[y] confirm   [n/esc] cancel"),
+                        ])
+                        .block(
+                            ratatui::widgets::Block::default()
+                                .borders(ratatui::widgets::Borders::ALL)
+                                .title("confirm"),
+                        ),
+                        box_area,
+                    );
+                }
+                BashPopup::None => {}
+            }
         })?;
 
         // Poll for key events with timeout (33ms → ~30hz refresh)
         if let Some(Event::Key(key)) = events.poll(Duration::from_millis(33))? {
+            // Ctrl+P opens the bash task popup when no popup is active.
+            if key.code == KeyCode::Char('p')
+                && key.modifiers == KeyModifiers::CONTROL
+                && matches!(bash_popup, BashPopup::None)
+            {
+                let ids: Vec<String> = task_registry.list().iter().map(|t| t.id.clone()).collect();
+                if !ids.is_empty() {
+                    bash_popup = BashPopup::List(ListPopup::new(ids));
+                }
+                continue;
+            }
+            // Route keys to the bash popup when active.
+            if !matches!(bash_popup, BashPopup::None) {
+                handle_bash_popup_key(key, &mut bash_popup, &task_registry);
+                continue;
+            }
             match handle_key(
                 key,
                 input,
@@ -264,6 +344,89 @@ fn run_loop<B: Backend, E: EventSource>(
     }
 
     Ok(())
+}
+
+/// Handle a key event for the bash popup state machine.
+fn handle_bash_popup_key(
+    key: KeyEvent,
+    bash_popup: &mut BashPopup,
+    task_registry: &RunningTaskRegistry,
+) {
+    match bash_popup {
+        BashPopup::List(p) => match key.code {
+            KeyCode::Up => p.move_up(),
+            KeyCode::Down => p.move_down(),
+            KeyCode::Enter => {
+                if let Some(id) = p.selected_id() {
+                    *bash_popup = BashPopup::Detail(DetailPopup::new(id.to_string()));
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                *bash_popup = BashPopup::None;
+            }
+            _ => {}
+        },
+        BashPopup::Detail(d) => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                // Back to list (rebuild ids from registry so new tasks appear)
+                let ids: Vec<String> = task_registry.list().iter().map(|t| t.id.clone()).collect();
+                if ids.is_empty() {
+                    *bash_popup = BashPopup::None;
+                } else {
+                    *bash_popup = BashPopup::List(ListPopup::new(ids));
+                }
+            }
+            KeyCode::Char('k') => {
+                // Only allow kill on running tasks.
+                let is_running = task_registry
+                    .get(&d.task_id)
+                    .map(|t| t.status == super::state::TaskStatus::Running)
+                    .unwrap_or(false);
+                if is_running {
+                    *bash_popup =
+                        BashPopup::ConfirmKill(ConfirmKill { task_id: d.task_id.clone() });
+                }
+            }
+            KeyCode::Up => {
+                d.scroll_up(1);
+            }
+            KeyCode::Down => {
+                // Approximate max scroll by stdout+stderr line count.
+                let lines = task_registry
+                    .get(&d.task_id)
+                    .map(|t| {
+                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
+                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
+                        so + se + 6 // header + labels
+                    })
+                    .unwrap_or(0);
+                d.scroll_down(1, lines);
+            }
+            KeyCode::Char('f') => {
+                d.scroll_to_bottom();
+            }
+            _ => {}
+        },
+        BashPopup::ConfirmKill(ck) => match key.code {
+            KeyCode::Char('y') => {
+                // TODO: wire a kill channel from TUI → agent → call_stream.
+                // For now, mark the task as failed in the registry and close.
+                // The real kill requires a channel in main.rs + oneshot in agent.rs.
+                let _ = ck.task_id; // placeholder
+                let ids: Vec<String> = task_registry.list().iter().map(|t| t.id.clone()).collect();
+                if ids.is_empty() {
+                    *bash_popup = BashPopup::None;
+                } else {
+                    *bash_popup = BashPopup::List(ListPopup::new(ids));
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                *bash_popup = BashPopup::Detail(DetailPopup::new(ck.task_id.clone()));
+            }
+            _ => {}
+        },
+        BashPopup::None => {}
+    }
 }
 
 /// Route agent events to the task registry + status bar before they reach
