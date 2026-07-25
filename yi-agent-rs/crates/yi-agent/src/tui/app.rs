@@ -239,26 +239,33 @@ fn handle_key(
 ) -> KeyOutcome {
     // Check if there's a pending permission request
     if let Some((request_id, _tool_name, prefix_suggestion, kind)) = history.pending_permission_info() {
-        let decision = match key.code {
-            KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
-            KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
-            KeyCode::Char('3') => prefix_suggestion.map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
-            KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
-            KeyCode::Enter => {
-                let default = match kind {
-                    yi_agent_core::permission::PermissionKind::Blacklisted(_) => yi_agent_core::permission::Decision::Deny,
-                    _ => yi_agent_core::permission::Decision::AllowOnce,
-                };
-                Some(default)
+        // Allow quit keys to pass through even when permission is pending
+        let is_quit_key = matches!(key.code, KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL)
+            || matches!(key.code, KeyCode::Esc);
+        if is_quit_key {
+            // Fall through to global key handling below
+        } else {
+            let decision = match key.code {
+                KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
+                KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
+                KeyCode::Char('3') => prefix_suggestion.map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
+                KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
+                KeyCode::Enter => {
+                    let default = match kind {
+                        yi_agent_core::permission::PermissionKind::Blacklisted(_) => yi_agent_core::permission::Decision::Deny,
+                        _ => yi_agent_core::permission::Decision::AllowOnce,
+                    };
+                    Some(default)
+                }
+                _ => None,
+            };
+            if let Some(d) = decision {
+                let _ = decision_tx.blocking_send((request_id, d));
+                return KeyOutcome::None;
             }
-            _ => None,
-        };
-        if let Some(d) = decision {
-            let _ = decision_tx.blocking_send((request_id, d));
+            // For other keys while permission pending, ignore (don't let user type input)
             return KeyOutcome::None;
         }
-        // For other keys while permission pending, ignore (don't let user type input)
-        return KeyOutcome::None;
     }
 
     // Global keys first
