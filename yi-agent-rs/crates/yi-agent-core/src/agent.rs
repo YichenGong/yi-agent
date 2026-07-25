@@ -747,9 +747,15 @@ fn estimate_tokens(text: &str) -> u32 {
     (ascii as f32 / 4.0 + non_ascii as f32 / 1.5) as u32
 }
 
-/// Estimate prefill tokens from the full request (system + all messages).
+/// Estimate prefill tokens from the full request (system + tools + all messages).
 fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
     let mut total = req.system.as_deref().map(estimate_tokens).unwrap_or(0);
+    // Tools schema (name + description + input_schema JSON) is part of prefill.
+    for tool in &req.tools {
+        total += estimate_tokens(&tool.name);
+        total += estimate_tokens(&tool.description);
+        total += estimate_tokens(&tool.input_schema.to_string());
+    }
     for msg in &req.messages {
         for block in &msg.content {
             match block {
