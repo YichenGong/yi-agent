@@ -47,12 +47,32 @@ pub fn run_tui(
         &input_tx,
         &interrupt_tx,
         &is_running,
+        &CrosstermEventSource,
     );
 
     // Always restore terminal state, even on error
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     result
+}
+
+/// Event source trait so the loop can be tested with fake events.
+pub trait EventSource {
+    /// Poll for an event, waiting up to `timeout`. Returns `Ok(None)` on timeout.
+    fn poll(&self, timeout: Duration) -> std::io::Result<Option<Event>>;
+}
+
+/// Production event source using crossterm's global event queue.
+struct CrosstermEventSource;
+
+impl EventSource for CrosstermEventSource {
+    fn poll(&self, timeout: Duration) -> std::io::Result<Option<Event>> {
+        if event::poll(timeout)? {
+            Ok(Some(event::read()?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Run the TUI loop with any ratatui backend (used by tests with TestBackend).
@@ -66,10 +86,24 @@ pub fn run_tui_with_backend<B: Backend>(
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
-    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, is_running)
+    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, is_running, &CrosstermEventSource)
 }
 
-fn run_loop<B: Backend>(
+/// Testable variant: accepts a custom EventSource for injecting fake key events.
+pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
+    terminal: &mut Terminal<B>,
+    agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    input_tx: &tokio::sync::mpsc::Sender<String>,
+    interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: &E,
+) -> std::io::Result<()> {
+    let mut history = HistoryState::new();
+    let mut input = InputLine::new();
+    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, is_running, events)
+}
+
+fn run_loop<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     history: &mut HistoryState,
@@ -77,6 +111,7 @@ fn run_loop<B: Backend>(
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: &E,
 ) -> std::io::Result<()> {
     let _ = is_running;
 
@@ -108,16 +143,14 @@ fn run_loop<B: Backend>(
         })?;
 
         // Poll for key events with timeout
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                match handle_key(key, input, history, input_tx, interrupt_tx) {
-                    KeyOutcome::Quit => break,
-                    KeyOutcome::Submit(text) => {
-                        history.push(super::cell::HistoryCell::UserMessage { text: text.clone() });
-                        let _ = input_tx.blocking_send(text);
-                    }
-                    KeyOutcome::None => {}
+        if let Some(Event::Key(key)) = events.poll(Duration::from_millis(50))? {
+            match handle_key(key, input, history, input_tx, interrupt_tx) {
+                KeyOutcome::Quit => break,
+                KeyOutcome::Submit(text) => {
+                    history.push(super::cell::HistoryCell::UserMessage { text: text.clone() });
+                    let _ = input_tx.blocking_send(text);
                 }
+                KeyOutcome::None => {}
             }
         }
     }
@@ -194,7 +227,22 @@ fn build_input_line(input: &InputLine) -> Paragraph<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::cell::HistoryCell;
     use ratatui::backend::TestBackend;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Fake event source that plays back a scripted sequence of events,
+    /// then returns None (timeout) forever. Used to test the loop deterministically.
+    struct ScriptedEvents {
+        events: Rc<RefCell<Vec<Event>>>,
+    }
+
+    impl EventSource for ScriptedEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            Ok(self.events.borrow_mut().pop())
+        }
+    }
 
     /// Regression test for blocking_send panic.
     ///
@@ -208,47 +256,89 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
 
-        // Simulate the production calling stack: block_on spawns a
-        // spawn_blocking task that does blocking_send (exactly what run_loop
-        // does on Submit). Before the fix this panicked.
         rt.block_on(async move {
             let tx = input_tx.clone();
             let handle = tokio::task::spawn_blocking(move || {
-                // This is what run_loop does on Submit:
                 tx.blocking_send("hello".to_string()).unwrap();
             });
             handle.await.unwrap();
-
-            // Verify the message arrived
             assert_eq!(input_rx.recv().await.unwrap(), "hello");
         });
     }
 
-    /// Verify run_tui_with_backend compiles and can construct a TestBackend-based
-    /// terminal without touching the real terminal (no enable_raw_mode).
+    /// Test that typing characters updates the input buffer and renders them
+    /// to the terminal buffer. This verifies the draw loop reacts to key events.
     #[test]
-    fn run_tui_with_backend_accepts_test_backend() {
+    fn typing_renders_to_screen() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let (agent_tx, agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Script: type "hi", then Ctrl+Q to quit (don't submit, so input stays on screen)
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedEvents { events: events.clone() };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        ).unwrap();
+
+        // No submit happened, so input_tx should be empty
+        assert!(input_rx.try_recv().is_err(), "no submit expected, but got a message");
+
+        // The terminal buffer should contain "hi" in the input row (last row)
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let row_text: String = (0..80)
+            .map(|x| buffer[(x, input_row)].symbol())
+            .collect();
+        assert!(row_text.contains("hi"), "expected 'hi' in input row, got: {row_text:?}");
+    }
+
+    /// Test that agent events appear in the rendered history area.
+    #[test]
+    fn agent_events_render_to_history_area() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Send a Start event so drain has something to do
-        agent_tx.try_send(AgentEvent::Start).unwrap();
+        // Send an assistant message before starting
+        agent_tx.try_send(AgentEvent::AssistantText("hello world".into())).unwrap();
 
-        // We can't easily test the full loop (event::poll needs a real tty),
-        // but we verify the function is callable with a TestBackend and
-        // returns an error (event::poll fails in test env) rather than panicking.
-        let result = run_tui_with_backend(
+        // Script: Ctrl+Q to quit after one frame
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events(
             &mut terminal,
-            &mut agent_rx.into(),
+            &mut agent_rx,
             &input_tx,
             &interrupt_tx,
             &is_running,
-        );
-        // event::poll returns Err in non-tty environment -> io::Error, not panic
-        assert!(result.is_err(), "expected io::Error from event::poll in non-tty, got {:?}", result);
+            &source,
+        ).unwrap();
+
+        // The history area should contain "hello world"
+        let buffer = terminal.backend().buffer();
+        let history_text: String = (0..23u16).flat_map(|y| {
+            (0..80u16).map(move |x| buffer[(x, y)].symbol())
+        }).collect();
+        assert!(history_text.contains("hello world"), "expected 'hello world' in history, got: {history_text:?}");
     }
 }
