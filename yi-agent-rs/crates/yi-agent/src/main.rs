@@ -12,7 +12,7 @@ mod tui;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use render::InlineRenderer;
 use yi_agent_core::Provider;
@@ -287,7 +287,10 @@ fn resolve_system_prompt(user: Option<String>) -> Option<String> {
 /// Set up the skills service: install bundled system skills, build roots, snapshot.
 /// Returns None on hard failure (and logs a warning); the agent runs without skills.
 fn setup_skills(config: &config::Config) -> Result<Option<Arc<yi_agent_skills::SkillsService>>> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("skills: could not determine home directory, skipping");
+        return Ok(None);
+    };
     let system_root = home.join(".yi-agent/skills/.system");
 
     // Install bundled skills; failure is non-fatal
@@ -448,5 +451,53 @@ mod tests {
     fn resolve_system_prompt_custom_overrides_default() {
         let resolved = resolve_system_prompt(Some("custom".into()));
         assert_eq!(resolved.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn resolve_effective_budget_explicit_returns_default() {
+        // When explicit=true, should return default regardless of total.
+        assert_eq!(resolve_effective_budget(100_000, 8192, true), 8192);
+        assert_eq!(resolve_effective_budget(0, 8192, true), 8192);
+        assert_eq!(resolve_effective_budget(8192, 8192, true), 8192);
+    }
+
+    #[test]
+    fn resolve_effective_budget_total_under_default_returns_default() {
+        // When total <= default, should return default.
+        assert_eq!(resolve_effective_budget(4096, 8192, false), 8192);
+        assert_eq!(resolve_effective_budget(8192, 8192, false), 8192);
+        assert_eq!(resolve_effective_budget(0, 8192, false), 8192);
+    }
+
+    #[test]
+    fn resolve_effective_budget_non_interactive_returns_default() {
+        // Tests run non-interactive (stdin is not a TTY), so even when
+        // total > default and explicit=false, should return default without prompting.
+        assert_eq!(resolve_effective_budget(100_000, 8192, false), 8192);
+    }
+
+    #[test]
+    fn resolve_system_prompt_with_skills_no_service_returns_base() {
+        // When service is None, should fall back to base via resolve_system_prompt.
+        let resolved = resolve_system_prompt_with_skills(None, &None, 8192, false);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(yi_agent_core::AgentConfig::default_system_prompt().as_str())
+        );
+    }
+
+    #[test]
+    fn resolve_system_prompt_with_skills_empty_catalog_returns_base() {
+        // When service is Some but catalog is empty (no skills discovered),
+        // should return the base prompt unchanged.
+        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
+        let base = yi_agent_core::AgentConfig::default_system_prompt();
+        let resolved = resolve_system_prompt_with_skills(
+            None,
+            &Some(svc),
+            8192,
+            false,
+        );
+        assert_eq!(resolved.as_deref(), Some(base.as_str()));
     }
 }

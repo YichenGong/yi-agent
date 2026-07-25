@@ -18,6 +18,7 @@ pub struct Config {
     pub compact_keep_turns: u32,
     pub yolo: bool,
     pub skills_catalog_budget: usize,
+    /// True if user explicitly set the budget via CLI flag or env var (skips interactive prompt).
     pub skills_catalog_budget_explicit: bool,
 }
 
@@ -295,7 +296,8 @@ pub fn load(cli: &Cli) -> Result<Config> {
             .unwrap_or(false);
 
     let skills_catalog_budget_explicit = cli.skills_catalog_budget.is_some()
-        || std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET").is_ok();
+        || std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
+            .ok().filter(|s| !s.is_empty()).is_some();
     let skills_catalog_budget = cli
         .skills_catalog_budget
         .or_else(|| {
