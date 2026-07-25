@@ -113,6 +113,7 @@ pub fn run_tui_with_backend<B: Backend>(
 
 /// Testable variant: accepts a custom EventSource for injecting fake key events.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
@@ -421,7 +422,12 @@ fn handle_key(
                 if let Some(cmd) = SlashCommand::from_name(name) {
                     *popup = None;
                     return execute_slash_command(
-                        cmd, args, history, input_tx, interrupt_tx, control_tx,
+                        cmd,
+                        args,
+                        history,
+                        input_tx,
+                        interrupt_tx,
+                        control_tx,
                     );
                 } else {
                     // Unknown slash command

@@ -348,10 +348,10 @@ mod tests {
                 &self,
                 _req: ProviderRequest,
             ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-                Ok(futures::stream::iter(vec![ProviderEvent::TextDelta(
-                    "summary text".into(),
-                )])
-                .boxed())
+                Ok(
+                    futures::stream::iter(vec![ProviderEvent::TextDelta("summary text".into())])
+                        .boxed(),
+                )
             }
         }
 
@@ -384,8 +384,7 @@ mod tests {
         // (Anthropic API requires strict alternation).
         for w in new_session.messages().windows(2) {
             assert!(
-                !(w[0].role == yi_agent_core::Role::User
-                    && w[1].role == yi_agent_core::Role::User),
+                !(w[0].role == yi_agent_core::Role::User && w[1].role == yi_agent_core::Role::User),
                 "consecutive User messages found"
             );
         }

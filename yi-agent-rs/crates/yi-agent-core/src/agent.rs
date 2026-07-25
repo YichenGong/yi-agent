@@ -1137,10 +1137,7 @@ mod tests {
         assert_eq!(session.messages()[0].role, Role::User);
         // 确认没有任何 Assistant 消息残留(tool_use 悬空)。
         assert!(
-            !session
-                .messages()
-                .iter()
-                .any(|m| m.role == Role::Assistant),
+            !session.messages().iter().any(|m| m.role == Role::Assistant),
             "no Assistant message should remain after ACT cancel"
         );
     }
@@ -1476,7 +1473,10 @@ mod tests {
         // Cancel before run starts. With Fix 1, run() resets the token,
         // so this cancel must NOT cause the upcoming run to emit Cancelled.
         agent.cancel();
-        assert!(agent.cancel_token().is_cancelled(), "precondition: token cancelled");
+        assert!(
+            agent.cancel_token().is_cancelled(),
+            "precondition: token cancelled"
+        );
 
         let stream = agent.run("hi".into()).await.unwrap();
         let events = collect_events(stream);

@@ -243,9 +243,7 @@ fn run_tui_agent(
                         }
                         ControlCommand::Compact => {
                             let session = agent.session();
-                            let keep_turns = rebuild_config
-                                .compact_keep_turns
-                                .unwrap_or(4);
+                            let keep_turns = rebuild_config.compact_keep_turns.unwrap_or(4);
                             match crate::compact::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
@@ -269,9 +267,8 @@ fn run_tui_agent(
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
-                                    let _ = agent_tx
-                                        .send(yi_agent_core::AgentEvent::Error(e))
-                                        .await;
+                                    let _ =
+                                        agent_tx.send(yi_agent_core::AgentEvent::Error(e)).await;
                                 }
                             }
                         }
