@@ -1,12 +1,13 @@
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
+use yi_agent_core::{OutputStream, Tool, ToolEvent, ToolMetadata, ToolResult, ToolSource};
 
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
@@ -30,6 +31,10 @@ struct BashArgs {
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
+    /// LLM-declared expected runtime. Default 120s. If no output for
+    /// expected_timeout_sec * 1.5, process is killed as stuck.
+    #[serde(default)]
+    expected_timeout_sec: Option<u32>,
 }
 
 #[async_trait]
@@ -46,36 +51,59 @@ impl Tool for BashTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Shell command to execute" },
-                "timeout": { "type": "integer", "description": "Timeout in seconds, default 120" }
+                "command": { "type": "string", "description": "The bash command to execute" },
+                "timeout": { "type": "integer", "description": "Optional timeout in seconds (legacy hard timeout)", "default": 120 },
+                "expected_timeout_sec": {
+                    "type": "integer",
+                    "description": "Expected runtime in seconds. If no stdout/stderr output for expected_timeout_sec * 1.5, the process is killed as stuck. Default 120.",
+                    "default": 120
+                }
             },
             "required": ["command"]
         })
     }
 
     async fn call(&self, args: Value) -> ToolResult {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ToolEvent>(1);
+        self.call_stream(args, tx).await
+    }
+
+    async fn call_stream(
+        &self,
+        args: Value,
+        tx: tokio::sync::mpsc::Sender<ToolEvent>,
+    ) -> ToolResult {
         let args: BashArgs = match serde_json::from_value(args) {
             Ok(a) => a,
             Err(e) => return ToolsError::ArgsParse(e).into(),
         };
 
-        tracing::info!(tool = "bash", command = %args.command, timeout = args.timeout, "executing");
+        tracing::info!(
+            tool = "bash",
+            command = %args.command,
+            timeout = args.timeout,
+            expected_timeout_sec = args.expected_timeout_sec,
+            "executing"
+        );
 
         if let Some(reason) = is_blocked(&args.command) {
             tracing::warn!(tool = "bash", reason = %reason, "command blocked");
             return ToolsError::CommandBlocked(reason.to_string()).into();
         }
 
-        let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        let hard_timeout = Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT));
+        let expected = args.expected_timeout_sec.unwrap_or(DEFAULT_TIMEOUT as u32);
+        let idle_limit = Duration::from_secs((expected as u64) * 3 / 2); // expected * 1.5
+
         let cwd = self.ctx.cwd();
 
         let mut child = match Command::new("sh")
             .arg("-c")
             .arg(&args.command)
             .current_dir(&cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
@@ -87,37 +115,204 @@ impl Tool for BashTool {
             self.ctx.set_cwd(new_cwd);
         }
 
-        // Take stdout/stderr pipes so we can read them concurrently with wait.
+        // Take stdout/stderr pipes.
         let mut stdout = child.stdout.take().expect("stdout piped");
         let mut stderr = child.stderr.take().expect("stderr piped");
 
-        // Read stdout/stderr concurrently with waiting to avoid pipe-buffer deadlock.
-        let stdout_fut = read_to_end(&mut stdout);
-        let stderr_fut = read_to_end(&mut stderr);
+        // Spawn reader tasks that send chunks through channels.
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-        let combined = async {
-            let (status, stdout_buf, stderr_buf) =
-                tokio::join!(child.wait(), stdout_fut, stderr_fut);
-            (status, stdout_buf, stderr_buf)
-        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdout_tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
 
-        match tokio::time::timeout(Duration::from_secs(timeout), combined).await {
-            Ok((Ok(status), stdout_buf, stderr_buf)) => {
-                let stdout_trunc = truncate_output(&stdout_buf);
-                let stderr_trunc = truncate_output(&stderr_buf);
-                let exit = status.code().unwrap_or(-1);
-                ToolResult::text(format!(
-                    "exit: {}\nstdout:\n{}\nstderr:\n{}",
-                    exit,
-                    String::from_utf8_lossy(&stdout_trunc),
-                    String::from_utf8_lossy(&stderr_trunc),
-                ))
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stderr_tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
-            Ok((Err(e), _, _)) => ToolsError::Io(e).into(),
-            Err(_) => {
-                let _ = child.kill().await;
-                ToolsError::Timeout(timeout).into()
+        });
+
+        // State for the main select loop.
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let mut stderr_buf: Vec<u8> = Vec::new();
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
+        let mut stdout_skipped: usize = 0;
+        let mut stderr_skipped: usize = 0;
+        let mut exit_code: Option<i32> = None;
+        let mut timed_out = false;
+
+        let now = tokio::time::Instant::now();
+        let hard_deadline = now + hard_timeout;
+        let mut next_idle_deadline = now + idle_limit;
+
+        // Track whether each reader channel is still open.
+        let mut stdout_rx = Some(stdout_rx);
+        let mut stderr_rx = Some(stderr_rx);
+
+        loop {
+            // Build the select branches conditionally using Option<Receiver>.
+            let stdout_recv = async {
+                if let Some(rx) = stdout_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    std::future::pending::<Option<Vec<u8>>>().await
+                }
+            };
+            let stderr_recv = async {
+                if let Some(rx) = stderr_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    std::future::pending::<Option<Vec<u8>>>().await
+                }
+            };
+
+            tokio::select! {
+                biased;
+
+                chunk = stdout_recv => {
+                    match chunk {
+                        Some(data) => {
+                            // Send OutputDelta event.
+                            let text = String::from_utf8_lossy(&data).into_owned();
+                            let _ = tx.send(ToolEvent::OutputDelta {
+                                stream: OutputStream::Stdout,
+                                text,
+                            }).await;
+
+                            // Accumulate with truncation tracking.
+                            append_with_truncation(
+                                &mut stdout_buf,
+                                &mut stdout_truncated,
+                                &mut stdout_skipped,
+                                &data,
+                            );
+                            if stdout_truncated && stdout_skipped == data.len() {
+                                // Just crossed the threshold — send Truncated event.
+                                let _ = tx.send(ToolEvent::Truncated {
+                                    stream: OutputStream::Stdout,
+                                    skipped_bytes: stdout_skipped,
+                                }).await;
+                            }
+
+                            // Reset idle deadline.
+                            next_idle_deadline = tokio::time::Instant::now() + idle_limit;
+                        }
+                        None => {
+                            // stdout reader finished; stop polling.
+                            stdout_rx = None;
+                        }
+                    }
+                }
+
+                chunk = stderr_recv => {
+                    match chunk {
+                        Some(data) => {
+                            let text = String::from_utf8_lossy(&data).into_owned();
+                            let _ = tx.send(ToolEvent::OutputDelta {
+                                stream: OutputStream::Stderr,
+                                text,
+                            }).await;
+
+                            append_with_truncation(
+                                &mut stderr_buf,
+                                &mut stderr_truncated,
+                                &mut stderr_skipped,
+                                &data,
+                            );
+                            if stderr_truncated && stderr_skipped == data.len() {
+                                let _ = tx.send(ToolEvent::Truncated {
+                                    stream: OutputStream::Stderr,
+                                    skipped_bytes: stderr_skipped,
+                                }).await;
+                            }
+
+                            next_idle_deadline = tokio::time::Instant::now() + idle_limit;
+                        }
+                        None => {
+                            // stderr reader finished; stop polling.
+                            stderr_rx = None;
+                        }
+                    }
+                }
+
+                _ = tokio::time::sleep_until(next_idle_deadline) => {
+                    // Idle watchdog: no output for idle_limit.
+                    let _ = child.kill().await;
+                    let _ = tx.send(ToolEvent::Timeout).await;
+                    timed_out = true;
+                    break;
+                }
+
+                _ = tokio::time::sleep_until(hard_deadline) => {
+                    // Hard timeout.
+                    let _ = child.kill().await;
+                    let _ = tx.send(ToolEvent::Timeout).await;
+                    timed_out = true;
+                    break;
+                }
+
+                status = child.wait() => {
+                    match status {
+                        Ok(s) => {
+                            exit_code = s.code();
+                        }
+                        Err(_) => {
+                            exit_code = None;
+                        }
+                    }
+                    break;
+                }
             }
+        }
+
+        // Reap the child if it was killed (wait already done if we hit the child.wait branch).
+        // If we broke out via timeout, child.kill() was already called, but we need to reap.
+        if timed_out {
+            let _ = child.wait().await;
+        }
+
+        // Emit Exit event.
+        let _ = tx.send(ToolEvent::Exit { code: exit_code }).await;
+
+        // Build the result text.
+        let stdout_trunc = truncate_output(&stdout_buf);
+        let stderr_trunc = truncate_output(&stderr_buf);
+
+        if timed_out {
+            ToolResult::error(format!(
+                "command timeout after {}s\nstdout:\n{}\nstderr:\n{}",
+                args.timeout.unwrap_or(DEFAULT_TIMEOUT),
+                String::from_utf8_lossy(&stdout_trunc),
+                String::from_utf8_lossy(&stderr_trunc),
+            ))
+        } else {
+            let exit = exit_code.unwrap_or(-1);
+            ToolResult::text(format!(
+                "exit: {}\nstdout:\n{}\nstderr:\n{}",
+                exit,
+                String::from_utf8_lossy(&stdout_trunc),
+                String::from_utf8_lossy(&stderr_trunc),
+            ))
         }
     }
 
@@ -131,6 +326,36 @@ impl Tool for BashTool {
     }
 }
 
+/// Append data to the buffer with truncation at MAX_OUTPUT_BYTES.
+/// Once the buffer exceeds the limit, we keep only the last MAX_OUTPUT_BYTES
+/// and track total skipped bytes for the Truncated event.
+fn append_with_truncation(
+    buf: &mut Vec<u8>,
+    truncated: &mut bool,
+    skipped: &mut usize,
+    data: &[u8],
+) {
+    if *truncated {
+        // Already truncated: append data, then trim to keep only last MAX_OUTPUT_BYTES.
+        buf.extend_from_slice(data);
+        if buf.len() > MAX_OUTPUT_BYTES {
+            let excess = buf.len() - MAX_OUTPUT_BYTES;
+            *skipped += excess;
+            buf.drain(..excess);
+        }
+    } else if buf.len() + data.len() > MAX_OUTPUT_BYTES {
+        // Crossing the threshold for the first time.
+        let total = buf.len() + data.len();
+        *skipped = total - MAX_OUTPUT_BYTES;
+        *truncated = true;
+        buf.extend_from_slice(data);
+        let start = buf.len() - MAX_OUTPUT_BYTES;
+        buf.drain(..start);
+    } else {
+        buf.extend_from_slice(data);
+    }
+}
+
 fn truncate_output(bytes: &[u8]) -> Vec<u8> {
     if bytes.len() <= MAX_OUTPUT_BYTES {
         bytes.to_vec()
@@ -141,13 +366,6 @@ fn truncate_output(bytes: &[u8]) -> Vec<u8> {
         truncated.extend_from_slice(&bytes[start..]);
         truncated
     }
-}
-
-/// Read all bytes from an async reader into a Vec.
-async fn read_to_end<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let _ = reader.read_to_end(&mut buf).await;
-    buf
 }
 
 /// Parse the last `cd <dir>` target from a command string.
