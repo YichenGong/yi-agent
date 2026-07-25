@@ -32,12 +32,14 @@ impl StatusBarState {
         self.last_usage_time = Some(std::time::Instant::now());
     }
 
-    /// Set a heuristic prefill estimate (before real usage arrives).
-    /// Lower than a real target so `set_token_target` max still overrides.
+    /// Set a heuristic prefill estimate at the start of a new LLM call.
+    /// Resets per-call counters so each think turn shows its own values;
+    /// real usage later overrides via `set_token_target` max.
     pub fn set_prefill_estimate(&mut self, input: u64) {
-        if self.last_usage_time.is_none() {
-            self.target_input = self.target_input.max(input);
-        }
+        self.target_input = input;
+        self.target_output = 0;
+        self.display_output = 0;
+        self.last_usage_time = None;
     }
 
     /// Accumulate decode estimate from streamed text deltas.
@@ -307,12 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn test_prefill_estimate_does_not_override_real_usage() {
+    fn test_prefill_estimate_resets_per_call() {
         let mut s = StatusBarState::default();
-        s.set_token_target(1000, 0);
-        // After real usage, estimate should not lower the target
+        s.set_token_target(1000, 50);
+        // New think turn: estimate resets everything
         s.set_prefill_estimate(500);
-        assert_eq!(s.target_input, 1000, "real usage target should win");
+        assert_eq!(s.target_input, 500);
+        assert_eq!(s.target_output, 0, "decode should reset for new call");
     }
 
     #[test]
