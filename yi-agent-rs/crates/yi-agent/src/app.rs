@@ -19,24 +19,65 @@ pub struct UsageStats {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub last_input_tokens: u64,
+    // Current LLM call (for status bar display). Resets on begin_call.
+    current_input_tokens: u64,
+    current_output_tokens: u64,
+    call_active: bool,
 }
 
 impl UsageStats {
     pub fn add_usage(&mut self, usage: yi_agent_core::TokenUsage) {
+        if self.call_active {
+            // Within a call, track the latest reported prefill/decode counts.
+            // Providers may emit multiple Usage events per call (streaming);
+            // we take the max as the high-water mark for this call.
+            self.current_input_tokens = self
+                .current_input_tokens
+                .max(usage.input_tokens as u64);
+            self.current_output_tokens = self
+                .current_output_tokens
+                .max(usage.output_tokens as u64);
+        }
+        self.last_input_tokens = usage.input_tokens as u64;
         self.total_input_tokens += usage.input_tokens as u64;
         self.total_output_tokens += usage.output_tokens as u64;
-        self.last_input_tokens = usage.input_tokens as u64;
+    }
+
+    /// Mark the start of a new LLM call. Resets per-call counters to zero.
+    pub fn begin_call(&mut self) {
+        self.current_input_tokens = 0;
+        self.current_output_tokens = 0;
+        self.call_active = true;
+    }
+
+    /// Mark the end of the current LLM call. Per-call values freeze at their
+    /// last value until the next `begin_call`.
+    pub fn end_call(&mut self) {
+        self.call_active = false;
     }
 
     pub fn reset_session(&mut self) {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
         self.last_input_tokens = 0;
+        self.current_input_tokens = 0;
+        self.current_output_tokens = 0;
+        self.call_active = false;
     }
 
     /// Last API call's input token count — approximates current context size.
     pub fn last_context_tokens(&self) -> u64 {
         self.last_input_tokens
+    }
+
+    /// Current call's prefill (input) token count, for status bar display.
+    pub fn current_input_tokens(&self) -> u64 {
+        self.current_input_tokens
+    }
+
+    /// Current call's decode (output) token count, for status bar display.
+    pub fn current_output_tokens(&self) -> u64 {
+        self.current_output_tokens
     }
 }
 
@@ -189,6 +230,7 @@ impl App {
                             self.renderer.render_user_input(&text);
                             match self.agent.run(expanded).await {
                                 Ok(stream) => {
+                                    self.usage_stats.begin_call();
                                     current_stream = Some(stream);
                                 }
                                 Err(e) => {
@@ -311,14 +353,17 @@ impl App {
                     match event {
                         Some(AgentEvent::Done { reason }) => {
                             tracing::info!(?reason, "agent done");
+                            self.usage_stats.end_call();
                             current_stream = None;
                         }
                         Some(AgentEvent::Cancelled) => {
                             tracing::info!("agent cancelled");
+                            self.usage_stats.end_call();
                             current_stream = None;
                         }
                         Some(AgentEvent::Error(e)) => {
                             tracing::warn!(error = %e, "agent error");
+                            self.usage_stats.end_call();
                             current_stream = None;
                         }
                         Some(AgentEvent::PermissionRequest {
@@ -525,6 +570,79 @@ mod tests {
         // Second call: context grew to 15K (not 25K cumulative)
         assert_eq!(stats.last_context_tokens(), 15_000);
         assert_eq!(stats.total_input_tokens, 25_000); // cumulative still tracks for /cost
+    }
+
+    #[test]
+    fn usage_stats_current_call_lifecycle() {
+        let mut s = UsageStats::default();
+        // Without begin_call, add_usage does not populate current_*.
+        s.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        });
+        assert_eq!(s.current_input_tokens(), 0);
+        assert_eq!(s.current_output_tokens(), 0);
+
+        // Start a call: per-call counters track subsequent usage.
+        s.begin_call();
+        s.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        });
+        assert_eq!(s.current_input_tokens(), 100);
+        assert_eq!(s.current_output_tokens(), 50);
+        // A later, smaller usage event within the same call does not regress.
+        s.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 40,
+            output_tokens: 20,
+            ..Default::default()
+        });
+        assert_eq!(s.current_input_tokens(), 100);
+        assert_eq!(s.current_output_tokens(), 50);
+        // A larger usage event raises the high-water mark.
+        s.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 150,
+            output_tokens: 80,
+            ..Default::default()
+        });
+        assert_eq!(s.current_input_tokens(), 150);
+        assert_eq!(s.current_output_tokens(), 80);
+
+        // End call: values freeze.
+        s.end_call();
+        assert_eq!(s.current_input_tokens(), 150);
+        assert_eq!(s.current_output_tokens(), 80);
+        // Usage outside a call does not change frozen per-call values.
+        s.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 999,
+            output_tokens: 999,
+            ..Default::default()
+        });
+        assert_eq!(s.current_input_tokens(), 150);
+        assert_eq!(s.current_output_tokens(), 80);
+
+        // Next begin_call resets to zero.
+        s.begin_call();
+        assert_eq!(s.current_input_tokens(), 0);
+        assert_eq!(s.current_output_tokens(), 0);
+    }
+
+    #[test]
+    fn usage_stats_reset_session_clears_current_call() {
+        let mut s = UsageStats::default();
+        s.begin_call();
+        s.add_usage(yi_agent_core::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        });
+        s.reset_session();
+        assert_eq!(s.current_input_tokens(), 0);
+        assert_eq!(s.current_output_tokens(), 0);
+        assert_eq!(s.total_input_tokens, 0);
+        assert_eq!(s.last_input_tokens, 0);
     }
 
     #[test]
