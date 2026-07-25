@@ -78,33 +78,48 @@ fn run_agent(cli: Cli) -> Result<()> {
     };
 
     // Branch on --tui flag
-    if cli.tui.as_deref() == Some("ratatui") {
-        return run_tui_agent(provider, tools, agent_config, config.workdir.clone());
+    match select_tui_mode(&cli) {
+        TuiMode::Ratatui => return run_tui_agent(provider, tools, agent_config, config.workdir.clone()),
+        TuiMode::Inline => {
+            // Default: InlineRenderer + reedline path
+            let agent = yi_agent_core::Agent::new(
+                Arc::clone(&provider),
+                Arc::clone(&tools),
+                agent_config.clone(),
+            );
+
+            let printer = reedline::ExternalPrinter::default();
+            let renderer = Box::new(InlineRenderer::with_printer(printer.sender()));
+
+            let app = App::new(
+                agent,
+                provider,
+                tools,
+                agent_config,
+                config.workdir.clone(),
+                renderer,
+            );
+
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(app.run(printer))?;
+        }
     }
 
-    // Default: InlineRenderer + reedline path
-    let agent = yi_agent_core::Agent::new(
-        Arc::clone(&provider),
-        Arc::clone(&tools),
-        agent_config.clone(),
-    );
-
-    let printer = reedline::ExternalPrinter::default();
-    let renderer = Box::new(InlineRenderer::with_printer(printer.sender()));
-
-    let app = App::new(
-        agent,
-        provider,
-        tools,
-        agent_config,
-        config.workdir.clone(),
-        renderer,
-    );
-
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(app.run(printer))?;
-
     Ok(())
+}
+
+/// Which TUI mode to use, based on the `--tui` CLI flag.
+/// Default (no flag) is Ratatui. `--tui inline` selects the old InlineRenderer.
+fn select_tui_mode(cli: &Cli) -> TuiMode {
+    match cli.tui.as_deref() {
+        Some("inline") => TuiMode::Inline,
+        _ => TuiMode::Ratatui,
+    }
+}
+
+enum TuiMode {
+    Ratatui,
+    Inline,
 }
 
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
@@ -201,4 +216,67 @@ fn run_tui_agent(
     tui_result?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Cli;
+
+    #[test]
+    fn default_tui_mode_is_ratatui() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: None,
+            model: None,
+            max_turns: None,
+            workdir: None,
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: None,
+            compact_keep_turns: None,
+            tui: None,
+        };
+        assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
+    }
+
+    #[test]
+    fn tui_inline_selects_inline() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: None,
+            model: None,
+            max_turns: None,
+            workdir: None,
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: None,
+            compact_keep_turns: None,
+            tui: Some("inline".into()),
+        };
+        assert!(matches!(select_tui_mode(&cli), TuiMode::Inline));
+    }
+
+    #[test]
+    fn tui_ratatui_selects_ratatui() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: None,
+            model: None,
+            max_turns: None,
+            workdir: None,
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: None,
+            compact_keep_turns: None,
+            tui: Some("ratatui".into()),
+        };
+        assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
+    }
 }

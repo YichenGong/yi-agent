@@ -65,7 +65,7 @@ pub struct Cli {
     #[arg(long)]
     pub compact_keep_turns: Option<u32>,
 
-    /// TUI mode: "inline" (default) or "ratatui"
+    /// TUI mode: "inline" for legacy InlineRenderer (default is ratatui)
     #[arg(long)]
     pub tui: Option<String>,
 }
