@@ -120,18 +120,49 @@ impl LineBuilder {
         self.current_spans.push(span);
     }
 
+    fn wrap_line(&self, line: Line<'static>) -> Line<'static> {
+        // Single Line can't represent wrapping; we handle it at flush_line level
+        // by splitting into multiple Lines. This function is kept for API compat
+        // but the actual wrapping happens in flush_line.
+        line
+    }
+
     fn flush_line(&mut self) {
         if self.current_spans.is_empty() {
             self.lines.push(Line::raw(""));
         } else {
-            let line = Line::from(std::mem::take(&mut self.current_spans));
-            self.lines.push(self.wrap_line(line));
+            let spans = std::mem::take(&mut self.current_spans);
+            let max_w = self.width as usize;
+            // Word-wrap: split spans into words, accumulate until width exceeded
+            let mut current: Vec<Span<'static>> = Vec::new();
+            let mut current_width: usize = 0;
+            for span in spans {
+                let span_style = span.style;
+                let span_text = span.content.into_owned();
+                // Split span into words preserving spaces
+                let mut words: Vec<&str> = span_text.split(' ').collect();
+                for (i, word) in words.drain(..).enumerate() {
+                    let word_width = word.chars().count();
+                    let sep = if i == 0 && current.is_empty() { 0 } else { 1 }; // space before word
+                    if current_width + sep + word_width <= max_w || current.is_empty() {
+                        // Fits on current line
+                        if sep == 1 && !current.is_empty() {
+                            current.push(Span::raw(" "));
+                        }
+                        current.push(Span::styled(word.to_string(), span_style));
+                        current_width += sep + word_width;
+                    } else {
+                        // Start new line
+                        self.lines.push(Line::from(std::mem::take(&mut current)));
+                        current.push(Span::styled(word.to_string(), span_style));
+                        current_width = word_width;
+                    }
+                }
+            }
+            if !current.is_empty() {
+                self.lines.push(Line::from(current));
+            }
         }
-    }
-
-    fn wrap_line(&self, line: Line<'static>) -> Line<'static> {
-        // Simple wrap: if line width exceeds, just return as-is (YAGNI for now)
-        line
     }
 
     fn flush_code_block(&mut self) {
@@ -214,5 +245,17 @@ mod tests {
     fn empty_string_returns_empty() {
         let lines = render_markdown("", 80);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn long_text_wraps_at_width() {
+        let src = "this is a very long line that should wrap when the terminal is narrow";
+        let lines = render_markdown(src, 20);
+        assert!(lines.len() > 1, "expected wrapping, got {} lines", lines.len());
+        // No single line should exceed the width
+        for line in &lines {
+            let w: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(w <= 20, "line width {w} exceeds 20: {:?}", spans_text(line));
+        }
     }
 }
