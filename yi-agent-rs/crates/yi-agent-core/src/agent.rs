@@ -93,7 +93,9 @@ You work efficiently by minimizing round-trips. Tool use strategy:
   RESULT of an earlier step.
 
 Example: instead of 3 turns (mkdir, write, test), use one bash call:
-  mkdir -p src/utils && echo '...' > src/utils/mod.rs && cargo test"#
+  mkdir -p src/utils && echo '...' > src/utils/mod.rs && cargo test
+
+Style: Never use emoji in any response. All communication must be plain text only."#
             .to_string()
     }
 }
