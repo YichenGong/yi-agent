@@ -6,8 +6,8 @@
 use crate::tui::state::{RunningTaskRegistry, TaskState, TaskStatus};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 /// Top-level popup state.
 #[derive(Debug, Clone)]
