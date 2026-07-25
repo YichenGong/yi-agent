@@ -325,7 +325,10 @@ impl reedline::Prompt for CodexPrompt {
     fn render_prompt_right(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed("")
     }
-    fn render_prompt_indicator(&self, _mode: reedline::PromptEditMode) -> std::borrow::Cow<'_, str> {
+    fn render_prompt_indicator(
+        &self,
+        _mode: reedline::PromptEditMode,
+    ) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(format!("{PROMPT_BG}> "))
     }
     fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<'_, str> {
@@ -368,7 +371,7 @@ impl reedline::Highlighter for CodexHighlighter {
 /// `InlineRenderer`，使渲染输出通过 reedline 事件循环安全打印。
 fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>, printer: reedline::ExternalPrinter<String>) {
     use crossterm::event::{KeyCode, KeyModifiers};
-    use reedline::{DefaultPrompt, Emacs, Reedline};
+    use reedline::{Emacs, Reedline};
 
     let mut keybindings = reedline::default_emacs_keybindings();
     // 将 ESC 绑定到 CtrlC 事件：清空当前行并返回 Signal::CtrlC
@@ -380,8 +383,9 @@ fn run_input_loop(cmd_tx: mpsc::Sender<UserCommand>, printer: reedline::External
 
     let mut line_editor = Reedline::create()
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_highlighter(Box::new(CodexHighlighter))
         .with_external_printer(printer);
-    let prompt = DefaultPrompt::default();
+    let prompt = CodexPrompt;
 
     loop {
         let sig = line_editor.read_line(&prompt);
