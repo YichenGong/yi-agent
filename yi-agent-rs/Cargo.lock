@@ -3553,6 +3553,7 @@ dependencies = [
  "walkdir",
  "wiremock",
  "yi-agent-core",
+ "yi-agent-skills",
 ]
 
 [[package]]

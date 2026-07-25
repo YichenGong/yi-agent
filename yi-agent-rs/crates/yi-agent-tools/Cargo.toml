@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 yi-agent-core = { workspace = true }
+yi-agent-skills = { workspace = true }
 
 # 异步
 async-trait = "0.1"
