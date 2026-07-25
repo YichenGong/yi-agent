@@ -181,6 +181,8 @@ impl Renderer for InlineRenderer {
             AgentEvent::PermissionRequest { .. } | AgentEvent::PermissionResolved { .. } => {
                 // Handled in Tasks 10/11
             }
+            // Temporary: new ToolEvent variants handled in a later commit
+            AgentEvent::ToolOutputDelta { .. } | AgentEvent::ToolExit { .. } | AgentEvent::ToolTimeout { .. } => {}
         }
     }
 

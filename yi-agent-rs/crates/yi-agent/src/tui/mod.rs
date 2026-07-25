@@ -8,3 +8,4 @@ pub mod markdown;
 pub mod queued;
 pub mod slash;
 pub mod state;
+pub mod statusbar;

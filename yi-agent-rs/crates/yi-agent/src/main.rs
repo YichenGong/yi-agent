@@ -331,6 +331,7 @@ fn run_tui_agent(
                 control_tx,
                 decision_tx,
                 is_running,
+                agent_config.model.clone(),
             )
         });
 

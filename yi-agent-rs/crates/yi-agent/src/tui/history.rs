@@ -222,6 +222,8 @@ impl HistoryState {
                 }
                 self.push(HistoryCell::PermissionResolved { decision });
             }
+            // Temporary: new ToolEvent variants handled in a later commit
+            AgentEvent::ToolOutputDelta { .. } | AgentEvent::ToolExit { .. } | AgentEvent::ToolTimeout { .. } => {}
         }
     }
 }

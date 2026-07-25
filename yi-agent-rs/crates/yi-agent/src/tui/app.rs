@@ -20,6 +20,8 @@ use super::cell::HistoryCell;
 use super::history::{HistoryState, HistoryView};
 use super::input::{InputAction, InputLine};
 use super::slash::{CommandPopup, SlashCommand};
+use super::state::RunningTaskRegistry;
+use super::statusbar::{StatusBarState, render_statusbar};
 
 /// Run the ratatui TUI main loop with the real terminal.
 ///
@@ -34,6 +36,7 @@ pub fn run_tui(
     control_tx: tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    model: String,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -55,6 +58,7 @@ pub fn run_tui(
         &decision_tx,
         &is_running,
         &CrosstermEventSource,
+        &model,
     );
 
     // Always restore terminal state, even on error
@@ -108,6 +112,7 @@ pub fn run_tui_with_backend<B: Backend>(
         decision_tx,
         is_running,
         &CrosstermEventSource,
+        "test-model",
     )
 }
 
@@ -137,6 +142,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         decision_tx,
         is_running,
         events,
+        "test-model",
     )
 }
 
@@ -152,10 +158,13 @@ fn run_loop<B: Backend, E: EventSource>(
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
+    model: &str,
 ) -> std::io::Result<()> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut statusbar_state = StatusBarState::default();
+    let mut task_registry = RunningTaskRegistry::new();
 
     loop {
         // Drain all pending agent events
@@ -176,6 +185,8 @@ fn run_loop<B: Backend, E: EventSource>(
 
         let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
         let queued_height = queued_lines.len() as u16;
+        // Advance status bar interpolation + spinner (~30hz).
+        statusbar_state.tick();
 
         terminal.draw(|f| {
             let area = f.area();
@@ -191,8 +202,9 @@ fn run_loop<B: Backend, E: EventSource>(
                 .constraints([
                     Constraint::Min(3),                // history
                     Constraint::Length(popup_height),  // popup (0 when none)
-                    Constraint::Length(1),             // blank gap
+                    Constraint::Length(1),             // status bar
                     Constraint::Length(queued_height), // queued preview
+                    Constraint::Length(1),             // blank gap
                     Constraint::Length(input_height),  // input (wraps up to 6 lines)
                 ])
                 .split(area);
@@ -211,17 +223,21 @@ fn run_loop<B: Backend, E: EventSource>(
                 }
             }
 
+            // Status bar
+            let statusbar_line = render_statusbar(&statusbar_state, &task_registry, model);
+            f.render_widget(statusbar_line, chunks[2]);
+
             // Render queued messages preview
             if queued_height > 0 {
                 f.render_widget(Paragraph::new(queued_lines.clone()), chunks[3]);
             }
 
-            let input_line = build_input_line(input, pending_quit, chunks[4].width);
-            f.render_widget(input_line, chunks[4]);
+            let input_line = build_input_line(input, pending_quit, chunks[5].width);
+            f.render_widget(input_line, chunks[5]);
         })?;
 
-        // Poll for key events with timeout
-        if let Some(Event::Key(key)) = events.poll(Duration::from_millis(50))? {
+        // Poll for key events with timeout (33ms → ~30hz refresh)
+        if let Some(Event::Key(key)) = events.poll(Duration::from_millis(33))? {
             match handle_key(
                 key,
                 input,
