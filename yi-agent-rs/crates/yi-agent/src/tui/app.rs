@@ -459,7 +459,7 @@ fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> P
         ]))
         .style(Style::new().bg(Color::Indexed(240)));
     }
-    let lines = wrap_input_buffer(&input.buffer, &prefix, area_width);
+    let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width);
     Paragraph::new(Text::from(lines)).style(Style::new().bg(Color::Indexed(240)))
 }
 
@@ -483,42 +483,107 @@ fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) 
 /// The first line begins with the `"> "` prefix; continuation lines begin
 /// with `"  "` so the cursor column is visually aligned. Wrapping is
 /// character-based using unicode display width (so CJK / wide chars work).
-fn wrap_input_buffer(buffer: &str, prefix: &Span<'static>, area_width: u16) -> Vec<Line<'static>> {
+///
+/// The character at `cursor` (byte offset) is rendered with reverse video
+/// (white background, black foreground) so the user can see the cursor.
+fn wrap_input_buffer(buffer: &str, cursor: usize, prefix: &Span<'static>, area_width: u16) -> Vec<Line<'static>> {
     const PREFIX_LEN: usize = 2; // "> " or "  "
     let avail = (area_width as usize).saturating_sub(PREFIX_LEN).max(1);
+    let cursor_style = Style::new().fg(Color::Black).bg(Color::White);
+
+    // Helper to build spans for a chunk of text, applying cursor_style to the
+    // character at the cursor byte offset if it falls within this chunk.
+    // Returns a Vec of spans (without prefix — caller adds prefix).
+    let build_spans = |text: &str, chunk_start: usize| -> Vec<Span<'static>> {
+        if text.is_empty() {
+            return vec![Span::raw(String::new())];
+        }
+        // Find if cursor is within this chunk
+        // Cursor byte offset relative to chunk start
+        let cursor_rel = cursor.checked_sub(chunk_start);
+        match cursor_rel {
+            Some(rel) if rel <= text.len() => {
+                // Cursor is at or after chunk start, within or at end of text.
+                // If rel == text.len(), cursor is at end — we need a cursor
+                // on the "empty" position after last char. We render a space
+                // with cursor style.
+                let before = &text[..rel];
+                let after = &text[rel..];
+                if after.is_empty() {
+                    // Cursor at end of text: render text normally, then a
+                    // cursor-styled space to show the cursor position.
+                    vec![
+                        Span::raw(before.to_string()),
+                        Span::styled(" ", cursor_style),
+                    ]
+                } else {
+                    // Cursor is on the first char of `after`
+                    let (cursor_char, rest) = after.char_indices().next()
+                        .map(|(i, c)| (&after[..i + c.len_utf8()], &after[i + c.len_utf8()..]))
+                        .unwrap_or(("", after));
+                    vec![
+                        Span::raw(before.to_string()),
+                        Span::styled(cursor_char.to_string(), cursor_style),
+                        Span::raw(rest.to_string()),
+                    ]
+                }
+            }
+            _ => {
+                // Cursor not in this chunk
+                vec![Span::raw(text.to_string())]
+            }
+        }
+    };
 
     // Compute the display width of the buffer.
-    if buffer.is_empty() || UnicodeWidthStr::width(buffer) <= avail {
-        return vec![Line::from(vec![prefix.clone(), Span::raw(buffer.to_string())])];
+    if buffer.is_empty() {
+        // Empty buffer: show cursor at position 0 (a space with cursor style)
+        return vec![Line::from(vec![prefix.clone(), Span::styled(" ", cursor_style)])];
+    }
+    if UnicodeWidthStr::width(buffer) <= avail {
+        let spans = build_spans(buffer, 0);
+        let mut all_spans = vec![prefix.clone()];
+        all_spans.extend(spans);
+        return vec![Line::from(all_spans)];
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current = String::new();
     let mut current_width = 0usize;
+    let mut chunk_start = 0usize;
 
     for ch in buffer.chars() {
         let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if current_width + ch_width > avail && !current.is_empty() {
             // Flush current line
-            if lines.is_empty() {
-                lines.push(Line::from(vec![prefix.clone(), Span::raw(std::mem::take(&mut current))]));
+            let chunk = std::mem::take(&mut current);
+            let spans = build_spans(&chunk, chunk_start);
+            let mut all_spans = if lines.is_empty() {
+                vec![prefix.clone()]
             } else {
-                lines.push(Line::from(vec![Span::raw("  "), Span::raw(std::mem::take(&mut current))]));
-            }
+                vec![Span::raw("  ")]
+            };
+            all_spans.extend(spans);
+            lines.push(Line::from(all_spans));
+            chunk_start += chunk.len();
             current_width = 0;
         }
         current.push(ch);
         current_width += ch_width;
     }
     if !current.is_empty() {
-        if lines.is_empty() {
-            lines.push(Line::from(vec![prefix.clone(), Span::raw(current)]));
+        let spans = build_spans(&current, chunk_start);
+        let mut all_spans = if lines.is_empty() {
+            vec![prefix.clone()]
         } else {
-            lines.push(Line::from(vec![Span::raw("  "), Span::raw(current)]));
-        }
+            vec![Span::raw("  ")]
+        };
+        all_spans.extend(spans);
+        lines.push(Line::from(all_spans));
     }
     if lines.is_empty() {
-        lines.push(Line::from(vec![prefix.clone(), Span::raw(String::new())]));
+        let mut all_spans = vec![prefix.clone(), Span::styled(" ", cursor_style)];
+        lines.push(Line::from(all_spans));
     }
     lines
 }
@@ -1139,5 +1204,130 @@ mod tests {
         // After space, popup should be dismissed
         let text = collect_all_text(&terminal);
         assert!(!text.contains("清空对话上下文"), "popup should be dismissed after space");
+    }
+
+    /// The cursor position should be rendered with reverse video (white bg,
+    /// black fg) so the user can see where their cursor is in the input.
+    #[test]
+    fn cursor_shown_with_reverse_video() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Type "abc" — cursor should be at position 3 (after 'c').
+        // With reverse video, at least one cell in the input row should have
+        // a white background.
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+        ).unwrap();
+
+        // Check the input row for a cell with white background (reverse video cursor)
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let mut found_cursor = false;
+        for x in 0..80u16 {
+            let cell = &buffer[(x, input_row)];
+            // Look for a cell with white background (Color::White)
+            if cell.bg == ratatui::style::Color::White {
+                found_cursor = true;
+                break;
+            }
+        }
+        assert!(found_cursor, "expected a cursor cell with white background in input row");
+    }
+
+    /// When the buffer is empty, the cursor should still be visible (at position 0).
+    #[test]
+    fn cursor_visible_on_empty_buffer() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Just quit — no input typed. The input row should still show a cursor.
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+        ).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let mut found_cursor = false;
+        for x in 0..80u16 {
+            let cell = &buffer[(x, input_row)];
+            if cell.bg == ratatui::style::Color::White {
+                found_cursor = true;
+                break;
+            }
+        }
+        assert!(found_cursor, "expected cursor on empty buffer");
+    }
+
+    /// When cursor is in the middle of text, the character at cursor should
+    /// be rendered with reverse video while surrounding text is normal.
+    #[test]
+    fn cursor_in_middle_of_text() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Type "abc", move left to position 2 (between 'b' and 'c').
+        // The 'c' character should have reverse video.
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+        ).unwrap();
+
+        // Input starts at x=2 (after "> " prefix). 'a' at x=2, 'b' at x=3, 'c' at x=4.
+        // Cursor at byte offset 2 means 'c' is the cursor character, at x=4.
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let cursor_cell = &buffer[(4, input_row)];
+        assert_eq!(
+            cursor_cell.fg,
+            ratatui::style::Color::Black,
+            "cursor character 'c' should have black foreground"
+        );
+        assert_eq!(
+            cursor_cell.bg,
+            ratatui::style::Color::White,
+            "cursor character 'c' should have white background"
+        );
+
+        // The 'a' character (not at cursor) should NOT have reverse video
+        let non_cursor_cell = &buffer[(2, input_row)];
+        assert_ne!(
+            non_cursor_cell.bg,
+            ratatui::style::Color::White,
+            "non-cursor character 'a' should not have white background"
+        );
     }
 }
