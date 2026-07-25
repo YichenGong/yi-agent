@@ -386,42 +386,25 @@ async fn run_loop(
                     }
                     crate::permission::CheckResult::NeedConfirm(req) => {
                         if let Some(decision_rx) = &decision_rx {
-                            let _ = tx
-                                .send(AgentEvent::PermissionRequest {
-                                    request_id: req.request_id,
-                                    tool_name: req.tool_name.clone(),
-                                    tool_input: req.tool_input.clone(),
-                                    prefix_suggestion: req.prefix_suggestion.clone(),
-                                    kind: req.kind.clone(),
-                                })
-                                .await;
-                            let decision =
-                                wait_for_decision(decision_rx, req.request_id, &cancel_token).await;
-                            let _ = tx
-                                .send(AgentEvent::PermissionResolved {
-                                    request_id: req.request_id,
-                                    decision: decision.clone(),
-                                })
-                                .await;
-                            match decision {
-                                crate::permission::Decision::AllowOnce
-                                | crate::permission::Decision::AlwaysAllowTool
-                                | crate::permission::Decision::AlwaysAllowPrefix(_) => {
-                                    if let Err(e) = checker.apply_decision(&name, &input, &decision).await {
-                                        tracing::warn!("failed to persist permission decision: {e}");
-                                    }
-                                    checked_uses.push((id, name, input));
-                                }
-                                crate::permission::Decision::Deny => {
-                                    let _ = tx
-                                        .send(AgentEvent::ToolResult {
-                                            id: id.clone(),
-                                            result: ToolResult::error("user denied"),
-                                        })
-                                        .await;
-                                    denied_results
-                                        .push((id.clone(), ToolResult::error("user denied")));
-                                }
+                            let id_clone = id.clone();
+                            match handle_confirmation(
+                                &tx,
+                                checker,
+                                decision_rx,
+                                &cancel_token,
+                                id,
+                                name,
+                                input,
+                                req,
+                                "user denied",
+                            )
+                            .await
+                            {
+                                Some((id, name, input)) => checked_uses.push((id, name, input)),
+                                None => denied_results.push((
+                                    id_clone,
+                                    ToolResult::error("user denied"),
+                                )),
                             }
                         } else {
                             // No decision channel - deny by default
@@ -441,46 +424,25 @@ async fn run_loop(
                     }
                     crate::permission::CheckResult::Blacklisted(req) => {
                         if let Some(decision_rx) = &decision_rx {
-                            let _ = tx
-                                .send(AgentEvent::PermissionRequest {
-                                    request_id: req.request_id,
-                                    tool_name: req.tool_name.clone(),
-                                    tool_input: req.tool_input.clone(),
-                                    prefix_suggestion: req.prefix_suggestion.clone(),
-                                    kind: req.kind.clone(),
-                                })
-                                .await;
-                            let decision =
-                                wait_for_decision(decision_rx, req.request_id, &cancel_token).await;
-                            let _ = tx
-                                .send(AgentEvent::PermissionResolved {
-                                    request_id: req.request_id,
-                                    decision: decision.clone(),
-                                })
-                                .await;
-                            match decision {
-                                crate::permission::Decision::AllowOnce
-                                | crate::permission::Decision::AlwaysAllowTool
-                                | crate::permission::Decision::AlwaysAllowPrefix(_) => {
-                                    if let Err(e) = checker.apply_decision(&name, &input, &decision).await {
-                                        tracing::warn!("failed to persist permission decision: {e}");
-                                    }
-                                    checked_uses.push((id, name, input));
-                                }
-                                crate::permission::Decision::Deny => {
-                                    let _ = tx
-                                        .send(AgentEvent::ToolResult {
-                                            id: id.clone(),
-                                            result: ToolResult::error(
-                                                "user denied blacklisted command",
-                                            ),
-                                        })
-                                        .await;
-                                    denied_results.push((
-                                        id.clone(),
-                                        ToolResult::error("user denied blacklisted command"),
-                                    ));
-                                }
+                            let id_clone = id.clone();
+                            match handle_confirmation(
+                                &tx,
+                                checker,
+                                decision_rx,
+                                &cancel_token,
+                                id,
+                                name,
+                                input,
+                                req,
+                                "user denied blacklisted command",
+                            )
+                            .await
+                            {
+                                Some((id, name, input)) => checked_uses.push((id, name, input)),
+                                None => denied_results.push((
+                                    id_clone,
+                                    ToolResult::error("user denied blacklisted command"),
+                                )),
                             }
                         } else {
                             let _ = tx
@@ -603,6 +565,63 @@ async fn wait_for_decision(
                 Some(_) => continue,
                 None => return crate::permission::Decision::Deny,
             }
+        }
+    }
+}
+
+/// Handles a permission request that needs user confirmation (NeedConfirm or Blacklisted).
+/// Sends PermissionRequest event, waits for decision, sends PermissionResolved event.
+/// Returns Some((id, name, input)) if user allows execution, None if user denies.
+async fn handle_confirmation(
+    tx: &mpsc::Sender<AgentEvent>,
+    checker: &Arc<crate::permission::PermissionChecker>,
+    decision_rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    id: String,
+    name: String,
+    input: Value,
+    req: crate::permission::PermissionRequest,
+    deny_message: &str,
+) -> Option<(String, String, Value)> {
+    let _ = tx
+        .send(AgentEvent::PermissionRequest {
+            request_id: req.request_id,
+            tool_name: req.tool_name.clone(),
+            tool_input: req.tool_input.clone(),
+            prefix_suggestion: req.prefix_suggestion.clone(),
+            kind: req.kind.clone(),
+        })
+        .await;
+
+    let decision = wait_for_decision(decision_rx, req.request_id, cancel_token).await;
+
+    let _ = tx
+        .send(AgentEvent::PermissionResolved {
+            request_id: req.request_id,
+            decision: decision.clone(),
+        })
+        .await;
+
+    match decision {
+        crate::permission::Decision::AllowOnce
+        | crate::permission::Decision::AlwaysAllowTool
+        | crate::permission::Decision::AlwaysAllowPrefix(_) => {
+            if let Err(e) = checker
+                .apply_decision(&name, &decision, &req.kind)
+                .await
+            {
+                tracing::warn!("failed to persist permission decision: {e}");
+            }
+            Some((id, name, input))
+        }
+        crate::permission::Decision::Deny => {
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    id: id.clone(),
+                    result: ToolResult::error(deny_message),
+                })
+                .await;
+            None
         }
     }
 }

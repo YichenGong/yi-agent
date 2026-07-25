@@ -41,7 +41,6 @@ pub enum HistoryCell {
     },
     /// Permission resolved notification. Shows the decision that was made.
     PermissionResolved {
-        request_id: u64,
         decision: yi_agent_core::permission::Decision,
     },
 }
@@ -94,7 +93,7 @@ impl HistoryCell {
                 *resolved,
                 width,
             ),
-            Self::PermissionResolved { request_id: _, decision } => {
+            Self::PermissionResolved { decision } => {
                 render_permission_resolved(decision)
             }
         }

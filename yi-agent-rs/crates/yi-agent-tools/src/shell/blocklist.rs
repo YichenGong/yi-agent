@@ -6,10 +6,19 @@ pub fn is_blocked(cmd: &str) -> Option<&'static str> {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         vec![
-            (Regex::new(r"rm\s+-rf?\s+/\s*(--)?").unwrap(), "rm -rf /"),
-            (Regex::new(r"rm\s+-rf?\s+~/").unwrap(), "rm -rf ~"),
-            (Regex::new(r"rm\s+-rf?\s+\$HOME").unwrap(), "rm -rf $HOME"),
-            (Regex::new(r":\(\)\{\s*:\|:&\s*\};:").unwrap(), "fork bomb"),
+            // rm -rf / — covers -rf, -fr, -Rf, -fR, -r -f, -f -r, with optional --no-preserve-root
+            (
+                Regex::new(r"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/")
+                    .unwrap(),
+                "rm -rf /",
+            ),
+            // rm -rf ~ and $HOME (all flag orderings)
+            (Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+~/").unwrap(), "rm -rf ~"),
+            (Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+\$HOME").unwrap(), "rm -rf $HOME"),
+            (
+                Regex::new(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:?\s*&\s*\}\s*;\s*:").unwrap(),
+                "fork bomb",
+            ),
             (Regex::new(r"mkfs(\.\w+)?\s+/dev/").unwrap(), "mkfs"),
             (Regex::new(r"dd\s+.*of=/dev/[a-z]").unwrap(), "dd to device"),
             (
@@ -35,10 +44,10 @@ pub fn is_blocked(cmd: &str) -> Option<&'static str> {
             ),
             (Regex::new(r"chmod\s+-R\s+0+").unwrap(), "chmod -R 0"),
             (Regex::new(r"chown\s+-R\s+.*:.*\s+/").unwrap(), "chown -R /"),
-            (Regex::new(r"shutdown\s+").unwrap(), "shutdown"),
-            (Regex::new(r"reboot\s+").unwrap(), "reboot"),
-            (Regex::new(r"halt\s+").unwrap(), "halt"),
-            (Regex::new(r"poweroff\s+").unwrap(), "poweroff"),
+            (Regex::new(r"\bshutdown(\s|$)").unwrap(), "shutdown"),
+            (Regex::new(r"\breboot(\s|$)").unwrap(), "reboot"),
+            (Regex::new(r"\bhalt(\s|$)").unwrap(), "halt"),
+            (Regex::new(r"\bpoweroff(\s|$)").unwrap(), "poweroff"),
             (Regex::new(r"init\s+0").unwrap(), "init 0"),
             (Regex::new(r"kill\s+-9\s+-1").unwrap(), "kill -9 -1"),
             (Regex::new(r"killall\s+-9").unwrap(), "killall -9"),
@@ -159,11 +168,11 @@ mod tests {
     #[case::rm_rf_home_var("rm -rf $HOME", true)]
     #[case::rm_rf_star("rm -rf *", false)]
     #[case::rm_rf_dot("rm -rf ./", false)]
-    #[case::rm_fr_root("rm -fr /", false)]
-    #[case::rm_r_f_root("rm -r -f /", false)]
+    #[case::rm_fr_root("rm -fr /", true)]
+    #[case::rm_r_f_root("rm -r -f /", true)]
     #[case::rm_rf_trailing_space("rm -rf / ", true)]
     #[case::sudo_rm_rf("sudo rm -rf /", true)]
-    #[case::rm_rf_no_preserve("rm -rf --no-preserve-root /", false)]
+    #[case::rm_rf_no_preserve("rm -rf --no-preserve-root /", true)]
     #[case::rm_rf_build( "rm -rf build/", false)]
     #[case::rm_rf_target("rm -rf ./target", false)]
     #[case::rm_single("rm foo.txt", false)]
@@ -173,10 +182,21 @@ mod tests {
         assert_eq!(is_blocked(cmd).is_some(), blocked, "cmd: {cmd}");
     }
 
+    // ==== rm -rf / 扩展:大写 -R 和 --no-preserve-root 组合 ====
+    #[rstest]
+    #[case::rm_Rf_root("rm -Rf /", true)]
+    #[case::rm_fR_root("rm -fR /", true)]
+    #[case::rm_fr_no_preserve("rm -fr --no-preserve-root /", true)]
+    #[case::rm_r_f_no_preserve("rm -r -f --no-preserve-root /", true)]
+    #[case::rm_f_r_no_preserve("rm -f -r --no-preserve-root /", true)]
+    fn test_rm_rf_extended(#[case] cmd: &str, #[case] blocked: bool) {
+        assert_eq!(is_blocked(cmd).is_some(), blocked, "cmd: {cmd}");
+    }
+
     // ==== fork bomb 枚举 ====
     #[rstest]
     #[case::classic(":(){ :|:& };:", true)]
-    #[case::with_spaces(": () { : | & } ; :", false)]
+    #[case::with_spaces(": () { : | & } ; :", true)]
     #[case::via_bash("bash -c ':(){ :|:& };:'", true)]
     #[case::echo_string("echo \":(){ :|:& };:\"", true)]
     fn test_fork_bomb(#[case] cmd: &str, #[case] blocked: bool) {
@@ -230,9 +250,9 @@ mod tests {
     // ==== 系统控制命令枚举 ====
     #[rstest]
     #[case::shutdown("shutdown -h now", true)]
-    #[case::reboot("reboot", false)]
-    #[case::halt("halt", false)]
-    #[case::poweroff("poweroff", false)]
+    #[case::reboot("reboot", true)]
+    #[case::halt("halt", true)]
+    #[case::poweroff("poweroff", true)]
     #[case::init0("init 0", true)]
     #[case::kill_all("kill -9 -1", true)]
     #[case::killall("killall -9 firefox", true)]

@@ -239,26 +239,33 @@ fn handle_key(
 ) -> KeyOutcome {
     // Check if there's a pending permission request
     if let Some((request_id, _tool_name, prefix_suggestion, kind)) = history.pending_permission_info() {
-        let decision = match key.code {
-            KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
-            KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
-            KeyCode::Char('3') => prefix_suggestion.map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
-            KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
-            KeyCode::Enter => {
-                let default = match kind {
-                    yi_agent_core::permission::PermissionKind::Blacklisted(_) => yi_agent_core::permission::Decision::Deny,
-                    _ => yi_agent_core::permission::Decision::AllowOnce,
-                };
-                Some(default)
+        // Allow quit keys to pass through even when permission is pending
+        let is_quit_key = matches!(key.code, KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL)
+            || matches!(key.code, KeyCode::Esc);
+        if is_quit_key {
+            // Fall through to global key handling below
+        } else {
+            let decision = match key.code {
+                KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
+                KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
+                KeyCode::Char('3') => prefix_suggestion.map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
+                KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
+                KeyCode::Enter => {
+                    let default = match kind {
+                        yi_agent_core::permission::PermissionKind::Blacklisted(_) => yi_agent_core::permission::Decision::Deny,
+                        _ => yi_agent_core::permission::Decision::AllowOnce,
+                    };
+                    Some(default)
+                }
+                _ => None,
+            };
+            if let Some(d) = decision {
+                let _ = decision_tx.blocking_send((request_id, d));
+                return KeyOutcome::None;
             }
-            _ => None,
-        };
-        if let Some(d) = decision {
-            let _ = decision_tx.blocking_send((request_id, d));
+            // For other keys while permission pending, ignore (don't let user type input)
             return KeyOutcome::None;
         }
-        // For other keys while permission pending, ignore (don't let user type input)
-        return KeyOutcome::None;
     }
 
     // Global keys first
@@ -1605,6 +1612,414 @@ mod tests {
             non_cursor_cell.bg,
             ratatui::style::Color::White,
             "non-cursor character 'a' should not have white background"
+        );
+    }
+
+    // ----- Permission key handling tests -----
+
+    /// Helper to create a Normal permission request event.
+    fn make_permission_request_normal(request_id: u64) -> AgentEvent {
+        AgentEvent::PermissionRequest {
+            request_id,
+            tool_name: "bash".into(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            prefix_suggestion: Some("ls".into()),
+            kind: yi_agent_core::permission::PermissionKind::Normal,
+        }
+    }
+
+    /// Helper to create a Blacklisted permission request event.
+    fn make_permission_request_blacklisted(request_id: u64) -> AgentEvent {
+        AgentEvent::PermissionRequest {
+            request_id,
+            tool_name: "bash".into(),
+            tool_input: serde_json::json!({"command": "rm -rf /"}),
+            prefix_suggestion: Some("rm".into()),
+            kind: yi_agent_core::permission::PermissionKind::Blacklisted("rm -rf".into()),
+        }
+    }
+
+    /// Helper to create a permission request with no prefix suggestion.
+    fn make_permission_request_no_prefix(request_id: u64) -> AgentEvent {
+        AgentEvent::PermissionRequest {
+            request_id,
+            tool_name: "bash".into(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            prefix_suggestion: None,
+            kind: yi_agent_core::permission::PermissionKind::Normal,
+        }
+    }
+
+    /// Event source that plays back scripted events, then returns Ctrl+Q
+    /// forever. This ensures the TUI loop eventually exits once scripted
+    /// events are exhausted and any pending permission is resolved.
+    struct ScriptedThenQuitEvents {
+        events: Rc<RefCell<Vec<Event>>>,
+    }
+
+    impl EventSource for ScriptedThenQuitEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let ev = self.events.borrow_mut().pop();
+            Ok(Some(ev.unwrap_or(Event::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+            )))))
+        }
+    }
+
+    /// Spawn a thread that sends `PermissionResolved` for `request_id` after
+    /// a short delay. This resolves the permission in the history so that
+    /// subsequent Ctrl+Q events can actually quit the TUI loop.
+    fn resolve_permission_after_delay(
+        agent_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        request_id: u64,
+    ) {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = agent_tx.blocking_send(AgentEvent::PermissionResolved {
+                request_id,
+                decision: yi_agent_core::permission::Decision::AllowOnce,
+            });
+        });
+    }
+
+    /// Key '1' on a pending permission should send AllowOnce on decision_tx.
+    #[test]
+    fn permission_key_1_allows_once() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx.try_send(make_permission_request_normal(1)).unwrap();
+        resolve_permission_after_delay(agent_tx, 1);
+
+        // Events are LIFO: '1' is processed first, then scripted events run out
+        // and ScriptedThenQuitEvents returns Ctrl+Q forever.
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((1, yi_agent_core::permission::Decision::AllowOnce))
+        );
+    }
+
+    /// Key '2' on a pending permission should send AlwaysAllowTool.
+    #[test]
+    fn permission_key_2_always_allow_tool() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx.try_send(make_permission_request_normal(2)).unwrap();
+        resolve_permission_after_delay(agent_tx, 2);
+
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((2, yi_agent_core::permission::Decision::AlwaysAllowTool))
+        );
+    }
+
+    /// Key '3' with a prefix suggestion should send AlwaysAllowPrefix.
+    #[test]
+    fn permission_key_3_always_allow_prefix() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx.try_send(make_permission_request_normal(3)).unwrap();
+        resolve_permission_after_delay(agent_tx, 3);
+
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((3, yi_agent_core::permission::Decision::AlwaysAllowPrefix("ls".into())))
+        );
+    }
+
+    /// Key '4' on a pending permission should send Deny.
+    #[test]
+    fn permission_key_4_deny() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx.try_send(make_permission_request_normal(4)).unwrap();
+        resolve_permission_after_delay(agent_tx, 4);
+
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((4, yi_agent_core::permission::Decision::Deny))
+        );
+    }
+
+    /// Enter on a Normal permission should default to AllowOnce.
+    #[test]
+    fn permission_enter_defaults_to_allow_for_normal() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx.try_send(make_permission_request_normal(5)).unwrap();
+        resolve_permission_after_delay(agent_tx, 5);
+
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((5, yi_agent_core::permission::Decision::AllowOnce))
+        );
+    }
+
+    /// Enter on a Blacklisted permission should default to Deny.
+    #[test]
+    fn permission_enter_defaults_to_deny_for_blacklisted() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx
+            .try_send(make_permission_request_blacklisted(6))
+            .unwrap();
+        resolve_permission_after_delay(agent_tx, 6);
+
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((6, yi_agent_core::permission::Decision::Deny))
+        );
+    }
+
+    /// Key '3' when there is no prefix suggestion should be a no-op:
+    /// no decision is sent, and the key is ignored. Afterward, pressing '1'
+    /// should still work to resolve the permission.
+    #[test]
+    fn permission_key_3_when_no_prefix_is_noop() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx
+            .try_send(make_permission_request_no_prefix(7))
+            .unwrap();
+        resolve_permission_after_delay(agent_tx, 7);
+
+        // Events (LIFO): '3' is processed first (noop, no prefix), then '1'
+        // resolves the permission. After '1' sends the decision, the resolver
+        // thread delivers PermissionResolved, and then Ctrl+Q quits.
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        // '3' should have been ignored (no prefix), so no AlwaysAllowPrefix.
+        // The only decision should be from '1' -> AllowOnce.
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((7, yi_agent_core::permission::Decision::AllowOnce))
+        );
+        // No further decisions
+        assert!(decision_rx.try_recv().is_err(), "should only have one decision");
+    }
+
+    /// Typing 'a' while a permission is pending should be ignored:
+    /// no decision sent and the input buffer is not modified.
+    /// Afterward, '1' resolves the permission and Ctrl+Q quits.
+    #[test]
+    fn permission_other_keys_ignored_while_pending() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        agent_tx.try_send(make_permission_request_normal(8)).unwrap();
+        resolve_permission_after_delay(agent_tx, 8);
+
+        // Events (LIFO): 'a' (should be ignored), then '1' (resolves permission)
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+        ]));
+        let source = ScriptedThenQuitEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        // The only decision should be from '1' -> AllowOnce (not from 'a')
+        let decision = decision_rx.blocking_recv();
+        assert_eq!(
+            decision,
+            Some((8, yi_agent_core::permission::Decision::AllowOnce))
+        );
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "should only have one decision"
+        );
+
+        // The input row should not contain 'a' — it was ignored while permission was pending.
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let row_text: String = (0..80u16)
+            .map(|x| buffer[(x, input_row)].symbol())
+            .collect();
+        assert!(
+            !row_text.contains('a'),
+            "expected 'a' to be ignored while permission pending, but found it in input row: {row_text:?}"
         );
     }
 }

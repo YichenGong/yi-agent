@@ -193,7 +193,7 @@ impl HistoryState {
                         }
                     }
                 }
-                self.push(HistoryCell::PermissionResolved { request_id, decision });
+                self.push(HistoryCell::PermissionResolved { decision });
             }
         }
     }

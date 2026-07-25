@@ -153,6 +153,28 @@ pub trait Provider: Send + Sync {
             stop_reason,
         })
     }
+
+    /// Non-streaming text completion. Builds a minimal request (no tools, no
+    /// system prompt) and returns the concatenated text from the response.
+    ///
+    /// Useful for simple prompt-response flows like prefix extraction.
+    async fn complete(&self, model: &str, prompt: &str) -> Result<String, ProviderError> {
+        let req = ProviderRequest {
+            model: model.to_string(),
+            system: None,
+            messages: vec![Message::user(prompt)],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let resp = self.call(req).await?;
+        let mut text = String::new();
+        for block in resp.content {
+            if let ContentBlock::Text(s) = block {
+                text.push_str(&s);
+            }
+        }
+        Ok(text)
+    }
 }
 
 #[cfg(test)]
