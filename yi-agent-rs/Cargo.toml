@@ -41,6 +41,7 @@ axum = "0.8"
 dotenvy = "0.15"
 
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+unicode-width = { version = "0.2", default-features = false, features = ["cjk"] }
 pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 

@@ -32,6 +32,7 @@ nu-ansi-term = { workspace = true }
 dotenvy = { workspace = true }
 
 ratatui = { workspace = true }
+unicode-width = { workspace = true }
 pulldown-cmark = { workspace = true }
 syntect = { workspace = true, optional = true }
 

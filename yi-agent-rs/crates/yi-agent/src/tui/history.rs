@@ -27,6 +27,13 @@ impl HistoryState {
         self.scroll_offset = 0;
     }
 
+    /// Clear all cells and reset state.
+    pub fn clear(&mut self) {
+        self.cells.clear();
+        self.selected = None;
+        self.scroll_offset = 0;
+    }
+
     /// Total number of display lines across all cells at given width.
     pub fn total_lines(&self, width: u16) -> usize {
         self.cells.iter().map(|c| c.line_count(width)).sum()
