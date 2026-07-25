@@ -6,12 +6,12 @@ pub fn is_blocked(cmd: &str) -> Option<&'static str> {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         vec![
-            // rm -rf / variants (covers -rf, -fr, -r -f, -f -r, --no-preserve-root)
-            (Regex::new(r"rm\s+-rf\s+/").unwrap(), "rm -rf /"),
-            (Regex::new(r"rm\s+-fr\s+/").unwrap(), "rm -rf /"),
-            (Regex::new(r"rm\s+-r\s+-f\s+/").unwrap(), "rm -rf /"),
-            (Regex::new(r"rm\s+-f\s+-r\s+/").unwrap(), "rm -rf /"),
-            (Regex::new(r"rm\s+-rf\s+--no-preserve-root\s+/").unwrap(), "rm -rf /"),
+            // rm -rf / — covers -rf, -fr, -Rf, -fR, -r -f, -f -r, with optional --no-preserve-root
+            (
+                Regex::new(r"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/")
+                    .unwrap(),
+                "rm -rf /",
+            ),
             // rm -rf ~ and $HOME (all flag orderings)
             (Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+~/").unwrap(), "rm -rf ~"),
             (Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+\$HOME").unwrap(), "rm -rf $HOME"),
@@ -179,6 +179,17 @@ mod tests {
     #[case::rm_rf_src("rm -rf src/", false)]
     #[case::cargo_rm("cargo rm", false)]
     fn test_rm_rf(#[case] cmd: &str, #[case] blocked: bool) {
+        assert_eq!(is_blocked(cmd).is_some(), blocked, "cmd: {cmd}");
+    }
+
+    // ==== rm -rf / 扩展:大写 -R 和 --no-preserve-root 组合 ====
+    #[rstest]
+    #[case::rm_Rf_root("rm -Rf /", true)]
+    #[case::rm_fR_root("rm -fR /", true)]
+    #[case::rm_fr_no_preserve("rm -fr --no-preserve-root /", true)]
+    #[case::rm_r_f_no_preserve("rm -r -f --no-preserve-root /", true)]
+    #[case::rm_f_r_no_preserve("rm -f -r --no-preserve-root /", true)]
+    fn test_rm_rf_extended(#[case] cmd: &str, #[case] blocked: bool) {
         assert_eq!(is_blocked(cmd).is_some(), blocked, "cmd: {cmd}");
     }
 
