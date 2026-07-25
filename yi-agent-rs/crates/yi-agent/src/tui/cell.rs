@@ -22,6 +22,7 @@ pub enum HistoryCell {
     },
     /// Tool result. Foldable (default folded).
     ToolResult {
+        #[allow(dead_code)]
         id: String,
         result_text: String,
         is_error: bool,
@@ -40,6 +41,7 @@ pub enum CallState {
 
 impl HistoryCell {
     /// Number of terminal lines this cell occupies at the given width.
+    #[allow(dead_code)]
     pub fn line_count(&self, width: u16) -> usize {
         self.lines(width).len()
     }
@@ -49,17 +51,25 @@ impl HistoryCell {
         match self {
             Self::UserMessage { text } => render_user_message(text, width),
             Self::AssistantMessage { rendered_lines, .. } => rendered_lines.clone(),
-            Self::ToolCall { name, input, state, expanded, .. } => {
-                render_tool_call(name, input, *state, *expanded, width)
-            }
-            Self::ToolResult { id: _, result_text, is_error, expanded } => {
-                render_tool_result(result_text, *is_error, *expanded, width)
-            }
+            Self::ToolCall {
+                name,
+                input,
+                state,
+                expanded,
+                ..
+            } => render_tool_call(name, input, *state, *expanded, width),
+            Self::ToolResult {
+                id: _,
+                result_text,
+                is_error,
+                expanded,
+            } => render_tool_result(result_text, *is_error, *expanded, width),
             Self::Separator { label } => vec![render_separator(label.as_deref(), width)],
         }
     }
 
     /// Whether this cell is foldable (can be toggled with Ctrl+O).
+    #[allow(dead_code)]
     pub fn is_foldable(&self) -> bool {
         matches!(self, Self::ToolCall { .. } | Self::ToolResult { .. })
     }
@@ -84,7 +94,11 @@ impl HistoryCell {
 
     /// Append more text to an existing AssistantMessage, re-rendering.
     pub fn append_assistant_text(&mut self, more: &str, width: u16) {
-        if let Self::AssistantMessage { markdown, rendered_lines } = self {
+        if let Self::AssistantMessage {
+            markdown,
+            rendered_lines,
+        } = self
+        {
             markdown.push_str(more);
             *rendered_lines = super::markdown::render_markdown(markdown, width);
         }
@@ -94,11 +108,20 @@ impl HistoryCell {
 // --- Renderers ---
 
 fn render_user_message(text: &str, width: u16) -> Vec<Line<'static>> {
-    let prefix = Span::styled("> ", Style::new().add_modifier(Modifier::BOLD | Modifier::DIM));
+    let prefix = Span::styled(
+        "> ",
+        Style::new().add_modifier(Modifier::BOLD | Modifier::DIM),
+    );
     wrap_with_prefix(text, width, prefix, "  ")
 }
 
-fn render_tool_call(name: &str, input: &Value, state: CallState, expanded: bool, _width: u16) -> Vec<Line<'static>> {
+fn render_tool_call(
+    name: &str,
+    input: &Value,
+    state: CallState,
+    expanded: bool,
+    _width: u16,
+) -> Vec<Line<'static>> {
     let (bullet, bullet_color) = match state {
         CallState::Running => ("●", Color::Yellow),
         CallState::Success => ("●", Color::Green),
@@ -106,7 +129,10 @@ fn render_tool_call(name: &str, input: &Value, state: CallState, expanded: bool,
     };
     let input_summary = summarize_json(input, 60);
     let mut lines = vec![Line::from(vec![
-        Span::styled(bullet, Style::new().fg(bullet_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            bullet,
+            Style::new().fg(bullet_color).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!(" {name}({input_summary})")),
     ])];
     if expanded {
@@ -118,16 +144,26 @@ fn render_tool_call(name: &str, input: &Value, state: CallState, expanded: bool,
     lines
 }
 
-fn render_tool_result(text: &str, is_error: bool, expanded: bool, _width: u16) -> Vec<Line<'static>> {
+fn render_tool_result(
+    text: &str,
+    is_error: bool,
+    expanded: bool,
+    _width: u16,
+) -> Vec<Line<'static>> {
     let arrow_color = if is_error { Color::Red } else { Color::Green };
     let summary = truncate(text, 80);
     let mut lines = vec![Line::from(vec![
-        Span::styled("  └ ", Style::new().fg(arrow_color).add_modifier(Modifier::DIM)),
+        Span::styled(
+            "  └ ",
+            Style::new().fg(arrow_color).add_modifier(Modifier::DIM),
+        ),
         Span::styled(summary, Style::new().add_modifier(Modifier::DIM)),
     ])];
     if expanded {
         for line in text.lines() {
-            lines.push(Line::from(format!("    {line}")).style(Style::new().add_modifier(Modifier::DIM)));
+            lines.push(
+                Line::from(format!("    {line}")).style(Style::new().add_modifier(Modifier::DIM)),
+            );
         }
     }
     lines
@@ -162,12 +198,21 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-fn wrap_with_prefix(text: &str, width: u16, first_prefix: Span<'static>, cont_prefix: &str) -> Vec<Line<'static>> {
+fn wrap_with_prefix(
+    text: &str,
+    width: u16,
+    first_prefix: Span<'static>,
+    cont_prefix: &str,
+) -> Vec<Line<'static>> {
     let max_w = width as usize;
     let mut lines = vec![];
     let mut current = String::new();
     for word in text.split_whitespace() {
-        let prefix_len = if lines.is_empty() { 2 } else { cont_prefix.len() };
+        let prefix_len = if lines.is_empty() {
+            2
+        } else {
+            cont_prefix.len()
+        };
         if current.is_empty() {
             current = word.to_string();
         } else if current.len() + 1 + word.len() + prefix_len <= max_w {
@@ -184,7 +229,8 @@ fn wrap_with_prefix(text: &str, width: u16, first_prefix: Span<'static>, cont_pr
     if lines.is_empty() {
         lines.push(String::new());
     }
-    lines.into_iter()
+    lines
+        .into_iter()
         .enumerate()
         .map(|(i, text)| {
             if i == 0 {
@@ -202,10 +248,16 @@ mod tests {
 
     #[test]
     fn user_message_renders_with_prefix() {
-        let cell = HistoryCell::UserMessage { text: "hello".into() };
+        let cell = HistoryCell::UserMessage {
+            text: "hello".into(),
+        };
         let lines = cell.lines(80);
         assert_eq!(lines.len(), 1);
-        let spans: Vec<String> = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        let spans: Vec<String> = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert_eq!(spans[0], "> ");
         assert_eq!(spans[1], "hello");
     }
@@ -220,7 +272,12 @@ mod tests {
             expanded: false,
         };
         let lines = cell.lines(80);
-        assert_eq!(lines.len(), 1, "folded tool call should be 1 line, got {}", lines.len());
+        assert_eq!(
+            lines.len(),
+            1,
+            "folded tool call should be 1 line, got {}",
+            lines.len()
+        );
     }
 
     #[test]
@@ -239,8 +296,11 @@ mod tests {
     #[test]
     fn toggle_fold_switches_expanded() {
         let mut cell = HistoryCell::ToolCall {
-            id: "1".into(), name: "t".into(), input: serde_json::json!({}),
-            state: CallState::Success, expanded: false,
+            id: "1".into(),
+            name: "t".into(),
+            input: serde_json::json!({}),
+            state: CallState::Success,
+            expanded: false,
         };
         assert!(!is_expanded(&cell));
         cell.toggle_fold();
@@ -262,17 +322,27 @@ mod tests {
         let cell = HistoryCell::Separator { label: None };
         let lines = cell.lines(40);
         assert_eq!(lines.len(), 1);
-        let s: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        let s: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert_eq!(s.chars().count(), 40);
         assert!(s.chars().all(|c| c == '─'));
     }
 
     #[test]
     fn separator_with_label_has_dashes_around() {
-        let cell = HistoryCell::Separator { label: Some("Worked for 2m".into()) };
+        let cell = HistoryCell::Separator {
+            label: Some("Worked for 2m".into()),
+        };
         let lines = cell.lines(40);
         assert_eq!(lines.len(), 1);
-        let s: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        let s: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert!(s.contains("Worked for 2m"));
         assert!(s.starts_with("─ "));
     }
@@ -286,8 +356,11 @@ mod tests {
     #[test]
     fn tool_call_is_foldable() {
         let cell = HistoryCell::ToolCall {
-            id: "1".into(), name: "t".into(), input: serde_json::json!({}),
-            state: CallState::Success, expanded: false,
+            id: "1".into(),
+            name: "t".into(),
+            input: serde_json::json!({}),
+            state: CallState::Success,
+            expanded: false,
         };
         assert!(cell.is_foldable());
     }

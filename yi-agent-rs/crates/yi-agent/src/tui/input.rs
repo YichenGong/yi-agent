@@ -33,22 +33,44 @@ impl InputLine {
     /// Returns true if the key was consumed by the editor.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         match key.code {
-            KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT => {
+            KeyCode::Char(c)
+                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
+            {
                 self.insert_char(c);
                 InputAction::Consumed
             }
-            KeyCode::Backspace => { self.backspace(); InputAction::Consumed }
-            KeyCode::Delete => { self.delete(); InputAction::Consumed }
-            KeyCode::Left => { self.move_left(); InputAction::Consumed }
-            KeyCode::Right => { self.move_right(); InputAction::Consumed }
+            KeyCode::Backspace => {
+                self.backspace();
+                InputAction::Consumed
+            }
+            KeyCode::Delete => {
+                self.delete();
+                InputAction::Consumed
+            }
+            KeyCode::Left => {
+                self.move_left();
+                InputAction::Consumed
+            }
+            KeyCode::Right => {
+                self.move_right();
+                InputAction::Consumed
+            }
             KeyCode::Home | KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
-                self.cursor = 0; InputAction::Consumed
+                self.cursor = 0;
+                InputAction::Consumed
             }
             KeyCode::End | KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
-                self.cursor = self.buffer.len(); InputAction::Consumed
+                self.cursor = self.buffer.len();
+                InputAction::Consumed
             }
-            KeyCode::Up => { self.history_prev(); InputAction::Consumed }
-            KeyCode::Down => { self.history_next(); InputAction::Consumed }
+            KeyCode::Up => {
+                self.history_prev();
+                InputAction::Consumed
+            }
+            KeyCode::Down => {
+                self.history_next();
+                InputAction::Consumed
+            }
             KeyCode::Enter => {
                 if !self.buffer.trim().is_empty() {
                     InputAction::Submit
@@ -67,32 +89,58 @@ impl InputLine {
     }
 
     pub fn backspace(&mut self) {
-        if self.cursor == 0 { return; }
-        let prev = self.buffer[..self.cursor].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.buffer[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         self.buffer.replace_range(prev..self.cursor, "");
         self.cursor = prev;
     }
 
     pub fn delete(&mut self) {
-        if self.cursor >= self.buffer.len() { return; }
-        let next = self.buffer[self.cursor..].char_indices().nth(1).map(|(i, _)| self.cursor + i).unwrap_or(self.buffer.len());
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        let next = self.buffer[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| self.cursor + i)
+            .unwrap_or(self.buffer.len());
         self.buffer.replace_range(self.cursor..next, "");
     }
 
     pub fn move_left(&mut self) {
-        if self.cursor == 0 { return; }
-        let prev = self.buffer[..self.cursor].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.buffer[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         self.cursor = prev;
     }
 
     pub fn move_right(&mut self) {
-        if self.cursor >= self.buffer.len() { return; }
-        let next = self.buffer[self.cursor..].char_indices().nth(1).map(|(i, _)| self.cursor + i).unwrap_or(self.buffer.len());
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        let next = self.buffer[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| self.cursor + i)
+            .unwrap_or(self.buffer.len());
         self.cursor = next;
     }
 
     pub fn history_prev(&mut self) {
-        if self.history.is_empty() { return; }
+        if self.history.is_empty() {
+            return;
+        }
         if self.history_idx.is_none() {
             self.saved_current = self.buffer.clone();
             self.history_idx = Some(self.history.len() - 1);
@@ -144,6 +192,7 @@ impl InputLine {
         self.saved_current.clear();
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
@@ -269,7 +318,10 @@ mod tests {
         inp.buffer = "   ".into();
         let text = inp.take_submitted();
         assert_eq!(text, "   ");
-        assert!(inp.history.is_empty(), "whitespace-only should not be saved");
+        assert!(
+            inp.history.is_empty(),
+            "whitespace-only should not be saved"
+        );
     }
 
     #[test]

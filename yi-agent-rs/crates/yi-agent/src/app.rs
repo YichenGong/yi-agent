@@ -617,7 +617,10 @@ mod tests {
             "text style should have a background color set"
         );
         let (clear_style, clear_seq) = &styled.buffer[1];
-        assert_eq!(clear_seq, "\x1b[K", "trailing segment should be ANSI clear-to-end");
+        assert_eq!(
+            clear_seq, "\x1b[K",
+            "trailing segment should be ANSI clear-to-end"
+        );
         assert!(
             clear_style.background.is_some(),
             "clear-to-end style should carry the gray background"

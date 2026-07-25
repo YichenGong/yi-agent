@@ -2,16 +2,16 @@ use std::io::stdout;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Terminal;
 use unicode_width::UnicodeWidthStr;
 
 use yi_agent_core::AgentEvent;
@@ -80,6 +80,8 @@ impl EventSource for CrosstermEventSource {
 
 /// Run the TUI loop with any ratatui backend (used by tests with TestBackend).
 /// Does NOT call enable_raw_mode / EnterAlternateScreen.
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn run_tui_with_backend<B: Backend>(
     terminal: &mut Terminal<B>,
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
@@ -89,10 +91,20 @@ pub fn run_tui_with_backend<B: Backend>(
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
-    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, is_running, &CrosstermEventSource)
+    run_loop(
+        terminal,
+        agent_rx,
+        &mut history,
+        &mut input,
+        input_tx,
+        interrupt_tx,
+        is_running,
+        &CrosstermEventSource,
+    )
 }
 
 /// Testable variant: accepts a custom EventSource for injecting fake key events.
+#[cfg(test)]
 pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
@@ -103,9 +115,19 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
-    run_loop(terminal, agent_rx, &mut history, &mut input, input_tx, interrupt_tx, is_running, events)
+    run_loop(
+        terminal,
+        agent_rx,
+        &mut history,
+        &mut input,
+        input_tx,
+        interrupt_tx,
+        is_running,
+        events,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
@@ -131,17 +153,18 @@ fn run_loop<B: Backend, E: EventSource>(
             let area = f.area();
             let input_width = area.width;
             let input_height = compute_input_height(input, pending_quit, input_width).min(6);
-            let popup_height = popup.as_ref()
-                .map(|p| (p.filtered().len() + 2).min(10) as u16)  // +2 for borders
+            let popup_height = popup
+                .as_ref()
+                .map(|p| (p.filtered().len() + 2).min(10) as u16) // +2 for borders
                 .unwrap_or(0);
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(3),                   // history
-                    Constraint::Length(popup_height),       // popup (0 when none)
-                    Constraint::Length(1),                  // blank gap
-                    Constraint::Length(input_height),       // input (wraps up to 6 lines)
+                    Constraint::Min(3),               // history
+                    Constraint::Length(popup_height), // popup (0 when none)
+                    Constraint::Length(1),            // blank gap
+                    Constraint::Length(input_height), // input (wraps up to 6 lines)
                 ])
                 .split(area);
 
@@ -165,7 +188,15 @@ fn run_loop<B: Backend, E: EventSource>(
 
         // Poll for key events with timeout
         if let Some(Event::Key(key)) = events.poll(Duration::from_millis(50))? {
-            match handle_key(key, input, history, input_tx, interrupt_tx, &mut pending_quit, &mut popup) {
+            match handle_key(
+                key,
+                input,
+                history,
+                input_tx,
+                interrupt_tx,
+                &mut pending_quit,
+                &mut popup,
+            ) {
                 KeyOutcome::Quit => break,
                 KeyOutcome::Submit(text) => {
                     pending_quit = false;
@@ -293,7 +324,13 @@ fn handle_key(
                         let args_str = args.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
                         *popup = None;
                         input.clear();
-                        return execute_slash_command(cmd, args_str, history, input_tx, interrupt_tx);
+                        return execute_slash_command(
+                            cmd,
+                            args_str,
+                            history,
+                            input_tx,
+                            interrupt_tx,
+                        );
                     } else {
                         // No command selected (empty filter) — show error
                         let text = input.take_submitted();
@@ -315,8 +352,16 @@ fn handle_key(
             let text = input.take_submitted();
             // Check if this is a slash command
             if text.starts_with('/') {
-                let name = text.trim_start_matches('/').split_whitespace().next().unwrap_or("");
-                let args = text.trim_start_matches('/').get(name.len()..).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                let name = text
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                let args = text
+                    .trim_start_matches('/')
+                    .get(name.len()..)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 if let Some(cmd) = SlashCommand::from_name(name) {
                     *popup = None;
                     return execute_slash_command(cmd, args, history, input_tx, interrupt_tx);
@@ -340,11 +385,10 @@ fn handle_key(
 /// Shows popup when buffer starts with '/' and cursor is in command name region.
 /// Hides popup otherwise.
 fn sync_popup(popup: &mut Option<CommandPopup>, buffer: &str) {
-    if buffer.starts_with('/') {
+    if let Some(filter_text) = buffer.strip_prefix('/') {
         // Check if we're still in the command name region (no space yet)
         let in_name_region = !buffer.contains(' ');
         if in_name_region {
-            let filter_text = &buffer[1..]; // skip '/'
             if let Some(p) = popup.as_mut() {
                 p.filter(filter_text);
             } else {
@@ -383,9 +427,7 @@ fn execute_slash_command(
             for c in SlashCommand::all() {
                 help_text.push_str(&format!("  /{:<10} {}\n", c.name(), c.description()));
             }
-            history.push(HistoryCell::UserMessage {
-                text: help_text,
-            });
+            history.push(HistoryCell::UserMessage { text: help_text });
             KeyOutcome::None
         }
         SlashCommand::Cost => {
@@ -440,22 +482,18 @@ fn build_popup<'a>(popup: &'a CommandPopup) -> Paragraph<'a> {
         })
         .collect();
 
-    Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("命令")
-    )
+    Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("命令"))
 }
 
 fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> Paragraph<'static> {
-    let prefix = Span::styled("> ", Style::new().add_modifier(Modifier::BOLD | Modifier::DIM));
+    let prefix = Span::styled(
+        "> ",
+        Style::new().add_modifier(Modifier::BOLD | Modifier::DIM),
+    );
     if pending_quit {
         return Paragraph::new(Line::from(vec![
             prefix,
-            Span::styled(
-                "再按 Ctrl+C 或 Esc 退出",
-                Style::new().fg(Color::Yellow),
-            ),
+            Span::styled("再按 Ctrl+C 或 Esc 退出", Style::new().fg(Color::Yellow)),
         ]))
         .style(Style::new().bg(Color::Indexed(240)));
     }
@@ -486,7 +524,12 @@ fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) 
 ///
 /// The character at `cursor` (byte offset) is rendered with reverse video
 /// (white background, black foreground) so the user can see the cursor.
-fn wrap_input_buffer(buffer: &str, cursor: usize, prefix: &Span<'static>, area_width: u16) -> Vec<Line<'static>> {
+fn wrap_input_buffer(
+    buffer: &str,
+    cursor: usize,
+    prefix: &Span<'static>,
+    area_width: u16,
+) -> Vec<Line<'static>> {
     const PREFIX_LEN: usize = 2; // "> " or "  "
     let avail = (area_width as usize).saturating_sub(PREFIX_LEN).max(1);
     let cursor_style = Style::new().fg(Color::Black).bg(Color::White);
@@ -518,7 +561,9 @@ fn wrap_input_buffer(buffer: &str, cursor: usize, prefix: &Span<'static>, area_w
                     ]
                 } else {
                     // Cursor is on the first char of `after`
-                    let (cursor_char, rest) = after.char_indices().next()
+                    let (cursor_char, rest) = after
+                        .char_indices()
+                        .next()
                         .map(|(i, c)| (&after[..i + c.len_utf8()], &after[i + c.len_utf8()..]))
                         .unwrap_or(("", after));
                     vec![
@@ -538,7 +583,10 @@ fn wrap_input_buffer(buffer: &str, cursor: usize, prefix: &Span<'static>, area_w
     // Compute the display width of the buffer.
     if buffer.is_empty() {
         // Empty buffer: show cursor at position 0 (a space with cursor style)
-        return vec![Line::from(vec![prefix.clone(), Span::styled(" ", cursor_style)])];
+        return vec![Line::from(vec![
+            prefix.clone(),
+            Span::styled(" ", cursor_style),
+        ])];
     }
     if UnicodeWidthStr::width(buffer) <= avail {
         let spans = build_spans(buffer, 0);
@@ -582,7 +630,7 @@ fn wrap_input_buffer(buffer: &str, cursor: usize, prefix: &Span<'static>, area_w
         lines.push(Line::from(all_spans));
     }
     if lines.is_empty() {
-        let mut all_spans = vec![prefix.clone(), Span::styled(" ", cursor_style)];
+        let all_spans = vec![prefix.clone(), Span::styled(" ", cursor_style)];
         lines.push(Line::from(all_spans));
     }
     lines
@@ -591,7 +639,6 @@ fn wrap_input_buffer(buffer: &str, cursor: usize, prefix: &Span<'static>, area_w
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::cell::HistoryCell;
     use ratatui::backend::TestBackend;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -650,17 +697,23 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // After Ctrl+C, the input row should show the confirm message
         let buffer = terminal.backend().buffer();
         let input_row = 23u16;
-        let row_text: String = (0..80)
-            .map(|x| buffer[(x, input_row)].symbol())
-            .collect();
-        assert!(row_text.contains("Ctrl") || row_text.contains("退出"),
-            "expected confirm prompt, got: {row_text:?}");
+        let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
+        assert!(
+            row_text.contains("Ctrl") || row_text.contains("退出"),
+            "expected confirm prompt, got: {row_text:?}"
+        );
     }
 
     /// Test that two Ctrl+C presses quit the TUI.
@@ -680,9 +733,18 @@ mod tests {
         let source = ScriptedEvents { events };
 
         let result = run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
         );
-        assert!(result.is_ok(), "two Ctrl+C should quit cleanly, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "two Ctrl+C should quit cleanly, got: {:?}",
+            result
+        );
     }
 
     /// Test that Esc behaves the same as Ctrl+C (confirm first, quit on second).
@@ -703,9 +765,18 @@ mod tests {
         let source = ScriptedEvents { events };
 
         let result = run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
         );
-        assert!(result.is_ok(), "two Esc should quit cleanly, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "two Esc should quit cleanly, got: {:?}",
+            result
+        );
     }
 
     /// Test that Ctrl+Q quits directly (no confirm needed).
@@ -718,15 +789,25 @@ mod tests {
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))]));
         let source = ScriptedEvents { events };
 
         let result = run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
         );
-        assert!(result.is_ok(), "Ctrl+Q should quit directly, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Ctrl+Q should quit directly, got: {:?}",
+            result
+        );
     }
 
     /// Test that typing characters updates the input buffer and renders them
@@ -746,7 +827,9 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
             Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
         ]));
-        let source = ScriptedEvents { events: events.clone() };
+        let source = ScriptedEvents {
+            events: events.clone(),
+        };
 
         run_tui_with_backend_and_events(
             &mut terminal,
@@ -755,18 +838,23 @@ mod tests {
             &interrupt_tx,
             &is_running,
             &source,
-        ).unwrap();
+        )
+        .unwrap();
 
         // No submit happened, so input_tx should be empty
-        assert!(input_rx.try_recv().is_err(), "no submit expected, but got a message");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "no submit expected, but got a message"
+        );
 
         // The terminal buffer should contain "hi" in the input row (last row)
         let buffer = terminal.backend().buffer();
         let input_row = 23u16;
-        let row_text: String = (0..80)
-            .map(|x| buffer[(x, input_row)].symbol())
-            .collect();
-        assert!(row_text.contains("hi"), "expected 'hi' in input row, got: {row_text:?}");
+        let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
+        assert!(
+            row_text.contains("hi"),
+            "expected 'hi' in input row, got: {row_text:?}"
+        );
     }
 
     /// Test that typing a long string that exceeds the terminal width wraps
@@ -883,7 +971,11 @@ mod tests {
         inp.buffer = "a".repeat(19);
         assert_eq!(compute_input_height(&inp, false, 20), 2, "19 wraps to 2");
         inp.buffer = "a".repeat(36);
-        assert_eq!(compute_input_height(&inp, false, 20), 2, "36 = 2 lines of 18");
+        assert_eq!(
+            compute_input_height(&inp, false, 20),
+            2,
+            "36 = 2 lines of 18"
+        );
         inp.buffer = "a".repeat(37);
         assert_eq!(compute_input_height(&inp, false, 20), 3, "37 wraps to 3");
         // pending_quit overrides to 1
@@ -897,9 +989,17 @@ mod tests {
         // width=20, prefix=2, avail=18. Each '你' is 2 cells. 9 chars = 18
         // cells fit on line 1; 10 chars = 20 cells -> 2 lines.
         inp.buffer = "你".repeat(9);
-        assert_eq!(compute_input_height(&inp, false, 20), 1, "9 cjk = 18 cells fits");
+        assert_eq!(
+            compute_input_height(&inp, false, 20),
+            1,
+            "9 cjk = 18 cells fits"
+        );
         inp.buffer = "你".repeat(10);
-        assert_eq!(compute_input_height(&inp, false, 20), 2, "10 cjk = 20 cells wraps");
+        assert_eq!(
+            compute_input_height(&inp, false, 20),
+            2,
+            "10 cjk = 20 cells wraps"
+        );
     }
 
     /// Test that agent events appear in the rendered history area.
@@ -913,12 +1013,15 @@ mod tests {
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Send an assistant message before starting
-        agent_tx.try_send(AgentEvent::AssistantText("hello world".into())).unwrap();
+        agent_tx
+            .try_send(AgentEvent::AssistantText("hello world".into()))
+            .unwrap();
 
         // Script: Ctrl+Q to quit after one frame
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))]));
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
@@ -928,14 +1031,18 @@ mod tests {
             &interrupt_tx,
             &is_running,
             &source,
-        ).unwrap();
+        )
+        .unwrap();
 
         // The history area should contain "hello world"
         let buffer = terminal.backend().buffer();
-        let history_text: String = (0..23u16).flat_map(|y| {
-            (0..80u16).map(move |x| buffer[(x, y)].symbol())
-        }).collect();
-        assert!(history_text.contains("hello world"), "expected 'hello world' in history, got: {history_text:?}");
+        let history_text: String = (0..23u16)
+            .flat_map(|y| (0..80u16).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(
+            history_text.contains("hello world"),
+            "expected 'hello world' in history, got: {history_text:?}"
+        );
     }
 
     // ----- Slash command popup tests -----
@@ -966,14 +1073,29 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         let text = collect_all_text(&terminal);
         // Popup should show at least some command names
-        assert!(text.contains("quit"), "expected 'quit' in popup, got: {text:?}");
-        assert!(text.contains("clear"), "expected 'clear' in popup, got: {text:?}");
-        assert!(text.contains("help"), "expected 'help' in popup, got: {text:?}");
+        assert!(
+            text.contains("quit"),
+            "expected 'quit' in popup, got: {text:?}"
+        );
+        assert!(
+            text.contains("clear"),
+            "expected 'clear' in popup, got: {text:?}"
+        );
+        assert!(
+            text.contains("help"),
+            "expected 'help' in popup, got: {text:?}"
+        );
     }
 
     /// Typing `/cl` should filter the popup to only show `/clear`.
@@ -996,8 +1118,14 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         let text = collect_all_text(&terminal);
         // Should show 'clear' but not 'quit' or 'help' (filtered out)
@@ -1027,8 +1155,14 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // The input row should contain "/clear" (completed by Tab)
         let buffer = terminal.backend().buffer();
@@ -1036,7 +1170,10 @@ mod tests {
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
-        assert!(row_text.contains("/clear"), "expected '/clear' in input after Tab, got: {row_text:?}");
+        assert!(
+            row_text.contains("/clear"),
+            "expected '/clear' in input after Tab, got: {row_text:?}"
+        );
     }
 
     /// Enter on `/quit` should execute the quit command and exit the loop.
@@ -1065,9 +1202,18 @@ mod tests {
         let source = ScriptedEvents { events };
 
         let result = run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
         );
-        assert!(result.is_ok(), "/quit + Enter should quit cleanly, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "/quit + Enter should quit cleanly, got: {:?}",
+            result
+        );
 
         // If /quit executed properly, no message should be sent to agent
         // (if it didn't execute, the fallback Ctrl+Q ran, which is still ok).
@@ -1093,8 +1239,14 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // After Esc, popup should be gone. The input row should still have "/"
         // (Esc doesn't clear input, just dismisses popup).
@@ -1107,7 +1259,10 @@ mod tests {
         // The input buffer still has "/".
         // Let's just verify the app didn't crash and the popup is not visible.
         // Since popup is dismissed, the text should not contain "清空对话上下文" (clear's description).
-        assert!(!text.contains("清空对话上下文"), "popup should be dismissed after Esc");
+        assert!(
+            !text.contains("清空对话上下文"),
+            "popup should be dismissed after Esc"
+        );
     }
 
     /// Up/Down should navigate the popup selection, not history.
@@ -1130,8 +1285,14 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // After Down + Tab, the 2nd command (clear) should be completed into input
         let buffer = terminal.backend().buffer();
@@ -1139,7 +1300,10 @@ mod tests {
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
-        assert!(row_text.contains("/clear"), "expected '/clear' after Down+Tab, got: {row_text:?}");
+        assert!(
+            row_text.contains("/clear"),
+            "expected '/clear' after Down+Tab, got: {row_text:?}"
+        );
     }
 
     /// Unknown slash command should show an error in history, not send to agent.
@@ -1164,19 +1328,30 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // No message should have been sent to the agent
-        assert!(input_rx.try_recv().is_err(), "unknown command should not send to agent");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "unknown command should not send to agent"
+        );
 
         // The history should contain an error message.
         // Note: TestBackend renders CJK chars with spaces between them, so we
         // check for a substring that works regardless of spacing.
         let text = collect_all_text(&terminal);
         let text_compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(text_compact.contains("未知命令") || text_compact.contains("unknown"),
-            "expected error message for unknown command, got compact: {text_compact:?}");
+        assert!(
+            text_compact.contains("未知命令") || text_compact.contains("unknown"),
+            "expected error message for unknown command, got compact: {text_compact:?}"
+        );
     }
 
     /// Typing a space after '/' should dismiss the popup (entering arg mode).
@@ -1198,12 +1373,21 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // After space, popup should be dismissed
         let text = collect_all_text(&terminal);
-        assert!(!text.contains("清空对话上下文"), "popup should be dismissed after space");
+        assert!(
+            !text.contains("清空对话上下文"),
+            "popup should be dismissed after space"
+        );
     }
 
     /// The cursor position should be rendered with reverse video (white bg,
@@ -1229,8 +1413,14 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // Check the input row for a cell with white background (reverse video cursor)
         let buffer = terminal.backend().buffer();
@@ -1244,7 +1434,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_cursor, "expected a cursor cell with white background in input row");
+        assert!(
+            found_cursor,
+            "expected a cursor cell with white background in input row"
+        );
     }
 
     /// When the buffer is empty, the cursor should still be visible (at position 0).
@@ -1258,14 +1451,21 @@ mod tests {
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Just quit — no input typed. The input row should still show a cursor.
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))]));
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         let buffer = terminal.backend().buffer();
         let input_row = 23u16;
@@ -1303,8 +1503,14 @@ mod tests {
         let source = ScriptedEvents { events };
 
         run_tui_with_backend_and_events(
-            &mut terminal, &mut agent_rx, &input_tx, &interrupt_tx, &is_running, &source,
-        ).unwrap();
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
 
         // Input starts at x=2 (after "> " prefix). 'a' at x=2, 'b' at x=3, 'c' at x=4.
         // Cursor at byte offset 2 means 'c' is the cursor character, at x=4.

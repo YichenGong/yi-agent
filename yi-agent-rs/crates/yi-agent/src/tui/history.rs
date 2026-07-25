@@ -18,7 +18,11 @@ pub struct HistoryState {
 
 impl HistoryState {
     pub fn new() -> Self {
-        Self { cells: Vec::new(), selected: None, scroll_offset: 0 }
+        Self {
+            cells: Vec::new(),
+            selected: None,
+            scroll_offset: 0,
+        }
     }
 
     /// Push a new cell and auto-scroll to bottom.
@@ -35,6 +39,7 @@ impl HistoryState {
     }
 
     /// Total number of display lines across all cells at given width.
+    #[allow(dead_code)]
     pub fn total_lines(&self, width: u16) -> usize {
         self.cells.iter().map(|c| c.line_count(width)).sum()
     }
@@ -82,26 +87,31 @@ impl HistoryState {
     pub fn push_event(&mut self, event: AgentEvent, width: u16) {
         match event {
             AgentEvent::Start => {}
-            AgentEvent::AssistantText(text) => {
-                match self.cells.last_mut() {
-                    Some(HistoryCell::AssistantMessage { .. }) => {
-                        self.cells.last_mut().unwrap().append_assistant_text(&text, width);
-                    }
-                    _ => {
-                        self.push(HistoryCell::from_assistant_text(&text, width));
-                    }
+            AgentEvent::AssistantText(text) => match self.cells.last_mut() {
+                Some(HistoryCell::AssistantMessage { .. }) => {
+                    self.cells
+                        .last_mut()
+                        .unwrap()
+                        .append_assistant_text(&text, width);
                 }
-            }
+                _ => {
+                    self.push(HistoryCell::from_assistant_text(&text, width));
+                }
+            },
             AgentEvent::ToolCall { id, name, input } => {
                 self.push(HistoryCell::ToolCall {
-                    id, name, input,
+                    id,
+                    name,
+                    input,
                     state: super::cell::CallState::Running,
                     expanded: false,
                 });
             }
             AgentEvent::ToolResult { id, result } => {
                 let is_error = result.is_error;
-                let result_text = result.content.iter()
+                let result_text = result
+                    .content
+                    .iter()
                     .filter_map(|b| match b {
                         yi_agent_core::ContentBlock::Text(t) => Some(t.as_str()),
                         _ => None,
@@ -121,32 +131,41 @@ impl HistoryState {
                     }
                 }
                 self.push(HistoryCell::ToolResult {
-                    id, result_text, is_error, expanded: false,
+                    id,
+                    result_text,
+                    is_error,
+                    expanded: false,
                 });
             }
-            AgentEvent::Done { reason } => {
-                match reason {
-                    DoneReason::EndTurn => {
-                        self.push(HistoryCell::Separator { label: None });
-                    }
-                    DoneReason::MaxTurns => {
-                        self.push(HistoryCell::Separator { label: Some("Max turns".into()) });
-                    }
+            AgentEvent::Done { reason } => match reason {
+                DoneReason::EndTurn => {
+                    self.push(HistoryCell::Separator { label: None });
                 }
-            }
+                DoneReason::MaxTurns => {
+                    self.push(HistoryCell::Separator {
+                        label: Some("Max turns".into()),
+                    });
+                }
+            },
             AgentEvent::Usage(_) => {}
             AgentEvent::Cancelled => {
-                self.push(HistoryCell::Separator { label: Some("Interrupted".into()) });
+                self.push(HistoryCell::Separator {
+                    label: Some("Interrupted".into()),
+                });
             }
             AgentEvent::Error(err) => {
-                self.push(HistoryCell::Separator { label: Some(format!("Error: {err}")) });
+                self.push(HistoryCell::Separator {
+                    label: Some(format!("Error: {err}")),
+                });
             }
         }
     }
 }
 
 impl Default for HistoryState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Ratatui widget that renders the history area.
@@ -178,7 +197,15 @@ impl<'a> Widget for HistoryView<'a> {
             if is_selected {
                 line = line.style(Style::new().add_modifier(Modifier::REVERSED));
             }
-            line.render(Rect { x, y, width: area.width, height: 1 }, buf);
+            line.render(
+                Rect {
+                    x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                buf,
+            );
         }
     }
 }
@@ -219,7 +246,8 @@ mod tests {
     fn toggle_fold_selected_toggles() {
         let mut s = HistoryState::new();
         s.push(HistoryCell::ToolCall {
-            id: "1".into(), name: "t".into(),
+            id: "1".into(),
+            name: "t".into(),
             input: serde_json::json!({}),
             state: crate::tui::cell::CallState::Success,
             expanded: false,
@@ -235,7 +263,9 @@ mod tests {
     #[test]
     fn total_lines_sums_all_cells() {
         let mut s = HistoryState::new();
-        s.push(HistoryCell::UserMessage { text: "hello".into() });
+        s.push(HistoryCell::UserMessage {
+            text: "hello".into(),
+        });
         s.push(HistoryCell::Separator { label: None });
         assert_eq!(s.total_lines(80), 2);
     }
@@ -258,16 +288,26 @@ mod tests {
     fn push_event_tool_call_creates_separate_cell() {
         let mut s = HistoryState::new();
         s.push_event(AgentEvent::AssistantText("text".into()), 80);
-        s.push_event(AgentEvent::ToolCall {
-            id: "1".into(), name: "read".into(), input: serde_json::json!({}),
-        }, 80);
+        s.push_event(
+            AgentEvent::ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+            80,
+        );
         assert_eq!(s.cells.len(), 2);
     }
 
     #[test]
     fn push_event_done_endturn_adds_separator() {
         let mut s = HistoryState::new();
-        s.push_event(AgentEvent::Done { reason: DoneReason::EndTurn }, 80);
+        s.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            80,
+        );
         assert_eq!(s.cells.len(), 1);
         assert!(matches!(s.cells[0], HistoryCell::Separator { .. }));
     }
@@ -275,20 +315,34 @@ mod tests {
     #[test]
     fn push_event_tool_result_updates_tool_call_state() {
         let mut s = HistoryState::new();
-        s.push_event(AgentEvent::ToolCall {
-            id: "1".into(), name: "read".into(), input: serde_json::json!({}),
-        }, 80);
-        s.push_event(AgentEvent::ToolResult {
-            id: "1".into(),
-            result: ToolResult {
-                content: vec![yi_agent_core::ContentBlock::Text("ok".into())],
-                is_error: false,
+        s.push_event(
+            AgentEvent::ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
             },
-        }, 80);
+            80,
+        );
+        s.push_event(
+            AgentEvent::ToolResult {
+                id: "1".into(),
+                result: ToolResult {
+                    content: vec![yi_agent_core::ContentBlock::Text("ok".into())],
+                    is_error: false,
+                },
+            },
+            80,
+        );
         assert!(matches!(
             &s.cells[0],
-            HistoryCell::ToolCall { state: crate::tui::cell::CallState::Success, .. }
+            HistoryCell::ToolCall {
+                state: crate::tui::cell::CallState::Success,
+                ..
+            }
         ));
-        assert!(matches!(s.cells.get(1), Some(HistoryCell::ToolResult { .. })));
+        assert!(matches!(
+            s.cells.get(1),
+            Some(HistoryCell::ToolResult { .. })
+        ));
     }
 }

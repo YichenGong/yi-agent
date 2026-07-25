@@ -61,7 +61,9 @@ impl LineBuilder {
         match tag {
             Tag::Heading { level, .. } => {
                 self.current_style = match level {
-                    pulldown_cmark::HeadingLevel::H1 => Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    pulldown_cmark::HeadingLevel::H1 => {
+                        Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    }
                     pulldown_cmark::HeadingLevel::H2 => Style::new().add_modifier(Modifier::BOLD),
                     _ => Style::new().add_modifier(Modifier::BOLD | Modifier::ITALIC),
                 };
@@ -87,7 +89,12 @@ impl LineBuilder {
                 self.current_style = self.current_style.fg(Color::Green);
             }
             Tag::Link { dest_url, .. } => {
-                self.push_span(Span::styled(dest_url.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)));
+                self.push_span(Span::styled(
+                    dest_url.to_string(),
+                    Style::new()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
             }
             _ => {}
         }
@@ -120,6 +127,7 @@ impl LineBuilder {
         self.current_spans.push(span);
     }
 
+    #[allow(dead_code)]
     fn wrap_line(&self, line: Line<'static>) -> Line<'static> {
         // Single Line can't represent wrapping; we handle it at flush_line level
         // by splitting into multiple Lines. This function is kept for API compat
@@ -212,7 +220,11 @@ mod tests {
     fn inline_code_is_cyan() {
         let lines = render_markdown("use `foo` here", 80);
         assert_eq!(lines.len(), 1);
-        let code_span = lines[0].spans.iter().find(|s| s.content == "foo").expect("should find code span");
+        let code_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "foo")
+            .expect("should find code span");
         assert_eq!(code_span.style.fg, Some(Color::Cyan));
     }
 
@@ -251,7 +263,11 @@ mod tests {
     fn long_text_wraps_at_width() {
         let src = "this is a very long line that should wrap when the terminal is narrow";
         let lines = render_markdown(src, 20);
-        assert!(lines.len() > 1, "expected wrapping, got {} lines", lines.len());
+        assert!(
+            lines.len() > 1,
+            "expected wrapping, got {} lines",
+            lines.len()
+        );
         // No single line should exceed the width
         for line in &lines {
             let w: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();

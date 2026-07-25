@@ -1,13 +1,13 @@
 //! yi-agent CLI 入口。
 
 mod app;
-mod tui;
 mod compact;
 mod config;
 mod file_ref;
 mod input;
 mod render;
 mod tracing_init;
+mod tui;
 
 use std::sync::Arc;
 
@@ -79,7 +79,9 @@ fn run_agent(cli: Cli) -> Result<()> {
 
     // Branch on --tui flag
     match select_tui_mode(&cli) {
-        TuiMode::Ratatui => return run_tui_agent(provider, tools, agent_config, config.workdir.clone()),
+        TuiMode::Ratatui => {
+            return run_tui_agent(provider, tools, agent_config, config.workdir.clone());
+        }
         TuiMode::Inline => {
             // Default: InlineRenderer + reedline path
             let agent = yi_agent_core::Agent::new(
@@ -152,7 +154,9 @@ fn run_tui_agent(
 
             loop {
                 // Wait for user input
-                let Some(text) = input_rx.recv().await else { break };
+                let Some(text) = input_rx.recv().await else {
+                    break;
+                };
 
                 // Clear any stale interrupt signal
                 let _ = interrupt_rx.try_recv();

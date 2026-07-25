@@ -43,6 +43,7 @@ impl SlashCommand {
     }
 
     /// Whether the command requires an argument (e.g. `/model gpt-4`).
+    #[allow(dead_code)]
     pub fn needs_arg(&self) -> bool {
         matches!(self, SlashCommand::Model)
     }
@@ -62,10 +63,7 @@ impl SlashCommand {
 
     /// Look up a command by its name (without leading `/`).
     pub fn from_name(name: &str) -> Option<SlashCommand> {
-        Self::all()
-            .iter()
-            .copied()
-            .find(|cmd| cmd.name() == name)
+        Self::all().iter().copied().find(|cmd| cmd.name() == name)
     }
 }
 
