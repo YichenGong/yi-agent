@@ -12,7 +12,7 @@ mod tui;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use render::InlineRenderer;
 use yi_agent_core::Provider;
@@ -87,11 +87,27 @@ fn run_agent(cli: Cli) -> Result<()> {
 
     let mut registry = yi_agent_core::ToolRegistry::new();
     yi_agent_tools::register_builtin_tools(&mut registry, config.workdir.clone());
+
+    // --- Skills system setup ---
+    let skills_service = setup_skills(&config)?;
+
+    let system_prompt = resolve_system_prompt_with_skills(
+        config.system_prompt.clone(),
+        &skills_service,
+        config.skills_catalog_budget,
+        config.skills_catalog_budget_explicit,
+    );
+
+    // Register Skill tool
+    if let Some(svc) = &skills_service {
+        registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
+    }
+
     let tools = Arc::new(registry);
 
     let agent_config = yi_agent_core::AgentConfig {
         model: config.model.clone(),
-        system_prompt: resolve_system_prompt(config.system_prompt.clone()),
+        system_prompt,
         max_turns: Some(config.max_turns),
         compact_threshold: Some(config.compact_threshold),
         compact_keep_turns: Some(config.compact_keep_turns),
@@ -266,6 +282,89 @@ fn run_tui_agent(
 /// when the user did not provide one.
 fn resolve_system_prompt(user: Option<String>) -> Option<String> {
     user.or_else(|| Some(yi_agent_core::AgentConfig::default_system_prompt()))
+}
+
+/// Set up the skills service: install bundled system skills, build roots, snapshot.
+/// Returns None on hard failure (and logs a warning); the agent runs without skills.
+fn setup_skills(config: &config::Config) -> Result<Option<Arc<yi_agent_skills::SkillsService>>> {
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    let system_root = home.join(".yi-agent/skills/.system");
+
+    // Install bundled skills; failure is non-fatal
+    if let Err(e) = yi_agent_skills::install_system_skills(&system_root) {
+        tracing::warn!("failed to install bundled skills: {e}");
+    }
+
+    let roots = vec![
+        (config.workdir.join(".yi-agent/skills"), yi_agent_skills::SkillScope::Project),
+        (home.join(".yi-agent/skills"), yi_agent_skills::SkillScope::User),
+        (home.join(".yi-agent/skills/.system"), yi_agent_skills::SkillScope::System),
+    ];
+
+    let service = Arc::new(yi_agent_skills::SkillsService::new(roots));
+    match service.snapshot() {
+        Ok(skills) => {
+            tracing::info!("skills: {} discovered", skills.len());
+            Ok(Some(service))
+        }
+        Err(e) => {
+            tracing::warn!("skills discovery failed: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Resolve the effective system prompt, appending the skills catalog if available.
+fn resolve_system_prompt_with_skills(
+    user: Option<String>,
+    service: &Option<Arc<yi_agent_skills::SkillsService>>,
+    budget: usize,
+    budget_explicit: bool,
+) -> Option<String> {
+    let base = resolve_system_prompt(user);
+    let Some(svc) = service else { return base; };
+
+    let total = svc.full_catalog_size();
+    let effective_budget = resolve_effective_budget(total, budget, budget_explicit);
+    let catalog = svc.render_catalog(effective_budget);
+
+    if catalog.is_empty() {
+        return base;
+    }
+
+    match base {
+        Some(p) => Some(format!("{p}\n\n{catalog}")),
+        None => Some(catalog),
+    }
+}
+
+fn resolve_effective_budget(total: usize, default: usize, explicit: bool) -> usize {
+    if explicit || total <= default || !is_interactive() {
+        return default;
+    }
+    prompt_catalog_budget(total, default).unwrap_or(default)
+}
+
+fn is_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
+fn prompt_catalog_budget(total: usize, default: usize) -> Option<usize> {
+    let total_kb = total / 1024;
+    let default_kb = default / 1024;
+    eprintln!(
+        "Skills catalog is {total_kb} KB, exceeds default {default_kb} KB budget.\n\
+         Include all skills? [Y/n]"
+    );
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return None;
+    }
+    match input.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" => Some(total),
+        _ => Some(default),
+    }
 }
 
 #[cfg(test)]

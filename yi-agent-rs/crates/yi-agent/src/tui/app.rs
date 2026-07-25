@@ -227,6 +227,7 @@ enum KeyOutcome {
     Submit(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
     input: &mut InputLine,

@@ -19,6 +19,7 @@ yi-agent-tools = { workspace = true }
 yi-agent-mcp = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-web = { workspace = true }
+yi-agent-skills = { workspace = true }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -30,6 +31,8 @@ crossterm = { workspace = true }
 crossbeam-channel = { workspace = true }
 nu-ansi-term = { workspace = true }
 dotenvy = { workspace = true }
+
+dirs = "5"
 
 ratatui = { workspace = true }
 unicode-width = { workspace = true }
