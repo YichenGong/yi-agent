@@ -208,6 +208,11 @@ impl Agent {
         &mut self,
         user_prompt: String,
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        // 每次运行使用新的 cancel token,避免上一次 cancel 留下的状态
+        // 卡死后续运行(inline 模式的 Interrupt/ctrl_c/新 prompt 只 cancel
+        // 不重建 agent,如果不重置,后续 run() 会在 run_loop 开头立刻返回
+        // Cancelled)。
+        self.cancel_token = CancellationToken::new();
         self.session
             .lock()
             .unwrap()
@@ -255,6 +260,11 @@ async fn run_loop(
     decision_rx: Option<DecisionRx>,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
+    // 记录进入 run_loop 时的 session 长度(含 Agent::run push 的 user 消息,
+    // 不含任何 assistant 回复)。cancel 时 truncate 到此长度,回滚悬空的
+    // assistant(tool_use),避免下次 run 被 Anthropic API 拒绝(tool_use
+    // 必须跟 tool_result)。
+    let session_len = session.lock().unwrap().len();
     let mut turn = 0u32;
     // Cursor for incremental request logging: only log messages[last_logged..] each turn.
     let mut last_logged = 0usize;
@@ -338,6 +348,10 @@ async fn run_loop(
             },
             _ = cancel_token.cancelled() => {
                 info!(turn, "agent loop cancelled during think");
+                // THINK 阶段 cancel: session 里只有 user 消息(无 assistant
+                // 回复),truncate 到 session_len 保留 user 消息(可接受,
+                // Anthropic 允许 user 无 assistant 回复)。
+                session.lock().unwrap().truncate(session_len);
                 let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }
@@ -531,6 +545,11 @@ async fn run_loop(
             r = futures::future::join_all(futures) => r,
             _ = cancel_token.cancelled() => {
                 info!(turn, "agent loop cancelled during act");
+                // ACT 阶段 cancel: session 里有 user + assistant(tool_use),
+                // 但无对应 tool_result。truncate 到 session_len(含 user,
+                // 不含 assistant)回滚悬空的 tool_use,避免下次 run 被
+                // Anthropic API 拒绝。
+                session.lock().unwrap().truncate(session_len);
                 let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }
@@ -983,13 +1002,14 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new());
         let mut agent = Agent::new(provider, tools, AgentConfig::default());
 
+        // run() resets the cancel token (Fix 1), so we must capture the
+        // token AFTER run() returns to cancel the correct (new) token.
+        let stream = agent.run("hi".into()).await.unwrap();
         let cancel_token = agent.cancel_token();
         let _handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             cancel_token.cancel();
         });
-
-        let stream = agent.run("hi".into()).await.unwrap();
         let events = collect_events(stream);
         assert!(
             events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
@@ -1042,13 +1062,13 @@ mod tests {
         tools.register(Arc::new(HangingTool));
         let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
 
+        // run() resets the cancel token (Fix 1), so capture AFTER run().
+        let stream = agent.run("hang".into()).await.unwrap();
         let cancel_token = agent.cancel_token();
         let _handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             cancel_token.cancel();
         });
-
-        let stream = agent.run("hang".into()).await.unwrap();
         let events = collect_events(stream);
 
         assert!(
@@ -1060,6 +1080,68 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolResult { .. })),
             "should NOT have ToolResult (tool was still running)"
+        );
+
+        // Fix 2: ACT 阶段 cancel 后,session 应回滚到 cancel 前长度
+        // (只含 user 消息,不含悬空的 assistant(tool_use))。
+        let session = agent.session();
+        assert_eq!(
+            session.len(),
+            1,
+            "session should be rolled back to only the user message"
+        );
+        assert_eq!(session.messages()[0].role, Role::User);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_during_act_rolls_back_session() {
+        // Fix 2 专项测试:ACT 阶段 cancel 后,session 中不能留下悬空的
+        // assistant(tool_use)(否则下次 run 会被 Anthropic API 拒绝,
+        // 因为 tool_use 必须跟 tool_result)。
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "hang".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangingTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let session_before = agent.session().len();
+        assert_eq!(session_before, 0, "fresh agent has empty session");
+
+        let stream = agent.run("hang".into()).await.unwrap();
+        let cancel_token = agent.cancel_token();
+        let _handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_token.cancel();
+        });
+        let _ = collect_events(stream);
+
+        let session = agent.session();
+        // session 应只含 user 消息(1 条),不含 assistant(tool_use)。
+        assert_eq!(
+            session.len(),
+            1,
+            "session should contain only the user message after ACT cancel"
+        );
+        assert_eq!(session.messages()[0].role, Role::User);
+        // 确认没有任何 Assistant 消息残留(tool_use 悬空)。
+        assert!(
+            !session
+                .messages()
+                .iter()
+                .any(|m| m.role == Role::Assistant),
+            "no Assistant message should remain after ACT cancel"
         );
     }
 
@@ -1377,7 +1459,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn agent_cancel_before_run_emits_cancelled() {
+    async fn agent_cancel_then_run_works() {
+        // Fix 1: cancel() was permanent. After Fix 1, run() resets the
+        // cancel token, so a previously cancelled agent can still run to
+        // completion. This regression test guards against reintroducing
+        // the "agent permanently stuck after cancel" bug.
         let provider = ScriptedProvider::new(vec![vec![
             ProviderEvent::TextDelta("hi".into()),
             ProviderEvent::Stop {
@@ -1387,15 +1473,25 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new());
         let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
 
-        // Cancel before run starts
+        // Cancel before run starts. With Fix 1, run() resets the token,
+        // so this cancel must NOT cause the upcoming run to emit Cancelled.
         agent.cancel();
+        assert!(agent.cancel_token().is_cancelled(), "precondition: token cancelled");
+
         let stream = agent.run("hi".into()).await.unwrap();
         let events = collect_events(stream);
 
+        // Should complete normally, ending with Done(EndTurn), NOT Cancelled.
         assert!(
-            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
-            "should have Cancelled event when pre-cancelled"
+            !events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "run after cancel should not be cancelled (Fix 1 reset token)"
         );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
     }
 
     #[test]

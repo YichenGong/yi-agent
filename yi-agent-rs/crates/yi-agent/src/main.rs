@@ -193,6 +193,7 @@ fn run_tui_agent(
         let (agent_tx, agent_rx) = mpsc::channel::<yi_agent_core::AgentEvent>(256);
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(8);
         let is_running = Arc::new(AtomicBool::new(false));
 
         // Spawn agent driver task (stays on the async runtime)
@@ -202,14 +203,84 @@ fn run_tui_agent(
         let is_running_clone = Arc::clone(&is_running);
         let checker_clone = Arc::clone(&checker);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+        // Keep extra clones for agent rebuild on /clear and /compact.
+        let rebuild_provider = Arc::clone(&provider);
+        let rebuild_tools = Arc::clone(&tools);
+        let rebuild_config = agent_config.clone();
+        let rebuild_checker = Arc::clone(&checker);
+        let rebuild_decision_rx = Arc::clone(&decision_rx);
         let driver = tokio::spawn(async move {
             let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone)
                 .with_permission(checker_clone, decision_rx);
             let _ = workdir; // workdir already passed to tools registration
 
             loop {
-                // Wait for user input
-                let Some(text) = input_rx.recv().await else {
+                // Wait for user input or a control command. Control commands
+                // take priority (biased) so /clear and /compact are handled
+                // even if a prompt is also pending.
+                let (prompt_text, control_cmd) = tokio::select! {
+                    biased;
+                    cmd = control_rx.recv() => (None, cmd),
+                    text = input_rx.recv() => (text, None),
+                };
+
+                // Handle control commands first (rebuild agent, no prompt run).
+                if let Some(cmd) = control_cmd {
+                    match cmd {
+                        ControlCommand::Clear => {
+                            // Rebuild agent with empty session.
+                            agent = yi_agent_core::Agent::new(
+                                Arc::clone(&rebuild_provider),
+                                Arc::clone(&rebuild_tools),
+                                rebuild_config.clone(),
+                            )
+                            .with_session(yi_agent_core::Session::new())
+                            .with_permission(
+                                Arc::clone(&rebuild_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                            );
+                            tracing::info!("agent session cleared via /clear");
+                        }
+                        ControlCommand::Compact => {
+                            let session = agent.session();
+                            let keep_turns = rebuild_config
+                                .compact_keep_turns
+                                .unwrap_or(4);
+                            match crate::compact::compact_session(
+                                &rebuild_provider,
+                                &rebuild_config,
+                                &session,
+                                keep_turns,
+                            )
+                            .await
+                            {
+                                Ok(new_session) => {
+                                    agent = yi_agent_core::Agent::new(
+                                        Arc::clone(&rebuild_provider),
+                                        Arc::clone(&rebuild_tools),
+                                        rebuild_config.clone(),
+                                    )
+                                    .with_session(new_session)
+                                    .with_permission(
+                                        Arc::clone(&rebuild_checker),
+                                        Arc::clone(&rebuild_decision_rx),
+                                    );
+                                    tracing::info!("agent session compacted via /compact");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "compact failed");
+                                    let _ = agent_tx
+                                        .send(yi_agent_core::AgentEvent::Error(e))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Otherwise, a prompt arrived (or both channels closed).
+                let Some(text) = prompt_text else {
                     break;
                 };
 
@@ -256,7 +327,14 @@ fn run_tui_agent(
 
         // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)
         let tui_handle = tokio::task::spawn_blocking(move || {
-            crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, decision_tx, is_running)
+            crate::tui::app::run_tui(
+                agent_rx,
+                input_tx,
+                interrupt_tx,
+                control_tx,
+                decision_tx,
+                is_running,
+            )
         });
 
         let result = match tui_handle.await {
@@ -275,6 +353,17 @@ fn run_tui_agent(
     tui_result?;
 
     Ok(())
+}
+
+/// Control commands sent from the TUI to the agent driver task.
+/// Allows the TUI to trigger agent session rebuilds (e.g. /clear, /compact)
+/// without reconstructing the whole agent inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlCommand {
+    /// Clear the agent session (rebuild with empty session).
+    Clear,
+    /// Compact the agent session (summarize old messages, keep recent turns).
+    Compact,
 }
 
 /// Resolve the effective system prompt: fall back to the built-in default

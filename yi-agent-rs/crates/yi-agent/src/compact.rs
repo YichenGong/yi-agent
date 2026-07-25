@@ -134,7 +134,11 @@ pub async fn compact_session(
         .join("");
 
     let mut new_session = Session::new();
-    new_session.push(Message::user(format!("[对话摘要]\n{summary_text}")));
+    // 摘要使用 Assistant 角色,避免与后续 recent_messages 首条 User 消息
+    // 产生连续 user 消息,Anthropic API 会拒绝这种序列。
+    new_session.push(Message::assistant(vec![ContentBlock::Text(format!(
+        "[对话摘要]\n{summary_text}"
+    ))]));
     for msg in recent_messages {
         new_session.push(msg.clone());
     }
@@ -329,6 +333,62 @@ mod tests {
 
         // The old part must not end with an orphaned tool_use
         // (verified by the fact that the split point is a User message)
+    }
+
+    #[tokio::test]
+    async fn compact_summary_is_assistant_role() {
+        use async_trait::async_trait;
+        use futures::stream::{BoxStream, StreamExt};
+        use yi_agent_core::{ProviderError, ProviderEvent};
+
+        struct SummaryProvider;
+        #[async_trait]
+        impl Provider for SummaryProvider {
+            async fn call_stream(
+                &self,
+                _req: ProviderRequest,
+            ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+                Ok(futures::stream::iter(vec![ProviderEvent::TextDelta(
+                    "summary text".into(),
+                )])
+                .boxed())
+            }
+        }
+
+        // Build a session with enough turns to trigger compact.
+        let mut session = Session::new();
+        session.push(Message::user("prompt 1"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply 1".into(),
+        )]));
+        session.push(Message::user("prompt 2"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply 2".into(),
+        )]));
+
+        let provider: Arc<dyn Provider> = Arc::new(SummaryProvider);
+        let config = AgentConfig::default();
+
+        let result = compact_session(&provider, &config, &session, 1).await;
+        assert!(result.is_ok());
+        let new_session = result.unwrap();
+
+        // First message must be Assistant (the summary), not User.
+        assert_eq!(
+            new_session.messages()[0].role,
+            yi_agent_core::Role::Assistant,
+            "summary should be Assistant role"
+        );
+
+        // No two consecutive User messages anywhere in the new session
+        // (Anthropic API requires strict alternation).
+        for w in new_session.messages().windows(2) {
+            assert!(
+                !(w[0].role == yi_agent_core::Role::User
+                    && w[1].role == yi_agent_core::Role::User),
+                "consecutive User messages found"
+            );
+        }
     }
 
     #[tokio::test]
