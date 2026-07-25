@@ -10,10 +10,7 @@ use yi_agent_web::api::{AppState, get_config, index_html, put_config};
 /// 构建 axum app 用于测试
 fn test_app(env_path: PathBuf) -> axum::Router {
     use axum::routing::get;
-    let state = AppState {
-        env_path,
-        env_example_path: None,
-    };
+    let state = AppState { env_path };
     axum::Router::new()
         .route("/", get(index_html))
         .route("/api/config", get(get_config).put(put_config))
