@@ -5,6 +5,7 @@ mod compact;
 mod config;
 mod file_ref;
 mod input;
+mod llm_prefix;
 mod render;
 mod tracing_init;
 mod tui;
