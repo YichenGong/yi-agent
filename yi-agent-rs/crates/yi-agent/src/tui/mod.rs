@@ -2,3 +2,4 @@
 
 pub mod cell;
 pub mod input;
+pub mod markdown;
