@@ -19,4 +19,43 @@ pub trait Renderer {
     fn render_error(&mut self, err: &AgentError);
     /// 渲染系统消息（如中断提示、状态）
     fn render_system(&mut self, msg: &str);
+
+    /// 渲染权限请求并返回用户决策。
+    /// 默认实现:拒绝(无法交互)。
+    fn render_permission_request(
+        &mut self,
+        _req: &yi_agent_core::permission::PermissionRequest,
+    ) -> yi_agent_core::permission::Decision {
+        yi_agent_core::permission::Decision::Deny
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yi_agent_core::permission::{Decision, PermissionKind, PermissionRequest};
+
+    /// A minimal renderer that uses all default implementations.
+    struct DefaultRenderer;
+
+    impl Renderer for DefaultRenderer {
+        fn render_user_input(&mut self, _text: &str) {}
+        fn render_agent_event(&mut self, _event: &AgentEvent) {}
+        fn render_error(&mut self, _err: &AgentError) {}
+        fn render_system(&mut self, _msg: &str) {}
+    }
+
+    #[test]
+    fn default_render_permission_request_returns_deny() {
+        let mut renderer = DefaultRenderer;
+        let req = PermissionRequest {
+            request_id: 1,
+            tool_name: "bash".to_string(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            prefix_suggestion: None,
+            kind: PermissionKind::Normal,
+        };
+        let decision = renderer.render_permission_request(&req);
+        assert!(matches!(decision, Decision::Deny));
+    }
 }

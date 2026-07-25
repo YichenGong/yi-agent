@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::stream::{BoxStream, StreamExt};
 use tokio::sync::mpsc;
+use yi_agent_core::permission::Decision;
 use yi_agent_core::{Agent, AgentConfig, AgentEvent, Provider, Session, ToolRegistry};
 
 use crate::compact::compact_session;
@@ -67,6 +68,7 @@ pub struct App {
     workdir: std::path::PathBuf,
     renderer: Box<dyn Renderer>,
     usage_stats: UsageStats,
+    decision_tx: mpsc::Sender<(u64, Decision)>,
 }
 
 impl App {
@@ -77,6 +79,7 @@ impl App {
         config: AgentConfig,
         workdir: std::path::PathBuf,
         renderer: Box<dyn Renderer>,
+        decision_tx: mpsc::Sender<(u64, Decision)>,
     ) -> Self {
         Self {
             agent,
@@ -86,6 +89,7 @@ impl App {
             workdir,
             renderer,
             usage_stats: UsageStats::default(),
+            decision_tx,
         }
     }
 
@@ -292,6 +296,26 @@ impl App {
                         Some(AgentEvent::Error(e)) => {
                             tracing::warn!(error = %e, "agent error");
                             current_stream = None;
+                        }
+                        Some(AgentEvent::PermissionRequest {
+                            request_id,
+                            tool_name,
+                            tool_input,
+                            prefix_suggestion,
+                            kind,
+                        }) => {
+                            let req = yi_agent_core::permission::PermissionRequest {
+                                request_id,
+                                tool_name: tool_name.clone(),
+                                tool_input: tool_input.clone(),
+                                prefix_suggestion: prefix_suggestion.clone(),
+                                kind: kind.clone(),
+                            };
+                            let decision = self.renderer.render_permission_request(&req);
+                            let _ = self.decision_tx.send((req.request_id, decision)).await;
+                        }
+                        Some(AgentEvent::PermissionResolved { .. }) => {
+                            // Optionally render the resolved decision; for now, no-op
                         }
                         Some(e) => {
                             if let AgentEvent::Usage(u) = &e {

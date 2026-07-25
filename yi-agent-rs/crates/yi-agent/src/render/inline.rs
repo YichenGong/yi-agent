@@ -193,6 +193,53 @@ impl Renderer for InlineRenderer {
         self.finish_streaming_line();
         self.send_line(&format!("{COLOR_DIM}· {msg}{COLOR_RESET}"));
     }
+
+    fn render_permission_request(
+        &mut self,
+        req: &yi_agent_core::permission::PermissionRequest,
+    ) -> yi_agent_core::permission::Decision {
+        use yi_agent_core::permission::{Decision, PermissionKind};
+
+        self.finish_streaming_line();
+
+        // Print request header
+        let tool_line = format!("{}: {}", req.tool_name, Self::summarize_input(&req.tool_input));
+        let blacklisted_line = match &req.kind {
+            PermissionKind::Blacklisted(reason) => format!("(blacklisted: {reason})"),
+            PermissionKind::Normal => String::new(),
+        };
+        self.send_line("━━━ Permission Required ━━━━━━━━━━━━━━━━━━━━━━━");
+        self.send_line(&tool_line);
+        if !blacklisted_line.is_empty() {
+            self.send_line(&blacklisted_line);
+        }
+        self.send_line("[1] Allow Once");
+        self.send_line(&format!("[2] Always Allow This Tool ({})", req.tool_name));
+        if let Some(p) = &req.prefix_suggestion {
+            self.send_line(&format!("[3] Always Allow Prefix: \"{p}\""));
+        }
+        self.send_line("[4] Deny");
+        self.send_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        let default = if matches!(req.kind, PermissionKind::Blacklisted(_)) { 4 } else { 1 };
+        let prompt = format!("Choice (1-4) [default: {default}]: ");
+        self.send_line(&prompt);
+
+        // Read from stdin
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        let choice = input.trim().parse::<u32>().unwrap_or(default);
+        match choice {
+            1 => Decision::AllowOnce,
+            2 => Decision::AlwaysAllowTool,
+            3 => req
+                .prefix_suggestion
+                .clone()
+                .map(Decision::AlwaysAllowPrefix)
+                .unwrap_or(Decision::AllowOnce),
+            _ => Decision::Deny,
+        }
+    }
 }
 
 /// 从 ContentBlock 列表提取纯文本

@@ -129,6 +129,7 @@ fn run_agent(cli: Cli) -> Result<()> {
                 agent_config,
                 config.workdir.clone(),
                 renderer,
+                decision_tx,
             );
 
             let rt = tokio::runtime::Runtime::new()?;
