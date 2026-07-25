@@ -1,12 +1,8 @@
 //! yi-agent CLI 入口。
 
-mod app;
 mod compact;
 mod config;
-mod file_ref;
-mod input;
 mod llm_prefix;
-mod render;
 mod tracing_init;
 mod tui;
 
@@ -14,10 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use render::InlineRenderer;
 use yi_agent_core::Provider;
 
-use crate::app::App;
 use crate::config::{Cli, Command};
 
 fn main() -> Result<()> {
@@ -113,64 +107,15 @@ fn run_agent(cli: Cli) -> Result<()> {
         ..Default::default()
     };
 
-    // Branch on --tui flag
-    match select_tui_mode(&cli) {
-        TuiMode::Ratatui => {
-            return run_tui_agent(
-                provider,
-                tools,
-                agent_config,
-                config.workdir.clone(),
-                checker,
-                decision_tx,
-                decision_rx,
-            );
-        }
-        TuiMode::Inline => {
-            // Inline mode: wire permission checker into agent
-            let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
-            let agent = yi_agent_core::Agent::new(
-                Arc::clone(&provider),
-                Arc::clone(&tools),
-                agent_config.clone(),
-            )
-            .with_permission(Arc::clone(&checker), Arc::clone(&decision_rx));
-
-            let printer = reedline::ExternalPrinter::default();
-            let renderer = Box::new(InlineRenderer::with_printer(printer.sender()));
-
-            let app = App::new(
-                agent,
-                provider,
-                tools,
-                agent_config,
-                config.workdir.clone(),
-                renderer,
-                decision_tx,
-                checker,
-                decision_rx,
-            );
-
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(app.run(printer))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Which TUI mode to use, based on the `--tui` CLI flag.
-/// Default (no flag) is Ratatui. `--tui inline` selects the old InlineRenderer.
-fn select_tui_mode(cli: &Cli) -> TuiMode {
-    match cli.tui.as_deref() {
-        Some("inline") => TuiMode::Inline,
-        _ => TuiMode::Ratatui,
-    }
-}
-
-enum TuiMode {
-    Ratatui,
-    Inline,
+    run_tui_agent(
+        provider,
+        tools,
+        agent_config,
+        config.workdir.clone(),
+        checker,
+        decision_tx,
+        decision_rx,
+    )
 }
 
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
@@ -474,76 +419,6 @@ fn prompt_catalog_budget(total: usize, default: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Cli;
-
-    #[test]
-    fn default_tui_mode_is_ratatui() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: None,
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            tui: None,
-            yolo: false,
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
-    }
-
-    #[test]
-    fn tui_inline_selects_inline() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: None,
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            tui: Some("inline".into()),
-            yolo: false,
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        assert!(matches!(select_tui_mode(&cli), TuiMode::Inline));
-    }
-
-    #[test]
-    fn tui_ratatui_selects_ratatui() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: None,
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            tui: Some("ratatui".into()),
-            yolo: false,
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
-    }
 
     #[test]
     fn resolve_system_prompt_none_uses_default() {

@@ -2,8 +2,7 @@
 
 /// A slash command the user can invoke from the TUI input.
 ///
-/// Mirrors the commands defined in `crate::input::UserCommand` but adds
-/// the metadata (description, arg requirements) needed for the popup UI.
+/// Adds metadata (description, arg requirements) needed for the popup UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
     Quit,
