@@ -64,8 +64,20 @@ impl Tool for BashTool {
     }
 
     async fn call(&self, args: Value) -> ToolResult {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<ToolEvent>(1);
-        self.call_stream(args, tx).await
+        // `call_stream` sends ToolEvent::OutputDelta/Exit/Timeout/Truncated
+        // through `tx`. For the non-streaming `call` API we don't need those
+        // events (the ToolResult already carries stdout/stderr/exit), but we
+        // must drain the channel or `call_stream`'s `tx.send(...).await` will
+        // block once the buffer fills, deadlocking the call. We spawn a task
+        // that drains the channel until `call_stream` drops its sender on
+        // return, which ends the drainer cleanly.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ToolEvent>(8);
+        let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = self.call_stream(args, tx).await;
+        // `tx` was moved into `call_stream` and is dropped when it returns,
+        // so the drainer's `rx.recv().await` returns None and the task exits.
+        let _ = drainer.await;
+        result
     }
 
     async fn call_stream(
@@ -75,7 +87,14 @@ impl Tool for BashTool {
     ) -> ToolResult {
         let args: BashArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolsError::ArgsParse(e).into(),
+            Err(e) => {
+                // Never started: emit Exit so the TUI can finalize the task
+                // (the agent already sent AgentEvent::ToolCall before
+                // invoking us). Without this the timer would tick until
+                // the turn-end cleanup aborts the task.
+                let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
+                return ToolsError::ArgsParse(e).into();
+            }
         };
 
         tracing::info!(
@@ -88,6 +107,7 @@ impl Tool for BashTool {
 
         if let Some(reason) = is_blocked(&args.command) {
             tracing::warn!(tool = "bash", reason = %reason, "command blocked");
+            let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
             return ToolsError::CommandBlocked(reason.to_string()).into();
         }
 
@@ -107,7 +127,10 @@ impl Tool for BashTool {
             .spawn()
         {
             Ok(c) => c,
-            Err(e) => return ToolsError::Io(e).into(),
+            Err(e) => {
+                let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
+                return ToolsError::Io(e).into();
+            }
         };
 
         // Update cwd based on cd commands in the command string.
@@ -123,7 +146,7 @@ impl Tool for BashTool {
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-        tokio::spawn(async move {
+        let stdout_reader = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             loop {
                 match stdout.read(&mut buf).await {
@@ -137,7 +160,7 @@ impl Tool for BashTool {
             }
         });
 
-        tokio::spawn(async move {
+        let stderr_reader = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             loop {
                 match stderr.read(&mut buf).await {
@@ -293,27 +316,91 @@ impl Tool for BashTool {
             let _ = child.wait().await;
         }
 
+        // Wait for the reader tasks to finish so we have all stdout/stderr
+        // chunks. The process has exited (or was killed) so the pipes will
+        // return EOF. Without this we could lose trailing chunks that were
+        // still in flight when the select loop broke on child.wait().
+        let _ = stdout_reader.await;
+        let _ = stderr_reader.await;
+
+        // Drain any chunks that arrived after the last select iteration.
+        if let Some(rx) = stdout_rx.as_mut() {
+            while let Ok(data) = rx.try_recv() {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                let _ = tx
+                    .send(ToolEvent::OutputDelta {
+                        stream: OutputStream::Stdout,
+                        text,
+                    })
+                    .await;
+                let was_truncated = stdout_truncated;
+                append_with_truncation(
+                    &mut stdout_buf,
+                    &mut stdout_truncated,
+                    &mut stdout_skipped,
+                    &data,
+                );
+                if !was_truncated && stdout_truncated {
+                    let _ = tx
+                        .send(ToolEvent::Truncated {
+                            stream: OutputStream::Stdout,
+                            skipped_bytes: stdout_skipped,
+                        })
+                        .await;
+                }
+            }
+        }
+        if let Some(rx) = stderr_rx.as_mut() {
+            while let Ok(data) = rx.try_recv() {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                let _ = tx
+                    .send(ToolEvent::OutputDelta {
+                        stream: OutputStream::Stderr,
+                        text,
+                    })
+                    .await;
+                let was_truncated = stderr_truncated;
+                append_with_truncation(
+                    &mut stderr_buf,
+                    &mut stderr_truncated,
+                    &mut stderr_skipped,
+                    &data,
+                );
+                if !was_truncated && stderr_truncated {
+                    let _ = tx
+                        .send(ToolEvent::Truncated {
+                            stream: OutputStream::Stderr,
+                            skipped_bytes: stderr_skipped,
+                        })
+                        .await;
+                }
+            }
+        }
+
         // Emit Exit event.
         let _ = tx.send(ToolEvent::Exit { code: exit_code }).await;
 
-        // Build the result text.
-        let stdout_trunc = truncate_output(&stdout_buf);
-        let stderr_trunc = truncate_output(&stderr_buf);
+        // Build the result text. The buffer was already capped at
+        // MAX_OUTPUT_BYTES by `append_with_truncation`; the `*_truncated`
+        // flag + `*_skipped` count carry the information needed to build
+        // the prefix. `truncate_output` alone can't tell us whether
+        // truncation happened (the buffer is exactly at the cap, not
+        // above it).
+        let stdout_text = format_truncated(&stdout_buf, stdout_truncated, stdout_skipped);
+        let stderr_text = format_truncated(&stderr_buf, stderr_truncated, stderr_skipped);
 
         if timed_out {
             ToolResult::error(format!(
                 "command timeout after {}s\nstdout:\n{}\nstderr:\n{}",
                 args.timeout.unwrap_or(DEFAULT_TIMEOUT),
-                String::from_utf8_lossy(&stdout_trunc),
-                String::from_utf8_lossy(&stderr_trunc),
+                stdout_text,
+                stderr_text,
             ))
         } else {
             let exit = exit_code.unwrap_or(-1);
             ToolResult::text(format!(
                 "exit: {}\nstdout:\n{}\nstderr:\n{}",
-                exit,
-                String::from_utf8_lossy(&stdout_trunc),
-                String::from_utf8_lossy(&stderr_trunc),
+                exit, stdout_text, stderr_text,
             ))
         }
     }
@@ -325,6 +412,38 @@ impl Tool for BashTool {
             read_only: false,
             version: None,
         }
+    }
+}
+
+/// Format the captured output for the ToolResult. If `truncated` is true,
+/// `append_with_truncation` already capped `bytes` at MAX_OUTPUT_BYTES and
+/// `skipped` carries the total bytes dropped from the front. We prepend a
+/// human-readable prefix; otherwise we return the bytes verbatim.
+fn format_truncated(bytes: &[u8], truncated: bool, skipped: usize) -> String {
+    if truncated {
+        format!(
+            "[truncated: showed last 100KB of {}B]\n{}",
+            skipped + bytes.len(),
+            String::from_utf8_lossy(bytes)
+        )
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// Legacy helper kept for compatibility: truncates a raw buffer to the last
+/// MAX_OUTPUT_BYTES with a prefix. Kept for any callers that haven't been
+/// migrated to `format_truncated`.
+#[allow(dead_code)]
+fn truncate_output(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() <= MAX_OUTPUT_BYTES {
+        bytes.to_vec()
+    } else {
+        let start = bytes.len() - MAX_OUTPUT_BYTES;
+        let mut truncated =
+            format!("[truncated: showed last 100KB of {}B]\n", bytes.len()).into_bytes();
+        truncated.extend_from_slice(&bytes[start..]);
+        truncated
     }
 }
 
@@ -355,18 +474,6 @@ fn append_with_truncation(
         buf.drain(..start);
     } else {
         buf.extend_from_slice(data);
-    }
-}
-
-fn truncate_output(bytes: &[u8]) -> Vec<u8> {
-    if bytes.len() <= MAX_OUTPUT_BYTES {
-        bytes.to_vec()
-    } else {
-        let start = bytes.len() - MAX_OUTPUT_BYTES;
-        let mut truncated =
-            format!("[truncated: showed last 100KB of {}B]\n", bytes.len()).into_bytes();
-        truncated.extend_from_slice(&bytes[start..]);
-        truncated
     }
 }
 
@@ -483,6 +590,49 @@ mod tests {
         let tool = make_tool(&tmp);
         let result = tool.call(serde_json::json!({"command": "rm -rf /"})).await;
         assert!(result.is_error);
+    }
+
+    /// Regression: when the bash tool early-returns on a blocked command
+    /// (or arg-parse / spawn error), it must still emit `ToolEvent::Exit`
+    /// so downstream consumers (the TUI task registry) can finalize the
+    /// task. Without this the status-bar timer ticks forever waiting for a
+    /// ToolExit that never arrives.
+    #[tokio::test]
+    async fn bash_error_paths_emit_exit() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        // Blocked command path.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ToolEvent>(8);
+        let _ = tool
+            .call_stream(serde_json::json!({"command": "rm -rf /"}), tx)
+            .await;
+        let mut saw_exit = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, ToolEvent::Exit { .. }) {
+                saw_exit = true;
+            }
+        }
+        assert!(
+            saw_exit,
+            "blocked command should still emit ToolEvent::Exit"
+        );
+
+        // Arg-parse error path (missing `command` field).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ToolEvent>(8);
+        let _ = tool
+            .call_stream(serde_json::json!({"timeout": 1}), tx)
+            .await;
+        let mut saw_exit = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, ToolEvent::Exit { .. }) {
+                saw_exit = true;
+            }
+        }
+        assert!(
+            saw_exit,
+            "arg-parse error should still emit ToolEvent::Exit"
+        );
     }
 
     #[tokio::test]
