@@ -263,9 +263,13 @@ fn run_tui_agent(
 }
 
 /// Resolve the effective system prompt: fall back to the built-in default
-/// when the user did not provide one.
+/// when the user did not provide one. The current local date is appended to
+/// the end so the model knows today's date; placed at the tail to avoid
+/// disrupting the cached prefix of the prompt.
 fn resolve_system_prompt(user: Option<String>) -> Option<String> {
-    user.or_else(|| Some(yi_agent_core::AgentConfig::default_system_prompt()))
+    let base = user.unwrap_or_else(yi_agent_core::AgentConfig::default_system_prompt);
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    Some(format!("{base}\n\nCurrent date: {today}"))
 }
 
 #[cfg(test)]
@@ -339,12 +343,29 @@ mod tests {
     #[test]
     fn resolve_system_prompt_none_uses_default() {
         let resolved = resolve_system_prompt(None);
-        assert_eq!(resolved.as_deref(), Some(yi_agent_core::AgentConfig::default_system_prompt().as_str()));
+        let default = yi_agent_core::AgentConfig::default_system_prompt();
+        // The resolved prompt should start with the default prompt and have
+        // the current date appended at the end.
+        assert!(
+            resolved.as_deref().is_some_and(|r| r.starts_with(&default)),
+            "resolved should start with default prompt"
+        );
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            resolved.as_deref().is_some_and(|r| r.ends_with(&today)),
+            "resolved should end with today's date: {resolved:?}"
+        );
     }
 
     #[test]
     fn resolve_system_prompt_custom_overrides_default() {
         let resolved = resolve_system_prompt(Some("custom".into()));
-        assert_eq!(resolved.as_deref(), Some("custom"));
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            resolved
+                .as_deref()
+                .is_some_and(|r| r.starts_with("custom") && r.ends_with(&today)),
+            "resolved should start with custom prompt and end with today's date: {resolved:?}"
+        );
     }
 }
