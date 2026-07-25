@@ -119,14 +119,14 @@ fn run_tui_agent(
     use tokio::sync::mpsc;
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
+    let tui_result = rt.block_on(async move {
         // Channels between agent driver and TUI
         let (agent_tx, agent_rx) = mpsc::channel::<yi_agent_core::AgentEvent>(256);
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let is_running = Arc::new(AtomicBool::new(false));
 
-        // Spawn agent driver task
+        // Spawn agent driver task (stays on the async runtime)
         let provider_clone = Arc::clone(&provider);
         let tools_clone = Arc::clone(&tools);
         let config_clone = agent_config.clone();
@@ -180,15 +180,25 @@ fn run_tui_agent(
             }
         });
 
-        // Run TUI (blocking)
-        crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, is_running)
-            .map_err(anyhow::Error::from)?;
+        // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)
+        let tui_handle = tokio::task::spawn_blocking(move || {
+            crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, is_running)
+        });
 
-        // Clean up: drop driver task
+        let result = match tui_handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::Error::from(e)),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+
+        // TUI exited; abort the driver task to clean up
+        // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
 
-        Ok::<(), anyhow::Error>(())
-    })?;
+        result
+    });
+
+    tui_result?;
 
     Ok(())
 }
