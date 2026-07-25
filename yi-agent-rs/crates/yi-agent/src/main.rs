@@ -43,6 +43,26 @@ fn main() -> Result<()> {
 fn run_agent(cli: Cli) -> Result<()> {
     let config = config::load(&cli)?;
 
+    // Load permissions and construct checker
+    let workdir = config.workdir.clone();
+    let yolo = config.yolo;
+    let permissions = {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
+            .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
+    };
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn = Arc::new(|cmd: &str| {
+        yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string())
+    });
+    let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+        permissions,
+        yolo,
+        workdir,
+        blocklist_fn,
+    ));
+    let (decision_tx, decision_rx) =
+        tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+
     let provider: Arc<dyn Provider> = match config.provider.as_str() {
         "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
             yi_agent_llm::AnthropicProviderOpts {
@@ -80,15 +100,25 @@ fn run_agent(cli: Cli) -> Result<()> {
     // Branch on --tui flag
     match select_tui_mode(&cli) {
         TuiMode::Ratatui => {
-            return run_tui_agent(provider, tools, agent_config, config.workdir.clone());
+            return run_tui_agent(
+                provider,
+                tools,
+                agent_config,
+                config.workdir.clone(),
+                checker,
+                decision_tx,
+                decision_rx,
+            );
         }
         TuiMode::Inline => {
-            // Default: InlineRenderer + reedline path
+            // Inline mode: wire permission checker into agent
+            let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
             let agent = yi_agent_core::Agent::new(
                 Arc::clone(&provider),
                 Arc::clone(&tools),
                 agent_config.clone(),
-            );
+            )
+            .with_permission(Arc::clone(&checker), Arc::clone(&decision_rx));
 
             let printer = reedline::ExternalPrinter::default();
             let renderer = Box::new(InlineRenderer::with_printer(printer.sender()));
@@ -100,6 +130,9 @@ fn run_agent(cli: Cli) -> Result<()> {
                 agent_config,
                 config.workdir.clone(),
                 renderer,
+                decision_tx,
+                checker,
+                decision_rx,
             );
 
             let rt = tokio::runtime::Runtime::new()?;
@@ -130,6 +163,9 @@ fn run_tui_agent(
     tools: Arc<yi_agent_core::ToolRegistry>,
     agent_config: yi_agent_core::AgentConfig,
     workdir: std::path::PathBuf,
+    checker: Arc<yi_agent_core::permission::PermissionChecker>,
+    decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+    decision_rx: tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -148,8 +184,11 @@ fn run_tui_agent(
         let tools_clone = Arc::clone(&tools);
         let config_clone = agent_config.clone();
         let is_running_clone = Arc::clone(&is_running);
+        let checker_clone = Arc::clone(&checker);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
         let driver = tokio::spawn(async move {
-            let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone);
+            let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone)
+                .with_permission(checker_clone, decision_rx);
             let _ = workdir; // workdir already passed to tools registration
 
             loop {
@@ -201,7 +240,7 @@ fn run_tui_agent(
 
         // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)
         let tui_handle = tokio::task::spawn_blocking(move || {
-            crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, is_running)
+            crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, decision_tx, is_running)
         });
 
         let result = match tui_handle.await {
@@ -242,6 +281,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
     }
@@ -261,6 +302,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: Some("inline".into()),
+            yolo: false,
+            skip_permissions: false,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Inline));
     }
@@ -280,6 +323,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: Some("ratatui".into()),
+            yolo: false,
+            skip_permissions: false,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
     }

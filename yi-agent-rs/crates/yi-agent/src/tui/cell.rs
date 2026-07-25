@@ -30,6 +30,20 @@ pub enum HistoryCell {
     },
     /// Full-width dim separator line between turns.
     Separator { label: Option<String> },
+    /// Permission request prompt. Shows a menu for the user to choose a decision.
+    PermissionRequest {
+        request_id: u64,
+        tool_name: String,
+        display: String,
+        prefix_suggestion: Option<String>,
+        kind: yi_agent_core::permission::PermissionKind,
+        resolved: bool,
+    },
+    /// Permission resolved notification. Shows the decision that was made.
+    PermissionResolved {
+        request_id: u64,
+        decision: yi_agent_core::permission::Decision,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +79,24 @@ impl HistoryCell {
                 expanded,
             } => render_tool_result(result_text, *is_error, *expanded, width),
             Self::Separator { label } => vec![render_separator(label.as_deref(), width)],
+            Self::PermissionRequest {
+                tool_name,
+                display,
+                prefix_suggestion,
+                kind,
+                resolved,
+                ..
+            } => render_permission_request(
+                tool_name,
+                display,
+                prefix_suggestion.as_deref(),
+                kind,
+                *resolved,
+                width,
+            ),
+            Self::PermissionResolved { request_id: _, decision } => {
+                render_permission_resolved(decision)
+            }
         }
     }
 
@@ -180,6 +212,84 @@ fn render_separator(label: Option<&str>, width: u16) -> Line<'static> {
                 .style(Style::new().add_modifier(Modifier::DIM))
         }
     }
+}
+
+fn render_permission_request(
+    tool_name: &str,
+    display: &str,
+    prefix_suggestion: Option<&str>,
+    kind: &yi_agent_core::permission::PermissionKind,
+    resolved: bool,
+    _width: u16,
+) -> Vec<Line<'static>> {
+    let warn_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let dim_style = Style::new().add_modifier(Modifier::DIM);
+    let menu_style = Style::new().fg(Color::Cyan);
+
+    if resolved {
+        return vec![Line::from(vec![
+            Span::styled("  [resolved] ", dim_style),
+            Span::raw(display.to_string()),
+        ])];
+    }
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("? ", warn_style),
+            Span::styled(format!("Permission needed: {tool_name}"), warn_style),
+        ]),
+        Line::from(format!("  {display}")).style(dim_style),
+    ];
+
+    // Menu options
+    let blacklisted = matches!(kind, yi_agent_core::permission::PermissionKind::Blacklisted(_));
+    if blacklisted {
+        lines.push(Line::from(vec![
+            Span::styled("  [!] Blacklisted command", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    let option_lines = match prefix_suggestion {
+        Some(p) => vec![
+            Span::styled("  [1] Allow once", menu_style.clone()),
+        ].into_iter().chain(vec![
+            Span::styled("  [2] Always allow tool", menu_style.clone()),
+        ]).chain(vec![
+            Span::styled(format!("  [3] Always allow prefix: {p}"), menu_style.clone()),
+        ]).chain(vec![
+            Span::styled("  [4] Deny", menu_style),
+        ]).collect::<Vec<_>>(),
+        None => vec![
+            Span::styled("  [1] Allow once", menu_style.clone()),
+            Span::styled("  [2] Always allow tool", menu_style.clone()),
+            Span::styled("  [4] Deny", menu_style),
+        ],
+    };
+    for span in option_lines {
+        lines.push(Line::from(span));
+    }
+
+    let default_hint = if blacklisted {
+        "  Enter = Deny"
+    } else {
+        "  Enter = Allow once"
+    };
+    lines.push(Line::from(default_hint).style(dim_style));
+
+    lines
+}
+
+fn render_permission_resolved(decision: &yi_agent_core::permission::Decision) -> Vec<Line<'static>> {
+    let (label, color) = match decision {
+        yi_agent_core::permission::Decision::AllowOnce => ("allowed (once)", Color::Green),
+        yi_agent_core::permission::Decision::AlwaysAllowTool => ("allowed (always)", Color::Green),
+        yi_agent_core::permission::Decision::AlwaysAllowPrefix(_) => ("allowed (prefix)", Color::Green),
+        yi_agent_core::permission::Decision::Deny => ("denied", Color::Red),
+    };
+    vec![Line::from(vec![
+        Span::styled("  -> ", Style::new().add_modifier(Modifier::DIM)),
+        Span::styled(label, Style::new().fg(color)),
+    ])]
 }
 
 // --- Helpers ---

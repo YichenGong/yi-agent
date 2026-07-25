@@ -16,6 +16,7 @@ pub struct Config {
     pub system_prompt: Option<String>,
     pub compact_threshold: u32, // computed: context_length * ratio / 100
     pub compact_keep_turns: u32,
+    pub yolo: bool,
 }
 
 /// clap CLI 参数定义。
@@ -68,6 +69,14 @@ pub struct Cli {
     /// TUI mode: "inline" for legacy InlineRenderer (default is ratatui)
     #[arg(long)]
     pub tui: Option<String>,
+
+    /// Skip permission prompts (except blacklisted commands)
+    #[arg(long)]
+    pub yolo: bool,
+
+    /// Alias for --yolo
+    #[arg(long = "dangerously-skip-permissions")]
+    pub skip_permissions: bool,
 }
 
 /// 子命令
@@ -273,6 +282,12 @@ pub fn load(cli: &Cli) -> Result<Config> {
         })
         .unwrap_or(4);
 
+    let yolo = cli.yolo
+        || cli.skip_permissions
+        || std::env::var("YI_AGENT_YOLO")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
     Ok(Config {
         provider,
         api_url,
@@ -283,6 +298,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
         system_prompt,
         compact_threshold,
         compact_keep_turns,
+        yolo,
     })
 }
 
@@ -314,6 +330,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -339,6 +357,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://example.com");
@@ -363,6 +383,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
@@ -386,6 +408,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -407,6 +431,8 @@ mod tests {
             compact_ratio: Some(50),
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 50_000); // 100000 * 50 / 100
@@ -427,6 +453,8 @@ mod tests {
             compact_ratio: Some(80),
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -447,6 +475,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -467,6 +497,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "anthropic");
@@ -487,6 +519,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "openai");
@@ -517,6 +551,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_key, "from-dotenv-file");
@@ -543,6 +579,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-project/.yi-agent/.env"));
@@ -567,6 +605,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
@@ -728,6 +768,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let result = load(&cli);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
@@ -764,6 +806,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             tui: None,
+            yolo: false,
+            skip_permissions: false,
         };
         let config = load(&cli).unwrap();
         assert!(
@@ -807,5 +851,114 @@ mod tests {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn yolo_env_var_enables_yolo() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("YI_AGENT_YOLO", "true");
+        }
+        let yolo = std::env::var("YI_AGENT_YOLO")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        assert!(yolo);
+        unsafe {
+            std::env::remove_var("YI_AGENT_YOLO");
+        }
+    }
+
+    #[test]
+    fn yolo_env_var_false_by_default() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("YI_AGENT_YOLO");
+        }
+        let yolo = std::env::var("YI_AGENT_YOLO")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        assert!(!yolo);
+    }
+
+    #[test]
+    fn cli_parses_yolo_flag() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "--yolo", "--api-key", "test"]);
+        assert!(cli.yolo);
+        assert!(!cli.skip_permissions);
+    }
+
+    #[test]
+    fn cli_parses_dangerously_skip_permissions_flag() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "--dangerously-skip-permissions", "--api-key", "test"]);
+        assert!(!cli.yolo);
+        assert!(cli.skip_permissions);
+    }
+
+    #[test]
+    fn load_yolo_from_cli_flag() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: None,
+            compact_keep_turns: None,
+            tui: None,
+            yolo: true,
+            skip_permissions: false,
+        };
+        let config = load(&cli).unwrap();
+        assert!(config.yolo);
+    }
+
+    #[test]
+    fn load_yolo_from_skip_permissions_flag() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: None,
+            compact_keep_turns: None,
+            tui: None,
+            yolo: false,
+            skip_permissions: true,
+        };
+        let config = load(&cli).unwrap();
+        assert!(config.yolo);
+    }
+
+    #[test]
+    fn load_yolo_defaults_false() {
+        let cli = Cli {
+            command: None,
+            provider: None,
+            api_url: None,
+            api_key: Some("test-key".into()),
+            model: None,
+            max_turns: None,
+            workdir: Some(PathBuf::from(".")),
+            system_prompt: None,
+            model_context_length: None,
+            compact_ratio: None,
+            compact_keep_turns: None,
+            tui: None,
+            yolo: false,
+            skip_permissions: false,
+        };
+        let config = load(&cli).unwrap();
+        assert!(!config.yolo);
     }
 }

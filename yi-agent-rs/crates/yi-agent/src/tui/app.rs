@@ -31,6 +31,7 @@ pub fn run_tui(
     mut agent_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::Sender<String>,
     interrupt_tx: tokio::sync::mpsc::Sender<()>,
+    decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
@@ -49,6 +50,7 @@ pub fn run_tui(
         &mut input,
         &input_tx,
         &interrupt_tx,
+        &decision_tx,
         &is_running,
         &CrosstermEventSource,
     );
@@ -87,6 +89,7 @@ pub fn run_tui_with_backend<B: Backend>(
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
@@ -98,6 +101,7 @@ pub fn run_tui_with_backend<B: Backend>(
         &mut input,
         input_tx,
         interrupt_tx,
+        decision_tx,
         is_running,
         &CrosstermEventSource,
     )
@@ -110,6 +114,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
 ) -> std::io::Result<()> {
@@ -122,6 +127,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         &mut input,
         input_tx,
         interrupt_tx,
+        decision_tx,
         is_running,
         events,
     )
@@ -135,6 +141,7 @@ fn run_loop<B: Backend, E: EventSource>(
     input: &mut InputLine,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
 ) -> std::io::Result<()> {
@@ -194,6 +201,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 history,
                 input_tx,
                 interrupt_tx,
+                decision_tx,
                 &mut pending_quit,
                 &mut popup,
             ) {
@@ -225,9 +233,34 @@ fn handle_key(
     history: &mut HistoryState,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
 ) -> KeyOutcome {
+    // Check if there's a pending permission request
+    if let Some((request_id, _tool_name, prefix_suggestion, kind)) = history.pending_permission_info() {
+        let decision = match key.code {
+            KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
+            KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
+            KeyCode::Char('3') => prefix_suggestion.map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
+            KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
+            KeyCode::Enter => {
+                let default = match kind {
+                    yi_agent_core::permission::PermissionKind::Blacklisted(_) => yi_agent_core::permission::Decision::Deny,
+                    _ => yi_agent_core::permission::Decision::AllowOnce,
+                };
+                Some(default)
+            }
+            _ => None,
+        };
+        if let Some(d) = decision {
+            let _ = decision_tx.blocking_send((request_id, d));
+            return KeyOutcome::None;
+        }
+        // For other keys while permission pending, ignore (don't let user type input)
+        return KeyOutcome::None;
+    }
+
     // Global keys first
     match key.code {
         KeyCode::Esc => {
@@ -686,6 +719,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Ctrl+C then Ctrl+Q: if first Ctrl+C quit, Ctrl+Q would be unreachable.
@@ -701,6 +735,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -724,6 +759,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let events = Rc::new(RefCell::new(vec![
@@ -737,6 +773,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         );
@@ -755,6 +792,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // First Esc alone should not quit
@@ -769,6 +807,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         );
@@ -787,6 +826,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
@@ -800,6 +840,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         );
@@ -819,6 +860,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Script: type "hi", then Ctrl+Q to quit (don't submit, so input stays on screen)
@@ -836,6 +878,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -869,6 +912,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type 30 'a's into a 20-column terminal. "> aa..." takes 3 cols for
@@ -892,6 +936,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -921,6 +966,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type 10 '你's (each 2 cells wide = 20 cells total) into 20-col
@@ -944,6 +990,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1010,6 +1057,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Send an assistant message before starting
@@ -1029,6 +1077,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1063,6 +1112,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', then Ctrl+Q to quit
@@ -1077,6 +1127,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1106,6 +1157,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', 'c', 'l', then Ctrl+Q
@@ -1122,6 +1174,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1142,6 +1195,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', 'c', 'l', Tab, then Ctrl+Q
@@ -1159,6 +1213,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1184,6 +1239,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', 'q', 'u', 'i', 't', Enter — /quit should exit the loop.
@@ -1206,6 +1262,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         );
@@ -1228,6 +1285,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', Esc, then Ctrl+Q
@@ -1243,6 +1301,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1273,6 +1332,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', Down (move to 2nd item), Tab (complete), Ctrl+Q
@@ -1289,6 +1349,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1314,6 +1375,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/foo', Enter, then Ctrl+Q to quit
@@ -1332,6 +1394,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1362,6 +1425,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', space, then Ctrl+Q
@@ -1377,6 +1441,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1399,6 +1464,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type "abc" — cursor should be at position 3 (after 'c').
@@ -1417,6 +1483,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1448,6 +1515,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Just quit — no input typed. The input row should still show a cursor.
@@ -1462,6 +1530,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
@@ -1489,6 +1558,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type "abc", move left to position 2 (between 'b' and 'c').
@@ -1507,6 +1577,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &decision_tx,
             &is_running,
             &source,
         )
