@@ -184,8 +184,9 @@ impl Renderer for InlineRenderer {
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
             | AgentEvent::ToolTimeout { .. }
-            | AgentEvent::EstimatedPrefill(_) => {
-                // Tool streaming + estimate events not rendered in inline mode
+            | AgentEvent::EstimatedPrefill(_)
+            | AgentEvent::DecodeDelta(_) => {
+                // Not rendered in inline mode
             }
         }
     }

@@ -139,6 +139,10 @@ pub enum AgentEvent {
     /// Heuristic estimate of prefill (input) tokens, emitted before the
     /// provider returns real usage. Lets the status bar show activity.
     EstimatedPrefill(u32),
+    /// Streamed delta that counts toward decode (output) tokens but is not
+    /// assistant-visible text (e.g. tool-call argument JSON). Used by the
+    /// status bar for flow-style decode estimation during tool-call turns.
+    DecodeDelta(String),
     Done {
         reason: DoneReason,
     },
@@ -726,6 +730,9 @@ async fn accumulate_provider_stream(
             }
             ProviderEvent::Usage(u) => {
                 let _ = tx.try_send(AgentEvent::Usage(u));
+            }
+            ProviderEvent::ToolUseDelta { partial_json, .. } => {
+                let _ = tx.try_send(AgentEvent::DecodeDelta(partial_json));
             }
             _ => {}
         })

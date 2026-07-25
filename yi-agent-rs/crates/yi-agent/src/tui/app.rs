@@ -459,11 +459,6 @@ fn route_event(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(120) as u32;
             registry.on_tool_call(id, name, &cmd, exp);
-            // Tool-call arguments are also generated tokens (decode).
-            // Estimate from name + input JSON so the status bar reflects
-            // generation activity during tool-call turns.
-            statusbar.estimate_decode_tokens(name);
-            statusbar.estimate_decode_tokens(&input.to_string());
         }
         AgentEvent::ToolOutputDelta { id, stream, text } => {
             registry.on_output_delta(id, *stream, text);
@@ -481,6 +476,9 @@ fn route_event(
             statusbar.set_prefill_estimate(*n as u64);
         }
         AgentEvent::AssistantText(text) => {
+            statusbar.estimate_decode_tokens(text);
+        }
+        AgentEvent::DecodeDelta(text) => {
             statusbar.estimate_decode_tokens(text);
         }
         _ => {}
