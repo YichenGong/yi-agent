@@ -60,7 +60,9 @@ impl Tool for SkillTool {
 
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
-            source: ToolSource::Plugin { name: "skills".to_string() },
+            source: ToolSource::Plugin {
+                name: "skills".to_string(),
+            },
             requires_confirmation: false,
             read_only: true,
             version: None,

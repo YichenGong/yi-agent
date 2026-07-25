@@ -297,7 +297,9 @@ pub fn load(cli: &Cli) -> Result<Config> {
 
     let skills_catalog_budget_explicit = cli.skills_catalog_budget.is_some()
         || std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
-            .ok().filter(|s| !s.is_empty()).is_some();
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
     let skills_catalog_budget = cli
         .skills_catalog_budget
         .or_else(|| {
@@ -926,7 +928,12 @@ mod tests {
     #[test]
     fn cli_parses_dangerously_skip_permissions_flag() {
         use clap::Parser;
-        let cli = Cli::parse_from(["yi-agent", "--dangerously-skip-permissions", "--api-key", "test"]);
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "--dangerously-skip-permissions",
+            "--api-key",
+            "test",
+        ]);
         assert!(!cli.yolo);
         assert!(cli.skip_permissions);
     }

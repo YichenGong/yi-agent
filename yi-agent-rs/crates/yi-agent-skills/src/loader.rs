@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::model::{is_valid_skill_name, SkillError, SkillMetadata, SkillScope};
+use crate::model::{SkillError, SkillMetadata, SkillScope, is_valid_skill_name};
 
 #[derive(Debug, Deserialize)]
 struct Frontmatter {
@@ -21,11 +21,9 @@ pub fn parse_skill_md(
     path: &Path,
     scope: SkillScope,
 ) -> Result<SkillMetadata, SkillError> {
-    let (frontmatter_text, body) = split_frontmatter(content)
-        .ok_or_else(|| SkillError::ParseError(
-            path.to_path_buf(),
-            "missing YAML frontmatter".to_string(),
-        ))?;
+    let (frontmatter_text, body) = split_frontmatter(content).ok_or_else(|| {
+        SkillError::ParseError(path.to_path_buf(), "missing YAML frontmatter".to_string())
+    })?;
 
     let fm: Frontmatter = serde_yaml::from_str(frontmatter_text)
         .map_err(|e| SkillError::ParseError(path.to_path_buf(), e.to_string()))?;
@@ -90,7 +88,10 @@ mod tests {
     #[test]
     fn missing_frontmatter_errors() {
         let content = "# No frontmatter here";
-        assert!(matches!(parse(content, SkillScope::User), Err(SkillError::ParseError(_, _))));
+        assert!(matches!(
+            parse(content, SkillScope::User),
+            Err(SkillError::ParseError(_, _))
+        ));
     }
 
     #[test]
@@ -110,7 +111,10 @@ mod tests {
     #[test]
     fn invalid_name_errors() {
         let content = "---\nname: Foo_Bar\ndescription: x\n---\nbody";
-        assert!(matches!(parse(content, SkillScope::User), Err(SkillError::InvalidName(_))));
+        assert!(matches!(
+            parse(content, SkillScope::User),
+            Err(SkillError::InvalidName(_))
+        ));
     }
 
     #[test]
@@ -132,6 +136,9 @@ mod tests {
     #[test]
     fn yaml_syntax_error() {
         let content = "---\nname: foo\ndescription: [unclosed\n---\nbody";
-        assert!(matches!(parse(content, SkillScope::User), Err(SkillError::ParseError(_, _))));
+        assert!(matches!(
+            parse(content, SkillScope::User),
+            Err(SkillError::ParseError(_, _))
+        ));
     }
 }

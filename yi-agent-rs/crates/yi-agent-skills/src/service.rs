@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use crate::discovery::{discover_skills, SkillRoot};
+use crate::discovery::{SkillRoot, discover_skills};
 use crate::loader::split_frontmatter;
 use crate::model::{SkillError, SkillMetadata, SkillScope};
 
@@ -103,7 +103,12 @@ fn scope_order(scope: SkillScope) -> u8 {
 }
 
 fn catalog_entry(s: &SkillMetadata) -> String {
-    format!("- {}: {} (path: {})", s.name, s.description, s.path.display())
+    format!(
+        "- {}: {} (path: {})",
+        s.name,
+        s.description,
+        s.path.display()
+    )
 }
 
 fn full_catalog_string(skills: &[SkillMetadata]) -> String {
@@ -183,7 +188,9 @@ mod tests {
     #[test]
     fn render_over_budget_truncates() {
         // Each entry is ~100 bytes; budget of 300 should only fit a couple
-        let skills: Vec<_> = (0..20).map(|i| make_metadata(&format!("s{i:02}"), SkillScope::User, 80)).collect();
+        let skills: Vec<_> = (0..20)
+            .map(|i| make_metadata(&format!("s{i:02}"), SkillScope::User, 80))
+            .collect();
         let s = SkillsService::new(vec![]);
         {
             let mut cache = s.cache.write().unwrap();
@@ -268,7 +275,8 @@ mod tests {
         std::fs::write(
             tmp.path().join("foo/SKILL.md"),
             "---\nname: foo\ndescription: x\n---\nbody",
-        ).unwrap();
+        )
+        .unwrap();
         let s = SkillsService::new(vec![(tmp.path().to_path_buf(), SkillScope::User)]);
         let first = s.snapshot().unwrap();
         assert_eq!(first.len(), 1);
@@ -279,9 +287,14 @@ mod tests {
         std::fs::write(
             tmp.path().join("bar/SKILL.md"),
             "---\nname: bar\ndescription: y\n---\nbody",
-        ).unwrap();
+        )
+        .unwrap();
 
         let second = s.snapshot().unwrap();
-        assert_eq!(second.len(), 1, "cache should serve stale data, not re-scan filesystem");
+        assert_eq!(
+            second.len(),
+            1,
+            "cache should serve stale data, not re-scan filesystem"
+        );
     }
 }

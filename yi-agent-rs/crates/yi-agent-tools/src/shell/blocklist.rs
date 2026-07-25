@@ -13,8 +13,14 @@ pub fn is_blocked(cmd: &str) -> Option<&'static str> {
                 "rm -rf /",
             ),
             // rm -rf ~ and $HOME (all flag orderings)
-            (Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+~/").unwrap(), "rm -rf ~"),
-            (Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+\$HOME").unwrap(), "rm -rf $HOME"),
+            (
+                Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+~/").unwrap(),
+                "rm -rf ~",
+            ),
+            (
+                Regex::new(r"rm\s+(-rf|-fr|-r\s+-f|-f\s+-r)\s+\$HOME").unwrap(),
+                "rm -rf $HOME",
+            ),
             (
                 Regex::new(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:?\s*&\s*\}\s*;\s*:").unwrap(),
                 "fork bomb",
@@ -173,7 +179,7 @@ mod tests {
     #[case::rm_rf_trailing_space("rm -rf / ", true)]
     #[case::sudo_rm_rf("sudo rm -rf /", true)]
     #[case::rm_rf_no_preserve("rm -rf --no-preserve-root /", true)]
-    #[case::rm_rf_build( "rm -rf build/", false)]
+    #[case::rm_rf_build("rm -rf build/", false)]
     #[case::rm_rf_target("rm -rf ./target", false)]
     #[case::rm_single("rm foo.txt", false)]
     #[case::rm_rf_src("rm -rf src/", false)]
@@ -184,8 +190,8 @@ mod tests {
 
     // ==== rm -rf / 扩展:大写 -R 和 --no-preserve-root 组合 ====
     #[rstest]
-    #[case::rm_Rf_root("rm -Rf /", true)]
-    #[case::rm_fR_root("rm -fR /", true)]
+    #[case::rm_capital_rf_root("rm -Rf /", true)]
+    #[case::rm_f_capital_r_root("rm -fR /", true)]
     #[case::rm_fr_no_preserve("rm -fr --no-preserve-root /", true)]
     #[case::rm_r_f_no_preserve("rm -r -f --no-preserve-root /", true)]
     #[case::rm_f_r_no_preserve("rm -f -r --no-preserve-root /", true)]

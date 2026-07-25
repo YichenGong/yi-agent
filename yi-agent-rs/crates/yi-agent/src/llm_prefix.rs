@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use yi_agent_core::permission::PrefixExtractor;
 use yi_agent_core::Provider;
+use yi_agent_core::permission::PrefixExtractor;
 
 /// LLM-based prefix extractor with a 15-second timeout.
 ///
@@ -62,9 +62,7 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use futures::stream::BoxStream;
-    use yi_agent_core::{
-        ProviderError, ProviderEvent, ProviderRequest, StopReason,
-    };
+    use yi_agent_core::{ProviderError, ProviderEvent, ProviderRequest, StopReason};
 
     /// Mock provider that returns a fixed text response (or an error).
     struct MockProvider {

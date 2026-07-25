@@ -82,14 +82,29 @@ impl HistoryState {
     }
 
     /// Returns info about the most recent unresolved permission request, if any.
-    pub fn pending_permission_info(&self) -> Option<(u64, &str, Option<&str>, &yi_agent_core::permission::PermissionKind)> {
-        self.cells.iter().rev().find_map(|c| {
-            match c {
-                HistoryCell::PermissionRequest { request_id, tool_name, prefix_suggestion, kind, resolved: false, .. } => {
-                    Some((*request_id, tool_name.as_str(), prefix_suggestion.as_deref(), kind))
-                }
-                _ => None,
-            }
+    pub fn pending_permission_info(
+        &self,
+    ) -> Option<(
+        u64,
+        &str,
+        Option<&str>,
+        &yi_agent_core::permission::PermissionKind,
+    )> {
+        self.cells.iter().rev().find_map(|c| match c {
+            HistoryCell::PermissionRequest {
+                request_id,
+                tool_name,
+                prefix_suggestion,
+                kind,
+                resolved: false,
+                ..
+            } => Some((
+                *request_id,
+                tool_name.as_str(),
+                prefix_suggestion.as_deref(),
+                kind,
+            )),
+            _ => None,
         })
     }
 }
@@ -171,7 +186,11 @@ impl HistoryState {
                 });
             }
             AgentEvent::PermissionRequest {
-                request_id, tool_name, tool_input, prefix_suggestion, kind,
+                request_id,
+                tool_name,
+                tool_input,
+                prefix_suggestion,
+                kind,
             } => {
                 let display = format!("{}: {}", tool_name, tool_input);
                 self.push(HistoryCell::PermissionRequest {
@@ -183,10 +202,18 @@ impl HistoryState {
                     resolved: false,
                 });
             }
-            AgentEvent::PermissionResolved { request_id, decision } => {
+            AgentEvent::PermissionResolved {
+                request_id,
+                decision,
+            } => {
                 // Update the corresponding PermissionRequest cell
                 for cell in self.cells.iter_mut() {
-                    if let HistoryCell::PermissionRequest { request_id: rid, resolved, .. } = cell {
+                    if let HistoryCell::PermissionRequest {
+                        request_id: rid,
+                        resolved,
+                        ..
+                    } = cell
+                    {
                         if *rid == request_id {
                             *resolved = true;
                             break;
@@ -386,13 +413,16 @@ mod tests {
     #[test]
     fn push_event_permission_request_creates_cell() {
         let mut s = HistoryState::new();
-        s.push_event(AgentEvent::PermissionRequest {
-            request_id: 1,
-            tool_name: "bash".into(),
-            tool_input: serde_json::json!({"command": "ls"}),
-            prefix_suggestion: Some("ls".into()),
-            kind: yi_agent_core::permission::PermissionKind::Normal,
-        }, 80);
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({"command": "ls"}),
+                prefix_suggestion: Some("ls".into()),
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
         assert_eq!(s.cells.len(), 1);
         assert!(matches!(s.cells[0], HistoryCell::PermissionRequest { .. }));
     }
@@ -400,14 +430,23 @@ mod tests {
     #[test]
     fn push_event_permission_resolved_marks_request() {
         let mut s = HistoryState::new();
-        s.push_event(AgentEvent::PermissionRequest {
-            request_id: 1, tool_name: "bash".into(),
-            tool_input: serde_json::json!({}), prefix_suggestion: None,
-            kind: yi_agent_core::permission::PermissionKind::Normal,
-        }, 80);
-        s.push_event(AgentEvent::PermissionResolved {
-            request_id: 1, decision: yi_agent_core::permission::Decision::AllowOnce,
-        }, 80);
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
+        s.push_event(
+            AgentEvent::PermissionResolved {
+                request_id: 1,
+                decision: yi_agent_core::permission::Decision::AllowOnce,
+            },
+            80,
+        );
         match &s.cells[0] {
             HistoryCell::PermissionRequest { resolved, .. } => assert!(*resolved),
             _ => panic!("expected PermissionRequest"),
@@ -417,11 +456,16 @@ mod tests {
     #[test]
     fn pending_permission_info_returns_unresolved() {
         let mut s = HistoryState::new();
-        s.push_event(AgentEvent::PermissionRequest {
-            request_id: 5, tool_name: "bash".into(),
-            tool_input: serde_json::json!({}), prefix_suggestion: Some("git".into()),
-            kind: yi_agent_core::permission::PermissionKind::Normal,
-        }, 80);
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 5,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({}),
+                prefix_suggestion: Some("git".into()),
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
         let info = s.pending_permission_info();
         assert!(info.is_some());
         let (id, name, prefix, _) = info.unwrap();
@@ -433,14 +477,23 @@ mod tests {
     #[test]
     fn pending_permission_info_none_when_resolved() {
         let mut s = HistoryState::new();
-        s.push_event(AgentEvent::PermissionRequest {
-            request_id: 1, tool_name: "bash".into(),
-            tool_input: serde_json::json!({}), prefix_suggestion: None,
-            kind: yi_agent_core::permission::PermissionKind::Normal,
-        }, 80);
-        s.push_event(AgentEvent::PermissionResolved {
-            request_id: 1, decision: yi_agent_core::permission::Decision::AllowOnce,
-        }, 80);
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
+        s.push_event(
+            AgentEvent::PermissionResolved {
+                request_id: 1,
+                decision: yi_agent_core::permission::Decision::AllowOnce,
+            },
+            80,
+        );
         assert!(s.pending_permission_info().is_none());
     }
 }

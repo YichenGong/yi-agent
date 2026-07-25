@@ -239,7 +239,9 @@ fn handle_key(
     popup: &mut Option<CommandPopup>,
 ) -> KeyOutcome {
     // Check if there's a pending permission request
-    if let Some((request_id, _tool_name, prefix_suggestion, kind)) = history.pending_permission_info() {
+    if let Some((request_id, _tool_name, prefix_suggestion, kind)) =
+        history.pending_permission_info()
+    {
         // Allow quit keys to pass through even when permission is pending
         let is_quit_key = matches!(key.code, KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL)
             || matches!(key.code, KeyCode::Esc);
@@ -249,11 +251,14 @@ fn handle_key(
             let decision = match key.code {
                 KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
                 KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
-                KeyCode::Char('3') => prefix_suggestion.map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
+                KeyCode::Char('3') => prefix_suggestion
+                    .map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
                 KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
                 KeyCode::Enter => {
                     let default = match kind {
-                        yi_agent_core::permission::PermissionKind::Blacklisted(_) => yi_agent_core::permission::Decision::Deny,
+                        yi_agent_core::permission::PermissionKind::Blacklisted(_) => {
+                            yi_agent_core::permission::Decision::Deny
+                        }
                         _ => yi_agent_core::permission::Decision::AllowOnce,
                     };
                     Some(default)
@@ -727,7 +732,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Ctrl+C then Ctrl+Q: if first Ctrl+C quit, Ctrl+Q would be unreachable.
@@ -767,7 +773,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let events = Rc::new(RefCell::new(vec![
@@ -800,7 +807,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // First Esc alone should not quit
@@ -834,7 +842,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
@@ -868,7 +877,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Script: type "hi", then Ctrl+Q to quit (don't submit, so input stays on screen)
@@ -920,7 +930,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type 30 'a's into a 20-column terminal. "> aa..." takes 3 cols for
@@ -974,7 +985,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type 10 '你's (each 2 cells wide = 20 cells total) into 20-col
@@ -1065,7 +1077,8 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Send an assistant message before starting
@@ -1120,7 +1133,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', then Ctrl+Q to quit
@@ -1165,7 +1179,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', 'c', 'l', then Ctrl+Q
@@ -1203,7 +1218,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', 'c', 'l', Tab, then Ctrl+Q
@@ -1247,7 +1263,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', 'q', 'u', 'i', 't', Enter — /quit should exit the loop.
@@ -1293,7 +1310,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', Esc, then Ctrl+Q
@@ -1340,7 +1358,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', Down (move to 2nd item), Tab (complete), Ctrl+Q
@@ -1383,7 +1402,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/foo', Enter, then Ctrl+Q to quit
@@ -1433,7 +1453,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type '/', space, then Ctrl+Q
@@ -1472,7 +1493,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type "abc" — cursor should be at position 3 (after 'c').
@@ -1523,7 +1545,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Just quit — no input typed. The input row should still show a cursor.
@@ -1566,7 +1589,8 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (decision_tx, _decision_rx) = tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type "abc", move left to position 2 (between 'b' and 'c').
@@ -1696,14 +1720,17 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        agent_tx.try_send(make_permission_request_normal(1)).unwrap();
+        agent_tx
+            .try_send(make_permission_request_normal(1))
+            .unwrap();
         resolve_permission_after_delay(agent_tx, 1);
 
         // Events are LIFO: '1' is processed first, then scripted events run out
         // and ScriptedThenQuitEvents returns Ctrl+Q forever.
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::NONE,
+        ))]));
         let source = ScriptedThenQuitEvents { events };
 
         run_tui_with_backend_and_events(
@@ -1736,12 +1763,15 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        agent_tx.try_send(make_permission_request_normal(2)).unwrap();
+        agent_tx
+            .try_send(make_permission_request_normal(2))
+            .unwrap();
         resolve_permission_after_delay(agent_tx, 2);
 
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('2'),
+            KeyModifiers::NONE,
+        ))]));
         let source = ScriptedThenQuitEvents { events };
 
         run_tui_with_backend_and_events(
@@ -1774,12 +1804,15 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        agent_tx.try_send(make_permission_request_normal(3)).unwrap();
+        agent_tx
+            .try_send(make_permission_request_normal(3))
+            .unwrap();
         resolve_permission_after_delay(agent_tx, 3);
 
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+        ))]));
         let source = ScriptedThenQuitEvents { events };
 
         run_tui_with_backend_and_events(
@@ -1796,7 +1829,10 @@ mod tests {
         let decision = decision_rx.blocking_recv();
         assert_eq!(
             decision,
-            Some((3, yi_agent_core::permission::Decision::AlwaysAllowPrefix("ls".into())))
+            Some((
+                3,
+                yi_agent_core::permission::Decision::AlwaysAllowPrefix("ls".into())
+            ))
         );
     }
 
@@ -1812,12 +1848,15 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        agent_tx.try_send(make_permission_request_normal(4)).unwrap();
+        agent_tx
+            .try_send(make_permission_request_normal(4))
+            .unwrap();
         resolve_permission_after_delay(agent_tx, 4);
 
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('4'),
+            KeyModifiers::NONE,
+        ))]));
         let source = ScriptedThenQuitEvents { events };
 
         run_tui_with_backend_and_events(
@@ -1850,12 +1889,15 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        agent_tx.try_send(make_permission_request_normal(5)).unwrap();
+        agent_tx
+            .try_send(make_permission_request_normal(5))
+            .unwrap();
         resolve_permission_after_delay(agent_tx, 5);
 
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))]));
         let source = ScriptedThenQuitEvents { events };
 
         run_tui_with_backend_and_events(
@@ -1893,9 +1935,10 @@ mod tests {
             .unwrap();
         resolve_permission_after_delay(agent_tx, 6);
 
-        let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        ]));
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))]));
         let source = ScriptedThenQuitEvents { events };
 
         run_tui_with_backend_and_events(
@@ -1963,7 +2006,10 @@ mod tests {
             Some((7, yi_agent_core::permission::Decision::AllowOnce))
         );
         // No further decisions
-        assert!(decision_rx.try_recv().is_err(), "should only have one decision");
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "should only have one decision"
+        );
     }
 
     /// Typing 'a' while a permission is pending should be ignored:
@@ -1980,7 +2026,9 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        agent_tx.try_send(make_permission_request_normal(8)).unwrap();
+        agent_tx
+            .try_send(make_permission_request_normal(8))
+            .unwrap();
         resolve_permission_after_delay(agent_tx, 8);
 
         // Events (LIFO): 'a' (should be ignored), then '1' (resolves permission)

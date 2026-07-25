@@ -203,7 +203,11 @@ impl Renderer for InlineRenderer {
         self.finish_streaming_line();
 
         // Print request header
-        let tool_line = format!("{}: {}", req.tool_name, Self::summarize_input(&req.tool_input));
+        let tool_line = format!(
+            "{}: {}",
+            req.tool_name,
+            Self::summarize_input(&req.tool_input)
+        );
         let blacklisted_line = match &req.kind {
             PermissionKind::Blacklisted(reason) => format!("(blacklisted: {reason})"),
             PermissionKind::Normal => String::new(),
@@ -221,7 +225,11 @@ impl Renderer for InlineRenderer {
         self.send_line("[4] Deny");
         self.send_line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-        let default = if matches!(req.kind, PermissionKind::Blacklisted(_)) { 4 } else { 1 };
+        let default = if matches!(req.kind, PermissionKind::Blacklisted(_)) {
+            4
+        } else {
+            1
+        };
         let prompt = format!("Choice (1-4) [default: {default}]: ");
         self.send_line(&prompt);
 

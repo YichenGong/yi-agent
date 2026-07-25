@@ -50,7 +50,8 @@ fn discover_one(root: &SkillRoot, out: &mut Vec<SkillMetadata>) {
         if entry_count > MAX_ENTRIES {
             tracing::warn!(
                 "skill discovery: root {} exceeded max entries ({}), stopping",
-                root.path.display(), MAX_ENTRIES
+                root.path.display(),
+                MAX_ENTRIES
             );
             break;
         }
@@ -60,7 +61,8 @@ fn discover_one(root: &SkillRoot, out: &mut Vec<SkillMetadata>) {
             if dir_count > MAX_DIRS {
                 tracing::warn!(
                     "skill discovery: root {} exceeded max dirs ({}), stopping",
-                    root.path.display(), MAX_DIRS
+                    root.path.display(),
+                    MAX_DIRS
                 );
                 break;
             }
@@ -84,7 +86,9 @@ fn load_skill_file(path: &Path, scope: SkillScope) -> Result<SkillMetadata, Skil
 }
 
 fn is_hidden(name: &std::ffi::OsStr) -> bool {
-    name.to_str().map(|s| s.starts_with('.') && s != ".").unwrap_or(false)
+    name.to_str()
+        .map(|s| s.starts_with('.') && s != ".")
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -100,7 +104,8 @@ mod tests {
         fs::write(
             &skill_md,
             format!("---\nname: {name}\ndescription: {desc}\n---\nbody"),
-        ).unwrap();
+        )
+        .unwrap();
         skill_md
     }
 
@@ -108,7 +113,10 @@ mod tests {
     fn single_root_single_skill() {
         let tmp = TempDir::new().unwrap();
         make_skill(tmp.path(), "foo", "A foo skill.");
-        let roots = vec![SkillRoot { path: tmp.path().to_path_buf(), scope: SkillScope::User }];
+        let roots = vec![SkillRoot {
+            path: tmp.path().to_path_buf(),
+            scope: SkillScope::User,
+        }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "foo");
@@ -119,7 +127,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         make_skill(tmp.path(), "foo", "Foo.");
         make_skill(tmp.path(), "bar", "Bar.");
-        let roots = vec![SkillRoot { path: tmp.path().to_path_buf(), scope: SkillScope::User }];
+        let roots = vec![SkillRoot {
+            path: tmp.path().to_path_buf(),
+            scope: SkillScope::User,
+        }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 2);
     }
@@ -132,8 +143,12 @@ mod tests {
         fs::write(
             nested.join("SKILL.md"),
             "---\nname: nested\ndescription: nested.\n---\nbody",
-        ).unwrap();
-        let roots = vec![SkillRoot { path: tmp.path().to_path_buf(), scope: SkillScope::Project }];
+        )
+        .unwrap();
+        let roots = vec![SkillRoot {
+            path: tmp.path().to_path_buf(),
+            scope: SkillScope::Project,
+        }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "nested");
@@ -147,8 +162,12 @@ mod tests {
         fs::write(
             hidden.join("SKILL.md"),
             "---\nname: hidden\ndescription: hidden.\n---\nbody",
-        ).unwrap();
-        let roots = vec![SkillRoot { path: tmp.path().to_path_buf(), scope: SkillScope::User }];
+        )
+        .unwrap();
+        let roots = vec![SkillRoot {
+            path: tmp.path().to_path_buf(),
+            scope: SkillScope::User,
+        }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 0);
     }
@@ -169,10 +188,17 @@ mod tests {
         // invalid: bad name
         let bad_dir = tmp.path().join("bad");
         fs::create_dir_all(&bad_dir).unwrap();
-        fs::write(bad_dir.join("SKILL.md"), "---\nname: Bad_Name\ndescription: x\n---\nbody").unwrap();
+        fs::write(
+            bad_dir.join("SKILL.md"),
+            "---\nname: Bad_Name\ndescription: x\n---\nbody",
+        )
+        .unwrap();
         // valid
         make_skill(tmp.path(), "good", "Good.");
-        let roots = vec![SkillRoot { path: tmp.path().to_path_buf(), scope: SkillScope::User }];
+        let roots = vec![SkillRoot {
+            path: tmp.path().to_path_buf(),
+            scope: SkillScope::User,
+        }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "good");
@@ -181,7 +207,10 @@ mod tests {
     #[test]
     fn empty_root_no_skills() {
         let tmp = TempDir::new().unwrap();
-        let roots = vec![SkillRoot { path: tmp.path().to_path_buf(), scope: SkillScope::User }];
+        let roots = vec![SkillRoot {
+            path: tmp.path().to_path_buf(),
+            scope: SkillScope::User,
+        }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 0);
     }
@@ -192,7 +221,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let file_path = tmp.path().join("notadir");
         fs::write(&file_path, "hello").unwrap();
-        let roots = vec![SkillRoot { path: file_path, scope: SkillScope::User }];
+        let roots = vec![SkillRoot {
+            path: file_path,
+            scope: SkillScope::User,
+        }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 0);
     }

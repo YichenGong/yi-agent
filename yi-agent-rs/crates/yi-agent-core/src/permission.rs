@@ -167,7 +167,12 @@ impl PermissionChecker {
                 let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) else {
                     return false;
                 };
-                config.prefix_level.bash.prefixes.iter().any(|p| cmd.starts_with(p))
+                config
+                    .prefix_level
+                    .bash
+                    .prefixes
+                    .iter()
+                    .any(|p| cmd.starts_with(p))
             }
             "write" | "edit" => {
                 let Some(path) = tool_input.get("path").and_then(|v| v.as_str()) else {
@@ -222,7 +227,10 @@ impl PermissionChecker {
     ) -> Result<(), String> {
         // 黑名单命令不可持久化到白名单
         if matches!(kind, PermissionKind::Blacklisted(_))
-            && matches!(decision, Decision::AlwaysAllowTool | Decision::AlwaysAllowPrefix(_))
+            && matches!(
+                decision,
+                Decision::AlwaysAllowTool | Decision::AlwaysAllowPrefix(_)
+            )
         {
             return Err("blacklisted commands cannot be added to whitelist".to_string());
         }
@@ -241,20 +249,14 @@ impl PermissionChecker {
             Decision::AlwaysAllowPrefix(prefix) => {
                 let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 match tool_name {
-                    "bash" => {
-                        if !config.prefix_level.bash.prefixes.contains(prefix) {
-                            config.prefix_level.bash.prefixes.push(prefix.clone());
-                        }
+                    "bash" if !config.prefix_level.bash.prefixes.contains(prefix) => {
+                        config.prefix_level.bash.prefixes.push(prefix.clone());
                     }
-                    "write" => {
-                        if !config.prefix_level.write.paths.contains(prefix) {
-                            config.prefix_level.write.paths.push(prefix.clone());
-                        }
+                    "write" if !config.prefix_level.write.paths.contains(prefix) => {
+                        config.prefix_level.write.paths.push(prefix.clone());
                     }
-                    "edit" => {
-                        if !config.prefix_level.edit.paths.contains(prefix) {
-                            config.prefix_level.edit.paths.push(prefix.clone());
-                        }
+                    "edit" if !config.prefix_level.edit.paths.contains(prefix) => {
+                        config.prefix_level.edit.paths.push(prefix.clone());
                     }
                     _ => {}
                 }
@@ -498,10 +500,7 @@ bash = true
         };
         let checker = checker_with(config, false);
         let input = serde_json::json!({"path": "src/main.rs", "content": "x"});
-        assert!(matches!(
-            checker.check("write", &input),
-            CheckResult::Allow
-        ));
+        assert!(matches!(checker.check("write", &input), CheckResult::Allow));
         let input2 = serde_json::json!({"path": "tests/foo.rs", "content": "x"});
         assert!(matches!(
             checker.check("write", &input2),
@@ -531,34 +530,43 @@ bash = true
         };
         let checker = checker_with(config, false);
         let input = serde_json::json!({"path": "src/lib.rs", "old_string": "a", "new_string": "b"});
-        assert!(matches!(
-            checker.check("edit", &input),
-            CheckResult::Allow
-        ));
+        assert!(matches!(checker.check("edit", &input), CheckResult::Allow));
     }
 
     #[test]
     fn check_bash_missing_command_field() {
         let checker = checker_with(PermissionsConfig::default(), false);
-        assert!(matches!(checker.check("bash", &serde_json::json!({})), CheckResult::NeedConfirm(_)));
+        assert!(matches!(
+            checker.check("bash", &serde_json::json!({})),
+            CheckResult::NeedConfirm(_)
+        ));
     }
 
     #[test]
     fn check_bash_non_string_command() {
         let checker = checker_with(PermissionsConfig::default(), false);
-        assert!(matches!(checker.check("bash", &serde_json::json!({"command": 42})), CheckResult::NeedConfirm(_)));
+        assert!(matches!(
+            checker.check("bash", &serde_json::json!({"command": 42})),
+            CheckResult::NeedConfirm(_)
+        ));
     }
 
     #[test]
     fn check_write_missing_path_field() {
         let checker = checker_with(PermissionsConfig::default(), false);
-        assert!(matches!(checker.check("write", &serde_json::json!({})), CheckResult::NeedConfirm(_)));
+        assert!(matches!(
+            checker.check("write", &serde_json::json!({})),
+            CheckResult::NeedConfirm(_)
+        ));
     }
 
     #[test]
     fn check_write_non_string_path() {
         let checker = checker_with(PermissionsConfig::default(), false);
-        assert!(matches!(checker.check("write", &serde_json::json!({"path": 123})), CheckResult::NeedConfirm(_)));
+        assert!(matches!(
+            checker.check("write", &serde_json::json!({"path": 123})),
+            CheckResult::NeedConfirm(_)
+        ));
     }
 
     #[test]
@@ -575,10 +583,7 @@ bash = true
         let checker = checker_with(config, false);
         // 绝对路径 /tmp/src/foo.rs,strip_prefix(/tmp) 后 = src/foo.rs,匹配 src/**
         let input = serde_json::json!({"path": "/tmp/src/foo.rs", "content": "x"});
-        assert!(matches!(
-            checker.check("write", &input),
-            CheckResult::Allow
-        ));
+        assert!(matches!(checker.check("write", &input), CheckResult::Allow));
     }
 
     #[tokio::test]
@@ -587,7 +592,12 @@ bash = true
         let workdir = tmpdir.path().to_path_buf();
 
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         checker
             .apply_decision("bash", &Decision::AlwaysAllowTool, &PermissionKind::Normal)
@@ -605,15 +615,27 @@ bash = true
         let workdir = tmpdir.path().to_path_buf();
 
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         checker
-            .apply_decision("bash", &Decision::AlwaysAllowPrefix("git push".to_string()), &PermissionKind::Normal)
+            .apply_decision(
+                "bash",
+                &Decision::AlwaysAllowPrefix("git push".to_string()),
+                &PermissionKind::Normal,
+            )
             .await
             .unwrap();
 
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
-        assert_eq!(loaded.prefix_level.bash.prefixes, vec!["git push".to_string()]);
+        assert_eq!(
+            loaded.prefix_level.bash.prefixes,
+            vec!["git push".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -622,7 +644,12 @@ bash = true
         let workdir = tmpdir.path().to_path_buf();
 
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         checker
             .apply_decision("bash", &Decision::AllowOnce, &PermissionKind::Normal)
@@ -640,7 +667,12 @@ bash = true
         let workdir = tmpdir.path().to_path_buf();
 
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         checker
             .apply_decision("bash", &Decision::Deny, &PermissionKind::Normal)
@@ -657,7 +689,12 @@ bash = true
         let workdir = tmpdir.path().to_path_buf();
 
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         checker
             .apply_decision("write", &Decision::AlwaysAllowTool, &PermissionKind::Normal)
@@ -675,10 +712,19 @@ bash = true
         let workdir = tmpdir.path().to_path_buf();
 
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         checker
-            .apply_decision("edit", &Decision::AlwaysAllowPrefix("src/**".to_string()), &PermissionKind::Normal)
+            .apply_decision(
+                "edit",
+                &Decision::AlwaysAllowPrefix("src/**".to_string()),
+                &PermissionKind::Normal,
+            )
             .await
             .unwrap();
 
@@ -691,13 +737,21 @@ bash = true
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().to_path_buf();
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
         let result = checker
             .apply_decision("bash", &Decision::AlwaysAllowTool, &kind)
             .await;
-        assert!(result.is_err(), "AlwaysAllowTool on blacklisted should be rejected");
+        assert!(
+            result.is_err(),
+            "AlwaysAllowTool on blacklisted should be rejected"
+        );
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
         assert!(!loaded.tool_level.bash, "should not persist");
     }
@@ -707,15 +761,30 @@ bash = true
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().to_path_buf();
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
         let result = checker
-            .apply_decision("bash", &Decision::AlwaysAllowPrefix("rm".to_string()), &kind)
+            .apply_decision(
+                "bash",
+                &Decision::AlwaysAllowPrefix("rm".to_string()),
+                &kind,
+            )
             .await;
-        assert!(result.is_err(), "AlwaysAllowPrefix on blacklisted should be rejected");
+        assert!(
+            result.is_err(),
+            "AlwaysAllowPrefix on blacklisted should be rejected"
+        );
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
-        assert!(loaded.prefix_level.bash.prefixes.is_empty(), "should not persist");
+        assert!(
+            loaded.prefix_level.bash.prefixes.is_empty(),
+            "should not persist"
+        );
     }
 
     #[tokio::test]
@@ -723,13 +792,21 @@ bash = true
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().to_path_buf();
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
         let result = checker
             .apply_decision("bash", &Decision::AllowOnce, &kind)
             .await;
-        assert!(result.is_ok(), "AllowOnce on blacklisted should be allowed (not persisted)");
+        assert!(
+            result.is_ok(),
+            "AllowOnce on blacklisted should be allowed (not persisted)"
+        );
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
         assert!(!loaded.tool_level.bash, "AllowOnce should not persist");
     }
@@ -739,12 +816,15 @@ bash = true
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().to_path_buf();
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
-        let result = checker
-            .apply_decision("bash", &Decision::Deny, &kind)
-            .await;
+        let result = checker.apply_decision("bash", &Decision::Deny, &kind).await;
         assert!(result.is_ok(), "Deny on blacklisted should be allowed");
     }
 
@@ -753,7 +833,12 @@ bash = true
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().to_path_buf();
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         let kind = PermissionKind::Normal;
         checker
@@ -761,7 +846,10 @@ bash = true
             .await
             .unwrap();
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
-        assert!(loaded.tool_level.bash, "Normal AlwaysAllowTool should persist");
+        assert!(
+            loaded.tool_level.bash,
+            "Normal AlwaysAllowTool should persist"
+        );
     }
 
     #[tokio::test]
@@ -778,7 +866,9 @@ bash = true
 
         let config = PermissionsConfig {
             prefix_level: PrefixLevelConfig {
-                bash: BashPrefixConfig { prefixes: vec!["git push".to_string()] },
+                bash: BashPrefixConfig {
+                    prefixes: vec!["git push".to_string()],
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -788,12 +878,20 @@ bash = true
 
         // Apply same prefix again
         checker
-            .apply_decision("bash", &Decision::AlwaysAllowPrefix("git push".to_string()), &PermissionKind::Normal)
+            .apply_decision(
+                "bash",
+                &Decision::AlwaysAllowPrefix("git push".to_string()),
+                &PermissionKind::Normal,
+            )
             .await
             .unwrap();
 
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
-        assert_eq!(loaded.prefix_level.bash.prefixes.len(), 1, "should not duplicate existing prefix");
+        assert_eq!(
+            loaded.prefix_level.bash.prefixes.len(),
+            1,
+            "should not duplicate existing prefix"
+        );
     }
 
     #[tokio::test]
@@ -801,7 +899,12 @@ bash = true
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().to_path_buf();
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            workdir.clone(),
+            blocklist,
+        );
 
         checker
             .apply_decision("bash", &Decision::AlwaysAllowTool, &PermissionKind::Normal)
@@ -809,7 +912,10 @@ bash = true
             .unwrap();
 
         let tmp = workdir.join(".yi-agent").join("permissions.toml.tmp");
-        assert!(!tmp.exists(), "tmp file should not remain after atomic write");
+        assert!(
+            !tmp.exists(),
+            "tmp file should not remain after atomic write"
+        );
         let final_path = workdir.join(".yi-agent").join("permissions.toml");
         assert!(final_path.exists());
     }
@@ -822,8 +928,14 @@ bash = true
 
     #[test]
     fn fallback_prefix_with_subcommand() {
-        assert_eq!(fallback_prefix("git push origin main"), Some("git push".to_string()));
-        assert_eq!(fallback_prefix("cargo run --release"), Some("cargo run".to_string()));
+        assert_eq!(
+            fallback_prefix("git push origin main"),
+            Some("git push".to_string())
+        );
+        assert_eq!(
+            fallback_prefix("cargo run --release"),
+            Some("cargo run".to_string())
+        );
     }
 
     #[test]
@@ -834,7 +946,10 @@ bash = true
 
     #[test]
     fn fallback_prefix_pipe() {
-        assert_eq!(fallback_prefix("git status | grep foo"), Some("git status".to_string()));
+        assert_eq!(
+            fallback_prefix("git status | grep foo"),
+            Some("git status".to_string())
+        );
     }
 
     #[test]
@@ -869,7 +984,10 @@ bash = true
             std::path::PathBuf::from("/tmp"),
             blocklist,
         );
-        let result = checker.check("write", &serde_json::json!({"path": "a.rs", "content": "x"}));
+        let result = checker.check(
+            "write",
+            &serde_json::json!({"path": "a.rs", "content": "x"}),
+        );
         if let CheckResult::NeedConfirm(req) = result {
             assert_eq!(req.prefix_suggestion, None);
         } else {

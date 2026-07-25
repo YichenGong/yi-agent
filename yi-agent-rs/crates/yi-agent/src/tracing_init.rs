@@ -122,11 +122,11 @@ mod tests {
     fn days_to_ymd_known_dates() {
         // (unix_days, expected_year, expected_month, expected_day)
         let cases: &[(i64, i64, u32, u32)] = &[
-            (0, 1970, 1, 1),       // epoch
+            (0, 1970, 1, 1),                      // epoch
             (days_for(2026, 7, 25), 2026, 7, 25), // 触发 bug 的日期(修复前会得到 7/30)
             (days_for(2000, 2, 29), 2000, 2, 29), // 闰日
             (days_for(1999, 12, 31), 1999, 12, 31),
-            (days_for(2100, 3, 1), 2100, 3, 1),   // 非闰年的世纪年
+            (days_for(2100, 3, 1), 2100, 3, 1), // 非闰年的世纪年
             (days_for(1970, 1, 31), 1970, 1, 31),
             (days_for(2024, 12, 31), 2024, 12, 31),
         ];

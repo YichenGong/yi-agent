@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use sha2::{Digest, Sha256};
 
 static ASSETS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/assets");
@@ -16,7 +16,12 @@ pub fn install_system_skills(cache_root: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(cache_root)?;
 
     for entry in ASSETS_DIR.dirs() {
-        let name = entry.path().file_name().unwrap().to_string_lossy().to_string();
+        let name = entry
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let target_dir = cache_root.join(&name);
         std::fs::create_dir_all(&target_dir)?;
         write_dir_recursive(entry, &target_dir)?;
@@ -43,7 +48,12 @@ fn write_dir_recursive(dir: &Dir, target: &Path) -> std::io::Result<()> {
         std::fs::write(&dest, content)?;
     }
     for sub in dir.dirs() {
-        let sub_name = sub.path().file_name().unwrap().to_string_lossy().to_string();
+        let sub_name = sub
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         write_dir_recursive(sub, &target.join(sub_name))?;
     }
     Ok(())

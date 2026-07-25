@@ -15,6 +15,9 @@ use crate::tool::{ToolRegistry, ToolResult};
 
 use tracing::{Instrument, info, info_span, warn};
 
+/// Shared decision channel used to gate tool execution behind user confirmation.
+type DecisionRx = Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>;
+
 /// In-memory message container. No persistence.
 #[derive(Debug, Clone, Default)]
 pub struct Session {
@@ -103,8 +106,7 @@ pub struct Agent {
     config: AgentConfig,
     cancel_token: CancellationToken,
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
-    decision_rx:
-        Option<Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>>,
+    decision_rx: Option<DecisionRx>,
 }
 
 /// Events emitted during agent loop.
@@ -180,9 +182,7 @@ impl Agent {
     pub fn with_permission(
         mut self,
         checker: Arc<crate::permission::PermissionChecker>,
-        decision_rx: Arc<
-            tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>,
-        >,
+        decision_rx: DecisionRx,
     ) -> Self {
         self.permission_checker = Some(checker);
         self.decision_rx = Some(decision_rx);
@@ -243,6 +243,7 @@ impl Agent {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: mpsc::Sender<AgentEvent>,
     provider: Arc<dyn Provider>,
@@ -251,7 +252,7 @@ async fn run_loop(
     config: AgentConfig,
     cancel_token: CancellationToken,
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
-    decision_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>>,
+    decision_rx: Option<DecisionRx>,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
@@ -401,10 +402,8 @@ async fn run_loop(
                             .await
                             {
                                 Some((id, name, input)) => checked_uses.push((id, name, input)),
-                                None => denied_results.push((
-                                    id_clone,
-                                    ToolResult::error("user denied"),
-                                )),
+                                None => denied_results
+                                    .push((id_clone, ToolResult::error("user denied"))),
                             }
                         } else {
                             // No decision channel - deny by default
@@ -551,7 +550,7 @@ async fn run_loop(
 /// Discards any mismatched messages (defensive) and returns `Deny` if the
 /// channel is closed or the cancel token is triggered.
 async fn wait_for_decision(
-    decision_rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>,
+    decision_rx: &DecisionRx,
     expected_id: u64,
     cancel_token: &tokio_util::sync::CancellationToken,
 ) -> crate::permission::Decision {
@@ -572,10 +571,11 @@ async fn wait_for_decision(
 /// Handles a permission request that needs user confirmation (NeedConfirm or Blacklisted).
 /// Sends PermissionRequest event, waits for decision, sends PermissionResolved event.
 /// Returns Some((id, name, input)) if user allows execution, None if user denies.
+#[allow(clippy::too_many_arguments)]
 async fn handle_confirmation(
     tx: &mpsc::Sender<AgentEvent>,
     checker: &Arc<crate::permission::PermissionChecker>,
-    decision_rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>,
+    decision_rx: &DecisionRx,
     cancel_token: &tokio_util::sync::CancellationToken,
     id: String,
     name: String,
@@ -606,10 +606,7 @@ async fn handle_confirmation(
         crate::permission::Decision::AllowOnce
         | crate::permission::Decision::AlwaysAllowTool
         | crate::permission::Decision::AlwaysAllowPrefix(_) => {
-            if let Err(e) = checker
-                .apply_decision(&name, &decision, &req.kind)
-                .await
-            {
+            if let Err(e) = checker.apply_decision(&name, &decision, &req.kind).await {
                 tracing::warn!("failed to persist permission decision: {e}");
             }
             Some((id, name, input))
@@ -1509,8 +1506,7 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));
-        let (_decision_tx, decision_rx) =
-            mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let (_decision_tx, decision_rx) = mpsc::channel::<(u64, crate::permission::Decision)>(16);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
         let provider = ScriptedProvider::new(vec![
@@ -1569,8 +1565,7 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));
-        let (decision_tx, decision_rx) =
-            mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, crate::permission::Decision)>(16);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
         let provider = ScriptedProvider::new(vec![
@@ -1652,8 +1647,7 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));
-        let (decision_tx, decision_rx) =
-            mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, crate::permission::Decision)>(16);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
         let provider = ScriptedProvider::new(vec![

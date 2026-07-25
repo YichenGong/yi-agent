@@ -52,9 +52,8 @@ fn run_agent(cli: Cli) -> Result<()> {
         rt.block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
             .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
     };
-    let blocklist_fn: yi_agent_core::permission::BlocklistFn = Arc::new(|cmd: &str| {
-        yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string())
-    });
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
     let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
         permissions,
         yolo,
@@ -303,9 +302,18 @@ fn setup_skills(config: &config::Config) -> Result<Option<Arc<yi_agent_skills::S
     }
 
     let roots = vec![
-        (config.workdir.join(".yi-agent/skills"), yi_agent_skills::SkillScope::Project),
-        (home.join(".yi-agent/skills"), yi_agent_skills::SkillScope::User),
-        (home.join(".yi-agent/skills/.system"), yi_agent_skills::SkillScope::System),
+        (
+            config.workdir.join(".yi-agent/skills"),
+            yi_agent_skills::SkillScope::Project,
+        ),
+        (
+            home.join(".yi-agent/skills"),
+            yi_agent_skills::SkillScope::User,
+        ),
+        (
+            home.join(".yi-agent/skills/.system"),
+            yi_agent_skills::SkillScope::System,
+        ),
     ];
 
     let service = Arc::new(yi_agent_skills::SkillsService::new(roots));
@@ -329,7 +337,9 @@ fn resolve_system_prompt_with_skills(
     budget_explicit: bool,
 ) -> Option<String> {
     let base = resolve_system_prompt(user);
-    let Some(svc) = service else { return base; };
+    let Some(svc) = service else {
+        return base;
+    };
 
     let total = svc.full_catalog_size();
     let effective_budget = resolve_effective_budget(total, budget, budget_explicit);
@@ -512,12 +522,7 @@ mod tests {
         // should return the base prompt unchanged (with current date appended).
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
         let expected = resolve_system_prompt(None);
-        let resolved = resolve_system_prompt_with_skills(
-            None,
-            &Some(svc),
-            8192,
-            false,
-        );
+        let resolved = resolve_system_prompt_with_skills(None, &Some(svc), 8192, false);
         assert_eq!(resolved, expected);
     }
 }
