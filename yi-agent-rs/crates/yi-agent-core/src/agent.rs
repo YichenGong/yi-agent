@@ -136,6 +136,9 @@ pub enum AgentEvent {
         id: String,
     },
     Usage(TokenUsage),
+    /// Heuristic estimate of prefill (input) tokens, emitted before the
+    /// provider returns real usage. Lets the status bar show activity.
+    EstimatedPrefill(u32),
     Done {
         reason: DoneReason,
     },
@@ -330,6 +333,11 @@ async fn run_loop(
             tools: tools.schemas(),
             params: config.gen_params.clone(),
         };
+        // Emit a heuristic prefill estimate so the status bar shows activity
+        // before the provider returns real usage (OpenAI-compatible APIs only
+        // send usage at stream end).
+        let prefill_estimate = estimate_prefill_tokens(&req);
+        let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
         let stream = match provider.call_stream(req).await {
             Ok(s) => s,
@@ -723,6 +731,45 @@ async fn accumulate_provider_stream(
         })
         .await?;
     Ok((content, stop_reason))
+}
+
+/// Heuristic token estimate: ASCII ~4 chars/token, non-ASCII (CJK etc.) ~1.5 chars/token.
+fn estimate_tokens(text: &str) -> u32 {
+    let mut ascii = 0u32;
+    let mut non_ascii = 0u32;
+    for c in text.chars() {
+        if (c as u32) < 0x80 {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    (ascii as f32 / 4.0 + non_ascii as f32 / 1.5) as u32
+}
+
+/// Estimate prefill tokens from the full request (system + all messages).
+fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
+    let mut total = req.system.as_deref().map(estimate_tokens).unwrap_or(0);
+    for msg in &req.messages {
+        for block in &msg.content {
+            match block {
+                crate::message::ContentBlock::Text(t) => total += estimate_tokens(t),
+                crate::message::ContentBlock::ToolUse { name, input, .. } => {
+                    total += estimate_tokens(name);
+                    total += estimate_tokens(&input.to_string());
+                }
+                crate::message::ContentBlock::ToolResult { content, .. } => {
+                    for b in content {
+                        if let crate::message::ContentBlock::Text(t) = b {
+                            total += estimate_tokens(t);
+                        }
+                    }
+                }
+                crate::message::ContentBlock::Image { .. } => {}
+            }
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -1998,5 +2045,28 @@ mod tests {
                 self.0 = value.to_string();
             }
         }
+    }
+
+    #[test]
+    fn estimate_tokens_ascii() {
+        // 8 ASCII chars → 8/4 = 2 tokens
+        assert_eq!(estimate_tokens("hello!!!"), 2);
+    }
+
+    #[test]
+    fn estimate_tokens_cjk() {
+        // 3 CJK chars → 3/1.5 = 2 tokens
+        assert_eq!(estimate_tokens("你好吗"), 2);
+    }
+
+    #[test]
+    fn estimate_tokens_mixed() {
+        // 4 ASCII + 3 CJK → 1 + 2 = 3 tokens
+        assert_eq!(estimate_tokens("hi!!你好吗"), 3);
+    }
+
+    #[test]
+    fn estimate_tokens_empty() {
+        assert_eq!(estimate_tokens(""), 0);
     }
 }

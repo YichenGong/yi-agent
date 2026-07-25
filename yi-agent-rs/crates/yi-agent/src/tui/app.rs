@@ -472,6 +472,12 @@ fn route_event(
         AgentEvent::Usage(u) => {
             statusbar.set_token_target(u.input_tokens as u64, u.output_tokens as u64);
         }
+        AgentEvent::EstimatedPrefill(n) => {
+            statusbar.set_prefill_estimate(*n as u64);
+        }
+        AgentEvent::AssistantText(text) => {
+            statusbar.estimate_decode_tokens(text);
+        }
         _ => {}
     }
 }

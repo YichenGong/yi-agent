@@ -224,8 +224,9 @@ impl HistoryState {
             }
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
-            | AgentEvent::ToolTimeout { .. } => {
-                // Tool streaming events not tracked in history (yet)
+            | AgentEvent::ToolTimeout { .. }
+            | AgentEvent::EstimatedPrefill(_) => {
+                // Tool streaming + estimate events not tracked in history
             }
         }
     }

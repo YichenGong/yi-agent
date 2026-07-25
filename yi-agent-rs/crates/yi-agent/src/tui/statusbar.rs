@@ -25,10 +25,26 @@ impl StatusBarState {
     /// Update the target token counts from a new Usage event.
     /// Targets are monotonic within a call (take the max), since providers
     /// may emit multiple Usage events as the stream progresses.
+    /// Real usage overrides any prior estimate.
     pub fn set_token_target(&mut self, input: u64, output: u64) {
         self.target_input = self.target_input.max(input);
         self.target_output = self.target_output.max(output);
         self.last_usage_time = Some(std::time::Instant::now());
+    }
+
+    /// Set a heuristic prefill estimate (before real usage arrives).
+    /// Lower than a real target so `set_token_target` max still overrides.
+    pub fn set_prefill_estimate(&mut self, input: u64) {
+        if self.last_usage_time.is_none() {
+            self.target_input = self.target_input.max(input);
+        }
+    }
+
+    /// Accumulate decode estimate from streamed text deltas.
+    pub fn estimate_decode_tokens(&mut self, text: &str) {
+        if self.last_usage_time.is_none() {
+            self.target_output = self.target_output.saturating_add(estimate_tokens(text));
+        }
     }
 
     /// Advance interpolation + spinner by one tick. Call at ~30hz.
@@ -78,6 +94,20 @@ impl StatusBarState {
         let (r, g, b) = hsl_to_rgb(h, 0.7, 0.6);
         Color::Rgb(r, g, b)
     }
+}
+
+/// Heuristic token estimate: ASCII ~4 chars/token, non-ASCII (CJK etc.) ~1.5 chars/token.
+fn estimate_tokens(text: &str) -> u64 {
+    let mut ascii = 0u64;
+    let mut non_ascii = 0u64;
+    for c in text.chars() {
+        if (c as u32) < 0x80 {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    (ascii as f32 / 4.0 + non_ascii as f32 / 1.5) as u64
 }
 
 /// HSL → RGB. `h` in [0,1), `s`/`l` in [0,1]. Returns 8-bit channels.
@@ -263,5 +293,47 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("●"), "should show running dot: {text}");
         assert!(text.contains("bash"), "should show tool name: {text}");
+    }
+
+    #[test]
+    fn test_set_prefill_estimate_sets_target() {
+        let mut s = StatusBarState::default();
+        s.set_prefill_estimate(500);
+        assert_eq!(s.target_input, 500);
+    }
+
+    #[test]
+    fn test_prefill_estimate_does_not_override_real_usage() {
+        let mut s = StatusBarState::default();
+        s.set_token_target(1000, 0);
+        // After real usage, estimate should not lower the target
+        s.set_prefill_estimate(500);
+        assert_eq!(s.target_input, 1000, "real usage target should win");
+    }
+
+    #[test]
+    fn test_estimate_decode_accumulates() {
+        let mut s = StatusBarState::default();
+        s.estimate_decode_tokens("hello"); // 5 ascii → 1
+        s.estimate_decode_tokens("world"); // 5 ascii → 1
+        assert_eq!(s.target_output, 2);
+    }
+
+    #[test]
+    fn test_real_usage_overrides_decode_estimate() {
+        let mut s = StatusBarState::default();
+        s.estimate_decode_tokens("hello world"); // ~2 tokens estimated
+        s.set_token_target(0, 100); // real usage: 100
+        assert_eq!(s.target_output, 100, "real usage should override estimate");
+    }
+
+    #[test]
+    fn test_reset_clears_estimates() {
+        let mut s = StatusBarState::default();
+        s.set_prefill_estimate(500);
+        s.estimate_decode_tokens("hi");
+        s.reset_for_new_call();
+        assert_eq!(s.target_input, 0);
+        assert_eq!(s.target_output, 0);
     }
 }
