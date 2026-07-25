@@ -586,7 +586,7 @@ async fn handle_confirmation(
         | crate::permission::Decision::AlwaysAllowTool
         | crate::permission::Decision::AlwaysAllowPrefix(_) => {
             if let Err(e) = checker
-                .apply_decision(&name, &input, &decision, &req.kind)
+                .apply_decision(&name, &decision, &req.kind)
                 .await
             {
                 tracing::warn!("failed to persist permission decision: {e}");

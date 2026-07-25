@@ -217,7 +217,6 @@ impl PermissionChecker {
     pub async fn apply_decision(
         &self,
         tool_name: &str,
-        tool_input: &serde_json::Value,
         decision: &Decision,
         kind: &PermissionKind,
     ) -> Result<(), String> {
@@ -271,7 +270,10 @@ impl PermissionChecker {
         let path = dir.join("permissions.toml");
         let toml_str = toml::to_string(config)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, toml_str)
+        // 原子写入:先写临时文件,再 rename(同一文件系统内 rename 是原子的)
+        let tmp_path = dir.join("permissions.toml.tmp");
+        std::fs::write(&tmp_path, &toml_str)?;
+        std::fs::rename(&tmp_path, &path)
     }
 
     pub async fn load(workdir: &std::path::Path) -> Result<PermissionsConfig, String> {
@@ -588,7 +590,7 @@ bash = true
         let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
 
         checker
-            .apply_decision("bash", &bash_input("ls"), &Decision::AlwaysAllowTool, &PermissionKind::Normal)
+            .apply_decision("bash", &Decision::AlwaysAllowTool, &PermissionKind::Normal)
             .await
             .unwrap();
 
@@ -606,7 +608,7 @@ bash = true
         let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
 
         checker
-            .apply_decision("bash", &bash_input("git push"), &Decision::AlwaysAllowPrefix("git push".to_string()), &PermissionKind::Normal)
+            .apply_decision("bash", &Decision::AlwaysAllowPrefix("git push".to_string()), &PermissionKind::Normal)
             .await
             .unwrap();
 
@@ -623,7 +625,7 @@ bash = true
         let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
 
         checker
-            .apply_decision("bash", &bash_input("ls"), &Decision::AllowOnce, &PermissionKind::Normal)
+            .apply_decision("bash", &Decision::AllowOnce, &PermissionKind::Normal)
             .await
             .unwrap();
 
@@ -641,7 +643,7 @@ bash = true
         let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
 
         checker
-            .apply_decision("bash", &bash_input("ls"), &Decision::Deny, &PermissionKind::Normal)
+            .apply_decision("bash", &Decision::Deny, &PermissionKind::Normal)
             .await
             .unwrap();
 
@@ -658,7 +660,7 @@ bash = true
         let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
 
         checker
-            .apply_decision("write", &serde_json::json!({"path": "a.rs"}), &Decision::AlwaysAllowTool, &PermissionKind::Normal)
+            .apply_decision("write", &Decision::AlwaysAllowTool, &PermissionKind::Normal)
             .await
             .unwrap();
 
@@ -676,7 +678,7 @@ bash = true
         let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
 
         checker
-            .apply_decision("edit", &serde_json::json!({"path": "a.rs"}), &Decision::AlwaysAllowPrefix("src/**".to_string()), &PermissionKind::Normal)
+            .apply_decision("edit", &Decision::AlwaysAllowPrefix("src/**".to_string()), &PermissionKind::Normal)
             .await
             .unwrap();
 
@@ -693,7 +695,7 @@ bash = true
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
         let result = checker
-            .apply_decision("bash", &bash_input("rm -rf /"), &Decision::AlwaysAllowTool, &kind)
+            .apply_decision("bash", &Decision::AlwaysAllowTool, &kind)
             .await;
         assert!(result.is_err(), "AlwaysAllowTool on blacklisted should be rejected");
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
@@ -709,7 +711,7 @@ bash = true
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
         let result = checker
-            .apply_decision("bash", &bash_input("rm -rf /"), &Decision::AlwaysAllowPrefix("rm".to_string()), &kind)
+            .apply_decision("bash", &Decision::AlwaysAllowPrefix("rm".to_string()), &kind)
             .await;
         assert!(result.is_err(), "AlwaysAllowPrefix on blacklisted should be rejected");
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
@@ -725,7 +727,7 @@ bash = true
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
         let result = checker
-            .apply_decision("bash", &bash_input("rm -rf /"), &Decision::AllowOnce, &kind)
+            .apply_decision("bash", &Decision::AllowOnce, &kind)
             .await;
         assert!(result.is_ok(), "AllowOnce on blacklisted should be allowed (not persisted)");
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
@@ -741,7 +743,7 @@ bash = true
 
         let kind = PermissionKind::Blacklisted("rm -rf /".to_string());
         let result = checker
-            .apply_decision("bash", &bash_input("rm -rf /"), &Decision::Deny, &kind)
+            .apply_decision("bash", &Decision::Deny, &kind)
             .await;
         assert!(result.is_ok(), "Deny on blacklisted should be allowed");
     }
@@ -755,7 +757,7 @@ bash = true
 
         let kind = PermissionKind::Normal;
         checker
-            .apply_decision("bash", &bash_input("ls"), &Decision::AlwaysAllowTool, &kind)
+            .apply_decision("bash", &Decision::AlwaysAllowTool, &kind)
             .await
             .unwrap();
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
@@ -786,12 +788,30 @@ bash = true
 
         // Apply same prefix again
         checker
-            .apply_decision("bash", &bash_input("git push"), &Decision::AlwaysAllowPrefix("git push".to_string()), &PermissionKind::Normal)
+            .apply_decision("bash", &Decision::AlwaysAllowPrefix("git push".to_string()), &PermissionKind::Normal)
             .await
             .unwrap();
 
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
         assert_eq!(loaded.prefix_level.bash.prefixes.len(), 1, "should not duplicate existing prefix");
+    }
+
+    #[tokio::test]
+    async fn save_config_does_not_leave_tmp_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().to_path_buf();
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(PermissionsConfig::default(), false, workdir.clone(), blocklist);
+
+        checker
+            .apply_decision("bash", &Decision::AlwaysAllowTool, &PermissionKind::Normal)
+            .await
+            .unwrap();
+
+        let tmp = workdir.join(".yi-agent").join("permissions.toml.tmp");
+        assert!(!tmp.exists(), "tmp file should not remain after atomic write");
+        let final_path = workdir.join(".yi-agent").join("permissions.toml");
+        assert!(final_path.exists());
     }
 
     #[test]
