@@ -64,6 +64,10 @@ pub struct Cli {
     /// Number of recent turns to keep during compact
     #[arg(long)]
     pub compact_keep_turns: Option<u32>,
+
+    /// TUI mode: "inline" (default) or "ratatui"
+    #[arg(long)]
+    pub tui: Option<String>,
 }
 
 /// 子命令
@@ -309,6 +313,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -333,6 +338,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://example.com");
@@ -356,6 +362,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
@@ -378,6 +385,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -398,6 +406,7 @@ mod tests {
             model_context_length: Some(100_000),
             compact_ratio: Some(50),
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 50_000); // 100000 * 50 / 100
@@ -417,6 +426,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: Some(80),
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -436,6 +446,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -455,6 +466,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "anthropic");
@@ -474,6 +486,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "openai");
@@ -503,6 +516,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_key, "from-dotenv-file");
@@ -528,6 +542,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-project/.yi-agent/.env"));
@@ -551,6 +566,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
@@ -711,6 +727,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let result = load(&cli);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
@@ -746,6 +763,7 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            tui: None,
         };
         let config = load(&cli).unwrap();
         assert!(

@@ -1,6 +1,7 @@
 //! yi-agent CLI 入口。
 
 mod app;
+mod tui;
 mod compact;
 mod config;
 mod file_ref;
@@ -76,6 +77,12 @@ fn run_agent(cli: Cli) -> Result<()> {
         ..Default::default()
     };
 
+    // Branch on --tui flag
+    if cli.tui.as_deref() == Some("ratatui") {
+        return run_tui_agent(provider, tools, agent_config, config.workdir.clone());
+    }
+
+    // Default: InlineRenderer + reedline path
     let agent = yi_agent_core::Agent::new(
         Arc::clone(&provider),
         Arc::clone(&tools),
@@ -96,6 +103,102 @@ fn run_agent(cli: Cli) -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(app.run(printer))?;
+
+    Ok(())
+}
+
+/// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
+fn run_tui_agent(
+    provider: Arc<dyn Provider>,
+    tools: Arc<yi_agent_core::ToolRegistry>,
+    agent_config: yi_agent_core::AgentConfig,
+    workdir: std::path::PathBuf,
+) -> Result<()> {
+    use futures::StreamExt;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::mpsc;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let tui_result = rt.block_on(async move {
+        // Channels between agent driver and TUI
+        let (agent_tx, agent_rx) = mpsc::channel::<yi_agent_core::AgentEvent>(256);
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let is_running = Arc::new(AtomicBool::new(false));
+
+        // Spawn agent driver task (stays on the async runtime)
+        let provider_clone = Arc::clone(&provider);
+        let tools_clone = Arc::clone(&tools);
+        let config_clone = agent_config.clone();
+        let is_running_clone = Arc::clone(&is_running);
+        let driver = tokio::spawn(async move {
+            let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone);
+            let _ = workdir; // workdir already passed to tools registration
+
+            loop {
+                // Wait for user input
+                let Some(text) = input_rx.recv().await else { break };
+
+                // Clear any stale interrupt signal
+                let _ = interrupt_rx.try_recv();
+
+                // Run agent
+                is_running_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                match agent.run(text).await {
+                    Ok(stream) => {
+                        let mut stream = Box::pin(stream);
+                        loop {
+                            // Concurrently forward events and listen for interrupt
+                            tokio::select! {
+                                event = stream.next() => {
+                                    match event {
+                                        Some(ev) => {
+                                            if agent_tx.send(ev).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        None => break, // stream ended
+                                    }
+                                }
+                                _ = interrupt_rx.recv() => {
+                                    // User pressed Ctrl+C/Esc: cancel agent
+                                    agent.cancel();
+                                    // Drain remaining events until Cancelled/Done
+                                    while let Some(ev) = stream.next().await {
+                                        if agent_tx.send(ev).await.is_err() { break; }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = agent_tx.send(yi_agent_core::AgentEvent::Error(e)).await;
+                    }
+                }
+                is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)
+        let tui_handle = tokio::task::spawn_blocking(move || {
+            crate::tui::app::run_tui(agent_rx, input_tx, interrupt_tx, is_running)
+        });
+
+        let result = match tui_handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::Error::from(e)),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+
+        // TUI exited; abort the driver task to clean up
+        // (driver may still be blocked on input_rx.recv() if agent was idle)
+        driver.abort();
+
+        result
+    });
+
+    tui_result?;
 
     Ok(())
 }
