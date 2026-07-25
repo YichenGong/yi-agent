@@ -156,6 +156,7 @@ fn run_loop<B: Backend, E: EventSource>(
     let _ = is_running;
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
+    let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     loop {
         // Drain all pending agent events
@@ -211,6 +212,8 @@ fn run_loop<B: Backend, E: EventSource>(
                 interrupt_tx,
                 control_tx,
                 decision_tx,
+                is_running,
+                &mut queued,
                 &mut pending_quit,
                 &mut popup,
             ) {
@@ -230,6 +233,7 @@ fn run_loop<B: Backend, E: EventSource>(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum KeyOutcome {
     None,
     Quit,
@@ -245,6 +249,8 @@ fn handle_key(
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _queued: &mut std::collections::VecDeque<String>,
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
 ) -> KeyOutcome {
@@ -296,6 +302,9 @@ fn handle_key(
                 return KeyOutcome::None;
             }
             *pending_quit = true;
+            if is_running.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = interrupt_tx.blocking_send(());
+            }
             return KeyOutcome::None;
         }
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
@@ -303,6 +312,9 @@ fn handle_key(
                 return KeyOutcome::Quit;
             }
             *pending_quit = true;
+            if is_running.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = interrupt_tx.blocking_send(());
+            }
             return KeyOutcome::None;
         }
         KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => {
@@ -710,9 +722,14 @@ fn wrap_input_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::mpsc;
 
     /// Fake event source that plays back a scripted sequence of events,
     /// then returns None (timeout) forever. Used to test the loop deterministically.
@@ -2149,5 +2166,156 @@ mod tests {
             !row_text.contains('a'),
             "expected 'a' to be ignored while permission pending, but found it in input row: {row_text:?}"
         );
+    }
+
+    // ----- handle_key Esc/Ctrl+C interrupt tests -----
+
+    fn make_key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn esc_when_running_sends_interrupt() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued: VecDeque<String> = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        let result = handle_key(
+            make_key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert_eq!(result, KeyOutcome::None);
+        assert!(pending_quit);
+        assert!(
+            interrupt_rx.try_recv().is_ok(),
+            "interrupt should be sent when agent running"
+        );
+    }
+
+    #[test]
+    fn esc_when_idle_does_not_send_interrupt() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued: VecDeque<String> = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        let result = handle_key(
+            make_key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert_eq!(result, KeyOutcome::None);
+        assert!(pending_quit);
+        assert!(
+            interrupt_rx.try_recv().is_err(),
+            "interrupt should NOT be sent when idle"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_when_running_sends_interrupt() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued: VecDeque<String> = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        let result = handle_key(
+            make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut input,
+            &mut history,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert_eq!(result, KeyOutcome::None);
+        assert!(pending_quit);
+        assert!(interrupt_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn double_esc_quits() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued: VecDeque<String> = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        let _ = handle_key(
+            make_key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        let result = handle_key(
+            make_key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert_eq!(result, KeyOutcome::Quit);
     }
 }
