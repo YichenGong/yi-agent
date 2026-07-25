@@ -134,6 +134,9 @@ impl HistoryState {
             AgentEvent::Error(err) => {
                 self.push(HistoryCell::Separator { label: Some(format!("Error: {err}")) });
             }
+            AgentEvent::PermissionRequest { .. } | AgentEvent::PermissionResolved { .. } => {
+                // Handled in Tasks 10/11
+            }
         }
     }
 }

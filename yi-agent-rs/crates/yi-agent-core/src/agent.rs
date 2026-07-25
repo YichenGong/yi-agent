@@ -340,6 +340,7 @@ async fn run_loop(
 
         // 权限检查阶段: 在并行执行前逐个检查,过滤被拒绝的工具
         let mut checked_uses: Vec<(String, String, Value)> = Vec::new();
+        let mut denied_results: Vec<(String, ToolResult)> = Vec::new();
         for (id, name, input) in tool_uses {
             if let Some(checker) = &permission_checker {
                 let check_result = checker.check(&name, &input);
@@ -354,6 +355,7 @@ async fn run_loop(
                                 result: ToolResult::error("permission denied"),
                             })
                             .await;
+                        denied_results.push((id.clone(), ToolResult::error("permission denied")));
                     }
                     crate::permission::CheckResult::NeedConfirm(req) => {
                         if let Some(decision_rx) = &decision_rx {
@@ -367,7 +369,7 @@ async fn run_loop(
                                 })
                                 .await;
                             let decision =
-                                wait_for_decision(decision_rx, req.request_id).await;
+                                wait_for_decision(decision_rx, req.request_id, &cancel_token).await;
                             let _ = tx
                                 .send(AgentEvent::PermissionResolved {
                                     request_id: req.request_id,
@@ -378,8 +380,9 @@ async fn run_loop(
                                 crate::permission::Decision::AllowOnce
                                 | crate::permission::Decision::AlwaysAllowTool
                                 | crate::permission::Decision::AlwaysAllowPrefix(_) => {
-                                    let _ =
-                                        checker.apply_decision(&name, &input, &decision).await;
+                                    if let Err(e) = checker.apply_decision(&name, &input, &decision).await {
+                                        tracing::warn!("failed to persist permission decision: {e}");
+                                    }
                                     checked_uses.push((id, name, input));
                                 }
                                 crate::permission::Decision::Deny => {
@@ -389,6 +392,8 @@ async fn run_loop(
                                             result: ToolResult::error("user denied"),
                                         })
                                         .await;
+                                    denied_results
+                                        .push((id.clone(), ToolResult::error("user denied")));
                                 }
                             }
                         } else {
@@ -401,6 +406,10 @@ async fn run_loop(
                                     ),
                                 })
                                 .await;
+                            denied_results.push((
+                                id.clone(),
+                                ToolResult::error("permission required but no decision channel"),
+                            ));
                         }
                     }
                     crate::permission::CheckResult::Blacklisted(req) => {
@@ -415,7 +424,7 @@ async fn run_loop(
                                 })
                                 .await;
                             let decision =
-                                wait_for_decision(decision_rx, req.request_id).await;
+                                wait_for_decision(decision_rx, req.request_id, &cancel_token).await;
                             let _ = tx
                                 .send(AgentEvent::PermissionResolved {
                                     request_id: req.request_id,
@@ -426,8 +435,9 @@ async fn run_loop(
                                 crate::permission::Decision::AllowOnce
                                 | crate::permission::Decision::AlwaysAllowTool
                                 | crate::permission::Decision::AlwaysAllowPrefix(_) => {
-                                    let _ =
-                                        checker.apply_decision(&name, &input, &decision).await;
+                                    if let Err(e) = checker.apply_decision(&name, &input, &decision).await {
+                                        tracing::warn!("failed to persist permission decision: {e}");
+                                    }
                                     checked_uses.push((id, name, input));
                                 }
                                 crate::permission::Decision::Deny => {
@@ -439,6 +449,10 @@ async fn run_loop(
                                             ),
                                         })
                                         .await;
+                                    denied_results.push((
+                                        id.clone(),
+                                        ToolResult::error("user denied blacklisted command"),
+                                    ));
                                 }
                             }
                         } else {
@@ -450,6 +464,10 @@ async fn run_loop(
                                     ),
                                 })
                                 .await;
+                            denied_results.push((
+                                id.clone(),
+                                ToolResult::error("blacklisted command requires confirmation"),
+                            ));
                         }
                     }
                 }
@@ -516,7 +534,7 @@ async fn run_loop(
         };
 
         // 4. OBSERVE - feed results back in tool_use_id order
-        let tool_results: Vec<ContentBlock> = results
+        let mut tool_results: Vec<ContentBlock> = results
             .into_iter()
             .filter_map(|(id, result)| {
                 result.map(|r| ContentBlock::ToolResult {
@@ -526,6 +544,14 @@ async fn run_loop(
                 })
             })
             .collect();
+        // Add denied tool results so LLM sees them
+        for (id, result) in denied_results {
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: result.content,
+                is_error: result.is_error,
+            });
+        }
         let tool_results_msg = Message::tool_results(tool_results);
         messages.push(tool_results_msg.clone());
         session.lock().unwrap().push(tool_results_msg);
@@ -534,17 +560,22 @@ async fn run_loop(
 
 /// Wait for a user decision matching `expected_id` on the decision channel.
 /// Discards any mismatched messages (defensive) and returns `Deny` if the
-/// channel is closed.
+/// channel is closed or the cancel token is triggered.
 async fn wait_for_decision(
     decision_rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>,
     expected_id: u64,
+    cancel_token: &tokio_util::sync::CancellationToken,
 ) -> crate::permission::Decision {
     let mut rx = decision_rx.lock().await;
     loop {
-        match rx.recv().await {
-            Some((id, d)) if id == expected_id => return d,
-            Some(_) => continue,
-            None => return crate::permission::Decision::Deny,
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return crate::permission::Decision::Deny,
+            msg = rx.recv() => match msg {
+                Some((id, d)) if id == expected_id => return d,
+                Some(_) => continue,
+                None => return crate::permission::Decision::Deny,
+            }
         }
     }
 }

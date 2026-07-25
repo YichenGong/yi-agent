@@ -178,6 +178,9 @@ impl Renderer for InlineRenderer {
                 self.finish_streaming_line();
                 self.render_error(err);
             }
+            AgentEvent::PermissionRequest { .. } | AgentEvent::PermissionResolved { .. } => {
+                // Handled in Tasks 10/11
+            }
         }
     }
 
