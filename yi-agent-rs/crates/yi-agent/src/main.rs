@@ -499,26 +499,25 @@ mod tests {
 
     #[test]
     fn resolve_system_prompt_with_skills_no_service_returns_base() {
-        // When service is None, should fall back to base via resolve_system_prompt.
+        // When service is None, should fall back to base via resolve_system_prompt
+        // (which appends the current date).
         let resolved = resolve_system_prompt_with_skills(None, &None, 8192, false);
-        assert_eq!(
-            resolved.as_deref(),
-            Some(yi_agent_core::AgentConfig::default_system_prompt().as_str())
-        );
+        let expected = resolve_system_prompt(None);
+        assert_eq!(resolved, expected);
     }
 
     #[test]
     fn resolve_system_prompt_with_skills_empty_catalog_returns_base() {
         // When service is Some but catalog is empty (no skills discovered),
-        // should return the base prompt unchanged.
+        // should return the base prompt unchanged (with current date appended).
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
-        let base = yi_agent_core::AgentConfig::default_system_prompt();
+        let expected = resolve_system_prompt(None);
         let resolved = resolve_system_prompt_with_skills(
             None,
             &Some(svc),
             8192,
             false,
         );
-        assert_eq!(resolved.as_deref(), Some(base.as_str()));
+        assert_eq!(resolved, expected);
     }
 }
