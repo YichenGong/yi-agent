@@ -11,7 +11,7 @@ use crate::message::{ContentBlock, Message};
 use crate::provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, TokenUsage,
 };
-use crate::tool::{ToolRegistry, ToolResult};
+use crate::tool::{ToolEvent, ToolRegistry, ToolResult};
 
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -122,6 +122,18 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         result: ToolResult,
+    },
+    ToolOutputDelta {
+        id: String,
+        stream: crate::tool::OutputStream,
+        text: String,
+    },
+    ToolExit {
+        id: String,
+        code: Option<i32>,
+    },
+    ToolTimeout {
+        id: String,
     },
     Usage(TokenUsage),
     Done {
@@ -516,10 +528,48 @@ async fn run_loop(
                         return (id.clone(), None);
                     }
 
-                    let result = match tools.get(name) {
-                        Some(tool) => tool.call(input.clone()).await,
-                        None => ToolResult::error(format!("tool not found: {}", name)),
+                    let tool = match tools.get(name) {
+                        Some(t) => t,
+                        None => {
+                            let _ = tx
+                                .send(AgentEvent::ToolResult {
+                                    id: id.clone(),
+                                    result: ToolResult::error(format!("tool not found: {}", name)),
+                                })
+                                .await;
+                            return (id.clone(), None);
+                        }
                     };
+
+                    // Set up streaming channel + forwarder
+                    let (event_tx, mut event_rx) =
+                        mpsc::channel::<ToolEvent>(64);
+                    let fwd_tx = tx.clone();
+                    let fwd_id = id.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = event_rx.recv().await {
+                            let agent_ev = match ev {
+                                ToolEvent::OutputDelta { stream, text } => {
+                                    AgentEvent::ToolOutputDelta {
+                                        id: fwd_id.clone(),
+                                        stream,
+                                        text,
+                                    }
+                                }
+                                ToolEvent::Exit { code } => AgentEvent::ToolExit {
+                                    id: fwd_id.clone(),
+                                    code,
+                                },
+                                ToolEvent::Timeout => AgentEvent::ToolTimeout {
+                                    id: fwd_id.clone(),
+                                },
+                                ToolEvent::Truncated { .. } => continue,
+                            };
+                            let _ = fwd_tx.send(agent_ev).await;
+                        }
+                    });
+
+                    let result = tool.call_stream(input.clone(), event_tx).await;
 
                     info!(is_error = result.is_error, "tool call done");
 
