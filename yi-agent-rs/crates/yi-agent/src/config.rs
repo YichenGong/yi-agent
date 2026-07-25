@@ -64,6 +64,10 @@ pub struct Cli {
     /// Number of recent turns to keep during compact
     #[arg(long)]
     pub compact_keep_turns: Option<u32>,
+
+    /// TUI mode: "inline" (default) or "ratatui"
+    #[arg(long)]
+    pub tui: Option<String>,
 }
 
 /// 子命令
