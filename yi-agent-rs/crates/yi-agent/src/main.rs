@@ -21,8 +21,8 @@ use crate::app::App;
 use crate::config::{Cli, Command};
 
 fn main() -> Result<()> {
-    let _trace_guard = tracing_init::init();
     let cli = Cli::parse();
+    let _trace_guard = tracing_init::init(cli.debug);
 
     match cli.command {
         Some(Command::Web { ref host, ref port }) => {
@@ -407,6 +407,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
     }
@@ -429,6 +430,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Inline));
     }
@@ -451,6 +453,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         assert!(matches!(select_tui_mode(&cli), TuiMode::Ratatui));
     }

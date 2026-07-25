@@ -14,7 +14,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 /// 初始化 tracing，返回的 guard 必须保活到程序结束。
-pub fn init() -> tracing_appender::non_blocking::WorkerGuard {
+pub fn init(debug: bool) -> tracing_appender::non_blocking::WorkerGuard {
     let trace_dir = trace_dir();
     let _ = std::fs::create_dir_all(&trace_dir);
 
@@ -38,7 +38,7 @@ pub fn init() -> tracing_appender::non_blocking::WorkerGuard {
     let file_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(file_writer)
-        .with_filter(EnvFilter::new("info"));
+        .with_filter(EnvFilter::new(file_filter(debug)));
 
     let registry = tracing_subscriber::registry().with(file_layer);
 
@@ -60,6 +60,17 @@ pub fn init() -> tracing_appender::non_blocking::WorkerGuard {
     );
 
     guard
+}
+
+/// 文件日志的 EnvFilter 字符串。
+/// `debug=false` 时仅记录 info 及以上;`debug=true` 时额外放开核心 crate 的 debug 日志,
+/// 用于记录发给 LLM 的消息内容和 LLM 返回的内容。
+fn file_filter(debug: bool) -> &'static str {
+    if debug {
+        "info,yi_agent_core=debug,yi_agent_llm=debug"
+    } else {
+        "info"
+    }
 }
 
 fn trace_dir() -> PathBuf {
@@ -142,5 +153,18 @@ mod tests {
         // chrono_local_timestamp 内部用 SystemTime,无法直接注入,
         // 这里通过 days_to_ymd 已覆盖核心逻辑。
         let _ = days_to_ymd(0);
+    }
+
+    #[test]
+    fn file_filter_debug_false_returns_info_only() {
+        assert_eq!(file_filter(false), "info");
+    }
+
+    #[test]
+    fn file_filter_debug_true_includes_core_and_llm_debug() {
+        let filter = file_filter(true);
+        assert!(filter.contains("yi_agent_core=debug"), "filter: {filter}");
+        assert!(filter.contains("yi_agent_llm=debug"), "filter: {filter}");
+        assert!(filter.contains("info"), "filter: {filter}");
     }
 }

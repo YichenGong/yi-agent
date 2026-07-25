@@ -84,6 +84,10 @@ pub struct Cli {
     /// Maximum bytes for the skills catalog in the system prompt (default: 8192)
     #[arg(long)]
     pub skills_catalog_budget: Option<usize>,
+
+    /// Enable debug-level tracing for conversation content (LLM messages and responses)
+    #[arg(long)]
+    pub debug: bool,
 }
 
 /// 子命令
@@ -356,6 +360,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -384,6 +389,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://example.com");
@@ -411,6 +417,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
@@ -437,6 +444,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -461,6 +469,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 50_000); // 100000 * 50 / 100
@@ -484,6 +493,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
@@ -507,6 +517,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let result = load(&cli);
         assert!(result.is_err());
@@ -530,6 +541,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "anthropic");
@@ -553,6 +565,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.provider, "openai");
@@ -586,6 +599,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.api_key, "from-dotenv-file");
@@ -615,6 +629,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-project/.yi-agent/.env"));
@@ -642,6 +657,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
@@ -806,6 +822,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let result = load(&cli);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
@@ -845,6 +862,7 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert!(
@@ -956,6 +974,7 @@ mod tests {
             yolo: true,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert!(config.yolo);
@@ -979,6 +998,7 @@ mod tests {
             yolo: false,
             skip_permissions: true,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert!(config.yolo);
@@ -1002,8 +1022,23 @@ mod tests {
             yolo: false,
             skip_permissions: false,
             skills_catalog_budget: None,
+            debug: false,
         };
         let config = load(&cli).unwrap();
         assert!(!config.yolo);
+    }
+
+    #[test]
+    fn cli_parses_debug_flag() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "--debug", "--api-key", "test"]);
+        assert!(cli.debug);
+    }
+
+    #[test]
+    fn cli_debug_defaults_false() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
+        assert!(!cli.debug);
     }
 }
