@@ -2834,7 +2834,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "yi-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2843,6 +2843,7 @@ dependencies = [
  "crossterm",
  "dotenvy",
  "futures",
+ "nu-ansi-term",
  "reedline",
  "serde_json",
  "tokio",
@@ -2859,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -2874,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-llm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2890,21 +2891,21 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "yi-agent-core",
 ]
 
 [[package]]
 name = "yi-agent-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "yi-agent-core",
 ]
 
 [[package]]
 name = "yi-agent-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -2925,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
