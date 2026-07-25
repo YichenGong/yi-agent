@@ -386,7 +386,7 @@ async fn run_loop(
                                 crate::permission::Decision::AllowOnce
                                 | crate::permission::Decision::AlwaysAllowTool
                                 | crate::permission::Decision::AlwaysAllowPrefix(_) => {
-                                    if let Err(e) = checker.apply_decision(&name, &input, &decision).await {
+                                    if let Err(e) = checker.apply_decision(&name, &input, &decision, &req.kind).await {
                                         tracing::warn!("failed to persist permission decision: {e}");
                                     }
                                     checked_uses.push((id, name, input));
@@ -441,7 +441,7 @@ async fn run_loop(
                                 crate::permission::Decision::AllowOnce
                                 | crate::permission::Decision::AlwaysAllowTool
                                 | crate::permission::Decision::AlwaysAllowPrefix(_) => {
-                                    if let Err(e) = checker.apply_decision(&name, &input, &decision).await {
+                                    if let Err(e) = checker.apply_decision(&name, &input, &decision, &req.kind).await {
                                         tracing::warn!("failed to persist permission decision: {e}");
                                     }
                                     checked_uses.push((id, name, input));
