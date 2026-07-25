@@ -112,12 +112,13 @@ fn run_agent(cli: Cli) -> Result<()> {
         }
         TuiMode::Inline => {
             // Inline mode: wire permission checker into agent
+            let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
             let agent = yi_agent_core::Agent::new(
                 Arc::clone(&provider),
                 Arc::clone(&tools),
                 agent_config.clone(),
             )
-            .with_permission(Arc::clone(&checker), decision_rx);
+            .with_permission(Arc::clone(&checker), Arc::clone(&decision_rx));
 
             let printer = reedline::ExternalPrinter::default();
             let renderer = Box::new(InlineRenderer::with_printer(printer.sender()));
@@ -130,6 +131,8 @@ fn run_agent(cli: Cli) -> Result<()> {
                 config.workdir.clone(),
                 renderer,
                 decision_tx,
+                checker,
+                decision_rx,
             );
 
             let rt = tokio::runtime::Runtime::new()?;
@@ -182,6 +185,7 @@ fn run_tui_agent(
         let config_clone = agent_config.clone();
         let is_running_clone = Arc::clone(&is_running);
         let checker_clone = Arc::clone(&checker);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
         let driver = tokio::spawn(async move {
             let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone)
                 .with_permission(checker_clone, decision_rx);

@@ -60,6 +60,7 @@ fn format_config(config: &AgentConfig, workdir: &std::path::Path) -> String {
 /// 应用运行时状态。
 ///
 /// 额外持有 provider/tools/config 的 Arc，用于 `/clear` 时重建 Agent。
+/// 持有 `checker` 和 `decision_rx` 的 Arc，以便重建 Agent 时重新附加权限检查。
 pub struct App {
     agent: Agent,
     provider: Arc<dyn Provider>,
@@ -69,6 +70,8 @@ pub struct App {
     renderer: Box<dyn Renderer>,
     usage_stats: UsageStats,
     decision_tx: mpsc::Sender<(u64, Decision)>,
+    checker: Arc<yi_agent_core::permission::PermissionChecker>,
+    decision_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, Decision)>>>,
 }
 
 impl App {
@@ -80,6 +83,8 @@ impl App {
         workdir: std::path::PathBuf,
         renderer: Box<dyn Renderer>,
         decision_tx: mpsc::Sender<(u64, Decision)>,
+        checker: Arc<yi_agent_core::permission::PermissionChecker>,
+        decision_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, Decision)>>>,
     ) -> Self {
         Self {
             agent,
@@ -90,6 +95,8 @@ impl App {
             renderer,
             usage_stats: UsageStats::default(),
             decision_tx,
+            checker,
+            decision_rx,
         }
     }
 
@@ -150,7 +157,11 @@ impl App {
                                             Arc::clone(&self.tools),
                                             self.config.clone(),
                                         )
-                                        .with_session(new_session);
+                                        .with_session(new_session)
+                                        .with_permission(
+                                            Arc::clone(&self.checker),
+                                            Arc::clone(&self.decision_rx),
+                                        );
                                         self.usage_stats.reset_session();
                                     }
                                     Err(e) => {
@@ -208,7 +219,11 @@ impl App {
                                 Arc::clone(&self.provider),
                                 Arc::clone(&self.tools),
                                 self.config.clone(),
-                            ).with_session(Session::new());
+                            ).with_session(Session::new())
+                            .with_permission(
+                                Arc::clone(&self.checker),
+                                Arc::clone(&self.decision_rx),
+                            );
                             self.renderer.render_system("对话已清空");
                         }
                         UserCommand::Help => {
@@ -224,7 +239,11 @@ impl App {
                                 Arc::clone(&self.tools),
                                 self.config.clone(),
                             )
-                            .with_session(session);
+                            .with_session(session)
+                            .with_permission(
+                                Arc::clone(&self.checker),
+                                Arc::clone(&self.decision_rx),
+                            );
                             self.renderer
                                 .render_system(&format!("模型已切换为 {name}"));
                         }
@@ -252,7 +271,11 @@ impl App {
                                         Arc::clone(&self.tools),
                                         self.config.clone(),
                                     )
-                                    .with_session(new_session);
+                                    .with_session(new_session)
+                                    .with_permission(
+                                        Arc::clone(&self.checker),
+                                        Arc::clone(&self.decision_rx),
+                                    );
                                     self.usage_stats.reset_session();
                                     self.renderer
                                         .render_system(&format!("对话已压缩：{before_msgs} 条消息 → {after_msgs} 条消息"));

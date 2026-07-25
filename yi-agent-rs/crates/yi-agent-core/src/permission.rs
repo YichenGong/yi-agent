@@ -197,11 +197,19 @@ impl PermissionChecker {
         tool_input: &serde_json::Value,
         kind: PermissionKind,
     ) -> PermissionRequest {
+        let prefix_suggestion = if tool_name == "bash" {
+            tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .and_then(fallback_prefix)
+        } else {
+            None
+        };
         PermissionRequest {
             request_id: self.next_request_id.fetch_add(1, Ordering::SeqCst),
             tool_name: tool_name.to_string(),
             tool_input: tool_input.clone(),
-            prefix_suggestion: None, // Task 6 填充
+            prefix_suggestion,
             kind,
         }
     }
@@ -728,5 +736,39 @@ bash = true
     fn fallback_prefix_empty() {
         assert_eq!(fallback_prefix(""), None);
         assert_eq!(fallback_prefix("   "), None);
+    }
+
+    #[test]
+    fn build_request_populates_prefix_for_bash() {
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        );
+        let result = checker.check("bash", &bash_input("git push origin main"));
+        if let CheckResult::NeedConfirm(req) = result {
+            assert_eq!(req.prefix_suggestion, Some("git push".to_string()));
+        } else {
+            panic!("expected NeedConfirm");
+        }
+    }
+
+    #[test]
+    fn build_request_no_prefix_for_write() {
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            false,
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        );
+        let result = checker.check("write", &serde_json::json!({"path": "a.rs", "content": "x"}));
+        if let CheckResult::NeedConfirm(req) = result {
+            assert_eq!(req.prefix_suggestion, None);
+        } else {
+            panic!("expected NeedConfirm");
+        }
     }
 }

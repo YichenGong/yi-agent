@@ -152,13 +152,19 @@ impl Agent {
     }
 
     /// Attach a permission checker and decision channel for tool gating.
+    ///
+    /// `decision_rx` is shared via `Arc<Mutex<Receiver>>` so that the same
+    /// receiver can be re-attached when the agent is reconstructed (e.g. on
+    /// `/clear` or `/model` in inline mode).
     pub fn with_permission(
         mut self,
         checker: Arc<crate::permission::PermissionChecker>,
-        decision_rx: mpsc::Receiver<(u64, crate::permission::Decision)>,
+        decision_rx: Arc<
+            tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>,
+        >,
     ) -> Self {
         self.permission_checker = Some(checker);
-        self.decision_rx = Some(Arc::new(tokio::sync::Mutex::new(decision_rx)));
+        self.decision_rx = Some(decision_rx);
         self
     }
 
@@ -1417,6 +1423,7 @@ mod tests {
             blocklist,
         ));
         let (_tx, rx) = mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let provider = ScriptedProvider::new(vec![]);
         let tools = Arc::new(ToolRegistry::new());
         let agent = Agent::new(Arc::new(provider), tools, AgentConfig::default())
@@ -1437,6 +1444,7 @@ mod tests {
         ));
         let (_decision_tx, decision_rx) =
             mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
         let provider = ScriptedProvider::new(vec![
             vec![
@@ -1496,6 +1504,7 @@ mod tests {
         ));
         let (decision_tx, decision_rx) =
             mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
         let provider = ScriptedProvider::new(vec![
             vec![
@@ -1578,6 +1587,7 @@ mod tests {
         ));
         let (decision_tx, decision_rx) =
             mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
         let provider = ScriptedProvider::new(vec![
             vec![
