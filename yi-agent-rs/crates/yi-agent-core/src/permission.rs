@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -272,6 +273,28 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     glob::Pattern::new(pattern)
         .map(|p| p.matches(path))
         .unwrap_or(false)
+}
+
+#[async_trait]
+pub trait PrefixExtractor: Send + Sync {
+    /// 从 bash 命令提取前缀。返回 None 表示 LLM 不可用或超时。
+    async fn extract(&self, command: &str) -> Option<String>;
+}
+
+/// 简单规则兜底:取管道前的第一个 token + 子命令(若存在且非参数)
+pub fn fallback_prefix(command: &str) -> Option<String> {
+    let first_segment = command.split('|').next()?.trim();
+    let mut tokens = first_segment.split_whitespace();
+    let first = tokens.next()?;
+    if first.is_empty() {
+        return None;
+    }
+    if let Some(second) = tokens.next() {
+        if !second.starts_with('-') {
+            return Some(format!("{first} {second}"));
+        }
+    }
+    Some(first.to_string())
 }
 
 #[cfg(test)]
@@ -676,5 +699,34 @@ bash = true
 
         let loaded = PermissionChecker::load(&workdir).await.unwrap();
         assert_eq!(loaded.prefix_level.bash.prefixes.len(), 1, "should not duplicate existing prefix");
+    }
+
+    #[test]
+    fn fallback_prefix_single_command() {
+        assert_eq!(fallback_prefix("ls"), Some("ls".to_string()));
+        assert_eq!(fallback_prefix("pwd"), Some("pwd".to_string()));
+    }
+
+    #[test]
+    fn fallback_prefix_with_subcommand() {
+        assert_eq!(fallback_prefix("git push origin main"), Some("git push".to_string()));
+        assert_eq!(fallback_prefix("cargo run --release"), Some("cargo run".to_string()));
+    }
+
+    #[test]
+    fn fallback_prefix_with_args_only() {
+        assert_eq!(fallback_prefix("ls -la"), Some("ls".to_string()));
+        assert_eq!(fallback_prefix("rm -rf build"), Some("rm".to_string()));
+    }
+
+    #[test]
+    fn fallback_prefix_pipe() {
+        assert_eq!(fallback_prefix("git status | grep foo"), Some("git status".to_string()));
+    }
+
+    #[test]
+    fn fallback_prefix_empty() {
+        assert_eq!(fallback_prefix(""), None);
+        assert_eq!(fallback_prefix("   "), None);
     }
 }
