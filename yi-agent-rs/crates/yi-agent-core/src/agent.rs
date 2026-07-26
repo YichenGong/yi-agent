@@ -1051,9 +1051,11 @@ mod tests {
 
         let events = collect_events(agent.run("write a file".into()).await.unwrap());
 
-        assert!(events.iter().any(
-            |event| matches!(event, AgentEvent::AssistantText(text) if text == " complete")
-        ));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, AgentEvent::AssistantText(text) if text == " complete")
+            )
+        );
         assert!(matches!(
             events.last(),
             Some(AgentEvent::Done {

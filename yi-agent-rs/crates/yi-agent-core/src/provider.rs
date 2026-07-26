@@ -182,7 +182,10 @@ where
         stop_reason = StopReason::Other("idle timeout".to_string());
     } else if !received_stop {
         stop_reason = StopReason::Other("stream ended without stop".to_string());
-        tracing::warn!(event_count, "accumulate_stream: stream ended without Stop event");
+        tracing::warn!(
+            event_count,
+            "accumulate_stream: stream ended without Stop event"
+        );
     } else {
         tracing::info!(
             event_count,
