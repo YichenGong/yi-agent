@@ -80,6 +80,19 @@
   stdout/stderr,`--json` 切换为 JSONL 供测试断言。详见
   `docs/plans/2026-07-26-real-llm-testing-design.md`。
 
+## 分级测试系统
+
+- **Tier 0 (Mock)**: `cargo test` / `just test` — wiremock,总是跑,无 API key
+- **Tier 1 (Provider smoke)**: `just test-real-llm` — SSE 解析、鉴权
+- **Tier 2 (Simple e2e)**: `just test-real-e2e` — 单轮文本、单工具调用
+- **Tier 3 (Complex one-shot)**: `just test-real-complex` — 多步骤生成任务
+  (个人网站、Python 脚本、数据转换、bug 修复)
+- `just test-real-all` 跑 Tier 1 + 2 + 3
+- 复杂测试用 `tempfile::TempDir` 隔离,300s 超时,结构性断言(文件存在/大小/标记)
+- 复杂测试同样是 `#[ignore]` gate,CI 不跑
+- 测试文件: `yi-agent-rs/crates/yi-agent/tests/e2e_complex.rs`
+- 共享 helper: `yi-agent-rs/crates/yi-agent/tests/common/mod.rs`
+
 ## 项目进度维护
 
 - **每完成一组需求,必须同步更新 `docs/project-management/` 下对应模块文件**,
