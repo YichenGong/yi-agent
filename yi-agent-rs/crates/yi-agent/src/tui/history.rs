@@ -1,7 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
 
 use yi_agent_core::{AgentEvent, DoneReason};
 
@@ -59,6 +59,19 @@ impl HistoryState {
             }
         }
         count
+    }
+
+    /// Width available to history text after reserving a scrollbar column
+    /// when the content overflows the viewport.
+    pub fn text_width(&self, area_width: u16, viewport_height: u16) -> u16 {
+        let candidate_width = area_width.saturating_sub(1);
+        if candidate_width > 0
+            && self.flattened_line_count(candidate_width) > viewport_height as usize
+        {
+            candidate_width
+        } else {
+            area_width
+        }
     }
 
     /// Maximum meaningful `scroll_offset` for the current content at the given
@@ -322,6 +335,7 @@ impl Default for HistoryState {
 /// Ratatui widget that renders the history area.
 pub struct HistoryView<'a> {
     pub state: &'a HistoryState,
+    #[allow(dead_code)]
     pub width: u16,
 }
 
@@ -329,11 +343,11 @@ impl<'a> HistoryView<'a> {
     /// Flatten all cells into display lines, inserting a blank spacer line
     /// after each `UserMessage` cell (unless it is the last cell) to
     /// visually separate user input from the system reply.
-    fn flattened_lines(&self) -> Vec<(usize, ratatui::text::Line<'static>)> {
+    fn flattened_lines(&self, text_width: u16) -> Vec<(usize, ratatui::text::Line<'static>)> {
         let n = self.state.cells.len();
         let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
         for (i, cell) in self.state.cells.iter().enumerate() {
-            for line in cell.lines(self.width) {
+            for line in cell.lines(text_width) {
                 all_lines.push((i, line));
             }
             // Insert a blank spacer line after user messages (except the last
@@ -348,7 +362,9 @@ impl<'a> HistoryView<'a> {
 
 impl<'a> Widget for HistoryView<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let all_lines = self.flattened_lines();
+        let text_width = self.state.text_width(area.width, area.height);
+        let show_scrollbar = text_width < area.width;
+        let all_lines = self.flattened_lines(text_width);
 
         let visible_height = area.height as usize;
         let total = all_lines.len();
@@ -377,11 +393,19 @@ impl<'a> Widget for HistoryView<'a> {
                 Rect {
                     x,
                     y,
-                    width: area.width,
+                    width: text_width,
                     height: 1,
                 },
                 buf,
             );
+        }
+
+        if show_scrollbar {
+            let mut scrollbar_state = ScrollbarState::new(total).position(effective_offset);
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_symbol("█")
+                .track_symbol(Some(" "))
+                .render(area, buf, &mut scrollbar_state);
         }
     }
 }
@@ -390,6 +414,7 @@ impl<'a> Widget for HistoryView<'a> {
 mod tests {
     use super::*;
     use crate::tui::cell::HistoryCell;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn push_preserves_position_when_scrolled_up() {
@@ -798,7 +823,7 @@ mod tests {
             state: &s,
             width: 80,
         };
-        let lines = view.flattened_lines();
+        let lines = view.flattened_lines(80);
 
         // UserMessage = 1 line, spacer = 1 line, AssistantMessage >= 1 line
         assert!(
@@ -827,7 +852,7 @@ mod tests {
             state: &s,
             width: 80,
         };
-        let lines = view.flattened_lines();
+        let lines = view.flattened_lines(80);
 
         // Only the user message line, no trailing spacer.
         assert_eq!(
@@ -850,7 +875,7 @@ mod tests {
             state: &s,
             width: 80,
         };
-        let lines = view.flattened_lines();
+        let lines = view.flattened_lines(80);
 
         // No spacer should be inserted between non-UserMessage cells.
         // Count empty lines attributed to non-user cells — should be zero.
@@ -906,6 +931,103 @@ mod tests {
         // Sanity: the top row should contain the label 'a'.
         let top: String = (0..80u16).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains('a'), "top row should show label 'a': {top:?}");
+    }
+
+    #[test]
+    fn render_overflow_reserves_rightmost_column_for_scrollbar() {
+        let mut state = HistoryState::new();
+        for row in 0..6 {
+            state.push(
+                HistoryCell::UserMessage {
+                    text: format!("row {row}"),
+                },
+                20,
+            );
+        }
+
+        let backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    HistoryView {
+                        state: &state,
+                        width: area.width,
+                    },
+                    area,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (0..5).any(|y| buffer[(19, y)].symbol() == "█"),
+            "an overflowing history should render a scrollbar thumb: {buffer:?}"
+        );
+        for y in 0..5 {
+            let symbol = buffer[(19, y)].symbol();
+            assert!(
+                matches!(symbol, " " | "█" | "▲" | "▼"),
+                "history text must not use the scrollbar column at row {y}: {symbol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_width_only_reserves_a_column_when_it_can_show_a_scrollbar() {
+        let mut state = HistoryState::new();
+        state.push(
+            HistoryCell::UserMessage {
+                text: "one line".into(),
+            },
+            20,
+        );
+        assert_eq!(
+            state.text_width(20, 5),
+            20,
+            "fitting content keeps full width"
+        );
+
+        for row in 0..5 {
+            state.push(
+                HistoryCell::UserMessage {
+                    text: format!("row {row}"),
+                },
+                20,
+            );
+        }
+        assert_eq!(state.text_width(20, 5), 19, "overflow reserves one column");
+        assert_eq!(
+            state.text_width(1, 5),
+            1,
+            "one-column areas cannot reserve a scrollbar"
+        );
+        assert_eq!(
+            state.text_width(0, 5),
+            0,
+            "zero-width areas stay zero-width"
+        );
+    }
+
+    #[test]
+    fn render_handles_zero_and_one_column_areas() {
+        let state = HistoryState {
+            cells: vec![HistoryCell::UserMessage {
+                text: "history that would overflow a narrow area".into(),
+            }],
+            selected: None,
+            scroll_offset: 0,
+        };
+
+        for area in [Rect::new(0, 0, 0, 5), Rect::new(0, 0, 1, 5)] {
+            let mut buffer = Buffer::empty(area);
+            HistoryView {
+                state: &state,
+                width: area.width,
+            }
+            .render(area, &mut buffer);
+        }
     }
 
     #[test]
