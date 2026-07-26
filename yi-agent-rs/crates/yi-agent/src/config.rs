@@ -350,14 +350,40 @@ mod tests {
     /// 测试用互斥锁:涉及环境变量的测试必须串行执行,避免并行干扰。
     static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A failed fixture must not prevent later tests from reporting their
+        // own result instead of a misleading PoisonError.
+        ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn clear_config_env() {
+        unsafe {
+            for key in [
+                "MODEL_API_KEY",
+                "MODEL_API_URL",
+                "YI_AGENT_PROVIDER",
+                "YI_AGENT_MODEL",
+                "YI_AGENT_WORKDIR",
+                "YI_AGENT_YOLO",
+                "YI_AGENT_MAX_TURNS",
+                "YI_AGENT_SYSTEM_PROMPT",
+                "YI_AGENT_MODEL_CONTEXT_LENGTH",
+                "YI_AGENT_COMPACT_RATIO",
+                "YI_AGENT_COMPACT_KEEP_TURNS",
+                "YI_AGENT_SKILLS_CATALOG_BUDGET",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     #[test]
     fn load_requires_api_key() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
-        // 清除环境变量确保测试隔离（Rust 2024: remove_var is unsafe）
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-            std::env::remove_var("MODEL_API_URL");
-        }
+        let _guard = env_lock();
+        clear_config_env();
+        let temp = tempfile::TempDir::new().unwrap();
         let cli = Cli {
             command: None,
             provider: None,
@@ -365,7 +391,7 @@ mod tests {
             api_key: None,
             model: None,
             max_turns: None,
-            workdir: None,
+            workdir: Some(temp.path().to_path_buf()),
             system_prompt: None,
             model_context_length: None,
             compact_ratio: None,
@@ -413,6 +439,8 @@ mod tests {
 
     #[test]
     fn load_defaults_api_url_and_model() {
+        let _guard = env_lock();
+        clear_config_env();
         let cli = Cli {
             command: None,
             provider: None,
@@ -532,6 +560,8 @@ mod tests {
 
     #[test]
     fn load_defaults_provider_to_anthropic() {
+        let _guard = env_lock();
+        clear_config_env();
         let cli = Cli {
             command: None,
             provider: None,
@@ -555,6 +585,8 @@ mod tests {
 
     #[test]
     fn load_defaults_openai_provider() {
+        let _guard = env_lock();
+        clear_config_env();
         let cli = Cli {
             command: None,
             provider: Some("openai".into()),
@@ -580,7 +612,10 @@ mod tests {
 
     #[test]
     fn load_reads_dotenv_file() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
+        // dotenvy preserves existing process variables, so clear a value
+        // loaded by an earlier config test before exercising this fixture.
+        clear_config_env();
         // 创建临时目录和 .yi-agent/.env 文件
         let temp_dir = std::env::temp_dir().join(".env_test_dotenv_dir");
         let yi_agent_dir = temp_dir.join(".yi-agent");
@@ -640,7 +675,7 @@ mod tests {
 
     #[test]
     fn resolve_env_path_uses_yi_agent_subdir_for_env_var() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         unsafe {
             std::env::set_var("YI_AGENT_WORKDIR", "/tmp/my-env-dir");
         }
@@ -670,7 +705,7 @@ mod tests {
 
     #[test]
     fn load_env_files_loads_global_when_no_local() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // local 不存在,global 存在 → 应该加载 global
         let temp = std::env::temp_dir().join(".env_test_global_only");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -693,7 +728,7 @@ mod tests {
 
     #[test]
     fn load_env_files_local_overrides_global() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // local 和 global 都存在 → local 覆盖 global
         let temp = std::env::temp_dir().join(".env_test_local_overrides");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -718,7 +753,7 @@ mod tests {
 
     #[test]
     fn load_env_files_skips_global_when_none() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // global_path = None → 不加载 global(显式指定 --workdir 的场景)
         let temp = std::env::temp_dir().join(".env_test_no_global");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -743,7 +778,7 @@ mod tests {
 
     #[test]
     fn load_env_files_real_env_overrides_all() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // 真实环境变量 > local > global
         let temp = std::env::temp_dir().join(".env_test_real_env");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -791,7 +826,7 @@ mod tests {
 
     #[test]
     fn load_creates_local_yi_agent_dir_in_fallback_mode() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // fallback 模式下,当前目录的 .yi-agent/ 不存在时应自动创建
         let temp = std::env::temp_dir().join(".env_test_auto_create_local");
         std::fs::create_dir_all(&temp).unwrap();
@@ -842,7 +877,7 @@ mod tests {
 
     #[test]
     fn load_falls_back_to_current_dir_when_workdir_env_empty() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // 设置空字符串环境变量,应该 fallback 到 current_dir 而非变成空路径
         unsafe {
             std::env::set_var("YI_AGENT_WORKDIR", "");
@@ -946,7 +981,7 @@ mod tests {
 
     #[test]
     fn yolo_env_var_enables_yolo() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         unsafe {
             std::env::set_var("YI_AGENT_YOLO", "true");
         }
@@ -961,7 +996,7 @@ mod tests {
 
     #[test]
     fn yolo_env_var_false_by_default() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("YI_AGENT_YOLO");
         }
