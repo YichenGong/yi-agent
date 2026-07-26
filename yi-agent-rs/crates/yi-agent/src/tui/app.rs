@@ -1,7 +1,10 @@
 use std::io::stdout;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -42,7 +45,7 @@ pub fn run_tui(
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -65,7 +68,11 @@ pub fn run_tui(
 
     // Always restore terminal state, even on error
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     result
 }
 
@@ -198,26 +205,14 @@ fn run_loop<B: Backend, E: EventSource>(
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
 
-        terminal.draw(|f| {
-            let area = f.area();
-            let input_width = area.width;
-            let input_height = compute_input_height(input, pending_quit, input_width).min(6);
-            let popup_height = popup
-                .as_ref()
-                .map(|p| (p.filtered().len() + 2).min(10) as u16) // +2 for borders
-                .unwrap_or(0);
+        // Pre-compute layout so mouse hit-testing uses the same chunk rects
+        // as the draw closure below.
+        let size = terminal.size()?;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        let layout = compute_layout(area, input, pending_quit, &popup, queued_height);
 
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(3),                // history
-                    Constraint::Length(popup_height),  // popup (0 when none)
-                    Constraint::Length(1),             // status bar
-                    Constraint::Length(queued_height), // queued preview
-                    Constraint::Length(1),             // blank gap
-                    Constraint::Length(input_height),  // input (wraps up to 6 lines)
-                ])
-                .split(area);
+        terminal.draw(|f| {
+            let chunks = layout.chunks.clone();
 
             let history_view = HistoryView {
                 state: history,
@@ -314,46 +309,60 @@ fn run_loop<B: Backend, E: EventSource>(
             }
         })?;
 
-        // Poll for key events with timeout (33ms → ~30hz refresh)
-        if let Some(Event::Key(key)) = events.poll(Duration::from_millis(33))? {
-            // Ctrl+P opens the bash task popup when no popup is active.
-            if key.code == KeyCode::Char('p')
-                && key.modifiers == KeyModifiers::CONTROL
-                && matches!(bash_popup, BashPopup::None)
-            {
-                let ids: Vec<String> = task_registry.list().iter().map(|t| t.id.clone()).collect();
-                if !ids.is_empty() {
-                    bash_popup = BashPopup::List(ListPopup::new(ids));
+        // Poll for events with timeout (33ms → ~30hz refresh)
+        match events.poll(Duration::from_millis(33))? {
+            Some(Event::Key(key)) => {
+                // Ctrl+P opens the bash task popup when no popup is active.
+                if key.code == KeyCode::Char('p')
+                    && key.modifiers == KeyModifiers::CONTROL
+                    && matches!(bash_popup, BashPopup::None)
+                {
+                    let ids: Vec<String> =
+                        task_registry.list().iter().map(|t| t.id.clone()).collect();
+                    if !ids.is_empty() {
+                        bash_popup = BashPopup::List(ListPopup::new(ids));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            // Route keys to the bash popup when active.
-            if !matches!(bash_popup, BashPopup::None) {
-                handle_bash_popup_key(key, &mut bash_popup, &task_registry);
-                continue;
-            }
-            match handle_key(
-                key,
-                input,
-                history,
-                &cost_tracker,
-                input_tx,
-                interrupt_tx,
-                control_tx,
-                decision_tx,
-                is_running,
-                &mut queued,
-                &mut pending_quit,
-                &mut popup,
-            ) {
-                KeyOutcome::Quit => break,
-                KeyOutcome::Submit(_) => {
-                    pending_quit = false;
+                // Route keys to the bash popup when active.
+                if !matches!(bash_popup, BashPopup::None) {
+                    handle_bash_popup_key(key, &mut bash_popup, &task_registry);
+                    continue;
                 }
-                KeyOutcome::None => {}
+                match handle_key(
+                    key,
+                    input,
+                    history,
+                    &cost_tracker,
+                    input_tx,
+                    interrupt_tx,
+                    control_tx,
+                    decision_tx,
+                    is_running,
+                    &mut queued,
+                    &mut pending_quit,
+                    &mut popup,
+                ) {
+                    KeyOutcome::Quit => break,
+                    KeyOutcome::Submit(_) => {
+                        pending_quit = false;
+                    }
+                    KeyOutcome::None => {}
+                }
+                // After any key, sync popup state with the (possibly modified) buffer
+                sync_popup(&mut popup, &input.buffer);
             }
-            // After any key, sync popup state with the (possibly modified) buffer
-            sync_popup(&mut popup, &input.buffer);
+            Some(Event::Mouse(mouse)) => {
+                handle_mouse(
+                    mouse,
+                    &layout,
+                    &mut bash_popup,
+                    history,
+                    &task_registry,
+                    &mut pending_quit,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -442,6 +451,73 @@ fn handle_bash_popup_key(
         },
         BashPopup::None => {}
     }
+}
+
+/// Handle a mouse event by routing scroll wheel movement to whichever region
+/// the cursor is over. Only scroll events are handled; clicks are ignored.
+///
+/// Routing priority:
+/// 1. If a bash detail popup is active and the mouse is over the history
+///    region (where the popup is rendered), scroll the popup.
+/// 2. Otherwise, if the mouse is over the history region, scroll history.
+/// 3. If the mouse is over the input region, do nothing — the input widget
+///    handles its own scrolling internally.
+fn handle_mouse(
+    mouse: MouseEvent,
+    layout: &LayoutInfo,
+    bash_popup: &mut BashPopup,
+    history: &mut HistoryState,
+    task_registry: &RunningTaskRegistry,
+    pending_quit: &mut bool,
+) {
+    // Only react to scroll-wheel events.
+    let scroll_delta = match mouse.kind {
+        MouseEventKind::ScrollUp => Some(1usize),
+        MouseEventKind::ScrollDown => Some(1usize),
+        _ => None,
+    };
+    let Some(delta) = scroll_delta else {
+        return;
+    };
+    let is_scroll_down = matches!(mouse.kind, MouseEventKind::ScrollDown);
+
+    let history_area = layout.chunks[0];
+    let pos = ratatui::layout::Position::from((mouse.column, mouse.row));
+
+    // The bash detail popup occupies the history region (chunks[0]).
+    if matches!(bash_popup, BashPopup::Detail(_) | BashPopup::ConfirmKill(_))
+        && history_area.contains(pos)
+    {
+        if let BashPopup::Detail(d) = bash_popup {
+            if is_scroll_down {
+                let lines = task_registry
+                    .get(&d.task_id)
+                    .map(|t| {
+                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
+                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
+                        so + se + 6 // header + labels
+                    })
+                    .unwrap_or(0);
+                d.scroll_down(delta, lines);
+            } else {
+                d.scroll_up(delta);
+            }
+        }
+        return;
+    }
+
+    // History region: scroll the conversation history.
+    if history_area.contains(pos) {
+        *pending_quit = false;
+        if is_scroll_down {
+            history.scroll_down(delta);
+        } else {
+            history.scroll_up(delta);
+        }
+    }
+    // Other regions (status bar, queued preview, input) are intentionally
+    // ignored — the input widget handles its own scroll, and the others have
+    // no scrollable content.
 }
 
 /// Route agent events to the task registry + status bar before they reach
@@ -879,6 +955,47 @@ fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) 
     }
     let lines = total_width.div_ceil(avail);
     lines.max(1) as u16
+}
+
+/// Pre-computed screen layout, shared between the draw closure and the mouse
+/// handler so hit-testing uses the exact same chunk rects that were rendered.
+#[derive(Clone, Debug)]
+struct LayoutInfo {
+    /// Vertical chunks: [0]=history, [1]=popup, [2]=status, [3]=queued,
+    /// [4]=gap, [5]=input.
+    chunks: Vec<ratatui::layout::Rect>,
+}
+
+/// Compute the screen layout from the current terminal size and widget state.
+fn compute_layout(
+    area: ratatui::layout::Rect,
+    input: &InputLine,
+    pending_quit: bool,
+    popup: &Option<CommandPopup>,
+    queued_height: u16,
+) -> LayoutInfo {
+    let input_width = area.width;
+    let input_height = compute_input_height(input, pending_quit, input_width).min(6);
+    let popup_height = popup
+        .as_ref()
+        .map(|p| (p.filtered().len() + 2).min(10) as u16)
+        .unwrap_or(0);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),                // history
+            Constraint::Length(popup_height),  // popup (0 when none)
+            Constraint::Length(1),             // status bar
+            Constraint::Length(queued_height), // queued preview
+            Constraint::Length(1),             // blank gap
+            Constraint::Length(input_height),  // input (wraps up to 6 lines)
+        ])
+        .split(area);
+
+    LayoutInfo {
+        chunks: chunks.to_vec(),
+    }
 }
 
 /// Wrap the input buffer into multiple `Line`s so all typed text is visible.
@@ -3122,6 +3239,265 @@ mod tests {
         assert!(
             rendered.contains("100"),
             "tracker should contain input tokens: {rendered}"
+        );
+    }
+
+    // ----- Mouse scroll routing tests -----
+
+    /// Build a `MouseEvent` of the given kind at `(column, row)`.
+    fn make_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Compute the layout for a standard 80×24 terminal with no popup and
+    /// empty input. Returns the history rect (chunks[0]) for convenience.
+    fn layout_80x24() -> (LayoutInfo, ratatui::layout::Rect) {
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let input = InputLine::new();
+        let layout = compute_layout(area, &input, false, &None, 0);
+        let history = layout.chunks[0];
+        (layout, history)
+    }
+
+    /// Scrolling up over the history region should increase `scroll_offset`.
+    #[test]
+    fn mouse_scroll_up_in_history_increases_offset() {
+        let (layout, history_area) = layout_80x24();
+        let mut bash_popup = BashPopup::None;
+        let mut hist = HistoryState::new();
+        // Fill enough lines so scrolling is meaningful.
+        for _ in 0..50 {
+            hist.push(HistoryCell::UserMessage {
+                text: "line".into(),
+            });
+        }
+        let registry = RunningTaskRegistry::new();
+        let mut pending_quit = false;
+
+        // Scroll up at the top of the history region.
+        let row = history_area.y;
+        handle_mouse(
+            make_mouse(MouseEventKind::ScrollUp, 0, row),
+            &layout,
+            &mut bash_popup,
+            &mut hist,
+            &registry,
+            &mut pending_quit,
+        );
+        assert_eq!(
+            hist.scroll_offset, 1,
+            "ScrollUp in history should scroll up"
+        );
+
+        // A second scroll should accumulate.
+        handle_mouse(
+            make_mouse(MouseEventKind::ScrollUp, 5, row + 3),
+            &layout,
+            &mut bash_popup,
+            &mut hist,
+            &registry,
+            &mut pending_quit,
+        );
+        assert_eq!(hist.scroll_offset, 2, "second ScrollUp should accumulate");
+    }
+
+    /// Scrolling down over the history region should decrease `scroll_offset`
+    /// (clamped at 0).
+    #[test]
+    fn mouse_scroll_down_in_history_decreases_offset() {
+        let (layout, history_area) = layout_80x24();
+        let mut bash_popup = BashPopup::None;
+        let mut hist = HistoryState::new();
+        for _ in 0..50 {
+            hist.push(HistoryCell::UserMessage {
+                text: "line".into(),
+            });
+        }
+        hist.scroll_up(5);
+        assert_eq!(hist.scroll_offset, 5);
+
+        let registry = RunningTaskRegistry::new();
+        let mut pending_quit = false;
+
+        handle_mouse(
+            make_mouse(MouseEventKind::ScrollDown, 0, history_area.y),
+            &layout,
+            &mut bash_popup,
+            &mut hist,
+            &registry,
+            &mut pending_quit,
+        );
+        assert_eq!(
+            hist.scroll_offset, 4,
+            "ScrollDown in history should decrease offset"
+        );
+
+        // Scrolling down past 0 should clamp at 0 (not underflow).
+        for _ in 0..10 {
+            handle_mouse(
+                make_mouse(MouseEventKind::ScrollDown, 0, history_area.y),
+                &layout,
+                &mut bash_popup,
+                &mut hist,
+                &registry,
+                &mut pending_quit,
+            );
+        }
+        assert_eq!(hist.scroll_offset, 0, "offset should clamp at 0");
+    }
+
+    /// Scrolling over the input region should NOT affect history.
+    #[test]
+    fn mouse_scroll_in_input_region_ignores_history() {
+        let (layout, _history_area) = layout_80x24();
+        let input_area = layout.chunks[5];
+        let mut bash_popup = BashPopup::None;
+        let mut hist = HistoryState::new();
+        for _ in 0..50 {
+            hist.push(HistoryCell::UserMessage {
+                text: "line".into(),
+            });
+        }
+        let registry = RunningTaskRegistry::new();
+        let mut pending_quit = false;
+
+        handle_mouse(
+            make_mouse(MouseEventKind::ScrollUp, 0, input_area.y),
+            &layout,
+            &mut bash_popup,
+            &mut hist,
+            &registry,
+            &mut pending_quit,
+        );
+        assert_eq!(
+            hist.scroll_offset, 0,
+            "ScrollUp in input region should not touch history"
+        );
+    }
+
+    /// Mouse clicks (non-scroll events) should be ignored entirely.
+    #[test]
+    fn mouse_click_is_ignored() {
+        let (layout, history_area) = layout_80x24();
+        let mut bash_popup = BashPopup::None;
+        let mut hist = HistoryState::new();
+        for _ in 0..50 {
+            hist.push(HistoryCell::UserMessage {
+                text: "line".into(),
+            });
+        }
+        let registry = RunningTaskRegistry::new();
+        let mut pending_quit = false;
+
+        handle_mouse(
+            make_mouse(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                0,
+                history_area.y,
+            ),
+            &layout,
+            &mut bash_popup,
+            &mut hist,
+            &registry,
+            &mut pending_quit,
+        );
+        assert_eq!(hist.scroll_offset, 0, "click should not scroll");
+    }
+
+    /// Scrolling up over the history region should clear `pending_quit`,
+    /// matching the behavior of other history navigation keys.
+    #[test]
+    fn mouse_scroll_clears_pending_quit() {
+        let (layout, history_area) = layout_80x24();
+        let mut bash_popup = BashPopup::None;
+        let mut hist = HistoryState::new();
+        let registry = RunningTaskRegistry::new();
+        let mut pending_quit = true;
+
+        handle_mouse(
+            make_mouse(MouseEventKind::ScrollUp, 0, history_area.y),
+            &layout,
+            &mut bash_popup,
+            &mut hist,
+            &registry,
+            &mut pending_quit,
+        );
+        assert!(!pending_quit, "scrolling history should clear pending_quit");
+    }
+
+    /// End-to-end: feed `Event::Mouse(ScrollUp)` events through the TUI loop
+    /// and verify history `scroll_offset` changes are visible in the rendered
+    /// buffer.
+    #[test]
+    fn tui_mouse_scroll_up_shifts_history_view() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(128);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+
+        // Fill history with many lines so the view is scrollable.
+        for i in 0..40 {
+            agent_tx
+                .try_send(AgentEvent::AssistantText(format!("line-{i}\n")))
+                .unwrap();
+            agent_tx
+                .try_send(AgentEvent::Done {
+                    reason: yi_agent_core::DoneReason::EndTurn,
+                })
+                .unwrap();
+        }
+
+        // Script: scroll up twice in the history region (row 0), then quit.
+        // Events are popped in reverse order (LIFO via Vec::pop).
+        let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Event::Mouse(make_mouse(MouseEventKind::ScrollUp, 0, 0)),
+            Event::Mouse(make_mouse(MouseEventKind::ScrollUp, 0, 0)),
+        ]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        // After scrolling up twice, the bottom of the history view should no
+        // longer show the last line. We verify by checking that the last
+        // "line-39" is NOT visible at the bottom of the history area (row 16
+        // = 24 - 1 status - 1 gap - 1 input - 5 ... but exact row depends on
+        // layout). Instead of asserting exact content, assert that scrolling
+        // changed the view: capture history rows and confirm the last line
+        // shifted.
+        //
+        // With scroll_offset=2, the last visible line should be "line-38"
+        // (one above the true last). We just assert the buffer contains the
+        // scrolled content and not "line-39" in the history area.
+        let buffer = terminal.backend().buffer();
+        // History occupies rows 0..(24-3)=21 (Min(3) minus status+gap+input).
+        // Collect history-area text.
+        let history_text: String = (0..21u16)
+            .flat_map(|y| (0..80u16).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(
+            !history_text.contains("line-39"),
+            "after scrolling up 2, the last line should be off-screen; got: {history_text:?}"
         );
     }
 }
