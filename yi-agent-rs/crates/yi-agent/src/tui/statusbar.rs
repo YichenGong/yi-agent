@@ -23,18 +23,24 @@ pub struct StatusBarState {
 
 impl StatusBarState {
     /// Update the target token counts from a new Usage event.
-    /// Targets are monotonic within a call (take the max), since providers
-    /// may emit multiple Usage events as the stream progresses.
-    /// Real usage overrides any prior estimate.
+    ///
+    /// `input` is always taken as a max (providers may emit multiple Usage
+    /// events with growing input as cache stats arrive). For `output`, a
+    /// positive value replaces any prior heuristic estimate — the API's real
+    /// token count is authoritative. A zero `output` (Anthropic `message_start`
+    /// emits Usage with only `input_tokens` known) is ignored on the output
+    /// side so it does not clobber a running decode estimate.
     pub fn set_token_target(&mut self, input: u64, output: u64) {
         self.target_input = self.target_input.max(input);
-        self.target_output = self.target_output.max(output);
+        if output > 0 {
+            self.target_output = output;
+        }
         self.last_usage_time = Some(std::time::Instant::now());
     }
 
     /// Set a heuristic prefill estimate at the start of a new LLM call.
     /// Resets per-call counters so each think turn shows its own values;
-    /// real usage later overrides via `set_token_target` max.
+    /// real usage later overrides via `set_token_target`.
     pub fn set_prefill_estimate(&mut self, input: u64) {
         self.target_input = input;
         self.target_output = 0;
@@ -315,6 +321,53 @@ mod tests {
         s.estimate_decode_tokens("hello world"); // ~2 tokens estimated
         s.set_token_target(0, 100); // real usage: 100
         assert_eq!(s.target_output, 100, "real usage should override estimate");
+    }
+
+    #[test]
+    fn test_real_usage_overrides_inflated_estimate() {
+        // Reproduces the reported bug: heuristic estimate (e.g. 2370 from
+        // long tool-call JSON + CJK text) far exceeds the real output_tokens
+        // (e.g. 285). Real usage must replace the estimate, not be clamped
+        // away by max().
+        let mut s = StatusBarState::default();
+        // Simulate ~2370 tokens of estimated decode from a long stream of
+        // tool-call JSON deltas (ASCII, 4 chars/token).
+        let big = "a".repeat(2370 * 4);
+        s.estimate_decode_tokens(&big);
+        assert!(
+            s.target_output >= 2370,
+            "estimate should reach ~2370, got {}",
+            s.target_output
+        );
+        s.set_token_target(0, 285); // real usage from API
+        assert_eq!(
+            s.target_output, 285,
+            "real usage (285) must override inflated estimate ({})",
+            s.target_output
+        );
+    }
+
+    #[test]
+    fn test_input_only_usage_does_not_clobber_decode_estimate() {
+        // Anthropic message_start emits Usage with output_tokens=0 (only
+        // input_tokens are known at stream start). A zero output must NOT
+        // replace a running heuristic estimate, otherwise the status bar
+        // would flicker to 0 before the real output_tokens arrive in
+        // message_delta.
+        let mut s = StatusBarState::default();
+        s.estimate_decode_tokens("hello world"); // ~2 tokens
+        s.set_token_target(500, 0); // message_start: input only, output=0
+        assert_eq!(
+            s.target_output, 2,
+            "output=0 (input-only event) must not clobber estimate"
+        );
+        assert_eq!(s.target_input, 500, "input should still update");
+        // Subsequent estimate deltas must stop once any usage arrived.
+        s.estimate_decode_tokens("more text here");
+        assert_eq!(
+            s.target_output, 2,
+            "estimates must stop after any usage event"
+        );
     }
 
     #[test]
