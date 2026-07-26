@@ -30,6 +30,7 @@ struct LineBuilder {
     table_rows: Vec<Vec<String>>,
     current_row: Vec<String>,
     current_cell: String,
+    list_stack: Vec<Option<u64>>,
 }
 
 impl LineBuilder {
@@ -47,6 +48,7 @@ impl LineBuilder {
             table_rows: Vec::new(),
             current_row: Vec::new(),
             current_cell: String::new(),
+            list_stack: Vec::new(),
         }
     }
 
@@ -135,6 +137,24 @@ impl LineBuilder {
             Tag::TableCell => {
                 self.current_cell.clear();
             }
+            Tag::List(start) => {
+                self.list_stack.push(start);
+            }
+            Tag::Item => {
+                let indent = "  ".repeat(self.list_stack.len().saturating_sub(1));
+                let marker = match self.list_stack.last_mut() {
+                    Some(Some(next)) => {
+                        let marker = format!("{next}.");
+                        *next += 1;
+                        marker
+                    }
+                    _ => "-".to_string(),
+                };
+                self.push_span(Span::styled(
+                    format!("{indent}{marker}"),
+                    self.current_style,
+                ));
+            }
             _ => {}
         }
     }
@@ -165,6 +185,14 @@ impl LineBuilder {
             TagEnd::Table => {
                 self.flush_table();
                 self.in_table = false;
+            }
+            TagEnd::Item => {
+                if !self.current_spans.is_empty() {
+                    self.flush_line();
+                }
+            }
+            TagEnd::List(_) => {
+                self.list_stack.pop();
             }
             _ => {}
         }
@@ -427,6 +455,14 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(spans_text(&lines[0]), "para one");
         assert_eq!(spans_text(&lines[1]), "para two");
+    }
+
+    #[test]
+    fn unordered_list_renders_each_item_on_its_own_line() {
+        let lines = render_markdown("- First item\n- Second item\n", 80);
+        let rendered: Vec<String> = lines.iter().map(spans_text).collect();
+
+        assert_eq!(rendered, ["- First item", "- Second item"]);
     }
 
     #[test]
