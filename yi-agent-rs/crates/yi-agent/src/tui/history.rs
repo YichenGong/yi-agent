@@ -414,6 +414,27 @@ mod tests {
     }
 
     #[test]
+    fn push_event_assistant_text_preserves_embedded_newlines() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::AssistantText("first line\nsecond line".into()),
+            80,
+        );
+
+        let rendered: Vec<String> = s.cells[0]
+            .lines(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rendered, ["first line", "second line"]);
+    }
+
+    #[test]
     fn push_event_tool_call_creates_separate_cell() {
         let mut s = HistoryState::new();
         s.push_event(AgentEvent::AssistantText("text".into()), 80);
