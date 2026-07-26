@@ -39,4 +39,5 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] `/cost` 命令 — `tui/cost.rs::CostTracker` 按模型累计 token + 调用次数 — [设计](../plans/2026-07-26-tui-cost-command-design.md)
 - [x] `/yolo` `/model` `/compact` `/clear` `/help` `/exit` slash 命令 — `tui/slash.rs` + `tui/app.rs` 路由
 - [x] Markdown 表格渲染 — commit `2e9da9e` 用 Unicode box drawing 修复
+- [x] 终端原生复制与 bracketed paste — `tui/app.rs` 不启用 mouse capture，并路由 `Event::Paste`; 验证：`cargo test -p yi-agent tui::app::tests::paste_`
 - [ ] InlineRenderer 退役 — `tui/` 仍保留 deprecated 的 InlineRenderer 代码，待删除
