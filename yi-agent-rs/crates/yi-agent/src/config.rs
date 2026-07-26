@@ -101,6 +101,11 @@ pub enum Command {
         /// Read prompt from stdin even if prompt arg is given.
         #[arg(long)]
         stdin: bool,
+
+        /// 裸模型模式:不注册任何工具,不加载 skills,不补 system prompt。
+        /// 等同于直接对话裸 LLM,无任何附加能力。
+        #[arg(long)]
+        naked: bool,
     },
     /// Start web config UI
     Web {
@@ -893,6 +898,42 @@ mod tests {
                 assert_eq!(port, 7292);
             }
             other => panic!("expected Web command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_naked_flag() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "run", "--naked", "hi"]);
+        match cli.command {
+            Some(Command::Run {
+                prompt,
+                json: _,
+                stdin: _,
+                naked,
+            }) => {
+                assert_eq!(prompt.as_deref(), Some("hi"));
+                assert!(naked, "naked flag should be true");
+            }
+            other => panic!("expected Run command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_default_naked_false() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "run", "hi"]);
+        match cli.command {
+            Some(Command::Run {
+                prompt,
+                json: _,
+                stdin: _,
+                naked,
+            }) => {
+                assert_eq!(prompt.as_deref(), Some("hi"));
+                assert!(!naked, "naked flag should default to false");
+            }
+            other => panic!("expected Run command, got {:?}", other),
         }
     }
 
