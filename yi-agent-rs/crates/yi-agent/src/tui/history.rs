@@ -174,7 +174,7 @@ impl HistoryState {
                     });
                 }
             },
-            AgentEvent::Usage(_) => {}
+            AgentEvent::Usage { .. } => {}
             AgentEvent::Cancelled => {
                 self.push(HistoryCell::Separator {
                     label: Some("Interrupted".into()),

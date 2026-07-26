@@ -480,8 +480,8 @@ fn route_event(
         AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_) => {
             registry.abort_all_running();
         }
-        AgentEvent::Usage(u) => {
-            statusbar.set_token_target(u.input_tokens as u64, u.output_tokens as u64);
+        AgentEvent::Usage { usage, .. } => {
+            statusbar.set_token_target(usage.input_tokens as u64, usage.output_tokens as u64);
         }
         AgentEvent::EstimatedPrefill(n) => {
             statusbar.set_prefill_estimate(*n as u64);
@@ -1058,11 +1058,14 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
-            &AgentEvent::Usage(yi_agent_core::TokenUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-                ..Default::default()
-            }),
+            &AgentEvent::Usage {
+                model: "test".to_string(),
+                usage: yi_agent_core::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+            },
         );
         sb.tick();
         assert!(sb.display_input_tokens() > 0);
