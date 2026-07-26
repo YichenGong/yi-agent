@@ -163,14 +163,10 @@ impl HistoryState {
             AgentEvent::Start => {}
             AgentEvent::AssistantText(text) => match self.cells.last_mut() {
                 Some(HistoryCell::AssistantMessage { .. }) => {
-                    self.cells
-                        .last_mut()
-                        .unwrap()
-                        .append_assistant_text(&text, width);
+                    self.cells.last_mut().unwrap().append_assistant_text(&text);
                 }
                 _ => {
-                    self.cells
-                        .push(HistoryCell::from_assistant_text(&text, width));
+                    self.cells.push(HistoryCell::from_assistant_text(&text));
                 }
             },
             AgentEvent::ToolCall { id, name, input } => {
@@ -554,6 +550,31 @@ mod tests {
             "streaming text should have added display lines"
         );
         assert_eq!(s.scroll_offset, 2 + added_lines);
+    }
+
+    #[test]
+    fn push_event_assistant_text_after_resize_uses_current_width_for_delta() {
+        let wide_width = 80;
+        let narrow_width = 20;
+        let initial = "this assistant response wraps across several narrow display lines";
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText(initial.into()), wide_width);
+        s.scroll_offset = 3;
+
+        let before = s.flattened_line_count(narrow_width);
+        let expected_before = HistoryCell::from_assistant_text(initial).line_count(narrow_width);
+        assert_eq!(
+            before, expected_before,
+            "history must reflow after a resize"
+        );
+
+        s.push_event(
+            AgentEvent::AssistantText(" with an additional narrow-width tail".into()),
+            narrow_width,
+        );
+
+        let after = s.flattened_line_count(narrow_width);
+        assert_eq!(s.scroll_offset, 3 + (after - before));
     }
 
     #[test]

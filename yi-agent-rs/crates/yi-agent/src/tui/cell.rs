@@ -12,10 +12,7 @@ pub enum HistoryCell {
     /// `render_markdown`, preserving table structure without re-flowing.
     Markdown { text: String },
     /// Assistant's markdown response. Always expanded.
-    AssistantMessage {
-        markdown: String,
-        rendered_lines: Vec<Line<'static>>,
-    },
+    AssistantMessage { markdown: String },
     /// Tool call. Foldable (default folded).
     ToolCall {
         id: String,
@@ -68,7 +65,9 @@ impl HistoryCell {
         match self {
             Self::UserMessage { text } => render_user_message(text, width),
             Self::Markdown { text } => super::markdown::render_markdown(text, width),
-            Self::AssistantMessage { rendered_lines, .. } => rendered_lines.clone(),
+            Self::AssistantMessage { markdown } => {
+                super::markdown::render_markdown(markdown, width)
+            }
             Self::ToolCall {
                 name,
                 input,
@@ -118,23 +117,16 @@ impl HistoryCell {
     }
 
     /// Create an AssistantMessage cell from a text chunk.
-    pub fn from_assistant_text(text: &str, width: u16) -> Self {
-        let rendered = super::markdown::render_markdown(text, width);
+    pub fn from_assistant_text(text: &str) -> Self {
         Self::AssistantMessage {
             markdown: text.to_string(),
-            rendered_lines: rendered,
         }
     }
 
-    /// Append more text to an existing AssistantMessage, re-rendering.
-    pub fn append_assistant_text(&mut self, more: &str, width: u16) {
-        if let Self::AssistantMessage {
-            markdown,
-            rendered_lines,
-        } = self
-        {
+    /// Append more text to an existing AssistantMessage.
+    pub fn append_assistant_text(&mut self, more: &str) {
+        if let Self::AssistantMessage { markdown } = self {
             markdown.push_str(more);
-            *rendered_lines = super::markdown::render_markdown(markdown, width);
         }
     }
 }
@@ -609,7 +601,7 @@ mod tests {
 
     #[test]
     fn assistant_text_creates_new_cell() {
-        let cell = HistoryCell::from_assistant_text("hello", 80);
+        let cell = HistoryCell::from_assistant_text("hello");
         match cell {
             HistoryCell::AssistantMessage { markdown, .. } => {
                 assert_eq!(markdown, "hello");
