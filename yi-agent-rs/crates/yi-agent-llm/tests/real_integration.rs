@@ -175,3 +175,85 @@ async fn real_anthropic_env_auth() {
         "expected Auth error, got: {result:?}"
     );
 }
+
+// === OpenAI provider real-API tests ===
+
+use yi_agent_llm::{OpenaiProvider, OpenaiProviderOpts};
+
+#[tokio::test]
+#[ignore]
+async fn real_openai_text_stream() {
+    let key = match skip_if_no_key("OPENAI_API_KEY") {
+        Some(k) => k,
+        None => return,
+    };
+    let provider = OpenaiProvider::new(OpenaiProviderOpts {
+        api_key: Some(key),
+        timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    })
+    .expect("provider");
+
+    let stream = provider
+        .call_stream(simple_request("gpt-4o"))
+        .await
+        .expect("stream ok");
+    let events = collect_events(stream).await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| {
+            if let ProviderEvent::TextDelta(t) = e {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(!text.is_empty(), "should have text");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ProviderEvent::Stop { .. }))
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_openai_call_accumulate() {
+    let key = match skip_if_no_key("OPENAI_API_KEY") {
+        Some(k) => k,
+        None => return,
+    };
+    let provider = OpenaiProvider::new(OpenaiProviderOpts {
+        api_key: Some(key),
+        timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    })
+    .expect("provider");
+
+    let resp: ProviderResponse = provider
+        .call(simple_request("gpt-4o"))
+        .await
+        .expect("call ok");
+
+    assert!(!resp.content.is_empty());
+    assert!(
+        resp.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(_)))
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_openai_env_auth() {
+    unsafe {
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+    let result = OpenaiProvider::new(OpenaiProviderOpts {
+        api_key: None,
+        ..Default::default()
+    });
+    assert!(matches!(result, Err(ProviderError::Auth(_))));
+}
