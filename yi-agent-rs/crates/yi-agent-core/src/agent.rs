@@ -63,6 +63,11 @@ pub struct AgentConfig {
     pub compact_threshold: Option<u32>,
     /// Number of recent turns to keep during compact.
     pub compact_keep_turns: Option<u32>,
+    /// Max idle time (no provider events) during THINK before the stream is
+    /// considered stalled. When elapsed, the agent emits `Done { EndTurn }`
+    /// with whatever content was accumulated so far. `None` disables the idle
+    /// timeout (stream can hang forever, as before).
+    pub think_idle_timeout: Option<std::time::Duration>,
 }
 
 impl Default for AgentConfig {
@@ -74,6 +79,11 @@ impl Default for AgentConfig {
             gen_params: Default::default(),
             compact_threshold: Some(100_000),
             compact_keep_turns: Some(4),
+            // Default idle timeout: 60s between provider events. This is
+            // intentionally generous (LLMs can pause between deltas while
+            // thinking) but bounded so a stalled connection eventually
+            // resolves instead of hanging forever.
+            think_idle_timeout: Some(std::time::Duration::from_secs(60)),
         }
     }
 }
@@ -407,7 +417,13 @@ async fn run_loop(
         let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
         let stream = match provider.call_stream(req).await {
-            Ok(s) => s,
+            Ok(s) => {
+                tracing::info!(
+                    turn,
+                    "provider call_stream returned Ok, entering accumulate"
+                );
+                s
+            }
             Err(e) => {
                 warn!(turn, error = %e, "provider call failed");
                 if tx
@@ -423,8 +439,11 @@ async fn run_loop(
 
         // Check 2: THINK 中 — select! between accumulate and cancel
         let (content, _stop_reason, last_usage) = tokio::select! {
-            result = accumulate_provider_stream(stream, &tx, &model) => match result {
-                Ok(v) => v,
+            result = accumulate_provider_stream(stream, &tx, &model, config.think_idle_timeout) => match result {
+                Ok(v) => {
+                    tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
+                    v
+                }
                 Err(e) => {
                     warn!(turn, error = %e, "provider stream error");
                     if tx.send(AgentEvent::Error(e)).await.is_err() {
@@ -449,6 +468,17 @@ async fn run_loop(
         // Log the full accumulated response content at debug level (never repeats across turns).
         debug!(turn, content = ?content, "think: response");
 
+        // Detect idle stall: accumulate_stream synthesizes this stop reason
+        // when no provider event arrives within the idle timeout.
+        if let StopReason::Other(ref s) = _stop_reason {
+            if s == "idle timeout" {
+                tracing::warn!(
+                    turn,
+                    "think phase ended due to idle timeout (stalled stream)"
+                );
+            }
+        }
+
         messages.push(Message::assistant(content.clone()));
         session
             .lock()
@@ -469,6 +499,7 @@ async fn run_loop(
 
         if tool_uses.is_empty() {
             info!(turn, "agent loop done: end_turn");
+            tracing::info!(turn, "emitting AgentEvent::Done(EndTurn)");
             if tx
                 .send(AgentEvent::Done {
                     reason: DoneReason::EndTurn,
@@ -787,11 +818,13 @@ async fn accumulate_provider_stream(
     stream: BoxStream<'static, ProviderEvent>,
     tx: &mpsc::Sender<AgentEvent>,
     model: &str,
+    idle_timeout: Option<std::time::Duration>,
 ) -> Result<(Vec<ContentBlock>, StopReason, Option<TokenUsage>), AgentError> {
     let tx = tx.clone();
     let model = model.to_string();
-    let (content, stop_reason, last_usage) =
-        crate::provider::accumulate_stream(stream, move |event| match event {
+    let (content, stop_reason, last_usage) = crate::provider::accumulate_stream(
+        stream,
+        move |event| match event {
             ProviderEvent::TextDelta(s) => {
                 let _ = tx.try_send(AgentEvent::AssistantText(s));
             }
@@ -805,8 +838,10 @@ async fn accumulate_provider_stream(
                 let _ = tx.try_send(AgentEvent::DecodeDelta(partial_json));
             }
             _ => {}
-        })
-        .await?;
+        },
+        idle_timeout,
+    )
+    .await?;
     Ok((content, stop_reason, last_usage))
 }
 
@@ -1175,6 +1210,24 @@ mod tests {
         }
     }
 
+    /// Provider that emits one TextDelta then stalls forever (no Stop, no None).
+    /// Simulates a real-world stall where the server sends partial text then
+    /// the connection goes silent without a proper terminal event.
+    struct StallAfterDeltaProvider;
+
+    #[async_trait]
+    impl Provider for StallAfterDeltaProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            // Emit one TextDelta, then pending forever.
+            let stream = futures::stream::iter(vec![ProviderEvent::TextDelta("partial".into())])
+                .chain(futures::stream::pending());
+            Ok(stream.boxed())
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_cancel_during_think_emits_cancelled() {
         let provider = Arc::new(HangingProvider);
@@ -1198,6 +1251,60 @@ mod tests {
             !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
             "should NOT have Done event"
         );
+    }
+
+    /// When the provider stream emits a TextDelta then stalls (no Stop event),
+    /// the agent must not hang forever. It should detect the idle stall and
+    /// emit a terminal event (Done or Error) within a bounded time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_think_stream_stall_emits_terminal_within_timeout() {
+        let provider = Arc::new(StallAfterDeltaProvider);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut config = AgentConfig::default();
+        // Short idle timeout so the test runs fast (the stall is detected
+        // quickly instead of waiting for the 60s default).
+        config.think_idle_timeout = Some(std::time::Duration::from_millis(500));
+        let mut agent = Agent::new(provider, tools, config);
+
+        let stream = agent.run("hi".into()).await.unwrap();
+
+        // Wrap in a timeout: if the agent hangs forever (the bug), this fails.
+        // The idle timeout under test should be much shorter than this.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            collect_events_async(stream),
+        )
+        .await;
+
+        let events = result
+            .expect("agent hung forever — idle stall not detected (no terminal event within 10s)");
+
+        // Must have received the partial text.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AssistantText(t) if t == "partial")),
+            "should have the partial AssistantText"
+        );
+        // Must have a terminal event (Done or Error), not just hang.
+        let has_terminal = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { .. } | AgentEvent::Error(_)));
+        assert!(
+            has_terminal,
+            "should emit a terminal event (Done or Error) after stall, got: {:?}",
+            events
+        );
+    }
+
+    /// Async version of collect_events for use with tokio::time::timeout.
+    async fn collect_events_async(mut stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        use futures::StreamExt;
+        while let Some(ev) = stream.next().await {
+            out.push(ev);
+        }
+        out
     }
 
     /// Tool that never completes (simulates a long-running tool).
@@ -1721,6 +1828,7 @@ mod tests {
             },
             compact_threshold: Some(50_000),
             compact_keep_turns: Some(2),
+            think_idle_timeout: None,
         };
         assert_eq!(config.model, "custom-model");
         assert_eq!(config.max_turns, Some(50));

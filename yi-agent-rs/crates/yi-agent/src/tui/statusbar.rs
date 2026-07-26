@@ -87,6 +87,17 @@ impl StatusBarState {
         self.last_usage_time = None;
     }
 
+    /// Called when tool execution begins (ToolCall event received).
+    /// Resets the decode counter so the user sees a clear transition from
+    /// "decoding" to "executing tools". Without this, the decode display
+    /// would show the stale count from the previous LLM turn throughout
+    /// the entire tool execution phase.
+    pub fn on_tool_call_phase(&mut self) {
+        self.target_output = 0;
+        self.display_output = 0;
+        self.last_usage_time = None;
+    }
+
     pub fn display_input_tokens(&self) -> u64 {
         self.display_input
     }
@@ -378,5 +389,42 @@ mod tests {
         s.reset_for_new_call();
         assert_eq!(s.target_input, 0);
         assert_eq!(s.target_output, 0);
+    }
+
+    /// When tool execution begins (ToolCall event), the decode display must
+    /// reset so the user sees "decode ended, tools running" instead of the
+    /// stale decode count from the previous LLM turn lingering during the
+    /// entire tool execution phase.
+    ///
+    /// Without this, the decode counter stays frozen at the previous LLM
+    /// response's value from when `Usage` arrived until the NEXT `Start`
+    /// event (which could be seconds or minutes later if a bash command
+    /// is long-running).
+    #[test]
+    fn test_tool_call_freezes_decode_display() {
+        let mut s = StatusBarState::default();
+        // Simulate LLM producing decode tokens
+        s.set_prefill_estimate(5000);
+        s.estimate_decode_tokens("hello world from the model");
+        s.set_token_target(5000, 120);
+        // Display is interpolating toward target
+        s.tick();
+        assert!(s.display_output_tokens() > 0, "decode should be showing");
+
+        // Now tool execution begins — call the freeze/reset
+        s.on_tool_call_phase();
+
+        // The decode display should no longer show the stale count.
+        // Either it's zeroed or frozen — the key requirement is that it
+        // doesn't keep displaying the previous LLM turn's decode count.
+        assert_eq!(
+            s.display_output_tokens(),
+            0,
+            "decode display should reset when tool execution begins"
+        );
+        assert_eq!(
+            s.target_output, 0,
+            "decode target should reset when tool execution begins"
+        );
     }
 }

@@ -85,9 +85,16 @@ pub enum ProviderError {
 /// Accumulate a provider stream into content blocks, stop reason, and last usage.
 /// `on_event` is called for each provider event (text delta, usage, etc.).
 /// Returns `None` for usage if the stream emitted no `ProviderEvent::Usage`.
+///
+/// If `idle_timeout` is set and no event arrives within that duration, the
+/// stream is considered stalled: the loop breaks and whatever was accumulated
+/// so far is returned with `StopReason::Other("idle timeout")`. This prevents
+/// the agent from hanging forever when the provider connection goes silent
+/// without a proper terminal event.
 pub async fn accumulate_stream<F>(
     mut stream: BoxStream<'static, ProviderEvent>,
     mut on_event: F,
+    idle_timeout: Option<std::time::Duration>,
 ) -> Result<(Vec<ContentBlock>, StopReason, Option<TokenUsage>), ProviderError>
 where
     F: FnMut(ProviderEvent),
@@ -99,7 +106,30 @@ where
     let mut stop_reason = StopReason::EndTurn;
     let mut last_usage: Option<TokenUsage> = None;
 
-    while let Some(event) = stream.next().await {
+    tracing::debug!(
+        ?idle_timeout,
+        "accumulate_stream: start consuming provider stream"
+    );
+    let mut event_count: usize = 0;
+    let stalled = loop {
+        let next = if let Some(to) = idle_timeout {
+            match tokio::time::timeout(to, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    tracing::warn!(
+                        event_count,
+                        idle_timeout_secs = to.as_secs(),
+                        "accumulate_stream: idle timeout — no event within timeout, treating as stalled"
+                    );
+                    break true;
+                }
+            }
+        } else {
+            stream.next().await
+        };
+
+        let Some(event) = next else { break false };
+        event_count += 1;
         match event {
             ProviderEvent::TextDelta(s) => {
                 current_text.push_str(&s);
@@ -126,6 +156,11 @@ where
                 }
             }
             ProviderEvent::Stop { reason } => {
+                tracing::info!(
+                    event_count,
+                    stop_reason = ?reason,
+                    "accumulate_stream: received Stop event"
+                );
                 stop_reason = reason;
             }
             ProviderEvent::Usage(u) => {
@@ -133,6 +168,23 @@ where
                 on_event(ProviderEvent::Usage(u));
             }
         }
+    };
+
+    if stalled {
+        tracing::info!(
+            event_count,
+            pending_text_len = current_text.len(),
+            "accumulate_stream: returning due to idle stall"
+        );
+        // Synthesize a stop reason so callers see a terminal signal.
+        stop_reason = StopReason::Other("idle timeout".to_string());
+    } else {
+        tracing::info!(
+            event_count,
+            stop_reason = ?stop_reason,
+            has_usage = last_usage.is_some(),
+            "accumulate_stream: stream ended (returned None)"
+        );
     }
     if !current_text.is_empty() {
         content.push(ContentBlock::Text(current_text));
@@ -152,7 +204,7 @@ pub trait Provider: Send + Sync {
     /// Convenience: accumulate stream into full response.
     async fn call(&self, req: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let stream = self.call_stream(req).await?;
-        let (content, stop_reason, _usage) = accumulate_stream(stream, |_| {}).await?;
+        let (content, stop_reason, _usage) = accumulate_stream(stream, |_| {}, None).await?;
         Ok(ProviderResponse {
             content,
             stop_reason,
@@ -386,11 +438,15 @@ mod tests {
 
         let mut received_text = Vec::new();
         let mut received_usage = Vec::new();
-        let (content, stop, usage) = accumulate_stream(stream, |ev| match ev {
-            ProviderEvent::TextDelta(s) => received_text.push(s),
-            ProviderEvent::Usage(u) => received_usage.push(u),
-            _ => {}
-        })
+        let (content, stop, usage) = accumulate_stream(
+            stream,
+            |ev| match ev {
+                ProviderEvent::TextDelta(s) => received_text.push(s),
+                ProviderEvent::Usage(u) => received_usage.push(u),
+                _ => {}
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -442,11 +498,15 @@ mod tests {
             .unwrap();
 
         let mut received_deltas = Vec::new();
-        let (content, _stop, _usage) = accumulate_stream(stream, |ev| {
-            if let ProviderEvent::ToolUseDelta { partial_json, .. } = ev {
-                received_deltas.push(partial_json);
-            }
-        })
+        let (content, _stop, _usage) = accumulate_stream(
+            stream,
+            |ev| {
+                if let ProviderEvent::ToolUseDelta { partial_json, .. } = ev {
+                    received_deltas.push(partial_json);
+                }
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -500,7 +560,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, _, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, _, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert_eq!(content.len(), 2);
         match &content[0] {
             ContentBlock::ToolUse { id, name, .. } => {
@@ -545,7 +605,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let result = accumulate_stream(stream, |_| {}).await;
+        let result = accumulate_stream(stream, |_| {}, None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             ProviderError::Stream(msg) => assert!(msg.contains("malformed tool use JSON")),
@@ -581,7 +641,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, _, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, _, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert_eq!(content.len(), 2);
         assert!(matches!(content[0], ContentBlock::ToolUse { .. }));
         match &content[1] {
@@ -614,7 +674,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, _, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, _, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert!(content.is_empty());
     }
 
@@ -631,7 +691,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, stop, usage) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, stop, usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert!(content.is_empty());
         assert_eq!(stop, StopReason::EndTurn);
         assert!(usage.is_none());
@@ -656,7 +716,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (_, stop, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (_, stop, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert_eq!(stop, StopReason::StopSequence);
     }
 
@@ -679,7 +739,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (_, stop, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (_, stop, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert_eq!(stop, StopReason::Other("custom".into()));
     }
 

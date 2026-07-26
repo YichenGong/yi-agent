@@ -538,6 +538,10 @@ fn route_event(
             statusbar.reset_for_new_call();
         }
         AgentEvent::ToolCall { id, name, input } => {
+            // LLM turn ended, tool execution begins. Reset the decode
+            // counter so it doesn't linger at the previous turn's value
+            // throughout the entire tool execution phase.
+            statusbar.on_tool_call_phase();
             let cmd = input
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -1465,6 +1469,152 @@ mod tests {
         );
         // 10 ascii chars → 10/4 = 2 tokens
         assert_eq!(sb.target_output_tokens(), 2);
+    }
+
+    /// Reproduces the user's observation: "after bash executes, the decode
+    /// display seems to persist until the process timeout-exits, not until
+    /// the LLM call actually ends."
+    ///
+    /// Expected event sequence:
+    ///   Start → prefill/decode deltas → Usage (LLM call ends naturally)
+    ///   → ToolCall (bash starts) → ToolOutputDelta (bash running)
+    ///   → ToolTimeout (bash timeout) → ToolResult → Done
+    ///
+    /// The decode display should reset when the LLM call ends (at ToolCall
+    /// or Usage), NOT linger until bash timeout. The bug: decode display
+    /// stayed frozen at the previous LLM turn's value throughout bash
+    /// execution, making it look like "decode is still going" until bash
+    /// timeout.
+    #[test]
+    fn test_decode_display_resets_when_bash_starts_not_when_it_times_out() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+
+        // --- LLM THINK phase: decode tokens arrive ---
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::Start,
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::EstimatedPrefill(500),
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::AssistantText("Let me run a command".into()),
+        );
+        // Real usage from LLM — this is when the LLM call "naturally ends"
+        // (the Stop event and Usage arrive at the end of the stream).
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::Usage {
+                model: "test".to_string(),
+                usage: yi_agent_core::TokenUsage {
+                    input_tokens: 500,
+                    output_tokens: 42,
+                    ..Default::default()
+                },
+            },
+        );
+        sb.tick();
+        // Decode is now showing (interpolating toward 42).
+        let decode_after_llm = sb.display_output_tokens();
+        assert!(
+            decode_after_llm <= 42,
+            "decode should be interpolating toward 42, got {decode_after_llm}"
+        );
+
+        // --- ACT phase: bash starts running ---
+        // This is when the LLM call has ENDED. The decode display should
+        // reset here so the user sees "decode ended, bash is running".
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"sleep 999","expected_timeout_sec":5}),
+            },
+        );
+
+        // KEY ASSERTION: decode display should be 0 immediately when bash
+        // starts, NOT waiting for bash to timeout.
+        assert_eq!(
+            sb.display_output_tokens(),
+            0,
+            "decode should reset to 0 when bash starts, not wait for timeout"
+        );
+        assert_eq!(
+            sb.target_output_tokens(),
+            0,
+            "decode target should reset to 0 when bash starts"
+        );
+
+        // --- bash produces output (still running) ---
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::ToolOutputDelta {
+                id: "t1".into(),
+                stream: OutputStream::Stdout,
+                text: "some output\n".into(),
+            },
+        );
+        // Decode should still be 0 — ToolOutputDelta must not affect decode.
+        assert_eq!(
+            sb.display_output_tokens(),
+            0,
+            "decode should stay 0 during bash execution"
+        );
+
+        // --- bash times out ---
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::ToolTimeout { id: "t1".into() },
+        );
+        // Decode should STILL be 0 — timeout doesn't change it.
+        assert_eq!(
+            sb.display_output_tokens(),
+            0,
+            "decode should still be 0 at bash timeout"
+        );
+
+        // --- ToolResult + Done (turn ends) ---
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::ToolResult {
+                id: "t1".into(),
+                result: yi_agent_core::ToolResult::error("timeout"),
+            },
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::Done {
+                reason: yi_agent_core::DoneReason::EndTurn,
+            },
+        );
+        // Decode should STILL be 0 — Done doesn't add decode tokens.
+        assert_eq!(
+            sb.display_output_tokens(),
+            0,
+            "decode should still be 0 at turn end"
+        );
     }
 
     /// Fake event source that plays back a scripted sequence of events,
