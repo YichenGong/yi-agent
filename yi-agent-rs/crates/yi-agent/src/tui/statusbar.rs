@@ -3,7 +3,7 @@
 //! The status bar state ticks at 30hz (driven by the TUI poll loop) and
 //! linearly interpolates the displayed token counts toward the latest
 //! target reported by `ProviderEvent::Usage`. The running-task dot uses
-//! a hue-rotating spinner to make activity visible at a glance.
+//! a gray-to-white breathing pulse to make activity visible at a glance.
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -60,7 +60,7 @@ impl StatusBarState {
         self.display_input = self.display_input.saturating_add(step_i.min(di));
         self.display_output = self.display_output.saturating_add(step_o.min(dd));
 
-        // Spinner hue: 8° per tick → ~1.5s per cycle at 30hz.
+        // Spinner phase: 8° per tick → ~1.5s per cycle at 30hz.
         self.spinner_phase = (self.spinner_phase + 8) % 360;
 
         // If no new usage for 1s, snap to target (call finished).
@@ -96,9 +96,12 @@ impl StatusBarState {
         self.spinner_phase
     }
     pub fn spinner_color(&self) -> Color {
-        let h = self.spinner_phase as f32 / 360.0;
-        let (r, g, b) = hsl_to_rgb(h, 0.7, 0.6);
-        Color::Rgb(r, g, b)
+        // Gray-to-white breathing: brightness oscillates in [100, 255].
+        // spinner_phase is 0..360; map to a sine wave for a soft pulse.
+        let phase = self.spinner_phase as f32 * std::f32::consts::PI / 180.0;
+        let v = 100.0 + 77.5 * (phase.sin() + 1.0); // (sin+1)/2 * 155 + 100 → [100, 255]
+        let v = v.round() as u8;
+        Color::Rgb(v, v, v)
     }
 }
 
@@ -114,26 +117,6 @@ fn estimate_tokens(text: &str) -> u64 {
         }
     }
     (ascii as f32 / 4.0 + non_ascii as f32 / 1.5) as u64
-}
-
-/// HSL → RGB. `h` in [0,1), `s`/`l` in [0,1]. Returns 8-bit channels.
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
-    let m = l - c / 2.0;
-    let (r, g, b) = match (h * 6.0) as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    (
-        ((r + m) * 255.0).round() as u8,
-        ((g + m) * 255.0).round() as u8,
-        ((b + m) * 255.0).round() as u8,
-    )
 }
 
 /// Format an integer with thousands separators (e.g., 12345 → "12,345").
@@ -186,15 +169,15 @@ pub fn render_statusbar<'a>(
         spans.push(Span::raw("  "));
     }
 
-    spans.push(Span::styled("prefill ", Style::new().fg(Color::DarkGray)));
+    spans.push(Span::raw("prefill "));
     spans.push(Span::styled(
         format_thousands(state.display_input_tokens()),
-        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Gray),
     ));
     spans.push(Span::raw("  decode "));
     spans.push(Span::styled(
         format_thousands(state.display_output_tokens()),
-        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Gray),
     ));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(model, Style::new().fg(Color::DarkGray)));
