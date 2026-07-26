@@ -8,6 +8,9 @@ use unicode_width::UnicodeWidthStr;
 pub enum HistoryCell {
     /// User's input message. Always expanded.
     UserMessage { text: String },
+    /// Pre-formatted markdown content (tables, lists, etc.). Rendered with
+    /// `render_markdown`, preserving table structure without re-flowing.
+    Markdown { text: String },
     /// Assistant's markdown response. Always expanded.
     AssistantMessage {
         markdown: String,
@@ -64,6 +67,7 @@ impl HistoryCell {
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
         match self {
             Self::UserMessage { text } => render_user_message(text, width),
+            Self::Markdown { text } => super::markdown::render_markdown(text, width),
             Self::AssistantMessage { rendered_lines, .. } => rendered_lines.clone(),
             Self::ToolCall {
                 name,
@@ -612,5 +616,32 @@ mod tests {
             }
             _ => panic!("expected AssistantMessage"),
         }
+    }
+
+    #[test]
+    fn markdown_cell_renders_table_with_box_drawing() {
+        let src = "| h1 | h2 |\n| --- | --- |\n| a | b |\n";
+        let cell = HistoryCell::Markdown { text: src.into() };
+        let lines = cell.lines(40);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            joined.contains('│'),
+            "should have box-drawing vertical bars: {joined}"
+        );
+        assert!(
+            joined.contains('─'),
+            "should have box-drawing horizontal bars: {joined}"
+        );
+        assert!(
+            joined.contains("h1") && joined.contains("h2"),
+            "should have headers: {joined}"
+        );
+        assert!(
+            joined.contains("a") && joined.contains("b"),
+            "should have data: {joined}"
+        );
     }
 }
