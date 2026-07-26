@@ -562,6 +562,9 @@ fn route_event(
         AgentEvent::ToolTimeout { id } => {
             registry.on_timeout(id);
         }
+        AgentEvent::ToolResult { id, result } => {
+            registry.on_result(id, result.is_error);
+        }
         // Turn-end events finalize any still-running tasks. This is a
         // defense-in-depth cleanup: in the happy path each ToolCall gets a
         // matching ToolExit before Done arrives. But ToolExit can be missed
@@ -1250,6 +1253,40 @@ mod tests {
             &AgentEvent::ToolTimeout { id: "t".into() },
         );
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
+    }
+
+    /// A normal (non-streaming) tool such as web_search returns ToolResult
+    /// without ToolExit. Its timer must stop when that result arrives rather
+    /// than continuing through the next LLM think phase until Done.
+    #[test]
+    fn test_route_event_tool_result_finalizes_non_streaming_tool() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        let mut cost = CostTracker::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut cost,
+            &AgentEvent::ToolCall {
+                id: "search".into(),
+                name: "web_search".into(),
+                input: serde_json::json!({"query": "rust"}),
+            },
+        );
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut cost,
+            &AgentEvent::ToolResult {
+                id: "search".into(),
+                result: yi_agent_core::ToolResult::text("result"),
+            },
+        );
+
+        let elapsed = registry.get("search").unwrap().elapsed();
+        assert_eq!(registry.get("search").unwrap().status, TaskStatus::Done);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(registry.get("search").unwrap().elapsed(), elapsed);
     }
 
     /// Regression: a ToolCall that never receives a ToolExit (e.g. bash tool
