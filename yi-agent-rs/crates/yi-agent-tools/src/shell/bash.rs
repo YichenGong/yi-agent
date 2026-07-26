@@ -121,6 +121,8 @@ impl Tool for BashTool {
             .arg("-c")
             .arg(&args.command)
             .current_dir(&cwd)
+            // Dropping the agent's tool future must not leave the shell running.
+            .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -132,11 +134,6 @@ impl Tool for BashTool {
                 return ToolsError::Io(e).into();
             }
         };
-
-        // Update cwd based on cd commands in the command string.
-        if let Some(new_cwd) = parse_cd_target(&args.command, &cwd) {
-            self.ctx.set_cwd(new_cwd);
-        }
 
         // Take stdout/stderr pipes.
         let mut stdout = child.stdout.take().expect("stdout piped");
@@ -418,6 +415,13 @@ impl Tool for BashTool {
             ))
         } else {
             let exit = exit_code.unwrap_or(-1);
+            // Only a successful standalone cd can change our persistent cwd.
+            // A cd embedded in a shell expression may not run at all.
+            if exit == 0 {
+                if let Some(new_cwd) = parse_standalone_cd_target(&args.command, &cwd) {
+                    self.ctx.set_cwd(new_cwd);
+                }
+            }
             ToolResult::text(format!(
                 "exit: {}\nstdout:\n{}\nstderr:\n{}",
                 exit, stdout_text, stderr_text,
@@ -499,14 +503,13 @@ fn append_with_truncation(
 
 /// Parse the last `cd <dir>` target from a command string.
 /// Returns None if there's no cd command.
-fn parse_cd_target(cmd: &str, current_cwd: &std::path::Path) -> Option<std::path::PathBuf> {
-    let re = regex::Regex::new(r"(?:^|;|\|\||&&|\n)\s*cd\s+(\S+)").unwrap();
-    let mut last_target: Option<String> = None;
-    for cap in re.captures_iter(cmd) {
-        last_target = Some(cap[1].trim_matches(|c| c == '"' || c == '\'').to_string());
-    }
-
-    last_target.map(|target| {
+fn parse_standalone_cd_target(
+    cmd: &str,
+    current_cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let re = regex::Regex::new(r"^\s*cd\s+(\S+)\s*$").unwrap();
+    re.captures(cmd).map(|cap| {
+        let target = cap[1].trim_matches(|c| c == '"' || c == '\'');
         let target_path = std::path::PathBuf::from(&target);
         if target_path.is_absolute() {
             target_path
@@ -584,6 +587,47 @@ mod tests {
         } else {
             panic!("expected text block");
         }
+    }
+
+    #[tokio::test]
+    async fn bash_failed_conditional_cd_does_not_persist_cwd() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("subdir")).unwrap();
+        let tool = make_tool(&tmp);
+
+        let result = tool
+            .call(serde_json::json!({"command": "false && cd subdir"}))
+            .await;
+        assert!(!result.is_error);
+
+        let result = tool.call(serde_json::json!({"command": "pwd"})).await;
+        let yi_agent_core::ContentBlock::Text(output) = &result.content[0] else {
+            panic!("expected text output");
+        };
+        assert!(output.contains(tmp.path().to_string_lossy().as_ref()));
+        assert!(!output.contains("subdir"));
+    }
+
+    #[tokio::test]
+    async fn dropping_bash_call_stops_the_child_process() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("should-not-exist");
+        let tool = Arc::new(make_tool(&tmp));
+        let command = format!("sleep 0.2; touch {}", marker.display());
+
+        let task = tokio::spawn({
+            let tool = tool.clone();
+            async move { tool.call(serde_json::json!({"command": command})).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !marker.exists(),
+            "child process outlived cancelled tool call"
+        );
     }
 
     #[tokio::test]
@@ -684,30 +728,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_cd_target_simple() {
+    fn parse_standalone_cd_target_simple() {
         let cwd = std::path::Path::new("/root");
-        let target = parse_cd_target("cd foo", cwd).unwrap();
+        let target = parse_standalone_cd_target("cd foo", cwd).unwrap();
         assert_eq!(target, std::path::PathBuf::from("/root/foo"));
     }
 
     #[test]
-    fn parse_cd_target_absolute() {
+    fn parse_standalone_cd_target_absolute() {
         let cwd = std::path::Path::new("/root");
-        let target = parse_cd_target("cd /abs/path", cwd).unwrap();
+        let target = parse_standalone_cd_target("cd /abs/path", cwd).unwrap();
         assert_eq!(target, std::path::PathBuf::from("/abs/path"));
     }
 
     #[test]
-    fn parse_cd_target_last_wins() {
+    fn parse_standalone_cd_target_rejects_compound_command() {
         let cwd = std::path::Path::new("/root");
-        let target = parse_cd_target("cd foo && cd bar", cwd).unwrap();
-        assert_eq!(target, std::path::PathBuf::from("/root/bar"));
+        assert!(parse_standalone_cd_target("cd foo && cd bar", cwd).is_none());
     }
 
     #[test]
-    fn parse_cd_target_none() {
+    fn parse_standalone_cd_target_none() {
         let cwd = std::path::Path::new("/root");
-        assert!(parse_cd_target("ls -la", cwd).is_none());
+        assert!(parse_standalone_cd_target("ls -la", cwd).is_none());
     }
 
     #[test]

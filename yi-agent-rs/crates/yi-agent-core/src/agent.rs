@@ -476,6 +476,13 @@ async fn run_loop(
                     turn,
                     "think phase ended due to idle timeout (stalled stream)"
                 );
+            } else if let Some(message) = s.strip_prefix("stream error: ") {
+                let _ = tx
+                    .send(AgentEvent::Error(AgentError::Provider(
+                        ProviderError::Stream(message.to_string()),
+                    )))
+                    .await;
+                return;
             }
         }
 
@@ -639,13 +646,14 @@ async fn run_loop(
                     let tool = match tools.get(name) {
                         Some(t) => t,
                         None => {
+                            let result = ToolResult::error(format!("tool not found: {}", name));
                             let _ = tx
                                 .send(AgentEvent::ToolResult {
                                     id: id.clone(),
-                                    result: ToolResult::error(format!("tool not found: {}", name)),
+                                    result: result.clone(),
                                 })
                                 .await;
-                            return (id.clone(), None);
+                            return (id.clone(), Some(result));
                         }
                     };
 
@@ -1084,6 +1092,40 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolResult { result, .. } if result.is_error))
+        );
+        let session = agent.session();
+        let tool_result_message = session
+            .messages()
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .unwrap();
+        assert!(matches!(
+            tool_result_message.content.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, is_error: true, .. }] if tool_use_id == "t1"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_reports_provider_stream_stop_as_error() {
+        let provider = ScriptedProvider::new(vec![vec![ProviderEvent::Stop {
+            reason: StopReason::Other("stream error: invalid SSE payload".into()),
+        }]]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+
+        let events = collect_events(agent.run("hello".into()).await.unwrap());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::Provider(ProviderError::Stream(message)))
+                if message.contains("invalid SSE payload")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Done { .. }))
         );
     }
 

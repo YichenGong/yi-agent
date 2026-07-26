@@ -310,8 +310,11 @@ fn run_headless(
         workdir.clone(),
         blocklist_fn,
     ));
-    let (_decision_tx, decision_rx) =
+    let (decision_tx, decision_rx) =
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+    // Headless mode has no confirmation UI. Closing the sender makes a
+    // blacklisted command resolve as Deny instead of waiting forever.
+    drop(decision_tx);
 
     let provider: Arc<dyn Provider> = match config.provider.as_str() {
         "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
