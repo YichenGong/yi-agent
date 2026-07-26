@@ -296,6 +296,7 @@ async fn run_loop(
     // assistant(tool_use),避免下次 run 被 Anthropic API 拒绝(tool_use
     // 必须跟 tool_result)。
     let session_len = session.lock().unwrap().len();
+    let mut last_input_tokens: Option<u32> = None;
     let mut turn = 0u32;
     // Cursor for incremental request logging: only log messages[last_logged..] each turn.
     let mut last_logged = 0usize;
@@ -310,6 +311,43 @@ async fn run_loop(
             info!(turn, "agent loop cancelled before think");
             let _ = tx.send(AgentEvent::Cancelled).await;
             return;
+        }
+
+        // auto-compact: 每轮 THINK 前用上次 input_tokens 判断
+        if let (Some(threshold), Some(tokens)) = (
+            config.compact_threshold.filter(|&t| t > 0),
+            last_input_tokens,
+        ) {
+            if tokens >= threshold && messages.len() > 4 {
+                let old_count = messages.len();
+                let keep_turns = config.compact_keep_turns.unwrap_or(4);
+                let session_snapshot = session.lock().unwrap().clone();
+                match crate::compact::compact_session(
+                    &provider,
+                    &config,
+                    &session_snapshot,
+                    keep_turns,
+                )
+                .await
+                {
+                    Ok(new_session) => {
+                        messages = new_session.messages().to_vec();
+                        *session.lock().unwrap() = new_session;
+                        // Reset logging cursor: compact replaced the entire
+                        // message list, so last_logged is now stale.
+                        last_logged = 0;
+                        let _ = tx
+                            .send(AgentEvent::AutoCompacting {
+                                old_msg_count: old_count,
+                                new_msg_count: messages.len(),
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-compact failed, will retry next turn");
+                    }
+                }
+            }
         }
 
         turn += 1;
@@ -371,7 +409,7 @@ async fn run_loop(
         };
 
         // Check 2: THINK 中 — select! between accumulate and cancel
-        let (content, _stop_reason, _last_usage) = tokio::select! {
+        let (content, _stop_reason, last_usage) = tokio::select! {
             result = accumulate_provider_stream(stream, &tx, &model) => match result {
                 Ok(v) => v,
                 Err(e) => {
@@ -392,6 +430,8 @@ async fn run_loop(
                 return;
             }
         };
+
+        last_input_tokens = last_usage.map(|u| u.input_tokens);
 
         // Log the full accumulated response content at debug level (never repeats across turns).
         debug!(turn, content = ?content, "think: response");
@@ -2031,6 +2071,89 @@ mod tests {
             messages.iter().any(|m| m.contains("think: response")),
             "expected response event, got: {messages:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_compact_triggers_when_threshold_exceeded() {
+        // Pre-populate session with 4 messages (2 user/assistant pairs) so that
+        // after turn 1 the session has 7 messages — enough for compact_session
+        // to find a non-zero split point with keep_turns=1.
+        // Turn 1: tool_use + Usage(input=200). After turn 1:
+        //   [user1, asst1, user2, asst2, user_prompt, asst_tool_use, tool_results] = 7
+        // Turn 2 THINK前: last_input_tokens=200 >= threshold=100, 7 > 4 → compact.
+        // compact_session 调 provider.call() → Script[1]: "summary text".
+        // session 替换为 [summary, recent...]. emit AutoCompacting.
+        // Turn 2 THINK → Script[2]: "done" + EndTurn.
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 200,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("summary text".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let config = AgentConfig {
+            compact_threshold: Some(100),
+            compact_keep_turns: Some(1),
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.push(Message::user("old1"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply1".into(),
+        )]));
+        session.push(Message::user("old2"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply2".into(),
+        )]));
+        let mut agent =
+            Agent::new(Arc::new(provider), Arc::new(tools), config).with_session(session);
+
+        let stream = agent.run("prompt".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::AutoCompacting {
+                    old_msg_count,
+                    new_msg_count
+                } if *old_msg_count > *new_msg_count
+            )),
+            "should emit AutoCompacting with old > new, events: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
     }
 
     /// A tracing layer that collects event messages into a shared buffer.
