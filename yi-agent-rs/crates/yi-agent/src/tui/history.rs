@@ -226,7 +226,8 @@ impl HistoryState {
             | AgentEvent::ToolExit { .. }
             | AgentEvent::ToolTimeout { .. }
             | AgentEvent::EstimatedPrefill(_)
-            | AgentEvent::DecodeDelta(_) => {
+            | AgentEvent::DecodeDelta(_)
+            | AgentEvent::AutoCompacting { .. } => {
                 // Not tracked in history
             }
         }

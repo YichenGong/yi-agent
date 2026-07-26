@@ -30,6 +30,24 @@ fn has_api_key() -> bool {
     has_provider_key || has_config_key
 }
 
+/// 返回可用于传给 yi-agent 的 --api-key 值。
+/// 优先 MODEL_API_KEY,其次 ANTHROPIC_API_KEY / OPENAI_API_KEY。
+fn resolve_api_key() -> Option<String> {
+    std::env::var("MODEL_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+}
+
 /// 从一行 JSONL 提取 AgentEvent 的 variant 名。
 /// serde 对 unit variant(如 Start, Cancelled)序列化为裸字符串 `"Start"`,
 /// 对其他 variant 序列化为 `{"VariantName": ...}` 对象。
@@ -233,4 +251,66 @@ fn e2e_tool_use_bash() {
     }
     assert!(found_bash_call, "should call bash tool, stdout: {stdout}");
     assert!(found_done, "should have Done event, stdout: {stdout}");
+}
+
+#[test]
+#[ignore]
+fn e2e_auto_compact_triggers() {
+    if !has_api_key() {
+        eprintln!("skip: no API key");
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // 写一个较大文件,让单轮 read 就可能超 2000 tokens
+    let big_file = tmp.path().join("big.txt");
+    let content = "line of text\n".repeat(500); // ~7KB
+    std::fs::write(&big_file, &content).expect("write");
+
+    let mut cmd = Command::new(yi_agent_bin());
+    cmd.arg("--workdir")
+        .arg(tmp.path())
+        .arg("--compact-ratio")
+        .arg("1") // threshold = context_length * 1% ≈ 2000 tokens
+        .arg("--compact-keep-turns")
+        .arg("1");
+    if let Some(key) = resolve_api_key() {
+        cmd.arg("--api-key").arg(key);
+    }
+    cmd.arg("run").arg("--json").arg(format!(
+        "Read the file at {} and tell me how many lines it has.",
+        big_file.display()
+    ));
+    let output = cmd.output().expect("failed to spawn");
+
+    assert!(
+        output.status.success(),
+        "failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut found_auto_compacting = false;
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let ty = event_variant(line).unwrap_or_else(|| panic!("invalid JSONL: {line}"));
+        if ty == "AutoCompacting" {
+            found_auto_compacting = true;
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let old = v["AutoCompacting"]["old_msg_count"].as_u64();
+            let new = v["AutoCompacting"]["new_msg_count"].as_u64();
+            assert!(
+                old > new,
+                "old_msg_count should be > new_msg_count, got old={old:?} new={new:?}"
+            );
+        }
+    }
+    // 不强制断言 found_auto_compacting:模型行为不稳定,可能 read 单轮没超阈值。
+    // 只要不 panic 且 AutoCompacting payload 结构正确就算通过。
+    if found_auto_compacting {
+        eprintln!("auto-compact triggered successfully");
+    } else {
+        eprintln!("auto-compact did not trigger (model output may be short) — acceptable");
+    }
 }

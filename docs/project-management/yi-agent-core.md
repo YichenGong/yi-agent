@@ -28,5 +28,6 @@ yi-agent 的核心库，定义消息模型、工具系统、Provider 抽象和 A
 - [x] 权限管理集成 — `agent.rs::request_permission()` 发送 `AgentEvent::PermissionRequest`/`PermissionResolved` — [设计](../plans/2026-07-25-permission-management-design.md) · [gaps 修复](../plans/2026-07-25-permission-gaps-impl.md)
 - [x] 批量工具调用引导 — `agent.rs::default_system_prompt()` 内嵌"并行调用 / 串行 && "指引 — [设计](../plans/2026-07-25-batch-tool-call-prompt-design.md)
 - [x] LLM 消息 tracing — `--debug` 时 `agent.rs` 打印 `think: request delta` / `think: response` debug 日志 — [设计](../plans/2026-07-25-trace-llm-content-design.md)
+- [x] auto-compact — `agent.rs::run_loop` 每轮 THINK 前用上次 `Usage.input_tokens` 检测,超 `compact_threshold` 调 `compact::compact_session` 压缩 session 并发 `AgentEvent::AutoCompacting` — [设计](../plans/2026-07-26-auto-compact-design.md) · 测试 `auto_compact_triggers_when_threshold_exceeded` 等 7 个
 - [ ] 图片工具（`ContentBlock::Image` 已留类型，无对应 Tool 实现）
 - [ ] 插件系统（`ToolSource::Plugin` 枚举已留，无加载机制）

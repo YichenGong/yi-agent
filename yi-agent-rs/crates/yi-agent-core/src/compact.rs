@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
-use yi_agent_core::{
-    AgentConfig, AgentError, ContentBlock, Message, Provider, ProviderRequest, Session,
+use crate::{
+    agent::{AgentConfig, AgentError, Session},
+    message::{ContentBlock, Message, Role},
+    provider::{Provider, ProviderRequest},
 };
 
 /// 结构化摘要提示词
@@ -26,10 +28,10 @@ pub fn format_messages_for_summary(messages: &[Message]) -> String {
     let mut out = String::new();
     for msg in messages {
         let role = match msg.role {
-            yi_agent_core::Role::User => "用户",
-            yi_agent_core::Role::Assistant => "助手",
-            yi_agent_core::Role::Tool => "工具结果",
-            yi_agent_core::Role::System => "系统",
+            Role::User => "用户",
+            Role::Assistant => "助手",
+            Role::Tool => "工具结果",
+            Role::System => "系统",
         };
         let text: String = msg
             .content
@@ -74,7 +76,7 @@ pub fn build_summary_prompt(messages: &[Message]) -> String {
 fn find_safe_split_point(messages: &[Message], keep_turns: u32) -> Option<usize> {
     let mut user_prompt_count = 0u32;
     for i in (0..messages.len()).rev() {
-        if messages[i].role == yi_agent_core::Role::User {
+        if messages[i].role == Role::User {
             user_prompt_count += 1;
             if user_prompt_count == keep_turns {
                 return Some(i);
@@ -268,9 +270,9 @@ mod tests {
 
     #[tokio::test]
     async fn compact_session_preserves_tool_use_tool_result_pairs() {
+        use crate::provider::{ProviderError, ProviderEvent};
         use async_trait::async_trait;
         use futures::stream::{BoxStream, StreamExt};
-        use yi_agent_core::{ProviderError, ProviderEvent};
 
         struct SummaryProvider;
         #[async_trait]
@@ -329,7 +331,7 @@ mod tests {
 
         // The recent part must start with a User prompt, not a ToolResult
         let first_recent = &new_session.messages()[1];
-        assert_eq!(first_recent.role, yi_agent_core::Role::User);
+        assert_eq!(first_recent.role, Role::User);
 
         // The old part must not end with an orphaned tool_use
         // (verified by the fact that the split point is a User message)
@@ -337,9 +339,9 @@ mod tests {
 
     #[tokio::test]
     async fn compact_summary_is_assistant_role() {
+        use crate::provider::{ProviderError, ProviderEvent};
         use async_trait::async_trait;
         use futures::stream::{BoxStream, StreamExt};
-        use yi_agent_core::{ProviderError, ProviderEvent};
 
         struct SummaryProvider;
         #[async_trait]
@@ -376,7 +378,7 @@ mod tests {
         // First message must be Assistant (the summary), not User.
         assert_eq!(
             new_session.messages()[0].role,
-            yi_agent_core::Role::Assistant,
+            Role::Assistant,
             "summary should be Assistant role"
         );
 
@@ -384,7 +386,7 @@ mod tests {
         // (Anthropic API requires strict alternation).
         for w in new_session.messages().windows(2) {
             assert!(
-                !(w[0].role == yi_agent_core::Role::User && w[1].role == yi_agent_core::Role::User),
+                !(w[0].role == Role::User && w[1].role == Role::User),
                 "consecutive User messages found"
             );
         }
@@ -392,9 +394,9 @@ mod tests {
 
     #[tokio::test]
     async fn compact_session_with_few_messages_returns_clone() {
+        use crate::provider::{ProviderError, ProviderEvent};
         use async_trait::async_trait;
         use futures::stream::{BoxStream, StreamExt};
-        use yi_agent_core::{ProviderError, ProviderEvent};
 
         struct DummyProvider;
         #[async_trait]
