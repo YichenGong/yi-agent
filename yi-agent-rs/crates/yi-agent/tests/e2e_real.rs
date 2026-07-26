@@ -7,8 +7,11 @@
 
 mod common;
 
-use common::{event_variant, has_api_key, resolve_api_key, yi_agent_bin};
+use common::{event_variant, has_api_key, resolve_api_key, run_command_with_timeout, yi_agent_bin};
 use std::process::Command;
+use std::time::Duration;
+
+const E2E_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[test]
 #[ignore]
@@ -16,7 +19,8 @@ fn e2e_error_no_api_key() {
     // 无 API key 时 yi-agent run 应以非零退出码失败,stderr 含错误信息。
     // 用空 tempdir 作 workdir,避免加载 ~/.yi-agent/.env 或 ./.yi-agent/.env。
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let output = Command::new(yi_agent_bin())
+    let mut command = Command::new(yi_agent_bin());
+    command
         .arg("run")
         .arg("--workdir")
         .arg(tmp.path())
@@ -26,9 +30,9 @@ fn e2e_error_no_api_key() {
         .env_remove("MODEL_API_KEY")
         .env_remove("MODEL_API_URL")
         .env_remove("YI_AGENT_PROVIDER")
-        .env_remove("YI_AGENT_MODEL")
-        .output()
-        .expect("failed to spawn yi-agent");
+        .env_remove("YI_AGENT_MODEL");
+    let output =
+        run_command_with_timeout(&mut command, E2E_TIMEOUT).expect("no-key command timed out");
 
     assert!(!output.status.success(), "should fail without API key");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -48,12 +52,16 @@ fn e2e_simple_text_response() {
         return;
     }
     // 透传父进程 env(含从 .env 加载的 MODEL_API_KEY / YI_AGENT_PROVIDER 等)。
-    let output = Command::new(yi_agent_bin())
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut command = Command::new(yi_agent_bin());
+    command
+        .arg("--workdir")
+        .arg(tmp.path())
         .arg("run")
         .arg("--json")
-        .arg("Reply with exactly: hello world")
-        .output()
-        .expect("failed to spawn yi-agent");
+        .arg("Reply with exactly: hello world");
+    let output = run_command_with_timeout(&mut command, E2E_TIMEOUT)
+        .expect("text response command timed out");
 
     assert!(
         output.status.success(),
@@ -101,15 +109,18 @@ fn e2e_tool_use_read() {
     let file_path = tmp.path().join("hello.txt");
     std::fs::write(&file_path, "secret123").expect("write");
 
-    let output = Command::new(yi_agent_bin())
+    let mut command = Command::new(yi_agent_bin());
+    command
+        .arg("--workdir")
+        .arg(tmp.path())
         .arg("run")
         .arg("--json")
         .arg(format!(
             "Read the file at {} and tell me its contents.",
             file_path.display()
-        ))
-        .output()
-        .expect("failed to spawn");
+        ));
+    let output =
+        run_command_with_timeout(&mut command, E2E_TIMEOUT).expect("read tool command timed out");
 
     assert!(
         output.status.success(),
@@ -160,14 +171,15 @@ fn e2e_tool_use_bash() {
     }
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let output = Command::new(yi_agent_bin())
+    let mut command = Command::new(yi_agent_bin());
+    command
         .arg("--workdir")
         .arg(tmp.path())
         .arg("run")
         .arg("--json")
-        .arg("Run the bash command `echo hello` and tell me the output.")
-        .output()
-        .expect("failed to spawn");
+        .arg("Run the bash command `echo hello` and tell me the output.");
+    let output =
+        run_command_with_timeout(&mut command, E2E_TIMEOUT).expect("bash tool command timed out");
 
     assert!(
         output.status.success(),
@@ -177,6 +189,7 @@ fn e2e_tool_use_bash() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut found_bash_call = false;
+    let mut found_hello_result = false;
     let mut found_done = false;
     for line in stdout.lines() {
         if line.trim().is_empty() {
@@ -190,6 +203,13 @@ fn e2e_tool_use_bash() {
                     found_bash_call = true;
                 }
             }
+            "ToolResult" => {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                let result = &v["ToolResult"]["result"];
+                if result["is_error"] == false && result.to_string().contains("hello") {
+                    found_hello_result = true;
+                }
+            }
             "Done" => {
                 found_done = true;
             }
@@ -197,6 +217,10 @@ fn e2e_tool_use_bash() {
         }
     }
     assert!(found_bash_call, "should call bash tool, stdout: {stdout}");
+    assert!(
+        found_hello_result,
+        "bash tool should return the requested output, stdout: {stdout}"
+    );
     assert!(found_done, "should have Done event, stdout: {stdout}");
 }
 
@@ -227,7 +251,8 @@ fn e2e_auto_compact_triggers() {
         "Read the file at {} and tell me how many lines it has.",
         big_file.display()
     ));
-    let output = cmd.output().expect("failed to spawn");
+    let output =
+        run_command_with_timeout(&mut cmd, E2E_TIMEOUT).expect("auto-compact command timed out");
 
     assert!(
         output.status.success(),
@@ -253,11 +278,8 @@ fn e2e_auto_compact_triggers() {
             );
         }
     }
-    // 不强制断言 found_auto_compacting:模型行为不稳定,可能 read 单轮没超阈值。
-    // 只要不 panic 且 AutoCompacting payload 结构正确就算通过。
-    if found_auto_compacting {
-        eprintln!("auto-compact triggered successfully");
-    } else {
-        eprintln!("auto-compact did not trigger (model output may be short) — acceptable");
-    }
+    assert!(
+        found_auto_compacting,
+        "expected auto-compaction with a 1% threshold, stdout: {stdout}"
+    );
 }

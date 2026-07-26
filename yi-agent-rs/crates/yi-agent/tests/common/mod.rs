@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::time::Duration;
 
 /// 复杂测试超时上限(秒)。agent 挂起时强制 kill,避免测试无限阻塞。
@@ -19,22 +19,17 @@ pub fn yi_agent_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("target/debug/yi-agent"))
 }
 
-/// 检查是否有任何可用的 API key 配置。
+/// 检查 headless CLI 所需的 API key 配置。
 pub fn has_api_key() -> bool {
-    let has_provider_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+    std::env::var("MODEL_API_KEY")
         .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let has_config_key = std::env::var("MODEL_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    has_provider_key || has_config_key
+        .unwrap_or(false)
 }
 
 /// 无 key 时打印 skip 并返回 false。
 pub fn skip_if_no_key() -> bool {
     if !has_api_key() {
-        eprintln!("skip: no API key");
+        eprintln!("SKIPPED: no headless configuration (MODEL_API_KEY)");
         false
     } else {
         true
@@ -46,16 +41,6 @@ pub fn resolve_api_key() -> Option<String> {
     std::env::var("MODEL_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
 }
 
 /// 从一行 JSONL 提取 AgentEvent 的 variant 名。
@@ -91,35 +76,74 @@ pub fn has_done_event(events: &[serde_json::Value]) -> bool {
     })
 }
 
-/// 用 `--workdir` + `--json` 启动 yi-agent,超时强制 kill。
-///
-/// 复杂任务可能因模型死循环或 API 挂起而无限阻塞。用 spawn + 计时线程:
-/// 等待 COMPLEX_TIMEOUT 后 kill -9 子进程(已退出则 no-op)。
-/// 返回子进程的 Output。killer 线程在测试退出后自然超时结束(不阻塞)。
-pub fn run_agent_with_timeout(workdir: &Path, prompt: &str) -> Output {
-    let child = Command::new(yi_agent_bin())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_child_timeout_reports_timeout() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 1"])
+            .spawn()
+            .expect("spawn sleeping child");
+
+        let err = wait_for_child(child, Duration::from_millis(20)).expect_err("should time out");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
+}
+
+fn wait_for_child(mut child: Child, timeout: Duration) -> Result<Output, String> {
+    let started = std::time::Instant::now();
+
+    loop {
+        if child
+            .try_wait()
+            .map_err(|err| format!("failed to poll yi-agent: {err}"))?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .map_err(|err| format!("failed to collect yi-agent output: {err}"));
+        }
+
+        if started.elapsed() >= timeout {
+            child
+                .kill()
+                .map_err(|err| format!("failed to terminate timed-out yi-agent: {err}"))?;
+            let output = child
+                .wait_with_output()
+                .map_err(|err| format!("failed to collect timed-out yi-agent output: {err}"))?;
+            return Err(format!(
+                "yi-agent timed out after {}s: {}",
+                timeout.as_secs(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn yi-agent: {err}"))?;
+    wait_for_child(child, timeout)
+}
+
+/// 用 `--workdir` + `--json` 启动 yi-agent,超时后仅终止自己持有的 Child。
+pub fn run_agent_with_timeout(workdir: &Path, prompt: &str) -> Result<Output, String> {
+    let mut command = Command::new(yi_agent_bin());
+    command
         .arg("--workdir")
         .arg(workdir)
         .arg("run")
         .arg("--json")
-        .arg(prompt)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn yi-agent");
-
-    let child_id = child.id();
-
-    // 计时线程:超时后 kill 子进程(已退出则 no-op)
-    std::thread::spawn(move || {
-        std::thread::sleep(COMPLEX_TIMEOUT);
-        let _ = std::process::Command::new("kill")
-            .arg("-9")
-            .arg(child_id.to_string())
-            .output();
-    });
-
-    child
-        .wait_with_output()
-        .expect("failed to wait for yi-agent")
+        .arg(prompt);
+    run_command_with_timeout(&mut command, COMPLEX_TIMEOUT)
 }
