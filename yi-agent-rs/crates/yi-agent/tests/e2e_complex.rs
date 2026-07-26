@@ -4,9 +4,7 @@
 //! 配置源:父进程环境变量(由 justfile recipe 从 .env 加载)。
 
 mod common;
-use common::{has_done_event, parse_events, skip_if_no_key, yi_agent_bin};
-
-use std::process::Command;
+use common::{has_done_event, parse_events, run_agent_with_timeout, skip_if_no_key};
 
 const PROMPT_WEBSITE: &str = "Create a single-page personal website. Write the complete HTML (with inline CSS) to output/index.html. The page should include a header, an 'About' section, and a footer. Use the write tool to create the file.";
 
@@ -20,14 +18,7 @@ fn complex_personal_website() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("output")).expect("create output dir");
 
-    let output = Command::new(yi_agent_bin())
-        .arg("--workdir")
-        .arg(tmp.path())
-        .arg("run")
-        .arg("--json")
-        .arg(PROMPT_WEBSITE)
-        .output()
-        .expect("failed to spawn yi-agent");
+    let output = run_agent_with_timeout(tmp.path(), PROMPT_WEBSITE);
 
     assert!(
         output.status.success(),
@@ -67,14 +58,7 @@ fn complex_python_script() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("output")).expect("create output dir");
 
-    let output = Command::new(yi_agent_bin())
-        .arg("--workdir")
-        .arg(tmp.path())
-        .arg("run")
-        .arg("--json")
-        .arg(PROMPT_PYTHON)
-        .output()
-        .expect("failed to spawn yi-agent");
+    let output = run_agent_with_timeout(tmp.path(), PROMPT_PYTHON);
 
     assert!(
         output.status.success(),
@@ -113,14 +97,7 @@ fn complex_data_transformation() {
     )
     .expect("write data.json");
 
-    let output = Command::new(yi_agent_bin())
-        .arg("--workdir")
-        .arg(tmp.path())
-        .arg("run")
-        .arg("--json")
-        .arg(PROMPT_DATA)
-        .output()
-        .expect("failed to spawn yi-agent");
+    let output = run_agent_with_timeout(tmp.path(), PROMPT_DATA);
 
     assert!(
         output.status.success(),
@@ -169,14 +146,7 @@ fn complex_bug_fix() {
     )
     .expect("write buggy.py");
 
-    let output = Command::new(yi_agent_bin())
-        .arg("--workdir")
-        .arg(tmp.path())
-        .arg("run")
-        .arg("--json")
-        .arg(PROMPT_BUGFIX)
-        .output()
-        .expect("failed to spawn yi-agent");
+    let output = run_agent_with_timeout(tmp.path(), PROMPT_BUGFIX);
 
     assert!(
         output.status.success(),

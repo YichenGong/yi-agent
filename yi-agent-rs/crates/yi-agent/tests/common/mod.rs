@@ -5,7 +5,12 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::Duration;
+
+/// 复杂测试超时上限(秒)。agent 挂起时强制 kill,避免测试无限阻塞。
+const COMPLEX_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Path to the compiled yi-agent binary.
 pub fn yi_agent_bin() -> PathBuf {
@@ -84,4 +89,37 @@ pub fn has_done_event(events: &[serde_json::Value]) -> bool {
                 .map(|o| o.contains_key("Done"))
                 .unwrap_or(false)
     })
+}
+
+/// 用 `--workdir` + `--json` 启动 yi-agent,超时强制 kill。
+///
+/// 复杂任务可能因模型死循环或 API 挂起而无限阻塞。用 spawn + 计时线程:
+/// 等待 COMPLEX_TIMEOUT 后 kill -9 子进程(已退出则 no-op)。
+/// 返回子进程的 Output。killer 线程在测试退出后自然超时结束(不阻塞)。
+pub fn run_agent_with_timeout(workdir: &Path, prompt: &str) -> Output {
+    let child = Command::new(yi_agent_bin())
+        .arg("--workdir")
+        .arg(workdir)
+        .arg("run")
+        .arg("--json")
+        .arg(prompt)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn yi-agent");
+
+    let child_id = child.id();
+
+    // 计时线程:超时后 kill 子进程(已退出则 no-op)
+    std::thread::spawn(move || {
+        std::thread::sleep(COMPLEX_TIMEOUT);
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(child_id.to_string())
+            .output();
+    });
+
+    child
+        .wait_with_output()
+        .expect("failed to wait for yi-agent")
 }
