@@ -1,6 +1,5 @@
 //! yi-agent CLI 入口。
 
-mod compact;
 mod config;
 mod llm_prefix;
 mod tracing_init;
@@ -444,7 +443,7 @@ fn run_tui_agent(
                         ControlCommand::Compact => {
                             let session = agent.session();
                             let keep_turns = rebuild_config.compact_keep_turns.unwrap_or(4);
-                            match crate::compact::compact_session(
+                            match yi_agent_core::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
                                 &session,
