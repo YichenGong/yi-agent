@@ -129,11 +129,34 @@ where
                     .get("completion_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as u32;
+                // Cache tokens: support two conventions.
+                // 1. Anthropic-style direct fields (passed through by some
+                //    OpenAI-compatible gateways): usage.cache_creation_input_tokens
+                //    and usage.cache_read_input_tokens.
+                // 2. OpenAI-style nested field: usage.prompt_tokens_details.cached_tokens
+                //    (cache READ only; OpenAI has no "cache creation" concept).
+                // Anthropic-style takes precedence when both are present, since it
+                // distinguishes creation vs read.
+                let cache_creation_input_tokens = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32);
+                let cache_read_input_tokens = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .or_else(|| {
+                        usage
+                            .get("prompt_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u32)
+                    });
                 events.push(ProviderEvent::Usage(TokenUsage {
                     input_tokens: prompt_tokens,
                     output_tokens: completion_tokens,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
                 }));
             }
         }
@@ -458,6 +481,67 @@ mod tests {
                 assert_eq!(u.output_tokens, 5);
                 assert_eq!(u.cache_creation_input_tokens, None);
                 assert_eq!(u.cache_read_input_tokens, None);
+            }
+            _ => panic!("expected Usage event, got: {:?}", events[1]),
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_anthropic_style_cache_tokens() {
+        // OpenAI-compatible gateway passing through Anthropic-style cache fields
+        // directly on the usage object.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":200}}\n\n\
+             data: [DONE]\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        match &events[1] {
+            ProviderEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.output_tokens, 20);
+                assert_eq!(u.cache_creation_input_tokens, Some(50));
+                assert_eq!(u.cache_read_input_tokens, Some(200));
+            }
+            _ => panic!("expected Usage event, got: {:?}", events[1]),
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_openai_style_cached_tokens() {
+        // OpenAI native convention: usage.prompt_tokens_details.cached_tokens
+        // (cache READ only; no cache creation concept).
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":150}}}\n\n\
+             data: [DONE]\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        match &events[1] {
+            ProviderEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.output_tokens, 20);
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.cache_read_input_tokens, Some(150));
+            }
+            _ => panic!("expected Usage event, got: {:?}", events[1]),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_style_cache_tokens_take_precedence() {
+        // When both conventions are present, Anthropic-style wins for
+        // cache_read (it's more specific), and cache_creation is populated.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":200,\"prompt_tokens_details\":{\"cached_tokens\":999}}}\n\n\
+             data: [DONE]\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        match &events[1] {
+            ProviderEvent::Usage(u) => {
+                assert_eq!(u.cache_creation_input_tokens, Some(50));
+                assert_eq!(u.cache_read_input_tokens, Some(200));
             }
             _ => panic!("expected Usage event, got: {:?}", events[1]),
         }
