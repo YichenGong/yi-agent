@@ -4,7 +4,10 @@
 //! 配置源:父进程环境变量(由 justfile recipe 从 .env 加载)。
 
 mod common;
-use common::{has_done_event, parse_events, run_agent_with_timeout, skip_if_no_key};
+use common::{
+    has_normal_end_turn, has_verification_after_last_mutation, parse_events,
+    run_agent_with_timeout, skip_if_no_key,
+};
 
 const PROMPT_WEBSITE: &str = "Create a single-page personal website. Write the complete HTML (with inline CSS) to output/index.html. The page should include a header, an 'About' section, and a footer. Use the write tool to create the file.";
 
@@ -29,7 +32,14 @@ fn complex_personal_website() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let events = parse_events(&stdout);
-    assert!(has_done_event(&events), "no Done event, stdout: {stdout}");
+    assert!(
+        has_normal_end_turn(&events),
+        "no normal EndTurn, stdout: {stdout}"
+    );
+    assert!(
+        has_verification_after_last_mutation(&events),
+        "no verification after final mutation, stdout: {stdout}"
+    );
 
     // 结构性断言
     let html_path = tmp.path().join("output/index.html");
@@ -70,7 +80,14 @@ fn complex_python_script() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let events = parse_events(&stdout);
-    assert!(has_done_event(&events), "no Done event, stdout: {stdout}");
+    assert!(
+        has_normal_end_turn(&events),
+        "no normal EndTurn, stdout: {stdout}"
+    );
+    assert!(
+        has_verification_after_last_mutation(&events),
+        "no verification after final mutation, stdout: {stdout}"
+    );
 
     // 结构性断言(不执行产出代码)
     let py_path = tmp.path().join("output/sort.py");
@@ -121,7 +138,14 @@ fn complex_data_transformation() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let events = parse_events(&stdout);
-    assert!(has_done_event(&events), "no Done event, stdout: {stdout}");
+    assert!(
+        has_normal_end_turn(&events),
+        "no normal EndTurn, stdout: {stdout}"
+    );
+    assert!(
+        has_verification_after_last_mutation(&events),
+        "no verification after final mutation, stdout: {stdout}"
+    );
 
     // 结构性断言
     let results_path = tmp.path().join("output/results.json");
@@ -172,7 +196,14 @@ fn complex_bug_fix() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let events = parse_events(&stdout);
-    assert!(has_done_event(&events), "no Done event, stdout: {stdout}");
+    assert!(
+        has_normal_end_turn(&events),
+        "no normal EndTurn, stdout: {stdout}"
+    );
+    assert!(
+        has_verification_after_last_mutation(&events),
+        "no verification after final mutation, stdout: {stdout}"
+    );
 
     // 结构性断言
     let fixed_path = tmp.path().join("output/fixed.py");

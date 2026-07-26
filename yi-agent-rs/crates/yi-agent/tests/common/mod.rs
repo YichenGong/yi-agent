@@ -76,6 +76,32 @@ pub fn has_done_event(events: &[serde_json::Value]) -> bool {
     })
 }
 
+pub fn has_normal_end_turn(events: &[serde_json::Value]) -> bool {
+    events
+        .iter()
+        .any(|event| event.pointer("/Done/reason") == Some(&serde_json::json!("EndTurn")))
+}
+
+pub fn has_verification_after_last_mutation(events: &[serde_json::Value]) -> bool {
+    let mut seen_mutation = false;
+    let mut verified = false;
+    for event in events {
+        let Some(name) = event
+            .pointer("/ToolCall/name")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if matches!(name, "write" | "edit" | "bash") {
+            seen_mutation = true;
+            verified = false;
+        } else if seen_mutation && matches!(name, "read" | "glob" | "grep") {
+            verified = true;
+        }
+    }
+    seen_mutation && verified
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +115,17 @@ mod tests {
 
         let err = wait_for_child(child, Duration::from_millis(20)).expect_err("should time out");
         assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn completion_helpers_require_normal_end_and_post_write_verification() {
+        let events = parse_events(
+            r#"{"ToolCall":{"name":"write"}}
+{"ToolCall":{"name":"read"}}
+{"Done":{"reason":"EndTurn"}}"#,
+        );
+        assert!(has_normal_end_turn(&events));
+        assert!(has_verification_after_last_mutation(&events));
     }
 }
 
