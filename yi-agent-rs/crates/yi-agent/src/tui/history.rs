@@ -25,10 +25,12 @@ impl HistoryState {
         }
     }
 
-    /// Push a new cell and auto-scroll to bottom.
+    /// Push a new cell while preserving the visible position when scrolled up.
     pub fn push(&mut self, cell: HistoryCell) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_add(1);
+        }
         self.cells.push(cell);
-        self.scroll_offset = 0;
     }
 
     /// Clear all cells and reset state.
@@ -357,10 +359,27 @@ mod tests {
     use crate::tui::cell::HistoryCell;
 
     #[test]
-    fn push_resets_scroll_to_bottom() {
+    fn push_preserves_position_when_scrolled_up() {
         let mut s = HistoryState::new();
-        s.scroll_up(5, 1000);
-        s.push(HistoryCell::UserMessage { text: "x".into() });
+        s.push(HistoryCell::UserMessage {
+            text: "first".into(),
+        });
+        s.scroll_offset = 2;
+        s.push(HistoryCell::UserMessage {
+            text: "second".into(),
+        });
+        assert_eq!(s.scroll_offset, 3);
+    }
+
+    #[test]
+    fn push_keeps_bottom_position_at_zero() {
+        let mut s = HistoryState::new();
+        s.push(HistoryCell::UserMessage {
+            text: "first".into(),
+        });
+        s.push(HistoryCell::UserMessage {
+            text: "second".into(),
+        });
         assert_eq!(s.scroll_offset, 0);
     }
 
