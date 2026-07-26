@@ -16,7 +16,9 @@
   - [x] ProviderRequest / AgentConfig 加 model 字段（请求级模型选择）
   - [x] 流式输出与中断处理 — [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
   - [x] Token 计数（AgentEvent::Usage + ProviderEvent::Usage）— [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
-  - [~] 权限管理（PermissionChecker + 白名单/黑名单）— [设计](../plans/2026-07-25-permission-management-design.md)
+  - [x] 权限管理集成（AgentEvent::PermissionRequest/PermissionResolved）— [设计](../plans/2026-07-25-permission-management-design.md)
+  - [x] 批量工具调用引导（default_system_prompt 内嵌并行/串行指引）— [设计](../plans/2026-07-25-batch-tool-call-prompt-design.md)
+  - [x] LLM 消息 tracing（`--debug` 开启 agent/llm 层 debug 日志）— [设计](../plans/2026-07-25-trace-llm-content-design.md)
   - [ ] 图片工具（ContentBlock::Image 已留类型）
   - [ ] 插件系统（基于 ToolSource::Plugin）
 - **yi-agent-llm** → [详情](./yi-agent-llm.md)
@@ -28,19 +30,41 @@
   - [ ] 重试与流断连重连
 - **yi-agent-tools** → [详情](./yi-agent-tools.md)
   - [x] FS 工具：Read/Write/Edit/Glob/Grep（单一 root 限制）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
-  - [x] Shell 工具：Bash（sh -c + 黑名单 + timeout + 输出截断）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
+  - [x] Shell 工具：Bash（sh -c + 黑名单 + timeout + 输出截断 + 流式增量）— [设计](../plans/2026-07-19-yi-agent-tools-design.md)
   - [x] 工具注册 API：register_builtin_tools() — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
   - [x] Web 工具：WebFetch + WebSearch（Bocha）— [设计](../plans/2026-07-19-yi-agent-web-tools-design.md)
+  - [x] Skill 工具：SkillTool（调用 yi-agent-skills 服务发现的 skill）— [设计](../plans/2026-07-25-skills-design.md)
   - [ ] Sandbox（跨平台进程隔离）— 延后单独设计
+- **yi-agent-skills** → [详情](./yi-agent-skills.md)
+  - [x] Skills 系统设计 — [设计](../plans/2026-07-25-skills-design.md) · [实现](../plans/2026-07-25-skills-impl.md)
+  - [x] Skill 元数据与作用域（Project / User / System）
+  - [x] 多根目录发现与 YAML 加载
+  - [x] `SkillsService`（snapshot + catalog 渲染 + 预算截断）
+  - [x] 系统内置 skill 安装
+  - [x] `SkillTool` 注册到 agent
+  - [x] 系统提示词注入 skill catalog（`--skills-catalog-budget`）
 - **yi-agent-tui** → [详情](./yi-agent-tui.md)
   - [x] ratatui 全屏 TUI 架构（HistoryView + InputLine + 事件循环）— [设计](../plans/2026-07-25-tui-history-redesign.md)
   - [x] 结构化对话历史（HistoryCell + 折叠/展开）— [设计](../plans/2026-07-25-tui-history-redesign.md)
-  - [x] Markdown 渲染（pulldown-cmark）— [设计](../plans/2026-07-25-tui-history-redesign.md)
-  - [x] 输入框多行自动换行（CJK 宽度感知）— [设计](../plans/2026-07-25-tui-history-redesign.md)
+  - [x] Markdown 渲染（pulldown-cmark，含代码块 + 表格 Unicode box drawing）— [设计](../plans/2026-07-25-tui-history-redesign.md)
+  - [x] 输入框多行自动换行（CJK 宽度感知）
   - [x] 两步退出确认（Ctrl+C / Esc）— [设计](../plans/2026-07-24-yi-agent-tui-features-design.md)
   - [x] Slash 命令弹窗（自动补全 + 中文描述）— [设计](../plans/2026-07-25-tui-slash-commands-design.md)
   - [x] 输入框光标可见（反色显示）
-  - [ ] InlineRenderer 退役（已标记 deprecated）
+  - [x] 输入排队（agent 运行期间粘贴的输入进入队列）— [设计](../plans/2026-07-25-tui-queued-input-design.md)
+  - [x] 状态栏（实时 token 计数 + 模型名 + 运行中任务指示）— [设计](../plans/2026-07-25-task-perception-design.md)
+  - [x] Bash 全屏弹窗（Ctrl+P 查看运行中/已完成 bash 的实时输出）— [设计](../plans/2026-07-25-task-perception-design.md)
+  - [x] `/cost` 命令（按模型累计 token 与调用次数）— [设计](../plans/2026-07-26-tui-cost-command-design.md)
+  - [x] `/yolo` `/model` `/compact` `/clear` `/help` `/exit` slash 命令
+  - [ ] InlineRenderer 退役（已标记 deprecated，待移除）
+- **yi-agent-run**（headless 模式）→ [详情](./yi-agent-run.md)
+  - [x] `yi-agent run` 子命令定义与 dispatch
+  - [x] Headless 事件 drain（stdout/stderr，流式拼接 AssistantText）
+  - [x] `--json` JSONL 输出（AgentEvent: Serialize）
+  - [x] `--stdin` 追加输入
+  - [x] `--naked` 裸模型模式 — [设计](../plans/2026-07-26-run-naked-flag-design.md)
+  - [x] 配置层级合并（全局 + 本地）— [设计](../plans/2026-07-25-config-layering-design.md)
+  - [x] 真实 LLM 端到端测试（`#[ignore]` gate）— [设计](../plans/2026-07-26-real-llm-testing-design.md)
 - **yi-agent-web** → [详情](./yi-agent-web.md)
   - [x] WebUI 配置服务器（axum + 内嵌 HTML）— [设计](../plans/2026-07-24-web-config-ui-design.md)
   - [x] 15 个环境变量元数据管理 — [设计](../plans/2026-07-25-web-config-ui-restructure-design.md)
@@ -49,11 +73,12 @@
   - [ ] Secret 值掩码与安全写入
 - **permission** → [详情](./permission.md)
   - [x] 权限管理设计 — [设计](../plans/2026-07-25-permission-management-design.md)
-  - [~] PermissionsConfig 数据结构（serde 持久化）
-  - [~] PermissionChecker（分层白名单 + 黑名单）
-  - [~] Agent 集成（AgentEvent::PermissionRequest/PermissionResolved）
-  - [~] CLI flag（--yolo / --dangerously-skip-permissions）
-  - [ ] TUI 确认 UI
+  - [x] PermissionsConfig 数据结构（serde 持久化）
+  - [x] PermissionChecker（分层白名单 + 黑名单）
+  - [x] Agent 集成（AgentEvent::PermissionRequest/PermissionResolved）
+  - [x] CLI flag（--yolo / --dangerously-skip-permissions）
+  - [x] TUI 确认 UI（Allow / Deny / AlwaysAllow 弹窗）
+  - [x] PrefixExtractor 与 gaps 修复 — [实现](../plans/2026-07-25-permission-gaps-impl.md)
 - **ci-cd** → [详情](./ci-cd.md)
   - [x] CI/CD 设计文档
   - [x] CI/CD 实现计划
@@ -65,9 +90,14 @@
   - [x] GitHub Actions Release 配置（tag 触发）
   - [x] Mac mini runner 配置
   - [x] 首次端到端验证
+  - [x] 真实 LLM 测试基础设施（`#[ignore]` gate + justfile recipes）— [设计](../plans/2026-07-26-real-llm-testing-design.md)
   - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
   - [-] crates.io 发布 — YAGNI，暂不做
 - **tooling** → [详情](./tooling.md)
   - [x] 项目进度追踪系统（docs/project-management/）
   - [x] 进度同步 Hook（Stop 事件触发，检测代码改动后提醒更新进度表格）
   - [x] Git worktree 工作流（feature 分支隔离开发）
+
+## 已知问题
+
+见 [bug-list](../bug-list.md)。

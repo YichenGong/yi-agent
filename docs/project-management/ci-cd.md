@@ -32,5 +32,6 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [x] GitHub Actions Release 配置（tag 触发）
 - [x] Mac mini runner 配置
 - [x] 首次端到端验证（v0.1.0 + v0.1.1 release 流水线全流程通过）
+- [x] 真实 LLM 测试基础设施（`#[ignore]` gate + justfile recipes，CI 不跑）— [设计](../plans/2026-07-26-real-llm-testing-design.md)
 - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
 - [-] crates.io 发布 — YAGNI，暂不做

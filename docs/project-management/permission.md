@@ -22,8 +22,9 @@ yi-agent 的权限管理系统。参考 codex 的 `--yolo` 和 claude 的 `--dan
 ## Features
 
 - [x] 权限管理设计 — [设计](../plans/2026-07-25-permission-management-design.md)
-- [~] PermissionsConfig 数据结构（serde 持久化）
-- [~] PermissionChecker（分层白名单 + 黑名单）
-- [~] Agent 集成（AgentEvent::PermissionRequest/PermissionResolved）
-- [~] CLI flag（--yolo / --dangerously-skip-permissions）
-- [ ] TUI 确认 UI
+- [x] PermissionsConfig 数据结构（serde 持久化到 `.yi-agent/permissions.toml`）
+- [x] PermissionChecker（分层白名单 + 黑名单）
+- [x] Agent 集成（AgentEvent::PermissionRequest/PermissionResolved）
+- [x] CLI flag（--yolo / --dangerously-skip-permissions）
+- [x] TUI 确认 UI（Allow / Deny / AlwaysAllow 弹窗，`tui/app.rs`）
+- [x] PrefixExtractor 与 gaps 修复 — [实现](../plans/2026-07-25-permission-gaps-impl.md)

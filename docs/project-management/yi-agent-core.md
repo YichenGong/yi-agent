@@ -25,6 +25,8 @@ yi-agent-core 是 yi-agent 的核心库，定义消息模型、工具系统、Pr
 - [x] ProviderRequest / AgentConfig 加 model 字段（请求级模型选择）
 - [x] 流式输出与中断处理 — [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
 - [x] Token 计数（AgentEvent::Usage + ProviderEvent::Usage）— [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
-- [~] 权限管理集成（AgentEvent::PermissionRequest/PermissionResolved）— [设计](../plans/2026-07-25-permission-management-design.md)
+- [x] 权限管理集成（AgentEvent::PermissionRequest/PermissionResolved）— [设计](../plans/2026-07-25-permission-management-design.md) · [gaps 修复](../plans/2026-07-25-permission-gaps-impl.md)
+- [x] 批量工具调用引导（default_system_prompt 内嵌并行/串行指引）— [设计](../plans/2026-07-25-batch-tool-call-prompt-design.md)
+- [x] LLM 消息 tracing（`--debug` 开启 agent/llm 层 debug 日志）— [设计](../plans/2026-07-25-trace-llm-content-design.md)
 - [ ] 图片工具（ContentBlock::Image 已留类型）
 - [ ] 插件系统（基于 ToolSource::Plugin）
