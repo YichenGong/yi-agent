@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use yi_agent_core::TokenUsage;
 
+use super::statusbar::format_thousands;
+
 /// Per-model accumulated token counters.
 #[derive(Debug, Clone, Default)]
 pub struct ModelCost {
@@ -34,7 +36,84 @@ impl CostTracker {
     }
 
     pub fn render(&self) -> String {
-        todo!()
+        if self.per_model.is_empty() {
+            return "Token 用量统计:\n(尚无数据)".to_string();
+        }
+
+        let mut rows: Vec<[String; 6]> = Vec::new();
+        for (model, cost) in &self.per_model {
+            rows.push([
+                model.clone(),
+                format_thousands(cost.input),
+                format_thousands(cost.output),
+                format_thousands(cost.cache_creation),
+                format_thousands(cost.cache_read),
+                format_thousands(cost.calls),
+            ]);
+        }
+
+        let mut total = ModelCost::default();
+        for c in self.per_model.values() {
+            total.input += c.input;
+            total.output += c.output;
+            total.cache_creation += c.cache_creation;
+            total.cache_read += c.cache_read;
+            total.calls += c.calls;
+        }
+
+        let header = [
+            "模型".to_string(),
+            "input".to_string(),
+            "output".to_string(),
+            "cache_create".to_string(),
+            "cache_read".to_string(),
+            "calls".to_string(),
+        ];
+        let total_row = [
+            "总计".to_string(),
+            format_thousands(total.input),
+            format_thousands(total.output),
+            format_thousands(total.cache_creation),
+            format_thousands(total.cache_read),
+            format_thousands(total.calls),
+        ];
+
+        // Compute column widths from header + all rows + total row.
+        let mut widths = [0usize; 6];
+        let all_rows: Vec<[String; 6]> = std::iter::once(header.clone())
+            .chain(rows.iter().cloned())
+            .chain(std::iter::once(total_row.clone()))
+            .collect();
+        for r in &all_rows {
+            for (i, cell) in r.iter().enumerate() {
+                widths[i] = widths[i].max(cell.chars().count());
+            }
+        }
+
+        let mut out = String::from("Token 用量统计:\n");
+        let mut first = true;
+        for r in &all_rows {
+            for (i, cell) in r.iter().enumerate() {
+                if i == 0 {
+                    out.push_str(&format!("{:<width$}", cell, width = widths[i]));
+                } else {
+                    out.push_str(&format!("  {:>width$}", cell, width = widths[i]));
+                }
+            }
+            out.push('\n');
+            if first {
+                let sep: String =
+                    std::iter::repeat_n('─', widths.iter().sum::<usize>() + 2 * 5).collect();
+                out.push_str(&sep);
+                out.push('\n');
+            }
+            first = false;
+        }
+        // Trailing newline already added by last row; trim if desired.
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        out
     }
 }
 
@@ -100,5 +179,68 @@ mod tests {
         let m = t.per_model.get("m").unwrap();
         assert_eq!(m.cache_creation, 25);
         assert_eq!(m.cache_read, 50);
+    }
+
+    #[test]
+    fn render_empty_shows_no_data() {
+        let t = CostTracker::new();
+        let s = t.render();
+        assert!(s.contains("Token 用量统计"), "should have title: {s}");
+        assert!(s.contains("尚无数据"), "empty should show no-data: {s}");
+    }
+
+    #[test]
+    fn render_single_model_has_header_data_total() {
+        let mut t = CostTracker::new();
+        t.record("claude-sonnet-4-5", &usage(12345, 6789));
+        let s = t.render();
+        assert!(s.contains("input"), "should have header: {s}");
+        assert!(s.contains("output"), "should have header: {s}");
+        assert!(
+            s.contains("claude-sonnet-4-5"),
+            "should have model row: {s}"
+        );
+        assert!(
+            s.contains("12,345"),
+            "should format input with thousands: {s}"
+        );
+        assert!(
+            s.contains("6,789"),
+            "should format output with thousands: {s}"
+        );
+        assert!(s.contains("总计"), "should have total row: {s}");
+    }
+
+    #[test]
+    fn render_multiple_models_sorted() {
+        let mut t = CostTracker::new();
+        t.record("zeta", &usage(1, 1));
+        t.record("alpha", &usage(2, 2));
+        t.record("mid", &usage(3, 3));
+        let s = t.render();
+        let ai = s.find("alpha").unwrap();
+        let mi = s.find("mid").unwrap();
+        let zi = s.find("zeta").unwrap();
+        assert!(ai < mi && mi < zi, "models should be sorted alphabetically");
+    }
+
+    #[test]
+    fn render_total_row_sums_all_models() {
+        let mut t = CostTracker::new();
+        t.record("a", &usage(100, 10));
+        t.record("b", &usage(200, 20));
+        let s = t.render();
+        assert!(s.contains("300"), "total input should be 300: {s}");
+        assert!(s.contains("30"), "total output should be 30: {s}");
+    }
+
+    #[test]
+    fn render_shows_calls_column() {
+        let mut t = CostTracker::new();
+        t.record("m", &usage(1, 1));
+        t.record("m", &usage(1, 1));
+        let s = t.render();
+        assert!(s.contains("calls"), "should have calls header: {s}");
+        assert!(s.contains("2"), "should show call count 2: {s}");
     }
 }
