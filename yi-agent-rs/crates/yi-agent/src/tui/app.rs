@@ -18,6 +18,7 @@ use yi_agent_core::AgentEvent;
 
 use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 use super::cell::HistoryCell;
+use super::cost::CostTracker;
 use super::history::{HistoryState, HistoryView};
 use super::input::{InputAction, InputLine};
 use super::slash::{CommandPopup, SlashCommand};
@@ -166,6 +167,7 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut statusbar_state = StatusBarState::default();
     let mut task_registry = RunningTaskRegistry::new();
+    let mut cost_tracker = CostTracker::default();
     let mut bash_popup: BashPopup = BashPopup::None;
 
     loop {
@@ -176,7 +178,12 @@ fn run_loop<B: Backend, E: EventSource>(
                 event,
                 AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
             );
-            route_event(&mut task_registry, &mut statusbar_state, &event);
+            route_event(
+                &mut task_registry,
+                &mut statusbar_state,
+                &mut cost_tracker,
+                &event,
+            );
             history.push_event(event, width);
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
@@ -442,6 +449,7 @@ fn handle_bash_popup_key(
 fn route_event(
     registry: &mut RunningTaskRegistry,
     statusbar: &mut StatusBarState,
+    cost: &mut CostTracker,
     event: &AgentEvent,
 ) {
     match event {
@@ -480,8 +488,9 @@ fn route_event(
         AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_) => {
             registry.abort_all_running();
         }
-        AgentEvent::Usage { usage, .. } => {
+        AgentEvent::Usage { model, usage } => {
             statusbar.set_token_target(usage.input_tokens as u64, usage.output_tokens as u64);
+            cost.record(model, usage);
         }
         AgentEvent::EstimatedPrefill(n) => {
             statusbar.set_prefill_estimate(*n as u64);
@@ -1007,7 +1016,12 @@ mod tests {
         let mut registry = RunningTaskRegistry::new();
         let mut sb = StatusBarState::default();
         // Start resets per-call status.
-        route_event(&mut registry, &mut sb, &AgentEvent::Start);
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::Start,
+        );
         sb.tick();
         assert_eq!(sb.display_input_tokens(), 0);
 
@@ -1015,6 +1029,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -1028,6 +1043,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolOutputDelta {
                 id: "t1".into(),
                 stream: OutputStream::Stdout,
@@ -1047,6 +1063,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolExit {
                 id: "t1".into(),
                 code: Some(0),
@@ -1058,6 +1075,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::Usage {
                 model: "test".to_string(),
                 usage: yi_agent_core::TokenUsage {
@@ -1078,6 +1096,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t".into(),
                 name: "bash".into(),
@@ -1087,6 +1106,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolTimeout { id: "t".into() },
         );
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
@@ -1104,6 +1124,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -1117,6 +1138,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::Done {
                 reason: DoneReason::EndTurn,
             },
@@ -1150,13 +1172,19 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({"command":"sleep 10","expected_timeout_sec":30}),
             },
         );
-        route_event(&mut registry, &mut sb, &AgentEvent::Cancelled);
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::Cancelled,
+        );
         assert_eq!(
             registry.get("t1").unwrap().status,
             TaskStatus::Aborted,
@@ -1175,6 +1203,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -1184,6 +1213,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::Error(AgentError::Provider(ProviderError::Auth("boom".into()))),
         );
         assert_eq!(
@@ -1202,6 +1232,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "done_task".into(),
                 name: "bash".into(),
@@ -1211,6 +1242,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolExit {
                 id: "done_task".into(),
                 code: Some(0),
@@ -1221,6 +1253,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "stuck_task".into(),
                 name: "bash".into(),
@@ -1230,6 +1263,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::Done {
                 reason: DoneReason::EndTurn,
             },
@@ -1259,11 +1293,13 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::DecodeDelta("{\"q\":".into()),
         );
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::DecodeDelta("\"weather\"}".into()),
         );
         // {"q": = 5 chars, "weather"} = 9 chars → 14 ascii → 14/4 = 3 tokens
@@ -1282,11 +1318,13 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::AssistantText("hello".into()),
         );
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::AssistantText("world".into()),
         );
         // 10 ascii chars → 10/4 = 2 tokens
