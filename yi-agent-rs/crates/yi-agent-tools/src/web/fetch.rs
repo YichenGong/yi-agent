@@ -163,7 +163,11 @@ fn process_content(content_type: &str, body: &[u8]) -> Result<String, ToolsError
     if ct.contains("text/html") {
         let html = std::str::from_utf8(body)
             .map_err(|e| ToolsError::Http(format!("invalid UTF-8 in HTML: {}", e)))?;
-        Ok(html2md::parse_html(html))
+        // html2md 0.1.1 遇到 HTML 注释会走 `println!("<!-- ... -->")` 把注释
+        // 直接写到 stdout，在 TUI 的 raw mode + alternate screen 下会污染
+        // 屏幕渲染。先在此剥掉注释再交给 html2md。
+        let html = strip_html_comments(html);
+        Ok(html2md::parse_html(&html))
     } else if ct.contains("text/plain")
         || ct.contains("application/json")
         || ct.contains("application/xml")
@@ -173,6 +177,41 @@ fn process_content(content_type: &str, body: &[u8]) -> Result<String, ToolsError
     } else {
         Err(ToolsError::UnsupportedContentType(content_type.to_string()))
     }
+}
+
+/// 剥掉 HTML 注释 `<!-- ... -->`（含跨行）。
+/// 用状态机扫描而非正则，避免引入 `regex` 依赖；同时正确处理注释内部的
+/// 嵌套 `--` 与伪注释边界（HTML5 规范：注释到第一个 `-->` 结束）。
+fn strip_html_comments(html: &str) -> String {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // 检测 `<!--` 开头
+        if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" {
+            // 找到第一个 `-->` 结束注释
+            let mut j = i + 4;
+            let mut found = false;
+            while j + 3 <= bytes.len() {
+                if &bytes[j..j + 3] == b"-->" {
+                    i = j + 3;
+                    found = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found {
+                // 没有匹配的 `-->`：把剩余内容当作注释丢弃
+                return out;
+            }
+        } else {
+            // 非 ASCII 安全：按 char 边界推进，避免把多字节字符拆开
+            let ch = html[i..].chars().next().expect("non-empty slice");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 fn truncate_content(content: &str, max_length: usize) -> String {
@@ -390,5 +429,99 @@ mod tests {
         let result = truncate_content(&content, 100); // 100 bytes, likely mid-char
         assert!(result.contains("[truncated:"));
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn strip_html_comments_removes_simple_comment() {
+        let html = "<p>before</p><!-- a comment --><p>after</p>";
+        let stripped = strip_html_comments(html);
+        assert!(
+            !stripped.contains("<!--") && !stripped.contains("-->"),
+            "comments should be gone: {stripped}"
+        );
+        assert!(stripped.contains("before"));
+        assert!(stripped.contains("after"));
+    }
+
+    #[test]
+    fn strip_html_comments_removes_multiline_comment() {
+        let html = "<!-- line one\nline two\nline three --><p>x</p>";
+        let stripped = strip_html_comments(html);
+        assert!(!stripped.contains("<!--"));
+        assert!(stripped.contains("<p>x</p>"));
+    }
+
+    #[test]
+    fn strip_html_comments_removes_multiple_comments() {
+        let html = "<!-- a --><p>1</p><!-- b --><p>2</p><!-- c -->";
+        let stripped = strip_html_comments(html);
+        assert!(!stripped.contains("<!--"));
+        assert!(stripped.contains("<p>1</p>"));
+        assert!(stripped.contains("<p>2</p>"));
+    }
+
+    #[test]
+    fn strip_html_comments_preserves_text_with_dash_dash() {
+        // 文本中合法的 `--` 不应被误判为注释边界
+        let html = "<p>a -- b</p>";
+        let stripped = strip_html_comments(html);
+        assert_eq!(stripped, "<p>a -- b</p>");
+    }
+
+    #[test]
+    fn strip_html_comments_handles_unclosed_comment() {
+        // 没有匹配 `-->` 的 `<!--`：剩余内容当作注释丢弃
+        let html = "<p>ok</p><!-- never closed";
+        let stripped = strip_html_comments(html);
+        assert!(stripped.contains("<p>ok</p>"));
+        assert!(!stripped.contains("<!--"));
+    }
+
+    #[test]
+    fn strip_html_comments_handles_cjk_content() {
+        let html = "<!-- 注释 --><p>你好世界</p>";
+        let stripped = strip_html_comments(html);
+        assert!(!stripped.contains("<!--"));
+        assert!(stripped.contains("你好世界"));
+    }
+
+    #[tokio::test]
+    async fn fetch_html_strips_comments_no_stdout_leak() {
+        // 回归测试：html2md 0.1.1 对 HTML 注释会走 println!，污染 TUI。
+        // 这里通过 mock server 返回带注释的 HTML，验证 fetch 结果里
+        // 不包含 `<!--` 且正文内容保留。
+        // 注意：wiremock 的 `set_body_string` 会把 mime 设为 text/plain，
+        // 且最终渲染时 mime 会覆盖 insert_header 设置的 content-type。
+        // 所以这里用 `set_body_raw` 同时设置 body 和 mime。
+        let server = setup_mock_server().await;
+        let html = "<html><body><!-- analytics tracker --><h1>Title</h1></body></html>";
+        Mock::given(method("GET"))
+            .and(path("/with_comments"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = WebFetchTool::new();
+        let result = tool
+            .call(serde_json::json!({
+                "url": format!("{}/with_comments", server.uri())
+            }))
+            .await;
+        assert!(!result.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            assert!(
+                !s.contains("<!--") && !s.contains("-->"),
+                "fetch result should not contain HTML comment markers: {s}"
+            );
+            assert!(
+                s.to_lowercase().contains("title"),
+                "real content should be preserved: {s}"
+            );
+        } else {
+            panic!("expected text block");
+        }
     }
 }
