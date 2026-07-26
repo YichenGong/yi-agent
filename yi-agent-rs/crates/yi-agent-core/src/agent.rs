@@ -138,7 +138,10 @@ pub enum AgentEvent {
     ToolTimeout {
         id: String,
     },
-    Usage(TokenUsage),
+    Usage {
+        model: String,
+        usage: TokenUsage,
+    },
     /// Heuristic estimate of prefill (input) tokens, emitted before the
     /// provider returns real usage. Lets the status bar show activity.
     EstimatedPrefill(u32),
@@ -363,7 +366,7 @@ async fn run_loop(
 
         // Check 2: THINK 中 — select! between accumulate and cancel
         let (content, _stop_reason) = tokio::select! {
-            result = accumulate_provider_stream(stream, &tx) => match result {
+            result = accumulate_provider_stream(stream, &tx, &model) => match result {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(turn, error = %e, "provider stream error");
@@ -724,15 +727,20 @@ async fn handle_confirmation(
 async fn accumulate_provider_stream(
     stream: BoxStream<'static, ProviderEvent>,
     tx: &mpsc::Sender<AgentEvent>,
+    model: &str,
 ) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
     let tx = tx.clone();
+    let model = model.to_string();
     let (content, stop_reason) =
         crate::provider::accumulate_stream(stream, move |event| match event {
             ProviderEvent::TextDelta(s) => {
                 let _ = tx.try_send(AgentEvent::AssistantText(s));
             }
             ProviderEvent::Usage(u) => {
-                let _ = tx.try_send(AgentEvent::Usage(u));
+                let _ = tx.try_send(AgentEvent::Usage {
+                    model: model.clone(),
+                    usage: u,
+                });
             }
             ProviderEvent::ToolUseDelta { partial_json, .. } => {
                 let _ = tx.try_send(AgentEvent::DecodeDelta(partial_json));
@@ -1067,7 +1075,7 @@ mod tests {
         let usage_events: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::Usage(u) => Some(u.clone()),
+                AgentEvent::Usage { usage, .. } => Some(usage.clone()),
                 _ => None,
             })
             .collect();

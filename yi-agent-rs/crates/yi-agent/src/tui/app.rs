@@ -18,6 +18,7 @@ use yi_agent_core::AgentEvent;
 
 use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 use super::cell::HistoryCell;
+use super::cost::CostTracker;
 use super::history::{HistoryState, HistoryView};
 use super::input::{InputAction, InputLine};
 use super::slash::{CommandPopup, SlashCommand};
@@ -166,6 +167,7 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut statusbar_state = StatusBarState::default();
     let mut task_registry = RunningTaskRegistry::new();
+    let mut cost_tracker = CostTracker::default();
     let mut bash_popup: BashPopup = BashPopup::None;
 
     loop {
@@ -176,7 +178,12 @@ fn run_loop<B: Backend, E: EventSource>(
                 event,
                 AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
             );
-            route_event(&mut task_registry, &mut statusbar_state, &event);
+            route_event(
+                &mut task_registry,
+                &mut statusbar_state,
+                &mut cost_tracker,
+                &event,
+            );
             history.push_event(event, width);
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
@@ -329,6 +336,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 key,
                 input,
                 history,
+                &cost_tracker,
                 input_tx,
                 interrupt_tx,
                 control_tx,
@@ -442,6 +450,7 @@ fn handle_bash_popup_key(
 fn route_event(
     registry: &mut RunningTaskRegistry,
     statusbar: &mut StatusBarState,
+    cost: &mut CostTracker,
     event: &AgentEvent,
 ) {
     match event {
@@ -480,8 +489,9 @@ fn route_event(
         AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_) => {
             registry.abort_all_running();
         }
-        AgentEvent::Usage(u) => {
-            statusbar.set_token_target(u.input_tokens as u64, u.output_tokens as u64);
+        AgentEvent::Usage { model, usage } => {
+            statusbar.set_token_target(usage.input_tokens as u64, usage.output_tokens as u64);
+            cost.record(model, usage);
         }
         AgentEvent::EstimatedPrefill(n) => {
             statusbar.set_prefill_estimate(*n as u64);
@@ -508,6 +518,7 @@ fn handle_key(
     key: KeyEvent,
     input: &mut InputLine,
     history: &mut HistoryState,
+    cost_tracker: &CostTracker,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
@@ -659,6 +670,7 @@ fn handle_key(
                             cmd,
                             args_str,
                             history,
+                            cost_tracker,
                             input_tx,
                             interrupt_tx,
                             control_tx,
@@ -700,6 +712,7 @@ fn handle_key(
                         cmd,
                         args,
                         history,
+                        cost_tracker,
                         input_tx,
                         interrupt_tx,
                         control_tx,
@@ -755,6 +768,7 @@ fn execute_slash_command(
     cmd: SlashCommand,
     args: Option<String>,
     history: &mut HistoryState,
+    cost: &CostTracker,
     _input_tx: &tokio::sync::mpsc::Sender<String>,
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
@@ -780,9 +794,8 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Cost => {
-            history.push(HistoryCell::Separator {
-                label: Some("Token 用量: (暂未实现)".to_string()),
-            });
+            let text = cost.render();
+            history.push(HistoryCell::UserMessage { text });
             KeyOutcome::None
         }
         SlashCommand::Config => {
@@ -1007,7 +1020,12 @@ mod tests {
         let mut registry = RunningTaskRegistry::new();
         let mut sb = StatusBarState::default();
         // Start resets per-call status.
-        route_event(&mut registry, &mut sb, &AgentEvent::Start);
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::Start,
+        );
         sb.tick();
         assert_eq!(sb.display_input_tokens(), 0);
 
@@ -1015,6 +1033,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -1028,6 +1047,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolOutputDelta {
                 id: "t1".into(),
                 stream: OutputStream::Stdout,
@@ -1047,6 +1067,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolExit {
                 id: "t1".into(),
                 code: Some(0),
@@ -1058,11 +1079,15 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
-            &AgentEvent::Usage(yi_agent_core::TokenUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-                ..Default::default()
-            }),
+            &mut CostTracker::default(),
+            &AgentEvent::Usage {
+                model: "test".to_string(),
+                usage: yi_agent_core::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+            },
         );
         sb.tick();
         assert!(sb.display_input_tokens() > 0);
@@ -1075,6 +1100,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t".into(),
                 name: "bash".into(),
@@ -1084,6 +1110,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolTimeout { id: "t".into() },
         );
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
@@ -1101,6 +1128,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -1114,6 +1142,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::Done {
                 reason: DoneReason::EndTurn,
             },
@@ -1147,13 +1176,19 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({"command":"sleep 10","expected_timeout_sec":30}),
             },
         );
-        route_event(&mut registry, &mut sb, &AgentEvent::Cancelled);
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut CostTracker::default(),
+            &AgentEvent::Cancelled,
+        );
         assert_eq!(
             registry.get("t1").unwrap().status,
             TaskStatus::Aborted,
@@ -1172,6 +1207,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -1181,6 +1217,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::Error(AgentError::Provider(ProviderError::Auth("boom".into()))),
         );
         assert_eq!(
@@ -1199,6 +1236,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "done_task".into(),
                 name: "bash".into(),
@@ -1208,6 +1246,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolExit {
                 id: "done_task".into(),
                 code: Some(0),
@@ -1218,6 +1257,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::ToolCall {
                 id: "stuck_task".into(),
                 name: "bash".into(),
@@ -1227,6 +1267,7 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::Done {
                 reason: DoneReason::EndTurn,
             },
@@ -1256,11 +1297,13 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::DecodeDelta("{\"q\":".into()),
         );
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::DecodeDelta("\"weather\"}".into()),
         );
         // {"q": = 5 chars, "weather"} = 9 chars → 14 ascii → 14/4 = 3 tokens
@@ -1279,11 +1322,13 @@ mod tests {
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::AssistantText("hello".into()),
         );
         route_event(
             &mut registry,
             &mut sb,
+            &mut CostTracker::default(),
             &AgentEvent::AssistantText("world".into()),
         );
         // 10 ascii chars → 10/4 = 2 tokens
@@ -2751,6 +2796,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2786,6 +2832,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2821,6 +2868,7 @@ mod tests {
             make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2853,6 +2901,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2866,6 +2915,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2901,6 +2951,7 @@ mod tests {
             make_key(KeyCode::Enter, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2948,6 +2999,7 @@ mod tests {
             make_key(KeyCode::Enter, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2969,5 +3021,107 @@ mod tests {
             }
             _ => panic!("expected Submit"),
         }
+    }
+
+    // ----- /cost slash command tests -----
+
+    #[test]
+    fn cost_command_renders_tracker() {
+        use yi_agent_core::TokenUsage;
+        let mut history = HistoryState::new();
+        let mut cost = CostTracker::default();
+        cost.record(
+            "claude-sonnet-4-5",
+            &TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+        );
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let outcome = execute_slash_command(
+            SlashCommand::Cost,
+            None,
+            &mut history,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        let cell = history.cells.last().unwrap();
+        match cell {
+            crate::tui::cell::HistoryCell::UserMessage { text } => {
+                assert!(
+                    text.contains("claude-sonnet-4-5"),
+                    "cost text should include model: {text}"
+                );
+                assert!(
+                    text.contains("100"),
+                    "cost text should include input tokens: {text}"
+                );
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_command_empty_shows_no_data() {
+        let mut history = HistoryState::new();
+        let cost = CostTracker::default();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let outcome = execute_slash_command(
+            SlashCommand::Cost,
+            None,
+            &mut history,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        let cell = history.cells.last().unwrap();
+        match cell {
+            crate::tui::cell::HistoryCell::UserMessage { text } => {
+                assert!(
+                    text.contains("尚无数据"),
+                    "empty cost should show no-data: {text}"
+                );
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_event_usage_records_to_tracker() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        let mut cost = CostTracker::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut cost,
+            &AgentEvent::Usage {
+                model: "claude".to_string(),
+                usage: yi_agent_core::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+            },
+        );
+        let rendered = cost.render();
+        assert!(
+            rendered.contains("claude"),
+            "tracker should contain model after route_event: {rendered}"
+        );
+        assert!(
+            rendered.contains("100"),
+            "tracker should contain input tokens: {rendered}"
+        );
     }
 }
