@@ -66,3 +66,19 @@
   stdout/stderr,`--json` 切换为 JSONL 供测试断言。详见
   `docs/plans/2026-07-26-real-llm-testing-design.md`。
 
+## 项目进度维护
+
+- **每完成一组需求,必须同步更新 `docs/project-management/` 下对应模块文件**,
+  并在同一个 commit 或 PR 内提交。不要事后补。
+- 状态只有三态:**`[x]` 已完成**、**`[ ]` 未完成**、**`[-]` 已放弃**。
+  **禁止使用 `[~]` 进行中**——要么完成要么没完成,"进行中"对读者没信息量且
+  容易成为黑洞(进去就出不来)。
+- 每条 feature 必须带**可验证的完成判据**:代码位置(`file.rs:line`)或
+  可执行命令,不要写"已实现权限管理"这种主观描述。
+- 更新模块文件后,同步更新 `README.md` 模块索引表的"完成 / 总计"计数。
+- **新增 crate 时**,同一 PR 内必须:
+  1. 在 `docs/project-management/` 下创建对应模块文件
+  2. 在 `README.md` 模块索引表登记一行
+- `bug-list.md` 同理:只有 `[x]` 已修复 / `[ ]` 未修复两态,不用 `[~]`。
+- 维护规则详见 `docs/project-management/README.md` 末尾"维护规则"小节。
+

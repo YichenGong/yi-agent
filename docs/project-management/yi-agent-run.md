@@ -22,10 +22,10 @@
 
 ## Features
 
-- [x] `yi-agent run` 子命令定义与 dispatch — [实现](../plans/2026-07-26-real-llm-testing-impl.md)
-- [x] Headless 事件 drain（stdout/stderr，流式拼接 AssistantText）
-- [x] `--json` JSONL 输出（`AgentEvent: Serialize`）
-- [x] `--stdin` 追加输入
-- [x] `--naked` 裸模型模式 — [设计](../plans/2026-07-26-run-naked-flag-design.md)
-- [x] 配置层级合并（全局 + 本地）— [设计](../plans/2026-07-25-config-layering-design.md)
-- [x] 真实 LLM 端到端测试（`#[ignore]` gate，`just test-real-e2e`）— [设计](../plans/2026-07-26-real-llm-testing-design.md)
+- [x] `yi-agent run` 子命令 — `crates/yi-agent/src/config.rs::Command::Run` 定义 + `main.rs` dispatch
+- [x] Headless 事件 drain — `main.rs::run_headless()` 拼接 AssistantText 到 stdout/stderr
+- [x] `--json` JSONL 输出 — `AgentEvent` 实现 `Serialize`，`--json` 切换输出格式
+- [x] `--stdin` 追加输入 — `config.rs::Run.stdin` flag 读取 stdin
+- [x] `--naked` 裸模型模式 — `main.rs` naked 分支跳过工具/skills/系统提示词 — [设计](../plans/2026-07-26-run-naked-flag-design.md)
+- [x] 配置层级合并 — `config.rs::load_env_files()` 本地覆盖全局 — [设计](../plans/2026-07-25-config-layering-design.md)
+- [x] 真实 LLM 端到端测试 — `crates/yi-agent/tests/e2e_real.rs` 用 `#[ignore]` gate — [设计](../plans/2026-07-26-real-llm-testing-design.md)

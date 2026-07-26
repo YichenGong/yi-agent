@@ -22,10 +22,10 @@ yi-agent 的 skills 系统，提供可发现的 skill 目录（类似 Claude Cod
 
 ## Features
 
-- [x] Skills 系统设计 — [设计](../plans/2026-07-25-skills-design.md) · [实现](../plans/2026-07-25-skills-impl.md)
-- [x] Skill 元数据与作用域（Project / User / System）
-- [x] 多根目录发现与 YAML 加载
-- [x] `SkillsService`（snapshot + catalog 渲染 + 预算截断）
-- [x] 系统内置 skill 安装
-- [x] `SkillTool` 注册到 `register_builtin_tools`
-- [x] 系统提示词注入 skill catalog（`--skills-catalog-budget`）
+- [x] Skills 系统设计 — 设计与实现文档齐全 — [设计](../plans/2026-07-25-skills-design.md) · [实现](../plans/2026-07-25-skills-impl.md)
+- [x] Skill 元数据与作用域 — `crates/yi-agent-skills/src/model.rs` 定义 `SkillMetadata` + `SkillScope`（Project/User/System）
+- [x] 多根目录发现与 YAML 加载 — `discovery.rs::discover_skills()` + `loader.rs` 实现 YAML 解析校验
+- [x] `SkillsService` — `service.rs::SkillsService` 提供 `snapshot()` / `render_catalog()` / `full_catalog_size()`
+- [x] 系统内置 skill 安装 — `system.rs::install_system_skills()` + `assets/` 目录含内置 skill 定义
+- [x] `SkillTool` 注册到 agent — `crates/yi-agent-tools/src/skill_tool.rs` 实现 `Tool` trait，`main.rs:105` 注册
+- [x] 系统提示词注入 skill catalog — `main.rs::resolve_system_prompt_with_skills()` 按 `--skills-catalog-budget` 截断注入

@@ -22,8 +22,8 @@ yi-agent 的 Web 配置管理界面。通过 axum Web 服务器提供内嵌 HTML
 
 ## Features
 
-- [x] WebUI 配置服务器（axum + 内嵌 HTML）— [设计](../plans/2026-07-24-web-config-ui-design.md)
-- [x] 15 个环境变量元数据管理 — [设计](../plans/2026-07-25-web-config-ui-restructure-design.md)
-- [x] 配置文件层级合并（全局 + 本地）— [设计](../plans/2026-07-25-config-layering-design.md)
-- [x] 垂直标签页 + 可折叠分区 UI — [设计](../plans/2026-07-25-web-config-ui-restructure-design.md)
-- [ ] Secret 值掩码与安全写入
+- [x] WebUI 配置服务器 — `crates/yi-agent-web/src/lib.rs::serve()` 启动 axum — [设计](../plans/2026-07-24-web-config-ui-design.md)
+- [x] 15 个环境变量元数据管理 — `config_meta.rs` 定义全部 env var 元数据 — [设计](../plans/2026-07-25-web-config-ui-restructure-design.md)
+- [x] 配置文件层级合并 — `env_file.rs` + `config.rs::load_env_files()` 实现本地覆盖全局 — [设计](../plans/2026-07-25-config-layering-design.md)
+- [x] 垂直标签页 + 可折叠分区 UI — `assets/` 内嵌 HTML 实现 — [设计](../plans/2026-07-25-web-config-ui-restructure-design.md)
+- [ ] Secret 值掩码与安全写入 — 当前 API 直接回显明文 api_key

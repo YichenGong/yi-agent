@@ -2,40 +2,41 @@
 
 ## 模块说明
 
-yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。提供结构化对话历史展示、输入编辑、slash 命令弹窗等功能。从早期 InlineRenderer（reedline 流式打印）迁移而来，现已设为默认 TUI 模式。
+yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。提供结构化对话历史展示、输入编辑、slash 命令弹窗、状态栏、bash 弹窗等功能。从早期 InlineRenderer（reedline 流式打印）迁移而来，现已设为默认 TUI 模式。
 
 ## 范围边界
 
 **做什么：**
-- ratatui 全屏布局（history 区 + popup 区 + input 区）
-- 结构化对话历史（HistoryCell: UserMessage / AssistantMessage / ToolCall / ToolResult / Separator）
-- Markdown 渲染（pulldown-cmark，标题/代码块/粗体/斜体/引用/链接）
+- ratatui 全屏布局（history 区 + popup 区 + input 区 + 状态栏）
+- 结构化对话历史（HistoryCell: UserMessage / AssistantMessage / ToolCall / ToolResult / Separator / Markdown / Usage）
+- Markdown 渲染（pulldown-cmark，标题/代码块/粗体/斜体/引用/链接/表格）
 - 输入行编辑器（自实现，不依赖 reedline）
 - 多行自动换行（unicode-width + CJK 宽度感知）
 - Slash 命令弹窗（自动补全 + 中文描述 + Up/Down/Tab/Enter 导航）
 - 两步退出确认（Ctrl+C / Esc 两次退出）
-- 输入框光标可见（反色显示：白底黑字）
-- 可折叠工具调用/结果（Ctrl+O 切换）
-- 历史区滚动（Shift+↑/↓ 选中 cell，Ctrl+U/D 半屏滚动）
+- 输入排队（agent 运行期间粘贴的输入进队列，结束后回放）
+- 状态栏（实时 token 计数 + 模型名 + 运行中任务指示）
+- Bash 全屏弹窗（Ctrl+P 查看运行中/已完成 bash 实时输出 + exit code）
 
 **不做什么：**
-- 不做 InlineRenderer 的功能扩展（已 deprecated，仅保留兼容）
+- 不做 InlineRenderer 的功能扩展（已 deprecated，待移除）
 - 不做 syntax-highlight（可选 feature，默认关闭）
 - 不做侧边栏 / 模态框（YAGNI）
 - 不做 spinner / 进度条（YAGNI）
 
 ## Features
 
-- [x] ratatui 全屏 TUI 架构（HistoryView + InputLine + 事件循环）— [设计](../plans/2026-07-25-tui-history-redesign.md)
-- [x] 结构化对话历史（HistoryCell + 折叠/展开）— [设计](../plans/2026-07-25-tui-history-redesign.md)
-- [x] Markdown 渲染（pulldown-cmark，含代码块 + 表格 Unicode box drawing）— [设计](../plans/2026-07-25-tui-history-redesign.md)
-- [x] 输入框多行自动换行（CJK 宽度感知）
-- [x] 两步退出确认（Ctrl+C / Esc）— [设计](../plans/2026-07-24-yi-agent-tui-features-design.md)
-- [x] Slash 命令弹窗（自动补全 + 中文描述）— [设计](../plans/2026-07-25-tui-slash-commands-design.md)
-- [x] 输入框光标可见（反色显示）
-- [x] 输入排队（agent 运行期间粘贴的输入进入队列，结束后回放）— [设计](../plans/2026-07-25-tui-queued-input-design.md)
-- [x] 状态栏（实时 token 计数 + 模型名 + 运行中任务指示）— [设计](../plans/2026-07-25-task-perception-design.md)
-- [x] Bash 全屏弹窗（Ctrl+P 查看运行中/已完成 bash 的实时输出与 exit code）— [设计](../plans/2026-07-25-task-perception-design.md)
-- [x] `/cost` 命令（按模型累计 input/output/cache token 与调用次数）— [设计](../plans/2026-07-26-tui-cost-command-design.md)
-- [x] `/yolo` `/model` `/compact` `/clear` `/help` `/exit` slash 命令
-- [ ] InlineRenderer 退役（已标记 deprecated，待移除）
+- [x] ratatui 全屏 TUI 架构 — `tui/app.rs` 实现事件循环 + 布局 — [设计](../plans/2026-07-25-tui-history-redesign.md)
+- [x] 结构化对话历史 — `tui/cell.rs` 定义 `HistoryCell` 枚举 + `tui/history.rs` 管理 — [设计](../plans/2026-07-25-tui-history-redesign.md)
+- [x] Markdown 渲染 — `tui/markdown.rs` 用 pulldown-cmark + 表格 Unicode box drawing — [设计](../plans/2026-07-25-tui-history-redesign.md)
+- [x] 输入框多行自动换行 — `tui/input.rs` 实现 CJK 宽度感知换行
+- [x] 两步退出确认 — `tui/app.rs` Ctrl+C / Esc 两次才退出 — [设计](../plans/2026-07-24-yi-agent-tui-features-design.md)
+- [x] Slash 命令弹窗 — `tui/slash.rs` 实现自动补全 + 中文描述 — [设计](../plans/2026-07-25-tui-slash-commands-design.md)
+- [x] 输入框光标可见 — `tui/input.rs` 反色显示（白底黑字）
+- [x] 输入排队 — `tui/queued.rs::QueuedInput` 在 agent 运行期间缓存输入 — [设计](../plans/2026-07-25-tui-queued-input-design.md)
+- [x] 状态栏 — `tui/statusbar.rs` 显示实时 token + 模型名 + 运行中任务 — [设计](../plans/2026-07-25-task-perception-design.md)
+- [x] Bash 全屏弹窗 — `tui/bash_popup.rs` Ctrl+P 打开，显示实时输出 + exit code — [设计](../plans/2026-07-25-task-perception-design.md)
+- [x] `/cost` 命令 — `tui/cost.rs::CostTracker` 按模型累计 token + 调用次数 — [设计](../plans/2026-07-26-tui-cost-command-design.md)
+- [x] `/yolo` `/model` `/compact` `/clear` `/help` `/exit` slash 命令 — `tui/slash.rs` + `tui/app.rs` 路由
+- [x] Markdown 表格渲染 — commit `2e9da9e` 用 Unicode box drawing 修复
+- [ ] InlineRenderer 退役 — `tui/` 仍保留 deprecated 的 InlineRenderer 代码，待删除

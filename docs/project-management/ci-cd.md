@@ -12,6 +12,7 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - 三平台交叉编译（macOS x64/ARM64、Linux x64）
 - 三渠道发布（GitHub Release、Homebrew、npm）
 - Mac mini runner 配置
+- 真实 LLM 测试基础设施（`#[ignore]` gate，CI 不跑）
 
 **不做什么：**
 - 不做覆盖率统计（codecov.io）— YAGNI
@@ -24,14 +25,14 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 
 - [x] CI/CD 设计文档 — [设计](../plans/2026-07-19-ci-cd-design.md)
 - [x] CI/CD 实现计划 — [实现](../plans/2026-07-19-ci-cd-impl.md)
-- [x] justfile 与 rust-toolchain.toml
-- [x] npm 包结构（主包 + 平台子包）
-- [x] Homebrew tap 自动更新脚本
-- [x] GitLab CI 配置
-- [x] GitHub Actions CI 配置（PR 触发）
-- [x] GitHub Actions Release 配置（tag 触发）
-- [x] Mac mini runner 配置
-- [x] 首次端到端验证（v0.1.0 + v0.1.1 release 流水线全流程通过）
-- [x] 真实 LLM 测试基础设施（`#[ignore]` gate + justfile recipes，CI 不跑）— [设计](../plans/2026-07-26-real-llm-testing-design.md)
+- [x] justfile 与 rust-toolchain.toml — `yi-agent-rs/justfile` + `rust-toolchain.toml` 存在
+- [x] npm 包结构 — `yi-agent-rs/yi-agent-cli/` 主包 + 平台子包
+- [x] Homebrew tap 自动更新脚本 — 发布脚本存在
+- [x] GitLab CI 配置 — `.gitlab-ci.yml` 存在
+- [x] GitHub Actions CI 配置 — `.github/workflows/ci.yml` PR 触发
+- [x] GitHub Actions Release 配置 — `.github/workflows/release.yml` tag 触发
+- [x] Mac mini runner 配置 — self-hosted runner 接入
+- [x] 首次端到端验证 — v0.1.0 + v0.1.1 release 流水线全流程通过
+- [x] 真实 LLM 测试基础设施 — justfile `test-real-llm` / `test-real-e2e` recipes + `#[ignore]` gate — [设计](../plans/2026-07-26-real-llm-testing-design.md)
 - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
 - [-] crates.io 发布 — YAGNI，暂不做
