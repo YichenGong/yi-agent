@@ -94,3 +94,60 @@ fn complex_python_script() {
     assert!(py.contains("def sort_list"), "missing def sort_list");
     assert!(py.contains("__main__"), "missing __main__ guard");
 }
+
+const PROMPT_DATA: &str = "Read the file input/data.json, extract all `name` fields, convert them to uppercase, and write the result as a JSON array to output/results.json.";
+
+#[test]
+#[ignore]
+fn complex_data_transformation() {
+    if !skip_if_no_key() {
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("input")).expect("create input dir");
+    std::fs::create_dir_all(tmp.path().join("output")).expect("create output dir");
+    std::fs::write(
+        tmp.path().join("input/data.json"),
+        r#"[{"name":"alice","age":30},{"name":"bob","age":25},{"name":"charlie","age":35}]"#,
+    )
+    .expect("write data.json");
+
+    let output = Command::new(yi_agent_bin())
+        .arg("--workdir")
+        .arg(tmp.path())
+        .arg("run")
+        .arg("--json")
+        .arg(PROMPT_DATA)
+        .output()
+        .expect("failed to spawn yi-agent");
+
+    assert!(
+        output.status.success(),
+        "yi-agent run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let events = parse_events(&stdout);
+    assert!(has_done_event(&events), "no Done event, stdout: {stdout}");
+
+    // 结构性断言
+    let results_path = tmp.path().join("output/results.json");
+    assert!(results_path.exists(), "results.json not created");
+    let content = std::fs::read_to_string(&results_path).expect("read results.json");
+
+    // 必须是合法 JSON 数组
+    let parsed: serde_json::Value =
+        serde_json::from_str(&content).expect("results.json is not valid JSON");
+    let arr = parsed
+        .as_array()
+        .expect("results.json should be a JSON array");
+    assert_eq!(arr.len(), 3, "should have 3 elements, got: {content}");
+
+    // 内容包含大写名字
+    let upper = content.to_uppercase();
+    assert!(upper.contains("ALICE"), "missing ALICE: {content}");
+    assert!(upper.contains("BOB"), "missing BOB: {content}");
+    assert!(upper.contains("CHARLIE"), "missing CHARLIE: {content}");
+}
