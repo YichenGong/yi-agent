@@ -117,6 +117,26 @@ impl HistoryState {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
+    /// Scroll up by one viewport, treating a zero-height viewport as one line.
+    pub fn scroll_page_up(&mut self, viewport_height: u16, max_offset: usize) {
+        self.scroll_up(viewport_height.max(1) as usize, max_offset);
+    }
+
+    /// Scroll down by one viewport, treating a zero-height viewport as one line.
+    pub fn scroll_page_down(&mut self, viewport_height: u16) {
+        self.scroll_down(viewport_height.max(1) as usize);
+    }
+
+    /// Jump to the greatest valid scroll offset for the current viewport.
+    pub fn scroll_to_top(&mut self, width: u16, visible_height: u16) {
+        self.scroll_offset = self.max_scroll_offset(width, visible_height);
+    }
+
+    /// Jump to the newest history content.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
     fn apply_scroll_delta(&mut self, was_scrolled: bool, lines_before: usize, width: u16) {
         if !was_scrolled {
             return;
@@ -923,6 +943,46 @@ mod tests {
         assert_eq!(max, 0, "max should be 0 when content < viewport");
         s.scroll_up(5, max);
         assert_eq!(s.scroll_offset, 0, "offset should stay 0");
+    }
+
+    #[test]
+    fn page_scrolling_moves_by_viewport_height() {
+        let mut s = HistoryState::new();
+
+        s.scroll_up(12, 100);
+        s.scroll_page_down(5);
+        assert_eq!(s.scroll_offset, 7);
+
+        s.scroll_page_up(5, 100);
+        assert_eq!(s.scroll_offset, 12);
+    }
+
+    #[test]
+    fn scroll_to_top_clamps_to_content_and_bottom_resets_offset() {
+        let width = 80;
+        let height = 1;
+        let mut s = HistoryState::new();
+        s.push(
+            HistoryCell::UserMessage {
+                text: "first".into(),
+            },
+            width,
+        );
+        s.push(
+            HistoryCell::UserMessage {
+                text: "second".into(),
+            },
+            width,
+        );
+
+        let max = s.max_scroll_offset(width, height);
+        assert!(max > 0, "two user messages include a spacer line");
+
+        s.scroll_to_top(width, height);
+        assert_eq!(s.scroll_offset, max);
+
+        s.scroll_to_bottom();
+        assert_eq!(s.scroll_offset, 0);
     }
 
     #[test]
