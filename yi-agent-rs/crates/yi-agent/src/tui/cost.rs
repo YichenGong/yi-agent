@@ -24,8 +24,13 @@ impl CostTracker {
         Self::default()
     }
 
-    pub fn record(&mut self, _model: &str, _usage: &TokenUsage) {
-        todo!()
+    pub fn record(&mut self, model: &str, usage: &TokenUsage) {
+        let m = self.per_model.entry(model.to_string()).or_default();
+        m.input += usage.input_tokens as u64;
+        m.output += usage.output_tokens as u64;
+        m.cache_creation += usage.cache_creation_input_tokens.unwrap_or(0) as u64;
+        m.cache_read += usage.cache_read_input_tokens.unwrap_or(0) as u64;
+        m.calls += 1;
     }
 
     pub fn render(&self) -> String {
