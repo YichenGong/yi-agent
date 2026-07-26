@@ -200,7 +200,11 @@ pub enum AgentEvent {
 pub enum DoneReason {
     EndTurn,
     MaxTurns,
+    Interrupted { reason: String },
 }
+
+const CONTINUE_AFTER_TRUNCATION: &str =
+    "Continue the interrupted task from where you stopped. Do not repeat completed work.";
 
 #[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum AgentError {
@@ -438,7 +442,7 @@ async fn run_loop(
         };
 
         // Check 2: THINK 中 — select! between accumulate and cancel
-        let (content, _stop_reason, last_usage) = tokio::select! {
+        let (content, stop_reason, last_usage) = tokio::select! {
             result = accumulate_provider_stream(stream, &tx, &model, config.think_idle_timeout) => match result {
                 Ok(v) => {
                     tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
@@ -470,7 +474,7 @@ async fn run_loop(
 
         // Detect idle stall: accumulate_stream synthesizes this stop reason
         // when no provider event arrives within the idle timeout.
-        if let StopReason::Other(ref s) = _stop_reason {
+        if let StopReason::Other(ref s) = stop_reason {
             if s == "idle timeout" {
                 tracing::warn!(
                     turn,
@@ -484,6 +488,36 @@ async fn run_loop(
             .lock()
             .unwrap()
             .push(Message::assistant(content.clone()));
+
+        match stop_reason {
+            StopReason::EndTurn => {}
+            StopReason::MaxTokens => {
+                messages.push(Message::user(CONTINUE_AFTER_TRUNCATION));
+                session
+                    .lock()
+                    .unwrap()
+                    .push(Message::user(CONTINUE_AFTER_TRUNCATION));
+                continue;
+            }
+            StopReason::StopSequence => {
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::Interrupted {
+                            reason: "stop sequence".into(),
+                        },
+                    })
+                    .await;
+                return;
+            }
+            StopReason::Other(reason) => {
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::Interrupted { reason },
+                    })
+                    .await;
+                return;
+            }
+        }
 
         // 2. Termination check
         let tool_uses: Vec<(String, String, Value)> = content
@@ -989,6 +1023,59 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::AssistantText(t) if t == "Hello"))
         );
         assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_continues_after_max_tokens() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::TextDelta("partial".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::MaxTokens,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta(" complete".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let events = collect_events(agent.run("write a file".into()).await.unwrap());
+
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::AssistantText(text) if text == " complete")
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_does_not_report_abnormal_stop_as_end_turn() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("partial".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::Other("idle timeout".into()),
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let events = collect_events(agent.run("write a file".into()).await.unwrap());
+
+        assert!(!matches!(
             events.last(),
             Some(AgentEvent::Done {
                 reason: DoneReason::EndTurn
