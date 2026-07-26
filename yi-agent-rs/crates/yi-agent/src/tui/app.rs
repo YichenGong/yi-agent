@@ -336,6 +336,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 key,
                 input,
                 history,
+                &cost_tracker,
                 input_tx,
                 interrupt_tx,
                 control_tx,
@@ -517,6 +518,7 @@ fn handle_key(
     key: KeyEvent,
     input: &mut InputLine,
     history: &mut HistoryState,
+    cost_tracker: &CostTracker,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
@@ -668,6 +670,7 @@ fn handle_key(
                             cmd,
                             args_str,
                             history,
+                            cost_tracker,
                             input_tx,
                             interrupt_tx,
                             control_tx,
@@ -709,6 +712,7 @@ fn handle_key(
                         cmd,
                         args,
                         history,
+                        cost_tracker,
                         input_tx,
                         interrupt_tx,
                         control_tx,
@@ -764,6 +768,7 @@ fn execute_slash_command(
     cmd: SlashCommand,
     args: Option<String>,
     history: &mut HistoryState,
+    cost: &CostTracker,
     _input_tx: &tokio::sync::mpsc::Sender<String>,
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
@@ -789,9 +794,8 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Cost => {
-            history.push(HistoryCell::Separator {
-                label: Some("Token 用量: (暂未实现)".to_string()),
-            });
+            let text = cost.render();
+            history.push(HistoryCell::UserMessage { text });
             KeyOutcome::None
         }
         SlashCommand::Config => {
@@ -2792,6 +2796,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2827,6 +2832,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2862,6 +2868,7 @@ mod tests {
             make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2894,6 +2901,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2907,6 +2915,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2942,6 +2951,7 @@ mod tests {
             make_key(KeyCode::Enter, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -2989,6 +2999,7 @@ mod tests {
             make_key(KeyCode::Enter, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
             &control_tx,
@@ -3010,5 +3021,107 @@ mod tests {
             }
             _ => panic!("expected Submit"),
         }
+    }
+
+    // ----- /cost slash command tests -----
+
+    #[test]
+    fn cost_command_renders_tracker() {
+        use yi_agent_core::TokenUsage;
+        let mut history = HistoryState::new();
+        let mut cost = CostTracker::default();
+        cost.record(
+            "claude-sonnet-4-5",
+            &TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+        );
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let outcome = execute_slash_command(
+            SlashCommand::Cost,
+            None,
+            &mut history,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        let cell = history.cells.last().unwrap();
+        match cell {
+            crate::tui::cell::HistoryCell::UserMessage { text } => {
+                assert!(
+                    text.contains("claude-sonnet-4-5"),
+                    "cost text should include model: {text}"
+                );
+                assert!(
+                    text.contains("100"),
+                    "cost text should include input tokens: {text}"
+                );
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_command_empty_shows_no_data() {
+        let mut history = HistoryState::new();
+        let cost = CostTracker::default();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let outcome = execute_slash_command(
+            SlashCommand::Cost,
+            None,
+            &mut history,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        let cell = history.cells.last().unwrap();
+        match cell {
+            crate::tui::cell::HistoryCell::UserMessage { text } => {
+                assert!(
+                    text.contains("尚无数据"),
+                    "empty cost should show no-data: {text}"
+                );
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_event_usage_records_to_tracker() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut sb = StatusBarState::default();
+        let mut cost = CostTracker::default();
+        route_event(
+            &mut registry,
+            &mut sb,
+            &mut cost,
+            &AgentEvent::Usage {
+                model: "claude".to_string(),
+                usage: yi_agent_core::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+            },
+        );
+        let rendered = cost.render();
+        assert!(
+            rendered.contains("claude"),
+            "tracker should contain model after route_event: {rendered}"
+        );
+        assert!(
+            rendered.contains("100"),
+            "tracker should contain input tokens: {rendered}"
+        );
     }
 }
