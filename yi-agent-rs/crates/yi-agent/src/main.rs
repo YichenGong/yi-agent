@@ -168,9 +168,17 @@ async fn drain_stream_human<W: std::io::Write, E: std::io::Write>(
                     result.is_error, result.content
                 );
             }
-            yi_agent_core::AgentEvent::Done { reason } => {
-                let _ = writeln!(err, "[done:{reason:?}]");
-            }
+            yi_agent_core::AgentEvent::Done { reason } => match reason {
+                // Normal completion is already signaled by exit code 0; the
+                // [done:EndTurn] line is noise on stderr and is suppressed
+                // to match the TUI, which renders EndTurn as a silent
+                // separator. Only abnormal non-error terminations emit a
+                // diagnostic line.
+                yi_agent_core::DoneReason::EndTurn => {}
+                yi_agent_core::DoneReason::MaxTurns => {
+                    let _ = writeln!(err, "[done:{reason:?}]");
+                }
+            },
             yi_agent_core::AgentEvent::Cancelled => {
                 let _ = writeln!(err, "[cancelled]");
                 exit_code = 130;
@@ -858,6 +866,36 @@ mod tests {
             AgentEvent::AssistantText("chunk2".into()),
             AgentEvent::AssistantText("chunk3".into()),
             AgentEvent::Done {
+                reason: DoneReason::MaxTurns,
+            },
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        assert_eq!(code, 0, "exit code should be 0 for Done::MaxTurns");
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(
+            stdout, "chunk1chunk2chunk3\n",
+            "AssistantText deltas should concatenate without per-chunk newlines"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().contains("[done:MaxTurns]"),
+            "MaxTurns is an abnormal non-error termination and should be reported on stderr"
+        );
+    }
+
+    #[test]
+    fn drain_stream_human_suppresses_done_endturn_on_stderr() {
+        // Bug regression: normal completion (EndTurn) is already signaled by
+        // exit code 0. The [done:EndTurn] line is noise on stderr and should
+        // be suppressed, matching the TUI which renders EndTurn as a silent
+        // separator. Only abnormal terminations (MaxTurns/Cancelled/Error)
+        // emit diagnostic lines to stderr.
+        let stream = scripted_stream(vec![
+            AgentEvent::AssistantText("hello".into()),
+            AgentEvent::Done {
                 reason: DoneReason::EndTurn,
             },
         ]);
@@ -868,11 +906,12 @@ mod tests {
 
         assert_eq!(code, 0, "exit code should be 0 for Done::EndTurn");
         let stdout = String::from_utf8(out).unwrap();
-        assert_eq!(
-            stdout, "chunk1chunk2chunk3\n",
-            "AssistantText deltas should concatenate without per-chunk newlines"
+        assert_eq!(stdout, "hello\n");
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            !stderr.contains("[done:"),
+            "EndTurn must not emit [done:EndTurn] on stderr; got: {stderr:?}"
         );
-        assert!(String::from_utf8(err).unwrap().contains("[done:"),);
     }
 
     #[test]
