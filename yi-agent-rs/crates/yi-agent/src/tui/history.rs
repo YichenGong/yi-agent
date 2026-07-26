@@ -200,6 +200,11 @@ impl HistoryState {
                         label: Some("Max turns".into()),
                     });
                 }
+                DoneReason::Interrupted { reason } => {
+                    self.push(HistoryCell::Separator {
+                        label: Some(format!("Interrupted: {reason}")),
+                    });
+                }
             },
             AgentEvent::Usage { .. } => {}
             AgentEvent::Cancelled => {
