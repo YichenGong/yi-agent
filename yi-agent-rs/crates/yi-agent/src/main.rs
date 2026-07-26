@@ -214,9 +214,7 @@ fn run_headless(cli: Cli, prompt: Option<String>, json: bool, from_stdin: bool) 
         let mut exit_code = 0;
         while let Some(event) = stream.next().await {
             if json {
-                // TODO: Task 4 adds Serialize derive to AgentEvent;
-                // switch back to serde_json::to_string(&event) once available.
-                let line = format!("{event:?}");
+                let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
                 println!("{line}");
             } else {
                 match &event {

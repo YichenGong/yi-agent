@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures::stream::{BoxStream, StreamExt};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -112,7 +113,7 @@ pub struct Agent {
 }
 
 /// Events emitted during agent loop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AgentEvent {
     Start,
     AssistantText(String),
@@ -163,13 +164,13 @@ pub enum AgentEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum DoneReason {
     EndTurn,
     MaxTurns,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum AgentError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),

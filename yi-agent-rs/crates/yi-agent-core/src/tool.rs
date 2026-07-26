@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::message::ContentBlock;
 
 /// Output stream type for tool streaming.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum OutputStream {
     Stdout,
     Stderr,
@@ -32,7 +33,7 @@ pub enum ToolEvent {
 }
 
 /// Result of tool execution, fed back to the LLM.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ToolResult {
     pub content: Vec<ContentBlock>,
     pub is_error: bool,

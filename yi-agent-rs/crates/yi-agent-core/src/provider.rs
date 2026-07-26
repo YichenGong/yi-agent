@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use serde::Serialize;
 
 use crate::message::ContentBlock;
 use crate::message::Message;
@@ -29,7 +30,7 @@ pub struct GenParams {
 }
 
 /// Token usage from a provider response.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -65,7 +66,7 @@ pub struct ProviderResponse {
 }
 
 /// Errors from a provider.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum ProviderError {
     #[error("network error: {0}")]
     Network(String),
