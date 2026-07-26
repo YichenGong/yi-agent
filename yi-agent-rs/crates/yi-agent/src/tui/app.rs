@@ -355,6 +355,16 @@ fn run_loop<B: Backend, E: EventSource>(
                 // After any key, sync popup state with the (possibly modified) buffer
                 sync_popup(&mut popup, &input.buffer);
             }
+            Some(Event::Paste(text)) => {
+                handle_paste(
+                    text,
+                    input,
+                    history,
+                    &bash_popup,
+                    &mut pending_quit,
+                    &mut popup,
+                );
+            }
             Some(Event::Mouse(mouse)) => {
                 handle_mouse(
                     mouse,
@@ -832,6 +842,23 @@ fn handle_key(
         }
         _ => KeyOutcome::None,
     }
+}
+
+fn handle_paste(
+    text: String,
+    input: &mut InputLine,
+    history: &HistoryState,
+    bash_popup: &BashPopup,
+    pending_quit: &mut bool,
+    popup: &mut Option<CommandPopup>,
+) {
+    if !matches!(bash_popup, BashPopup::None) || history.pending_permission_info().is_some() {
+        return;
+    }
+
+    input.insert_str(&text);
+    *pending_quit = false;
+    sync_popup(popup, &input.buffer);
 }
 
 /// Synchronize popup state with the current input buffer.
@@ -2067,6 +2094,114 @@ mod tests {
         (0..24u16)
             .flat_map(|y| (0..80u16).map(move |x| buffer[(x, y)].symbol()))
             .collect()
+    }
+
+    #[test]
+    fn paste_inserts_text_clears_pending_quit_and_filters_slash_popup() {
+        let history = HistoryState::new();
+        let mut input = InputLine::new();
+        let bash_popup = BashPopup::None;
+        let mut pending_quit = true;
+        let mut popup = None;
+
+        handle_paste(
+            "/cl".to_string(),
+            &mut input,
+            &history,
+            &bash_popup,
+            &mut pending_quit,
+            &mut popup,
+        );
+
+        assert_eq!(input.buffer, "/cl");
+        assert!(!pending_quit);
+        assert_eq!(
+            popup.and_then(|popup| popup.selected()),
+            Some(SlashCommand::Clear)
+        );
+    }
+
+    #[test]
+    fn paste_is_ignored_while_permission_is_pending() {
+        let mut history = HistoryState::new();
+        history.push_event(make_permission_request_normal(1), 80);
+        let mut input = InputLine::new();
+        let bash_popup = BashPopup::None;
+        let mut pending_quit = true;
+        let mut popup = None;
+
+        handle_paste(
+            "/cl".to_string(),
+            &mut input,
+            &history,
+            &bash_popup,
+            &mut pending_quit,
+            &mut popup,
+        );
+
+        assert!(input.buffer.is_empty());
+        assert!(pending_quit);
+        assert!(popup.is_none());
+    }
+
+    #[test]
+    fn paste_is_ignored_while_bash_popup_is_active() {
+        let history = HistoryState::new();
+        let mut input = InputLine::new();
+        let bash_popup = BashPopup::List(ListPopup::new(vec!["task-1".to_string()]));
+        let mut pending_quit = true;
+        let mut popup = None;
+
+        handle_paste(
+            "/cl".to_string(),
+            &mut input,
+            &history,
+            &bash_popup,
+            &mut pending_quit,
+            &mut popup,
+        );
+
+        assert!(input.buffer.is_empty());
+        assert!(pending_quit);
+        assert!(popup.is_none());
+    }
+
+    #[test]
+    fn bracketed_paste_renders_input_and_opens_slash_popup() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let source = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Paste("/cl".into()),
+            ])),
+        };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let text = collect_all_text(&terminal);
+        assert!(text.contains("/cl"), "expected pasted input, got: {text:?}");
+        assert!(
+            text.contains("clear"),
+            "expected slash popup, got: {text:?}"
+        );
     }
 
     /// Typing `/` should show the slash command popup with all commands.

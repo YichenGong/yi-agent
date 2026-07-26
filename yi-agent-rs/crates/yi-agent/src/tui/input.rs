@@ -88,8 +88,6 @@ impl InputLine {
         self.cursor += c.len_utf8();
     }
 
-    // Task 2 will wire bracketed paste into event routing.
-    #[allow(dead_code)]
     pub fn insert_str(&mut self, text: &str) {
         self.buffer.insert_str(self.cursor, text);
         self.cursor += text.len();
