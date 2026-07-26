@@ -5,63 +5,10 @@
 //! 测试不硬编码 provider/key,而是透传父进程 env 给子进程,
 //! 让 config 层按 YI_AGENT_PROVIDER / MODEL_API_KEY / ANTHROPIC_API_KEY 等解析。
 
-use std::path::PathBuf;
+mod common;
+
+use common::{event_variant, has_api_key, resolve_api_key, yi_agent_bin};
 use std::process::Command;
-
-/// Path to the compiled yi-agent binary.
-fn yi_agent_bin() -> PathBuf {
-    // CARGO_BIN_EXE_yi-agent is set by cargo when running integration tests.
-    // Fallback to target/debug/yi-agent for manual runs.
-    option_env!("CARGO_BIN_EXE_yi-agent")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/debug/yi-agent"))
-}
-
-/// 检查是否有任何可用的 API key 配置(provider 层或 config 层)。
-/// 有 key 才跑真实测试;无 key 则 skip。
-fn has_api_key() -> bool {
-    let has_provider_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let has_config_key = std::env::var("MODEL_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    has_provider_key || has_config_key
-}
-
-/// 返回可用于传给 yi-agent 的 --api-key 值。
-/// 优先 MODEL_API_KEY,其次 ANTHROPIC_API_KEY / OPENAI_API_KEY。
-fn resolve_api_key() -> Option<String> {
-    std::env::var("MODEL_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-}
-
-/// 从一行 JSONL 提取 AgentEvent 的 variant 名。
-/// serde 对 unit variant(如 Start, Cancelled)序列化为裸字符串 `"Start"`,
-/// 对其他 variant 序列化为 `{"VariantName": ...}` 对象。
-fn event_variant(line: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    if let Some(s) = v.as_str() {
-        // unit variant: "Start" / "Cancelled"
-        return Some(s.to_string());
-    }
-    if let Some(obj) = v.as_object() {
-        return obj.keys().next().cloned();
-    }
-    None
-}
 
 #[test]
 #[ignore]
