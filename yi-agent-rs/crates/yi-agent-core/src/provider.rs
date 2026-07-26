@@ -82,8 +82,9 @@ pub enum ProviderError {
     Stream(String),
 }
 
-/// Accumulate a provider stream into content blocks + stop reason.
+/// Accumulate a provider stream into content blocks, stop reason, and last usage.
 /// `on_event` is called for each provider event (text delta, usage, etc.).
+/// Returns `None` for usage if the stream emitted no `ProviderEvent::Usage`.
 pub async fn accumulate_stream<F>(
     mut stream: BoxStream<'static, ProviderEvent>,
     mut on_event: F,
@@ -385,7 +386,7 @@ mod tests {
 
         let mut received_text = Vec::new();
         let mut received_usage = Vec::new();
-        let (content, stop, _usage) = accumulate_stream(stream, |ev| match ev {
+        let (content, stop, usage) = accumulate_stream(stream, |ev| match ev {
             ProviderEvent::TextDelta(s) => received_text.push(s),
             ProviderEvent::Usage(u) => received_usage.push(u),
             _ => {}
@@ -398,6 +399,14 @@ mod tests {
         assert_eq!(received_text, vec!["hi".to_string()]);
         assert_eq!(received_usage.len(), 1);
         assert_eq!(received_usage[0].input_tokens, 10);
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            })
+        );
     }
 
     #[tokio::test]
@@ -622,9 +631,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, stop, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, stop, usage) = accumulate_stream(stream, |_| {}).await.unwrap();
         assert!(content.is_empty());
         assert_eq!(stop, StopReason::EndTurn);
+        assert!(usage.is_none());
     }
 
     #[tokio::test]
