@@ -47,3 +47,22 @@
   编译没问题,卡住的是测试运行;`target/debug/deps/<test_binary>` 直接跑
   测试二进制可以绕过 cargo 的进程管理,配合 `sample` 定位死锁测试。
 
+## 真实 LLM 测试
+
+- 默认 `cargo test` / `just test` / `just ci` 只跑 mock 测试(wiremock 模拟),
+  不调用真实 LLM API,无需 API key。
+- 真实 LLM 测试用 `#[ignore]` 标记 gate,默认跳过,需手动加 `--ignored`:
+  - provider 层冒烟:`cargo test -p yi-agent-llm --test real_integration -- --ignored`
+  - 端到端(经 `yi-agent run`):`cargo test -p yi-agent --test e2e_real -- --ignored`
+- 推荐用 justfile recipe,无 API key 时自动跳过(exit 0,非失败):
+  - `just test-real-llm`:跑 provider 层
+  - `just test-real-e2e`:跑端到端
+  - `just test-real-all`:两者都跑
+- 真实测试需要环境变量 `ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`。测试代码开头
+  会检查 env var,无 key 时 `eprintln!("skip")` 并 return(双保险,即使误加
+  `--ignored` 也安全跳过)。
+- CI **不跑**真实 LLM 测试(避免成本与密钥泄露),只跑 mock 测试。
+- `yi-agent run` 子命令是端到端测试的载体:非交互式 drain `AgentEvent` 到
+  stdout/stderr,`--json` 切换为 JSONL 供测试断言。详见
+  `docs/plans/2026-07-26-real-llm-testing-design.md`。
+
