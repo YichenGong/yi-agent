@@ -76,22 +76,6 @@ pub fn has_done_event(events: &[serde_json::Value]) -> bool {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn owned_child_timeout_reports_timeout() {
-        let child = Command::new("sh")
-            .args(["-c", "sleep 1"])
-            .spawn()
-            .expect("spawn sleeping child");
-
-        let err = wait_for_child(child, Duration::from_millis(20)).expect_err("should time out");
-        assert!(err.contains("timed out"), "unexpected error: {err}");
-    }
-}
-
 fn wait_for_child(mut child: Child, timeout: Duration) -> Result<Output, String> {
     let started = std::time::Instant::now();
 
@@ -146,4 +130,20 @@ pub fn run_agent_with_timeout(workdir: &Path, prompt: &str) -> Result<Output, St
         .arg("--json")
         .arg(prompt);
     run_command_with_timeout(&mut command, COMPLEX_TIMEOUT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_child_timeout_reports_timeout() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 1"])
+            .spawn()
+            .expect("spawn sleeping child");
+
+        let err = wait_for_child(child, Duration::from_millis(20)).expect_err("should time out");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
 }
