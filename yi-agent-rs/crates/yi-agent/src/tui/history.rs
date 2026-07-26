@@ -139,6 +139,9 @@ impl HistoryState {
 impl HistoryState {
     /// Process an AgentEvent and update the cell list accordingly.
     pub fn push_event(&mut self, event: AgentEvent, width: u16) {
+        let was_scrolled = self.scroll_offset != 0;
+        let lines_before = self.flattened_line_count(width);
+
         match event {
             AgentEvent::Start => {}
             AgentEvent::AssistantText(text) => match self.cells.last_mut() {
@@ -149,11 +152,12 @@ impl HistoryState {
                         .append_assistant_text(&text, width);
                 }
                 _ => {
-                    self.push(HistoryCell::from_assistant_text(&text, width));
+                    self.cells
+                        .push(HistoryCell::from_assistant_text(&text, width));
                 }
             },
             AgentEvent::ToolCall { id, name, input } => {
-                self.push(HistoryCell::ToolCall {
+                self.cells.push(HistoryCell::ToolCall {
                     id,
                     name,
                     input,
@@ -184,7 +188,7 @@ impl HistoryState {
                         }
                     }
                 }
-                self.push(HistoryCell::ToolResult {
+                self.cells.push(HistoryCell::ToolResult {
                     id,
                     result_text,
                     is_error,
@@ -193,27 +197,27 @@ impl HistoryState {
             }
             AgentEvent::Done { reason } => match reason {
                 DoneReason::EndTurn => {
-                    self.push(HistoryCell::Separator { label: None });
+                    self.cells.push(HistoryCell::Separator { label: None });
                 }
                 DoneReason::MaxTurns => {
-                    self.push(HistoryCell::Separator {
+                    self.cells.push(HistoryCell::Separator {
                         label: Some("Max turns".into()),
                     });
                 }
                 DoneReason::Interrupted { reason } => {
-                    self.push(HistoryCell::Separator {
+                    self.cells.push(HistoryCell::Separator {
                         label: Some(format!("Interrupted: {reason}")),
                     });
                 }
             },
             AgentEvent::Usage { .. } => {}
             AgentEvent::Cancelled => {
-                self.push(HistoryCell::Separator {
+                self.cells.push(HistoryCell::Separator {
                     label: Some("Interrupted".into()),
                 });
             }
             AgentEvent::Error(err) => {
-                self.push(HistoryCell::Separator {
+                self.cells.push(HistoryCell::Separator {
                     label: Some(format!("Error: {err}")),
                 });
             }
@@ -225,7 +229,7 @@ impl HistoryState {
                 kind,
             } => {
                 let display = format!("{}: {}", tool_name, tool_input);
-                self.push(HistoryCell::PermissionRequest {
+                self.cells.push(HistoryCell::PermissionRequest {
                     request_id,
                     tool_name,
                     display,
@@ -252,7 +256,8 @@ impl HistoryState {
                         }
                     }
                 }
-                self.push(HistoryCell::PermissionResolved { decision });
+                self.cells
+                    .push(HistoryCell::PermissionResolved { decision });
             }
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
@@ -262,6 +267,13 @@ impl HistoryState {
             | AgentEvent::AutoCompacting { .. } => {
                 // Not tracked in history
             }
+        }
+
+        if was_scrolled {
+            let added_lines = self
+                .flattened_line_count(width)
+                .saturating_sub(lines_before);
+            self.scroll_offset = self.scroll_offset.saturating_add(added_lines);
         }
     }
 }
@@ -411,6 +423,62 @@ mod tests {
             HistoryCell::AssistantMessage { markdown, .. } => assert_eq!(*markdown, "hello world"),
             _ => panic!("expected AssistantMessage"),
         }
+    }
+
+    #[test]
+    fn push_event_new_cell_preserves_non_bottom_reading_position() {
+        let mut s = HistoryState::new();
+        for _ in 0..5 {
+            s.push(HistoryCell::Separator { label: None });
+        }
+        s.scroll_offset = 3;
+
+        s.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            80,
+        );
+
+        assert_eq!(
+            s.scroll_offset, 4,
+            "a one-line new cell should leave the previously visible lines in place"
+        );
+    }
+
+    #[test]
+    fn push_event_new_content_at_bottom_keeps_offset_zero() {
+        let mut s = HistoryState::new();
+
+        s.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            80,
+        );
+
+        assert_eq!(s.scroll_offset, 0);
+    }
+
+    #[test]
+    fn push_event_streaming_text_preserves_non_bottom_position_by_line_delta() {
+        let width = 20;
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("short".into()), width);
+        s.scroll_offset = 2;
+        let before = s.flattened_line_count(width);
+
+        s.push_event(
+            AgentEvent::AssistantText(" text that wraps onto multiple display lines".into()),
+            width,
+        );
+
+        let added_lines = s.flattened_line_count(width).saturating_sub(before);
+        assert!(
+            added_lines > 0,
+            "streaming text should have added display lines"
+        );
+        assert_eq!(s.scroll_offset, 2 + added_lines);
     }
 
     #[test]
