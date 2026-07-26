@@ -152,6 +152,12 @@ pub enum AgentEvent {
     Done {
         reason: DoneReason,
     },
+    /// Auto-compact 完成事件。old_msg_count 是 compact 前的消息数,
+    /// new_msg_count 是 compact 后(含 summary + 保留轮)。
+    AutoCompacting {
+        old_msg_count: usize,
+        new_msg_count: usize,
+    },
     Cancelled,
     Error(AgentError),
     PermissionRequest {
