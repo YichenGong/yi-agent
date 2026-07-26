@@ -1,8 +1,8 @@
-use std::io::stdout;
+use std::io::{self, stdout};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
@@ -45,7 +45,7 @@ pub fn run_tui(
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -66,14 +66,23 @@ pub fn run_tui(
         &model,
     );
 
-    // Always restore terminal state, even on error
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    result
+    // Try every cleanup step so a failed write cannot leave the terminal in another mode.
+    let mut cleanup_error: Option<io::Error> = None;
+    if let Err(error) = execute!(terminal.backend_mut(), DisableBracketedPaste) {
+        cleanup_error.get_or_insert(error);
+    }
+    if let Err(error) = disable_raw_mode() {
+        cleanup_error.get_or_insert(error);
+    }
+    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
+        cleanup_error.get_or_insert(error);
+    }
+
+    match (result, cleanup_error) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Some(error)) => Err(error),
+        (Ok(()), None) => Ok(()),
+    }
 }
 
 /// Event source trait so the loop can be tested with fake events.
