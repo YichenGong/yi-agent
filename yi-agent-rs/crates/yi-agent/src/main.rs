@@ -177,6 +177,10 @@ async fn drain_stream_human<W: std::io::Write, E: std::io::Write>(
                 yi_agent_core::DoneReason::MaxTurns => {
                     let _ = writeln!(err, "[done:{reason:?}]");
                 }
+                yi_agent_core::DoneReason::Interrupted { reason } => {
+                    let _ = writeln!(err, "[interrupted:{reason}]");
+                    exit_code = 1;
+                }
             },
             yi_agent_core::AgentEvent::Cancelled => {
                 let _ = writeln!(err, "[cancelled]");

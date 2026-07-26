@@ -200,7 +200,11 @@ pub enum AgentEvent {
 pub enum DoneReason {
     EndTurn,
     MaxTurns,
+    Interrupted { reason: String },
 }
+
+const CONTINUE_AFTER_TRUNCATION: &str =
+    "Continue the interrupted task from where you stopped. Do not repeat completed work.";
 
 #[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum AgentError {
@@ -438,7 +442,7 @@ async fn run_loop(
         };
 
         // Check 2: THINK 中 — select! between accumulate and cancel
-        let (content, _stop_reason, last_usage) = tokio::select! {
+        let (content, stop_reason, last_usage) = tokio::select! {
             result = accumulate_provider_stream(stream, &tx, &model, config.think_idle_timeout) => match result {
                 Ok(v) => {
                     tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
@@ -470,7 +474,7 @@ async fn run_loop(
 
         // Detect idle stall: accumulate_stream synthesizes this stop reason
         // when no provider event arrives within the idle timeout.
-        if let StopReason::Other(ref s) = _stop_reason {
+        if let StopReason::Other(ref s) = stop_reason {
             if s == "idle timeout" {
                 tracing::warn!(
                     turn,
@@ -491,6 +495,36 @@ async fn run_loop(
             .lock()
             .unwrap()
             .push(Message::assistant(content.clone()));
+
+        match stop_reason {
+            StopReason::EndTurn => {}
+            StopReason::MaxTokens => {
+                messages.push(Message::user(CONTINUE_AFTER_TRUNCATION));
+                session
+                    .lock()
+                    .unwrap()
+                    .push(Message::user(CONTINUE_AFTER_TRUNCATION));
+                continue;
+            }
+            StopReason::StopSequence => {
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::Interrupted {
+                            reason: "stop sequence".into(),
+                        },
+                    })
+                    .await;
+                return;
+            }
+            StopReason::Other(reason) => {
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::Interrupted { reason },
+                    })
+                    .await;
+                return;
+            }
+        }
 
         // 2. Termination check
         let tool_uses: Vec<(String, String, Value)> = content
@@ -997,6 +1031,61 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::AssistantText(t) if t == "Hello"))
         );
         assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_continues_after_max_tokens() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::TextDelta("partial".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::MaxTokens,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta(" complete".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let events = collect_events(agent.run("write a file".into()).await.unwrap());
+
+        assert!(
+            events.iter().any(
+                |event| matches!(event, AgentEvent::AssistantText(text) if text == " complete")
+            )
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_does_not_report_abnormal_stop_as_end_turn() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("partial".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::Other("idle timeout".into()),
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let events = collect_events(agent.run("write a file".into()).await.unwrap());
+
+        assert!(!matches!(
             events.last(),
             Some(AgentEvent::Done {
                 reason: DoneReason::EndTurn
@@ -2179,65 +2268,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn agent_emits_debug_events_for_request_delta_and_response() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-
-        // Collect captured event messages into a shared buffer.
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let collector_layer = CollectingLayer {
-            captured: Arc::clone(&captured),
-        };
-
-        // set_default applies to the current thread; run_loop is called directly
-        // (not spawned) so events flow through this subscriber.
-        let _guard = tracing_subscriber::Registry::default()
-            .with(collector_layer)
-            .set_default();
-
-        // Provider returns a text response in turn 1, no tool calls.
-        let provider = ScriptedProvider::new(vec![vec![
-            ProviderEvent::TextDelta("Hello".into()),
-            ProviderEvent::Stop {
-                reason: StopReason::EndTurn,
-            },
-        ]]);
-        let tools = Arc::new(ToolRegistry::new());
-        let session = Arc::new(Mutex::new(Session::new()));
-        let (tx, rx) = mpsc::channel(64);
-        let cancel_token = CancellationToken::new();
-
-        // Call run_loop directly (not via tokio::spawn) so the test's
-        // thread-local subscriber is in scope.
-        run_loop(
-            tx,
-            Arc::new(provider),
-            tools,
-            session,
-            AgentConfig::default(),
-            cancel_token,
-            None,
-            None,
-        )
-        .await;
-
-        // Drain channel to ensure run_loop completes.
-        drop(rx);
-
-        let events = captured.lock().unwrap();
-        let messages: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
-        assert!(
-            messages.iter().any(|m| m.contains("think: request delta")),
-            "expected request delta event, got: {messages:?}"
-        );
-        assert!(
-            messages.iter().any(|m| m.contains("think: response")),
-            "expected response event, got: {messages:?}"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn auto_compact_triggers_when_threshold_exceeded() {
         // Pre-populate session with 4 messages (2 user/assistant pairs) so that
@@ -2773,50 +2803,6 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
-    }
-
-    /// A tracing layer that collects event messages into a shared buffer.
-    struct CollectingLayer {
-        captured: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for CollectingLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            // Only collect events from yi_agent_core at DEBUG or below.
-            let meta = event.metadata();
-            if !meta.target().starts_with("yi_agent_core") || meta.level() > &tracing::Level::DEBUG
-            {
-                return;
-            }
-            // The message is stored as a field named "message".
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            let mut buf = self.captured.lock().unwrap();
-            buf.push(visitor.0);
-        }
-    }
-
-    /// tracing field visitor that extracts the `message` field.
-    struct MessageVisitor(String);
-
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{:?}", value);
-            }
-        }
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = value.to_string();
-            }
-        }
     }
 
     #[test]

@@ -104,6 +104,7 @@ where
     let mut tool_uses: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut stop_reason = StopReason::EndTurn;
+    let mut received_stop = false;
     let mut last_usage: Option<TokenUsage> = None;
 
     tracing::debug!(
@@ -162,6 +163,7 @@ where
                     "accumulate_stream: received Stop event"
                 );
                 stop_reason = reason;
+                received_stop = true;
             }
             ProviderEvent::Usage(u) => {
                 last_usage = Some(u.clone());
@@ -178,6 +180,12 @@ where
         );
         // Synthesize a stop reason so callers see a terminal signal.
         stop_reason = StopReason::Other("idle timeout".to_string());
+    } else if !received_stop {
+        stop_reason = StopReason::Other("stream ended without stop".to_string());
+        tracing::warn!(
+            event_count,
+            "accumulate_stream: stream ended without Stop event"
+        );
     } else {
         tracing::info!(
             event_count,
@@ -353,6 +361,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_eof_without_stop_is_abnormal() {
+        let stream = futures::stream::iter(vec![text_event("partial")]).boxed();
+
+        let (content, stop_reason, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+
+        assert_eq!(content, vec![ContentBlock::Text("partial".into())]);
+        assert_eq!(
+            stop_reason,
+            StopReason::Other("stream ended without stop".into())
+        );
     }
 
     #[tokio::test]
@@ -679,7 +700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accumulate_stream_empty_yields_default() {
+    async fn accumulate_stream_empty_without_stop_is_abnormal() {
         let provider = MockProvider { events: vec![] };
         let stream = provider
             .call_stream(ProviderRequest {
@@ -693,7 +714,7 @@ mod tests {
             .unwrap();
         let (content, stop, usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert!(content.is_empty());
-        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(stop, StopReason::Other("stream ended without stop".into()));
         assert!(usage.is_none());
     }
 
