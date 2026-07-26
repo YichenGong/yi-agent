@@ -22,10 +22,6 @@ pub struct CostTracker {
 }
 
 impl CostTracker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn record(&mut self, model: &str, usage: &TokenUsage) {
         let m = self.per_model.entry(model.to_string()).or_default();
         m.input += usage.input_tokens as u64;
@@ -89,7 +85,7 @@ mod tests {
 
     #[test]
     fn record_single_model_accumulates() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("claude", &usage(100, 50));
         t.record("claude", &usage(200, 30));
         let m = t.per_model.get("claude").unwrap();
@@ -99,7 +95,7 @@ mod tests {
 
     #[test]
     fn record_multiple_models_separate() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("a", &usage(10, 1));
         t.record("b", &usage(20, 2));
         assert_eq!(t.per_model.len(), 2);
@@ -109,7 +105,7 @@ mod tests {
 
     #[test]
     fn record_increments_calls() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("m", &usage(1, 1));
         t.record("m", &usage(1, 1));
         t.record("m", &usage(1, 1));
@@ -118,7 +114,7 @@ mod tests {
 
     #[test]
     fn record_accumulates_cache_fields() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         let u1 = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
@@ -140,7 +136,7 @@ mod tests {
 
     #[test]
     fn render_empty_shows_no_data() {
-        let t = CostTracker::new();
+        let t = CostTracker::default();
         let s = t.render();
         assert!(s.contains("Token 用量统计"), "should have title: {s}");
         assert!(s.contains("尚无数据"), "empty should show no-data: {s}");
@@ -148,7 +144,7 @@ mod tests {
 
     #[test]
     fn render_single_model_has_header_data_total() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("claude-sonnet-4-5", &usage(12345, 6789));
         let s = t.render();
         assert!(s.contains("input"), "should have header: {s}");
@@ -170,7 +166,7 @@ mod tests {
 
     #[test]
     fn render_multiple_models_sorted() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("zeta", &usage(1, 1));
         t.record("alpha", &usage(2, 2));
         t.record("mid", &usage(3, 3));
@@ -183,7 +179,7 @@ mod tests {
 
     #[test]
     fn render_total_row_sums_all_models() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("a", &usage(100, 10));
         t.record("b", &usage(200, 20));
         let s = t.render();
@@ -193,7 +189,7 @@ mod tests {
 
     #[test]
     fn render_shows_calls_column() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("m", &usage(1, 1));
         t.record("m", &usage(1, 1));
         let s = t.render();
@@ -203,7 +199,7 @@ mod tests {
 
     #[test]
     fn render_two_models_markdown_structure() {
-        let mut t = CostTracker::new();
+        let mut t = CostTracker::default();
         t.record("alpha", &usage(100, 10));
         t.record("beta", &usage(2000, 200));
         let s = t.render();

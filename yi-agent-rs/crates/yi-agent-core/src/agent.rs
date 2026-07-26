@@ -1260,10 +1260,12 @@ mod tests {
     async fn agent_think_stream_stall_emits_terminal_within_timeout() {
         let provider = Arc::new(StallAfterDeltaProvider);
         let tools = Arc::new(ToolRegistry::new());
-        let mut config = AgentConfig::default();
         // Short idle timeout so the test runs fast (the stall is detected
         // quickly instead of waiting for the 60s default).
-        config.think_idle_timeout = Some(std::time::Duration::from_millis(500));
+        let config = AgentConfig {
+            think_idle_timeout: Some(std::time::Duration::from_millis(500)),
+            ..Default::default()
+        };
         let mut agent = Agent::new(provider, tools, config);
 
         let stream = agent.run("hi".into()).await.unwrap();
