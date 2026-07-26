@@ -2,6 +2,20 @@
 
 项目级 Claude Code 指令,会被自动加载到 Claude Code 的上下文。
 
+## 分支与 worktree 规范
+
+- **严禁在 `main` 分支上直接修改代码或提交 commit。** 所有变更——无论代码、
+  文档、配置——都必须先建 worktree、在新分支上改,再合回 `main`。
+- 建 worktree 用 `git worktree add .worktrees/<branch> -b <type>/<name>`,
+  `.worktrees/` 已在 `.gitignore` 中。`<type>` 用 conventional commits
+  前缀(`fix/`、`feat/`、`docs/`、`ci/` 等)。
+- 改完在 worktree 里跑测试 + `cargo fmt --all`,确认通过后再 commit,
+  最后回 `main` 做 `git merge --no-ff <branch>` 合并,合并后删分支 + 移除
+  worktree。流程详见 `superpowers:using-git-worktrees` 和
+  `superpowers:finishing-a-development-branch` skill。
+- 唯一例外:紧急回滚 / hotfix 也走 worktree 流程,不允许在 `main` 上直接
+  `git revert` 或改文件。
+
 ## Commit 规范
 
 - **不要**在 commit message 里写 `Co-Authored-By: Claude ...` 行
