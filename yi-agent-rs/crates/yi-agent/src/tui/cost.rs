@@ -1,9 +1,30 @@
 //! Cumulative per-model token cost tracking for `/cost`.
 
 use std::collections::BTreeMap;
+use unicode_width::UnicodeWidthStr;
 use yi_agent_core::TokenUsage;
 
 use super::statusbar::format_thousands;
+
+/// Pad `s` with leading spaces so its display width equals `width` (right-align).
+fn pad_left(s: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", " ".repeat(width - w), s)
+    }
+}
+
+/// Pad `s` with trailing spaces so its display width equals `width` (left-align).
+fn pad_right(s: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - w))
+    }
+}
 
 /// Per-model accumulated token counters.
 #[derive(Debug, Clone, Default)]
@@ -86,7 +107,7 @@ impl CostTracker {
             .collect();
         for r in &all_rows {
             for (i, cell) in r.iter().enumerate() {
-                widths[i] = widths[i].max(cell.chars().count());
+                widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
             }
         }
 
@@ -95,9 +116,9 @@ impl CostTracker {
         for r in &all_rows {
             for (i, cell) in r.iter().enumerate() {
                 if i == 0 {
-                    out.push_str(&format!("{:<width$}", cell, width = widths[i]));
+                    out.push_str(&pad_right(cell, widths[i]));
                 } else {
-                    out.push_str(&format!("  {:>width$}", cell, width = widths[i]));
+                    out.push_str(&format!("  {}", pad_left(cell, widths[i])));
                 }
             }
             out.push('\n');
@@ -242,5 +263,54 @@ mod tests {
         let s = t.render();
         assert!(s.contains("calls"), "should have calls header: {s}");
         assert!(s.contains("2"), "should show call count 2: {s}");
+    }
+
+    #[test]
+    fn render_two_models_exact_snapshot() {
+        let mut t = CostTracker::new();
+        t.record("alpha", &usage(100, 10));
+        t.record("beta", &usage(2000, 200));
+        let s = t.render();
+        // Verify exact structure: title, header, separator, two model rows, total row = 6 lines.
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(
+            lines.len(),
+            6,
+            "should have 6 lines (title, header, separator, 2 models, total): {s}"
+        );
+        assert_eq!(lines[0], "Token 用量统计:");
+        let header_line = lines[1];
+        assert!(
+            header_line.contains("模型")
+                && header_line.contains("input")
+                && header_line.contains("calls"),
+            "header line: {header_line}"
+        );
+        let sep_line = lines[2];
+        assert!(
+            sep_line.chars().all(|c| c == '─'),
+            "separator line should be all box-drawing chars: {sep_line}"
+        );
+        let alpha_line = lines[3];
+        assert!(
+            alpha_line.contains("alpha") && alpha_line.contains("100"),
+            "alpha row: {alpha_line}"
+        );
+        let beta_line = lines[4];
+        assert!(
+            beta_line.contains("beta") && beta_line.contains("2,000"),
+            "beta row: {beta_line}"
+        );
+        // Total row: 2100 input, 210 output.
+        let total_line = lines[5];
+        assert!(
+            total_line.contains("总计"),
+            "total row should contain 总计: {total_line}"
+        );
+        assert!(
+            total_line.contains("2,100"),
+            "total input 2,100: {total_line}"
+        );
+        assert!(total_line.contains("210"), "total output 210: {total_line}");
     }
 }
