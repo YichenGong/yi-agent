@@ -151,3 +151,59 @@ fn complex_data_transformation() {
     assert!(upper.contains("BOB"), "missing BOB: {content}");
     assert!(upper.contains("CHARLIE"), "missing CHARLIE: {content}");
 }
+
+const PROMPT_BUGFIX: &str = "The file buggy.py contains a Python function with a bug. Read it, identify the bug, fix it, and write the fixed version to output/fixed.py. Do not just copy the original — fix the bug.";
+
+#[test]
+#[ignore]
+fn complex_bug_fix() {
+    if !skip_if_no_key() {
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("output")).expect("create output dir");
+    std::fs::write(
+        tmp.path().join("buggy.py"),
+        "def add(a, b):\n    return a - b   # BUG: should be +\n\nif __name__ == \"__main__\":\n    print(add(2, 3))\n",
+    )
+    .expect("write buggy.py");
+
+    let output = Command::new(yi_agent_bin())
+        .arg("--workdir")
+        .arg(tmp.path())
+        .arg("run")
+        .arg("--json")
+        .arg(PROMPT_BUGFIX)
+        .output()
+        .expect("failed to spawn yi-agent");
+
+    assert!(
+        output.status.success(),
+        "yi-agent run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let events = parse_events(&stdout);
+    assert!(has_done_event(&events), "no Done event, stdout: {stdout}");
+
+    // 结构性断言
+    let fixed_path = tmp.path().join("output/fixed.py");
+    assert!(fixed_path.exists(), "fixed.py not created");
+    let fixed = std::fs::read_to_string(&fixed_path).expect("read fixed.py");
+    assert!(
+        fixed.len() > 50,
+        "fixed.py too small: {} bytes",
+        fixed.len()
+    );
+    assert!(fixed.contains("def add"), "missing def add");
+    assert!(
+        fixed.contains('+'),
+        "missing + (fix should contain addition)"
+    );
+    assert!(
+        !fixed.contains("return a - b"),
+        "original bug line 'return a - b' should be replaced"
+    );
+}
