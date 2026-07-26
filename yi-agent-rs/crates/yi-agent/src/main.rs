@@ -575,7 +575,11 @@ pub(crate) enum ControlCommand {
 /// the end so the model knows today's date; placed at the tail to avoid
 /// disrupting the cached prefix of the prompt.
 fn resolve_system_prompt(user: Option<String>) -> Option<String> {
-    let base = user.unwrap_or_else(yi_agent_core::AgentConfig::default_system_prompt);
+    let mut base = yi_agent_core::AgentConfig::default_system_prompt();
+    if let Some(user) = user {
+        base.push_str("\n\nUser-provided instructions:\n");
+        base.push_str(&user);
+    }
     let today = chrono::Local::now().format("%Y-%m-%d");
     Some(format!("{base}\n\nCurrent date: {today}"))
 }
@@ -699,14 +703,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_system_prompt_custom_overrides_default() {
+    fn resolve_system_prompt_custom_keeps_base_instructions() {
         let resolved = resolve_system_prompt(Some("custom".into()));
+        let default = yi_agent_core::AgentConfig::default_system_prompt();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(
-            resolved
-                .as_deref()
-                .is_some_and(|r| r.starts_with("custom") && r.ends_with(&today)),
-            "resolved should start with custom prompt and end with today's date: {resolved:?}"
+            resolved.as_deref().is_some_and(|r| r.starts_with(&default)
+                && r.contains("User-provided instructions:\ncustom")
+                && r.ends_with(&today)),
+            "resolved should retain base instructions, append custom prompt, and end with date: {resolved:?}"
         );
     }
 
