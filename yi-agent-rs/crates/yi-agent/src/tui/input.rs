@@ -88,6 +88,8 @@ impl InputLine {
         self.cursor += c.len_utf8();
     }
 
+    // Task 2 will wire bracketed paste into event routing.
+    #[allow(dead_code)]
     pub fn insert_str(&mut self, text: &str) {
         self.buffer.insert_str(self.cursor, text);
         self.cursor += text.len();
@@ -278,6 +280,24 @@ mod tests {
         inp.insert_str("\nworld");
         assert_eq!(inp.buffer, "你\nworld好");
         assert_eq!(inp.cursor, "你\nworld".len());
+    }
+
+    #[test]
+    fn insert_str_advances_by_utf8_payload_length() {
+        let mut inp = InputLine::new();
+        inp.buffer = "你好".into();
+        inp.cursor = "你".len();
+        inp.insert_str("\n世界");
+        assert_eq!(inp.buffer, "你\n世界好");
+        assert_eq!(inp.cursor, "你\n世界".len());
+    }
+
+    #[test]
+    fn insert_str_into_empty_buffer_tracks_utf8_length() {
+        let mut inp = InputLine::new();
+        inp.insert_str("粘贴");
+        assert_eq!(inp.buffer, "粘贴");
+        assert_eq!(inp.cursor, "粘贴".len());
     }
 
     #[test]
