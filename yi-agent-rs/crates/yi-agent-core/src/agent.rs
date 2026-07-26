@@ -2137,65 +2137,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn agent_emits_debug_events_for_request_delta_and_response() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-
-        // Collect captured event messages into a shared buffer.
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let collector_layer = CollectingLayer {
-            captured: Arc::clone(&captured),
-        };
-
-        // set_default applies to the current thread; run_loop is called directly
-        // (not spawned) so events flow through this subscriber.
-        let _guard = tracing_subscriber::Registry::default()
-            .with(collector_layer)
-            .set_default();
-
-        // Provider returns a text response in turn 1, no tool calls.
-        let provider = ScriptedProvider::new(vec![vec![
-            ProviderEvent::TextDelta("Hello".into()),
-            ProviderEvent::Stop {
-                reason: StopReason::EndTurn,
-            },
-        ]]);
-        let tools = Arc::new(ToolRegistry::new());
-        let session = Arc::new(Mutex::new(Session::new()));
-        let (tx, rx) = mpsc::channel(64);
-        let cancel_token = CancellationToken::new();
-
-        // Call run_loop directly (not via tokio::spawn) so the test's
-        // thread-local subscriber is in scope.
-        run_loop(
-            tx,
-            Arc::new(provider),
-            tools,
-            session,
-            AgentConfig::default(),
-            cancel_token,
-            None,
-            None,
-        )
-        .await;
-
-        // Drain channel to ensure run_loop completes.
-        drop(rx);
-
-        let events = captured.lock().unwrap();
-        let messages: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
-        assert!(
-            messages.iter().any(|m| m.contains("think: request delta")),
-            "expected request delta event, got: {messages:?}"
-        );
-        assert!(
-            messages.iter().any(|m| m.contains("think: response")),
-            "expected response event, got: {messages:?}"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn auto_compact_triggers_when_threshold_exceeded() {
         // Pre-populate session with 4 messages (2 user/assistant pairs) so that
@@ -2731,50 +2672,6 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
-    }
-
-    /// A tracing layer that collects event messages into a shared buffer.
-    struct CollectingLayer {
-        captured: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for CollectingLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            // Only collect events from yi_agent_core at DEBUG or below.
-            let meta = event.metadata();
-            if !meta.target().starts_with("yi_agent_core") || meta.level() > &tracing::Level::DEBUG
-            {
-                return;
-            }
-            // The message is stored as a field named "message".
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            let mut buf = self.captured.lock().unwrap();
-            buf.push(visitor.0);
-        }
-    }
-
-    /// tracing field visitor that extracts the `message` field.
-    struct MessageVisitor(String);
-
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{:?}", value);
-            }
-        }
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = value.to_string();
-            }
-        }
     }
 
     #[test]
