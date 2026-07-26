@@ -346,18 +346,106 @@ pub fn load(cli: &Cli) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
 
     /// 测试用互斥锁:涉及环境变量的测试必须串行执行,避免并行干扰。
     static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    struct EnvVarGuard {
+        original: BTreeMap<&'static str, Option<OsString>>,
+    }
+
+    impl EnvVarGuard {
+        fn new(names: impl IntoIterator<Item = &'static str>) -> Self {
+            let original = names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            Self { original }
+        }
+
+        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            self.original
+                .entry(name)
+                .or_insert_with(|| std::env::var_os(name));
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+
+        fn remove(&mut self, name: &'static str) {
+            self.original
+                .entry(name)
+                .or_insert_with(|| std::env::var_os(name));
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.original {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> Self {
+            let original = std::env::current_dir().expect("read current directory");
+            std::env::set_current_dir(path).expect("change current directory");
+            Self(original)
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    #[test]
+    fn env_var_guard_restores_host_value() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var("YI_AGENT_TEST_GUARD", "host-value");
+        }
+
+        {
+            let mut env = EnvVarGuard::new(["YI_AGENT_TEST_GUARD"]);
+            env.remove("YI_AGENT_TEST_GUARD");
+            assert!(std::env::var("YI_AGENT_TEST_GUARD").is_err());
+        }
+
+        assert_eq!(
+            std::env::var("YI_AGENT_TEST_GUARD").as_deref(),
+            Ok("host-value")
+        );
+        unsafe {
+            std::env::remove_var("YI_AGENT_TEST_GUARD");
+        }
+    }
+
     #[test]
     fn load_requires_api_key() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
-        // 清除环境变量确保测试隔离（Rust 2024: remove_var is unsafe）
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-            std::env::remove_var("MODEL_API_URL");
-        }
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["MODEL_API_KEY", "MODEL_API_URL"]);
+        env.remove("MODEL_API_KEY");
+        env.remove("MODEL_API_URL");
+        let temp = tempfile::TempDir::new().expect("tempdir");
         let cli = Cli {
             command: None,
             provider: None,
@@ -365,7 +453,9 @@ mod tests {
             api_key: None,
             model: None,
             max_turns: None,
-            workdir: None,
+            // An explicit empty workdir prevents fallback loading of a local
+            // or global .yi-agent/.env file.
+            workdir: Some(temp.path().to_path_buf()),
             system_prompt: None,
             model_context_length: None,
             compact_ratio: None,
@@ -580,7 +670,11 @@ mod tests {
 
     #[test]
     fn load_reads_dotenv_file() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
+        env.remove("MODEL_API_KEY");
         // 创建临时目录和 .yi-agent/.env 文件
         let temp_dir = std::env::temp_dir().join(".env_test_dotenv_dir");
         let yi_agent_dir = temp_dir.join(".yi-agent");
@@ -608,10 +702,6 @@ mod tests {
         let config = load(&cli).unwrap();
         assert_eq!(config.api_key, "from-dotenv-file");
 
-        // 清理
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
@@ -640,10 +730,11 @@ mod tests {
 
     #[test]
     fn resolve_env_path_uses_yi_agent_subdir_for_env_var() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("YI_AGENT_WORKDIR", "/tmp/my-env-dir");
-        }
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
+        env.set("YI_AGENT_WORKDIR", "/tmp/my-env-dir");
         let cli = Cli {
             command: None,
             provider: None,
@@ -663,14 +754,14 @@ mod tests {
         };
         let path = resolve_env_path(&cli);
         assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
-        unsafe {
-            std::env::remove_var("YI_AGENT_WORKDIR");
-        }
     }
 
     #[test]
     fn load_env_files_loads_global_when_no_local() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
         // local 不存在,global 存在 → 应该加载 global
         let temp = std::env::temp_dir().join(".env_test_global_only");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -678,22 +769,20 @@ mod tests {
         std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
         std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
 
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
+        env.remove("MODEL_API_KEY");
         load_env_files(&local_path, Some(&global_path));
 
         assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-global");
 
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn load_env_files_local_overrides_global() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
         // local 和 global 都存在 → local 覆盖 global
         let temp = std::env::temp_dir().join(".env_test_local_overrides");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -703,22 +792,20 @@ mod tests {
         std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
         std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
 
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
+        env.remove("MODEL_API_KEY");
         load_env_files(&local_path, Some(&global_path));
 
         assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-local");
 
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn load_env_files_skips_global_when_none() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
         // global_path = None → 不加载 global(显式指定 --workdir 的场景)
         let temp = std::env::temp_dir().join(".env_test_no_global");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -728,22 +815,20 @@ mod tests {
         std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
         std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
 
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
+        env.remove("MODEL_API_KEY");
         load_env_files(&local_path, None);
 
         assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-local");
 
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn load_env_files_real_env_overrides_all() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
         // 真实环境变量 > local > global
         let temp = std::env::temp_dir().join(".env_test_real_env");
         let local_path = temp.join("local/.yi-agent/.env");
@@ -753,16 +838,11 @@ mod tests {
         std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
         std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
 
-        unsafe {
-            std::env::set_var("MODEL_API_KEY", "from-real-env");
-        }
+        env.set("MODEL_API_KEY", "from-real-env");
         load_env_files(&local_path, Some(&global_path));
 
         assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-real-env");
 
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
@@ -791,7 +871,9 @@ mod tests {
 
     #[test]
     fn load_creates_local_yi_agent_dir_in_fallback_mode() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // fallback 模式下,当前目录的 .yi-agent/ 不存在时应自动创建
         let temp = std::env::temp_dir().join(".env_test_auto_create_local");
         std::fs::create_dir_all(&temp).unwrap();
@@ -799,14 +881,12 @@ mod tests {
         assert!(!yi_agent_dir.exists());
 
         // 临时切换 current_dir 到 temp
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&temp).unwrap();
+        let _cwd = CurrentDirGuard::change_to(&temp);
 
         // 清除可能干扰的环境变量
-        unsafe {
-            std::env::remove_var("YI_AGENT_WORKDIR");
-            std::env::remove_var("MODEL_API_KEY");
-        }
+        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR", "MODEL_API_KEY"]);
+        env.remove("YI_AGENT_WORKDIR");
+        env.remove("MODEL_API_KEY");
 
         let cli = Cli {
             command: None,
@@ -828,25 +908,19 @@ mod tests {
         let result = load(&cli);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
 
-        // 恢复 current_dir
-        std::env::set_current_dir(&original).unwrap();
-
         // 验证 .yi-agent/ 目录已创建
         assert!(yi_agent_dir.is_dir(), ".yi-agent/ should be auto-created");
-
-        unsafe {
-            std::env::remove_var("MODEL_API_KEY");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn load_falls_back_to_current_dir_when_workdir_env_empty() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
         // 设置空字符串环境变量,应该 fallback 到 current_dir 而非变成空路径
-        unsafe {
-            std::env::set_var("YI_AGENT_WORKDIR", "");
-        }
+        env.set("YI_AGENT_WORKDIR", "");
         let cli = Cli {
             command: None,
             provider: None,
@@ -870,9 +944,6 @@ mod tests {
             "workdir should be a valid absolute path (current_dir fallback), got: {}",
             config.workdir.display()
         );
-        unsafe {
-            std::env::remove_var("YI_AGENT_WORKDIR");
-        }
     }
 
     #[test]
@@ -946,25 +1017,24 @@ mod tests {
 
     #[test]
     fn yolo_env_var_enables_yolo() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("YI_AGENT_YOLO", "true");
-        }
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_YOLO"]);
+        env.set("YI_AGENT_YOLO", "true");
         let yolo = std::env::var("YI_AGENT_YOLO")
             .map(|v| v == "true")
             .unwrap_or(false);
         assert!(yolo);
-        unsafe {
-            std::env::remove_var("YI_AGENT_YOLO");
-        }
     }
 
     #[test]
     fn yolo_env_var_false_by_default() {
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("YI_AGENT_YOLO");
-        }
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_YOLO"]);
+        env.remove("YI_AGENT_YOLO");
         let yolo = std::env::var("YI_AGENT_YOLO")
             .map(|v| v == "true")
             .unwrap_or(false);

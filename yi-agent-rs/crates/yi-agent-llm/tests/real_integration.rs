@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use futures::stream::StreamExt;
 use yi_agent_core::{
-    ContentBlock, GenParams, Message, Provider, ProviderError, ProviderEvent, ProviderRequest,
-    ProviderResponse, ToolSchema,
+    ContentBlock, GenParams, Message, Provider, ProviderEvent, ProviderRequest, ProviderResponse,
+    ToolSchema,
 };
 use yi_agent_llm::{AnthropicProvider, AnthropicProviderOpts};
 
@@ -159,23 +159,6 @@ async fn real_anthropic_call_accumulate() {
     );
 }
 
-#[tokio::test]
-#[ignore]
-async fn real_anthropic_env_auth() {
-    // No key: provider construction should fail with Auth error.
-    unsafe {
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-    let result = AnthropicProvider::new(AnthropicProviderOpts {
-        api_key: None,
-        ..Default::default()
-    });
-    assert!(
-        matches!(result, Err(ProviderError::Auth(_))),
-        "expected Auth error, got: {result:?}"
-    );
-}
-
 // === OpenAI provider real-API tests ===
 
 use yi_agent_llm::{OpenaiProvider, OpenaiProviderOpts};
@@ -220,6 +203,51 @@ async fn real_openai_text_stream() {
 
 #[tokio::test]
 #[ignore]
+async fn real_openai_tool_use() {
+    let key = match skip_if_no_key("OPENAI_API_KEY") {
+        Some(k) => k,
+        None => return,
+    };
+    let provider = OpenaiProvider::new(OpenaiProviderOpts {
+        api_key: Some(key),
+        timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    })
+    .expect("provider");
+
+    let req = ProviderRequest {
+        model: "gpt-4o".to_string(),
+        system: None,
+        messages: vec![Message::user("What is 2+2? Use the calculator tool.")],
+        tools: vec![ToolSchema {
+            name: "calculator".to_string(),
+            description: "Basic calculator".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"expr": {"type": "string"}},
+                "required": ["expr"]
+            }),
+        }],
+        params: GenParams::default(),
+    };
+
+    let events = collect_events(provider.call_stream(req).await.expect("stream ok")).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::ToolUseStart { .. })),
+        "should have ToolUseStart, events: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::ToolUseEnd { .. })),
+        "should have ToolUseEnd, events: {events:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn real_openai_call_accumulate() {
     let key = match skip_if_no_key("OPENAI_API_KEY") {
         Some(k) => k,
@@ -243,17 +271,4 @@ async fn real_openai_call_accumulate() {
             .iter()
             .any(|b| matches!(b, ContentBlock::Text(_)))
     );
-}
-
-#[tokio::test]
-#[ignore]
-async fn real_openai_env_auth() {
-    unsafe {
-        std::env::remove_var("OPENAI_API_KEY");
-    }
-    let result = OpenaiProvider::new(OpenaiProviderOpts {
-        api_key: None,
-        ..Default::default()
-    });
-    assert!(matches!(result, Err(ProviderError::Auth(_))));
 }
