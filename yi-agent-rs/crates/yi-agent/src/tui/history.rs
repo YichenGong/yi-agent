@@ -71,6 +71,13 @@ impl HistoryState {
         total.saturating_sub(visible_height as usize)
     }
 
+    /// Clamp the stored offset to the current viewport after a resize.
+    pub fn reconcile_scroll_offset(&mut self, width: u16, visible_height: u16) {
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.max_scroll_offset(width, visible_height));
+    }
+
     /// Move selection up by one cell.
     pub fn select_up(&mut self) {
         match self.selected {
@@ -916,5 +923,18 @@ mod tests {
         assert_eq!(max, 0, "max should be 0 when content < viewport");
         s.scroll_up(5, max);
         assert_eq!(s.scroll_offset, 0, "offset should stay 0");
+    }
+
+    #[test]
+    fn reconcile_scroll_offset_keeps_bottom_after_resize_then_append() {
+        let width = 80;
+        let mut s = HistoryState::new();
+        s.push(HistoryCell::Separator { label: None }, width);
+        s.scroll_offset = 1;
+
+        s.reconcile_scroll_offset(width, 10);
+        s.push(HistoryCell::Separator { label: None }, width);
+
+        assert_eq!(s.scroll_offset, 0);
     }
 }

@@ -187,8 +187,16 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut bash_popup: BashPopup = BashPopup::None;
 
     loop {
+        let size = terminal.size()?;
+        let width = size.width;
+        let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
+        let queued_height = queued_lines.len() as u16;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        let pre_drain_layout = compute_layout(area, input, pending_quit, &popup, queued_height);
+        let history_area = pre_drain_layout.chunks[0];
+        history.reconcile_scroll_offset(history_area.width, history_area.height);
+
         // Drain all pending agent events
-        let width = terminal.size()?.width;
         while let Ok(event) = agent_rx.try_recv() {
             let is_turn_end = matches!(
                 event,
@@ -200,11 +208,11 @@ fn run_loop<B: Backend, E: EventSource>(
                 &mut cost_tracker,
                 &event,
             );
-            history.push_event(event, width);
+            history.push_event(event, history_area.width);
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
                 if let Some(text) = queued.pop_front() {
-                    history.push(HistoryCell::UserMessage { text }, width);
+                    history.push(HistoryCell::UserMessage { text }, history_area.width);
                 }
             }
         }
