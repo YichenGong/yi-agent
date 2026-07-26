@@ -70,9 +70,24 @@ test-real-e2e:
     fi
     cargo test -p yi-agent --test e2e_real -- --ignored
 
-# 跑所有真实 LLM 测试
-test-real-all: test-real-llm test-real-e2e
-    @echo "Real LLM tests passed"
+# 跑复杂 one-shot 任务测试(Tier 3)
+# 配置源:yi-agent-rs/.env(优先,强制覆盖 shell 环境变量)
+test-real-complex:
+    #!/usr/bin/env bash
+    set -e
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
+    if [ -f .env ]; then
+        set -a; . ./.env; set +a
+    fi
+    if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$MODEL_API_KEY" ]; then
+        echo "skip: no API key set (.env)"
+        exit 0
+    fi
+    cargo test -p yi-agent --test e2e_complex -- --ignored
+
+# 跑所有真实 LLM 测试(Tier 1 + 2 + 3)
+test-real-all: test-real-llm test-real-e2e test-real-complex
+    @echo "All real LLM tests passed"
 
 # === Release ===
 

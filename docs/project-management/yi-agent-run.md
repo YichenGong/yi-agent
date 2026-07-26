@@ -29,3 +29,4 @@
 - [x] `--naked` 裸模型模式 — `main.rs` naked 分支跳过工具/skills/系统提示词 — [设计](../plans/2026-07-26-run-naked-flag-design.md)
 - [x] 配置层级合并 — `config.rs::load_env_files()` 本地覆盖全局 — [设计](../plans/2026-07-25-config-layering-design.md)
 - [x] 真实 LLM 端到端测试 — `crates/yi-agent/tests/e2e_real.rs` 用 `#[ignore]` gate — [设计](../plans/2026-07-26-real-llm-testing-design.md)
+- [x] 复杂 one-shot 任务测试(Tier 3)— `crates/yi-agent/tests/e2e_complex.rs` 4 个场景 — [设计](../plans/2026-07-26-graded-test-system-design.md)
