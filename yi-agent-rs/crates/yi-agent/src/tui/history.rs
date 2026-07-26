@@ -44,6 +44,31 @@ impl HistoryState {
         self.cells.iter().map(|c| c.line_count(width)).sum()
     }
 
+    /// Number of display lines including the blank spacer inserted after
+    /// each `UserMessage` cell (except the last). This matches the line count
+    /// used by `HistoryView::flattened_lines` / `render`.
+    pub fn flattened_line_count(&self, width: u16) -> usize {
+        let n = self.cells.len();
+        let mut count = 0usize;
+        for (i, cell) in self.cells.iter().enumerate() {
+            count += cell.line_count(width);
+            if matches!(cell, HistoryCell::UserMessage { .. }) && i + 1 < n {
+                count += 1; // spacer line
+            }
+        }
+        count
+    }
+
+    /// Maximum meaningful `scroll_offset` for the current content at the given
+    /// width and viewport height. Scrolling beyond this would leave blank rows
+    /// at the bottom of the viewport, so `scroll_up` clamps to this value.
+    ///
+    /// Returns 0 when the content fits entirely within the viewport.
+    pub fn max_scroll_offset(&self, width: u16, visible_height: u16) -> usize {
+        let total = self.flattened_line_count(width);
+        total.saturating_sub(visible_height as usize)
+    }
+
     /// Move selection up by one cell.
     pub fn select_up(&mut self) {
         match self.selected {
@@ -71,9 +96,11 @@ impl HistoryState {
         }
     }
 
-    /// Scroll up by `n` lines.
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_add(n);
+    /// Scroll up by `n` lines, clamped to `max_offset` so the viewport never
+    /// scrolls past the top of the content (which would leave blank rows at
+    /// the bottom). Callers should pass `max_scroll_offset(width, height)`.
+    pub fn scroll_up(&mut self, n: usize, max_offset: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(n).min(max_offset);
     }
 
     /// Scroll down by `n` lines.
@@ -273,8 +300,17 @@ impl<'a> Widget for HistoryView<'a> {
 
         let visible_height = area.height as usize;
         let total = all_lines.len();
-        let start = total.saturating_sub(visible_height + self.state.scroll_offset);
-        let end = total.saturating_sub(self.state.scroll_offset).min(total);
+        // Clamp the scroll offset defensively: even if the state's
+        // `scroll_offset` is larger than the maximum (e.g. content was
+        // removed after scrolling, or the caller didn't clamp), the render
+        // must still fill the whole viewport without leaving stale blank
+        // rows at the bottom.
+        let effective_offset = self
+            .state
+            .scroll_offset
+            .min(total.saturating_sub(visible_height));
+        let start = total.saturating_sub(visible_height + effective_offset);
+        let end = (start + visible_height).min(total);
         let visible = &all_lines[start..end];
 
         for (row, (cell_idx, line)) in visible.iter().enumerate() {
@@ -306,7 +342,7 @@ mod tests {
     #[test]
     fn push_resets_scroll_to_bottom() {
         let mut s = HistoryState::new();
-        s.scroll_up(5);
+        s.scroll_up(5, 1000);
         s.push(HistoryCell::UserMessage { text: "x".into() });
         assert_eq!(s.scroll_offset, 0);
     }
@@ -594,5 +630,80 @@ mod tests {
             })
             .count();
         assert_eq!(spacers, 0, "no spacers between assistant/separator cells");
+    }
+
+    #[test]
+    fn render_over_scrolled_fills_viewport_without_gaps() {
+        // Regression: when scroll_offset exceeds total - visible_height, the
+        // render slice shrank below visible_height, leaving stale blank rows
+        // at the bottom of the history area.
+        let mut s = HistoryState::new();
+        // 5 separator lines (no spacers inserted between non-UserMessage
+        // cells), viewport height 3 → max useful offset is 2.
+        for c in ['a', 'b', 'c', 'd', 'e'] {
+            s.push(HistoryCell::Separator {
+                label: Some(c.to_string()),
+            });
+        }
+        // Over-scroll past the maximum.
+        s.scroll_offset = 10;
+
+        let view = HistoryView {
+            state: &s,
+            width: 80,
+        };
+        let area = Rect::new(0, 0, 80, 3);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        // Every row in the viewport should have been written by the render
+        // (i.e. not left as the default empty ' ' cell with default style).
+        // With over-scroll clamped to 2, rows 0..3 should show the top of
+        // the content (separators "a", "b", "c"), not blanks.
+        for y in 0..3u16 {
+            let cell = &buf[(0, y)];
+            let sym = cell.symbol();
+            assert!(
+                !sym.is_empty() && sym != " ",
+                "row {y} should not be blank, got {sym:?}"
+            );
+        }
+        // Sanity: the top row should contain the label 'a'.
+        let top: String = (0..80u16).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(top.contains('a'), "top row should show label 'a': {top:?}");
+    }
+
+    #[test]
+    fn scroll_up_clamps_at_max_offset() {
+        // 5 content lines (no spacers since these are not UserMessages),
+        // viewport height 3 → max offset = 2.
+        let mut s = HistoryState::new();
+        for c in ['a', 'b', 'c', 'd', 'e'] {
+            s.push(HistoryCell::Separator {
+                label: Some(c.to_string()),
+            });
+        }
+        // total = 5, visible_height = 3 → max = 2
+        let max = s.max_scroll_offset(80, 3);
+        assert_eq!(max, 2, "max should be total - visible_height = 5 - 3");
+
+        // Scrolling up by 100 should clamp to 2, not 100.
+        s.scroll_up(100, max);
+        assert_eq!(s.scroll_offset, 2, "scroll_up should clamp at max");
+
+        // Further scroll_up stays at max.
+        s.scroll_up(10, max);
+        assert_eq!(s.scroll_offset, 2, "clamped offset should not grow");
+    }
+
+    #[test]
+    fn scroll_up_zero_max_keeps_offset_zero() {
+        // Content shorter than viewport → max offset = 0, scrolling does nothing.
+        let mut s = HistoryState::new();
+        s.push(HistoryCell::UserMessage { text: "x".into() });
+        let max = s.max_scroll_offset(80, 10);
+        assert_eq!(max, 0, "max should be 0 when content < viewport");
+        s.scroll_up(5, max);
+        assert_eq!(s.scroll_offset, 0, "offset should stay 0");
     }
 }
