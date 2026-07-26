@@ -245,14 +245,30 @@ pub struct HistoryView<'a> {
     pub width: u16,
 }
 
-impl<'a> Widget for HistoryView<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl<'a> HistoryView<'a> {
+    /// Flatten all cells into display lines, inserting a blank spacer line
+    /// after each `UserMessage` cell (unless it is the last cell) to
+    /// visually separate user input from the system reply.
+    fn flattened_lines(&self) -> Vec<(usize, ratatui::text::Line<'static>)> {
+        let n = self.state.cells.len();
         let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
         for (i, cell) in self.state.cells.iter().enumerate() {
             for line in cell.lines(self.width) {
                 all_lines.push((i, line));
             }
+            // Insert a blank spacer line after user messages (except the last
+            // cell) to visually separate user input from the system reply.
+            if matches!(cell, HistoryCell::UserMessage { .. }) && i + 1 < n {
+                all_lines.push((i, ratatui::text::Line::raw("")));
+            }
         }
+        all_lines
+    }
+}
+
+impl<'a> Widget for HistoryView<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let all_lines = self.flattened_lines();
 
         let visible_height = area.height as usize;
         let total = all_lines.len();
@@ -502,5 +518,80 @@ mod tests {
             80,
         );
         assert!(s.pending_permission_info().is_none());
+    }
+
+    #[test]
+    fn flattened_lines_inserts_spacer_after_user_message() {
+        let mut s = HistoryState::new();
+        s.push(HistoryCell::UserMessage {
+            text: "hello".into(),
+        });
+        s.push_event(AgentEvent::AssistantText("hi there".into()), 80);
+
+        let view = HistoryView {
+            state: &s,
+            width: 80,
+        };
+        let lines = view.flattened_lines();
+
+        // UserMessage = 1 line, spacer = 1 line, AssistantMessage >= 1 line
+        assert!(
+            lines.len() >= 3,
+            "expected spacer between user and assistant, got {} lines",
+            lines.len()
+        );
+
+        // The spacer line should be the second line (index 1), belonging to
+        // cell index 0 (the UserMessage).
+        assert_eq!(lines[1].0, 0, "spacer should be attributed to user cell");
+        assert!(lines[1].1.spans.is_empty(), "spacer line should be empty");
+    }
+
+    #[test]
+    fn flattened_lines_no_spacer_after_last_cell() {
+        let mut s = HistoryState::new();
+        s.push(HistoryCell::UserMessage {
+            text: "orphan message".into(),
+        });
+
+        let view = HistoryView {
+            state: &s,
+            width: 80,
+        };
+        let lines = view.flattened_lines();
+
+        // Only the user message line, no trailing spacer.
+        assert_eq!(
+            lines.len(),
+            1,
+            "no spacer after last cell, got {} lines",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn flattened_lines_no_spacer_between_assistant_cells() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("part1".into()), 80);
+        // Force a new AssistantMessage cell by inserting a Separator first.
+        s.push(HistoryCell::Separator { label: None });
+        s.push_event(AgentEvent::AssistantText("part2".into()), 80);
+
+        let view = HistoryView {
+            state: &s,
+            width: 80,
+        };
+        let lines = view.flattened_lines();
+
+        // No spacer should be inserted between non-UserMessage cells.
+        // Count empty lines attributed to non-user cells — should be zero.
+        let spacers = lines
+            .iter()
+            .filter(|(idx, l)| {
+                l.spans.is_empty()
+                    && !matches!(s.cells.get(*idx), Some(HistoryCell::UserMessage { .. }))
+            })
+            .count();
+        assert_eq!(spacers, 0, "no spacers between assistant/separator cells");
     }
 }
