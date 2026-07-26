@@ -1,5 +1,9 @@
 //! End-to-end tests calling `yi-agent run` with a real LLM.
 //! All tests are #[ignore]'d; run with: cargo test -p yi-agent --test e2e_real -- --ignored
+//!
+//! 配置源:父进程的环境变量(由 justfile recipe 从 .env 加载,或手动 export)。
+//! 测试不硬编码 provider/key,而是透传父进程 env 给子进程,
+//! 让 config 层按 YI_AGENT_PROVIDER / MODEL_API_KEY / ANTHROPIC_API_KEY 等解析。
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,17 +17,51 @@ fn yi_agent_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("target/debug/yi-agent"))
 }
 
+/// 检查是否有任何可用的 API key 配置(provider 层或 config 层)。
+/// 有 key 才跑真实测试;无 key 则 skip。
+fn has_api_key() -> bool {
+    let has_provider_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let has_config_key = std::env::var("MODEL_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    has_provider_key || has_config_key
+}
+
+/// 从一行 JSONL 提取 AgentEvent 的 variant 名。
+/// serde 对 unit variant(如 Start, Cancelled)序列化为裸字符串 `"Start"`,
+/// 对其他 variant 序列化为 `{"VariantName": ...}` 对象。
+fn event_variant(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if let Some(s) = v.as_str() {
+        // unit variant: "Start" / "Cancelled"
+        return Some(s.to_string());
+    }
+    if let Some(obj) = v.as_object() {
+        return obj.keys().next().cloned();
+    }
+    None
+}
+
 #[test]
 #[ignore]
 fn e2e_error_no_api_key() {
-    // No API key in env: yi-agent run should fail with non-zero exit and
-    // an auth/provider error message on stderr.
+    // 无 API key 时 yi-agent run 应以非零退出码失败,stderr 含错误信息。
+    // 用空 tempdir 作 workdir,避免加载 ~/.yi-agent/.env 或 ./.yi-agent/.env。
+    let tmp = tempfile::TempDir::new().expect("tempdir");
     let output = Command::new(yi_agent_bin())
         .arg("run")
+        .arg("--workdir")
+        .arg(tmp.path())
         .arg("hi")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("MODEL_API_KEY")
+        .env_remove("MODEL_API_URL")
+        .env_remove("YI_AGENT_PROVIDER")
+        .env_remove("YI_AGENT_MODEL")
         .output()
         .expect("failed to spawn yi-agent");
 
@@ -40,21 +78,15 @@ fn e2e_error_no_api_key() {
 #[test]
 #[ignore]
 fn e2e_simple_text_response() {
-    // Smoke test: real LLM returns text, JSONL contains AssistantText + Done.
-    let api_key =
-        match std::env::var("ANTHROPIC_API_KEY").or_else(|_| std::env::var("MODEL_API_KEY")) {
-            Ok(k) => k,
-            Err(_) => {
-                eprintln!("skip: no ANTHROPIC_API_KEY / MODEL_API_KEY");
-                return;
-            }
-        };
-
+    if !has_api_key() {
+        eprintln!("skip: no API key");
+        return;
+    }
+    // 透传父进程 env(含从 .env 加载的 MODEL_API_KEY / YI_AGENT_PROVIDER 等)。
     let output = Command::new(yi_agent_bin())
         .arg("run")
         .arg("--json")
         .arg("Reply with exactly: hello world")
-        .env("ANTHROPIC_API_KEY", api_key)
         .output()
         .expect("failed to spawn yi-agent");
 
@@ -71,15 +103,10 @@ fn e2e_simple_text_response() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("invalid JSONL line: {line}\nerror: {e}"));
-        // AgentEvent is externally-tagged; the variant name is the top-level key.
-        let ty = v
-            .as_object()
-            .and_then(|m| m.keys().next().cloned())
-            .unwrap_or_else(|| panic!("expected tagged enum, got: {line}"));
+        let ty = event_variant(line).unwrap_or_else(|| panic!("invalid JSONL line: {line}"));
         match ty.as_str() {
             "AssistantText" => {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
                 let text = v["AssistantText"].as_str().unwrap_or("");
                 assert!(!text.is_empty(), "assistant text should be non-empty");
                 found_text = true;
@@ -100,15 +127,10 @@ fn e2e_simple_text_response() {
 #[test]
 #[ignore]
 fn e2e_tool_use_read() {
-    // Real LLM uses read tool to read a file, then responds.
-    let api_key =
-        match std::env::var("ANTHROPIC_API_KEY").or_else(|_| std::env::var("MODEL_API_KEY")) {
-            Ok(k) => k,
-            Err(_) => {
-                eprintln!("skip: no API key");
-                return;
-            }
-        };
+    if !has_api_key() {
+        eprintln!("skip: no API key");
+        return;
+    }
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let file_path = tmp.path().join("hello.txt");
@@ -121,7 +143,6 @@ fn e2e_tool_use_read() {
             "Read the file at {} and tell me its contents.",
             file_path.display()
         ))
-        .env("ANTHROPIC_API_KEY", api_key)
         .output()
         .expect("failed to spawn");
 
@@ -139,14 +160,10 @@ fn e2e_tool_use_read() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|e| panic!("invalid JSONL: {line}\n{e}"));
-        let ty = v
-            .as_object()
-            .and_then(|m| m.keys().next().cloned())
-            .unwrap();
+        let ty = event_variant(line).unwrap_or_else(|| panic!("invalid JSONL: {line}"));
         match ty.as_str() {
             "ToolCall" => {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
                 let name = v["ToolCall"]["name"].as_str().unwrap_or("");
                 if name == "read" {
                     found_tool_call = true;
@@ -172,24 +189,18 @@ fn e2e_tool_use_read() {
 #[test]
 #[ignore]
 fn e2e_tool_use_bash() {
-    // Real LLM uses bash tool to run a command, then responds.
-    let api_key =
-        match std::env::var("ANTHROPIC_API_KEY").or_else(|_| std::env::var("MODEL_API_KEY")) {
-            Ok(k) => k,
-            Err(_) => {
-                eprintln!("skip: no API key");
-                return;
-            }
-        };
+    if !has_api_key() {
+        eprintln!("skip: no API key");
+        return;
+    }
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let output = Command::new(yi_agent_bin())
+        .arg("--workdir")
+        .arg(tmp.path())
         .arg("run")
         .arg("--json")
         .arg("Run the bash command `echo hello` and tell me the output.")
-        .arg("--workdir")
-        .arg(tmp.path())
-        .env("ANTHROPIC_API_KEY", api_key)
         .output()
         .expect("failed to spawn");
 
@@ -206,14 +217,10 @@ fn e2e_tool_use_bash() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|e| panic!("invalid JSONL: {line}\n{e}"));
-        let ty = v
-            .as_object()
-            .and_then(|m| m.keys().next().cloned())
-            .unwrap();
+        let ty = event_variant(line).unwrap_or_else(|| panic!("invalid JSONL: {line}"));
         match ty.as_str() {
             "ToolCall" => {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
                 if v["ToolCall"]["name"].as_str() == Some("bash") {
                     found_bash_call = true;
                 }

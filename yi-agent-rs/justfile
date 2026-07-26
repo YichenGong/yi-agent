@@ -36,24 +36,36 @@ build-release:
 ci: fmt-check lint test build
     @echo "CI passed"
 
-# === 真实 LLM 测试（需 API key，默认跳过） ===
+# === 真实 LLM 测试(需 API key,默认跳过) ===
 
 # 跑真实 LLM provider 层测试
+# 配置源:yi-agent-rs/.env(优先,强制覆盖 shell 环境变量)
 test-real-llm:
     #!/usr/bin/env bash
     set -e
+    # 清除 shell 环境变量污染(如 ~/.zshrc 里的全局 key),让 .env 成为唯一配置源
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
+    # 加载 .env(强制覆盖: .env 里的空值也会覆盖已设变量)
+    if [ -f .env ]; then
+        set -a; . ./.env; set +a
+    fi
     if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$MODEL_API_KEY" ]; then
-        echo "skip: no API key set (ANTHROPIC_API_KEY / OPENAI_API_KEY / MODEL_API_KEY)"
+        echo "skip: no API key set (.env: ANTHROPIC_API_KEY / OPENAI_API_KEY / MODEL_API_KEY)"
         exit 0
     fi
     cargo test -p yi-agent-llm --test real_integration -- --ignored
 
-# 跑真实 LLM 端到端测试（经 `yi-agent run`）
+# 跑真实 LLM 端到端测试(经 `yi-agent run`)
+# 配置源:yi-agent-rs/.env(优先,强制覆盖 shell 环境变量)
 test-real-e2e:
     #!/usr/bin/env bash
     set -e
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
+    if [ -f .env ]; then
+        set -a; . ./.env; set +a
+    fi
     if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$MODEL_API_KEY" ]; then
-        echo "skip: no API key set"
+        echo "skip: no API key set (.env)"
         exit 0
     fi
     cargo test -p yi-agent --test e2e_real -- --ignored
