@@ -6,3 +6,5 @@
 - [x] TUI render markdown 表格格式失败（`tui/markdown.rs` Unicode box drawing 已实现）
 - [ ] 当前一些测试需要手工测试验证，无法自动化验证
 - [ ] 显示内容太密集，user 和 system 的内容之间加空行
+- [ ] bash 目前没有后台模式
+- [ ] sandbox没有，目前命令执行危险。
