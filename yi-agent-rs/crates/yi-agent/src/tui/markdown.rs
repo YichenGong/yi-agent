@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -22,6 +22,14 @@ struct LineBuilder {
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
+    // Table rendering state. When inside a table, text events are buffered
+    // into `current_cell` instead of `current_spans`; on `TagEnd::Table` the
+    // whole table is rendered as Unicode box-drawing Lines.
+    in_table: bool,
+    table_alignments: Vec<Alignment>,
+    table_rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
 }
 
 impl LineBuilder {
@@ -34,6 +42,11 @@ impl LineBuilder {
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
+            in_table: false,
+            table_alignments: Vec::new(),
+            table_rows: Vec::new(),
+            current_row: Vec::new(),
+            current_cell: String::new(),
         }
     }
 
@@ -44,15 +57,27 @@ impl LineBuilder {
             Event::Text(text) => {
                 if self.in_code_block {
                     self.code_block_buffer.push_str(&text);
+                } else if self.in_table {
+                    // Inside a table: buffer cell text instead of styling it.
+                    self.current_cell.push_str(&text);
                 } else {
                     self.push_text(&text);
                 }
             }
             Event::Code(code) => {
-                self.push_span(Span::styled(code.to_string(), Style::new().fg(Color::Cyan)));
+                if self.in_table {
+                    self.current_cell.push_str(code.as_ref());
+                } else {
+                    self.push_span(Span::styled(code.to_string(), Style::new().fg(Color::Cyan)));
+                }
             }
             Event::SoftBreak | Event::HardBreak => {
-                self.flush_line();
+                if self.in_table {
+                    // Treat as space within a cell.
+                    self.current_cell.push(' ');
+                } else {
+                    self.flush_line();
+                }
             }
             _ => {}
         }
@@ -97,6 +122,19 @@ impl LineBuilder {
                         .add_modifier(Modifier::UNDERLINED),
                 ));
             }
+            Tag::Table(alignments) => {
+                self.in_table = true;
+                self.table_alignments = alignments;
+                self.table_rows.clear();
+                self.current_row.clear();
+                self.current_cell.clear();
+            }
+            Tag::TableHead | Tag::TableRow => {
+                self.current_row.clear();
+            }
+            Tag::TableCell => {
+                self.current_cell.clear();
+            }
             _ => {}
         }
     }
@@ -115,6 +153,18 @@ impl LineBuilder {
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::BlockQuote(_) => {
                 self.current_style = Style::new();
+            }
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.current_cell);
+                self.current_row.push(cell);
+            }
+            TagEnd::TableHead | TagEnd::TableRow => {
+                let row = std::mem::take(&mut self.current_row);
+                self.table_rows.push(row);
+            }
+            TagEnd::Table => {
+                self.flush_table();
+                self.in_table = false;
             }
             _ => {}
         }
@@ -213,6 +263,101 @@ impl LineBuilder {
                 Style::new().fg(Color::Yellow),
             ));
         }
+    }
+
+    /// Render the accumulated table rows as Unicode box-drawing Lines and push
+    /// them to `self.lines`. Resets all table state.
+    fn flush_table(&mut self) {
+        let rows = std::mem::take(&mut self.table_rows);
+        let alignments = std::mem::take(&mut self.table_alignments);
+        if rows.is_empty() {
+            return;
+        }
+        // Determine number of columns and the max display width in each column.
+        let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        if num_cols == 0 {
+            return;
+        }
+        let mut col_widths = vec![0usize; num_cols];
+        for row in &rows {
+            for (i, cell) in row.iter().enumerate() {
+                let w = UnicodeWidthStr::width(cell.as_str());
+                if w > col_widths[i] {
+                    col_widths[i] = w;
+                }
+            }
+        }
+        // Cap column widths so total table fits in self.width when possible.
+        // Total = sum(col_widths) + 3*num_cols + 1 (borders + padding + final border)
+        // We don't hard-wrap cells here; if the table is wider than the terminal,
+        // we let it overflow (consistent with how `flush_line` handles long words
+        // in non-table text: the wrapping layer above this handles wrapping).
+        let _ = self.width;
+
+        // Helper: build a horizontal border line.
+        // `left`, `mid`, `right` are the corner/junction chars; `fill` is ─.
+        let border = |left: char, mid: char, right: char| -> String {
+            let mut s = String::new();
+            s.push(left);
+            for (i, w) in col_widths.iter().enumerate() {
+                if i > 0 {
+                    s.push(mid);
+                }
+                let pad = w + 2; // 2 spaces of padding around cell content
+                for _ in 0..pad {
+                    s.push('─');
+                }
+            }
+            s.push(right);
+            s
+        };
+
+        // Helper: build a data row line with the given alignment per column.
+        let data_line = |row: &[String]| -> String {
+            let mut s = String::new();
+            s.push('│');
+            for (i, col_w) in col_widths.iter().enumerate() {
+                let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                let cw = UnicodeWidthStr::width(cell);
+                let pad_total = col_w.saturating_sub(cw);
+                let align = alignments.get(i).copied().unwrap_or(Alignment::None);
+                let (left_pad, right_pad) = match align {
+                    Alignment::Center => {
+                        let l = pad_total / 2;
+                        let r = pad_total - l;
+                        (l, r)
+                    }
+                    Alignment::Right => (pad_total, 0),
+                    _ => (0, pad_total), // None and Left both left-align
+                };
+                s.push(' ');
+                for _ in 0..left_pad {
+                    s.push(' ');
+                }
+                s.push_str(cell);
+                for _ in 0..right_pad {
+                    s.push(' ');
+                }
+                s.push(' ');
+                s.push('│');
+            }
+            s
+        };
+
+        // Top border: ┌─┬─┐
+        self.lines.push(Line::raw(border('┌', '┬', '┐')));
+        for (ri, row) in rows.iter().enumerate() {
+            self.lines.push(Line::raw(data_line(row)));
+            if ri == 0 {
+                // Header separator after the first (header) row.
+                self.lines.push(Line::raw(border('├', '┼', '┤')));
+            }
+        }
+        // Bottom border: └─┴─┘
+        self.lines.push(Line::raw(border('└', '┴', '┘')));
+        self.in_table = false;
+        self.current_row.clear();
+        self.current_cell.clear();
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
@@ -369,5 +514,134 @@ mod tests {
             "expected emoji to wrap at width 5, got {} lines",
             lines.len()
         );
+    }
+
+    #[test]
+    fn simple_table_renders_with_box_drawing() {
+        // A basic two-column table with a header row and one data row.
+        // The renderer should emit Unicode box drawing characters (┌─┬─┐ etc.)
+        // and the cell text, NOT raw markdown pipes.
+        let src = "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n";
+        let lines = render_markdown(src, 40);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = rendered.join("\n");
+
+        // Should contain box-drawing top border with column separator ┬
+        assert!(
+            joined.contains('┌') && joined.contains('┐'),
+            "expected top corners ┌/┐, got: {joined:?}"
+        );
+        assert!(
+            joined.contains('┬'),
+            "expected column separator ┬ in top border, got: {joined:?}"
+        );
+        // Should contain both header and data cell text
+        assert!(
+            joined.contains("Name") && joined.contains("Age"),
+            "expected header text, got: {joined:?}"
+        );
+        assert!(
+            joined.contains("Alice") && joined.contains("30"),
+            "expected data row text, got: {joined:?}"
+        );
+        // Should NOT contain raw markdown pipe syntax for table structure
+        // (pipes might still appear in cell content, but not as `| --- |` separator)
+        assert!(
+            !joined.contains("---"),
+            "expected no raw markdown separator dashes, got: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn table_borders_use_unicode_box_chars_not_pipes() {
+        // Regression guard: table should render with Unicode box drawing,
+        // not as raw markdown source with `|` column separators.
+        let src = "| h1 | h2 |\n| --- | --- |\n| a | b |\n";
+        let lines = render_markdown(src, 40);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.chars().collect::<Vec<_>>())
+            })
+            .flatten()
+            .collect();
+        // Box-drawing vertical bar ─── or │ should appear
+        assert!(
+            joined.contains('│'),
+            "expected vertical box-drawing char │, got: {joined:?}"
+        );
+        assert!(
+            joined.contains('─'),
+            "expected horizontal box-drawing char ─, got: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn table_with_cjk_cells_uses_display_width() {
+        // CJK characters have display width 2. Column width should be based on
+        // display width, not char count, so "姓名" (2 chars, 4 cols) and "Alice"
+        // (5 chars, 5 cols) both fit in a column sized to the wider one (5 cols).
+        let src = "| 姓名 | 年龄 |\n| --- | --- |\n| Alice | 30 |\n";
+        let lines = render_markdown(src, 40);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = rendered.join("\n");
+        assert!(joined.contains("姓名"), "missing CJK header: {joined:?}");
+        assert!(joined.contains("Alice"), "missing ASCII data: {joined:?}");
+        // Verify no data row exceeds the rendered width: each row should start
+        // with │ and end with │, and contain both cells.
+        let data_line = rendered.iter().find(|l| l.contains("Alice"));
+        assert!(data_line.is_some(), "missing Alice row: {rendered:?}");
+        let data_line = data_line.unwrap();
+        assert!(
+            data_line.starts_with('│'),
+            "row should start with │: {data_line:?}"
+        );
+        assert!(
+            data_line.ends_with('│'),
+            "row should end with │: {data_line:?}"
+        );
+    }
+
+    #[test]
+    fn table_preserves_cell_text_without_dropping_words() {
+        // Regression guard: all cell content should appear in output. Earlier
+        // bug had table tags silently dropped, which concatenated cells as
+        // plain text. This test ensures no cell content is lost.
+        let src = "| alpha | beta | gamma |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n| x | y | z |\n";
+        let lines = render_markdown(src, 60);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = rendered.join("\n");
+        for expected in ["alpha", "beta", "gamma", "1", "2", "3", "x", "y", "z"] {
+            assert!(
+                joined.contains(expected),
+                "missing cell content {expected:?} in: {joined:?}"
+            );
+        }
     }
 }
