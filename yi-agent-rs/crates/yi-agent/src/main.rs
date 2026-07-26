@@ -31,9 +31,13 @@ fn main() -> Result<()> {
                 yi_agent_web::serve(host, *port, env_path, global_env_path).await
             })
         }
-        Some(Command::Run { .. }) => {
-            // TODO: Task 3 — implement headless run handler
-            anyhow::bail!("`yi-agent run` is not yet implemented")
+        Some(Command::Run {
+            ref prompt,
+            json,
+            stdin,
+        }) => {
+            let prompt = prompt.clone();
+            run_headless(cli, prompt, json, stdin)
         }
         None => run_agent(cli),
     }
@@ -120,6 +124,142 @@ fn run_agent(cli: Cli) -> Result<()> {
         decision_tx,
         decision_rx,
     )
+}
+
+/// Run agent non-interactively: drain AgentEvent stream to stdout/stderr.
+/// Used for headless CLI usage and end-to-end real-LLM testing.
+fn run_headless(cli: Cli, prompt: Option<String>, json: bool, from_stdin: bool) -> Result<()> {
+    use futures::StreamExt;
+
+    let config = config::load(&cli)?;
+
+    // Resolve prompt: explicit stdin flag > no prompt arg > prompt arg
+    let prompt_text = if from_stdin || prompt.is_none() {
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        buf.trim_end_matches('\n').to_string()
+    } else {
+        prompt.unwrap()
+    };
+    if prompt_text.is_empty() {
+        anyhow::bail!("empty prompt");
+    }
+
+    let workdir = config.workdir.clone();
+    // Headless mode: auto-allow non-blacklisted tools (yolo behavior)
+    let yolo = true;
+    let permissions = {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
+            .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
+    };
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
+    let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+        permissions,
+        yolo,
+        workdir.clone(),
+        blocklist_fn,
+    ));
+    let (_decision_tx, decision_rx) =
+        tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+
+    let provider: Arc<dyn Provider> = match config.provider.as_str() {
+        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
+            yi_agent_llm::AnthropicProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
+            yi_agent_llm::OpenaiProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        other => anyhow::bail!(
+            "unknown provider '{}': expected 'anthropic' or 'openai'",
+            other
+        ),
+    };
+
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_tools::register_builtin_tools(&mut registry, config.workdir.clone());
+    let tools = Arc::new(registry);
+
+    let agent_config = yi_agent_core::AgentConfig {
+        model: config.model.clone(),
+        system_prompt: config.system_prompt.clone(),
+        max_turns: Some(config.max_turns),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let exit_code = rt.block_on(async move {
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+        let mut agent = yi_agent_core::Agent::new(provider, tools, agent_config)
+            .with_permission(checker, decision_rx);
+
+        let stream = match agent.run(prompt_text).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        };
+
+        let mut stream = Box::pin(stream);
+        let mut exit_code = 0;
+        while let Some(event) = stream.next().await {
+            if json {
+                // TODO: Task 4 adds Serialize derive to AgentEvent;
+                // switch back to serde_json::to_string(&event) once available.
+                let line = format!("{event:?}");
+                println!("{line}");
+            } else {
+                match &event {
+                    yi_agent_core::AgentEvent::AssistantText(t) => {
+                        println!("{t}");
+                    }
+                    yi_agent_core::AgentEvent::ToolCall { name, input, .. } => {
+                        eprintln!("[tool:{name}] {input}");
+                    }
+                    yi_agent_core::AgentEvent::ToolResult { id, result } => {
+                        eprintln!(
+                            "[result:{id}] error={} content={:?}",
+                            result.is_error, result.content
+                        );
+                    }
+                    yi_agent_core::AgentEvent::Done { reason } => {
+                        eprintln!("[done:{reason:?}]");
+                    }
+                    yi_agent_core::AgentEvent::Cancelled => {
+                        eprintln!("[cancelled]");
+                        exit_code = 130;
+                    }
+                    yi_agent_core::AgentEvent::Error(e) => {
+                        eprintln!("[error:{e}]");
+                        exit_code = 1;
+                    }
+                    _ => {} // Usage, EstimatedPrefill, DecodeDelta, ToolOutputDelta, etc.
+                }
+            }
+            // Exit on terminal events
+            if matches!(
+                event,
+                yi_agent_core::AgentEvent::Done { .. }
+                    | yi_agent_core::AgentEvent::Cancelled
+                    | yi_agent_core::AgentEvent::Error(_)
+            ) {
+                break;
+            }
+        }
+        exit_code
+    });
+
+    std::process::exit(exit_code);
 }
 
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
