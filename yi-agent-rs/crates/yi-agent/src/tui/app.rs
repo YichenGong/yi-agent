@@ -204,7 +204,7 @@ fn run_loop<B: Backend, E: EventSource>(
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
                 if let Some(text) = queued.pop_front() {
-                    history.push(HistoryCell::UserMessage { text });
+                    history.push(HistoryCell::UserMessage { text }, width);
                 }
             }
         }
@@ -345,6 +345,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     input,
                     history,
                     max_offset,
+                    history_area.width,
                     &cost_tracker,
                     input_tx,
                     interrupt_tx,
@@ -635,6 +636,7 @@ fn handle_key(
     input: &mut InputLine,
     history: &mut HistoryState,
     max_scroll_offset: usize,
+    history_width: u16,
     cost_tracker: &CostTracker,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
@@ -787,6 +789,7 @@ fn handle_key(
                             cmd,
                             args_str,
                             history,
+                            history_width,
                             cost_tracker,
                             input_tx,
                             interrupt_tx,
@@ -796,9 +799,12 @@ fn handle_key(
                         // No command selected (empty filter) — show error
                         let text = input.take_submitted();
                         *popup = None;
-                        history.push(HistoryCell::Separator {
-                            label: Some(format!("未知命令: {}", text)),
-                        });
+                        history.push(
+                            HistoryCell::Separator {
+                                label: Some(format!("未知命令: {}", text)),
+                            },
+                            history_width,
+                        );
                         return KeyOutcome::None;
                     }
                 }
@@ -829,6 +835,7 @@ fn handle_key(
                         cmd,
                         args,
                         history,
+                        history_width,
                         cost_tracker,
                         input_tx,
                         interrupt_tx,
@@ -837,9 +844,12 @@ fn handle_key(
                 } else {
                     // Unknown slash command
                     *popup = None;
-                    history.push(HistoryCell::Separator {
-                        label: Some(format!("未知命令: {}", text)),
-                    });
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some(format!("未知命令: {}", text)),
+                        },
+                        history_width,
+                    );
                     return KeyOutcome::None;
                 }
             }
@@ -847,7 +857,10 @@ fn handle_key(
             if is_running.load(std::sync::atomic::Ordering::SeqCst) {
                 queued.push_back(text.clone());
             } else {
-                history.push(HistoryCell::UserMessage { text: text.clone() });
+                history.push(
+                    HistoryCell::UserMessage { text: text.clone() },
+                    history_width,
+                );
             }
             let _ = input_tx.blocking_send(text.clone());
             KeyOutcome::Submit(text)
@@ -902,6 +915,7 @@ fn execute_slash_command(
     cmd: SlashCommand,
     args: Option<String>,
     history: &mut HistoryState,
+    width: u16,
     cost: &CostTracker,
     _input_tx: &tokio::sync::mpsc::Sender<String>,
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
@@ -913,9 +927,12 @@ fn execute_slash_command(
             // 本地清空 history 显示,TUI 不等 driver 确认。
             // 通过 control channel 通知 driver 重建 agent(空 session)。
             history.clear();
-            history.push(HistoryCell::Separator {
-                label: Some("对话已清空".to_string()),
-            });
+            history.push(
+                HistoryCell::Separator {
+                    label: Some("对话已清空".to_string()),
+                },
+                width,
+            );
             let _ = control_tx.blocking_send(crate::ControlCommand::Clear);
             KeyOutcome::None
         }
@@ -924,38 +941,50 @@ fn execute_slash_command(
             for c in SlashCommand::all() {
                 help_text.push_str(&format!("  /{:<10} {}\n", c.name(), c.description()));
             }
-            history.push(HistoryCell::UserMessage { text: help_text });
+            history.push(HistoryCell::UserMessage { text: help_text }, width);
             KeyOutcome::None
         }
         SlashCommand::Cost => {
             let text = cost.render();
-            history.push(HistoryCell::Markdown { text });
+            history.push(HistoryCell::Markdown { text }, width);
             KeyOutcome::None
         }
         SlashCommand::Config => {
-            history.push(HistoryCell::Separator {
-                label: Some("当前配置: (暂未实现)".to_string()),
-            });
+            history.push(
+                HistoryCell::Separator {
+                    label: Some("当前配置: (暂未实现)".to_string()),
+                },
+                width,
+            );
             KeyOutcome::None
         }
         SlashCommand::Compact => {
             // 本地 push "正在压缩..." 提示,通过 control channel
             // 通知 driver 调用 compact_session 并重建 agent。
-            history.push(HistoryCell::Separator {
-                label: Some("正在压缩对话...".to_string()),
-            });
+            history.push(
+                HistoryCell::Separator {
+                    label: Some("正在压缩对话...".to_string()),
+                },
+                width,
+            );
             let _ = control_tx.blocking_send(crate::ControlCommand::Compact);
             KeyOutcome::None
         }
         SlashCommand::Model => {
             if let Some(model) = args {
-                history.push(HistoryCell::Separator {
-                    label: Some(format!("切换模型到: {} (暂未实现)", model)),
-                });
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some(format!("切换模型到: {} (暂未实现)", model)),
+                    },
+                    width,
+                );
             } else {
-                history.push(HistoryCell::Separator {
-                    label: Some("用法: /model <model-name>".to_string()),
-                });
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some("用法: /model <model-name>".to_string()),
+                    },
+                    width,
+                );
             }
             KeyOutcome::None
         }
@@ -3260,6 +3289,7 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3297,6 +3327,7 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3334,6 +3365,7 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3368,6 +3400,7 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3383,6 +3416,7 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3420,6 +3454,7 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3469,6 +3504,7 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3515,6 +3551,7 @@ mod tests {
             SlashCommand::Cost,
             None,
             &mut history,
+            80,
             &cost,
             &input_tx,
             &interrupt_tx,
@@ -3548,6 +3585,7 @@ mod tests {
             SlashCommand::Cost,
             None,
             &mut history,
+            80,
             &cost,
             &input_tx,
             &interrupt_tx,
@@ -3625,9 +3663,12 @@ mod tests {
         let mut hist = HistoryState::new();
         // Fill enough lines so scrolling is meaningful.
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = false;
@@ -3667,9 +3708,12 @@ mod tests {
         let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         hist.scroll_up(5, 1000);
         assert_eq!(hist.scroll_offset, 5);
@@ -3712,9 +3756,12 @@ mod tests {
         let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = false;
@@ -3740,9 +3787,12 @@ mod tests {
         let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = false;
