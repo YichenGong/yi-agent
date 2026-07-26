@@ -111,6 +111,23 @@ impl RunningTaskRegistry {
         }
     }
 
+    /// Finalize a non-streaming tool when its result is delivered. Streaming
+    /// tools may already be finalized by ToolExit or ToolTimeout, so preserve
+    /// their more specific terminal status.
+    pub fn on_result(&mut self, id: &str, is_error: bool) {
+        if let Some(t) = self.tasks.get_mut(id) {
+            if t.status == TaskStatus::Running {
+                t.end_time = Some(Instant::now());
+                t.exit_code = None;
+                t.status = if is_error {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Done
+                };
+            }
+        }
+    }
+
     pub fn on_timeout(&mut self, id: &str) {
         if let Some(t) = self.tasks.get_mut(id) {
             t.end_time = Some(Instant::now());
@@ -210,6 +227,24 @@ mod tests {
         r.on_timeout("t");
         assert_eq!(r.get("t").unwrap().status, TaskStatus::Timeout);
         assert_eq!(r.get("t").unwrap().exit_code, None);
+    }
+
+    #[test]
+    fn test_result_finalizes_running_task_and_preserves_streaming_terminals() {
+        let mut r = RunningTaskRegistry::new();
+        r.on_tool_call("error", "web_search", "query", 120);
+        r.on_result("error", true);
+        assert_eq!(r.get("error").unwrap().status, TaskStatus::Failed);
+
+        r.on_tool_call("exit", "bash", "echo hi", 120);
+        r.on_exit("exit", Some(0));
+        r.on_result("exit", true);
+        assert_eq!(r.get("exit").unwrap().status, TaskStatus::Done);
+
+        r.on_tool_call("timeout", "bash", "sleep 10", 120);
+        r.on_timeout("timeout");
+        r.on_result("timeout", false);
+        assert_eq!(r.get("timeout").unwrap().status, TaskStatus::Timeout);
     }
 
     #[test]
