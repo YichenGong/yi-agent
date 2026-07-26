@@ -88,6 +88,11 @@ impl InputLine {
         self.cursor += c.len_utf8();
     }
 
+    pub fn insert_str(&mut self, text: &str) {
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -253,6 +258,26 @@ mod tests {
         inp.insert_char('b');
         assert_eq!(inp.buffer, "abc");
         assert_eq!(inp.cursor, 2);
+    }
+
+    #[test]
+    fn insert_str_in_middle() {
+        let mut inp = InputLine::new();
+        inp.buffer = "ac".into();
+        inp.cursor = 1;
+        inp.insert_str("b");
+        assert_eq!(inp.buffer, "abc");
+        assert_eq!(inp.cursor, 2);
+    }
+
+    #[test]
+    fn insert_str_handles_multibyte_text_and_newlines() {
+        let mut inp = InputLine::new();
+        inp.buffer = "你好".into();
+        inp.cursor = "你".len();
+        inp.insert_str("\nworld");
+        assert_eq!(inp.buffer, "你\nworld好");
+        assert_eq!(inp.cursor, "你\nworld".len());
     }
 
     #[test]
