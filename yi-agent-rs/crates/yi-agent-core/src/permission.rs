@@ -44,13 +44,13 @@ pub struct PathPrefixConfig {
     pub paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum PermissionKind {
     Normal,
     Blacklisted(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Decision {
     AllowOnce,
     AlwaysAllowTool,

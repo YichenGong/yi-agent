@@ -89,6 +89,19 @@ pub struct Cli {
 /// 子命令
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
+    /// Run a prompt non-interactively and exit (headless mode).
+    Run {
+        /// Prompt text. If omitted, reads from stdin.
+        prompt: Option<String>,
+
+        /// Output events as JSONL (one AgentEvent per line).
+        #[arg(long)]
+        json: bool,
+
+        /// Read prompt from stdin even if prompt arg is given.
+        #[arg(long)]
+        stdin: bool,
+    },
     /// Start web config UI
     Web {
         /// Host to bind

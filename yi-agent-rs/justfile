@@ -36,6 +36,32 @@ build-release:
 ci: fmt-check lint test build
     @echo "CI passed"
 
+# === 真实 LLM 测试（需 API key，默认跳过） ===
+
+# 跑真实 LLM provider 层测试
+test-real-llm:
+    #!/usr/bin/env bash
+    set -e
+    if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$MODEL_API_KEY" ]; then
+        echo "skip: no API key set (ANTHROPIC_API_KEY / OPENAI_API_KEY / MODEL_API_KEY)"
+        exit 0
+    fi
+    cargo test -p yi-agent-llm --test real_integration -- --ignored
+
+# 跑真实 LLM 端到端测试（经 `yi-agent run`）
+test-real-e2e:
+    #!/usr/bin/env bash
+    set -e
+    if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$MODEL_API_KEY" ]; then
+        echo "skip: no API key set"
+        exit 0
+    fi
+    cargo test -p yi-agent --test e2e_real -- --ignored
+
+# 跑所有真实 LLM 测试
+test-real-all: test-real-llm test-real-e2e
+    @echo "Real LLM tests passed"
+
 # === Release ===
 
 # 三平台目标列表
