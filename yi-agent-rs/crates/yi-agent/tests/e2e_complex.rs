@@ -18,7 +18,8 @@ fn complex_personal_website() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("output")).expect("create output dir");
 
-    let output = run_agent_with_timeout(tmp.path(), PROMPT_WEBSITE);
+    let output = run_agent_with_timeout(tmp.path(), PROMPT_WEBSITE)
+        .expect("personal website agent run timed out");
 
     assert!(
         output.status.success(),
@@ -58,7 +59,8 @@ fn complex_python_script() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("output")).expect("create output dir");
 
-    let output = run_agent_with_timeout(tmp.path(), PROMPT_PYTHON);
+    let output = run_agent_with_timeout(tmp.path(), PROMPT_PYTHON)
+        .expect("python script agent run timed out");
 
     assert!(
         output.status.success(),
@@ -77,6 +79,17 @@ fn complex_python_script() {
     assert!(py.len() > 100, "sort.py too small: {} bytes", py.len());
     assert!(py.contains("def sort_list"), "missing def sort_list");
     assert!(py.contains("__main__"), "missing __main__ guard");
+    let check = std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import runpy; ns = runpy.run_path('output/sort.py'); assert ns['sort_list']([3, 1, 2]) == [1, 2, 3]")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run python validation");
+    assert!(
+        check.status.success(),
+        "sort.py is not a working sort_list module: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
 }
 
 const PROMPT_DATA: &str = "Read the file input/data.json, extract all `name` fields, convert them to uppercase, and write the result as a JSON array to output/results.json.";
@@ -97,7 +110,8 @@ fn complex_data_transformation() {
     )
     .expect("write data.json");
 
-    let output = run_agent_with_timeout(tmp.path(), PROMPT_DATA);
+    let output = run_agent_with_timeout(tmp.path(), PROMPT_DATA)
+        .expect("data transformation agent run timed out");
 
     assert!(
         output.status.success(),
@@ -120,13 +134,14 @@ fn complex_data_transformation() {
     let arr = parsed
         .as_array()
         .expect("results.json should be a JSON array");
-    assert_eq!(arr.len(), 3, "should have 3 elements, got: {content}");
-
-    // 内容包含大写名字
-    let upper = content.to_uppercase();
-    assert!(upper.contains("ALICE"), "missing ALICE: {content}");
-    assert!(upper.contains("BOB"), "missing BOB: {content}");
-    assert!(upper.contains("CHARLIE"), "missing CHARLIE: {content}");
+    assert_eq!(
+        arr,
+        &vec![
+            serde_json::json!("ALICE"),
+            serde_json::json!("BOB"),
+            serde_json::json!("CHARLIE")
+        ]
+    );
 }
 
 const PROMPT_BUGFIX: &str = "The file buggy.py contains a Python function with a bug. Read it, identify the bug, fix it, and write the fixed version to output/fixed.py. Do not just copy the original — fix the bug.";
@@ -146,7 +161,8 @@ fn complex_bug_fix() {
     )
     .expect("write buggy.py");
 
-    let output = run_agent_with_timeout(tmp.path(), PROMPT_BUGFIX);
+    let output =
+        run_agent_with_timeout(tmp.path(), PROMPT_BUGFIX).expect("bug-fix agent run timed out");
 
     assert!(
         output.status.success(),
@@ -175,5 +191,16 @@ fn complex_bug_fix() {
     assert!(
         !fixed.contains("return a - b"),
         "original bug line 'return a - b' should be replaced"
+    );
+    let check = std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import runpy; ns = runpy.run_path('output/fixed.py'); assert ns['add'](2, 3) == 5")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run python validation");
+    assert!(
+        check.status.success(),
+        "fixed.py does not implement add correctly: {}",
+        String::from_utf8_lossy(&check.stderr)
     );
 }
