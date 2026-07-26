@@ -329,10 +329,13 @@ fn run_loop<B: Backend, E: EventSource>(
                     handle_bash_popup_key(key, &mut bash_popup, &task_registry);
                     continue;
                 }
+                let history_area = layout.chunks[0];
+                let max_offset = history.max_scroll_offset(history_area.width, history_area.height);
                 match handle_key(
                     key,
                     input,
                     history,
+                    max_offset,
                     &cost_tracker,
                     input_tx,
                     interrupt_tx,
@@ -509,10 +512,11 @@ fn handle_mouse(
     // History region: scroll the conversation history.
     if history_area.contains(pos) {
         *pending_quit = false;
+        let max_offset = history.max_scroll_offset(history_area.width, history_area.height);
         if is_scroll_down {
             history.scroll_down(delta);
         } else {
-            history.scroll_up(delta);
+            history.scroll_up(delta, max_offset);
         }
     }
     // Other regions (status bar, queued preview, input) are intentionally
@@ -604,6 +608,7 @@ fn handle_key(
     key: KeyEvent,
     input: &mut InputLine,
     history: &mut HistoryState,
+    max_scroll_offset: usize,
     cost_tracker: &CostTracker,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
@@ -697,7 +702,7 @@ fn handle_key(
         }
         KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
             *pending_quit = false;
-            history.scroll_up(10);
+            history.scroll_up(10, max_scroll_offset);
             return KeyOutcome::None;
         }
         KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
@@ -2923,6 +2928,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            1000,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -2959,6 +2965,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            1000,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -2995,6 +3002,7 @@ mod tests {
             make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &mut input,
             &mut history,
+            1000,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3028,6 +3036,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            1000,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3042,6 +3051,7 @@ mod tests {
             make_key(KeyCode::Esc, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            1000,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3078,6 +3088,7 @@ mod tests {
             make_key(KeyCode::Enter, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            1000,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3126,6 +3137,7 @@ mod tests {
             make_key(KeyCode::Enter, KeyModifiers::NONE),
             &mut input,
             &mut history,
+            1000,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3328,7 +3340,7 @@ mod tests {
                 text: "line".into(),
             });
         }
-        hist.scroll_up(5);
+        hist.scroll_up(5, 1000);
         assert_eq!(hist.scroll_offset, 5);
 
         let registry = RunningTaskRegistry::new();
