@@ -320,8 +320,28 @@ impl Tool for BashTool {
         // chunks. The process has exited (or was killed) so the pipes will
         // return EOF. Without this we could lose trailing chunks that were
         // still in flight when the select loop broke on child.wait().
-        let _ = stdout_reader.await;
-        let _ = stderr_reader.await;
+        //
+        // However, if an orphaned subprocess inherited the pipe FDs (common
+        // with `sleep 30 &`, `nohup`, daemons), the reader tasks will never
+        // see EOF even though the main child has exited. The raw `.await`
+        // would block forever, hanging call_stream → join_all → Done event
+        // → TUI shows frozen decode + ticking bash timer forever.
+        //
+        // Fix: bound the wait by idle_limit. If the readers don't finish by
+        // then, an orphan is holding the pipe — give up and drain what we
+        // have via try_recv below.
+        let reader_wait = tokio::time::timeout(idle_limit, async {
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+        })
+        .await;
+        if reader_wait.is_err() {
+            tracing::warn!(
+                idle_limit_secs = idle_limit.as_secs(),
+                "bash: reader tasks did not finish within idle_limit after child exited — \
+                 orphaned subprocess is holding the pipe; draining available output"
+            );
+        }
 
         // Drain any chunks that arrived after the last select iteration.
         if let Some(rx) = stdout_rx.as_mut() {
@@ -698,6 +718,57 @@ mod tests {
         assert!(
             desc.contains("&&"),
             "description should guide combining dependent steps with &&, got: {desc}"
+        );
+    }
+
+    /// Regression: when the main bash process exits but an orphaned
+    /// subprocess inherits the stdout/stderr pipes (common with
+    /// backgrounded processes, daemons, or `nohup`), the reader tasks
+    /// block forever waiting for EOF. The `call_stream` must not hang
+    /// indefinitely — it should return within a bounded time after the
+    /// main child exits.
+    ///
+    /// Before the fix, lines 323-324 (`let _ = stdout_reader.await`)
+    /// blocked forever because the orphan keeps the pipe open, so the
+    /// reader never sees EOF. This caused the agent's ACT phase to hang
+    /// (join_all never completes), the Done event to never fire, and
+    /// the TUI to show a frozen decode counter + ticking bash timer
+    /// until the user manually cancelled.
+    #[tokio::test]
+    async fn bash_orphan_subprocess_does_not_hang_call_stream() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        // Spawn a command that backgrounds a long-running child which
+        // inherits stdout/stderr, then exits immediately. The orphan
+        // keeps the pipes open so the reader tasks never see EOF.
+        //
+        // `sleep 30 &` backgrounds a child; `exit 0` exits the main
+        // shell. The orphan holds the pipe FDs for 30s.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.call_stream(
+                serde_json::json!({
+                    "command": "sleep 30 & exit 0",
+                    "timeout": 5,
+                    "expected_timeout_sec": 3
+                }),
+                tokio::sync::mpsc::channel::<ToolEvent>(8).0,
+            ),
+        )
+        .await;
+
+        // If call_stream hangs forever (the bug), this timeout fires
+        // and the test fails with "elapsed".
+        let result = result.expect(
+            "call_stream hung forever — reader await blocked on orphan-held pipe \
+             (no timeout on stdout_reader/stderr_reader after child exits)",
+        );
+        // Should have completed successfully (exit 0).
+        assert!(
+            !result.is_error,
+            "expected success (exit 0), got error: {:?}",
+            result.content
         );
     }
 }
