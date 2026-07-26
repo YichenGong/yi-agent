@@ -134,12 +134,13 @@ fn run_headless(cli: Cli, prompt: Option<String>, json: bool, from_stdin: bool) 
     let config = config::load(&cli)?;
 
     // Resolve prompt: explicit stdin flag > no prompt arg > prompt arg
-    let prompt_text = if from_stdin || prompt.is_none() {
-        let mut buf = String::new();
-        std::io::stdin().read_line(&mut buf)?;
-        buf.trim_end_matches('\n').to_string()
-    } else {
-        prompt.unwrap()
+    let prompt_text = match (from_stdin, prompt) {
+        (true, _) | (false, None) => {
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf)?;
+            buf.trim_end_matches('\n').to_string()
+        }
+        (false, Some(p)) => p,
     };
     if prompt_text.is_empty() {
         anyhow::bail!("empty prompt");
