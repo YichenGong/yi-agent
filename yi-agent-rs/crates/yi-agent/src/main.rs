@@ -31,6 +31,10 @@ fn main() -> Result<()> {
                 yi_agent_web::serve(host, *port, env_path, global_env_path).await
             })
         }
+        Some(Command::Run { .. }) => {
+            // TODO: Task 3 — implement headless run handler
+            anyhow::bail!("`yi-agent run` is not yet implemented")
+        }
         None => run_agent(cli),
     }
 }
