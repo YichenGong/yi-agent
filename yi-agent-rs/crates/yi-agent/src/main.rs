@@ -35,9 +35,10 @@ fn main() -> Result<()> {
             ref prompt,
             json,
             stdin,
+            naked,
         }) => {
             let prompt = prompt.clone();
-            run_headless(cli, prompt, json, stdin)
+            run_headless(cli, prompt, json, stdin, naked)
         }
         None => run_agent(cli),
     }
@@ -222,9 +223,55 @@ async fn drain_stream_json<W: std::io::Write>(
     exit_code
 }
 
+/// Headless 模式的工具 + system prompt 构建结果。
+struct HeadlessSetup {
+    tools: Arc<yi_agent_core::ToolRegistry>,
+    system_prompt: Option<String>,
+}
+
+/// 根据 `naked` flag 构建 headless 模式用的工具集和 system prompt。
+///
+/// `naked = true`:不注册任何工具,不加载 skills,`system_prompt = None`(裸模型)。
+/// `naked = false`:与 TUI `run_agent` 对齐 — 注册内置工具、加载 skills、
+/// 注册 SkillTool、用 `resolve_system_prompt_with_skills` 拼接默认 prompt +
+/// 当前日期 + skills catalog。
+fn build_headless_setup(config: &config::Config, naked: bool) -> Result<HeadlessSetup> {
+    let mut registry = yi_agent_core::ToolRegistry::new();
+
+    if naked {
+        return Ok(HeadlessSetup {
+            tools: Arc::new(registry),
+            system_prompt: None,
+        });
+    }
+
+    yi_agent_tools::register_builtin_tools(&mut registry, config.workdir.clone());
+    let skills_service = setup_skills(config)?;
+    let system_prompt = resolve_system_prompt_with_skills(
+        config.system_prompt.clone(),
+        &skills_service,
+        config.skills_catalog_budget,
+        config.skills_catalog_budget_explicit,
+    );
+    if let Some(svc) = &skills_service {
+        registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
+    }
+
+    Ok(HeadlessSetup {
+        tools: Arc::new(registry),
+        system_prompt,
+    })
+}
+
 /// Run agent non-interactively: drain AgentEvent stream to stdout/stderr.
 /// Used for headless CLI usage and end-to-end real-LLM testing.
-fn run_headless(cli: Cli, prompt: Option<String>, json: bool, from_stdin: bool) -> Result<()> {
+fn run_headless(
+    cli: Cli,
+    prompt: Option<String>,
+    json: bool,
+    from_stdin: bool,
+    naked: bool,
+) -> Result<()> {
     let config = config::load(&cli)?;
 
     // Resolve prompt: explicit stdin flag > no prompt arg > prompt arg
@@ -280,13 +327,12 @@ fn run_headless(cli: Cli, prompt: Option<String>, json: bool, from_stdin: bool) 
         ),
     };
 
-    let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_tools::register_builtin_tools(&mut registry, config.workdir.clone());
-    let tools = Arc::new(registry);
+    let setup = build_headless_setup(&config, naked)?;
+    let tools = setup.tools;
 
     let agent_config = yi_agent_core::AgentConfig {
         model: config.model.clone(),
-        system_prompt: config.system_prompt.clone(),
+        system_prompt: setup.system_prompt,
         max_turns: Some(config.max_turns),
         ..Default::default()
     };
@@ -699,6 +745,92 @@ mod tests {
 
     fn scripted_stream(events: Vec<AgentEvent>) -> BoxStream<'static, AgentEvent> {
         stream::iter(events).boxed()
+    }
+
+    // --- build_headless_setup tests ---
+
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn test_config() -> Config {
+        Config {
+            provider: "anthropic".into(),
+            api_url: "https://api.anthropic.com".into(),
+            api_key: "test-key".into(),
+            model: "claude-sonnet-4-5".into(),
+            max_turns: 50,
+            workdir: PathBuf::from("/tmp"),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_keep_turns: 4,
+            yolo: false,
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: false,
+        }
+    }
+
+    #[test]
+    fn build_headless_setup_naked_has_no_tools_and_no_system_prompt() {
+        let config = test_config();
+        let setup = build_headless_setup(&config, true).expect("setup should succeed");
+        assert!(
+            setup.tools.schemas().is_empty(),
+            "naked mode should register zero tools, got: {:?}",
+            setup
+                .tools
+                .schemas()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            setup.system_prompt.is_none(),
+            "naked mode should pass None as system_prompt, got: {:?}",
+            setup.system_prompt
+        );
+    }
+
+    #[test]
+    fn build_headless_setup_default_registers_builtin_tools() {
+        let config = test_config();
+        let setup = build_headless_setup(&config, false).expect("setup should succeed");
+        assert!(
+            !setup.tools.schemas().is_empty(),
+            "default mode should register builtin tools, got empty set"
+        );
+        let names: Vec<String> = setup
+            .tools
+            .schemas()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        // 至少应该有 read/write/bash 这几个核心工具
+        assert!(
+            names.iter().any(|n| n == "read"),
+            "default mode should register 'read' tool, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "write"),
+            "default mode should register 'write' tool, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "bash"),
+            "default mode should register 'bash' tool, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_headless_setup_default_includes_current_date_in_system_prompt() {
+        let config = test_config();
+        let setup = build_headless_setup(&config, false).expect("setup should succeed");
+        let sp = setup
+            .system_prompt
+            .as_ref()
+            .expect("default mode should produce a system prompt");
+        assert!(
+            sp.contains("Current date:"),
+            "default system_prompt should contain current date marker, got: {sp}"
+        );
     }
 
     // Sync wrapper around `drain_stream_human` so tests can drive the async
