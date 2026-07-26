@@ -114,6 +114,9 @@ Task execution:
   turn when you are confident the task is complete.
 - Verify your work before declaring done: for code changes, run the
   relevant build/test commands; for factual claims, cite the source.
+- After writing or editing a file, inspect the changed result and run the
+  most relevant check before giving a final answer. Prefer write/edit tools
+  for file changes; use bash primarily for checks and batch operations.
 - If a tool call fails, diagnose the error and retry with a fix rather
   than reporting failure and stopping.
 - When information is missing, make a reasonable assumption, state it
