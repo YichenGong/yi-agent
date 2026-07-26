@@ -60,8 +60,8 @@ impl StatusBarState {
         self.display_input = self.display_input.saturating_add(step_i.min(di));
         self.display_output = self.display_output.saturating_add(step_o.min(dd));
 
-        // Spinner phase: 8° per tick → ~1.5s per cycle at 30hz.
-        self.spinner_phase = (self.spinner_phase + 8) % 360;
+        // Spinner phase: 4° per tick → ~3s per cycle at 30hz.
+        self.spinner_phase = (self.spinner_phase + 4) % 360;
 
         // If no new usage for 1s, snap to target (call finished).
         if let Some(t) = self.last_usage_time {
@@ -240,7 +240,7 @@ mod tests {
         s.tick();
         let h2 = s.spinner_hue();
         assert_ne!(h1, h2);
-        assert_eq!(h2, (h1 + 8) % 360);
+        assert_eq!(h2, (h1 + 4) % 360);
     }
 
     #[test]
