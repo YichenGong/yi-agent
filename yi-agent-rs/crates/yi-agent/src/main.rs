@@ -126,11 +126,105 @@ fn run_agent(cli: Cli) -> Result<()> {
     )
 }
 
+/// Drain an `AgentEvent` stream to the provided writers in human-readable
+/// (non-JSON) form. Returns the process exit code.
+///
+/// `AssistantText` deltas are written inline without forcing a newline
+/// after every chunk, so streaming text renders as one continuous line
+/// (the LLM's own newlines are preserved). A trailing newline is emitted
+/// at the end of the stream if the last assistant text did not end with
+/// one, so the shell prompt (or any following output) starts on a fresh
+/// line.
+///
+/// ToolCall / ToolResult / Done / Cancelled / Error are routed to `err`.
+async fn drain_stream_human<W: std::io::Write, E: std::io::Write>(
+    stream: futures::stream::BoxStream<'static, yi_agent_core::AgentEvent>,
+    out: &mut W,
+    err: &mut E,
+) -> i32 {
+    use futures::StreamExt;
+
+    let mut stream = Box::pin(stream);
+    let mut exit_code = 0;
+    // True when the last bytes written to `out` did NOT end with '\n'.
+    // Used to ensure we terminate assistant text before returning so the
+    // shell prompt starts on a fresh line.
+    let mut mid_line = false;
+
+    while let Some(event) = stream.next().await {
+        match &event {
+            yi_agent_core::AgentEvent::AssistantText(t) => {
+                let _ = out.write_all(t.as_bytes());
+                mid_line = !t.ends_with('\n');
+            }
+            yi_agent_core::AgentEvent::ToolCall { name, input, .. } => {
+                let _ = writeln!(err, "[tool:{name}] {input}");
+            }
+            yi_agent_core::AgentEvent::ToolResult { id, result } => {
+                let _ = writeln!(
+                    err,
+                    "[result:{id}] error={} content={:?}",
+                    result.is_error, result.content
+                );
+            }
+            yi_agent_core::AgentEvent::Done { reason } => {
+                let _ = writeln!(err, "[done:{reason:?}]");
+            }
+            yi_agent_core::AgentEvent::Cancelled => {
+                let _ = writeln!(err, "[cancelled]");
+                exit_code = 130;
+            }
+            yi_agent_core::AgentEvent::Error(e) => {
+                let _ = writeln!(err, "[error:{e}]");
+                exit_code = 1;
+            }
+            _ => {}
+        }
+        if matches!(
+            event,
+            yi_agent_core::AgentEvent::Done { .. }
+                | yi_agent_core::AgentEvent::Cancelled
+                | yi_agent_core::AgentEvent::Error(_)
+        ) {
+            break;
+        }
+    }
+
+    if mid_line {
+        let _ = out.write_all(b"\n");
+    }
+
+    exit_code
+}
+
+/// Drain an `AgentEvent` stream to the provided writer as JSONL (one JSON
+/// object per line). Returns the process exit code.
+async fn drain_stream_json<W: std::io::Write>(
+    stream: futures::stream::BoxStream<'static, yi_agent_core::AgentEvent>,
+    out: &mut W,
+) -> i32 {
+    use futures::StreamExt;
+
+    let mut stream = Box::pin(stream);
+    let exit_code = 0;
+    while let Some(event) = stream.next().await {
+        let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+        let _ = writeln!(out, "{line}");
+        if matches!(
+            event,
+            yi_agent_core::AgentEvent::Done { .. }
+                | yi_agent_core::AgentEvent::Cancelled
+                | yi_agent_core::AgentEvent::Error(_)
+        ) {
+            break;
+        }
+    }
+    exit_code
+}
+
 /// Run agent non-interactively: drain AgentEvent stream to stdout/stderr.
 /// Used for headless CLI usage and end-to-end real-LLM testing.
 fn run_headless(cli: Cli, prompt: Option<String>, json: bool, from_stdin: bool) -> Result<()> {
-    use futures::StreamExt;
-
     let config = config::load(&cli)?;
 
     // Resolve prompt: explicit stdin flag > no prompt arg > prompt arg
@@ -211,51 +305,15 @@ fn run_headless(cli: Cli, prompt: Option<String>, json: bool, from_stdin: bool) 
             }
         };
 
-        let mut stream = Box::pin(stream);
-        let mut exit_code = 0;
-        while let Some(event) = stream.next().await {
-            if json {
-                let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
-                println!("{line}");
-            } else {
-                match &event {
-                    yi_agent_core::AgentEvent::AssistantText(t) => {
-                        println!("{t}");
-                    }
-                    yi_agent_core::AgentEvent::ToolCall { name, input, .. } => {
-                        eprintln!("[tool:{name}] {input}");
-                    }
-                    yi_agent_core::AgentEvent::ToolResult { id, result } => {
-                        eprintln!(
-                            "[result:{id}] error={} content={:?}",
-                            result.is_error, result.content
-                        );
-                    }
-                    yi_agent_core::AgentEvent::Done { reason } => {
-                        eprintln!("[done:{reason:?}]");
-                    }
-                    yi_agent_core::AgentEvent::Cancelled => {
-                        eprintln!("[cancelled]");
-                        exit_code = 130;
-                    }
-                    yi_agent_core::AgentEvent::Error(e) => {
-                        eprintln!("[error:{e}]");
-                        exit_code = 1;
-                    }
-                    _ => {} // Usage, EstimatedPrefill, DecodeDelta, ToolOutputDelta, etc.
-                }
-            }
-            // Exit on terminal events
-            if matches!(
-                event,
-                yi_agent_core::AgentEvent::Done { .. }
-                    | yi_agent_core::AgentEvent::Cancelled
-                    | yi_agent_core::AgentEvent::Error(_)
-            ) {
-                break;
-            }
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let mut out = stdout.lock();
+        let mut err = stderr.lock();
+        if json {
+            drain_stream_json(stream, &mut out).await
+        } else {
+            drain_stream_human(stream, &mut out, &mut err).await
         }
-        exit_code
     });
 
     std::process::exit(exit_code);
@@ -632,5 +690,190 @@ mod tests {
         let expected = resolve_system_prompt(None);
         let resolved = resolve_system_prompt_with_skills(None, &Some(svc), 8192, false);
         assert_eq!(resolved, expected);
+    }
+
+    // --- drain_stream_human tests ---
+
+    use futures::stream::{self, BoxStream, StreamExt};
+    use yi_agent_core::{AgentEvent, DoneReason};
+
+    fn scripted_stream(events: Vec<AgentEvent>) -> BoxStream<'static, AgentEvent> {
+        stream::iter(events).boxed()
+    }
+
+    // Sync wrapper around `drain_stream_human` so tests can drive the async
+    // stream without spinning up a multi-thread runtime.
+    fn drain_stream_human_sync<W: std::io::Write, E: std::io::Write>(
+        stream: BoxStream<'static, AgentEvent>,
+        out: &mut W,
+        err: &mut E,
+    ) -> i32 {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(drain_stream_human(stream, out, err))
+    }
+
+    #[test]
+    fn drain_stream_human_concatenates_text_deltas_without_extra_newlines() {
+        // Bug regression: each AssistantText delta should NOT be on its own
+        // line. Three chunks "chunk1" "chunk2" "chunk3" must produce
+        // "chunk1chunk2chunk3\n" (one trailing newline), not
+        // "chunk1\nchunk2\nchunk3\n".
+        let stream = scripted_stream(vec![
+            AgentEvent::AssistantText("chunk1".into()),
+            AgentEvent::AssistantText("chunk2".into()),
+            AgentEvent::AssistantText("chunk3".into()),
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        assert_eq!(code, 0, "exit code should be 0 for Done::EndTurn");
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(
+            stdout, "chunk1chunk2chunk3\n",
+            "AssistantText deltas should concatenate without per-chunk newlines"
+        );
+        assert!(String::from_utf8(err).unwrap().contains("[done:"),);
+    }
+
+    #[test]
+    fn drain_stream_human_preserves_embedded_newlines_in_text() {
+        // The LLM's own newlines inside AssistantText must be preserved.
+        let stream = scripted_stream(vec![
+            AgentEvent::AssistantText("line one\n".into()),
+            AgentEvent::AssistantText("line two\n".into()),
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(
+            stdout, "line one\nline two\n",
+            "embedded newlines preserved, no extra trailing newline added"
+        );
+    }
+
+    #[test]
+    fn drain_stream_human_adds_trailing_newline_only_when_missing() {
+        // If the final AssistantText does NOT end with '\n', drain_stream
+        // should add exactly one so the shell prompt starts on a fresh line.
+        let stream = scripted_stream(vec![
+            AgentEvent::AssistantText("hello".into()),
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(stdout, "hello\n", "exactly one trailing newline added");
+    }
+
+    #[test]
+    fn drain_stream_human_no_trailing_newline_when_text_already_ends_with_newline() {
+        let stream = scripted_stream(vec![
+            AgentEvent::AssistantText("hello\n".into()),
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(
+            stdout, "hello\n",
+            "no duplicate trailing newline when text already ends with \\n"
+        );
+    }
+
+    #[test]
+    fn drain_stream_human_routes_tool_events_to_err_not_out() {
+        // ToolCall and ToolResult must go to stderr, not stdout, so they
+        // don't pollute the assistant text stream.
+        let stream = scripted_stream(vec![
+            AgentEvent::AssistantText("let me run ".into()),
+            AgentEvent::AssistantText("a command\n".into()),
+            AgentEvent::ToolCall {
+                id: "tool_1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"cmd": "echo hi"}),
+            },
+            AgentEvent::ToolResult {
+                id: "tool_1".into(),
+                result: yi_agent_core::ToolResult::text("hi\n"),
+            },
+            AgentEvent::AssistantText("done\n".into()),
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(
+            stdout, "let me run a command\ndone\n",
+            "stdout should contain only assistant text, concatenated"
+        );
+        assert!(
+            stderr.contains("[tool:bash]"),
+            "stderr should contain tool call: {stderr}"
+        );
+        assert!(
+            stderr.contains("[result:tool_1]"),
+            "stderr should contain tool result: {stderr}"
+        );
+    }
+
+    #[test]
+    fn drain_stream_human_cancelled_returns_exit_130() {
+        let stream = scripted_stream(vec![AgentEvent::Cancelled]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        assert_eq!(code, 130, "Cancelled should produce exit code 130");
+    }
+
+    #[test]
+    fn drain_stream_human_error_returns_exit_1() {
+        let stream = scripted_stream(vec![AgentEvent::Error(
+            yi_agent_core::AgentError::Provider(yi_agent_core::ProviderError::Network(
+                "boom".into(),
+            )),
+        )]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        assert_eq!(code, 1, "Error should produce exit code 1");
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("[error:"),
+            "stderr should contain error: {stderr}"
+        );
     }
 }
