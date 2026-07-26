@@ -213,7 +213,10 @@ mod tests {
             "should start with title: {s}"
         );
         // 表头行
-        assert!(s.contains("| 模型 | input |"), "should have header row: {s}");
+        assert!(
+            s.contains("| 模型 | input |"),
+            "should have header row: {s}"
+        );
         // 对齐行
         assert!(
             s.contains("| --- | ---: |"),
