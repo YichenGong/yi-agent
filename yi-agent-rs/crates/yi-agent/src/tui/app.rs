@@ -502,6 +502,16 @@ fn route_event(
         AgentEvent::DecodeDelta(text) => {
             statusbar.estimate_decode_tokens(text);
         }
+        AgentEvent::AutoCompacting {
+            old_msg_count,
+            new_msg_count,
+        } => {
+            tracing::info!(
+                old_msg_count,
+                new_msg_count,
+                "auto-compact: session compressed"
+            );
+        }
         _ => {}
     }
 }
