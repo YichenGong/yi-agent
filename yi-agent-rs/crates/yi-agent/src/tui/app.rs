@@ -795,7 +795,7 @@ fn execute_slash_command(
         }
         SlashCommand::Cost => {
             let text = cost.render();
-            history.push(HistoryCell::UserMessage { text });
+            history.push(HistoryCell::Markdown { text });
             KeyOutcome::None
         }
         SlashCommand::Config => {
@@ -3053,7 +3053,7 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
         match cell {
-            crate::tui::cell::HistoryCell::UserMessage { text } => {
+            crate::tui::cell::HistoryCell::Markdown { text } => {
                 assert!(
                     text.contains("claude-sonnet-4-5"),
                     "cost text should include model: {text}"
@@ -3063,7 +3063,7 @@ mod tests {
                     "cost text should include input tokens: {text}"
                 );
             }
-            other => panic!("expected UserMessage, got {other:?}"),
+            other => panic!("expected Markdown, got {other:?}"),
         }
     }
 
@@ -3086,13 +3086,13 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
         match cell {
-            crate::tui::cell::HistoryCell::UserMessage { text } => {
+            crate::tui::cell::HistoryCell::Markdown { text } => {
                 assert!(
                     text.contains("尚无数据"),
                     "empty cost should show no-data: {text}"
                 );
             }
-            other => panic!("expected UserMessage, got {other:?}"),
+            other => panic!("expected Markdown, got {other:?}"),
         }
     }
 
