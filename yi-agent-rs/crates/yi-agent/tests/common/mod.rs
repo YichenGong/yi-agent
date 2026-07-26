@@ -1,4 +1,9 @@
 //! 共享 helper:供 e2e_real.rs 和 e2e_complex.rs 复用。
+//!
+//! 每个测试二进制独立编译本模块,未被该二进制使用的 helper 会触发 dead_code。
+//! 加 module-level allow 避免每个函数单独标注。
+
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 
