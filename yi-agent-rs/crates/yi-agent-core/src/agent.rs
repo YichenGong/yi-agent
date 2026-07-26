@@ -365,7 +365,7 @@ async fn run_loop(
         };
 
         // Check 2: THINK 中 — select! between accumulate and cancel
-        let (content, _stop_reason) = tokio::select! {
+        let (content, _stop_reason, _last_usage) = tokio::select! {
             result = accumulate_provider_stream(stream, &tx, &model) => match result {
                 Ok(v) => v,
                 Err(e) => {
@@ -728,10 +728,10 @@ async fn accumulate_provider_stream(
     stream: BoxStream<'static, ProviderEvent>,
     tx: &mpsc::Sender<AgentEvent>,
     model: &str,
-) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
+) -> Result<(Vec<ContentBlock>, StopReason, Option<TokenUsage>), AgentError> {
     let tx = tx.clone();
     let model = model.to_string();
-    let (content, stop_reason) =
+    let (content, stop_reason, last_usage) =
         crate::provider::accumulate_stream(stream, move |event| match event {
             ProviderEvent::TextDelta(s) => {
                 let _ = tx.try_send(AgentEvent::AssistantText(s));
@@ -748,7 +748,7 @@ async fn accumulate_provider_stream(
             _ => {}
         })
         .await?;
-    Ok((content, stop_reason))
+    Ok((content, stop_reason, last_usage))
 }
 
 /// Heuristic token estimate: ASCII ~4 chars/token, non-ASCII (CJK etc.) ~1.5 chars/token.

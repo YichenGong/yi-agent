@@ -87,7 +87,7 @@ pub enum ProviderError {
 pub async fn accumulate_stream<F>(
     mut stream: BoxStream<'static, ProviderEvent>,
     mut on_event: F,
-) -> Result<(Vec<ContentBlock>, StopReason), ProviderError>
+) -> Result<(Vec<ContentBlock>, StopReason, Option<TokenUsage>), ProviderError>
 where
     F: FnMut(ProviderEvent),
 {
@@ -96,6 +96,7 @@ where
     let mut tool_uses: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut stop_reason = StopReason::EndTurn;
+    let mut last_usage: Option<TokenUsage> = None;
 
     while let Some(event) = stream.next().await {
         match event {
@@ -127,6 +128,7 @@ where
                 stop_reason = reason;
             }
             ProviderEvent::Usage(u) => {
+                last_usage = Some(u.clone());
                 on_event(ProviderEvent::Usage(u));
             }
         }
@@ -134,7 +136,7 @@ where
     if !current_text.is_empty() {
         content.push(ContentBlock::Text(current_text));
     }
-    Ok((content, stop_reason))
+    Ok((content, stop_reason, last_usage))
 }
 
 /// LLM provider trait.
@@ -149,7 +151,7 @@ pub trait Provider: Send + Sync {
     /// Convenience: accumulate stream into full response.
     async fn call(&self, req: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let stream = self.call_stream(req).await?;
-        let (content, stop_reason) = accumulate_stream(stream, |_| {}).await?;
+        let (content, stop_reason, _usage) = accumulate_stream(stream, |_| {}).await?;
         Ok(ProviderResponse {
             content,
             stop_reason,
@@ -383,7 +385,7 @@ mod tests {
 
         let mut received_text = Vec::new();
         let mut received_usage = Vec::new();
-        let (content, stop) = accumulate_stream(stream, |ev| match ev {
+        let (content, stop, _usage) = accumulate_stream(stream, |ev| match ev {
             ProviderEvent::TextDelta(s) => received_text.push(s),
             ProviderEvent::Usage(u) => received_usage.push(u),
             _ => {}
@@ -431,7 +433,7 @@ mod tests {
             .unwrap();
 
         let mut received_deltas = Vec::new();
-        let (content, _stop) = accumulate_stream(stream, |ev| {
+        let (content, _stop, _usage) = accumulate_stream(stream, |ev| {
             if let ProviderEvent::ToolUseDelta { partial_json, .. } = ev {
                 received_deltas.push(partial_json);
             }
@@ -489,7 +491,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, _, _) = accumulate_stream(stream, |_| {}).await.unwrap();
         assert_eq!(content.len(), 2);
         match &content[0] {
             ContentBlock::ToolUse { id, name, .. } => {
@@ -570,7 +572,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, _, _) = accumulate_stream(stream, |_| {}).await.unwrap();
         assert_eq!(content.len(), 2);
         assert!(matches!(content[0], ContentBlock::ToolUse { .. }));
         match &content[1] {
@@ -603,7 +605,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, _) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, _, _) = accumulate_stream(stream, |_| {}).await.unwrap();
         assert!(content.is_empty());
     }
 
@@ -620,7 +622,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, stop) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (content, stop, _) = accumulate_stream(stream, |_| {}).await.unwrap();
         assert!(content.is_empty());
         assert_eq!(stop, StopReason::EndTurn);
     }
@@ -644,7 +646,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (_, stop) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (_, stop, _) = accumulate_stream(stream, |_| {}).await.unwrap();
         assert_eq!(stop, StopReason::StopSequence);
     }
 
@@ -667,7 +669,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (_, stop) = accumulate_stream(stream, |_| {}).await.unwrap();
+        let (_, stop, _) = accumulate_stream(stream, |_| {}).await.unwrap();
         assert_eq!(stop, StopReason::Other("custom".into()));
     }
 
