@@ -191,16 +191,56 @@ fn run_loop<B: Backend, E: EventSource>(
     loop {
         let size = terminal.size()?;
         let width = size.width;
-        let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
-        let queued_height = queued_lines.len() as u16;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let pre_drain_layout = compute_layout(area, input, pending_quit, &popup, queued_height);
-        let history_area = pre_drain_layout.chunks[0];
-        let history_text_width = history.text_width(history_area.width, history_area.height);
-        history.reconcile_scroll_offset(history_text_width, history_area.height);
-
-        // Drain all pending agent events
+        let initial_queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
+        let initial_layout = compute_layout(
+            area,
+            input,
+            pending_quit,
+            &popup,
+            initial_queued_lines.len() as u16,
+        );
+        let initial_history_area = initial_layout.chunks[0];
+        let initial_text_width =
+            history.text_width(initial_history_area.width, initial_history_area.height);
+        history.reconcile_scroll_offset(initial_text_width, initial_history_area.height);
+        let initial_offset = history.scroll_offset;
+        let initial_cells = history.cells.clone();
+        let mut pending_events = Vec::new();
         while let Ok(event) = agent_rx.try_recv() {
+            pending_events.push(event);
+        }
+
+        // A completed turn promotes one queued item into history. Determine the
+        // resulting layout before applying those history mutations.
+        let promotion_count = pending_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
+                )
+            })
+            .count()
+            .min(queued.len());
+        let mut final_queue = queued.clone();
+        for _ in 0..promotion_count {
+            final_queue.pop_front();
+        }
+        let final_queued_lines = crate::tui::queued::render_queued_preview(&final_queue, width);
+        let final_layout = compute_layout(
+            area,
+            input,
+            pending_quit,
+            &popup,
+            final_queued_lines.len() as u16,
+        );
+        let final_history_area = final_layout.chunks[0];
+
+        // Reapply the offset from the final rendered line counts after all
+        // events and queued promotions have updated history.
+        history.scroll_offset = 0;
+        for event in pending_events {
             let is_turn_end = matches!(
                 event,
                 AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
@@ -211,14 +251,39 @@ fn run_loop<B: Backend, E: EventSource>(
                 &mut cost_tracker,
                 &event,
             );
-            history.push_event(event, history_text_width);
+            history.push_event(event, final_history_area.width);
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
                 if let Some(text) = queued.pop_front() {
-                    history.push(HistoryCell::UserMessage { text }, history_text_width);
+                    history.push(HistoryCell::UserMessage { text }, final_history_area.width);
                 }
             }
         }
+
+        let final_text_width =
+            history.text_width(final_history_area.width, final_history_area.height);
+        if initial_offset != 0 {
+            let initial_history = HistoryState {
+                cells: initial_cells,
+                selected: None,
+                scroll_offset: initial_offset,
+            };
+            let initial_lines = initial_history.flattened_line_count(initial_text_width);
+            let initial_top = initial_lines
+                .saturating_sub(initial_history_area.height as usize)
+                .saturating_sub(initial_offset);
+            let reflowed_initial_lines = initial_history.flattened_line_count(final_text_width);
+            let final_lines = history.flattened_line_count(final_text_width);
+            // Preserve the line at the old viewport top, even when queued
+            // promotion changes the history height or text reflows.
+            let equivalent_initial_top = initial_top
+                .saturating_add(reflowed_initial_lines)
+                .saturating_sub(initial_lines);
+            history.scroll_offset = final_lines
+                .saturating_sub(final_history_area.height as usize)
+                .saturating_sub(equivalent_initial_top);
+        }
+        history.reconcile_scroll_offset(final_text_width, final_history_area.height);
 
         let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
         let queued_height = queued_lines.len() as u16;
@@ -1256,7 +1321,7 @@ mod tests {
     use crate::tui::state::TaskStatus;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::Arc;
