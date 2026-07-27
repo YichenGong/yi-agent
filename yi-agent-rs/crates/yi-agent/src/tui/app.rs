@@ -28,6 +28,8 @@ use super::slash::{CommandPopup, SlashCommand};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
 
+const HISTORY_WHEEL_LINES: usize = 3;
+
 /// Run the ratatui TUI main loop with the real terminal.
 ///
 /// - `agent_rx`: receives agent events to display in history
@@ -194,7 +196,8 @@ fn run_loop<B: Backend, E: EventSource>(
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let pre_drain_layout = compute_layout(area, input, pending_quit, &popup, queued_height);
         let history_area = pre_drain_layout.chunks[0];
-        history.reconcile_scroll_offset(history_area.width, history_area.height);
+        let history_text_width = history.text_width(history_area.width, history_area.height);
+        history.reconcile_scroll_offset(history_text_width, history_area.height);
 
         // Drain all pending agent events
         while let Ok(event) = agent_rx.try_recv() {
@@ -208,11 +211,11 @@ fn run_loop<B: Backend, E: EventSource>(
                 &mut cost_tracker,
                 &event,
             );
-            history.push_event(event, history_area.width);
+            history.push_event(event, history_text_width);
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
                 if let Some(text) = queued.pop_front() {
-                    history.push(HistoryCell::UserMessage { text }, history_area.width);
+                    history.push(HistoryCell::UserMessage { text }, history_text_width);
                 }
             }
         }
@@ -347,13 +350,16 @@ fn run_loop<B: Backend, E: EventSource>(
                     continue;
                 }
                 let history_area = layout.chunks[0];
-                let max_offset = history.max_scroll_offset(history_area.width, history_area.height);
+                let history_text_width =
+                    history.text_width(history_area.width, history_area.height);
+                let max_offset = history.max_scroll_offset(history_text_width, history_area.height);
                 match handle_key(
                     key,
                     input,
                     history,
                     max_offset,
-                    history_area.width,
+                    history_text_width,
+                    history_area.height,
                     &cost_tracker,
                     input_tx,
                     interrupt_tx,
@@ -503,8 +509,8 @@ fn handle_mouse(
 ) {
     // Only react to scroll-wheel events.
     let scroll_delta = match mouse.kind {
-        MouseEventKind::ScrollUp => Some(1usize),
-        MouseEventKind::ScrollDown => Some(1usize),
+        MouseEventKind::ScrollUp => Some(HISTORY_WHEEL_LINES),
+        MouseEventKind::ScrollDown => Some(HISTORY_WHEEL_LINES),
         _ => None,
     };
     let Some(delta) = scroll_delta else {
@@ -540,7 +546,8 @@ fn handle_mouse(
     // History region: scroll the conversation history.
     if history_area.contains(pos) {
         *pending_quit = false;
-        let max_offset = history.max_scroll_offset(history_area.width, history_area.height);
+        let history_text_width = history.text_width(history_area.width, history_area.height);
+        let max_offset = history.max_scroll_offset(history_text_width, history_area.height);
         if is_scroll_down {
             history.scroll_down(delta);
         } else {
@@ -645,6 +652,7 @@ fn handle_key(
     history: &mut HistoryState,
     max_scroll_offset: usize,
     history_width: u16,
+    history_height: u16,
     cost_tracker: &CostTracker,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
@@ -821,6 +829,34 @@ fn handle_key(
         }
     }
 
+    match key.code {
+        KeyCode::Up if key.modifiers.is_empty() => {
+            history.scroll_up(1, max_scroll_offset);
+            return KeyOutcome::None;
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            history.scroll_down(1);
+            return KeyOutcome::None;
+        }
+        KeyCode::PageUp if key.modifiers.is_empty() => {
+            history.scroll_page_up(history_height, max_scroll_offset);
+            return KeyOutcome::None;
+        }
+        KeyCode::PageDown if key.modifiers.is_empty() => {
+            history.scroll_page_down(history_height);
+            return KeyOutcome::None;
+        }
+        KeyCode::Home if key.modifiers.is_empty() => {
+            history.scroll_to_top(history_width, history_height);
+            return KeyOutcome::None;
+        }
+        KeyCode::End if key.modifiers.is_empty() => {
+            history.scroll_to_bottom();
+            return KeyOutcome::None;
+        }
+        _ => {}
+    }
+
     // Input handling
     match input.handle_key(key) {
         InputAction::Submit => {
@@ -919,6 +955,7 @@ fn sync_popup(popup: &mut Option<CommandPopup>, buffer: &str) {
 }
 
 /// Execute a slash command locally (does not send to agent).
+#[allow(clippy::too_many_arguments)]
 fn execute_slash_command(
     cmd: SlashCommand,
     args: Option<String>,
@@ -3279,6 +3316,79 @@ mod tests {
     }
 
     #[test]
+    fn normal_navigation_keys_route_to_history_without_affecting_shift_selection() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        for _ in 0..120 {
+            history.push(HistoryCell::Separator { label: None }, 80);
+        }
+        history.scroll_offset = 5;
+
+        for (key, expected_offset) in [
+            (KeyCode::Up, 6),
+            (KeyCode::Down, 5),
+            (KeyCode::PageUp, 25),
+            (KeyCode::PageDown, 5),
+            (KeyCode::Home, 100),
+            (KeyCode::End, 0),
+        ] {
+            let outcome = handle_key(
+                make_key(key, KeyModifiers::NONE),
+                &mut input,
+                &mut history,
+                100,
+                80,
+                20,
+                &CostTracker::default(),
+                &input_tx,
+                &interrupt_tx,
+                &control_tx,
+                &decision_tx,
+                &is_running,
+                &mut queued,
+                &mut pending_quit,
+                &mut popup,
+            );
+            assert_eq!(outcome, KeyOutcome::None);
+            assert_eq!(history.scroll_offset, expected_offset, "key {key:?}");
+        }
+
+        history.selected = Some(5);
+        let _ = handle_key(
+            make_key(KeyCode::Up, KeyModifiers::SHIFT),
+            &mut input,
+            &mut history,
+            100,
+            80,
+            20,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert_eq!(history.selected, Some(4));
+        assert_eq!(
+            history.scroll_offset, 0,
+            "Shift+Up keeps selection behavior"
+        );
+    }
+
+    #[test]
     fn esc_when_running_sends_interrupt() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
@@ -3298,6 +3408,7 @@ mod tests {
             &mut history,
             1000,
             80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3336,6 +3447,7 @@ mod tests {
             &mut history,
             1000,
             80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3374,6 +3486,7 @@ mod tests {
             &mut history,
             1000,
             80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3409,6 +3522,7 @@ mod tests {
             &mut history,
             1000,
             80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3425,6 +3539,7 @@ mod tests {
             &mut history,
             1000,
             80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3463,6 +3578,7 @@ mod tests {
             &mut history,
             1000,
             80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3513,6 +3629,7 @@ mod tests {
             &mut history,
             1000,
             80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3663,6 +3780,11 @@ mod tests {
         (layout, history)
     }
 
+    #[test]
+    fn history_wheel_events_move_three_lines() {
+        assert_eq!(HISTORY_WHEEL_LINES, 3);
+    }
+
     /// Scrolling up over the history region should increase `scroll_offset`.
     #[test]
     fn mouse_scroll_up_in_history_increases_offset() {
@@ -3692,7 +3814,7 @@ mod tests {
             &mut pending_quit,
         );
         assert_eq!(
-            hist.scroll_offset, 1,
+            hist.scroll_offset, 3,
             "ScrollUp in history should scroll up"
         );
 
@@ -3705,7 +3827,7 @@ mod tests {
             &registry,
             &mut pending_quit,
         );
-        assert_eq!(hist.scroll_offset, 2, "second ScrollUp should accumulate");
+        assert_eq!(hist.scroll_offset, 6, "second ScrollUp should accumulate");
     }
 
     /// Scrolling down over the history region should decrease `scroll_offset`
@@ -3738,7 +3860,7 @@ mod tests {
             &mut pending_quit,
         );
         assert_eq!(
-            hist.scroll_offset, 4,
+            hist.scroll_offset, 2,
             "ScrollDown in history should decrease offset"
         );
 

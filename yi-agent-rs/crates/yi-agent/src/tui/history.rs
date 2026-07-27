@@ -401,7 +401,11 @@ impl<'a> Widget for HistoryView<'a> {
         }
 
         if show_scrollbar {
-            let mut scrollbar_state = ScrollbarState::new(total).position(effective_offset);
+            let max_offset = total.saturating_sub(visible_height);
+            let top_origin_position = max_offset.saturating_sub(effective_offset);
+            let mut scrollbar_state = ScrollbarState::new(total)
+                .viewport_content_length(visible_height)
+                .position(top_origin_position);
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .thumb_symbol("█")
                 .track_symbol(Some(" "))
@@ -975,6 +979,55 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_uses_top_origin_while_history_offset_uses_bottom_origin() {
+        let mut state = HistoryState::new();
+        for row in 0..10 {
+            state.push(
+                HistoryCell::UserMessage {
+                    text: format!("row {row}"),
+                },
+                20,
+            );
+        }
+
+        let thumb_rows = |state: &HistoryState| {
+            let backend = TestBackend::new(20, 5);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame.render_widget(
+                        HistoryView {
+                            state,
+                            width: area.width,
+                        },
+                        area,
+                    );
+                })
+                .unwrap();
+            (0..5u16)
+                .filter(|&y| terminal.backend().buffer()[(19, y)].symbol() == "█")
+                .collect::<Vec<_>>()
+        };
+
+        let bottom_rows = thumb_rows(&state);
+        assert_eq!(
+            bottom_rows.last(),
+            Some(&3),
+            "offset zero puts thumb at bottom"
+        );
+
+        let text_width = state.text_width(20, 5);
+        state.scroll_offset = state.max_scroll_offset(text_width, 5);
+        let top_rows = thumb_rows(&state);
+        assert_eq!(
+            top_rows.first(),
+            Some(&1),
+            "larger offsets move thumb upward"
+        );
+    }
+
+    #[test]
     fn text_width_only_reserves_a_column_when_it_can_show_a_scrollbar() {
         let mut state = HistoryState::new();
         state.push(
@@ -1008,6 +1061,37 @@ mod tests {
             0,
             "zero-width areas stay zero-width"
         );
+    }
+
+    #[test]
+    fn streaming_uses_reserved_scrollbar_width_to_preserve_scrolled_position() {
+        let area_width = 20;
+        let viewport_height = 3;
+        let mut state = HistoryState::new();
+        for _ in 0..4 {
+            state.push(HistoryCell::Separator { label: None }, area_width);
+        }
+        let text_width = state.text_width(area_width, viewport_height);
+        assert_eq!(text_width, 19, "overflow reserves the scrollbar column");
+
+        state.push_event(
+            AgentEvent::AssistantText("123456789012345678".into()),
+            text_width,
+        );
+        state.scroll_offset = 2;
+        let before = state.flattened_line_count(text_width);
+
+        state.push_event(
+            AgentEvent::AssistantText(" wrapping stream content".into()),
+            text_width,
+        );
+
+        let after = state.flattened_line_count(text_width);
+        assert!(
+            after > before,
+            "the streamed text should wrap at the reserved width"
+        );
+        assert_eq!(state.scroll_offset, 2 + (after - before));
     }
 
     #[test]
