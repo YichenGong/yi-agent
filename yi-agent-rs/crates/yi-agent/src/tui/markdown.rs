@@ -3,6 +3,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static LIST_PARENT_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Render a markdown string into ratatui Lines, wrapped at `width`.
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
@@ -155,10 +163,6 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
         .bytes()
         .take_while(|ch| *ch == b' ')
         .count();
-    let list_indented = quote_depth == 0 && indent > 3 && has_list_parent(src, index);
-    if indent > 3 && !list_indented {
-        return None;
-    }
     let fence_start = index + container_prefix + indent;
     let fence = *src.as_bytes().get(fence_start)?;
     if fence != b'`' && fence != b'~' {
@@ -169,6 +173,10 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
         .take_while(|ch| *ch == fence)
         .count();
     if fence_len < 3 {
+        return None;
+    }
+    let list_indented = quote_depth == 0 && indent > 3 && has_list_parent(src, index);
+    if indent > 3 && !list_indented {
         return None;
     }
 
@@ -244,6 +252,9 @@ fn blockquote_prefix(line: &str) -> (usize, usize) {
 }
 
 fn has_list_parent(src: &str, line_start: usize) -> bool {
+    #[cfg(test)]
+    LIST_PARENT_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
+
     src[..line_start]
         .lines()
         .rev()
@@ -1011,11 +1022,27 @@ mod tests {
         line.spans.iter().map(|s| s.content.to_string()).collect()
     }
 
+    fn reset_list_parent_lookups() {
+        LIST_PARENT_LOOKUPS.with(|lookups| lookups.set(0));
+    }
+
+    fn list_parent_lookups() -> usize {
+        LIST_PARENT_LOOKUPS.with(Cell::get)
+    }
+
     #[test]
     fn plain_text_renders_as_single_line() {
         let lines = render_markdown("hello world", 80);
         assert_eq!(lines.len(), 1);
         assert_eq!(spans_text(&lines[0]), "hello world");
+    }
+
+    #[test]
+    fn deeply_indented_non_fence_skips_list_parent_lookup() {
+        reset_list_parent_lookups();
+
+        assert_eq!(fenced_code_end("    ordinary text", 0), None);
+        assert_eq!(list_parent_lookups(), 0);
     }
 
     #[test]
