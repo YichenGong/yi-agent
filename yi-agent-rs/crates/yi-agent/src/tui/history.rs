@@ -7,6 +7,13 @@ use yi_agent_core::{AgentEvent, DoneReason};
 
 use super::cell::HistoryCell;
 
+/// A location in the history content, independent of its current wrapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ViewportAnchor {
+    cell_index: usize,
+    line_in_cell: usize,
+}
+
 /// State for the scrollable history area.
 pub struct HistoryState {
     pub cells: Vec<HistoryCell>,
@@ -89,6 +96,80 @@ impl HistoryState {
         self.scroll_offset = self
             .scroll_offset
             .min(self.max_scroll_offset(width, visible_height));
+    }
+
+    /// Capture the top visible content location when the viewport is not
+    /// following the bottom. A user-message spacer belongs to that user cell.
+    pub(super) fn capture_viewport_anchor(
+        &self,
+        text_width: u16,
+        viewport_height: u16,
+    ) -> Option<ViewportAnchor> {
+        let total = self.flattened_line_count(text_width);
+        let effective_offset = self
+            .scroll_offset
+            .min(total.saturating_sub(viewport_height as usize));
+        if effective_offset == 0 {
+            return None;
+        }
+
+        let anchor_top = total.saturating_sub(viewport_height as usize + effective_offset);
+        let mut lines_before = 0;
+        for (cell_index, cell) in self.cells.iter().enumerate() {
+            let cell_lines = cell.line_count(text_width);
+            if anchor_top < lines_before + cell_lines {
+                return Some(ViewportAnchor {
+                    cell_index,
+                    line_in_cell: anchor_top - lines_before,
+                });
+            }
+            lines_before += cell_lines;
+
+            if matches!(cell, HistoryCell::UserMessage { .. }) && cell_index + 1 < self.cells.len()
+            {
+                if anchor_top == lines_before {
+                    return Some(ViewportAnchor {
+                        cell_index,
+                        line_in_cell: cell_lines,
+                    });
+                }
+                lines_before += 1;
+            }
+        }
+
+        None
+    }
+
+    /// Restore a captured top-of-viewport location after wrapping changes.
+    pub(super) fn restore_viewport_anchor(
+        &mut self,
+        anchor: ViewportAnchor,
+        text_width: u16,
+        viewport_height: u16,
+    ) {
+        let Some(anchor_cell) = self.cells.get(anchor.cell_index) else {
+            self.reconcile_scroll_offset(text_width, viewport_height);
+            return;
+        };
+
+        let mut anchor_top = 0;
+        for (cell_index, cell) in self.cells.iter().enumerate() {
+            if cell_index == anchor.cell_index {
+                anchor_top += anchor.line_in_cell.min(anchor_cell.line_count(text_width));
+                break;
+            }
+
+            anchor_top += cell.line_count(text_width);
+            if matches!(cell, HistoryCell::UserMessage { .. }) {
+                anchor_top += 1;
+            }
+        }
+
+        let total = self.flattened_line_count(text_width);
+        self.scroll_offset = total
+            .saturating_sub(viewport_height as usize)
+            .saturating_sub(anchor_top)
+            .min(self.max_scroll_offset(text_width, viewport_height));
     }
 
     /// Move selection up by one cell.
@@ -419,6 +500,55 @@ mod tests {
     use super::*;
     use crate::tui::cell::HistoryCell;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn two_multiline_assistant_cells() -> HistoryState {
+        HistoryState {
+            cells: vec![
+                HistoryCell::AssistantMessage {
+                    markdown: "alpha bravo charlie delta echo foxtrot golf hotel".into(),
+                },
+                HistoryCell::AssistantMessage {
+                    markdown: "india juliet kilo lima mike november oscar papa".into(),
+                },
+            ],
+            selected: None,
+            scroll_offset: 0,
+        }
+    }
+
+    #[test]
+    fn viewport_anchor_keeps_same_cell_line_through_reflow() {
+        let mut state = two_multiline_assistant_cells();
+        state.scroll_offset = 2;
+
+        let anchor = state
+            .capture_viewport_anchor(20, 3)
+            .expect("a non-bottom viewport should have an anchor");
+        assert_eq!(
+            anchor,
+            ViewportAnchor {
+                cell_index: 0,
+                line_in_cell: 1,
+            }
+        );
+
+        state.restore_viewport_anchor(anchor, 10, 4);
+
+        assert_eq!(
+            state.capture_viewport_anchor(10, 4),
+            Some(ViewportAnchor {
+                cell_index: 0,
+                line_in_cell: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn viewport_anchor_is_none_at_bottom() {
+        let state = two_multiline_assistant_cells();
+
+        assert_eq!(state.capture_viewport_anchor(20, 3), None);
+    }
 
     #[test]
     fn push_preserves_position_when_scrolled_up() {
