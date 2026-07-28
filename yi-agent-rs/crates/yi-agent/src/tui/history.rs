@@ -11,7 +11,13 @@ use super::cell::HistoryCell;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ViewportAnchor {
     cell_index: usize,
-    line_in_cell: usize,
+    position: AnchorPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorPosition {
+    ContentLine(usize),
+    AfterCellSpacer,
 }
 
 /// State for the scrollable history area.
@@ -120,7 +126,7 @@ impl HistoryState {
             if anchor_top < lines_before + cell_lines {
                 return Some(ViewportAnchor {
                     cell_index,
-                    line_in_cell: anchor_top - lines_before,
+                    position: AnchorPosition::ContentLine(anchor_top - lines_before),
                 });
             }
             lines_before += cell_lines;
@@ -130,7 +136,7 @@ impl HistoryState {
                 if anchor_top == lines_before {
                     return Some(ViewportAnchor {
                         cell_index,
-                        line_in_cell: cell_lines,
+                        position: AnchorPosition::AfterCellSpacer,
                     });
                 }
                 lines_before += 1;
@@ -155,7 +161,12 @@ impl HistoryState {
         let mut anchor_top = 0;
         for (cell_index, cell) in self.cells.iter().enumerate() {
             if cell_index == anchor.cell_index {
-                anchor_top += anchor.line_in_cell.min(anchor_cell.line_count(text_width));
+                anchor_top += match anchor.position {
+                    AnchorPosition::ContentLine(line_in_cell) => {
+                        line_in_cell.min(anchor_cell.line_count(text_width))
+                    }
+                    AnchorPosition::AfterCellSpacer => anchor_cell.line_count(text_width),
+                };
                 break;
             }
 
@@ -528,7 +539,7 @@ mod tests {
             anchor,
             ViewportAnchor {
                 cell_index: 0,
-                line_in_cell: 1,
+                position: AnchorPosition::ContentLine(1),
             }
         );
 
@@ -538,7 +549,7 @@ mod tests {
             state.capture_viewport_anchor(10, 4),
             Some(ViewportAnchor {
                 cell_index: 0,
-                line_in_cell: 1,
+                position: AnchorPosition::ContentLine(1),
             })
         );
     }
@@ -548,6 +559,55 @@ mod tests {
         let state = two_multiline_assistant_cells();
 
         assert_eq!(state.capture_viewport_anchor(20, 3), None);
+    }
+
+    #[test]
+    fn viewport_anchor_restores_user_spacer_after_reflow() {
+        let old_width = 20;
+        let new_width = 10;
+        let viewport_height = 1;
+        let mut state = HistoryState {
+            cells: vec![
+                HistoryCell::UserMessage {
+                    text: "alpha bravo charlie delta echo foxtrot".into(),
+                },
+                HistoryCell::AssistantMessage {
+                    markdown: "india juliet kilo lima mike november oscar papa".into(),
+                },
+            ],
+            selected: None,
+            scroll_offset: 0,
+        };
+        let old_user_lines = state.cells[0].line_count(old_width);
+        state.scroll_offset = state
+            .flattened_line_count(old_width)
+            .saturating_sub(viewport_height as usize + old_user_lines);
+
+        let anchor = state
+            .capture_viewport_anchor(old_width, viewport_height)
+            .expect("the spacer is above the bottom viewport");
+        assert_eq!(
+            anchor,
+            ViewportAnchor {
+                cell_index: 0,
+                position: AnchorPosition::AfterCellSpacer,
+            }
+        );
+
+        state.restore_viewport_anchor(anchor, new_width, viewport_height);
+
+        let new_user_lines = state.cells[0].line_count(new_width);
+        assert!(
+            new_user_lines > old_user_lines,
+            "the user message must wrap differently at the new width"
+        );
+        assert_eq!(
+            state.scroll_offset,
+            state
+                .flattened_line_count(new_width)
+                .saturating_sub(viewport_height as usize + new_user_lines),
+            "the spacer, rather than a reflowed user-content line, remains at the top"
+        );
     }
 
     #[test]
