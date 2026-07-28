@@ -466,6 +466,8 @@ fn render_math(formula: &str) -> String {
     TexRenderer::new(formula).render()
 }
 
+const MAX_TEX_NESTING: usize = 32;
+
 struct TexRenderer {
     chars: Vec<char>,
     position: usize,
@@ -480,10 +482,10 @@ impl TexRenderer {
     }
 
     fn render(mut self) -> String {
-        self.render_until(None)
+        self.render_until(None, 0)
     }
 
-    fn render_until(&mut self, closing: Option<char>) -> String {
+    fn render_until(&mut self, closing: Option<char>, depth: usize) -> String {
         let mut rendered = String::new();
 
         while let Some(ch) = self.next_char() {
@@ -491,10 +493,16 @@ impl TexRenderer {
                 break;
             }
             match ch {
-                '\\' => rendered.push_str(&self.render_command()),
-                '{' => rendered.push_str(&self.render_until(Some('}'))),
-                '^' => rendered.push_str(&self.render_script(true)),
-                '_' => rendered.push_str(&self.render_script(false)),
+                '\\' => rendered.push_str(&self.render_command(depth)),
+                '{' => {
+                    if depth >= MAX_TEX_NESTING {
+                        rendered.push_str(&self.consume_raw_group_after_open());
+                    } else {
+                        rendered.push_str(&self.render_until(Some('}'), depth + 1));
+                    }
+                }
+                '^' => rendered.push_str(&self.render_script(true, depth)),
+                '_' => rendered.push_str(&self.render_script(false, depth)),
                 _ => rendered.push(ch),
             }
         }
@@ -502,7 +510,7 @@ impl TexRenderer {
         rendered
     }
 
-    fn render_command(&mut self) -> String {
+    fn render_command(&mut self, depth: usize) -> String {
         let name = self.consume_command_name();
         match name.as_str() {
             "alpha" => "α".to_string(),
@@ -538,12 +546,9 @@ impl TexRenderer {
             "to" | "rightarrow" => "→".to_string(),
             "sin" | "cos" | "tan" => name,
             "left" | "right" => String::new(),
-            "frac" => {
-                let numerator = self.render_argument();
-                let denominator = self.render_argument();
-                format!("{numerator}⁄{denominator}")
-            }
-            "sqrt" => format!("√{}", self.render_argument()),
+            "frac" => self.render_fraction(depth),
+            "sqrt" => format!("√{}", self.render_argument(depth)),
+            _ if name.is_empty() => "\\".to_string(),
             _ => name,
         }
     }
@@ -560,22 +565,84 @@ impl TexRenderer {
         self.chars[start..self.position].iter().collect()
     }
 
-    fn render_argument(&mut self) -> String {
+    fn render_fraction(&mut self, depth: usize) -> String {
+        let numerator_end = self.braced_group_end(self.position);
+        let denominator_end = numerator_end.and_then(|end| self.braced_group_end(end));
+        if denominator_end.is_none() {
+            return "frac".to_string();
+        }
+
+        let numerator = self.render_argument(depth);
+        let denominator = self.render_argument(depth);
+        format!("{numerator}⁄{denominator}")
+    }
+
+    fn render_argument(&mut self, depth: usize) -> String {
         if self.peek_char() == Some('{') {
+            if depth >= MAX_TEX_NESTING {
+                self.position += 1;
+                self.consume_raw_group_after_open()
+            } else {
+                self.position += 1;
+                self.render_until(Some('}'), depth + 1)
+            }
+        } else if self.peek_char() == Some('\\') {
             self.position += 1;
-            self.render_until(Some('}'))
+            self.render_command(depth)
         } else {
             self.next_char()
                 .map_or_else(String::new, |ch| ch.to_string())
         }
     }
 
-    fn render_script(&mut self, superscript: bool) -> String {
-        let script = self.render_argument();
+    fn render_script(&mut self, superscript: bool, depth: usize) -> String {
+        let script = self.render_argument(depth);
         script
             .chars()
             .map(|ch| map_script_character(ch, superscript))
             .collect()
+    }
+
+    fn braced_group_end(&self, start: usize) -> Option<usize> {
+        if self.chars.get(start) != Some(&'{') {
+            return None;
+        }
+
+        let mut nesting = 0;
+        for (index, ch) in self.chars.iter().enumerate().skip(start) {
+            match ch {
+                '{' => nesting += 1,
+                '}' => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn consume_raw_group_after_open(&mut self) -> String {
+        let mut raw = String::from("{");
+        let mut nesting = 1;
+
+        while let Some(ch) = self.next_char() {
+            raw.push(ch);
+            match ch {
+                '{' => nesting += 1,
+                '}' => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        raw
     }
 
     fn peek_char(&self) -> Option<char> {
@@ -742,6 +809,32 @@ mod tests {
     fn unsupported_math_command_remains_readable() {
         let rendered = render_markdown("$\\unknown{x}$", 80);
         assert_eq!(spans_text(&rendered[0]), "unknownx");
+    }
+
+    #[test]
+    fn script_command_arguments_remain_readable_without_slashes() {
+        let rendered = render_markdown("$x^\\alpha + a_\\infty$", 80);
+        assert_eq!(spans_text(&rendered[0]), "xα + a∞");
+    }
+
+    #[test]
+    fn malformed_fraction_commands_remain_readable() {
+        let incomplete = render_markdown("$\\frac{a}$", 80);
+        let bare = render_markdown("$\\frac$", 80);
+
+        assert_eq!(spans_text(&incomplete[0]), "fraca");
+        assert_eq!(spans_text(&bare[0]), "frac");
+        assert_eq!(render_math("\\"), "\\");
+    }
+
+    #[test]
+    fn nesting_beyond_the_limit_keeps_group_content_readable() {
+        let nesting = 33;
+        let formula = format!("${}x{}$", "{".repeat(nesting), "}".repeat(nesting));
+
+        let rendered = render_markdown(&formula, 120);
+
+        assert!(spans_text(&rendered[0]).contains("{x}"));
     }
 
     #[test]
