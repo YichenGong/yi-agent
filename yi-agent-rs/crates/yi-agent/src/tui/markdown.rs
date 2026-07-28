@@ -138,7 +138,9 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
         let line = &src[line_start..line_end];
         let spaces = line.bytes().take_while(|ch| *ch == b' ').count();
         let run = line[spaces..].bytes().take_while(|ch| *ch == fence).count();
-        if spaces <= 3 && run >= fence_len {
+        let remainder = &line[spaces + run..];
+        if spaces <= 3 && run >= fence_len && remainder.bytes().all(|ch| matches!(ch, b' ' | b'\t'))
+        {
             return Some(if line_end < src.len() {
                 line_end + 1
             } else {
@@ -151,7 +153,10 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
             line_end
         };
     }
-    None
+
+    // pulldown-cmark treats an unclosed fence as a code block through EOF, so
+    // the normalizer must leave its content untouched as well.
+    Some(src.len())
 }
 
 fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize> {
@@ -982,6 +987,26 @@ mod tests {
                 .iter()
                 .any(|line| spans_text(line).contains(r"\[\sqrt{x}\]"))
         );
+    }
+
+    #[test]
+    fn unclosed_fenced_code_preserves_backslash_math_delimiters_to_eof() {
+        let rendered: Vec<String> = render_markdown("```text\n\\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn invalid_fence_closer_does_not_end_code_protection() {
+        let rendered: Vec<String> = render_markdown("```text\n```not-a-close\n\\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
     }
 
     #[test]
