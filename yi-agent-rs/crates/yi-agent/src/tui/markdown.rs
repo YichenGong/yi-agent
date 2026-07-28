@@ -190,6 +190,12 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
             .take_while(|ch| *ch == fence)
             .count();
         let remainder = &line[container_prefix + spaces + run..];
+        if !line.trim().is_empty()
+            && ((quote_depth > 0 && line_quote_depth < quote_depth)
+                || (list_indented && line_quote_depth == 0 && spaces < indent))
+        {
+            return Some(line_start);
+        }
         let valid_indent = if list_indented {
             spaces >= indent
         } else {
@@ -213,8 +219,8 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
         };
     }
 
-    // pulldown-cmark treats an unclosed fence as a code block through EOF, so
-    // the normalizer must leave its content untouched as well.
+    // An unclosed fence remains code until its container ends, or EOF for a
+    // top-level fence, so the normalizer must leave that range untouched.
     Some(src.len())
 }
 
@@ -1098,6 +1104,16 @@ mod tests {
     }
 
     #[test]
+    fn unclosed_blockquote_fence_stops_protection_at_outer_prose() {
+        let rendered: Vec<String> = render_markdown("> ```text\n> code\noutside \\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("outside x")));
+    }
+
+    #[test]
     fn list_indented_fenced_code_preserves_backslash_math_delimiters() {
         let rendered: Vec<String> = render_markdown("- item\n\n    ```text\n    \\(x\\)", 80)
             .iter()
@@ -1105,6 +1121,17 @@ mod tests {
             .collect();
 
         assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn unclosed_list_fence_stops_protection_at_outer_prose() {
+        let rendered: Vec<String> =
+            render_markdown("- item\n\n    ```text\n    code\noutside \\(x\\)", 80)
+                .iter()
+                .map(spans_text)
+                .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("outside x")));
     }
 
     #[test]
