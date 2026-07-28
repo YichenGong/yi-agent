@@ -6,12 +6,167 @@ use unicode_width::UnicodeWidthStr;
 /// Render a markdown string into ratatui Lines, wrapped at `width`.
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
-    let parser = Parser::new_ext(src, opts);
+    let normalized = normalize_math_delimiters(src);
+    let parser = Parser::new_ext(&normalized, opts);
     let mut builder = LineBuilder::new(width);
     for event in parser {
         builder.handle_event(event);
     }
     builder.finish()
+}
+
+/// Convert TeX's `\\(...\\)` and `\\[...\\]` delimiters to pulldown-cmark's
+/// dollar syntax, without changing Markdown code spans or fenced code blocks.
+fn normalize_math_delimiters(src: &str) -> String {
+    let mut normalized = String::with_capacity(src.len());
+    let mut plain_start = 0;
+    let mut index = 0;
+
+    while index < src.len() {
+        if let Some(fence_end) = fenced_code_end(src, index) {
+            normalized.push_str(&normalize_math_text(&src[plain_start..index]));
+            normalized.push_str(&src[index..fence_end]);
+            index = fence_end;
+            plain_start = index;
+        } else if src[index..].starts_with('`') {
+            let ticks = src[index..].bytes().take_while(|ch| *ch == b'`').count();
+            if let Some(close) = closing_backticks(src, index + ticks, ticks) {
+                normalized.push_str(&normalize_math_text(&src[plain_start..index]));
+                normalized.push_str(&src[index..close + ticks]);
+                index = close + ticks;
+                plain_start = index;
+            } else {
+                index += ticks;
+            }
+        } else {
+            index += src[index..].chars().next().expect("valid UTF-8").len_utf8();
+        }
+    }
+
+    normalized.push_str(&normalize_math_text(&src[plain_start..]));
+    normalized
+}
+
+fn normalize_math_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut index = 0;
+
+    while index < text.len() {
+        let delimiter = match &text[index..] {
+            rest if rest.starts_with(r"\(") && !is_escaped(text, index) => Some((r"\)", false)),
+            rest if rest.starts_with(r"\[") && !is_escaped(text, index) => Some((r"\]", true)),
+            _ => None,
+        };
+
+        if let Some((closing, display)) = delimiter {
+            if let Some(close) = find_closing_delimiter(text, index + 2, closing) {
+                let dollar = if display { "$$" } else { "$" };
+                normalized.push_str(dollar);
+                normalized.push_str(&text[index + 2..close]);
+                normalized.push_str(dollar);
+                index = close + 2;
+                continue;
+            }
+        }
+
+        // Markdown consumes the slash of an unmatched TeX delimiter. Double it
+        // so malformed or escaped math stays visible to the user.
+        if !is_escaped(text, index)
+            && [r"\(", r"\)", r"\[", r"\]"]
+                .iter()
+                .any(|d| text[index..].starts_with(d))
+        {
+            normalized.push('\\');
+        }
+
+        let ch = text[index..].chars().next().expect("valid UTF-8");
+        normalized.push(ch);
+        index += ch.len_utf8();
+    }
+
+    normalized
+}
+
+fn find_closing_delimiter(text: &str, mut index: usize, closing: &str) -> Option<usize> {
+    while index < text.len() {
+        if text[index..].starts_with(closing) && !is_escaped(text, index) {
+            return Some(index);
+        }
+        index += text[index..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn is_escaped(text: &str, index: usize) -> bool {
+    text[..index]
+        .bytes()
+        .rev()
+        .take_while(|ch| *ch == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
+    if index != 0 && src.as_bytes()[index - 1] != b'\n' {
+        return None;
+    }
+    let indent = src[index..].bytes().take_while(|ch| *ch == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let fence_start = index + indent;
+    let fence = *src.as_bytes().get(fence_start)?;
+    if fence != b'`' && fence != b'~' {
+        return None;
+    }
+    let fence_len = src[fence_start..]
+        .bytes()
+        .take_while(|ch| *ch == fence)
+        .count();
+    if fence_len < 3 {
+        return None;
+    }
+
+    let mut line_start = src[fence_start..]
+        .find('\n')
+        .map_or(src.len(), |offset| fence_start + offset + 1);
+    while line_start < src.len() {
+        let line_end = src[line_start..]
+            .find('\n')
+            .map_or(src.len(), |offset| line_start + offset);
+        let line = &src[line_start..line_end];
+        let spaces = line.bytes().take_while(|ch| *ch == b' ').count();
+        let run = line[spaces..].bytes().take_while(|ch| *ch == fence).count();
+        if spaces <= 3 && run >= fence_len {
+            return Some(if line_end < src.len() {
+                line_end + 1
+            } else {
+                line_end
+            });
+        }
+        line_start = if line_end < src.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+    }
+    None
+}
+
+fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize> {
+    while index < src.len() {
+        if src[index..].starts_with('`') {
+            let run = src[index..].bytes().take_while(|ch| *ch == b'`').count();
+            if run >= ticks {
+                return Some(index);
+            }
+            index += run;
+        } else {
+            index += src[index..].chars().next()?.len_utf8();
+        }
+    }
+    None
 }
 
 struct LineBuilder {
@@ -797,6 +952,47 @@ mod tests {
             .expect("formula span");
         assert_eq!(formula.style.fg, Some(Color::Cyan));
         assert_eq!(spans_text(&lines[0]), "area is π r².");
+    }
+
+    #[test]
+    fn inline_backslash_parenthesis_math_renders_as_inline_math() {
+        let lines = render_markdown(r"mass \(\alpha + \beta\)", 80);
+
+        assert_eq!(spans_text(&lines[0]), "mass α + β");
+    }
+
+    #[test]
+    fn backslash_bracket_math_renders_on_its_own_line() {
+        let rendered: Vec<String> = render_markdown("before\n\n\\[\\sqrt{x}\\]\n\nafter", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert_eq!(rendered, ["before", "√x", "after"]);
+    }
+
+    #[test]
+    fn backslash_math_delimiters_in_code_are_preserved() {
+        let inline = render_markdown(r"`\(\alpha\)`", 80);
+        let fenced = render_markdown("```text\n\\[\\sqrt{x}\\]\n```", 80);
+
+        assert_eq!(spans_text(&inline[0]), r"\(\alpha\)");
+        assert!(
+            fenced
+                .iter()
+                .any(|line| spans_text(line).contains(r"\[\sqrt{x}\]"))
+        );
+    }
+
+    #[test]
+    fn unmatched_or_escaped_backslash_math_delimiters_remain_literal() {
+        let unmatched = render_markdown(r"mass \(\alpha", 80);
+        let escaped = render_markdown(r"mass \\(\alpha\\)", 80);
+
+        assert!(spans_text(&unmatched[0]).contains(r"\(\alpha"));
+        let escaped_text = spans_text(&escaped[0]);
+        assert!(escaped_text.contains(r"\("));
+        assert!(escaped_text.contains(r"\)"));
     }
 
     #[test]
