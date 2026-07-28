@@ -374,7 +374,7 @@ fn is_list_item_line(line: &str) -> bool {
 
 fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize> {
     while index < src.len() {
-        if !is_backslash_escaped(src, index) && src[index..].starts_with('`') {
+        if src[index..].starts_with('`') {
             let run = src[index..].bytes().take_while(|ch| *ch == b'`').count();
             if run == ticks {
                 return Some(index);
@@ -1174,6 +1174,13 @@ mod tests {
     #[test]
     fn escaped_backticks_do_not_hide_backslash_math() {
         let rendered = render_markdown(r"\`literal \(\alpha\) `", 80);
+
+        assert!(spans_text(&rendered[0]).contains('α'));
+    }
+
+    #[test]
+    fn escaped_backtick_closes_an_open_code_span() {
+        let rendered = render_markdown(r"`foo \` math \(\alpha\) `", 80);
 
         assert!(spans_text(&rendered[0]).contains('α'));
     }
