@@ -22,7 +22,7 @@ use yi_agent_core::AgentEvent;
 use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 use super::cell::HistoryCell;
 use super::cost::CostTracker;
-use super::history::{HistoryState, HistoryView};
+use super::history::{HistoryState, HistoryView, ViewportAnchor};
 use super::input::{InputAction, InputLine};
 use super::slash::{CommandPopup, SlashCommand};
 use super::state::RunningTaskRegistry;
@@ -187,6 +187,9 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
     let mut bash_popup: BashPopup = BashPopup::None;
+    // Keep the rendered viewport location so geometry that changes between
+    // frames (such as a resize or newly queued preview) has an old-width anchor.
+    let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
 
     loop {
         let size = terminal.size()?;
@@ -204,8 +207,15 @@ fn run_loop<B: Backend, E: EventSource>(
         let initial_text_width =
             history.text_width(initial_history_area.width, initial_history_area.height);
         history.reconcile_scroll_offset(initial_text_width, initial_history_area.height);
-        let initial_offset = history.scroll_offset;
-        let initial_cells = history.cells.clone();
+        let viewport_anchor = match previous_viewport.take() {
+            Some((anchor, previous_width, previous_height))
+                if previous_width != initial_text_width
+                    || previous_height != initial_history_area.height =>
+            {
+                Some(anchor)
+            }
+            _ => history.capture_viewport_anchor(initial_text_width, initial_history_area.height),
+        };
         let mut pending_events = Vec::new();
         while let Ok(event) = agent_rx.try_recv() {
             pending_events.push(event);
@@ -237,9 +247,6 @@ fn run_loop<B: Backend, E: EventSource>(
         );
         let final_history_area = final_layout.chunks[0];
 
-        // Reapply the offset from the final rendered line counts after all
-        // events and queued promotions have updated history.
-        history.scroll_offset = 0;
         for event in pending_events {
             let is_turn_end = matches!(
                 event,
@@ -262,28 +269,14 @@ fn run_loop<B: Backend, E: EventSource>(
 
         let final_text_width =
             history.text_width(final_history_area.width, final_history_area.height);
-        if initial_offset != 0 {
-            let initial_history = HistoryState {
-                cells: initial_cells,
-                selected: None,
-                scroll_offset: initial_offset,
-            };
-            let initial_lines = initial_history.flattened_line_count(initial_text_width);
-            let initial_top = initial_lines
-                .saturating_sub(initial_history_area.height as usize)
-                .saturating_sub(initial_offset);
-            let reflowed_initial_lines = initial_history.flattened_line_count(final_text_width);
-            let final_lines = history.flattened_line_count(final_text_width);
-            // Preserve the line at the old viewport top, even when queued
-            // promotion changes the history height or text reflows.
-            let equivalent_initial_top = initial_top
-                .saturating_add(reflowed_initial_lines)
-                .saturating_sub(initial_lines);
-            history.scroll_offset = final_lines
-                .saturating_sub(final_history_area.height as usize)
-                .saturating_sub(equivalent_initial_top);
+        if let Some(anchor) = viewport_anchor {
+            history.restore_viewport_anchor(anchor, final_text_width, final_history_area.height);
+        } else {
+            history.reconcile_scroll_offset(final_text_width, final_history_area.height);
         }
-        history.reconcile_scroll_offset(final_text_width, final_history_area.height);
+        previous_viewport = history
+            .capture_viewport_anchor(final_text_width, final_history_area.height)
+            .map(|anchor| (anchor, final_text_width, final_history_area.height));
 
         let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
         let queued_height = queued_lines.len() as u16;
@@ -1871,8 +1864,174 @@ mod tests {
         }
     }
 
+    /// A test backend whose size can change from a fake event source between
+    /// frames, matching a terminal resize without sharing the terminal itself.
+    #[derive(Clone)]
+    struct ResizableTestBackend {
+        inner: Rc<RefCell<TestBackend>>,
+    }
+
+    impl Backend for ResizableTestBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.borrow_mut().draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            self.inner.borrow_mut().get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.inner.borrow_mut().set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().clear()
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.inner.borrow().size()
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.inner.borrow_mut().window_size()
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().flush()
+        }
+    }
+
+    struct ResizeThenQuitEvents {
+        backend: Rc<RefCell<TestBackend>>,
+        top_marker: Rc<RefCell<Option<String>>>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for ResizeThenQuitEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let poll_count = self.poll_count.get();
+            self.poll_count.set(poll_count + 1);
+            match poll_count {
+                0 => {
+                    let backend = self.backend.borrow();
+                    let row: String = (0..32u16)
+                        .map(|x| backend.buffer()[(x, 0)].symbol())
+                        .collect();
+                    drop(backend);
+                    let marker = row
+                        .split_whitespace()
+                        .find(|word| word.starts_with("MARKER-"))
+                        .expect("the first rendered history row has a marker")
+                        .to_string();
+                    *self.top_marker.borrow_mut() = Some(marker);
+                    self.backend.borrow_mut().resize(16, 14);
+                    Ok(None)
+                }
+                1 => Ok(None),
+                _ => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                )))),
+            }
+        }
+    }
+
     #[test]
-    fn done_promotion_reconciles_scroll_against_final_history_layout() {
+    fn history_anchor_survives_resize_between_frames() {
+        let backend = Rc::new(RefCell::new(TestBackend::new(32, 14)));
+        let mut terminal = Terminal::new(ResizableTestBackend {
+            inner: Rc::clone(&backend),
+        })
+        .unwrap();
+        let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        for index in 0..20 {
+            history.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("MARKER-{index:02} 12345678901234567890"),
+                },
+                32,
+            );
+        }
+        history.scroll_offset = 16;
+        let mut input = InputLine::new();
+        let source = ResizeThenQuitEvents {
+            backend: Rc::clone(&backend),
+            top_marker: Rc::new(RefCell::new(None)),
+            poll_count: Cell::new(0),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut input,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+        )
+        .unwrap();
+
+        let narrow_area = ratatui::layout::Rect::new(0, 0, 16, 14);
+        let narrow_layout = compute_layout(narrow_area, &input, false, &None, 0);
+        let narrow_history_area = narrow_layout.chunks[0];
+        let narrow_text_width =
+            history.text_width(narrow_history_area.width, narrow_history_area.height);
+        let mut before_resize = HistoryState {
+            cells: history.cells.clone(),
+            selected: None,
+            scroll_offset: 16,
+        };
+        let wide_area = ratatui::layout::Rect::new(0, 0, 32, 14);
+        let wide_layout = compute_layout(wide_area, &InputLine::new(), false, &None, 0);
+        let wide_history_area = wide_layout.chunks[0];
+        let wide_text_width =
+            before_resize.text_width(wide_history_area.width, wide_history_area.height);
+        before_resize.reconcile_scroll_offset(wide_text_width, wide_history_area.height);
+        let anchor = before_resize
+            .capture_viewport_anchor(wide_text_width, wide_history_area.height)
+            .unwrap();
+        let mut expected = before_resize;
+        expected.restore_viewport_anchor(anchor, narrow_text_width, narrow_history_area.height);
+
+        assert_eq!(history.scroll_offset, expected.scroll_offset);
+        let top_marker = source.top_marker.borrow().clone().unwrap();
+        let resized_backend = backend.borrow();
+        let final_row: String = (0..16u16)
+            .map(|x| resized_backend.buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            final_row.contains(&top_marker),
+            "expected top marker {top_marker:?} after resize, got {final_row:?}"
+        );
+    }
+
+    #[test]
+    fn history_anchor_survives_queued_preview_promotion() {
         let backend = TestBackend::new(20, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
@@ -1883,10 +2042,10 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = Arc::new(AtomicBool::new(true));
         let mut history = HistoryState::new();
-        for _ in 0..20 {
+        for index in 0..20 {
             history.push(
                 HistoryCell::AssistantMessage {
-                    markdown: "12345678901234567890".into(),
+                    markdown: format!("MARKER-{index:02} 1234567890"),
                 },
                 20,
             );
@@ -1944,33 +2103,29 @@ mod tests {
         let prior_text_width =
             before.text_width(prior_layout.chunks[0].width, prior_layout.chunks[0].height);
         before.reconcile_scroll_offset(prior_text_width, prior_layout.chunks[0].height);
-        let old_text_width = before.text_width(
-            pre_drain_layout.chunks[0].width,
-            pre_drain_layout.chunks[0].height,
-        );
-        let old_total = before.flattened_line_count(old_text_width);
-        let old_top = old_total
-            .saturating_sub(pre_drain_layout.chunks[0].height as usize)
-            .saturating_sub(before.scroll_offset);
-        let reflowed_old_total = before.flattened_line_count(final_text_width);
-        let equivalent_old_top = old_top
-            .saturating_add(reflowed_old_total)
-            .saturating_sub(old_total);
-        let expected_offset = history
-            .flattened_line_count(final_text_width)
-            .saturating_sub(final_history_area.height as usize)
-            .saturating_sub(equivalent_old_top);
+        let anchor = before
+            .capture_viewport_anchor(prior_text_width, prior_layout.chunks[0].height)
+            .expect("the initial viewport is scrolled up");
+        let mut expected = HistoryState {
+            cells: history.cells.clone(),
+            selected: None,
+            scroll_offset: 0,
+        };
+        expected.restore_viewport_anchor(anchor, final_text_width, final_history_area.height);
 
         assert_eq!(
-            history.scroll_offset,
-            expected_offset,
-            "old_total={old_total}, old_height={}, old_offset={}, old_top={old_top}, \
-             reflowed_old_total={reflowed_old_total}, final_total={}, final_height={}, \
-             equivalent_old_top={equivalent_old_top}",
-            pre_drain_layout.chunks[0].height,
-            before.scroll_offset,
-            history.flattened_line_count(final_text_width),
-            final_history_area.height,
+            history.scroll_offset, expected.scroll_offset,
+            "the top history cell must remain anchored when the queued preview is promoted; \
+             old_width={prior_text_width}, new_width={final_text_width}, old_height={}, \
+             new_height={}",
+            pre_drain_layout.chunks[0].height, final_history_area.height,
+        );
+        let top_row: String = (0..20u16)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            top_row.contains("MARKER-00"),
+            "the original top marker must remain at the viewport top: {top_row:?}"
         );
     }
 
