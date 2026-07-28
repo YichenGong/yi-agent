@@ -162,7 +162,7 @@ fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize>
     while index < src.len() {
         if src[index..].starts_with('`') {
             let run = src[index..].bytes().take_while(|ch| *ch == b'`').count();
-            if run >= ticks {
+            if run == ticks {
                 return Some(index);
             }
             index += run;
@@ -986,6 +986,13 @@ mod tests {
                 .iter()
                 .any(|line| spans_text(line).contains(r"\[\sqrt{x}\]"))
         );
+    }
+
+    #[test]
+    fn single_backtick_code_span_ignores_longer_backtick_runs() {
+        let rendered = render_markdown(r"`triple ``` then \(\alpha\) end`", 80);
+
+        assert_eq!(spans_text(&rendered[0]), r"triple ``` then \(\alpha\) end");
     }
 
     #[test]
