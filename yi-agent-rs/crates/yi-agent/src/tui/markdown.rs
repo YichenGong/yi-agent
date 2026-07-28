@@ -462,30 +462,214 @@ impl LineBuilder {
     }
 }
 
-// Kept separate so a full TeX renderer can replace this small readable subset.
 fn render_math(formula: &str) -> String {
-    let formula = formula.replace("\\pi", "π");
-    if let Some((numerator, denominator)) = parse_fraction(&formula) {
-        return format!("{numerator}⁄{denominator}");
-    }
-
-    formula
-        .replace("^0", "⁰")
-        .replace("^1", "¹")
-        .replace("^2", "²")
-        .replace("^3", "³")
-        .replace("^4", "⁴")
-        .replace("^5", "⁵")
-        .replace("^6", "⁶")
-        .replace("^7", "⁷")
-        .replace("^8", "⁸")
-        .replace("^9", "⁹")
+    TexRenderer::new(formula).render()
 }
 
-fn parse_fraction(formula: &str) -> Option<(&str, &str)> {
-    let fraction = formula.strip_prefix("\\frac{")?;
-    let (numerator, denominator) = fraction.split_once("}{")?;
-    Some((numerator, denominator.strip_suffix('}')?))
+struct TexRenderer {
+    chars: Vec<char>,
+    position: usize,
+}
+
+impl TexRenderer {
+    fn new(formula: &str) -> Self {
+        Self {
+            chars: formula.chars().collect(),
+            position: 0,
+        }
+    }
+
+    fn render(mut self) -> String {
+        self.render_until(None)
+    }
+
+    fn render_until(&mut self, closing: Option<char>) -> String {
+        let mut rendered = String::new();
+
+        while let Some(ch) = self.next_char() {
+            if Some(ch) == closing {
+                break;
+            }
+            match ch {
+                '\\' => rendered.push_str(&self.render_command()),
+                '{' => rendered.push_str(&self.render_until(Some('}'))),
+                '^' => rendered.push_str(&self.render_script(true)),
+                '_' => rendered.push_str(&self.render_script(false)),
+                _ => rendered.push(ch),
+            }
+        }
+
+        rendered
+    }
+
+    fn render_command(&mut self) -> String {
+        let name = self.consume_command_name();
+        match name.as_str() {
+            "alpha" => "α".to_string(),
+            "beta" => "β".to_string(),
+            "gamma" => "γ".to_string(),
+            "delta" => "δ".to_string(),
+            "epsilon" => "ε".to_string(),
+            "theta" => "θ".to_string(),
+            "lambda" => "λ".to_string(),
+            "mu" => "μ".to_string(),
+            "pi" => "π".to_string(),
+            "sigma" => "σ".to_string(),
+            "phi" => "φ".to_string(),
+            "omega" => "ω".to_string(),
+            "Gamma" => "Γ".to_string(),
+            "Delta" => "Δ".to_string(),
+            "Theta" => "Θ".to_string(),
+            "Lambda" => "Λ".to_string(),
+            "Pi" => "Π".to_string(),
+            "Sigma" => "Σ".to_string(),
+            "Phi" => "Φ".to_string(),
+            "Omega" => "Ω".to_string(),
+            "sum" => "∑".to_string(),
+            "prod" => "∏".to_string(),
+            "int" => "∫".to_string(),
+            "infty" => "∞".to_string(),
+            "le" | "leq" => "≤".to_string(),
+            "ge" | "geq" => "≥".to_string(),
+            "neq" => "≠".to_string(),
+            "times" => "×".to_string(),
+            "cdot" => "·".to_string(),
+            "pm" => "±".to_string(),
+            "to" | "rightarrow" => "→".to_string(),
+            "sin" | "cos" | "tan" => name,
+            "left" | "right" => String::new(),
+            "frac" => {
+                let numerator = self.render_argument();
+                let denominator = self.render_argument();
+                format!("{numerator}⁄{denominator}")
+            }
+            "sqrt" => format!("√{}", self.render_argument()),
+            _ => name,
+        }
+    }
+
+    fn consume_command_name(&mut self) -> String {
+        let start = self.position;
+        while self
+            .chars
+            .get(self.position)
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        {
+            self.position += 1;
+        }
+        self.chars[start..self.position].iter().collect()
+    }
+
+    fn render_argument(&mut self) -> String {
+        if self.peek_char() == Some('{') {
+            self.position += 1;
+            self.render_until(Some('}'))
+        } else {
+            self.next_char()
+                .map_or_else(String::new, |ch| ch.to_string())
+        }
+    }
+
+    fn render_script(&mut self, superscript: bool) -> String {
+        let script = self.render_argument();
+        script
+            .chars()
+            .map(|ch| map_script_character(ch, superscript))
+            .collect()
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.chars.get(self.position).copied()
+    }
+
+    fn next_char(&mut self) -> Option<char> {
+        let ch = self.peek_char()?;
+        self.position += 1;
+        Some(ch)
+    }
+}
+
+fn map_script_character(ch: char, superscript: bool) -> char {
+    let mapped = if superscript {
+        match ch {
+            '0' => Some('⁰'),
+            '1' => Some('¹'),
+            '2' => Some('²'),
+            '3' => Some('³'),
+            '4' => Some('⁴'),
+            '5' => Some('⁵'),
+            '6' => Some('⁶'),
+            '7' => Some('⁷'),
+            '8' => Some('⁸'),
+            '9' => Some('⁹'),
+            '+' => Some('⁺'),
+            '-' => Some('⁻'),
+            '=' => Some('⁼'),
+            '(' => Some('⁽'),
+            ')' => Some('⁾'),
+            'a' => Some('ᵃ'),
+            'b' => Some('ᵇ'),
+            'c' => Some('ᶜ'),
+            'd' => Some('ᵈ'),
+            'e' => Some('ᵉ'),
+            'f' => Some('ᶠ'),
+            'g' => Some('ᵍ'),
+            'h' => Some('ʰ'),
+            'i' => Some('ⁱ'),
+            'j' => Some('ʲ'),
+            'k' => Some('ᵏ'),
+            'l' => Some('ˡ'),
+            'm' => Some('ᵐ'),
+            'n' => Some('ⁿ'),
+            'o' => Some('ᵒ'),
+            'p' => Some('ᵖ'),
+            'r' => Some('ʳ'),
+            's' => Some('ˢ'),
+            't' => Some('ᵗ'),
+            'u' => Some('ᵘ'),
+            'v' => Some('ᵛ'),
+            'w' => Some('ʷ'),
+            'x' => Some('ˣ'),
+            'y' => Some('ʸ'),
+            'z' => Some('ᶻ'),
+            _ => None,
+        }
+    } else {
+        match ch {
+            '0' => Some('₀'),
+            '1' => Some('₁'),
+            '2' => Some('₂'),
+            '3' => Some('₃'),
+            '4' => Some('₄'),
+            '5' => Some('₅'),
+            '6' => Some('₆'),
+            '7' => Some('₇'),
+            '8' => Some('₈'),
+            '9' => Some('₉'),
+            '+' => Some('₊'),
+            '-' => Some('₋'),
+            '=' => Some('₌'),
+            '(' => Some('₍'),
+            ')' => Some('₎'),
+            'a' => Some('ₐ'),
+            'e' => Some('ₑ'),
+            'h' => Some('ₕ'),
+            'i' => Some('ᵢ'),
+            'j' => Some('ⱼ'),
+            'k' => Some('ₖ'),
+            'l' => Some('ₗ'),
+            'm' => Some('ₘ'),
+            'n' => Some('ₙ'),
+            'o' => Some('ₒ'),
+            'p' => Some('ₚ'),
+            'r' => Some('ᵣ'),
+            's' => Some('ₛ'),
+            't' => Some('ₜ'),
+            'x' => Some('ₓ'),
+            _ => None,
+        }
+    };
+    mapped.unwrap_or(ch)
 }
 
 #[cfg(test)]
@@ -546,6 +730,18 @@ mod tests {
             .expect("formula span");
         assert_eq!(formula.style.fg, Some(Color::Cyan));
         assert_eq!(spans_text(&lines[0]), "area is π r².");
+    }
+
+    #[test]
+    fn inline_math_renders_symbols_scripts_fractions_and_roots() {
+        let rendered = render_markdown("$\\alpha + x^2 + a_{i+1} + \\frac{m}{n} + \\sqrt{z}$", 80);
+        assert_eq!(spans_text(&rendered[0]), "α + x² + aᵢ₊₁ + m⁄n + √z");
+    }
+
+    #[test]
+    fn unsupported_math_command_remains_readable() {
+        let rendered = render_markdown("$\\unknown{x}$", 80);
+        assert_eq!(spans_text(&rendered[0]), "unknownx");
     }
 
     #[test]
