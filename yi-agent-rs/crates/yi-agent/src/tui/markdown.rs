@@ -139,8 +139,7 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
         let spaces = line.bytes().take_while(|ch| *ch == b' ').count();
         let run = line[spaces..].bytes().take_while(|ch| *ch == fence).count();
         let remainder = &line[spaces + run..];
-        if spaces <= 3 && run >= fence_len && remainder.bytes().all(|ch| matches!(ch, b' ' | b'\t'))
-        {
+        if spaces <= 3 && run >= fence_len && remainder.bytes().all(|ch| ch == b' ') {
             return Some(if line_end < src.len() {
                 line_end + 1
             } else {
@@ -1002,6 +1001,16 @@ mod tests {
     #[test]
     fn invalid_fence_closer_does_not_end_code_protection() {
         let rendered: Vec<String> = render_markdown("```text\n```not-a-close\n\\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn tab_after_fence_run_does_not_end_code_protection() {
+        let rendered: Vec<String> = render_markdown("```text\n```\t\n\\(x\\)", 80)
             .iter()
             .map(spans_text)
             .collect();
