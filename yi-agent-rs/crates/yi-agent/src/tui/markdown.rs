@@ -8,7 +8,7 @@ use std::cell::Cell;
 
 #[cfg(test)]
 thread_local! {
-    static LIST_PARENT_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    static LIST_CONTEXT_LINE_INSPECTIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Render a markdown string into ratatui Lines, wrapped at `width`.
@@ -29,9 +29,10 @@ fn normalize_math_delimiters(src: &str) -> String {
     let mut normalized = String::with_capacity(src.len());
     let mut plain_start = 0;
     let mut index = 0;
+    let list_parents = list_parent_contexts(src);
 
     while index < src.len() {
-        if let Some(fence_end) = fenced_code_end(src, index) {
+        if let Some(fence_end) = fenced_code_end(src, index, list_parents[index]) {
             normalized.push_str(&normalize_math_text(&src[plain_start..index]));
             normalized.push_str(&src[index..fence_end]);
             index = fence_end;
@@ -150,7 +151,7 @@ fn collect_tex_delimiters(text: &str) -> Vec<TexDelimiter> {
     delimiters
 }
 
-fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
+fn fenced_code_end(src: &str, index: usize, list_parent: bool) -> Option<usize> {
     if index != 0 && src.as_bytes()[index - 1] != b'\n' {
         return None;
     }
@@ -175,7 +176,7 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
     if fence_len < 3 {
         return None;
     }
-    let list_indented = quote_depth == 0 && indent > 3 && has_list_parent(src, index);
+    let list_indented = quote_depth == 0 && indent > 3 && list_parent;
     if indent > 3 && !list_indented {
         return None;
     }
@@ -251,15 +252,24 @@ fn blockquote_prefix(line: &str) -> (usize, usize) {
     (index, depth)
 }
 
-fn has_list_parent(src: &str, line_start: usize) -> bool {
-    #[cfg(test)]
-    LIST_PARENT_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
+fn list_parent_contexts(src: &str) -> Vec<bool> {
+    let mut contexts = vec![false; src.len() + 1];
+    let mut list_parent = false;
+    let mut line_start = 0;
 
-    src[..line_start]
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(is_list_item_line)
+    for raw_line in src.split_inclusive('\n') {
+        contexts[line_start] = list_parent;
+        #[cfg(test)]
+        LIST_CONTEXT_LINE_INSPECTIONS.with(|inspections| inspections.set(inspections.get() + 1));
+
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if !line.trim().is_empty() {
+            list_parent = is_list_item_line(line);
+        }
+        line_start += raw_line.len();
+    }
+
+    contexts
 }
 
 fn is_list_item_line(line: &str) -> bool {
@@ -1022,12 +1032,12 @@ mod tests {
         line.spans.iter().map(|s| s.content.to_string()).collect()
     }
 
-    fn reset_list_parent_lookups() {
-        LIST_PARENT_LOOKUPS.with(|lookups| lookups.set(0));
+    fn reset_list_context_line_inspections() {
+        LIST_CONTEXT_LINE_INSPECTIONS.with(|inspections| inspections.set(0));
     }
 
-    fn list_parent_lookups() -> usize {
-        LIST_PARENT_LOOKUPS.with(Cell::get)
+    fn list_context_line_inspections() -> usize {
+        LIST_CONTEXT_LINE_INSPECTIONS.with(Cell::get)
     }
 
     #[test]
@@ -1038,11 +1048,18 @@ mod tests {
     }
 
     #[test]
-    fn deeply_indented_non_fence_skips_list_parent_lookup() {
-        reset_list_parent_lookups();
+    fn many_deep_fence_candidates_use_one_forward_list_context_pass() {
+        let src = format!("{}outside \\(x\\)", "    ```text\n".repeat(128));
+        reset_list_context_line_inspections();
 
-        assert_eq!(fenced_code_end("    ordinary text", 0), None);
-        assert_eq!(list_parent_lookups(), 0);
+        let rendered = render_markdown(&src, 80);
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| spans_text(line).contains("outside x"))
+        );
+        assert_eq!(list_context_line_inspections(), src.lines().count());
     }
 
     #[test]
