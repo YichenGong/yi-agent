@@ -84,21 +84,25 @@ impl LineBuilder {
             }
             Event::InlineMath(formula) => {
                 self.display_math_just_flushed = false;
-                self.push_math_span(Span::styled(
-                    render_math(&formula),
-                    Style::new().fg(Color::Cyan),
-                ));
+                let formula = render_math(&formula);
+                if self.in_table {
+                    self.current_cell.push_str(&formula);
+                } else {
+                    self.push_math_span(Span::styled(formula, Style::new().fg(Color::Cyan)));
+                }
             }
             Event::DisplayMath(formula) => {
-                if !self.current_spans.is_empty() {
+                let formula = render_math(&formula);
+                if self.in_table {
+                    self.current_cell.push_str(&formula);
+                } else {
+                    if !self.current_spans.is_empty() {
+                        self.flush_line();
+                    }
+                    self.push_math_span(Span::styled(formula, Style::new().fg(Color::Cyan)));
                     self.flush_line();
+                    self.display_math_just_flushed = true;
                 }
-                self.push_math_span(Span::styled(
-                    render_math(&formula),
-                    Style::new().fg(Color::Cyan),
-                ));
-                self.flush_line();
-                self.display_math_just_flushed = true;
             }
             Event::SoftBreak | Event::HardBreak => {
                 if self.in_table {
@@ -265,24 +269,35 @@ impl LineBuilder {
             // break it character-by-character.
             let mut current: Vec<Span<'static>> = Vec::new();
             let mut current_width: usize = 0;
+            let mut previous_was_formula = false;
             for pending in spans {
                 let span = pending.span;
                 let span_style = span.style;
                 let span_text = span.content.into_owned();
                 // Keep formulas readable as one semantic span
                 // whenever it fits, rather than splitting it at internal spaces.
-                if pending.preserve_as_single_span
-                    && current_width + UnicodeWidthStr::width(span_text.as_str()) <= max_w
-                {
-                    current_width += UnicodeWidthStr::width(span_text.as_str());
-                    current.push(Span::styled(span_text, span_style));
-                    continue;
+                if pending.preserve_as_single_span {
+                    let formula_width = UnicodeWidthStr::width(span_text.as_str());
+                    if formula_width <= max_w {
+                        if !current.is_empty() && current_width + formula_width > max_w {
+                            self.lines.push(Line::from(std::mem::take(&mut current)));
+                            current_width = 0;
+                        }
+                        current_width += formula_width;
+                        current.push(Span::styled(span_text, span_style));
+                        previous_was_formula = true;
+                        continue;
+                    }
                 }
                 // Split span into words preserving spaces
                 let mut words: Vec<&str> = span_text.split(' ').collect();
                 for (i, word) in words.drain(..).enumerate() {
                     let word_width = UnicodeWidthStr::width(word);
-                    let sep = if i == 0 && current.is_empty() { 0 } else { 1 }; // space before word
+                    let sep = if i == 0 && (current.is_empty() || previous_was_formula) {
+                        0
+                    } else {
+                        1
+                    }; // space before word
                     if current_width + sep + word_width <= max_w {
                         // Fits on current line
                         if sep == 1 && !current.is_empty() {
@@ -325,6 +340,7 @@ impl LineBuilder {
                         }
                     }
                 }
+                previous_was_formula = false;
             }
             if !current.is_empty() {
                 self.lines.push(Line::from(current));
@@ -529,6 +545,17 @@ mod tests {
             .find(|span| span.content == "π r²")
             .expect("formula span");
         assert_eq!(formula.style.fg, Some(Color::Cyan));
+        assert_eq!(spans_text(&lines[0]), "area is π r².");
+    }
+
+    #[test]
+    fn formula_moves_to_a_fresh_line_without_splitting() {
+        let lines = render_markdown("word$a b$", 6);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(spans_text(&lines[0]), "word");
+        assert_eq!(spans_text(&lines[1]), "a b");
+        assert_eq!(lines[1].spans.len(), 1);
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Cyan));
     }
 
     #[test]
@@ -701,6 +728,21 @@ mod tests {
         assert!(
             !joined.contains("---"),
             "expected no raw markdown separator dashes, got: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn table_cell_keeps_inline_math_without_trailing_formula_line() {
+        let rendered: Vec<String> = render_markdown("| Formula |\n| --- |\n| $\\pi$ |\n", 40)
+            .iter()
+            .map(spans_text)
+            .collect();
+        let joined = rendered.join("\n");
+
+        assert!(joined.contains('π'), "missing table formula: {rendered:?}");
+        assert!(
+            !rendered.iter().any(|line| line == "π"),
+            "formula escaped the table: {rendered:?}"
         );
     }
 
