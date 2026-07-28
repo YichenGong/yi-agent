@@ -163,7 +163,7 @@ impl HistoryState {
             if cell_index == anchor.cell_index {
                 anchor_top += match anchor.position {
                     AnchorPosition::ContentLine(line_in_cell) => {
-                        line_in_cell.min(anchor_cell.line_count(text_width))
+                        line_in_cell.min(anchor_cell.line_count(text_width).saturating_sub(1))
                     }
                     AnchorPosition::AfterCellSpacer => anchor_cell.line_count(text_width),
                 };
@@ -607,6 +607,44 @@ mod tests {
                 .flattened_line_count(new_width)
                 .saturating_sub(viewport_height as usize + new_user_lines),
             "the spacer, rather than a reflowed user-content line, remains at the top"
+        );
+    }
+
+    #[test]
+    fn viewport_anchor_clamps_shortened_content_to_last_line() {
+        let old_width = 10;
+        let new_width = 20;
+        let viewport_height = 1;
+        let mut state = two_multiline_assistant_cells();
+        let old_line_count = state.cells[0].line_count(old_width);
+        state.scroll_offset = state
+            .flattened_line_count(old_width)
+            .saturating_sub(viewport_height as usize + old_line_count - 1);
+
+        let anchor = state
+            .capture_viewport_anchor(old_width, viewport_height)
+            .expect("the final old content line is above the bottom viewport");
+        assert_eq!(
+            anchor,
+            ViewportAnchor {
+                cell_index: 0,
+                position: AnchorPosition::ContentLine(old_line_count - 1),
+            }
+        );
+
+        state.restore_viewport_anchor(anchor, new_width, viewport_height);
+
+        let new_line_count = state.cells[0].line_count(new_width);
+        assert!(
+            new_line_count < old_line_count,
+            "the first cell must use fewer lines at the new width"
+        );
+        assert_eq!(
+            state.scroll_offset,
+            state
+                .flattened_line_count(new_width)
+                .saturating_sub(viewport_height as usize + new_line_count - 1),
+            "a shortened cell should anchor to its final content line, not its spacer"
         );
     }
 
