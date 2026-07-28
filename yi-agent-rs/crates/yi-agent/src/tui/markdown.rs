@@ -17,7 +17,7 @@ pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
 struct LineBuilder {
     width: u16,
     lines: Vec<Line<'static>>,
-    current_spans: Vec<Span<'static>>,
+    current_spans: Vec<PendingSpan>,
     current_style: Style,
     display_math_just_flushed: bool,
     in_code_block: bool,
@@ -32,6 +32,11 @@ struct LineBuilder {
     current_row: Vec<String>,
     current_cell: String,
     list_stack: Vec<Option<u64>>,
+}
+
+struct PendingSpan {
+    span: Span<'static>,
+    preserve_as_single_span: bool,
 }
 
 impl LineBuilder {
@@ -79,7 +84,7 @@ impl LineBuilder {
             }
             Event::InlineMath(formula) => {
                 self.display_math_just_flushed = false;
-                self.push_span(Span::styled(
+                self.push_math_span(Span::styled(
                     render_math(&formula),
                     Style::new().fg(Color::Cyan),
                 ));
@@ -88,7 +93,7 @@ impl LineBuilder {
                 if !self.current_spans.is_empty() {
                     self.flush_line();
                 }
-                self.push_span(Span::styled(
+                self.push_math_span(Span::styled(
                     render_math(&formula),
                     Style::new().fg(Color::Cyan),
                 ));
@@ -228,7 +233,17 @@ impl LineBuilder {
     }
 
     fn push_span(&mut self, span: Span<'static>) {
-        self.current_spans.push(span);
+        self.current_spans.push(PendingSpan {
+            span,
+            preserve_as_single_span: false,
+        });
+    }
+
+    fn push_math_span(&mut self, span: Span<'static>) {
+        self.current_spans.push(PendingSpan {
+            span,
+            preserve_as_single_span: true,
+        });
     }
 
     #[allow(dead_code)]
@@ -250,12 +265,13 @@ impl LineBuilder {
             // break it character-by-character.
             let mut current: Vec<Span<'static>> = Vec::new();
             let mut current_width: usize = 0;
-            for span in spans {
+            for pending in spans {
+                let span = pending.span;
                 let span_style = span.style;
                 let span_text = span.content.into_owned();
-                // Keep cyan inline code and math readable as one semantic span
+                // Keep formulas readable as one semantic span
                 // whenever it fits, rather than splitting it at internal spaces.
-                if span_style.fg == Some(Color::Cyan)
+                if pending.preserve_as_single_span
                     && current_width + UnicodeWidthStr::width(span_text.as_str()) <= max_w
                 {
                     current_width += UnicodeWidthStr::width(span_text.as_str());
@@ -490,6 +506,18 @@ mod tests {
             .find(|s| s.content == "foo")
             .expect("should find code span");
         assert_eq!(code_span.style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn inline_code_with_spaces_keeps_existing_word_wrapping() {
+        let lines = render_markdown("`two words`", 80);
+        let code_words: Vec<_> = lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(code_words, ["two", "words"]);
     }
 
     #[test]
