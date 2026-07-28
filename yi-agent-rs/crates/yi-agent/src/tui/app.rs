@@ -1950,6 +1950,46 @@ mod tests {
         }
     }
 
+    /// Captures the old and new top rows around an idle local submission.
+    /// The final frame must restore the pre-submit content anchor rather than
+    /// using the width before the scrollbar was accounted for.
+    struct SubmitThenQuitEvents {
+        backend: Rc<RefCell<TestBackend>>,
+        top_marker: Rc<RefCell<Option<String>>>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for SubmitThenQuitEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let poll_count = self.poll_count.get();
+            self.poll_count.set(poll_count + 1);
+            match poll_count {
+                0 => {
+                    let backend = self.backend.borrow();
+                    let row: String = (0..20u16)
+                        .map(|x| backend.buffer()[(x, 0)].symbol())
+                        .collect();
+                    drop(backend);
+                    let marker = row
+                        .split_whitespace()
+                        .find(|word| word.starts_with("MARKER-"))
+                        .expect("the first rendered history row has a marker")
+                        .to_string();
+                    *self.top_marker.borrow_mut() = Some(marker);
+                    Ok(Some(Event::Paste("new local message".into())))
+                }
+                1 => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))),
+                _ => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                )))),
+            }
+        }
+    }
+
     #[test]
     fn history_anchor_survives_resize_between_frames() {
         let backend = Rc::new(RefCell::new(TestBackend::new(32, 14)));
@@ -2027,6 +2067,70 @@ mod tests {
         assert!(
             final_row.contains(&top_marker),
             "expected top marker {top_marker:?} after resize, got {final_row:?}"
+        );
+    }
+
+    #[test]
+    fn history_anchor_survives_local_user_insertion_at_scrollbar_width() {
+        let backend = Rc::new(RefCell::new(TestBackend::new(20, 14)));
+        let mut terminal = Terminal::new(ResizableTestBackend {
+            inner: Rc::clone(&backend),
+        })
+        .unwrap();
+        let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        for index in 0..20 {
+            history.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("MARKER-{index:02} 1234567890"),
+                },
+                20,
+            );
+        }
+        history.scroll_offset = 30;
+        let source = SubmitThenQuitEvents {
+            backend: Rc::clone(&backend),
+            top_marker: Rc::new(RefCell::new(None)),
+            poll_count: Cell::new(0),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+        )
+        .unwrap();
+
+        let area = ratatui::layout::Rect::new(0, 0, 20, 14);
+        let layout = compute_layout(area, &InputLine::new(), false, &None, 0);
+        let history_area = layout.chunks[0];
+        assert_eq!(
+            history.text_width(history_area.width, history_area.height),
+            history_area.width - 1,
+            "the inserted local message is restored with the scrollbar-reserved width"
+        );
+        let top_marker = source.top_marker.borrow().clone().unwrap();
+        let backend = terminal.backend().inner.borrow();
+        let final_row: String = (0..20u16)
+            .map(|x| backend.buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            final_row.contains(&top_marker),
+            "expected top marker {top_marker:?} after local insertion, got {final_row:?}"
         );
     }
 
