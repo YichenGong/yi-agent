@@ -1841,6 +1841,139 @@ mod tests {
         }
     }
 
+    struct QueueThenDoneEvents {
+        agent_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for QueueThenDoneEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let poll_count = self.poll_count.get();
+            self.poll_count.set(poll_count + 1);
+            match poll_count {
+                0 => Ok(Some(Event::Paste("queued message".into()))),
+                1 => {
+                    self.agent_tx
+                        .try_send(AgentEvent::Done {
+                            reason: yi_agent_core::DoneReason::EndTurn,
+                        })
+                        .unwrap();
+                    Ok(Some(Event::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    ))))
+                }
+                _ => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                )))),
+            }
+        }
+    }
+
+    #[test]
+    fn done_promotion_reconciles_scroll_against_final_history_layout() {
+        let backend = TestBackend::new(20, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let mut history = HistoryState::new();
+        for _ in 0..20 {
+            history.push(
+                HistoryCell::AssistantMessage {
+                    markdown: "12345678901234567890".into(),
+                },
+                20,
+            );
+        }
+        history.scroll_offset = 30;
+        let before_cells = history.cells.clone();
+        let mut input = InputLine::new();
+        let source = QueueThenDoneEvents {
+            agent_tx,
+            poll_count: Cell::new(0),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut input,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+        )
+        .unwrap();
+
+        let area = ratatui::layout::Rect::new(0, 0, 20, 14);
+        let final_layout = compute_layout(area, &input, false, &None, 0);
+        let final_history_area = final_layout.chunks[0];
+        let final_text_width =
+            history.text_width(final_history_area.width, final_history_area.height);
+        let pre_drain_layout = compute_layout(area, &InputLine::new(), false, &None, 2);
+        let pre_drain_width = history.text_width(
+            pre_drain_layout.chunks[0].width,
+            pre_drain_layout.chunks[0].height,
+        );
+        assert_ne!(
+            pre_drain_layout.chunks[0].height, final_history_area.height,
+            "promotion changes the history viewport height"
+        );
+        assert_eq!(
+            pre_drain_width, 19,
+            "wrapped history reserves a scrollbar column"
+        );
+
+        let mut before = HistoryState {
+            cells: before_cells,
+            selected: None,
+            scroll_offset: 30,
+        };
+        // The loop first renders without a queue and clamps the deliberately
+        // over-large starting offset before the queued preview appears.
+        let prior_layout = compute_layout(area, &InputLine::new(), false, &None, 0);
+        let prior_text_width =
+            before.text_width(prior_layout.chunks[0].width, prior_layout.chunks[0].height);
+        before.reconcile_scroll_offset(prior_text_width, prior_layout.chunks[0].height);
+        let old_text_width = before.text_width(
+            pre_drain_layout.chunks[0].width,
+            pre_drain_layout.chunks[0].height,
+        );
+        let old_total = before.flattened_line_count(old_text_width);
+        let old_top = old_total
+            .saturating_sub(pre_drain_layout.chunks[0].height as usize)
+            .saturating_sub(before.scroll_offset);
+        let reflowed_old_total = before.flattened_line_count(final_text_width);
+        let equivalent_old_top = old_top
+            .saturating_add(reflowed_old_total)
+            .saturating_sub(old_total);
+        let expected_offset = history
+            .flattened_line_count(final_text_width)
+            .saturating_sub(final_history_area.height as usize)
+            .saturating_sub(equivalent_old_top);
+
+        assert_eq!(
+            history.scroll_offset,
+            expected_offset,
+            "old_total={old_total}, old_height={}, old_offset={}, old_top={old_top}, \
+             reflowed_old_total={reflowed_old_total}, final_total={}, final_height={}, \
+             equivalent_old_top={equivalent_old_top}",
+            pre_drain_layout.chunks[0].height,
+            before.scroll_offset,
+            history.flattened_line_count(final_text_width),
+            final_history_area.height,
+        );
+    }
+
     /// Regression test for blocking_send panic.
     ///
     /// The bug: run_tui called `input_tx.blocking_send` while on the tokio
@@ -3893,6 +4026,43 @@ mod tests {
             &mut pending_quit,
         );
         assert_eq!(hist.scroll_offset, 6, "second ScrollUp should accumulate");
+    }
+
+    #[test]
+    fn mouse_scroll_uses_reserved_text_width_for_its_max_offset() {
+        let (layout, history_area) = layout_80x24();
+        let mut bash_popup = BashPopup::None;
+        let mut hist = HistoryState::new();
+        // This fits the raw 80-column area (78 chars after the user prefix)
+        // but wraps after the scrollbar reserves one column.
+        for _ in 0..30 {
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "x".repeat(78),
+                },
+                80,
+            );
+        }
+        let text_width = hist.text_width(history_area.width, history_area.height);
+        assert_eq!(text_width, 79, "overflow reserves a scrollbar column");
+        let expected_max = hist.max_scroll_offset(text_width, history_area.height);
+        let raw_max = hist.max_scroll_offset(history_area.width, history_area.height);
+        assert!(expected_max > raw_max, "reserved width adds wrapped lines");
+
+        let registry = RunningTaskRegistry::new();
+        let mut pending_quit = false;
+        for _ in 0..100 {
+            handle_mouse(
+                make_mouse(MouseEventKind::ScrollUp, 0, history_area.y),
+                &layout,
+                &mut bash_popup,
+                &mut hist,
+                &registry,
+                &mut pending_quit,
+            );
+        }
+
+        assert_eq!(hist.scroll_offset, expected_max);
     }
 
     /// Scrolling down over the history region should decrease `scroll_offset`
