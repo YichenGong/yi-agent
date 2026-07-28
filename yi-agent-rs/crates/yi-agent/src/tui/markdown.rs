@@ -5,7 +5,7 @@ use unicode_width::UnicodeWidthStr;
 
 /// Render a markdown string into ratatui Lines, wrapped at `width`.
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
     let parser = Parser::new_ext(src, opts);
     let mut builder = LineBuilder::new(width);
     for event in parser {
@@ -19,6 +19,7 @@ struct LineBuilder {
     lines: Vec<Line<'static>>,
     current_spans: Vec<Span<'static>>,
     current_style: Style,
+    display_math_just_flushed: bool,
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
@@ -40,6 +41,7 @@ impl LineBuilder {
             lines: Vec::new(),
             current_spans: Vec::new(),
             current_style: Style::new(),
+            display_math_just_flushed: false,
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
@@ -57,6 +59,7 @@ impl LineBuilder {
             Event::Start(tag) => self.start_tag(tag),
             Event::End(tag) => self.end_tag(tag),
             Event::Text(text) => {
+                self.display_math_just_flushed = false;
                 if self.in_code_block {
                     self.code_block_buffer.push_str(&text);
                 } else if self.in_table {
@@ -67,11 +70,30 @@ impl LineBuilder {
                 }
             }
             Event::Code(code) => {
+                self.display_math_just_flushed = false;
                 if self.in_table {
                     self.current_cell.push_str(code.as_ref());
                 } else {
                     self.push_span(Span::styled(code.to_string(), Style::new().fg(Color::Cyan)));
                 }
+            }
+            Event::InlineMath(formula) => {
+                self.display_math_just_flushed = false;
+                self.push_span(Span::styled(
+                    render_math(&formula),
+                    Style::new().fg(Color::Cyan),
+                ));
+            }
+            Event::DisplayMath(formula) => {
+                if !self.current_spans.is_empty() {
+                    self.flush_line();
+                }
+                self.push_span(Span::styled(
+                    render_math(&formula),
+                    Style::new().fg(Color::Cyan),
+                ));
+                self.flush_line();
+                self.display_math_just_flushed = true;
             }
             Event::SoftBreak | Event::HardBreak => {
                 if self.in_table {
@@ -162,7 +184,10 @@ impl LineBuilder {
     fn end_tag(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Heading(_) | TagEnd::Paragraph => {
-                self.flush_line();
+                if !self.display_math_just_flushed {
+                    self.flush_line();
+                }
+                self.display_math_just_flushed = false;
                 self.current_style = Style::new();
             }
             TagEnd::CodeBlock => {
@@ -228,6 +253,15 @@ impl LineBuilder {
             for span in spans {
                 let span_style = span.style;
                 let span_text = span.content.into_owned();
+                // Keep cyan inline code and math readable as one semantic span
+                // whenever it fits, rather than splitting it at internal spaces.
+                if span_style.fg == Some(Color::Cyan)
+                    && current_width + UnicodeWidthStr::width(span_text.as_str()) <= max_w
+                {
+                    current_width += UnicodeWidthStr::width(span_text.as_str());
+                    current.push(Span::styled(span_text, span_style));
+                    continue;
+                }
                 // Split span into words preserving spaces
                 let mut words: Vec<&str> = span_text.split(' ').collect();
                 for (i, word) in words.drain(..).enumerate() {
@@ -396,6 +430,32 @@ impl LineBuilder {
     }
 }
 
+// Kept separate so a full TeX renderer can replace this small readable subset.
+fn render_math(formula: &str) -> String {
+    let formula = formula.replace("\\pi", "π");
+    if let Some((numerator, denominator)) = parse_fraction(&formula) {
+        return format!("{numerator}⁄{denominator}");
+    }
+
+    formula
+        .replace("^0", "⁰")
+        .replace("^1", "¹")
+        .replace("^2", "²")
+        .replace("^3", "³")
+        .replace("^4", "⁴")
+        .replace("^5", "⁵")
+        .replace("^6", "⁶")
+        .replace("^7", "⁷")
+        .replace("^8", "⁸")
+        .replace("^9", "⁹")
+}
+
+fn parse_fraction(formula: &str) -> Option<(&str, &str)> {
+    let fraction = formula.strip_prefix("\\frac{")?;
+    let (numerator, denominator) = fraction.split_once("}{")?;
+    Some((numerator, denominator.strip_suffix('}')?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +490,26 @@ mod tests {
             .find(|s| s.content == "foo")
             .expect("should find code span");
         assert_eq!(code_span.style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn inline_dollar_math_omits_delimiters_and_is_cyan() {
+        let lines = render_markdown("area is $\\pi r^2$.", 80);
+        let formula = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "π r²")
+            .expect("formula span");
+        assert_eq!(formula.style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn display_dollar_math_is_its_own_line() {
+        let rendered: Vec<String> = render_markdown("before\n\n$$\\frac{a}{b}$$\n\nafter", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+        assert_eq!(rendered, ["before", "a⁄b", "after"]);
     }
 
     #[test]
