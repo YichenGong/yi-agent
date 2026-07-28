@@ -48,34 +48,45 @@ fn normalize_math_delimiters(src: &str) -> String {
 }
 
 fn normalize_math_text(text: &str) -> String {
+    let delimiters = collect_tex_delimiters(text);
+    let mut matching_closes = vec![None; text.len()];
+    let mut delimiter_starts = vec![false; text.len()];
+    let mut next_parenthesis_close = None;
+    let mut next_bracket_close = None;
+
+    // A reverse pass records the next valid closer for every opener, so an
+    // unmatched opener cannot repeatedly scan the rest of the input.
+    for delimiter in delimiters.iter().rev() {
+        delimiter_starts[delimiter.index] = true;
+        match delimiter.kind {
+            TexDelimiterKind::CloseParenthesis => next_parenthesis_close = Some(delimiter.index),
+            TexDelimiterKind::CloseBracket => next_bracket_close = Some(delimiter.index),
+            TexDelimiterKind::OpenParenthesis => {
+                matching_closes[delimiter.index] = next_parenthesis_close;
+            }
+            TexDelimiterKind::OpenBracket => {
+                matching_closes[delimiter.index] = next_bracket_close;
+            }
+        }
+    }
+
     let mut normalized = String::with_capacity(text.len());
     let mut index = 0;
 
     while index < text.len() {
-        let delimiter = match &text[index..] {
-            rest if rest.starts_with(r"\(") && !is_escaped(text, index) => Some((r"\)", false)),
-            rest if rest.starts_with(r"\[") && !is_escaped(text, index) => Some((r"\]", true)),
-            _ => None,
-        };
-
-        if let Some((closing, display)) = delimiter {
-            if let Some(close) = find_closing_delimiter(text, index + 2, closing) {
-                let dollar = if display { "$$" } else { "$" };
-                normalized.push_str(dollar);
-                normalized.push_str(&text[index + 2..close]);
-                normalized.push_str(dollar);
-                index = close + 2;
-                continue;
-            }
+        if let Some(close) = matching_closes[index] {
+            let display = text[index..].starts_with(r"\[");
+            let dollar = if display { "$$" } else { "$" };
+            normalized.push_str(dollar);
+            normalized.push_str(&text[index + 2..close]);
+            normalized.push_str(dollar);
+            index = close + 2;
+            continue;
         }
 
         // Markdown consumes the slash of an unmatched TeX delimiter. Double it
         // so malformed or escaped math stays visible to the user.
-        if !is_escaped(text, index)
-            && [r"\(", r"\)", r"\[", r"\]"]
-                .iter()
-                .any(|d| text[index..].starts_with(d))
-        {
+        if delimiter_starts[index] {
             normalized.push('\\');
         }
 
@@ -87,35 +98,68 @@ fn normalize_math_text(text: &str) -> String {
     normalized
 }
 
-fn find_closing_delimiter(text: &str, mut index: usize, closing: &str) -> Option<usize> {
-    while index < text.len() {
-        if text[index..].starts_with(closing) && !is_escaped(text, index) {
-            return Some(index);
-        }
-        index += text[index..].chars().next()?.len_utf8();
-    }
-    None
+#[derive(Clone, Copy)]
+struct TexDelimiter {
+    index: usize,
+    kind: TexDelimiterKind,
 }
 
-fn is_escaped(text: &str, index: usize) -> bool {
-    text[..index]
-        .bytes()
-        .rev()
-        .take_while(|ch| *ch == b'\\')
-        .count()
-        % 2
-        == 1
+#[derive(Clone, Copy)]
+enum TexDelimiterKind {
+    OpenParenthesis,
+    CloseParenthesis,
+    OpenBracket,
+    CloseBracket,
+}
+
+fn collect_tex_delimiters(text: &str) -> Vec<TexDelimiter> {
+    let mut delimiters = Vec::new();
+    let mut index = 0;
+    let mut preceding_backslashes = 0;
+
+    while index < text.len() {
+        let ch = text[index..].chars().next().expect("valid UTF-8");
+        if ch == '\\' {
+            if preceding_backslashes % 2 == 0 {
+                let kind = match &text[index..] {
+                    rest if rest.starts_with(r"\(") => Some(TexDelimiterKind::OpenParenthesis),
+                    rest if rest.starts_with(r"\)") => Some(TexDelimiterKind::CloseParenthesis),
+                    rest if rest.starts_with(r"\[") => Some(TexDelimiterKind::OpenBracket),
+                    rest if rest.starts_with(r"\]") => Some(TexDelimiterKind::CloseBracket),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    delimiters.push(TexDelimiter { index, kind });
+                }
+            }
+            preceding_backslashes += 1;
+        } else {
+            preceding_backslashes = 0;
+        }
+        index += ch.len_utf8();
+    }
+
+    delimiters
 }
 
 fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
     if index != 0 && src.as_bytes()[index - 1] != b'\n' {
         return None;
     }
-    let indent = src[index..].bytes().take_while(|ch| *ch == b' ').count();
-    if indent > 3 {
+    let line_end = src[index..]
+        .find('\n')
+        .map_or(src.len(), |offset| index + offset);
+    let line = &src[index..line_end];
+    let (container_prefix, quote_depth) = blockquote_prefix(line);
+    let indent = line[container_prefix..]
+        .bytes()
+        .take_while(|ch| *ch == b' ')
+        .count();
+    let list_indented = quote_depth == 0 && indent > 3 && has_list_parent(src, index);
+    if indent > 3 && !list_indented {
         return None;
     }
-    let fence_start = index + indent;
+    let fence_start = index + container_prefix + indent;
     let fence = *src.as_bytes().get(fence_start)?;
     if fence != b'`' && fence != b'~' {
         return None;
@@ -136,10 +180,26 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
             .find('\n')
             .map_or(src.len(), |offset| line_start + offset);
         let line = &src[line_start..line_end];
-        let spaces = line.bytes().take_while(|ch| *ch == b' ').count();
-        let run = line[spaces..].bytes().take_while(|ch| *ch == fence).count();
-        let remainder = &line[spaces + run..];
-        if spaces <= 3 && run >= fence_len && remainder.bytes().all(|ch| ch == b' ') {
+        let (container_prefix, line_quote_depth) = blockquote_prefix(line);
+        let spaces = line[container_prefix..]
+            .bytes()
+            .take_while(|ch| *ch == b' ')
+            .count();
+        let run = line[container_prefix + spaces..]
+            .bytes()
+            .take_while(|ch| *ch == fence)
+            .count();
+        let remainder = &line[container_prefix + spaces + run..];
+        let valid_indent = if list_indented {
+            spaces >= indent
+        } else {
+            spaces <= 3
+        };
+        if line_quote_depth == quote_depth
+            && valid_indent
+            && run >= fence_len
+            && remainder.bytes().all(|ch| ch == b' ')
+        {
             return Some(if line_end < src.len() {
                 line_end + 1
             } else {
@@ -156,6 +216,45 @@ fn fenced_code_end(src: &str, index: usize) -> Option<usize> {
     // pulldown-cmark treats an unclosed fence as a code block through EOF, so
     // the normalizer must leave its content untouched as well.
     Some(src.len())
+}
+
+fn blockquote_prefix(line: &str) -> (usize, usize) {
+    let mut index = 0;
+    let mut depth = 0;
+
+    loop {
+        let spaces = line[index..].bytes().take_while(|ch| *ch == b' ').count();
+        if spaces > 3 || line.as_bytes().get(index + spaces) != Some(&b'>') {
+            break;
+        }
+        index += spaces + 1;
+        if line.as_bytes().get(index) == Some(&b' ') {
+            index += 1;
+        }
+        depth += 1;
+    }
+
+    (index, depth)
+}
+
+fn has_list_parent(src: &str, line_start: usize) -> bool {
+    src[..line_start]
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(is_list_item_line)
+}
+
+fn is_list_item_line(line: &str) -> bool {
+    let line = line.trim_start_matches(' ');
+    if matches!(line.as_bytes().first(), Some(b'-' | b'+' | b'*')) {
+        return line.as_bytes().get(1) == Some(&b' ');
+    }
+
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && matches!(line.as_bytes().get(digits), Some(b'.' | b')'))
+        && line.as_bytes().get(digits + 1) == Some(&b' ')
 }
 
 fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize> {
@@ -986,6 +1085,26 @@ mod tests {
                 .iter()
                 .any(|line| spans_text(line).contains(r"\[\sqrt{x}\]"))
         );
+    }
+
+    #[test]
+    fn blockquote_fenced_code_preserves_backslash_math_delimiters() {
+        let rendered: Vec<String> = render_markdown("> ```text\n> \\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn list_indented_fenced_code_preserves_backslash_math_delimiters() {
+        let rendered: Vec<String> = render_markdown("- item\n\n    ```text\n    \\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
     }
 
     #[test]
