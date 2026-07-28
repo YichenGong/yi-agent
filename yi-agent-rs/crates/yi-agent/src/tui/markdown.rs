@@ -37,7 +37,7 @@ fn normalize_math_delimiters(src: &str) -> String {
             normalized.push_str(&src[index..fence_end]);
             index = fence_end;
             plain_start = index;
-        } else if src[index..].starts_with('`') {
+        } else if !is_backslash_escaped(src, index) && src[index..].starts_with('`') {
             let ticks = src[index..].bytes().take_while(|ch| *ch == b'`').count();
             if let Some(close) = closing_backticks(src, index + ticks, ticks) {
                 normalized.push_str(&normalize_math_text(&src[plain_start..index]));
@@ -47,6 +47,11 @@ fn normalize_math_delimiters(src: &str) -> String {
             } else {
                 index += ticks;
             }
+        } else if let Some(protected_end) = markdown_protected_end(src, index) {
+            normalized.push_str(&normalize_math_text(&src[plain_start..index]));
+            normalized.push_str(&src[index..protected_end]);
+            index = protected_end;
+            plain_start = index;
         } else {
             index += src[index..].chars().next().expect("valid UTF-8").len_utf8();
         }
@@ -54,6 +59,89 @@ fn normalize_math_delimiters(src: &str) -> String {
 
     normalized.push_str(&normalize_math_text(&src[plain_start..]));
     normalized
+}
+
+fn markdown_protected_end(src: &str, index: usize) -> Option<usize> {
+    if src[index..].starts_with("](") {
+        return link_destination_end(src, index + 2);
+    }
+    if src[index..].starts_with('<') {
+        return angle_bracket_end(src, index);
+    }
+    None
+}
+
+fn link_destination_end(src: &str, mut index: usize) -> Option<usize> {
+    let mut depth = 1;
+    let mut quote = None;
+
+    while index < src.len() {
+        let ch = src[index..].chars().next()?;
+        if is_backslash_escaped(src, index) {
+            index += ch.len_utf8();
+            continue;
+        }
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn angle_bracket_end(src: &str, index: usize) -> Option<usize> {
+    let next = *src.as_bytes().get(index + 1)?;
+    if !(next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?')) {
+        return None;
+    }
+
+    let mut quote = None;
+    let mut cursor = index + 1;
+    while cursor < src.len() {
+        let ch = src[cursor..].chars().next()?;
+        if is_backslash_escaped(src, cursor) {
+            cursor += ch.len_utf8();
+            continue;
+        }
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '>' => return Some(cursor + 1),
+                '\n' => return None,
+                _ => {}
+            }
+        }
+        cursor += ch.len_utf8();
+    }
+    None
+}
+
+fn is_backslash_escaped(src: &str, index: usize) -> bool {
+    src[..index]
+        .bytes()
+        .rev()
+        .take_while(|ch| *ch == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn normalize_math_text(text: &str) -> String {
@@ -286,7 +374,7 @@ fn is_list_item_line(line: &str) -> bool {
 
 fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize> {
     while index < src.len() {
-        if src[index..].starts_with('`') {
+        if !is_backslash_escaped(src, index) && src[index..].starts_with('`') {
             let run = src[index..].bytes().take_while(|ch| *ch == b'`').count();
             if run == ticks {
                 return Some(index);
@@ -1081,6 +1169,38 @@ mod tests {
             .find(|s| s.content == "foo")
             .expect("should find code span");
         assert_eq!(code_span.style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn escaped_backticks_do_not_hide_backslash_math() {
+        let rendered = render_markdown(r"\`literal \(\alpha\) `", 80);
+
+        assert!(spans_text(&rendered[0]).contains('α'));
+    }
+
+    #[test]
+    fn math_delimiters_in_link_destinations_remain_literal() {
+        let src =
+            r"[visible \(\alpha\)](https://example.com/\(path\)) ![alt](https://img.test/\[x\])";
+        let normalized = normalize_math_delimiters(src);
+        let rendered = render_markdown(src, 120);
+        let text: String = rendered.iter().map(spans_text).collect();
+
+        assert!(text.contains('α'));
+        assert!(normalized.contains(r"https://example.com/\(path\)"));
+        assert!(normalized.contains(r"https://img.test/\[x\]"));
+    }
+
+    #[test]
+    fn math_delimiters_in_autolinks_and_html_attributes_remain_literal() {
+        let src = r#"<https://example.com/\(path\)> <a href="https://example.com/\[path\]">link \(\beta\)</a>"#;
+        let normalized = normalize_math_delimiters(src);
+        let rendered = render_markdown(src, 120);
+        let text: String = rendered.iter().map(spans_text).collect();
+
+        assert!(normalized.contains(r"https://example.com/\(path\)"));
+        assert!(normalized.contains(r"https://example.com/\[path\]"));
+        assert!(text.contains('β'));
     }
 
     #[test]
