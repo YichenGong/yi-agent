@@ -1284,6 +1284,17 @@ mod tests {
     }
 
     #[test]
+    fn display_math_wraps_at_requested_width() {
+        let rendered = render_markdown("$$\\alpha + \\beta + \\gamma + \\delta$$", 8);
+
+        assert!(
+            rendered
+                .iter()
+                .all(|line| { UnicodeWidthStr::width(spans_text(line).as_str()) <= 8 })
+        );
+    }
+
+    #[test]
     fn code_block_renders_as_separate_lines() {
         let src = "```rust\nfn main() {}\n```\n";
         let lines = render_markdown(src, 80);
