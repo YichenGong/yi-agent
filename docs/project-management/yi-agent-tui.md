@@ -29,6 +29,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] ratatui 全屏 TUI 架构 — `tui/app.rs` 实现事件循环 + 布局 — [设计](../plans/2026-07-25-tui-history-redesign.md)
 - [x] 结构化对话历史 — `tui/cell.rs` 定义 `HistoryCell` 枚举 + `tui/history.rs` 管理 — [设计](../plans/2026-07-25-tui-history-redesign.md)
 - [x] Markdown 渲染 — `tui/markdown.rs` 用 pulldown-cmark + 表格 Unicode box drawing — [设计](../plans/2026-07-25-tui-history-redesign.md)
+- [x] LaTeX 终端渲染 — `tui/markdown.rs` 支持 `$...$`、`$$...$$`、`\\(...\\)`、`\\[...\\]` 并按终端宽度换行；验证：`cargo test -p yi-agent tui::markdown::tests -- --nocapture`
 - [x] 输入框多行自动换行 — `tui/input.rs` 实现 CJK 宽度感知换行
 - [x] 两步退出确认 — `tui/app.rs` Ctrl+C / Esc 两次才退出 — [设计](../plans/2026-07-24-yi-agent-tui-features-design.md)
 - [x] Slash 命令弹窗 — `tui/slash.rs` 实现自动补全 + 中文描述 — [设计](../plans/2026-07-25-tui-slash-commands-design.md)

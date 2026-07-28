@@ -3,10 +3,19 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static LIST_CONTEXT_LINE_INSPECTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Render a markdown string into ratatui Lines, wrapped at `width`.
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
-    let parser = Parser::new_ext(src, opts);
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
+    let normalized = normalize_math_delimiters(src);
+    let parser = Parser::new_ext(&normalized, opts);
     let mut builder = LineBuilder::new(width);
     for event in parser {
         builder.handle_event(event);
@@ -14,11 +23,376 @@ pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
     builder.finish()
 }
 
+/// Convert TeX's `\\(...\\)` and `\\[...\\]` delimiters to pulldown-cmark's
+/// dollar syntax, without changing Markdown code spans or fenced code blocks.
+fn normalize_math_delimiters(src: &str) -> String {
+    let mut normalized = String::with_capacity(src.len());
+    let mut plain_start = 0;
+    let mut index = 0;
+    let list_parents = list_parent_contexts(src);
+
+    while index < src.len() {
+        if let Some(fence_end) = fenced_code_end(src, index, list_parents[index]) {
+            normalized.push_str(&normalize_math_text(&src[plain_start..index]));
+            normalized.push_str(&src[index..fence_end]);
+            index = fence_end;
+            plain_start = index;
+        } else if !is_backslash_escaped(src, index) && src[index..].starts_with('`') {
+            let ticks = src[index..].bytes().take_while(|ch| *ch == b'`').count();
+            if let Some(close) = closing_backticks(src, index + ticks, ticks) {
+                normalized.push_str(&normalize_math_text(&src[plain_start..index]));
+                normalized.push_str(&src[index..close + ticks]);
+                index = close + ticks;
+                plain_start = index;
+            } else {
+                index += ticks;
+            }
+        } else if let Some(protected_end) = markdown_protected_end(src, index) {
+            normalized.push_str(&normalize_math_text(&src[plain_start..index]));
+            normalized.push_str(&src[index..protected_end]);
+            index = protected_end;
+            plain_start = index;
+        } else {
+            index += src[index..].chars().next().expect("valid UTF-8").len_utf8();
+        }
+    }
+
+    normalized.push_str(&normalize_math_text(&src[plain_start..]));
+    normalized
+}
+
+fn markdown_protected_end(src: &str, index: usize) -> Option<usize> {
+    if src[index..].starts_with("](") {
+        return link_destination_end(src, index + 2);
+    }
+    if src[index..].starts_with('<') {
+        return angle_bracket_end(src, index);
+    }
+    None
+}
+
+fn link_destination_end(src: &str, mut index: usize) -> Option<usize> {
+    let mut depth = 1;
+    let mut quote = None;
+
+    while index < src.len() {
+        let ch = src[index..].chars().next()?;
+        if is_backslash_escaped(src, index) {
+            index += ch.len_utf8();
+            continue;
+        }
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn angle_bracket_end(src: &str, index: usize) -> Option<usize> {
+    let next = *src.as_bytes().get(index + 1)?;
+    if !(next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?')) {
+        return None;
+    }
+
+    let mut quote = None;
+    let mut cursor = index + 1;
+    while cursor < src.len() {
+        let ch = src[cursor..].chars().next()?;
+        if is_backslash_escaped(src, cursor) {
+            cursor += ch.len_utf8();
+            continue;
+        }
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '>' => return Some(cursor + 1),
+                '\n' => return None,
+                _ => {}
+            }
+        }
+        cursor += ch.len_utf8();
+    }
+    None
+}
+
+fn is_backslash_escaped(src: &str, index: usize) -> bool {
+    src[..index]
+        .bytes()
+        .rev()
+        .take_while(|ch| *ch == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn normalize_math_text(text: &str) -> String {
+    let delimiters = collect_tex_delimiters(text);
+    let mut matching_closes = vec![None; text.len()];
+    let mut delimiter_starts = vec![false; text.len()];
+    let mut next_parenthesis_close = None;
+    let mut next_bracket_close = None;
+
+    // A reverse pass records the next valid closer for every opener, so an
+    // unmatched opener cannot repeatedly scan the rest of the input.
+    for delimiter in delimiters.iter().rev() {
+        delimiter_starts[delimiter.index] = true;
+        match delimiter.kind {
+            TexDelimiterKind::CloseParenthesis => next_parenthesis_close = Some(delimiter.index),
+            TexDelimiterKind::CloseBracket => next_bracket_close = Some(delimiter.index),
+            TexDelimiterKind::OpenParenthesis => {
+                matching_closes[delimiter.index] = next_parenthesis_close;
+            }
+            TexDelimiterKind::OpenBracket => {
+                matching_closes[delimiter.index] = next_bracket_close;
+            }
+        }
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    let mut index = 0;
+
+    while index < text.len() {
+        if let Some(close) = matching_closes[index] {
+            let display = text[index..].starts_with(r"\[");
+            let dollar = if display { "$$" } else { "$" };
+            normalized.push_str(dollar);
+            normalized.push_str(&text[index + 2..close]);
+            normalized.push_str(dollar);
+            index = close + 2;
+            continue;
+        }
+
+        // Markdown consumes the slash of an unmatched TeX delimiter. Double it
+        // so malformed or escaped math stays visible to the user.
+        if delimiter_starts[index] {
+            normalized.push('\\');
+        }
+
+        let ch = text[index..].chars().next().expect("valid UTF-8");
+        normalized.push(ch);
+        index += ch.len_utf8();
+    }
+
+    normalized
+}
+
+#[derive(Clone, Copy)]
+struct TexDelimiter {
+    index: usize,
+    kind: TexDelimiterKind,
+}
+
+#[derive(Clone, Copy)]
+enum TexDelimiterKind {
+    OpenParenthesis,
+    CloseParenthesis,
+    OpenBracket,
+    CloseBracket,
+}
+
+fn collect_tex_delimiters(text: &str) -> Vec<TexDelimiter> {
+    let mut delimiters = Vec::new();
+    let mut index = 0;
+    let mut preceding_backslashes = 0;
+
+    while index < text.len() {
+        let ch = text[index..].chars().next().expect("valid UTF-8");
+        if ch == '\\' {
+            if preceding_backslashes % 2 == 0 {
+                let kind = match &text[index..] {
+                    rest if rest.starts_with(r"\(") => Some(TexDelimiterKind::OpenParenthesis),
+                    rest if rest.starts_with(r"\)") => Some(TexDelimiterKind::CloseParenthesis),
+                    rest if rest.starts_with(r"\[") => Some(TexDelimiterKind::OpenBracket),
+                    rest if rest.starts_with(r"\]") => Some(TexDelimiterKind::CloseBracket),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    delimiters.push(TexDelimiter { index, kind });
+                }
+            }
+            preceding_backslashes += 1;
+        } else {
+            preceding_backslashes = 0;
+        }
+        index += ch.len_utf8();
+    }
+
+    delimiters
+}
+
+fn fenced_code_end(src: &str, index: usize, list_parent: bool) -> Option<usize> {
+    if index != 0 && src.as_bytes()[index - 1] != b'\n' {
+        return None;
+    }
+    let line_end = src[index..]
+        .find('\n')
+        .map_or(src.len(), |offset| index + offset);
+    let line = &src[index..line_end];
+    let (container_prefix, quote_depth) = blockquote_prefix(line);
+    let indent = line[container_prefix..]
+        .bytes()
+        .take_while(|ch| *ch == b' ')
+        .count();
+    let fence_start = index + container_prefix + indent;
+    let fence = *src.as_bytes().get(fence_start)?;
+    if fence != b'`' && fence != b'~' {
+        return None;
+    }
+    let fence_len = src[fence_start..]
+        .bytes()
+        .take_while(|ch| *ch == fence)
+        .count();
+    if fence_len < 3 {
+        return None;
+    }
+    let list_indented = quote_depth == 0 && indent > 3 && list_parent;
+    if indent > 3 && !list_indented {
+        return None;
+    }
+
+    let mut line_start = src[fence_start..]
+        .find('\n')
+        .map_or(src.len(), |offset| fence_start + offset + 1);
+    while line_start < src.len() {
+        let line_end = src[line_start..]
+            .find('\n')
+            .map_or(src.len(), |offset| line_start + offset);
+        let line = &src[line_start..line_end];
+        let (container_prefix, line_quote_depth) = blockquote_prefix(line);
+        let spaces = line[container_prefix..]
+            .bytes()
+            .take_while(|ch| *ch == b' ')
+            .count();
+        let run = line[container_prefix + spaces..]
+            .bytes()
+            .take_while(|ch| *ch == fence)
+            .count();
+        let remainder = &line[container_prefix + spaces + run..];
+        if !line.trim().is_empty()
+            && ((quote_depth > 0 && line_quote_depth < quote_depth)
+                || (list_indented && line_quote_depth == 0 && spaces < indent))
+        {
+            return Some(line_start);
+        }
+        let valid_indent = if list_indented {
+            spaces >= indent
+        } else {
+            spaces <= 3
+        };
+        if line_quote_depth == quote_depth
+            && valid_indent
+            && run >= fence_len
+            && remainder.bytes().all(|ch| ch == b' ')
+        {
+            return Some(if line_end < src.len() {
+                line_end + 1
+            } else {
+                line_end
+            });
+        }
+        line_start = if line_end < src.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+    }
+
+    // An unclosed fence remains code until its container ends, or EOF for a
+    // top-level fence, so the normalizer must leave that range untouched.
+    Some(src.len())
+}
+
+fn blockquote_prefix(line: &str) -> (usize, usize) {
+    let mut index = 0;
+    let mut depth = 0;
+
+    loop {
+        let spaces = line[index..].bytes().take_while(|ch| *ch == b' ').count();
+        if spaces > 3 || line.as_bytes().get(index + spaces) != Some(&b'>') {
+            break;
+        }
+        index += spaces + 1;
+        if line.as_bytes().get(index) == Some(&b' ') {
+            index += 1;
+        }
+        depth += 1;
+    }
+
+    (index, depth)
+}
+
+fn list_parent_contexts(src: &str) -> Vec<bool> {
+    let mut contexts = vec![false; src.len() + 1];
+    let mut list_parent = false;
+    let mut line_start = 0;
+
+    for raw_line in src.split_inclusive('\n') {
+        contexts[line_start] = list_parent;
+        #[cfg(test)]
+        LIST_CONTEXT_LINE_INSPECTIONS.with(|inspections| inspections.set(inspections.get() + 1));
+
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if !line.trim().is_empty() {
+            list_parent = is_list_item_line(line);
+        }
+        line_start += raw_line.len();
+    }
+
+    contexts
+}
+
+fn is_list_item_line(line: &str) -> bool {
+    let line = line.trim_start_matches(' ');
+    if matches!(line.as_bytes().first(), Some(b'-' | b'+' | b'*')) {
+        return line.as_bytes().get(1) == Some(&b' ');
+    }
+
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && matches!(line.as_bytes().get(digits), Some(b'.' | b')'))
+        && line.as_bytes().get(digits + 1) == Some(&b' ')
+}
+
+fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize> {
+    while index < src.len() {
+        if src[index..].starts_with('`') {
+            let run = src[index..].bytes().take_while(|ch| *ch == b'`').count();
+            if run == ticks {
+                return Some(index);
+            }
+            index += run;
+        } else {
+            index += src[index..].chars().next()?.len_utf8();
+        }
+    }
+    None
+}
+
 struct LineBuilder {
     width: u16,
     lines: Vec<Line<'static>>,
-    current_spans: Vec<Span<'static>>,
+    current_spans: Vec<PendingSpan>,
     current_style: Style,
+    display_math_just_flushed: bool,
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
@@ -33,6 +407,11 @@ struct LineBuilder {
     list_stack: Vec<Option<u64>>,
 }
 
+struct PendingSpan {
+    span: Span<'static>,
+    preserve_as_single_span: bool,
+}
+
 impl LineBuilder {
     fn new(width: u16) -> Self {
         Self {
@@ -40,6 +419,7 @@ impl LineBuilder {
             lines: Vec::new(),
             current_spans: Vec::new(),
             current_style: Style::new(),
+            display_math_just_flushed: false,
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
@@ -57,6 +437,7 @@ impl LineBuilder {
             Event::Start(tag) => self.start_tag(tag),
             Event::End(tag) => self.end_tag(tag),
             Event::Text(text) => {
+                self.display_math_just_flushed = false;
                 if self.in_code_block {
                     self.code_block_buffer.push_str(&text);
                 } else if self.in_table {
@@ -67,10 +448,33 @@ impl LineBuilder {
                 }
             }
             Event::Code(code) => {
+                self.display_math_just_flushed = false;
                 if self.in_table {
                     self.current_cell.push_str(code.as_ref());
                 } else {
                     self.push_span(Span::styled(code.to_string(), Style::new().fg(Color::Cyan)));
+                }
+            }
+            Event::InlineMath(formula) => {
+                self.display_math_just_flushed = false;
+                let formula = render_math(&formula);
+                if self.in_table {
+                    self.current_cell.push_str(&formula);
+                } else {
+                    self.push_math_span(Span::styled(formula, Style::new().fg(Color::Cyan)));
+                }
+            }
+            Event::DisplayMath(formula) => {
+                let formula = render_math(&formula);
+                if self.in_table {
+                    self.current_cell.push_str(&formula);
+                } else {
+                    if !self.current_spans.is_empty() {
+                        self.flush_line();
+                    }
+                    self.push_math_span(Span::styled(formula, Style::new().fg(Color::Cyan)));
+                    self.flush_line();
+                    self.display_math_just_flushed = true;
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -162,7 +566,10 @@ impl LineBuilder {
     fn end_tag(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Heading(_) | TagEnd::Paragraph => {
-                self.flush_line();
+                if !self.display_math_just_flushed {
+                    self.flush_line();
+                }
+                self.display_math_just_flushed = false;
                 self.current_style = Style::new();
             }
             TagEnd::CodeBlock => {
@@ -203,7 +610,17 @@ impl LineBuilder {
     }
 
     fn push_span(&mut self, span: Span<'static>) {
-        self.current_spans.push(span);
+        self.current_spans.push(PendingSpan {
+            span,
+            preserve_as_single_span: false,
+        });
+    }
+
+    fn push_math_span(&mut self, span: Span<'static>) {
+        self.current_spans.push(PendingSpan {
+            span,
+            preserve_as_single_span: true,
+        });
     }
 
     #[allow(dead_code)]
@@ -225,14 +642,35 @@ impl LineBuilder {
             // break it character-by-character.
             let mut current: Vec<Span<'static>> = Vec::new();
             let mut current_width: usize = 0;
-            for span in spans {
+            let mut previous_was_formula = false;
+            for pending in spans {
+                let span = pending.span;
                 let span_style = span.style;
                 let span_text = span.content.into_owned();
+                // Keep formulas readable as one semantic span
+                // whenever it fits, rather than splitting it at internal spaces.
+                if pending.preserve_as_single_span {
+                    let formula_width = UnicodeWidthStr::width(span_text.as_str());
+                    if formula_width <= max_w {
+                        if !current.is_empty() && current_width + formula_width > max_w {
+                            self.lines.push(Line::from(std::mem::take(&mut current)));
+                            current_width = 0;
+                        }
+                        current_width += formula_width;
+                        current.push(Span::styled(span_text, span_style));
+                        previous_was_formula = true;
+                        continue;
+                    }
+                }
                 // Split span into words preserving spaces
                 let mut words: Vec<&str> = span_text.split(' ').collect();
                 for (i, word) in words.drain(..).enumerate() {
                     let word_width = UnicodeWidthStr::width(word);
-                    let sep = if i == 0 && current.is_empty() { 0 } else { 1 }; // space before word
+                    let sep = if i == 0 && (current.is_empty() || previous_was_formula) {
+                        0
+                    } else {
+                        1
+                    }; // space before word
                     if current_width + sep + word_width <= max_w {
                         // Fits on current line
                         if sep == 1 && !current.is_empty() {
@@ -275,6 +713,7 @@ impl LineBuilder {
                         }
                     }
                 }
+                previous_was_formula = false;
             }
             if !current.is_empty() {
                 self.lines.push(Line::from(current));
@@ -396,6 +835,283 @@ impl LineBuilder {
     }
 }
 
+fn render_math(formula: &str) -> String {
+    TexRenderer::new(formula).render()
+}
+
+const MAX_TEX_NESTING: usize = 32;
+
+struct TexRenderer {
+    chars: Vec<char>,
+    position: usize,
+}
+
+impl TexRenderer {
+    fn new(formula: &str) -> Self {
+        Self {
+            chars: formula.chars().collect(),
+            position: 0,
+        }
+    }
+
+    fn render(mut self) -> String {
+        self.render_until(None, 0)
+    }
+
+    fn render_until(&mut self, closing: Option<char>, depth: usize) -> String {
+        let mut rendered = String::new();
+
+        while let Some(ch) = self.next_char() {
+            if Some(ch) == closing {
+                break;
+            }
+            match ch {
+                '\\' => rendered.push_str(&self.render_command(depth)),
+                '{' => {
+                    if depth >= MAX_TEX_NESTING {
+                        rendered.push_str(&self.consume_raw_group_after_open());
+                    } else {
+                        rendered.push_str(&self.render_until(Some('}'), depth + 1));
+                    }
+                }
+                '^' => rendered.push_str(&self.render_script(true, depth)),
+                '_' => rendered.push_str(&self.render_script(false, depth)),
+                _ => rendered.push(ch),
+            }
+        }
+
+        rendered
+    }
+
+    fn render_command(&mut self, depth: usize) -> String {
+        let name = self.consume_command_name();
+        match name.as_str() {
+            "alpha" => "α".to_string(),
+            "beta" => "β".to_string(),
+            "gamma" => "γ".to_string(),
+            "delta" => "δ".to_string(),
+            "epsilon" => "ε".to_string(),
+            "theta" => "θ".to_string(),
+            "lambda" => "λ".to_string(),
+            "mu" => "μ".to_string(),
+            "pi" => "π".to_string(),
+            "sigma" => "σ".to_string(),
+            "phi" => "φ".to_string(),
+            "omega" => "ω".to_string(),
+            "Gamma" => "Γ".to_string(),
+            "Delta" => "Δ".to_string(),
+            "Theta" => "Θ".to_string(),
+            "Lambda" => "Λ".to_string(),
+            "Pi" => "Π".to_string(),
+            "Sigma" => "Σ".to_string(),
+            "Phi" => "Φ".to_string(),
+            "Omega" => "Ω".to_string(),
+            "sum" => "∑".to_string(),
+            "prod" => "∏".to_string(),
+            "int" => "∫".to_string(),
+            "infty" => "∞".to_string(),
+            "le" | "leq" => "≤".to_string(),
+            "ge" | "geq" => "≥".to_string(),
+            "neq" => "≠".to_string(),
+            "times" => "×".to_string(),
+            "cdot" => "·".to_string(),
+            "pm" => "±".to_string(),
+            "to" | "rightarrow" => "→".to_string(),
+            "sin" | "cos" | "tan" => name,
+            "left" | "right" => String::new(),
+            "frac" => self.render_fraction(depth),
+            "sqrt" => format!("√{}", self.render_argument(depth)),
+            _ if name.is_empty() => "\\".to_string(),
+            _ => name,
+        }
+    }
+
+    fn consume_command_name(&mut self) -> String {
+        let start = self.position;
+        while self
+            .chars
+            .get(self.position)
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        {
+            self.position += 1;
+        }
+        self.chars[start..self.position].iter().collect()
+    }
+
+    fn render_fraction(&mut self, depth: usize) -> String {
+        let numerator_end = self.braced_group_end(self.position);
+        let denominator_end = numerator_end.and_then(|end| self.braced_group_end(end));
+        if denominator_end.is_none() {
+            return "frac".to_string();
+        }
+
+        let numerator = self.render_argument(depth);
+        let denominator = self.render_argument(depth);
+        format!("{numerator}⁄{denominator}")
+    }
+
+    fn render_argument(&mut self, depth: usize) -> String {
+        if self.peek_char() == Some('{') {
+            if depth >= MAX_TEX_NESTING {
+                self.position += 1;
+                self.consume_raw_group_after_open()
+            } else {
+                self.position += 1;
+                self.render_until(Some('}'), depth + 1)
+            }
+        } else if self.peek_char() == Some('\\') {
+            self.position += 1;
+            self.render_command(depth)
+        } else {
+            self.next_char()
+                .map_or_else(String::new, |ch| ch.to_string())
+        }
+    }
+
+    fn render_script(&mut self, superscript: bool, depth: usize) -> String {
+        let script = self.render_argument(depth);
+        script
+            .chars()
+            .map(|ch| map_script_character(ch, superscript))
+            .collect()
+    }
+
+    fn braced_group_end(&self, start: usize) -> Option<usize> {
+        if self.chars.get(start) != Some(&'{') {
+            return None;
+        }
+
+        let mut nesting = 0;
+        for (index, ch) in self.chars.iter().enumerate().skip(start) {
+            match ch {
+                '{' => nesting += 1,
+                '}' => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn consume_raw_group_after_open(&mut self) -> String {
+        let mut raw = String::from("{");
+        let mut nesting = 1;
+
+        while let Some(ch) = self.next_char() {
+            raw.push(ch);
+            match ch {
+                '{' => nesting += 1,
+                '}' => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        raw
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.chars.get(self.position).copied()
+    }
+
+    fn next_char(&mut self) -> Option<char> {
+        let ch = self.peek_char()?;
+        self.position += 1;
+        Some(ch)
+    }
+}
+
+fn map_script_character(ch: char, superscript: bool) -> char {
+    let mapped = if superscript {
+        match ch {
+            '0' => Some('⁰'),
+            '1' => Some('¹'),
+            '2' => Some('²'),
+            '3' => Some('³'),
+            '4' => Some('⁴'),
+            '5' => Some('⁵'),
+            '6' => Some('⁶'),
+            '7' => Some('⁷'),
+            '8' => Some('⁸'),
+            '9' => Some('⁹'),
+            '+' => Some('⁺'),
+            '-' => Some('⁻'),
+            '=' => Some('⁼'),
+            '(' => Some('⁽'),
+            ')' => Some('⁾'),
+            'a' => Some('ᵃ'),
+            'b' => Some('ᵇ'),
+            'c' => Some('ᶜ'),
+            'd' => Some('ᵈ'),
+            'e' => Some('ᵉ'),
+            'f' => Some('ᶠ'),
+            'g' => Some('ᵍ'),
+            'h' => Some('ʰ'),
+            'i' => Some('ⁱ'),
+            'j' => Some('ʲ'),
+            'k' => Some('ᵏ'),
+            'l' => Some('ˡ'),
+            'm' => Some('ᵐ'),
+            'n' => Some('ⁿ'),
+            'o' => Some('ᵒ'),
+            'p' => Some('ᵖ'),
+            'r' => Some('ʳ'),
+            's' => Some('ˢ'),
+            't' => Some('ᵗ'),
+            'u' => Some('ᵘ'),
+            'v' => Some('ᵛ'),
+            'w' => Some('ʷ'),
+            'x' => Some('ˣ'),
+            'y' => Some('ʸ'),
+            'z' => Some('ᶻ'),
+            _ => None,
+        }
+    } else {
+        match ch {
+            '0' => Some('₀'),
+            '1' => Some('₁'),
+            '2' => Some('₂'),
+            '3' => Some('₃'),
+            '4' => Some('₄'),
+            '5' => Some('₅'),
+            '6' => Some('₆'),
+            '7' => Some('₇'),
+            '8' => Some('₈'),
+            '9' => Some('₉'),
+            '+' => Some('₊'),
+            '-' => Some('₋'),
+            '=' => Some('₌'),
+            '(' => Some('₍'),
+            ')' => Some('₎'),
+            'a' => Some('ₐ'),
+            'e' => Some('ₑ'),
+            'h' => Some('ₕ'),
+            'i' => Some('ᵢ'),
+            'j' => Some('ⱼ'),
+            'k' => Some('ₖ'),
+            'l' => Some('ₗ'),
+            'm' => Some('ₘ'),
+            'n' => Some('ₙ'),
+            'o' => Some('ₒ'),
+            'p' => Some('ₚ'),
+            'r' => Some('ᵣ'),
+            's' => Some('ₛ'),
+            't' => Some('ₜ'),
+            'x' => Some('ₓ'),
+            _ => None,
+        }
+    };
+    mapped.unwrap_or(ch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,11 +1120,34 @@ mod tests {
         line.spans.iter().map(|s| s.content.to_string()).collect()
     }
 
+    fn reset_list_context_line_inspections() {
+        LIST_CONTEXT_LINE_INSPECTIONS.with(|inspections| inspections.set(0));
+    }
+
+    fn list_context_line_inspections() -> usize {
+        LIST_CONTEXT_LINE_INSPECTIONS.with(Cell::get)
+    }
+
     #[test]
     fn plain_text_renders_as_single_line() {
         let lines = render_markdown("hello world", 80);
         assert_eq!(lines.len(), 1);
         assert_eq!(spans_text(&lines[0]), "hello world");
+    }
+
+    #[test]
+    fn many_deep_fence_candidates_use_one_forward_list_context_pass() {
+        let src = format!("{}outside \\(x\\)", "    ```text\n".repeat(128));
+        reset_list_context_line_inspections();
+
+        let rendered = render_markdown(&src, 80);
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| spans_text(line).contains("outside x"))
+        );
+        assert_eq!(list_context_line_inspections(), src.lines().count());
     }
 
     #[test]
@@ -430,6 +1169,256 @@ mod tests {
             .find(|s| s.content == "foo")
             .expect("should find code span");
         assert_eq!(code_span.style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn escaped_backticks_do_not_hide_backslash_math() {
+        let rendered = render_markdown(r"\`literal \(\alpha\) `", 80);
+
+        assert!(spans_text(&rendered[0]).contains('α'));
+    }
+
+    #[test]
+    fn escaped_backtick_closes_an_open_code_span() {
+        let rendered = render_markdown(r"`foo \` math \(\alpha\) `", 80);
+
+        assert!(spans_text(&rendered[0]).contains('α'));
+    }
+
+    #[test]
+    fn math_delimiters_in_link_destinations_remain_literal() {
+        let src =
+            r"[visible \(\alpha\)](https://example.com/\(path\)) ![alt](https://img.test/\[x\])";
+        let normalized = normalize_math_delimiters(src);
+        let rendered = render_markdown(src, 120);
+        let text: String = rendered.iter().map(spans_text).collect();
+
+        assert!(text.contains('α'));
+        assert!(normalized.contains(r"https://example.com/\(path\)"));
+        assert!(normalized.contains(r"https://img.test/\[x\]"));
+    }
+
+    #[test]
+    fn math_delimiters_in_autolinks_and_html_attributes_remain_literal() {
+        let src = r#"<https://example.com/\(path\)> <a href="https://example.com/\[path\]">link \(\beta\)</a>"#;
+        let normalized = normalize_math_delimiters(src);
+        let rendered = render_markdown(src, 120);
+        let text: String = rendered.iter().map(spans_text).collect();
+
+        assert!(normalized.contains(r"https://example.com/\(path\)"));
+        assert!(normalized.contains(r"https://example.com/\[path\]"));
+        assert!(text.contains('β'));
+    }
+
+    #[test]
+    fn inline_code_with_spaces_keeps_existing_word_wrapping() {
+        let lines = render_markdown("`two words`", 80);
+        let code_words: Vec<_> = lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(code_words, ["two", "words"]);
+    }
+
+    #[test]
+    fn inline_dollar_math_omits_delimiters_and_is_cyan() {
+        let lines = render_markdown("area is $\\pi r^2$.", 80);
+        let formula = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "π r²")
+            .expect("formula span");
+        assert_eq!(formula.style.fg, Some(Color::Cyan));
+        assert_eq!(spans_text(&lines[0]), "area is π r².");
+    }
+
+    #[test]
+    fn inline_backslash_parenthesis_math_renders_as_inline_math() {
+        let lines = render_markdown(r"mass \(\alpha + \beta\)", 80);
+
+        assert_eq!(spans_text(&lines[0]), "mass α + β");
+    }
+
+    #[test]
+    fn backslash_bracket_math_renders_on_its_own_line() {
+        let rendered: Vec<String> = render_markdown("before\n\n\\[\\sqrt{x}\\]\n\nafter", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert_eq!(rendered, ["before", "√x", "after"]);
+    }
+
+    #[test]
+    fn backslash_math_delimiters_in_code_are_preserved() {
+        let inline = render_markdown(r"`\(\alpha\)`", 80);
+        let fenced = render_markdown("```text\n\\[\\sqrt{x}\\]\n```", 80);
+
+        assert_eq!(spans_text(&inline[0]), r"\(\alpha\)");
+        assert!(
+            fenced
+                .iter()
+                .any(|line| spans_text(line).contains(r"\[\sqrt{x}\]"))
+        );
+    }
+
+    #[test]
+    fn blockquote_fenced_code_preserves_backslash_math_delimiters() {
+        let rendered: Vec<String> = render_markdown("> ```text\n> \\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn unclosed_blockquote_fence_stops_protection_at_outer_prose() {
+        let rendered: Vec<String> = render_markdown("> ```text\n> code\noutside \\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("outside x")));
+    }
+
+    #[test]
+    fn list_indented_fenced_code_preserves_backslash_math_delimiters() {
+        let rendered: Vec<String> = render_markdown("- item\n\n    ```text\n    \\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn unclosed_list_fence_stops_protection_at_outer_prose() {
+        let rendered: Vec<String> =
+            render_markdown("- item\n\n    ```text\n    code\noutside \\(x\\)", 80)
+                .iter()
+                .map(spans_text)
+                .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("outside x")));
+    }
+
+    #[test]
+    fn single_backtick_code_span_ignores_longer_backtick_runs() {
+        let rendered = render_markdown(r"`triple ``` then \(\alpha\) end`", 80);
+
+        assert_eq!(spans_text(&rendered[0]), r"triple ``` then \(\alpha\) end");
+    }
+
+    #[test]
+    fn unclosed_fenced_code_preserves_backslash_math_delimiters_to_eof() {
+        let rendered: Vec<String> = render_markdown("```text\n\\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn invalid_fence_closer_does_not_end_code_protection() {
+        let rendered: Vec<String> = render_markdown("```text\n```not-a-close\n\\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn tab_after_fence_run_does_not_end_code_protection() {
+        let rendered: Vec<String> = render_markdown("```text\n```\t\n\\(x\\)", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains(r"\(x\)")));
+    }
+
+    #[test]
+    fn unmatched_or_escaped_backslash_math_delimiters_remain_literal() {
+        let unmatched = render_markdown(r"mass \(\alpha", 80);
+        let escaped = render_markdown(r"mass \\(\alpha\\)", 80);
+
+        assert!(spans_text(&unmatched[0]).contains(r"\(\alpha"));
+        let escaped_text = spans_text(&escaped[0]);
+        assert!(escaped_text.contains(r"\("));
+        assert!(escaped_text.contains(r"\)"));
+    }
+
+    #[test]
+    fn inline_math_renders_symbols_scripts_fractions_and_roots() {
+        let rendered = render_markdown("$\\alpha + x^2 + a_{i+1} + \\frac{m}{n} + \\sqrt{z}$", 80);
+        assert_eq!(spans_text(&rendered[0]), "α + x² + aᵢ₊₁ + m⁄n + √z");
+    }
+
+    #[test]
+    fn unsupported_math_command_remains_readable() {
+        let rendered = render_markdown("$\\unknown{x}$", 80);
+        assert_eq!(spans_text(&rendered[0]), "unknownx");
+    }
+
+    #[test]
+    fn script_command_arguments_remain_readable_without_slashes() {
+        let rendered = render_markdown("$x^\\alpha + a_\\infty$", 80);
+        assert_eq!(spans_text(&rendered[0]), "xα + a∞");
+    }
+
+    #[test]
+    fn malformed_fraction_commands_remain_readable() {
+        let incomplete = render_markdown("$\\frac{a}$", 80);
+        let bare = render_markdown("$\\frac$", 80);
+
+        assert_eq!(spans_text(&incomplete[0]), "fraca");
+        assert_eq!(spans_text(&bare[0]), "frac");
+        assert_eq!(render_math("\\"), "\\");
+    }
+
+    #[test]
+    fn nesting_beyond_the_limit_keeps_group_content_readable() {
+        let nesting = 33;
+        let formula = format!("${}x{}$", "{".repeat(nesting), "}".repeat(nesting));
+
+        let rendered = render_markdown(&formula, 120);
+
+        assert!(spans_text(&rendered[0]).contains("{x}"));
+    }
+
+    #[test]
+    fn formula_moves_to_a_fresh_line_without_splitting() {
+        let lines = render_markdown("word$a b$", 6);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(spans_text(&lines[0]), "word");
+        assert_eq!(spans_text(&lines[1]), "a b");
+        assert_eq!(lines[1].spans.len(), 1);
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn display_dollar_math_is_its_own_line() {
+        let rendered: Vec<String> = render_markdown("before\n\n$$\\frac{a}{b}$$\n\nafter", 80)
+            .iter()
+            .map(spans_text)
+            .collect();
+        assert_eq!(rendered, ["before", "a⁄b", "after"]);
+    }
+
+    #[test]
+    fn display_math_wraps_at_requested_width() {
+        let rendered = render_markdown("$$\\alpha + \\beta + \\gamma + \\delta$$", 8);
+
+        assert!(
+            rendered
+                .iter()
+                .all(|line| { UnicodeWidthStr::width(spans_text(line).as_str()) <= 8 })
+        );
     }
 
     #[test]
@@ -599,6 +1588,21 @@ mod tests {
         assert!(
             !joined.contains("---"),
             "expected no raw markdown separator dashes, got: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn table_cell_keeps_inline_math_without_trailing_formula_line() {
+        let rendered: Vec<String> = render_markdown("| Formula |\n| --- |\n| $\\pi$ |\n", 40)
+            .iter()
+            .map(spans_text)
+            .collect();
+        let joined = rendered.join("\n");
+
+        assert!(joined.contains('π'), "missing table formula: {rendered:?}");
+        assert!(
+            !rendered.iter().any(|line| line == "π"),
+            "formula escaped the table: {rendered:?}"
         );
     }
 
