@@ -34,8 +34,10 @@ popups, and bash task popups retain their existing keyboard and mouse routing.
 
 ## Architecture
 
-`HistoryState` owns offset updates and exposes helpers for line/page/top/bottom
-navigation plus a method that preserves the viewport as content grows.
+`HistoryState` owns positioning and exposes helpers for line/page/top/bottom
+navigation plus methods that capture and restore a viewport anchor. An anchor
+identifies the history cell and rendered line at the top of a non-bottom
+viewport; it is content-relative rather than a bottom-origin offset.
 `HistoryView` renders content in the reduced text rectangle and renders the
 scrollbar in its reserved column. `app::handle_key` and `app::handle_mouse`
 map events to the state helpers and calculate a viewport height from the
@@ -43,7 +45,13 @@ history layout rectangle.
 
 The width used for wrapping and line counts is the text width, excluding the
 scrollbar column when a scrollbar is needed. The same effective width is used
-for rendering, maximum-offset calculations, and viewport-preservation updates.
+for rendering, maximum-offset calculations, anchor capture, and anchor
+restoration. Before any mutation that can change history geometry--including
+streaming output, a terminal resize, a queued-preview height change, or the
+scrollbar appearing--the app captures the current anchor from the old history
+rectangle. After rendering geometry and history content are final, it restores
+the anchor using the new rectangle. At the bottom, no anchor is retained and
+the offset remains zero.
 
 ## Error Handling And Edge Cases
 
@@ -51,8 +59,9 @@ for rendering, maximum-offset calculations, and viewport-preservation updates.
   and all scroll actions safely clamp to zero.
 - Very narrow history panes reserve no scrollbar column when doing so would
   leave no text width.
-- Offset calculations use saturating arithmetic and clamp after terminal
-  resizing or content removal.
+- Anchor restoration uses saturating arithmetic and clamps after terminal
+  resizing or content removal. If the anchored cell is removed, it falls back
+  to the nearest valid line while preserving bottom follow when appropriate.
 - Existing modal popups continue to consume their own navigation before normal
   history key handling runs.
 
@@ -65,4 +74,6 @@ for rendering, maximum-offset calculations, and viewport-preservation updates.
 - Input-routing tests prove the new keyboard shortcuts move the history by the
   correct line or page amount, and mouse-wheel scrolling uses the configured
   multi-line step.
+- Anchor tests cover resize reflow, queued-preview growth and promotion,
+  first-overflow scrollbar activation, and streaming output below the reader.
 - Existing TUI tests continue to cover input, popups, and prior scroll routing.

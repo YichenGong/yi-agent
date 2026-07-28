@@ -463,6 +463,12 @@ mod tests {
         let rendered: Vec<String> = lines.iter().map(spans_text).collect();
 
         assert_eq!(rendered, ["- First item", "- Second item"]);
+
+        let ordered = render_markdown("1. first\n2. second", 80);
+        assert_eq!(
+            ordered.iter().map(spans_text).collect::<Vec<_>>(),
+            ["1. first", "2. second"]
+        );
     }
 
     #[test]

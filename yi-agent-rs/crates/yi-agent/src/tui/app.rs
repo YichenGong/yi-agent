@@ -22,11 +22,13 @@ use yi_agent_core::AgentEvent;
 use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 use super::cell::HistoryCell;
 use super::cost::CostTracker;
-use super::history::{HistoryState, HistoryView};
+use super::history::{HistoryState, HistoryView, ViewportAnchor};
 use super::input::{InputAction, InputLine};
 use super::slash::{CommandPopup, SlashCommand};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
+
+const HISTORY_WHEEL_LINES: usize = 3;
 
 /// Run the ratatui TUI main loop with the real terminal.
 ///
@@ -185,11 +187,67 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
     let mut bash_popup: BashPopup = BashPopup::None;
+    // Keep the rendered viewport location so geometry that changes between
+    // frames (such as a resize or newly queued preview) has an old-width anchor.
+    let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
 
     loop {
-        // Drain all pending agent events
-        let width = terminal.size()?.width;
+        let size = terminal.size()?;
+        let width = size.width;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        let initial_queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
+        let initial_layout = compute_layout(
+            area,
+            input,
+            pending_quit,
+            &popup,
+            initial_queued_lines.len() as u16,
+        );
+        let initial_history_area = initial_layout.chunks[0];
+        let initial_text_width =
+            history.text_width(initial_history_area.width, initial_history_area.height);
+        history.reconcile_scroll_offset(initial_text_width, initial_history_area.height);
+        let viewport_anchor = match previous_viewport.take() {
+            Some((anchor, previous_width, previous_height))
+                if previous_width != initial_text_width
+                    || previous_height != initial_history_area.height =>
+            {
+                Some(anchor)
+            }
+            _ => history.capture_viewport_anchor(initial_text_width, initial_history_area.height),
+        };
+        let mut pending_events = Vec::new();
         while let Ok(event) = agent_rx.try_recv() {
+            pending_events.push(event);
+        }
+
+        // A completed turn promotes one queued item into history. Determine the
+        // resulting layout before applying those history mutations.
+        let promotion_count = pending_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
+                )
+            })
+            .count()
+            .min(queued.len());
+        let mut final_queue = queued.clone();
+        for _ in 0..promotion_count {
+            final_queue.pop_front();
+        }
+        let final_queued_lines = crate::tui::queued::render_queued_preview(&final_queue, width);
+        let final_layout = compute_layout(
+            area,
+            input,
+            pending_quit,
+            &popup,
+            final_queued_lines.len() as u16,
+        );
+        let final_history_area = final_layout.chunks[0];
+
+        for event in pending_events {
             let is_turn_end = matches!(
                 event,
                 AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
@@ -200,14 +258,25 @@ fn run_loop<B: Backend, E: EventSource>(
                 &mut cost_tracker,
                 &event,
             );
-            history.push_event(event, width);
+            history.push_event(event, final_history_area.width);
             // 回合结束后把排队第一条「转正」进 history(在 Separator 之后)
             if is_turn_end {
                 if let Some(text) = queued.pop_front() {
-                    history.push(HistoryCell::UserMessage { text });
+                    history.push(HistoryCell::UserMessage { text }, final_history_area.width);
                 }
             }
         }
+
+        let final_text_width =
+            history.text_width(final_history_area.width, final_history_area.height);
+        if let Some(anchor) = viewport_anchor {
+            history.restore_viewport_anchor(anchor, final_text_width, final_history_area.height);
+        } else {
+            history.reconcile_scroll_offset(final_text_width, final_history_area.height);
+        }
+        previous_viewport = history
+            .capture_viewport_anchor(final_text_width, final_history_area.height)
+            .map(|anchor| (anchor, final_text_width, final_history_area.height));
 
         let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
         let queued_height = queued_lines.len() as u16;
@@ -339,12 +408,16 @@ fn run_loop<B: Backend, E: EventSource>(
                     continue;
                 }
                 let history_area = layout.chunks[0];
-                let max_offset = history.max_scroll_offset(history_area.width, history_area.height);
+                let history_text_width =
+                    history.text_width(history_area.width, history_area.height);
+                let max_offset = history.max_scroll_offset(history_text_width, history_area.height);
                 match handle_key(
                     key,
                     input,
                     history,
                     max_offset,
+                    history_text_width,
+                    history_area.height,
                     &cost_tracker,
                     input_tx,
                     interrupt_tx,
@@ -494,8 +567,8 @@ fn handle_mouse(
 ) {
     // Only react to scroll-wheel events.
     let scroll_delta = match mouse.kind {
-        MouseEventKind::ScrollUp => Some(1usize),
-        MouseEventKind::ScrollDown => Some(1usize),
+        MouseEventKind::ScrollUp => Some(HISTORY_WHEEL_LINES),
+        MouseEventKind::ScrollDown => Some(HISTORY_WHEEL_LINES),
         _ => None,
     };
     let Some(delta) = scroll_delta else {
@@ -531,7 +604,8 @@ fn handle_mouse(
     // History region: scroll the conversation history.
     if history_area.contains(pos) {
         *pending_quit = false;
-        let max_offset = history.max_scroll_offset(history_area.width, history_area.height);
+        let history_text_width = history.text_width(history_area.width, history_area.height);
+        let max_offset = history.max_scroll_offset(history_text_width, history_area.height);
         if is_scroll_down {
             history.scroll_down(delta);
         } else {
@@ -635,6 +709,8 @@ fn handle_key(
     input: &mut InputLine,
     history: &mut HistoryState,
     max_scroll_offset: usize,
+    history_width: u16,
+    history_height: u16,
     cost_tracker: &CostTracker,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
@@ -787,6 +863,7 @@ fn handle_key(
                             cmd,
                             args_str,
                             history,
+                            history_width,
                             cost_tracker,
                             input_tx,
                             interrupt_tx,
@@ -796,15 +873,46 @@ fn handle_key(
                         // No command selected (empty filter) — show error
                         let text = input.take_submitted();
                         *popup = None;
-                        history.push(HistoryCell::Separator {
-                            label: Some(format!("未知命令: {}", text)),
-                        });
+                        history.push(
+                            HistoryCell::Separator {
+                                label: Some(format!("未知命令: {}", text)),
+                            },
+                            history_width,
+                        );
                         return KeyOutcome::None;
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    match key.code {
+        KeyCode::Up if key.modifiers.is_empty() => {
+            history.scroll_up(1, max_scroll_offset);
+            return KeyOutcome::None;
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            history.scroll_down(1);
+            return KeyOutcome::None;
+        }
+        KeyCode::PageUp if key.modifiers.is_empty() => {
+            history.scroll_page_up(history_height, max_scroll_offset);
+            return KeyOutcome::None;
+        }
+        KeyCode::PageDown if key.modifiers.is_empty() => {
+            history.scroll_page_down(history_height);
+            return KeyOutcome::None;
+        }
+        KeyCode::Home if key.modifiers.is_empty() => {
+            history.scroll_to_top(history_width, history_height);
+            return KeyOutcome::None;
+        }
+        KeyCode::End if key.modifiers.is_empty() => {
+            history.scroll_to_bottom();
+            return KeyOutcome::None;
+        }
+        _ => {}
     }
 
     // Input handling
@@ -829,6 +937,7 @@ fn handle_key(
                         cmd,
                         args,
                         history,
+                        history_width,
                         cost_tracker,
                         input_tx,
                         interrupt_tx,
@@ -837,9 +946,12 @@ fn handle_key(
                 } else {
                     // Unknown slash command
                     *popup = None;
-                    history.push(HistoryCell::Separator {
-                        label: Some(format!("未知命令: {}", text)),
-                    });
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some(format!("未知命令: {}", text)),
+                        },
+                        history_width,
+                    );
                     return KeyOutcome::None;
                 }
             }
@@ -847,7 +959,10 @@ fn handle_key(
             if is_running.load(std::sync::atomic::Ordering::SeqCst) {
                 queued.push_back(text.clone());
             } else {
-                history.push(HistoryCell::UserMessage { text: text.clone() });
+                history.push(
+                    HistoryCell::UserMessage { text: text.clone() },
+                    history_width,
+                );
             }
             let _ = input_tx.blocking_send(text.clone());
             KeyOutcome::Submit(text)
@@ -898,10 +1013,12 @@ fn sync_popup(popup: &mut Option<CommandPopup>, buffer: &str) {
 }
 
 /// Execute a slash command locally (does not send to agent).
+#[allow(clippy::too_many_arguments)]
 fn execute_slash_command(
     cmd: SlashCommand,
     args: Option<String>,
     history: &mut HistoryState,
+    width: u16,
     cost: &CostTracker,
     _input_tx: &tokio::sync::mpsc::Sender<String>,
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
@@ -913,9 +1030,12 @@ fn execute_slash_command(
             // 本地清空 history 显示,TUI 不等 driver 确认。
             // 通过 control channel 通知 driver 重建 agent(空 session)。
             history.clear();
-            history.push(HistoryCell::Separator {
-                label: Some("对话已清空".to_string()),
-            });
+            history.push(
+                HistoryCell::Separator {
+                    label: Some("对话已清空".to_string()),
+                },
+                width,
+            );
             let _ = control_tx.blocking_send(crate::ControlCommand::Clear);
             KeyOutcome::None
         }
@@ -924,38 +1044,50 @@ fn execute_slash_command(
             for c in SlashCommand::all() {
                 help_text.push_str(&format!("  /{:<10} {}\n", c.name(), c.description()));
             }
-            history.push(HistoryCell::UserMessage { text: help_text });
+            history.push(HistoryCell::UserMessage { text: help_text }, width);
             KeyOutcome::None
         }
         SlashCommand::Cost => {
             let text = cost.render();
-            history.push(HistoryCell::Markdown { text });
+            history.push(HistoryCell::Markdown { text }, width);
             KeyOutcome::None
         }
         SlashCommand::Config => {
-            history.push(HistoryCell::Separator {
-                label: Some("当前配置: (暂未实现)".to_string()),
-            });
+            history.push(
+                HistoryCell::Separator {
+                    label: Some("当前配置: (暂未实现)".to_string()),
+                },
+                width,
+            );
             KeyOutcome::None
         }
         SlashCommand::Compact => {
             // 本地 push "正在压缩..." 提示,通过 control channel
             // 通知 driver 调用 compact_session 并重建 agent。
-            history.push(HistoryCell::Separator {
-                label: Some("正在压缩对话...".to_string()),
-            });
+            history.push(
+                HistoryCell::Separator {
+                    label: Some("正在压缩对话...".to_string()),
+                },
+                width,
+            );
             let _ = control_tx.blocking_send(crate::ControlCommand::Compact);
             KeyOutcome::None
         }
         SlashCommand::Model => {
             if let Some(model) = args {
-                history.push(HistoryCell::Separator {
-                    label: Some(format!("切换模型到: {} (暂未实现)", model)),
-                });
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some(format!("切换模型到: {} (暂未实现)", model)),
+                    },
+                    width,
+                );
             } else {
-                history.push(HistoryCell::Separator {
-                    label: Some("用法: /model <model-name>".to_string()),
-                });
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some("用法: /model <model-name>".to_string()),
+                    },
+                    width,
+                );
             }
             KeyOutcome::None
         }
@@ -1182,7 +1314,7 @@ mod tests {
     use crate::tui::state::TaskStatus;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1700,6 +1832,405 @@ mod tests {
         fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
             Ok(self.events.borrow_mut().pop())
         }
+    }
+
+    struct QueueThenDoneEvents {
+        agent_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for QueueThenDoneEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let poll_count = self.poll_count.get();
+            self.poll_count.set(poll_count + 1);
+            match poll_count {
+                0 => Ok(Some(Event::Paste("queued message".into()))),
+                1 => {
+                    self.agent_tx
+                        .try_send(AgentEvent::Done {
+                            reason: yi_agent_core::DoneReason::EndTurn,
+                        })
+                        .unwrap();
+                    Ok(Some(Event::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    ))))
+                }
+                _ => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                )))),
+            }
+        }
+    }
+
+    /// A test backend whose size can change from a fake event source between
+    /// frames, matching a terminal resize without sharing the terminal itself.
+    #[derive(Clone)]
+    struct ResizableTestBackend {
+        inner: Rc<RefCell<TestBackend>>,
+    }
+
+    impl Backend for ResizableTestBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.borrow_mut().draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            self.inner.borrow_mut().get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.inner.borrow_mut().set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().clear()
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.inner.borrow().size()
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.inner.borrow_mut().window_size()
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.borrow_mut().flush()
+        }
+    }
+
+    struct ResizeThenQuitEvents {
+        backend: Rc<RefCell<TestBackend>>,
+        top_marker: Rc<RefCell<Option<String>>>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for ResizeThenQuitEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let poll_count = self.poll_count.get();
+            self.poll_count.set(poll_count + 1);
+            match poll_count {
+                0 => {
+                    let backend = self.backend.borrow();
+                    let row: String = (0..32u16)
+                        .map(|x| backend.buffer()[(x, 0)].symbol())
+                        .collect();
+                    drop(backend);
+                    let marker = row
+                        .split_whitespace()
+                        .find(|word| word.starts_with("MARKER-"))
+                        .expect("the first rendered history row has a marker")
+                        .to_string();
+                    *self.top_marker.borrow_mut() = Some(marker);
+                    self.backend.borrow_mut().resize(16, 14);
+                    Ok(None)
+                }
+                1 => Ok(None),
+                _ => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                )))),
+            }
+        }
+    }
+
+    /// Captures the old and new top rows around an idle local submission.
+    /// The final frame must restore the pre-submit content anchor rather than
+    /// using the width before the scrollbar was accounted for.
+    struct SubmitThenQuitEvents {
+        backend: Rc<RefCell<TestBackend>>,
+        top_marker: Rc<RefCell<Option<String>>>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for SubmitThenQuitEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let poll_count = self.poll_count.get();
+            self.poll_count.set(poll_count + 1);
+            match poll_count {
+                0 => {
+                    let backend = self.backend.borrow();
+                    let row: String = (0..20u16)
+                        .map(|x| backend.buffer()[(x, 0)].symbol())
+                        .collect();
+                    drop(backend);
+                    let marker = row
+                        .split_whitespace()
+                        .find(|word| word.starts_with("MARKER-"))
+                        .expect("the first rendered history row has a marker")
+                        .to_string();
+                    *self.top_marker.borrow_mut() = Some(marker);
+                    Ok(Some(Event::Paste("new local message".into())))
+                }
+                1 => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))),
+                _ => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                )))),
+            }
+        }
+    }
+
+    #[test]
+    fn history_anchor_survives_resize_between_frames() {
+        let backend = Rc::new(RefCell::new(TestBackend::new(32, 14)));
+        let mut terminal = Terminal::new(ResizableTestBackend {
+            inner: Rc::clone(&backend),
+        })
+        .unwrap();
+        let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        for index in 0..20 {
+            history.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("MARKER-{index:02} 12345678901234567890"),
+                },
+                32,
+            );
+        }
+        history.scroll_offset = 16;
+        let mut input = InputLine::new();
+        let source = ResizeThenQuitEvents {
+            backend: Rc::clone(&backend),
+            top_marker: Rc::new(RefCell::new(None)),
+            poll_count: Cell::new(0),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut input,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+        )
+        .unwrap();
+
+        let narrow_area = ratatui::layout::Rect::new(0, 0, 16, 14);
+        let narrow_layout = compute_layout(narrow_area, &input, false, &None, 0);
+        let narrow_history_area = narrow_layout.chunks[0];
+        let narrow_text_width =
+            history.text_width(narrow_history_area.width, narrow_history_area.height);
+        let mut before_resize = HistoryState {
+            cells: history.cells.clone(),
+            selected: None,
+            scroll_offset: 16,
+        };
+        let wide_area = ratatui::layout::Rect::new(0, 0, 32, 14);
+        let wide_layout = compute_layout(wide_area, &InputLine::new(), false, &None, 0);
+        let wide_history_area = wide_layout.chunks[0];
+        let wide_text_width =
+            before_resize.text_width(wide_history_area.width, wide_history_area.height);
+        before_resize.reconcile_scroll_offset(wide_text_width, wide_history_area.height);
+        let anchor = before_resize
+            .capture_viewport_anchor(wide_text_width, wide_history_area.height)
+            .unwrap();
+        let mut expected = before_resize;
+        expected.restore_viewport_anchor(anchor, narrow_text_width, narrow_history_area.height);
+
+        assert_eq!(history.scroll_offset, expected.scroll_offset);
+        let top_marker = source.top_marker.borrow().clone().unwrap();
+        let resized_backend = backend.borrow();
+        let final_row: String = (0..16u16)
+            .map(|x| resized_backend.buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            final_row.contains(&top_marker),
+            "expected top marker {top_marker:?} after resize, got {final_row:?}"
+        );
+    }
+
+    #[test]
+    fn history_anchor_survives_local_user_insertion_at_scrollbar_width() {
+        let backend = Rc::new(RefCell::new(TestBackend::new(20, 14)));
+        let mut terminal = Terminal::new(ResizableTestBackend {
+            inner: Rc::clone(&backend),
+        })
+        .unwrap();
+        let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        for index in 0..20 {
+            history.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("MARKER-{index:02} 1234567890"),
+                },
+                20,
+            );
+        }
+        history.scroll_offset = 30;
+        let source = SubmitThenQuitEvents {
+            backend: Rc::clone(&backend),
+            top_marker: Rc::new(RefCell::new(None)),
+            poll_count: Cell::new(0),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+        )
+        .unwrap();
+
+        let area = ratatui::layout::Rect::new(0, 0, 20, 14);
+        let layout = compute_layout(area, &InputLine::new(), false, &None, 0);
+        let history_area = layout.chunks[0];
+        assert_eq!(
+            history.text_width(history_area.width, history_area.height),
+            history_area.width - 1,
+            "the inserted local message is restored with the scrollbar-reserved width"
+        );
+        let top_marker = source.top_marker.borrow().clone().unwrap();
+        let backend = terminal.backend().inner.borrow();
+        let final_row: String = (0..20u16)
+            .map(|x| backend.buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            final_row.contains(&top_marker),
+            "expected top marker {top_marker:?} after local insertion, got {final_row:?}"
+        );
+    }
+
+    #[test]
+    fn history_anchor_survives_queued_preview_promotion() {
+        let backend = TestBackend::new(20, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let mut history = HistoryState::new();
+        for index in 0..20 {
+            history.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("MARKER-{index:02} 1234567890"),
+                },
+                20,
+            );
+        }
+        history.scroll_offset = 30;
+        let before_cells = history.cells.clone();
+        let mut input = InputLine::new();
+        let source = QueueThenDoneEvents {
+            agent_tx,
+            poll_count: Cell::new(0),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut input,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+        )
+        .unwrap();
+
+        let area = ratatui::layout::Rect::new(0, 0, 20, 14);
+        let final_layout = compute_layout(area, &input, false, &None, 0);
+        let final_history_area = final_layout.chunks[0];
+        let final_text_width =
+            history.text_width(final_history_area.width, final_history_area.height);
+        let pre_drain_layout = compute_layout(area, &InputLine::new(), false, &None, 2);
+        let pre_drain_width = history.text_width(
+            pre_drain_layout.chunks[0].width,
+            pre_drain_layout.chunks[0].height,
+        );
+        assert_ne!(
+            pre_drain_layout.chunks[0].height, final_history_area.height,
+            "promotion changes the history viewport height"
+        );
+        assert_eq!(
+            pre_drain_width, 19,
+            "wrapped history reserves a scrollbar column"
+        );
+
+        let mut before = HistoryState {
+            cells: before_cells,
+            selected: None,
+            scroll_offset: 30,
+        };
+        // The loop first renders without a queue and clamps the deliberately
+        // over-large starting offset before the queued preview appears.
+        let prior_layout = compute_layout(area, &InputLine::new(), false, &None, 0);
+        let prior_text_width =
+            before.text_width(prior_layout.chunks[0].width, prior_layout.chunks[0].height);
+        before.reconcile_scroll_offset(prior_text_width, prior_layout.chunks[0].height);
+        let anchor = before
+            .capture_viewport_anchor(prior_text_width, prior_layout.chunks[0].height)
+            .expect("the initial viewport is scrolled up");
+        let mut expected = HistoryState {
+            cells: history.cells.clone(),
+            selected: None,
+            scroll_offset: 0,
+        };
+        expected.restore_viewport_anchor(anchor, final_text_width, final_history_area.height);
+
+        assert_eq!(
+            history.scroll_offset, expected.scroll_offset,
+            "the top history cell must remain anchored when the queued preview is promoted; \
+             old_width={prior_text_width}, new_width={final_text_width}, old_height={}, \
+             new_height={}",
+            pre_drain_layout.chunks[0].height, final_history_area.height,
+        );
+        let top_row: String = (0..20u16)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            top_row.contains("MARKER-00"),
+            "the original top marker must remain at the viewport top: {top_row:?}"
+        );
     }
 
     /// Regression test for blocking_send panic.
@@ -3242,6 +3773,79 @@ mod tests {
     }
 
     #[test]
+    fn normal_navigation_keys_route_to_history_without_affecting_shift_selection() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        for _ in 0..120 {
+            history.push(HistoryCell::Separator { label: None }, 80);
+        }
+        history.scroll_offset = 5;
+
+        for (key, expected_offset) in [
+            (KeyCode::Up, 6),
+            (KeyCode::Down, 5),
+            (KeyCode::PageUp, 25),
+            (KeyCode::PageDown, 5),
+            (KeyCode::Home, 100),
+            (KeyCode::End, 0),
+        ] {
+            let outcome = handle_key(
+                make_key(key, KeyModifiers::NONE),
+                &mut input,
+                &mut history,
+                100,
+                80,
+                20,
+                &CostTracker::default(),
+                &input_tx,
+                &interrupt_tx,
+                &control_tx,
+                &decision_tx,
+                &is_running,
+                &mut queued,
+                &mut pending_quit,
+                &mut popup,
+            );
+            assert_eq!(outcome, KeyOutcome::None);
+            assert_eq!(history.scroll_offset, expected_offset, "key {key:?}");
+        }
+
+        history.selected = Some(5);
+        let _ = handle_key(
+            make_key(KeyCode::Up, KeyModifiers::SHIFT),
+            &mut input,
+            &mut history,
+            100,
+            80,
+            20,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert_eq!(history.selected, Some(4));
+        assert_eq!(
+            history.scroll_offset, 0,
+            "Shift+Up keeps selection behavior"
+        );
+    }
+
+    #[test]
     fn esc_when_running_sends_interrupt() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
@@ -3260,6 +3864,8 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3297,6 +3903,8 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3334,6 +3942,8 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3368,6 +3978,8 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3383,6 +3995,8 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3420,6 +4034,8 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3469,6 +4085,8 @@ mod tests {
             &mut input,
             &mut history,
             1000,
+            80,
+            24,
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
@@ -3515,6 +4133,7 @@ mod tests {
             SlashCommand::Cost,
             None,
             &mut history,
+            80,
             &cost,
             &input_tx,
             &interrupt_tx,
@@ -3548,6 +4167,7 @@ mod tests {
             SlashCommand::Cost,
             None,
             &mut history,
+            80,
             &cost,
             &input_tx,
             &interrupt_tx,
@@ -3617,6 +4237,11 @@ mod tests {
         (layout, history)
     }
 
+    #[test]
+    fn history_wheel_events_move_three_lines() {
+        assert_eq!(HISTORY_WHEEL_LINES, 3);
+    }
+
     /// Scrolling up over the history region should increase `scroll_offset`.
     #[test]
     fn mouse_scroll_up_in_history_increases_offset() {
@@ -3625,9 +4250,12 @@ mod tests {
         let mut hist = HistoryState::new();
         // Fill enough lines so scrolling is meaningful.
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = false;
@@ -3643,7 +4271,7 @@ mod tests {
             &mut pending_quit,
         );
         assert_eq!(
-            hist.scroll_offset, 1,
+            hist.scroll_offset, 3,
             "ScrollUp in history should scroll up"
         );
 
@@ -3656,7 +4284,44 @@ mod tests {
             &registry,
             &mut pending_quit,
         );
-        assert_eq!(hist.scroll_offset, 2, "second ScrollUp should accumulate");
+        assert_eq!(hist.scroll_offset, 6, "second ScrollUp should accumulate");
+    }
+
+    #[test]
+    fn mouse_scroll_uses_reserved_text_width_for_its_max_offset() {
+        let (layout, history_area) = layout_80x24();
+        let mut bash_popup = BashPopup::None;
+        let mut hist = HistoryState::new();
+        // This fits the raw 80-column area (78 chars after the user prefix)
+        // but wraps after the scrollbar reserves one column.
+        for _ in 0..30 {
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "x".repeat(78),
+                },
+                80,
+            );
+        }
+        let text_width = hist.text_width(history_area.width, history_area.height);
+        assert_eq!(text_width, 79, "overflow reserves a scrollbar column");
+        let expected_max = hist.max_scroll_offset(text_width, history_area.height);
+        let raw_max = hist.max_scroll_offset(history_area.width, history_area.height);
+        assert!(expected_max > raw_max, "reserved width adds wrapped lines");
+
+        let registry = RunningTaskRegistry::new();
+        let mut pending_quit = false;
+        for _ in 0..100 {
+            handle_mouse(
+                make_mouse(MouseEventKind::ScrollUp, 0, history_area.y),
+                &layout,
+                &mut bash_popup,
+                &mut hist,
+                &registry,
+                &mut pending_quit,
+            );
+        }
+
+        assert_eq!(hist.scroll_offset, expected_max);
     }
 
     /// Scrolling down over the history region should decrease `scroll_offset`
@@ -3667,9 +4332,12 @@ mod tests {
         let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         hist.scroll_up(5, 1000);
         assert_eq!(hist.scroll_offset, 5);
@@ -3686,7 +4354,7 @@ mod tests {
             &mut pending_quit,
         );
         assert_eq!(
-            hist.scroll_offset, 4,
+            hist.scroll_offset, 2,
             "ScrollDown in history should decrease offset"
         );
 
@@ -3712,9 +4380,12 @@ mod tests {
         let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = false;
@@ -3740,9 +4411,12 @@ mod tests {
         let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
-            hist.push(HistoryCell::UserMessage {
-                text: "line".into(),
-            });
+            hist.push(
+                HistoryCell::UserMessage {
+                    text: "line".into(),
+                },
+                80,
+            );
         }
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = false;

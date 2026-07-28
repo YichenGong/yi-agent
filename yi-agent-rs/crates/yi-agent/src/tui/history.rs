@@ -1,11 +1,24 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
 
 use yi_agent_core::{AgentEvent, DoneReason};
 
 use super::cell::HistoryCell;
+
+/// A location in the history content, independent of its current wrapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ViewportAnchor {
+    cell_index: usize,
+    position: AnchorPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorPosition {
+    ContentLine(usize),
+    AfterCellSpacer,
+}
 
 /// State for the scrollable history area.
 pub struct HistoryState {
@@ -25,10 +38,12 @@ impl HistoryState {
         }
     }
 
-    /// Push a new cell and auto-scroll to bottom.
-    pub fn push(&mut self, cell: HistoryCell) {
+    /// Push a new cell while preserving the visible position when scrolled up.
+    pub fn push(&mut self, cell: HistoryCell, width: u16) {
+        let was_scrolled = self.scroll_offset != 0;
+        let lines_before = self.flattened_line_count(width);
         self.cells.push(cell);
-        self.scroll_offset = 0;
+        self.apply_scroll_delta(was_scrolled, lines_before, width);
     }
 
     /// Clear all cells and reset state.
@@ -59,6 +74,19 @@ impl HistoryState {
         count
     }
 
+    /// Width available to history text after reserving a scrollbar column
+    /// when the content overflows the viewport.
+    pub fn text_width(&self, area_width: u16, viewport_height: u16) -> u16 {
+        let candidate_width = area_width.saturating_sub(1);
+        if candidate_width > 0
+            && self.flattened_line_count(candidate_width) > viewport_height as usize
+        {
+            candidate_width
+        } else {
+            area_width
+        }
+    }
+
     /// Maximum meaningful `scroll_offset` for the current content at the given
     /// width and viewport height. Scrolling beyond this would leave blank rows
     /// at the bottom of the viewport, so `scroll_up` clamps to this value.
@@ -67,6 +95,92 @@ impl HistoryState {
     pub fn max_scroll_offset(&self, width: u16, visible_height: u16) -> usize {
         let total = self.flattened_line_count(width);
         total.saturating_sub(visible_height as usize)
+    }
+
+    /// Clamp the stored offset to the current viewport after a resize.
+    pub fn reconcile_scroll_offset(&mut self, width: u16, visible_height: u16) {
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.max_scroll_offset(width, visible_height));
+    }
+
+    /// Capture the top visible content location when the viewport is not
+    /// following the bottom. A user-message spacer belongs to that user cell.
+    pub(super) fn capture_viewport_anchor(
+        &self,
+        text_width: u16,
+        viewport_height: u16,
+    ) -> Option<ViewportAnchor> {
+        let total = self.flattened_line_count(text_width);
+        let effective_offset = self
+            .scroll_offset
+            .min(total.saturating_sub(viewport_height as usize));
+        if effective_offset == 0 {
+            return None;
+        }
+
+        let anchor_top = total.saturating_sub(viewport_height as usize + effective_offset);
+        let mut lines_before = 0;
+        for (cell_index, cell) in self.cells.iter().enumerate() {
+            let cell_lines = cell.line_count(text_width);
+            if anchor_top < lines_before + cell_lines {
+                return Some(ViewportAnchor {
+                    cell_index,
+                    position: AnchorPosition::ContentLine(anchor_top - lines_before),
+                });
+            }
+            lines_before += cell_lines;
+
+            if matches!(cell, HistoryCell::UserMessage { .. }) && cell_index + 1 < self.cells.len()
+            {
+                if anchor_top == lines_before {
+                    return Some(ViewportAnchor {
+                        cell_index,
+                        position: AnchorPosition::AfterCellSpacer,
+                    });
+                }
+                lines_before += 1;
+            }
+        }
+
+        None
+    }
+
+    /// Restore a captured top-of-viewport location after wrapping changes.
+    pub(super) fn restore_viewport_anchor(
+        &mut self,
+        anchor: ViewportAnchor,
+        text_width: u16,
+        viewport_height: u16,
+    ) {
+        let Some(anchor_cell) = self.cells.get(anchor.cell_index) else {
+            self.reconcile_scroll_offset(text_width, viewport_height);
+            return;
+        };
+
+        let mut anchor_top = 0;
+        for (cell_index, cell) in self.cells.iter().enumerate() {
+            if cell_index == anchor.cell_index {
+                anchor_top += match anchor.position {
+                    AnchorPosition::ContentLine(line_in_cell) => {
+                        line_in_cell.min(anchor_cell.line_count(text_width).saturating_sub(1))
+                    }
+                    AnchorPosition::AfterCellSpacer => anchor_cell.line_count(text_width),
+                };
+                break;
+            }
+
+            anchor_top += cell.line_count(text_width);
+            if matches!(cell, HistoryCell::UserMessage { .. }) {
+                anchor_top += 1;
+            }
+        }
+
+        let total = self.flattened_line_count(text_width);
+        self.scroll_offset = total
+            .saturating_sub(viewport_height as usize)
+            .saturating_sub(anchor_top)
+            .min(self.max_scroll_offset(text_width, viewport_height));
     }
 
     /// Move selection up by one cell.
@@ -108,6 +222,41 @@ impl HistoryState {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
+    /// Scroll up by one viewport, treating a zero-height viewport as one line.
+    pub fn scroll_page_up(&mut self, viewport_height: u16, max_offset: usize) {
+        self.scroll_up(viewport_height.max(1) as usize, max_offset);
+    }
+
+    /// Scroll down by one viewport, treating a zero-height viewport as one line.
+    pub fn scroll_page_down(&mut self, viewport_height: u16) {
+        self.scroll_down(viewport_height.max(1) as usize);
+    }
+
+    /// Jump to the greatest valid scroll offset for the current viewport.
+    pub fn scroll_to_top(&mut self, width: u16, visible_height: u16) {
+        self.scroll_offset = self.max_scroll_offset(width, visible_height);
+    }
+
+    /// Jump to the newest history content.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    fn apply_scroll_delta(&mut self, was_scrolled: bool, lines_before: usize, width: u16) {
+        if !was_scrolled {
+            return;
+        }
+
+        let lines_after = self.flattened_line_count(width);
+        self.scroll_offset = if lines_after >= lines_before {
+            self.scroll_offset
+                .saturating_add(lines_after - lines_before)
+        } else {
+            self.scroll_offset
+                .saturating_sub(lines_before - lines_after)
+        };
+    }
+
     /// Returns info about the most recent unresolved permission request, if any.
     pub fn pending_permission_info(
         &self,
@@ -139,21 +288,21 @@ impl HistoryState {
 impl HistoryState {
     /// Process an AgentEvent and update the cell list accordingly.
     pub fn push_event(&mut self, event: AgentEvent, width: u16) {
+        let was_scrolled = self.scroll_offset != 0;
+        let lines_before = self.flattened_line_count(width);
+
         match event {
             AgentEvent::Start => {}
             AgentEvent::AssistantText(text) => match self.cells.last_mut() {
                 Some(HistoryCell::AssistantMessage { .. }) => {
-                    self.cells
-                        .last_mut()
-                        .unwrap()
-                        .append_assistant_text(&text, width);
+                    self.cells.last_mut().unwrap().append_assistant_text(&text);
                 }
                 _ => {
-                    self.push(HistoryCell::from_assistant_text(&text, width));
+                    self.cells.push(HistoryCell::from_assistant_text(&text));
                 }
             },
             AgentEvent::ToolCall { id, name, input } => {
-                self.push(HistoryCell::ToolCall {
+                self.cells.push(HistoryCell::ToolCall {
                     id,
                     name,
                     input,
@@ -184,7 +333,7 @@ impl HistoryState {
                         }
                     }
                 }
-                self.push(HistoryCell::ToolResult {
+                self.cells.push(HistoryCell::ToolResult {
                     id,
                     result_text,
                     is_error,
@@ -193,27 +342,27 @@ impl HistoryState {
             }
             AgentEvent::Done { reason } => match reason {
                 DoneReason::EndTurn => {
-                    self.push(HistoryCell::Separator { label: None });
+                    self.cells.push(HistoryCell::Separator { label: None });
                 }
                 DoneReason::MaxTurns => {
-                    self.push(HistoryCell::Separator {
+                    self.cells.push(HistoryCell::Separator {
                         label: Some("Max turns".into()),
                     });
                 }
                 DoneReason::Interrupted { reason } => {
-                    self.push(HistoryCell::Separator {
+                    self.cells.push(HistoryCell::Separator {
                         label: Some(format!("Interrupted: {reason}")),
                     });
                 }
             },
             AgentEvent::Usage { .. } => {}
             AgentEvent::Cancelled => {
-                self.push(HistoryCell::Separator {
+                self.cells.push(HistoryCell::Separator {
                     label: Some("Interrupted".into()),
                 });
             }
             AgentEvent::Error(err) => {
-                self.push(HistoryCell::Separator {
+                self.cells.push(HistoryCell::Separator {
                     label: Some(format!("Error: {err}")),
                 });
             }
@@ -225,7 +374,7 @@ impl HistoryState {
                 kind,
             } => {
                 let display = format!("{}: {}", tool_name, tool_input);
-                self.push(HistoryCell::PermissionRequest {
+                self.cells.push(HistoryCell::PermissionRequest {
                     request_id,
                     tool_name,
                     display,
@@ -252,7 +401,8 @@ impl HistoryState {
                         }
                     }
                 }
-                self.push(HistoryCell::PermissionResolved { decision });
+                self.cells
+                    .push(HistoryCell::PermissionResolved { decision });
             }
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
@@ -263,6 +413,8 @@ impl HistoryState {
                 // Not tracked in history
             }
         }
+
+        self.apply_scroll_delta(was_scrolled, lines_before, width);
     }
 }
 
@@ -275,6 +427,7 @@ impl Default for HistoryState {
 /// Ratatui widget that renders the history area.
 pub struct HistoryView<'a> {
     pub state: &'a HistoryState,
+    #[allow(dead_code)]
     pub width: u16,
 }
 
@@ -282,11 +435,11 @@ impl<'a> HistoryView<'a> {
     /// Flatten all cells into display lines, inserting a blank spacer line
     /// after each `UserMessage` cell (unless it is the last cell) to
     /// visually separate user input from the system reply.
-    fn flattened_lines(&self) -> Vec<(usize, ratatui::text::Line<'static>)> {
+    fn flattened_lines(&self, text_width: u16) -> Vec<(usize, ratatui::text::Line<'static>)> {
         let n = self.state.cells.len();
         let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
         for (i, cell) in self.state.cells.iter().enumerate() {
-            for line in cell.lines(self.width) {
+            for line in cell.lines(text_width) {
                 all_lines.push((i, line));
             }
             // Insert a blank spacer line after user messages (except the last
@@ -301,7 +454,9 @@ impl<'a> HistoryView<'a> {
 
 impl<'a> Widget for HistoryView<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let all_lines = self.flattened_lines();
+        let text_width = self.state.text_width(area.width, area.height);
+        let show_scrollbar = text_width < area.width;
+        let all_lines = self.flattened_lines(text_width);
 
         let visible_height = area.height as usize;
         let total = all_lines.len();
@@ -330,11 +485,23 @@ impl<'a> Widget for HistoryView<'a> {
                 Rect {
                     x,
                     y,
-                    width: area.width,
+                    width: text_width,
                     height: 1,
                 },
                 buf,
             );
+        }
+
+        if show_scrollbar {
+            let max_offset = total.saturating_sub(visible_height);
+            let top_origin_position = max_offset.saturating_sub(effective_offset);
+            let mut scrollbar_state = ScrollbarState::new(total)
+                .viewport_content_length(visible_height)
+                .position(top_origin_position);
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_symbol("█")
+                .track_symbol(Some(" "))
+                .render(area, buf, &mut scrollbar_state);
         }
     }
 }
@@ -343,21 +510,215 @@ impl<'a> Widget for HistoryView<'a> {
 mod tests {
     use super::*;
     use crate::tui::cell::HistoryCell;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn two_multiline_assistant_cells() -> HistoryState {
+        HistoryState {
+            cells: vec![
+                HistoryCell::AssistantMessage {
+                    markdown: "alpha bravo charlie delta echo foxtrot golf hotel".into(),
+                },
+                HistoryCell::AssistantMessage {
+                    markdown: "india juliet kilo lima mike november oscar papa".into(),
+                },
+            ],
+            selected: None,
+            scroll_offset: 0,
+        }
+    }
 
     #[test]
-    fn push_resets_scroll_to_bottom() {
+    fn viewport_anchor_keeps_same_cell_line_through_reflow() {
+        let mut state = two_multiline_assistant_cells();
+        state.scroll_offset = 2;
+
+        let anchor = state
+            .capture_viewport_anchor(20, 3)
+            .expect("a non-bottom viewport should have an anchor");
+        assert_eq!(
+            anchor,
+            ViewportAnchor {
+                cell_index: 0,
+                position: AnchorPosition::ContentLine(1),
+            }
+        );
+
+        state.restore_viewport_anchor(anchor, 10, 4);
+
+        assert_eq!(
+            state.capture_viewport_anchor(10, 4),
+            Some(ViewportAnchor {
+                cell_index: 0,
+                position: AnchorPosition::ContentLine(1),
+            })
+        );
+    }
+
+    #[test]
+    fn viewport_anchor_is_none_at_bottom() {
+        let state = two_multiline_assistant_cells();
+
+        assert_eq!(state.capture_viewport_anchor(20, 3), None);
+    }
+
+    #[test]
+    fn viewport_anchor_restores_user_spacer_after_reflow() {
+        let old_width = 20;
+        let new_width = 10;
+        let viewport_height = 1;
+        let mut state = HistoryState {
+            cells: vec![
+                HistoryCell::UserMessage {
+                    text: "alpha bravo charlie delta echo foxtrot".into(),
+                },
+                HistoryCell::AssistantMessage {
+                    markdown: "india juliet kilo lima mike november oscar papa".into(),
+                },
+            ],
+            selected: None,
+            scroll_offset: 0,
+        };
+        let old_user_lines = state.cells[0].line_count(old_width);
+        state.scroll_offset = state
+            .flattened_line_count(old_width)
+            .saturating_sub(viewport_height as usize + old_user_lines);
+
+        let anchor = state
+            .capture_viewport_anchor(old_width, viewport_height)
+            .expect("the spacer is above the bottom viewport");
+        assert_eq!(
+            anchor,
+            ViewportAnchor {
+                cell_index: 0,
+                position: AnchorPosition::AfterCellSpacer,
+            }
+        );
+
+        state.restore_viewport_anchor(anchor, new_width, viewport_height);
+
+        let new_user_lines = state.cells[0].line_count(new_width);
+        assert!(
+            new_user_lines > old_user_lines,
+            "the user message must wrap differently at the new width"
+        );
+        assert_eq!(
+            state.scroll_offset,
+            state
+                .flattened_line_count(new_width)
+                .saturating_sub(viewport_height as usize + new_user_lines),
+            "the spacer, rather than a reflowed user-content line, remains at the top"
+        );
+    }
+
+    #[test]
+    fn viewport_anchor_clamps_shortened_content_to_last_line() {
+        let old_width = 10;
+        let new_width = 20;
+        let viewport_height = 1;
+        let mut state = two_multiline_assistant_cells();
+        let old_line_count = state.cells[0].line_count(old_width);
+        state.scroll_offset = state
+            .flattened_line_count(old_width)
+            .saturating_sub(viewport_height as usize + old_line_count - 1);
+
+        let anchor = state
+            .capture_viewport_anchor(old_width, viewport_height)
+            .expect("the final old content line is above the bottom viewport");
+        assert_eq!(
+            anchor,
+            ViewportAnchor {
+                cell_index: 0,
+                position: AnchorPosition::ContentLine(old_line_count - 1),
+            }
+        );
+
+        state.restore_viewport_anchor(anchor, new_width, viewport_height);
+
+        let new_line_count = state.cells[0].line_count(new_width);
+        assert!(
+            new_line_count < old_line_count,
+            "the first cell must use fewer lines at the new width"
+        );
+        assert_eq!(
+            state.scroll_offset,
+            state
+                .flattened_line_count(new_width)
+                .saturating_sub(viewport_height as usize + new_line_count - 1),
+            "a shortened cell should anchor to its final content line, not its spacer"
+        );
+    }
+
+    #[test]
+    fn push_preserves_position_when_scrolled_up() {
         let mut s = HistoryState::new();
-        s.scroll_up(5, 1000);
-        s.push(HistoryCell::UserMessage { text: "x".into() });
+        s.push(
+            HistoryCell::UserMessage {
+                text: "first".into(),
+            },
+            80,
+        );
+        s.scroll_offset = 2;
+        s.push(
+            HistoryCell::UserMessage {
+                text: "second".into(),
+            },
+            80,
+        );
+        assert_eq!(s.scroll_offset, 4);
+    }
+
+    #[test]
+    fn push_keeps_bottom_position_at_zero() {
+        let mut s = HistoryState::new();
+        s.push(
+            HistoryCell::UserMessage {
+                text: "first".into(),
+            },
+            80,
+        );
+        s.push(
+            HistoryCell::UserMessage {
+                text: "second".into(),
+            },
+            80,
+        );
         assert_eq!(s.scroll_offset, 0);
+    }
+
+    #[test]
+    fn push_preserves_position_by_rendered_line_delta() {
+        let width = 10;
+        let mut s = HistoryState::new();
+        s.push(
+            HistoryCell::UserMessage {
+                text: "first".into(),
+            },
+            width,
+        );
+        s.scroll_offset = 2;
+        let before = s.flattened_line_count(width);
+
+        s.push(
+            HistoryCell::UserMessage {
+                text: "a long user message that wraps".into(),
+            },
+            width,
+        );
+
+        let added_lines = s.flattened_line_count(width) - before;
+        assert!(
+            added_lines > 1,
+            "the wrapped message and spacer add multiple lines"
+        );
+        assert_eq!(s.scroll_offset, 2 + added_lines);
     }
 
     #[test]
     fn select_up_from_none_selects_second_to_last() {
         let mut s = HistoryState::new();
-        s.push(HistoryCell::UserMessage { text: "a".into() });
-        s.push(HistoryCell::UserMessage { text: "b".into() });
-        s.push(HistoryCell::UserMessage { text: "c".into() });
+        s.push(HistoryCell::UserMessage { text: "a".into() }, 80);
+        s.push(HistoryCell::UserMessage { text: "b".into() }, 80);
+        s.push(HistoryCell::UserMessage { text: "c".into() }, 80);
         s.select_up();
         assert_eq!(s.selected, Some(1));
     }
@@ -365,7 +726,7 @@ mod tests {
     #[test]
     fn select_down_past_last_clears_selection() {
         let mut s = HistoryState::new();
-        s.push(HistoryCell::UserMessage { text: "a".into() });
+        s.push(HistoryCell::UserMessage { text: "a".into() }, 80);
         s.selected = Some(0);
         s.select_down();
         assert_eq!(s.selected, None);
@@ -374,13 +735,16 @@ mod tests {
     #[test]
     fn toggle_fold_selected_toggles() {
         let mut s = HistoryState::new();
-        s.push(HistoryCell::ToolCall {
-            id: "1".into(),
-            name: "t".into(),
-            input: serde_json::json!({}),
-            state: crate::tui::cell::CallState::Success,
-            expanded: false,
-        });
+        s.push(
+            HistoryCell::ToolCall {
+                id: "1".into(),
+                name: "t".into(),
+                input: serde_json::json!({}),
+                state: crate::tui::cell::CallState::Success,
+                expanded: false,
+            },
+            80,
+        );
         s.selected = Some(0);
         s.toggle_fold_selected();
         match &s.cells[0] {
@@ -392,10 +756,13 @@ mod tests {
     #[test]
     fn total_lines_sums_all_cells() {
         let mut s = HistoryState::new();
-        s.push(HistoryCell::UserMessage {
-            text: "hello".into(),
-        });
-        s.push(HistoryCell::Separator { label: None });
+        s.push(
+            HistoryCell::UserMessage {
+                text: "hello".into(),
+            },
+            80,
+        );
+        s.push(HistoryCell::Separator { label: None }, 80);
         assert_eq!(s.total_lines(80), 2);
     }
 
@@ -432,6 +799,117 @@ mod tests {
             })
             .collect();
         assert_eq!(rendered, ["first line", "second line"]);
+    }
+
+    #[test]
+    fn push_event_new_cell_preserves_non_bottom_reading_position() {
+        let mut s = HistoryState::new();
+        for _ in 0..5 {
+            s.push(HistoryCell::Separator { label: None }, 80);
+        }
+        s.scroll_offset = 3;
+
+        s.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            80,
+        );
+
+        assert_eq!(
+            s.scroll_offset, 4,
+            "a one-line new cell should leave the previously visible lines in place"
+        );
+    }
+
+    #[test]
+    fn push_event_new_content_at_bottom_keeps_offset_zero() {
+        let mut s = HistoryState::new();
+
+        s.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            80,
+        );
+
+        assert_eq!(s.scroll_offset, 0);
+    }
+
+    #[test]
+    fn push_event_streaming_text_preserves_non_bottom_position_by_line_delta() {
+        let width = 20;
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("short".into()), width);
+        s.scroll_offset = 2;
+        let before = s.flattened_line_count(width);
+
+        s.push_event(
+            AgentEvent::AssistantText(" text that wraps onto multiple display lines".into()),
+            width,
+        );
+
+        let added_lines = s.flattened_line_count(width).saturating_sub(before);
+        assert!(
+            added_lines > 0,
+            "streaming text should have added display lines"
+        );
+        assert_eq!(s.scroll_offset, 2 + added_lines);
+    }
+
+    #[test]
+    fn push_event_assistant_text_after_resize_uses_current_width_for_delta() {
+        let wide_width = 80;
+        let narrow_width = 20;
+        let initial = "this assistant response wraps across several narrow display lines";
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText(initial.into()), wide_width);
+        s.scroll_offset = 3;
+
+        let before = s.flattened_line_count(narrow_width);
+        let expected_before = HistoryCell::from_assistant_text(initial).line_count(narrow_width);
+        assert_eq!(
+            before, expected_before,
+            "history must reflow after a resize"
+        );
+
+        s.push_event(
+            AgentEvent::AssistantText(" with an additional narrow-width tail".into()),
+            narrow_width,
+        );
+
+        let after = s.flattened_line_count(narrow_width);
+        assert_eq!(s.scroll_offset, 3 + (after - before));
+    }
+
+    #[test]
+    fn push_event_permission_resolved_reduces_offset_by_removed_lines() {
+        let width = 80;
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            width,
+        );
+        s.scroll_offset = 4;
+        let before = s.flattened_line_count(width);
+
+        s.push_event(
+            AgentEvent::PermissionResolved {
+                request_id: 1,
+                decision: yi_agent_core::permission::Decision::AllowOnce,
+            },
+            width,
+        );
+
+        let removed_lines = before - s.flattened_line_count(width);
+        assert!(removed_lines > 0, "resolving the request compacts it");
+        assert_eq!(s.scroll_offset, 4usize.saturating_sub(removed_lines));
     }
 
     #[test]
@@ -586,16 +1064,19 @@ mod tests {
     #[test]
     fn flattened_lines_inserts_spacer_after_user_message() {
         let mut s = HistoryState::new();
-        s.push(HistoryCell::UserMessage {
-            text: "hello".into(),
-        });
+        s.push(
+            HistoryCell::UserMessage {
+                text: "hello".into(),
+            },
+            80,
+        );
         s.push_event(AgentEvent::AssistantText("hi there".into()), 80);
 
         let view = HistoryView {
             state: &s,
             width: 80,
         };
-        let lines = view.flattened_lines();
+        let lines = view.flattened_lines(80);
 
         // UserMessage = 1 line, spacer = 1 line, AssistantMessage >= 1 line
         assert!(
@@ -613,15 +1094,18 @@ mod tests {
     #[test]
     fn flattened_lines_no_spacer_after_last_cell() {
         let mut s = HistoryState::new();
-        s.push(HistoryCell::UserMessage {
-            text: "orphan message".into(),
-        });
+        s.push(
+            HistoryCell::UserMessage {
+                text: "orphan message".into(),
+            },
+            80,
+        );
 
         let view = HistoryView {
             state: &s,
             width: 80,
         };
-        let lines = view.flattened_lines();
+        let lines = view.flattened_lines(80);
 
         // Only the user message line, no trailing spacer.
         assert_eq!(
@@ -637,14 +1121,14 @@ mod tests {
         let mut s = HistoryState::new();
         s.push_event(AgentEvent::AssistantText("part1".into()), 80);
         // Force a new AssistantMessage cell by inserting a Separator first.
-        s.push(HistoryCell::Separator { label: None });
+        s.push(HistoryCell::Separator { label: None }, 80);
         s.push_event(AgentEvent::AssistantText("part2".into()), 80);
 
         let view = HistoryView {
             state: &s,
             width: 80,
         };
-        let lines = view.flattened_lines();
+        let lines = view.flattened_lines(80);
 
         // No spacer should be inserted between non-UserMessage cells.
         // Count empty lines attributed to non-user cells — should be zero.
@@ -667,9 +1151,12 @@ mod tests {
         // 5 separator lines (no spacers inserted between non-UserMessage
         // cells), viewport height 3 → max useful offset is 2.
         for c in ['a', 'b', 'c', 'd', 'e'] {
-            s.push(HistoryCell::Separator {
-                label: Some(c.to_string()),
-            });
+            s.push(
+                HistoryCell::Separator {
+                    label: Some(c.to_string()),
+                },
+                80,
+            );
         }
         // Over-scroll past the maximum.
         s.scroll_offset = 10;
@@ -700,14 +1187,194 @@ mod tests {
     }
 
     #[test]
+    fn render_overflow_reserves_rightmost_column_for_scrollbar() {
+        let mut state = HistoryState::new();
+        for row in 0..6 {
+            state.push(
+                HistoryCell::UserMessage {
+                    text: format!("row {row}"),
+                },
+                20,
+            );
+        }
+
+        let backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    HistoryView {
+                        state: &state,
+                        width: area.width,
+                    },
+                    area,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (0..5).any(|y| buffer[(19, y)].symbol() == "█"),
+            "an overflowing history should render a scrollbar thumb: {buffer:?}"
+        );
+        for y in 0..5 {
+            let symbol = buffer[(19, y)].symbol();
+            assert!(
+                matches!(symbol, " " | "█" | "▲" | "▼"),
+                "history text must not use the scrollbar column at row {y}: {symbol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrollbar_uses_top_origin_while_history_offset_uses_bottom_origin() {
+        let mut state = HistoryState::new();
+        for row in 0..10 {
+            state.push(
+                HistoryCell::UserMessage {
+                    text: format!("row {row}"),
+                },
+                20,
+            );
+        }
+
+        let thumb_rows = |state: &HistoryState| {
+            let backend = TestBackend::new(20, 5);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame.render_widget(
+                        HistoryView {
+                            state,
+                            width: area.width,
+                        },
+                        area,
+                    );
+                })
+                .unwrap();
+            (0..5u16)
+                .filter(|&y| terminal.backend().buffer()[(19, y)].symbol() == "█")
+                .collect::<Vec<_>>()
+        };
+
+        let bottom_rows = thumb_rows(&state);
+        assert_eq!(
+            bottom_rows.last(),
+            Some(&3),
+            "offset zero puts thumb at bottom"
+        );
+
+        let text_width = state.text_width(20, 5);
+        state.scroll_offset = state.max_scroll_offset(text_width, 5);
+        let top_rows = thumb_rows(&state);
+        assert_eq!(
+            top_rows.first(),
+            Some(&1),
+            "larger offsets move thumb upward"
+        );
+    }
+
+    #[test]
+    fn text_width_only_reserves_a_column_when_it_can_show_a_scrollbar() {
+        let mut state = HistoryState::new();
+        state.push(
+            HistoryCell::UserMessage {
+                text: "one line".into(),
+            },
+            20,
+        );
+        assert_eq!(
+            state.text_width(20, 5),
+            20,
+            "fitting content keeps full width"
+        );
+
+        for row in 0..5 {
+            state.push(
+                HistoryCell::UserMessage {
+                    text: format!("row {row}"),
+                },
+                20,
+            );
+        }
+        assert_eq!(state.text_width(20, 5), 19, "overflow reserves one column");
+        assert_eq!(
+            state.text_width(1, 5),
+            1,
+            "one-column areas cannot reserve a scrollbar"
+        );
+        assert_eq!(
+            state.text_width(0, 5),
+            0,
+            "zero-width areas stay zero-width"
+        );
+    }
+
+    #[test]
+    fn streaming_uses_reserved_scrollbar_width_to_preserve_scrolled_position() {
+        let area_width = 20;
+        let viewport_height = 3;
+        let mut state = HistoryState::new();
+        for _ in 0..4 {
+            state.push(HistoryCell::Separator { label: None }, area_width);
+        }
+        let text_width = state.text_width(area_width, viewport_height);
+        assert_eq!(text_width, 19, "overflow reserves the scrollbar column");
+
+        state.push_event(
+            AgentEvent::AssistantText("123456789012345678".into()),
+            text_width,
+        );
+        state.scroll_offset = 2;
+        let before = state.flattened_line_count(text_width);
+
+        state.push_event(
+            AgentEvent::AssistantText(" wrapping stream content".into()),
+            text_width,
+        );
+
+        let after = state.flattened_line_count(text_width);
+        assert!(
+            after > before,
+            "the streamed text should wrap at the reserved width"
+        );
+        assert_eq!(state.scroll_offset, 2 + (after - before));
+    }
+
+    #[test]
+    fn render_handles_zero_and_one_column_areas() {
+        let state = HistoryState {
+            cells: vec![HistoryCell::UserMessage {
+                text: "history that would overflow a narrow area".into(),
+            }],
+            selected: None,
+            scroll_offset: 0,
+        };
+
+        for area in [Rect::new(0, 0, 0, 5), Rect::new(0, 0, 1, 5)] {
+            let mut buffer = Buffer::empty(area);
+            HistoryView {
+                state: &state,
+                width: area.width,
+            }
+            .render(area, &mut buffer);
+        }
+    }
+
+    #[test]
     fn scroll_up_clamps_at_max_offset() {
         // 5 content lines (no spacers since these are not UserMessages),
         // viewport height 3 → max offset = 2.
         let mut s = HistoryState::new();
         for c in ['a', 'b', 'c', 'd', 'e'] {
-            s.push(HistoryCell::Separator {
-                label: Some(c.to_string()),
-            });
+            s.push(
+                HistoryCell::Separator {
+                    label: Some(c.to_string()),
+                },
+                80,
+            );
         }
         // total = 5, visible_height = 3 → max = 2
         let max = s.max_scroll_offset(80, 3);
@@ -726,10 +1393,63 @@ mod tests {
     fn scroll_up_zero_max_keeps_offset_zero() {
         // Content shorter than viewport → max offset = 0, scrolling does nothing.
         let mut s = HistoryState::new();
-        s.push(HistoryCell::UserMessage { text: "x".into() });
+        s.push(HistoryCell::UserMessage { text: "x".into() }, 80);
         let max = s.max_scroll_offset(80, 10);
         assert_eq!(max, 0, "max should be 0 when content < viewport");
         s.scroll_up(5, max);
         assert_eq!(s.scroll_offset, 0, "offset should stay 0");
+    }
+
+    #[test]
+    fn page_scrolling_moves_by_viewport_height() {
+        let mut s = HistoryState::new();
+
+        s.scroll_up(12, 100);
+        s.scroll_page_down(5);
+        assert_eq!(s.scroll_offset, 7);
+
+        s.scroll_page_up(5, 100);
+        assert_eq!(s.scroll_offset, 12);
+    }
+
+    #[test]
+    fn scroll_to_top_clamps_to_content_and_bottom_resets_offset() {
+        let width = 80;
+        let height = 1;
+        let mut s = HistoryState::new();
+        s.push(
+            HistoryCell::UserMessage {
+                text: "first".into(),
+            },
+            width,
+        );
+        s.push(
+            HistoryCell::UserMessage {
+                text: "second".into(),
+            },
+            width,
+        );
+
+        let max = s.max_scroll_offset(width, height);
+        assert!(max > 0, "two user messages include a spacer line");
+
+        s.scroll_to_top(width, height);
+        assert_eq!(s.scroll_offset, max);
+
+        s.scroll_to_bottom();
+        assert_eq!(s.scroll_offset, 0);
+    }
+
+    #[test]
+    fn reconcile_scroll_offset_keeps_bottom_after_resize_then_append() {
+        let width = 80;
+        let mut s = HistoryState::new();
+        s.push(HistoryCell::Separator { label: None }, width);
+        s.scroll_offset = 1;
+
+        s.reconcile_scroll_offset(width, 10);
+        s.push(HistoryCell::Separator { label: None }, width);
+
+        assert_eq!(s.scroll_offset, 0);
     }
 }
