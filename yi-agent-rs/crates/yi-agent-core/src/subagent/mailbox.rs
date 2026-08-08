@@ -103,6 +103,10 @@ impl MailboxMessageDraft {
             Some(correlation_id),
         )
     }
+
+    pub fn recipient(&self) -> &TaskId {
+        &self.recipient
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
