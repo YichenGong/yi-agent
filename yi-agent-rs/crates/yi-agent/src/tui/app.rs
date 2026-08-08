@@ -1114,7 +1114,6 @@ fn execute_slash_command(
         SlashCommand::Message
         | SlashCommand::Pause
         | SlashCommand::Resume
-        | SlashCommand::Retry
         | SlashCommand::Approve
         | SlashCommand::Review
         | SlashCommand::Accept
@@ -1140,6 +1139,17 @@ fn execute_slash_command(
                         Err(error) => format!("无法取消任务: {error}"),
                     }
                 }
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Retry => {
+            let label = match parse_retry_args(args.as_deref()) {
+                Ok((session_id, task_id)) => match daemon_retry(session_id, task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法重试任务: {error}"),
+                },
                 Err(error) => error,
             };
             history.push(HistoryCell::Separator { label: Some(label) }, width);
@@ -1203,6 +1213,47 @@ fn parse_cancel_args(args: Option<&str>) -> Result<(&str, &str, bool), String> {
         return Err("用法: /cancel <session-id> <task-id> [recursive]".into());
     }
     Ok((session_id, task_id, recursive))
+}
+
+fn parse_retry_args(args: Option<&str>) -> Result<(&str, &str), String> {
+    let Some(args) = args else {
+        return Err("用法: /retry <session-id> <task-id>".into());
+    };
+    let mut parts = args.split_whitespace();
+    let (Some(session_id), Some(task_id)) = (parts.next(), parts.next()) else {
+        return Err("用法: /retry <session-id> <task-id>".into());
+    };
+    if parts.next().is_some() {
+        return Err("用法: /retry <session-id> <task-id>".into());
+    }
+    Ok((session_id, task_id))
+}
+
+fn daemon_retry(session_id: &str, task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_retry_at(&runtime_dir.join("runtime.sock"), session_id, task_id)
+}
+
+fn daemon_retry_at(
+    socket: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::RetryTask {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskRetried) {
+        return Err("daemon 返回了非重试响应".into());
+    }
+    Ok(format!("已请求重试任务: {task_id}"))
 }
 
 fn daemon_cancel(session_id: &str, task_id: &str, recursive: bool) -> Result<String, String> {
@@ -1638,6 +1689,39 @@ mod tests {
         assert!(result.contains("递归"));
         let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
         assert!(detail.contains("state: cancelled"));
+    }
+
+    #[test]
+    fn retry_control_routes_to_the_daemon_with_explicit_session_scope() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated {
+            session_id,
+            root_task_id,
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::CreateSession,
+        )
+        .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::CancelTask {
+                session_id: session_id.clone(),
+                task_id: root_task_id.clone(),
+                recursive: false,
+            },
+        )
+        .unwrap();
+
+        let result = daemon_retry_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+
+        assert!(result.contains("已请求重试"));
     }
 
     #[test]

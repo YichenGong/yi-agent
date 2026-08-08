@@ -64,6 +64,10 @@ pub enum IpcRequest {
         task_id: String,
         recursive: bool,
     },
+    RetryTask {
+        session_id: String,
+        task_id: String,
+    },
     SendMessage {
         session_id: String,
         sender_task_id: String,
@@ -98,6 +102,7 @@ pub enum IpcResponse {
     },
     TaskStarted,
     TaskCancelled,
+    TaskRetried,
     MessageDelivered,
     WaitCompleted {
         status: String,
@@ -589,6 +594,18 @@ fn respond(
                 .build()?;
             runtime.block_on(coordinator.cancel_task(&session_id, &task_id, recursive))?;
             Ok(IpcResponse::TaskCancelled)
+        }
+        IpcRequest::RetryTask {
+            session_id,
+            task_id,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.retry_task(&session_id, &task_id))?;
+            Ok(IpcResponse::TaskRetried)
         }
         IpcRequest::SendMessage {
             session_id,

@@ -210,7 +210,10 @@ impl RuntimeCoordinator {
             repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
             repository.create_attempt(&attempt.id, task, attempt.number, "queued")?;
         }
-        self.start_worker(session, task).await
+        if self.factory.is_available() {
+            self.start_worker(session, task).await?;
+        }
+        Ok(())
     }
 
     pub async fn cancel_task(

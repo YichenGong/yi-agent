@@ -663,3 +663,61 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
     assert_eq!(detail.depth, 1);
     assert_eq!(detail.state, "queued");
 }
+
+#[test]
+fn daemon_retries_a_terminal_task_through_its_control_api() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(RecordingWorkerFactory),
+    )
+    .unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::StartWorker {
+            session_id: session_id.clone(),
+            task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap();
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::CancelTask {
+            session_id: session_id.clone(),
+            task_id: root_task_id.clone(),
+            recursive: false,
+        },
+    )
+    .unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::RetryTask {
+            session_id,
+            task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(response, IpcResponse::TaskRetried));
+    let detail = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectTask {
+            task_id: root_task_id,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        detail,
+        IpcResponse::TaskDetail(detail) if detail.state == "running"
+    ));
+}
