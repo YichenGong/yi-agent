@@ -11,6 +11,8 @@ mod shell;
 mod skill_tool;
 mod web;
 
+pub mod worktree;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
