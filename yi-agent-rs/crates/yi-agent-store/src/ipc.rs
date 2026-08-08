@@ -28,6 +28,8 @@ pub enum IpcError {
     AlreadyRunning { path: PathBuf },
     #[error("IPC frame exceeds {MAX_FRAME_BYTES} bytes")]
     FrameTooLarge,
+    #[error("daemon listener thread panicked during shutdown")]
+    ListenerPanicked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,18 +152,32 @@ impl Daemon {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
-}
 
-impl Drop for Daemon {
-    fn drop(&mut self) {
+    /// Stop this manually started daemon and release its local runtime files.
+    pub fn stop(&mut self) -> Result<(), IpcError> {
         self.stop.store(true, Ordering::Release);
         // Wake the nonblocking accept loop so shutdown does not wait for its sleep interval.
         let _ = UnixStream::connect(&self.socket_path);
         if let Some(listener) = self.listener.take() {
-            let _ = listener.join();
+            listener.join().map_err(|_| IpcError::ListenerPanicked)?;
         }
-        let _ = fs::remove_file(&self.socket_path);
-        let _ = fs::remove_file(&self.lock_path);
+        remove_if_exists(&self.socket_path)?;
+        remove_if_exists(&self.lock_path)?;
+        Ok(())
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

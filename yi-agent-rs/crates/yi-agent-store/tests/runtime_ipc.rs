@@ -141,3 +141,14 @@ fn daemon_rejects_second_instance_and_reports_protocol_mismatch() {
     let response = send_request_with_version(daemon.socket_path(), 2, IpcRequest::Status).unwrap();
     assert!(matches!(response, IpcResponse::UnsupportedProtocol { .. }));
 }
+
+#[test]
+fn manually_stopped_daemon_releases_its_socket_and_instance_lock() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    let database = directory.path().join("runtime.sqlite");
+    let mut daemon = Daemon::start(&runtime, &database).unwrap();
+
+    daemon.stop().unwrap();
+    assert!(Daemon::start(&runtime, &database).is_ok());
+}
