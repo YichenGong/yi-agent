@@ -42,6 +42,7 @@ struct RequestEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcRequest {
     Status,
+    Stop,
     SubscribeEvents { after_event_id: i64 },
 }
 
@@ -50,6 +51,7 @@ pub enum IpcResponse {
     Status {
         high_water_event_id: i64,
     },
+    Stopping,
     Subscription(SubscriptionSnapshot),
     UnsupportedProtocol {
         supported_min: u32,
@@ -83,7 +85,6 @@ pub struct IpcEvent {
 /// A manually owned, current-user-only local daemon socket.
 pub struct Daemon {
     socket_path: PathBuf,
-    lock_path: PathBuf,
     stop: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
 }
@@ -110,11 +111,13 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let database_path = database_path.as_ref().to_path_buf();
+        let cleanup_socket = socket_path.clone();
+        let cleanup_lock = lock_path.clone();
         let listener = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = handle_client(stream, &database_path);
+                        let _ = handle_client(stream, &database_path, &thread_stop);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -122,10 +125,11 @@ impl Daemon {
                     Err(_) => break,
                 }
             }
+            let _ = remove_if_exists(&cleanup_socket);
+            let _ = remove_if_exists(&cleanup_lock);
         });
         Ok(Self {
             socket_path,
-            lock_path,
             stop,
             listener: Some(listener),
         })
@@ -143,8 +147,6 @@ impl Daemon {
         if let Some(listener) = self.listener.take() {
             listener.join().map_err(|_| IpcError::ListenerPanicked)?;
         }
-        remove_if_exists(&self.socket_path)?;
-        remove_if_exists(&self.lock_path)?;
         Ok(())
     }
 }
@@ -242,7 +244,11 @@ pub fn send_request_with_version(
     Ok(serde_json::from_str(&response)?)
 }
 
-fn handle_client(mut stream: UnixStream, database_path: &Path) -> Result<(), IpcError> {
+fn handle_client(
+    mut stream: UnixStream,
+    database_path: &Path,
+    stop: &AtomicBool,
+) -> Result<(), IpcError> {
     let mut frame = String::new();
     let bytes = BufReader::new(stream.try_clone()?).read_line(&mut frame)?;
     let response = if bytes > MAX_FRAME_BYTES {
@@ -256,6 +262,10 @@ fn handle_client(mut stream: UnixStream, database_path: &Path) -> Result<(), Ipc
                     supported_min: PROTOCOL_VERSION,
                     supported_max: PROTOCOL_VERSION,
                 }
+            }
+            Ok(envelope) if matches!(envelope.request, IpcRequest::Stop) => {
+                stop.store(true, Ordering::Release);
+                IpcResponse::Stopping
             }
             Ok(envelope) => match respond(database_path, envelope.request) {
                 Ok(response) => response,
@@ -280,6 +290,7 @@ fn respond(database_path: &Path, request: IpcRequest) -> Result<IpcResponse, Ipc
         IpcRequest::Status => Ok(IpcResponse::Status {
             high_water_event_id: repository.latest_event_id()?,
         }),
+        IpcRequest::Stop => Ok(IpcResponse::Stopping),
         IpcRequest::SubscribeEvents { after_event_id } => {
             let snapshot = repository.subscription_snapshot(after_event_id)?;
             let tasks = snapshot

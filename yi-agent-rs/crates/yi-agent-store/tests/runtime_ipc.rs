@@ -189,3 +189,21 @@ fn daemon_reclaims_a_stale_lock_when_no_socket_is_listening() {
 
     assert!(Daemon::start(&runtime, &database).is_ok());
 }
+
+#[test]
+fn daemon_stop_request_releases_the_runtime_for_a_future_manual_start() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(&runtime, &database).unwrap();
+
+    let response = send_request(daemon.socket_path(), IpcRequest::Stop).unwrap();
+    assert!(matches!(response, IpcResponse::Stopping));
+    for _ in 0..50 {
+        if Daemon::start(&runtime, &database).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("daemon stop request did not release runtime lock");
+}
