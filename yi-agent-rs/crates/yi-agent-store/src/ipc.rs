@@ -70,6 +70,11 @@ pub enum IpcRequest {
         recipient_task_id: String,
         message: String,
     },
+    WaitAgent {
+        session_id: String,
+        caller_task_id: String,
+        mode: String,
+    },
     SubscribeEvents {
         after_event_id: i64,
     },
@@ -91,6 +96,10 @@ pub enum IpcResponse {
     TaskStarted,
     TaskCancelled,
     MessageDelivered,
+    WaitCompleted {
+        status: String,
+        children: Vec<String>,
+    },
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
     ResyncRequired,
@@ -579,6 +588,45 @@ fn respond(
                 message,
             ))?;
             Ok(IpcResponse::MessageDelivered)
+        }
+        IpcRequest::WaitAgent {
+            session_id,
+            caller_task_id,
+            mode,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            let mode = match mode.as_str() {
+                "one" | "any" => yi_agent_core::subagent::supervisor::WaitMode::Any,
+                "all" => yi_agent_core::subagent::supervisor::WaitMode::All,
+                _ => {
+                    return Err(IpcError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "mode must be one, any, or all",
+                    )));
+                }
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let outcome = runtime.block_on(coordinator.wait_for_children(
+                &session_id,
+                &caller_task_id,
+                mode,
+            ))?;
+            let (status, children) = match outcome {
+                yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention => {
+                    ("needs_attention".into(), Vec::new())
+                }
+                yi_agent_core::subagent::supervisor::WaitOutcome::Completed(children) => (
+                    "completed".into(),
+                    children
+                        .into_iter()
+                        .map(|child| child.to_string())
+                        .collect(),
+                ),
+            };
+            Ok(IpcResponse::WaitCompleted { status, children })
         }
         IpcRequest::SubscribeEvents { after_event_id } => {
             let snapshot = repository.subscription_snapshot(after_event_id)?;

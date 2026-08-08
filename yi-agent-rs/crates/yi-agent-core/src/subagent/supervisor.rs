@@ -39,6 +39,17 @@ pub enum MessageDeliveryError {
     RecipientTerminal,
 }
 
+#[derive(Clone, Copy)]
+pub enum WaitMode {
+    Any,
+    All,
+}
+
+pub enum WaitOutcome {
+    NeedsAttention,
+    Completed(Vec<TaskId>),
+}
+
 pub struct AgentSupervisor {
     root_task_id: TaskId,
     tasks: HashMap<TaskId, AgentTask>,
@@ -253,8 +264,36 @@ impl AgentSupervisor {
         }
     }
 
-    fn subscribe_updates(&self) -> watch::Receiver<u64> {
+    pub fn subscribe_updates(&self) -> watch::Receiver<u64> {
         self.updates.subscribe()
+    }
+
+    /// Computes the non-blocking part of a child join. Runtime callers own
+    /// waiting on the update receiver so the supervisor mutex stays available.
+    pub fn wait_outcome(&self, caller: &TaskId, mode: WaitMode) -> Option<WaitOutcome> {
+        if self.mailbox(caller).is_some_and(|mailbox| {
+            mailbox
+                .messages()
+                .iter()
+                .any(|message| message.priority <= MessagePriority::High)
+        }) {
+            return Some(WaitOutcome::NeedsAttention);
+        }
+        let children = self.children_of(caller);
+        let complete = match mode {
+            WaitMode::Any => children.iter().any(|child| {
+                self.task(child)
+                    .is_some_and(|task| task.state().is_terminal())
+            }),
+            WaitMode::All => {
+                !children.is_empty()
+                    && children.iter().all(|child| {
+                        self.task(child)
+                            .is_some_and(|task| task.state().is_terminal())
+                    })
+            }
+        };
+        complete.then(|| WaitOutcome::Completed(children.to_vec()))
     }
 
     fn notify_update(&self) {
@@ -518,40 +557,18 @@ impl Tool for WaitAgentTool {
                     .supervisor
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if supervisor
-                    .mailbox(&self.tools.caller)
-                    .is_some_and(|mailbox| {
-                        mailbox
-                            .messages()
-                            .iter()
-                            .any(|message| message.priority <= MessagePriority::High)
-                    })
-                {
-                    Some(("needs_attention", Vec::new()))
-                } else {
-                    let children = supervisor.children_of(&self.tools.caller);
-                    let complete = match mode {
-                        WaitMode::Any => children.iter().any(|child| {
-                            supervisor
-                                .task(child)
-                                .is_some_and(|task| task.state().is_terminal())
-                        }),
-                        WaitMode::All => {
-                            !children.is_empty()
-                                && children.iter().all(|child| {
-                                    supervisor
-                                        .task(child)
-                                        .is_some_and(|task| task.state().is_terminal())
-                                })
-                        }
-                    };
-                    complete.then(|| {
-                        (
+                supervisor
+                    .wait_outcome(&self.tools.caller, mode)
+                    .map(|outcome| match outcome {
+                        WaitOutcome::NeedsAttention => ("needs_attention", Vec::new()),
+                        WaitOutcome::Completed(children) => (
                             "completed",
-                            children.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                        )
+                            children
+                                .into_iter()
+                                .map(|child| child.to_string())
+                                .collect(),
+                        ),
                     })
-                }
             };
             if let Some((status, children)) = status {
                 return ToolResult::text(
@@ -563,12 +580,6 @@ impl Tool for WaitAgentTool {
             }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum WaitMode {
-    Any,
-    All,
 }
 
 struct SendMessageTool {

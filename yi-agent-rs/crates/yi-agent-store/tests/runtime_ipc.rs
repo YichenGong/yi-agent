@@ -409,6 +409,59 @@ fn daemon_rejects_messages_to_unrelated_tasks_without_persisting_them() {
 }
 
 #[test]
+fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            objective: "Inspect child behavior".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::CancelTask {
+            session_id: session_id.clone(),
+            task_id: child_task_id.clone(),
+            recursive: false,
+        },
+    )
+    .unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id,
+            caller_task_id: root_task_id,
+            mode: "all".into(),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        response,
+        IpcResponse::WaitCompleted { status, children }
+            if status == "completed" && children == vec![child_task_id]
+    ));
+}
+
+#[test]
 fn daemon_starts_a_worker_through_its_injected_factory() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

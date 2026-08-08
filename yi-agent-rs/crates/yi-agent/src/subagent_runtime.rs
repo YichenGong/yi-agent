@@ -59,6 +59,11 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 caller_task_id: request.task_id.to_string(),
             }));
             worker_tools.register(Arc::new(DaemonSendMessageTool {
+                runtime_socket: runtime_socket.clone(),
+                session_id: request.root_session_id.to_string(),
+                caller_task_id: request.task_id.to_string(),
+            }));
+            worker_tools.register(Arc::new(DaemonWaitAgentTool {
                 runtime_socket,
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
@@ -181,6 +186,56 @@ struct DaemonSpawnAgentTool {
     caller_task_id: String,
 }
 
+struct DaemonWaitAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+}
+
+#[async_trait]
+impl Tool for DaemonWaitAgentTool {
+    fn name(&self) -> &str {
+        "wait_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Wait for one, all, or any direct child to report a terminal result."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "mode": { "type": "string", "enum": ["one", "all", "any"] } },
+            "required": ["mode"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(mode) = args.get("mode").and_then(Value::as_str) else {
+            return ToolResult::error("mode is required");
+        };
+        if !matches!(mode, "one" | "any" | "all") {
+            return ToolResult::error("mode must be one, any, or all");
+        }
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::WaitAgent {
+                session_id: self.session_id.clone(),
+                caller_task_id: self.caller_task_id.clone(),
+                mode: mode.to_owned(),
+            },
+        );
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::WaitCompleted { status, children }) => {
+                ToolResult::text(json!({ "status": status, "children": children }).to_string())
+            }
+            Ok(other) => ToolResult::error(format!("daemon rejected wait request: {other:?}")),
+            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for DaemonSpawnAgentTool {
     fn name(&self) -> &str {
@@ -278,6 +333,59 @@ mod tests {
         assert!(matches!(
             result.content.as_slice(),
             [yi_agent_core::ContentBlock::Text(text)] if text == "message delivered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_wait_proxy_routes_through_the_daemon() {
+        let directory = TempDir::new().unwrap();
+        let daemon = Daemon::start(
+            directory.path().join("runtime"),
+            directory.path().join("runtime.sqlite"),
+        )
+        .unwrap();
+        let IpcResponse::SessionCreated {
+            session_id,
+            root_task_id,
+        } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+        else {
+            panic!("expected session");
+        };
+        let IpcResponse::TaskSpawned {
+            task_id: child_task_id,
+        } = send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnChild {
+                session_id: session_id.clone(),
+                parent_task_id: root_task_id.clone(),
+                objective: "Inspect the target".into(),
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected child");
+        };
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::CancelTask {
+                session_id: session_id.clone(),
+                task_id: child_task_id,
+                recursive: false,
+            },
+        )
+        .unwrap();
+
+        let tool = DaemonWaitAgentTool {
+            runtime_socket: daemon.socket_path().to_path_buf(),
+            session_id,
+            caller_task_id: root_task_id,
+        };
+        let result = tool.call(json!({ "mode": "all" })).await;
+
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)] if text.contains("completed")
         ));
     }
 }

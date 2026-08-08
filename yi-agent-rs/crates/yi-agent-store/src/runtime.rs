@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use yi_agent_core::subagent::scheduler::ResourceCoordinator;
-use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError};
+use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError, WaitMode, WaitOutcome};
 use yi_agent_core::subagent::task::{RootSessionId, TaskId};
 use yi_agent_core::subagent::worker::AgentWorkerFactory;
 
@@ -209,6 +209,26 @@ impl RuntimeCoordinator {
             .expect("runtime repository mutex poisoned")
             .record_user_message(sender, &recipient, &message)?;
         Ok(())
+    }
+
+    /// Waits without retaining the supervisor lock, allowing child lifecycle
+    /// events and cancellation to continue while the parent is suspended.
+    pub async fn wait_for_children(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        mode: WaitMode,
+    ) -> Result<WaitOutcome, RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        let mut updates = supervisor.lock().await.subscribe_updates();
+        loop {
+            if let Some(outcome) = supervisor.lock().await.wait_outcome(caller, mode) {
+                return Ok(outcome);
+            }
+            updates.changed().await.map_err(|_| {
+                RuntimeCoordinatorError::Supervisor("supervisor is no longer available".into())
+            })?;
+        }
     }
 
     /// Drains facts emitted by application workers and persists their reducer
