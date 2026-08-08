@@ -6,3 +6,4 @@
 
 pub mod ipc;
 pub mod repository;
+pub mod schedule;
