@@ -1114,7 +1114,6 @@ fn execute_slash_command(
         SlashCommand::Message
         | SlashCommand::Pause
         | SlashCommand::Resume
-        | SlashCommand::Cancel
         | SlashCommand::Retry
         | SlashCommand::Approve
         | SlashCommand::Review
@@ -1131,6 +1130,19 @@ fn execute_slash_command(
                 },
                 width,
             );
+            KeyOutcome::None
+        }
+        SlashCommand::Cancel => {
+            let label = match parse_cancel_args(args.as_deref()) {
+                Ok((session_id, task_id, recursive)) => {
+                    match daemon_cancel(session_id, task_id, recursive) {
+                        Ok(message) => message,
+                        Err(error) => format!("无法取消任务: {error}"),
+                    }
+                }
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
     }
@@ -1172,6 +1184,63 @@ fn daemon_agent_detail_at(socket: &std::path::Path, task_id: &str) -> Result<Str
         detail.state,
         detail.delivery_json,
     ))
+}
+
+fn parse_cancel_args(args: Option<&str>) -> Result<(&str, &str, bool), String> {
+    let Some(args) = args else {
+        return Err("用法: /cancel <session-id> <task-id> [recursive]".into());
+    };
+    let mut parts = args.split_whitespace();
+    let (Some(session_id), Some(task_id)) = (parts.next(), parts.next()) else {
+        return Err("用法: /cancel <session-id> <task-id> [recursive]".into());
+    };
+    let recursive = match parts.next() {
+        None => false,
+        Some("recursive") => true,
+        Some(_) => return Err("第三个参数只能是 recursive".into()),
+    };
+    if parts.next().is_some() {
+        return Err("用法: /cancel <session-id> <task-id> [recursive]".into());
+    }
+    Ok((session_id, task_id, recursive))
+}
+
+fn daemon_cancel(session_id: &str, task_id: &str, recursive: bool) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_cancel_at(
+        &runtime_dir.join("runtime.sock"),
+        session_id,
+        task_id,
+        recursive,
+    )
+}
+
+fn daemon_cancel_at(
+    socket: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+    recursive: bool,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::CancelTask {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+            recursive,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskCancelled) {
+        return Err("daemon 返回了非取消响应".into());
+    }
+    Ok(if recursive {
+        format!("已递归取消任务树: {task_id}")
+    } else {
+        format!("已取消任务: {task_id}")
+    })
 }
 
 fn daemon_agents_summary_at(socket: &std::path::Path) -> Result<String, String> {
@@ -1542,6 +1611,33 @@ mod tests {
         assert!(detail.contains(&root_task_id));
         assert!(detail.contains("state: queued"));
         assert!(detail.contains("depth: 0"));
+    }
+
+    #[test]
+    fn cancel_control_routes_to_the_daemon_with_explicit_session_scope() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated {
+            session_id,
+            root_task_id,
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::CreateSession,
+        )
+        .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let result =
+            daemon_cancel_at(daemon.socket_path(), &session_id, &root_task_id, true).unwrap();
+
+        assert!(result.contains("递归"));
+        let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+        assert!(detail.contains("state: cancelled"));
     }
 
     #[test]
