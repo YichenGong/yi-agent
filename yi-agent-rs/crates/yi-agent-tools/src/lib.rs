@@ -6,6 +6,7 @@
 mod context;
 mod error;
 mod fs;
+mod sandbox;
 mod shell;
 mod skill_tool;
 mod web;
@@ -18,6 +19,7 @@ use yi_agent_core::ToolRegistry;
 pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+pub use sandbox::{SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
 pub use skill_tool::SkillTool;
@@ -25,22 +27,34 @@ pub use web::{BochaSearchProvider, SearchResult, WebFetchTool, WebSearchProvider
 
 /// Register all builtin tools into the given registry.
 ///
-/// `root` constrains FS tool operations to the given directory.
-/// Shell tools use it as initial cwd but do not restrict `sh -c` operations
-/// to within root (system-level isolation requires sandbox, which is future work).
+/// `root` constrains FS tool operations and shell writes to the given directory.
 ///
 /// Web tools:
 /// - WebFetchTool is always registered.
 /// - WebSearchTool is only registered if BOCHA_API_KEY env var is set.
 pub fn register_builtin_tools(registry: &mut ToolRegistry, root: PathBuf) {
+    register_builtin_tools_with_sandbox(registry, root, SandboxMode::WorkspaceWrite, Vec::new());
+}
+
+/// Register builtin tools with an explicit shell sandbox policy.
+pub fn register_builtin_tools_with_sandbox(
+    registry: &mut ToolRegistry,
+    root: PathBuf,
+    sandbox_mode: SandboxMode,
+    extra_writable_roots: Vec<PathBuf>,
+) {
     let ctx = Arc::new(ToolsContext::new(root));
-    // FS + Shell tools
+    let sandbox = SandboxPolicy::new(sandbox_mode, ctx.root(), extra_writable_roots);
+    // A read-only session has no write/edit tool surface, in addition to the
+    // process-level file-write denial enforced for shell commands.
     registry.register(Arc::new(ReadTool::new(ctx.clone())));
-    registry.register(Arc::new(WriteTool::new(ctx.clone())));
-    registry.register(Arc::new(EditTool::new(ctx.clone())));
+    if sandbox.allows_writes() {
+        registry.register(Arc::new(WriteTool::new(ctx.clone())));
+        registry.register(Arc::new(EditTool::new(ctx.clone())));
+    }
     registry.register(Arc::new(GlobTool::new(ctx.clone())));
     registry.register(Arc::new(GrepTool::new(ctx.clone())));
-    registry.register(Arc::new(BashTool::new(ctx)));
+    registry.register(Arc::new(BashTool::with_sandbox(ctx, sandbox)));
 
     // Web tools
     registry.register(Arc::new(WebFetchTool::new()));

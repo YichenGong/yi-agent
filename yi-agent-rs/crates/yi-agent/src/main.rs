@@ -87,7 +87,12 @@ fn run_agent(cli: Cli) -> Result<()> {
     };
 
     let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_tools::register_builtin_tools(&mut registry, config.workdir.clone());
+    yi_agent_tools::register_builtin_tools_with_sandbox(
+        &mut registry,
+        config.workdir.clone(),
+        config.sandbox,
+        config.sandbox_writable_roots.clone(),
+    );
 
     // --- Skills system setup ---
     let skills_service = setup_skills(&config)?;
@@ -256,7 +261,12 @@ fn build_headless_setup(config: &config::Config, naked: bool) -> Result<Headless
         });
     }
 
-    yi_agent_tools::register_builtin_tools(&mut registry, config.workdir.clone());
+    yi_agent_tools::register_builtin_tools_with_sandbox(
+        &mut registry,
+        config.workdir.clone(),
+        config.sandbox,
+        config.sandbox_writable_roots.clone(),
+    );
     let skills_service = setup_skills(config)?;
     let system_prompt = resolve_system_prompt_with_skills(
         config.system_prompt.clone(),
@@ -783,6 +793,8 @@ mod tests {
             compact_threshold: 160_000,
             compact_keep_turns: 4,
             yolo: false,
+            sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
+            sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
         }
