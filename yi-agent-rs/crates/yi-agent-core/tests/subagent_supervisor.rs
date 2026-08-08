@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
+use yi_agent_core::ContentBlock;
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
@@ -82,5 +83,69 @@ async fn send_message_delivers_to_a_direct_child_mailbox() {
             .messages()
             .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn wait_all_returns_only_after_all_direct_children_are_terminal() {
+    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
+    let root = supervisor.lock().unwrap().root_task_id().clone();
+    let first = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
+    let second = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
+    supervisor.lock().unwrap().start_task(&first).unwrap();
+    supervisor.lock().unwrap().start_task(&second).unwrap();
+    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
+
+    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "all" })).await });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    supervisor
+        .lock()
+        .unwrap()
+        .fail_task(&first, "first failed")
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    supervisor
+        .lock()
+        .unwrap()
+        .fail_task(&second, "second failed")
+        .unwrap();
+    let result = waiting.await.unwrap();
+    assert!(!result.is_error);
+    assert!(matches!(&result.content[0], ContentBlock::Text(text) if text.contains("completed")));
+}
+
+#[tokio::test]
+async fn wait_any_returns_after_the_first_terminal_child() {
+    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
+    let root = supervisor.lock().unwrap().root_task_id().clone();
+    let first = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
+    let second = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
+    supervisor.lock().unwrap().start_task(&first).unwrap();
+    supervisor.lock().unwrap().start_task(&second).unwrap();
+    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
+
+    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "any" })).await });
+    tokio::task::yield_now().await;
+    supervisor
+        .lock()
+        .unwrap()
+        .fail_task(&first, "first failed")
+        .unwrap();
+
+    let result = waiting.await.unwrap();
+    assert!(!result.is_error);
+    assert_eq!(
+        supervisor
+            .lock()
+            .unwrap()
+            .task(&second)
+            .unwrap()
+            .state()
+            .is_terminal(),
+        false
     );
 }

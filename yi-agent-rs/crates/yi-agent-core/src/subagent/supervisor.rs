@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::watch;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, UserInstruction};
-use super::task::{AgentTask, RootSessionId, TaskId};
+use super::task::{AgentTask, RootSessionId, TaskEvent, TaskFailure, TaskId};
 use crate::tool::{Tool, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
@@ -43,6 +44,7 @@ pub struct AgentSupervisor {
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
     events: Vec<SupervisorEvent>,
+    updates: watch::Sender<u64>,
 }
 
 impl AgentSupervisor {
@@ -53,12 +55,14 @@ impl AgentSupervisor {
         tasks.insert(root_task_id.clone(), root);
         let mut mailboxes = HashMap::new();
         mailboxes.insert(root_task_id.clone(), Mailbox::default());
+        let (updates, _) = watch::channel(0_u64);
         Self {
             root_task_id,
             tasks,
             children: HashMap::new(),
             mailboxes,
             events: Vec::new(),
+            updates,
         }
     }
 
@@ -80,6 +84,15 @@ impl AgentSupervisor {
 
     pub fn mailbox(&self, task_id: &TaskId) -> Option<&Mailbox> {
         self.mailboxes.get(task_id)
+    }
+
+    fn subscribe_updates(&self) -> watch::Receiver<u64> {
+        self.updates.subscribe()
+    }
+
+    fn notify_update(&self) {
+        self.updates
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
     }
 
     pub fn spawn(&mut self, parent_id: TaskId) -> Result<TaskId, SpawnError> {
@@ -108,6 +121,7 @@ impl AgentSupervisor {
             parent_id,
             task_id: child_id.clone(),
         });
+        self.notify_update();
         Ok(child_id)
     }
 
@@ -136,6 +150,44 @@ impl AgentSupervisor {
             .get_mut(&recipient)
             .expect("task mailbox is created with task")
             .push(draft);
+        self.notify_update();
+        Ok(())
+    }
+
+    pub fn fail_task(
+        &mut self,
+        task_id: &TaskId,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::WorkerFailed {
+                attempt_id,
+                failure: TaskFailure::new(message),
+            },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(())
+    }
+
+    pub fn start_task(&mut self, task_id: &TaskId) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::AdmissionGranted { attempt_id },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
         Ok(())
     }
 }
@@ -146,11 +198,20 @@ impl AgentSupervisor {
 pub struct SupervisorTools {
     supervisor: Arc<Mutex<AgentSupervisor>>,
     caller: TaskId,
+    updates: watch::Receiver<u64>,
 }
 
 impl SupervisorTools {
     pub fn new(supervisor: Arc<Mutex<AgentSupervisor>>, caller: TaskId) -> Self {
-        Self { supervisor, caller }
+        let updates = supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .subscribe_updates();
+        Self {
+            supervisor,
+            caller,
+            updates,
+        }
     }
 
     pub fn spawn_agent(&self) -> Arc<dyn Tool> {
@@ -233,15 +294,54 @@ impl Tool for WaitAgentTool {
         })
     }
 
-    async fn call(&self, _args: Value) -> ToolResult {
-        let supervisor = self
-            .tools
-            .supervisor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let children = supervisor.children_of(&self.tools.caller);
-        ToolResult::text(json!({ "status": "waiting", "children": children.iter().map(ToString::to_string).collect::<Vec<_>>() }).to_string())
+    async fn call(&self, args: Value) -> ToolResult {
+        let mode = match args.get("mode").and_then(Value::as_str) {
+            Some("one" | "any") => WaitMode::Any,
+            Some("all") => WaitMode::All,
+            _ => return ToolResult::error("mode must be one, any, or all"),
+        };
+        let mut updates = self.tools.updates.clone();
+        loop {
+            let status = {
+                let supervisor = self
+                    .tools
+                    .supervisor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let children = supervisor.children_of(&self.tools.caller);
+                let complete = match mode {
+                    WaitMode::Any => children.iter().any(|child| {
+                        supervisor
+                            .task(child)
+                            .is_some_and(|task| task.state().is_terminal())
+                    }),
+                    WaitMode::All => {
+                        !children.is_empty()
+                            && children.iter().all(|child| {
+                                supervisor
+                                    .task(child)
+                                    .is_some_and(|task| task.state().is_terminal())
+                            })
+                    }
+                };
+                complete.then(|| children.iter().map(ToString::to_string).collect::<Vec<_>>())
+            };
+            if let Some(children) = status {
+                return ToolResult::text(
+                    json!({ "status": "completed", "children": children }).to_string(),
+                );
+            }
+            if updates.changed().await.is_err() {
+                return ToolResult::error("supervisor is no longer available");
+            }
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum WaitMode {
+    Any,
+    All,
 }
 
 struct SendMessageTool {
