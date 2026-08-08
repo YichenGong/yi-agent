@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -54,6 +54,7 @@ pub enum IpcResponse {
     Stopping,
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
+    ResyncRequired,
     UnsupportedProtocol {
         supported_min: u32,
         supported_max: u32,
@@ -90,14 +91,13 @@ pub struct Subscription {
 
 impl Subscription {
     pub fn next_response(&mut self) -> Result<IpcResponse, IpcError> {
-        let mut response = String::new();
-        if self.reader.read_line(&mut response)? == 0 {
-            return Err(IpcError::Io(std::io::Error::new(
+        let response = read_limited_frame(&mut self.reader)?.ok_or_else(|| {
+            IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "daemon closed subscription",
-            )));
-        }
-        Ok(serde_json::from_str(&response)?)
+            ))
+        })?;
+        Ok(serde_json::from_slice(&response)?)
     }
 }
 
@@ -253,9 +253,13 @@ pub fn send_request_with_version(
 ) -> Result<IpcResponse, IpcError> {
     let mut stream = UnixStream::connect(socket_path)?;
     write_request(&mut stream, protocol_version, request)?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
-    Ok(serde_json::from_str(&response)?)
+    let response = read_limited_frame(&mut BufReader::new(stream))?.ok_or_else(|| {
+        IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "daemon closed request connection",
+        ))
+    })?;
+    Ok(serde_json::from_slice(&response)?)
 }
 
 pub fn subscribe(
@@ -298,39 +302,44 @@ fn handle_client(
 ) -> Result<(), IpcError> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-    let mut frame = String::new();
-    let bytes = BufReader::new(stream.try_clone()?).read_line(&mut frame)?;
-    let response = if bytes > MAX_FRAME_BYTES {
-        IpcResponse::Error {
-            code: "frame_too_large".into(),
+    let frame = match read_limited_frame(&mut BufReader::new(stream.try_clone()?)) {
+        Err(IpcError::FrameTooLarge) => {
+            return write_response(
+                &mut stream,
+                &IpcResponse::Error {
+                    code: "frame_too_large".into(),
+                },
+            );
         }
-    } else {
-        match serde_json::from_str::<RequestEnvelope>(&frame) {
-            Ok(envelope) if envelope.protocol_version != PROTOCOL_VERSION => {
-                IpcResponse::UnsupportedProtocol {
-                    supported_min: PROTOCOL_VERSION,
-                    supported_max: PROTOCOL_VERSION,
-                }
+        Err(error) => return Err(error),
+        Ok(None) => return Ok(()),
+        Ok(Some(frame)) => frame,
+    };
+    let response = match serde_json::from_slice::<RequestEnvelope>(&frame) {
+        Ok(envelope) if envelope.protocol_version != PROTOCOL_VERSION => {
+            IpcResponse::UnsupportedProtocol {
+                supported_min: PROTOCOL_VERSION,
+                supported_max: PROTOCOL_VERSION,
             }
-            Ok(envelope) => match envelope.request {
-                IpcRequest::Stop => {
-                    stop.store(true, Ordering::Release);
-                    IpcResponse::Stopping
-                }
-                IpcRequest::SubscribeEvents { after_event_id } => {
-                    return stream_subscription(&mut stream, database_path, stop, after_event_id);
-                }
-                request => match respond(database_path, request) {
-                    Ok(response) => response,
-                    Err(_) => IpcResponse::Error {
-                        code: "internal".into(),
-                    },
+        }
+        Ok(envelope) => match envelope.request {
+            IpcRequest::Stop => {
+                stop.store(true, Ordering::Release);
+                IpcResponse::Stopping
+            }
+            IpcRequest::SubscribeEvents { after_event_id } => {
+                return stream_subscription(&mut stream, database_path, stop, after_event_id);
+            }
+            request => match respond(database_path, request) {
+                Ok(response) => response,
+                Err(_) => IpcResponse::Error {
+                    code: "internal".into(),
                 },
             },
-            Err(_) => IpcResponse::Error {
-                code: "invalid_request".into(),
-            },
-        }
+        },
+        Err(_) => IpcResponse::Error {
+            code: "invalid_request".into(),
+        },
     };
     write_response(&mut stream, &response)
 }
@@ -372,10 +381,31 @@ fn stream_subscription(
 }
 
 fn write_response(stream: &mut UnixStream, response: &IpcResponse) -> Result<(), IpcError> {
-    serde_json::to_writer(&mut *stream, response)?;
+    let frame = serde_json::to_vec(response)?;
+    let frame = if frame.len() <= MAX_FRAME_BYTES {
+        frame
+    } else {
+        serde_json::to_vec(&IpcResponse::ResyncRequired)?
+    };
+    stream.write_all(&frame)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+fn read_limited_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, IpcError> {
+    let mut frame = Vec::new();
+    let read = reader
+        .take((MAX_FRAME_BYTES + 1) as u64)
+        .read_until(b'\n', &mut frame)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if frame.len() > MAX_FRAME_BYTES || !frame.ends_with(b"\n") {
+        return Err(IpcError::FrameTooLarge);
+    }
+    frame.pop();
+    Ok(Some(frame))
 }
 
 fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
