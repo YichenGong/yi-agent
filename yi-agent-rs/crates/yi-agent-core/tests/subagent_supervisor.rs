@@ -8,8 +8,8 @@ use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
-use yi_agent_core::subagent::task::{PermissionRequestId, RootSessionId, TaskDepth};
-use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerHandle, WorkerStart};
+use yi_agent_core::subagent::task::{PermissionRequestId, RootSessionId, TaskDepth, TaskState};
+use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{ContentBlock, ToolRegistry};
 
 #[test]
@@ -60,6 +60,17 @@ impl AgentWorkerFactory for ImmediateWorkerFactory {
     }
 }
 
+struct FailingWorkerFactory;
+
+impl AgentWorkerFactory for FailingWorkerFactory {
+    fn start(
+        &self,
+        _request: WorkerStart,
+    ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async { Err(WorkerError::Startup("provider bootstrap failed".into())) })
+    }
+}
+
 #[tokio::test]
 async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -73,6 +84,25 @@ async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let cancellation = supervisor.worker_cancellation(&child).unwrap();
     supervisor.cancel_worker(&child).unwrap();
     assert!(cancellation.is_cancelled());
+}
+
+#[tokio::test]
+async fn worker_startup_failure_is_recorded_after_admission_without_a_handle() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+
+    assert!(
+        supervisor
+            .start_worker(&FailingWorkerFactory, &child)
+            .await
+            .is_err()
+    );
+
+    assert!(!supervisor.has_worker(&child));
+    assert!(matches!(
+        supervisor.task(&child).unwrap().state(),
+        TaskState::Failed(_)
+    ));
 }
 
 #[tokio::test]

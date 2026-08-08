@@ -108,6 +108,9 @@ impl AgentSupervisor {
         factory: &dyn AgentWorkerFactory,
         task_id: &TaskId,
     ) -> Result<(), String> {
+        if self.workers.contains_key(task_id) {
+            return Err("task already owns a worker".into());
+        }
         let task = self
             .tasks
             .get(task_id)
@@ -117,11 +120,16 @@ impl AgentSupervisor {
             task.active_attempt_id().clone(),
             task.root_session_id.clone(),
         );
-        let handle = factory
-            .start(start)
-            .await
-            .map_err(|error| error.to_string())?;
+        // Admission is visible before the application factory can create any
+        // side effects. A factory failure is reduced to a terminal task state.
         self.start_task(task_id)?;
+        let handle = match factory.start(start).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.fail_task(task_id, error.to_string())?;
+                return Err(error.to_string());
+            }
+        };
         self.workers.insert(task_id.clone(), handle);
         Ok(())
     }
