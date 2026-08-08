@@ -1100,8 +1100,18 @@ fn execute_slash_command(
             history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
-        SlashCommand::Agent
-        | SlashCommand::Message
+        SlashCommand::Agent => {
+            let label = match args.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+                Some(task_id) => match daemon_agent_detail(task_id) {
+                    Ok(detail) => detail,
+                    Err(error) => format!("无法读取 agent 详情: {error}"),
+                },
+                None => "用法: /agent <task-id>".into(),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Message
         | SlashCommand::Pause
         | SlashCommand::Resume
         | SlashCommand::Cancel
@@ -1132,6 +1142,36 @@ fn daemon_agents_summary() -> Result<String, String> {
         .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
         .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
     daemon_agents_summary_at(&runtime_dir.join("runtime.sock"))
+}
+
+fn daemon_agent_detail(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_agent_detail_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_agent_detail_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::InspectTask {
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let yi_agent_store::ipc::IpcResponse::TaskDetail(detail) = response else {
+        return Err("daemon 返回了非任务详情响应".into());
+    };
+    Ok(format!(
+        "Agent {}\nsession: {}\nparent: {}\ndepth: {}\nstate: {}\ndelivery: {}",
+        detail.task_id,
+        detail.session_id,
+        detail.parent_task_id.as_deref().unwrap_or("(root)"),
+        detail.depth,
+        detail.state,
+        detail.delivery_json,
+    ))
 }
 
 fn daemon_agents_summary_at(socket: &std::path::Path) -> Result<String, String> {
@@ -1478,6 +1518,30 @@ mod tests {
 
         assert!(summary.contains(&task.to_string()));
         assert!(summary.contains("queued"));
+    }
+
+    #[test]
+    fn agent_detail_reads_a_daemon_task_for_user_inspection() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(detail.contains(&root_task_id));
+        assert!(detail.contains("state: queued"));
+        assert!(detail.contains("depth: 0"));
     }
 
     #[test]
