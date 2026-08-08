@@ -71,3 +71,24 @@ async fn coordinator_persists_worker_failure_reported_by_the_factory() {
 
     assert_eq!(coordinator.task_state(&root).unwrap(), "failed");
 }
+
+#[tokio::test]
+async fn global_resident_capacity_leaves_excess_child_queued() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let mut children = Vec::new();
+    for _ in 0..17 {
+        let session = coordinator.create_session().unwrap();
+        let root = coordinator.root_task_id(&session).unwrap();
+        let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        children.push((session, child));
+    }
+
+    for (session, child) in children.iter().take(16) {
+        coordinator.start_worker(session, child).await.unwrap();
+    }
+    let (session, child) = &children[16];
+    assert!(coordinator.start_worker(session, child).await.is_err());
+    assert_eq!(coordinator.task_state(child).unwrap(), "queued");
+}

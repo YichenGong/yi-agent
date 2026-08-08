@@ -1,11 +1,12 @@
 //! Process-local ownership of subagent supervisors and application workers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+use yi_agent_core::subagent::scheduler::ResourceCoordinator;
 use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError};
 use yi_agent_core::subagent::task::{RootSessionId, TaskId};
 use yi_agent_core::subagent::worker::AgentWorkerFactory;
@@ -22,6 +23,8 @@ pub enum RuntimeCoordinatorError {
     Supervisor(String),
     #[error(transparent)]
     Spawn(#[from] SpawnError),
+    #[error("global resident subagent capacity is exhausted")]
+    ResidentCapacityExhausted,
 }
 
 /// Owns all supervisor instances and their worker handles for one daemon.
@@ -32,6 +35,7 @@ pub struct RuntimeCoordinator {
     repository: Mutex<RuntimeRepository>,
     factory: Arc<dyn AgentWorkerFactory>,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
+    resident_tasks: Mutex<HashSet<TaskId>>,
 }
 
 impl RuntimeCoordinator {
@@ -43,6 +47,7 @@ impl RuntimeCoordinator {
             repository: Mutex::new(RuntimeRepository::open(database_path)?),
             factory,
             supervisors: Mutex::new(HashMap::new()),
+            resident_tasks: Mutex::new(HashSet::new()),
         })
     }
 
@@ -92,10 +97,37 @@ impl RuntimeCoordinator {
     ) -> Result<(), RuntimeCoordinatorError> {
         let supervisor = self.supervisor(session)?;
         let mut supervisor = supervisor.lock().await;
+        let is_subagent = !matches!(
+            supervisor
+                .task(task)
+                .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
+                .depth,
+            yi_agent_core::TaskDepth::Root
+        );
+        if is_subagent {
+            let mut residents = self
+                .resident_tasks
+                .lock()
+                .expect("runtime resident task mutex poisoned");
+            if residents.len()
+                >= usize::from(ResourceCoordinator::DEFAULT_GLOBAL_RESIDENT_SUBAGENTS)
+            {
+                return Err(RuntimeCoordinatorError::ResidentCapacityExhausted);
+            }
+            residents.insert(task.clone());
+        }
         supervisor
             .start_worker(self.factory.as_ref(), task)
             .await
-            .map_err(RuntimeCoordinatorError::Supervisor)?;
+            .map_err(|error| {
+                if is_subagent {
+                    self.resident_tasks
+                        .lock()
+                        .expect("runtime resident task mutex poisoned")
+                        .remove(task);
+                }
+                RuntimeCoordinatorError::Supervisor(error)
+            })?;
         if let Err(error) = self
             .repository
             .lock()
@@ -103,6 +135,12 @@ impl RuntimeCoordinator {
             .transition_task(task, "running", RuntimeEvent::TaskStarted)
         {
             let _ = supervisor.cancel_task_tree(task, false);
+            if is_subagent {
+                self.resident_tasks
+                    .lock()
+                    .expect("runtime resident task mutex poisoned")
+                    .remove(task);
+            }
             return Err(error.into());
         }
         Ok(())
@@ -125,6 +163,10 @@ impl RuntimeCoordinator {
             .expect("runtime repository mutex poisoned");
         for task in cancelled {
             repository.transition_task(&task, "cancelled", RuntimeEvent::TaskCancelled)?;
+            self.resident_tasks
+                .lock()
+                .expect("runtime resident task mutex poisoned")
+                .remove(&task);
         }
         Ok(())
     }
@@ -166,6 +208,10 @@ impl RuntimeCoordinator {
             .expect("runtime repository mutex poisoned");
         for (task_id, state, event) in updates {
             repository.transition_task(&task_id, state, event)?;
+            self.resident_tasks
+                .lock()
+                .expect("runtime resident task mutex poisoned")
+                .remove(&task_id);
         }
         Ok(())
     }

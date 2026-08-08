@@ -72,7 +72,10 @@ pub struct ResourceCoordinator {
 impl Default for ResourceCoordinator {
     fn default() -> Self {
         let mut capacities = HashMap::new();
-        capacities.insert("resident:global".into(), 16);
+        capacities.insert(
+            "resident:global".into(),
+            ResourceCoordinator::DEFAULT_GLOBAL_RESIDENT_SUBAGENTS,
+        );
         capacities.insert("coding:global".into(), 6);
         capacities.insert("build:host".into(), 2);
         Self {
@@ -86,6 +89,7 @@ impl Default for ResourceCoordinator {
 }
 
 impl ResourceCoordinator {
+    pub const DEFAULT_GLOBAL_RESIDENT_SUBAGENTS: u16 = 16;
     pub const DEFAULT_LLM_PER_PROVIDER_KEY: u16 = 8;
     pub const RESERVED_COORDINATION_LLM_PERMITS: u16 = 1;
 
