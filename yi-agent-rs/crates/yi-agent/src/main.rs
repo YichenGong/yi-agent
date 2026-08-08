@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
 
-use crate::config::{Cli, Command};
+use crate::config::{Cli, Command, DaemonAction};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -39,8 +39,35 @@ fn main() -> Result<()> {
             let prompt = prompt.clone();
             run_headless(cli, prompt, json, stdin, naked)
         }
+        Some(Command::Daemon { action }) => control_daemon(action),
         None => run_agent(cli),
     }
+}
+
+fn control_daemon(action: DaemonAction) -> Result<()> {
+    let runtime = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+        .join(".yi-agent/runtime/runtime.sock");
+    let request = match action {
+        DaemonAction::Status => yi_agent_store::ipc::IpcRequest::Status,
+        DaemonAction::Stop => yi_agent_store::ipc::IpcRequest::Stop,
+    };
+    let response = yi_agent_store::ipc::send_request(&runtime, request)
+        .map_err(|error| anyhow::anyhow!("runtime daemon is unavailable: {error}"))?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::Status {
+            high_water_event_id,
+        } => println!("daemon running (event high-water: {high_water_event_id})"),
+        yi_agent_store::ipc::IpcResponse::Stopping => println!("daemon stopping"),
+        yi_agent_store::ipc::IpcResponse::UnsupportedProtocol { .. } => {
+            anyhow::bail!("runtime daemon protocol is incompatible")
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            anyhow::bail!("runtime daemon rejected request: {code}")
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+    Ok(())
 }
 
 fn run_agent(cli: Cli) -> Result<()> {

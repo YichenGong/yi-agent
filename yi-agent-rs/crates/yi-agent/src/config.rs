@@ -128,6 +128,19 @@ pub enum Command {
         #[arg(long, default_value = "7292")]
         port: u16,
     },
+    /// Inspect or stop the manually started local subagent runtime daemon.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    /// Report the daemon event high-water mark.
+    Status,
+    /// Request an orderly daemon stop.
+    Stop,
 }
 
 /// 解析 .env 文件路径：优先 workdir CLI 参数，否则 YI_AGENT_WORKDIR 环境变量，否则当前目录。
@@ -1114,6 +1127,18 @@ mod tests {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn cli_parses_daemon_status_and_stop() {
+        use clap::Parser;
+        for (argument, expected) in [
+            ("status", DaemonAction::Status),
+            ("stop", DaemonAction::Stop),
+        ] {
+            let cli = Cli::parse_from(["yi-agent", "daemon", argument]);
+            assert!(matches!(cli.command, Some(Command::Daemon { action }) if action == expected));
+        }
     }
 
     #[test]
