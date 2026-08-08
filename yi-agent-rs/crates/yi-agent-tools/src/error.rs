@@ -21,6 +21,9 @@ pub enum ToolsError {
     #[error("command blocked by safety filter: {0}")]
     CommandBlocked(String),
 
+    #[error("sandbox unavailable: {0}")]
+    SandboxUnavailable(String),
+
     #[error("command timeout after {0}s")]
     Timeout(u64),
 

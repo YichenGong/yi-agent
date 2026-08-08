@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 
 /// 运行时配置，由 CLI 参数和环境变量合并而来。
 #[derive(Debug, Clone)]
@@ -17,6 +18,8 @@ pub struct Config {
     pub compact_threshold: u32, // computed: context_length * ratio / 100
     pub compact_keep_turns: u32,
     pub yolo: bool,
+    pub sandbox: yi_agent_tools::SandboxMode,
+    pub sandbox_writable_roots: Vec<PathBuf>,
     pub skills_catalog_budget: usize,
     /// True if user explicitly set the budget via CLI flag or env var (skips interactive prompt).
     pub skills_catalog_budget_explicit: bool,
@@ -72,6 +75,14 @@ pub struct Cli {
     /// Skip permission prompts (except blacklisted commands)
     #[arg(long)]
     pub yolo: bool,
+
+    /// Process sandbox: read-only, workspace-write, or danger-full-access.
+    #[arg(long, value_enum)]
+    pub sandbox: Option<yi_agent_tools::SandboxMode>,
+
+    /// Additional directory a workspace-write sandbox may modify (repeatable).
+    #[arg(long = "sandbox-writable-root")]
+    pub sandbox_writable_roots: Vec<PathBuf>,
 
     /// Alias for --yolo
     #[arg(long = "dangerously-skip-permissions")]
@@ -313,6 +324,20 @@ pub fn load(cli: &Cli) -> Result<Config> {
             .map(|v| v == "true")
             .unwrap_or(false);
 
+    let sandbox = match cli.sandbox {
+        Some(mode) => mode,
+        None => match std::env::var("YI_AGENT_SANDBOX") {
+            Ok(value) => yi_agent_tools::SandboxMode::from_str(&value, true).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid YI_AGENT_SANDBOX: expected read-only, workspace-write, or danger-full-access"
+                )
+            })?,
+            Err(_) => yi_agent_tools::SandboxMode::default(),
+        },
+    };
+
+    let sandbox_writable_roots = cli.sandbox_writable_roots.clone();
+
     let skills_catalog_budget_explicit = cli.skills_catalog_budget.is_some()
         || std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
             .ok()
@@ -338,6 +363,8 @@ pub fn load(cli: &Cli) -> Result<Config> {
         compact_threshold,
         compact_keep_turns,
         yolo,
+        sandbox,
+        sandbox_writable_roots,
         skills_catalog_budget,
         skills_catalog_budget_explicit,
     })
@@ -405,6 +432,7 @@ mod tests {
             "YI_AGENT_MODEL",
             "YI_AGENT_WORKDIR",
             "YI_AGENT_YOLO",
+            "YI_AGENT_SANDBOX",
             "YI_AGENT_MAX_TURNS",
             "YI_AGENT_SYSTEM_PROMPT",
             "YI_AGENT_MODEL_CONTEXT_LENGTH",
@@ -419,6 +447,7 @@ mod tests {
             "YI_AGENT_MODEL",
             "YI_AGENT_WORKDIR",
             "YI_AGENT_YOLO",
+            "YI_AGENT_SANDBOX",
             "YI_AGENT_MAX_TURNS",
             "YI_AGENT_SYSTEM_PROMPT",
             "YI_AGENT_MODEL_CONTEXT_LENGTH",
@@ -493,6 +522,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -521,6 +552,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -552,6 +585,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -578,6 +613,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -602,6 +639,8 @@ mod tests {
             compact_ratio: Some(50),
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -625,6 +664,8 @@ mod tests {
             compact_ratio: Some(80),
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -648,6 +689,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -675,6 +718,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -702,6 +747,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -739,6 +786,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -764,6 +813,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -792,6 +843,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -945,6 +998,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -978,6 +1033,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -1094,6 +1151,27 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_sandbox_mode_and_writable_roots() {
+        use clap::Parser;
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "--sandbox",
+            "read-only",
+            "--sandbox-writable-root",
+            "/tmp/one",
+            "--sandbox-writable-root",
+            "/tmp/two",
+            "--api-key",
+            "test",
+        ]);
+        assert_eq!(cli.sandbox, Some(yi_agent_tools::SandboxMode::ReadOnly));
+        assert_eq!(
+            cli.sandbox_writable_roots,
+            vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+        );
+    }
+
+    #[test]
     fn cli_parses_dangerously_skip_permissions_flag() {
         use clap::Parser;
         let cli = Cli::parse_from([
@@ -1121,6 +1199,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: true,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
@@ -1144,6 +1224,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: true,
             skills_catalog_budget: None,
             debug: false,
@@ -1167,6 +1249,8 @@ mod tests {
             compact_ratio: None,
             compact_keep_turns: None,
             yolo: false,
+            sandbox: None,
+            sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,

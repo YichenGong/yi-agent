@@ -13,11 +13,12 @@ yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统
 - 实现 Skill 工具（加载并执行 yi-agent-skills 发现的 skill）
 - 路径安全（单一 root 限制，canonicalize + starts_with）
 - 工具注册 API（`register_builtin_tools`）
+- Shell sandbox（Codex-compatible sandbox mode names + platform enforcement）
 
 **不做什么：**
 - 不做 MCP 协议工具（由 yi-agent-mcp 负责）
 - 不做插件系统（基于 ToolSource::Plugin，后续）
-- 不做 sandbox（跨平台方案，单独一轮设计）
+- 不实现 Windows restricted-token backend（不支持的平台会拒绝受限命令，不会静默裸跑）
 
 ## Features
 
@@ -26,4 +27,4 @@ yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统
 - [x] 工具注册 API — `crates/yi-agent-tools/src/lib.rs::register_builtin_tools()` 注册全部内置工具 — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
 - [x] Web 工具：WebFetch + WebSearch — `crates/yi-agent-tools/src/web/` 目录，WebSearch 在有 `BOCHA_API_KEY` 时注册 — [设计](../plans/2026-07-19-yi-agent-web-tools-design.md)
 - [x] Skill 工具：SkillTool — `crates/yi-agent-tools/src/skill_tool.rs` 实现 `Tool` trait — [设计](../plans/2026-07-25-skills-design.md)
-- [ ] Sandbox（跨平台进程隔离）— 无 sandbox 模块
+- [x] Sandbox（进程隔离）— `crates/yi-agent-tools/src/sandbox.rs` 实现 `read-only` / `workspace-write` / `danger-full-access`；macOS 通过 Seatbelt、Linux 通过 Bubblewrap 强制文件写入与网络策略；运行 `cargo test -p yi-agent-tools workspace_sandbox read_only_sandbox` 验证受限模式

@@ -3548,6 +3548,7 @@ name = "yi-agent-tools"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "clap",
  "futures",
  "glob",
  "html2md",

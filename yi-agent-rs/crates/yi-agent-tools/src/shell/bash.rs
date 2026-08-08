@@ -11,6 +11,7 @@ use yi_agent_core::{OutputStream, Tool, ToolEvent, ToolMetadata, ToolResult, Too
 
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
+use crate::sandbox::{SandboxMode, SandboxPolicy};
 use crate::shell::blocklist::is_blocked;
 
 const DEFAULT_TIMEOUT: u64 = 120;
@@ -18,11 +19,17 @@ const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100KB
 
 pub struct BashTool {
     ctx: Arc<ToolsContext>,
+    sandbox: SandboxPolicy,
 }
 
 impl BashTool {
     pub fn new(ctx: Arc<ToolsContext>) -> Self {
-        Self { ctx }
+        let sandbox = SandboxPolicy::new(SandboxMode::DangerFullAccess, ctx.root(), Vec::new());
+        Self { ctx, sandbox }
+    }
+
+    pub fn with_sandbox(ctx: Arc<ToolsContext>, sandbox: SandboxPolicy) -> Self {
+        Self { ctx, sandbox }
     }
 }
 
@@ -117,9 +124,16 @@ impl Tool for BashTool {
 
         let cwd = self.ctx.cwd();
 
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(&args.command)
+        let (program, command_args) = match self.sandbox.command(&args.command, &cwd) {
+            Ok(command) => command,
+            Err(error) => {
+                let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
+                return error.into();
+            }
+        };
+
+        let mut child = match Command::new(program)
+            .args(command_args)
             .current_dir(&cwd)
             // Dropping the agent's tool future must not leave the shell running.
             .kill_on_drop(true)
@@ -543,6 +557,47 @@ mod tests {
         } else {
             panic!("expected text block");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn workspace_sandbox_allows_workspace_writes_and_denies_other_writes() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ctx = Arc::new(ToolsContext::new(workspace.path().to_path_buf()));
+        let sandbox = SandboxPolicy::new(SandboxMode::WorkspaceWrite, workspace.path(), vec![]);
+        let tool = BashTool::with_sandbox(ctx, sandbox);
+
+        let inside = tool
+            .call(serde_json::json!({"command": "touch allowed.txt"}))
+            .await;
+        assert!(!inside.is_error);
+        assert!(workspace.path().join("allowed.txt").exists());
+
+        let denied_path = outside.path().join("denied.txt");
+        let denied = tool
+            .call(serde_json::json!({"command": format!("touch {}", denied_path.display())}))
+            .await;
+        assert!(!denied.is_error);
+        assert!(
+            !denied_path.exists(),
+            "sandbox must deny writes outside workspace"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn read_only_sandbox_denies_workspace_writes() {
+        let workspace = TempDir::new().unwrap();
+        let ctx = Arc::new(ToolsContext::new(workspace.path().to_path_buf()));
+        let sandbox = SandboxPolicy::new(SandboxMode::ReadOnly, workspace.path(), vec![]);
+        let tool = BashTool::with_sandbox(ctx, sandbox);
+
+        let result = tool
+            .call(serde_json::json!({"command": "touch denied.txt"}))
+            .await;
+        assert!(!result.is_error);
+        assert!(!workspace.path().join("denied.txt").exists());
     }
 
     #[tokio::test]
