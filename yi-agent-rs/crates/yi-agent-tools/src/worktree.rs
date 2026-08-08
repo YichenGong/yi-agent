@@ -13,6 +13,8 @@ pub enum WorktreeError {
     DirtyChild { path: PathBuf },
     #[error("parent base commit is not available: {base}")]
     UnknownBase { base: String },
+    #[error("recorded base {base} is not the current parent HEAD {head}")]
+    BaseIsNotParentHead { base: String, head: String },
     #[error("child branch must merge into recorded parent {expected}, not {actual}")]
     WrongParentBranch { expected: String, actual: String },
     #[error("child branch {branch} has not been merged into {parent}")]
@@ -32,6 +34,13 @@ pub struct ChildWorktree {
     pub base_commit: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedDelivery {
+    pub branch: String,
+    pub base_commit: String,
+    pub head_commit: String,
+}
+
 impl WorktreeService {
     pub fn new() -> Self {
         Self
@@ -49,18 +58,7 @@ impl WorktreeService {
                 path: parent_worktree.to_path_buf(),
             });
         }
-        let check = Command::new("git")
-            .args(["cat-file", "-e", &format!("{base}^{{commit}}")])
-            .current_dir(parent_worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !check.status.success() {
-            return Err(WorktreeError::UnknownBase {
-                base: base.to_owned(),
-            });
-        }
+        self.resolve_parent_base(parent_worktree, base)?;
         Ok(())
     }
 
@@ -77,11 +75,12 @@ impl WorktreeService {
             });
         }
         self.validate_parent_base(parent_worktree, base)?;
+        let base_commit = self.resolve_parent_base(parent_worktree, base)?;
         let parent_branch = current_branch(parent_worktree)?;
         let output = Command::new("git")
             .args(["worktree", "add"])
             .arg(child_path)
-            .args(["-b", branch, base])
+            .args(["-b", branch, &base_commit])
             .current_dir(parent_worktree)
             .output()
             .map_err(|error| WorktreeError::Git {
@@ -96,7 +95,42 @@ impl WorktreeService {
             path: child_path.to_path_buf(),
             branch: branch.to_owned(),
             parent_branch,
-            base_commit: base.to_owned(),
+            base_commit,
+        })
+    }
+
+    /// Capture the exact clean commit that a parent may review and integrate.
+    pub fn inspect_delivery(
+        &self,
+        child: &ChildWorktree,
+    ) -> Result<InspectedDelivery, WorktreeError> {
+        let status = git(&child.path, &["status", "--porcelain"])?;
+        if !status.trim().is_empty() {
+            return Err(WorktreeError::DirtyChild {
+                path: child.path.clone(),
+            });
+        }
+        let branch = current_branch(&child.path)?;
+        if branch != child.branch {
+            return Err(WorktreeError::WrongParentBranch {
+                expected: child.branch.clone(),
+                actual: branch,
+            });
+        }
+        let head_commit = git(&child.path, &["rev-parse", "HEAD"])?.trim().to_owned();
+        let merge_base = git(
+            &child.path,
+            &["merge-base", &child.base_commit, &head_commit],
+        )?;
+        if merge_base.trim() != child.base_commit || head_commit == child.base_commit {
+            return Err(WorktreeError::UnknownBase {
+                base: child.base_commit.clone(),
+            });
+        }
+        Ok(InspectedDelivery {
+            branch: child.branch.clone(),
+            base_commit: child.base_commit.clone(),
+            head_commit,
         })
     }
 
@@ -107,6 +141,18 @@ impl WorktreeService {
         child: &ChildWorktree,
         message: &str,
     ) -> Result<(), WorktreeError> {
+        let delivery = self.inspect_delivery(child)?;
+        self.merge_inspected_delivery(parent_worktree, child, &delivery, message)
+    }
+
+    /// Merge only a previously inspected commit, never the moving child branch tip.
+    pub fn merge_inspected_delivery(
+        &self,
+        parent_worktree: &Path,
+        child: &ChildWorktree,
+        delivery: &InspectedDelivery,
+        message: &str,
+    ) -> Result<(), WorktreeError> {
         let parent_branch = current_branch(parent_worktree)?;
         if parent_branch != child.parent_branch {
             return Err(WorktreeError::WrongParentBranch {
@@ -114,9 +160,14 @@ impl WorktreeService {
                 actual: parent_branch,
             });
         }
+        if delivery.branch != child.branch || delivery.base_commit != child.base_commit {
+            return Err(WorktreeError::UnknownBase {
+                base: delivery.base_commit.clone(),
+            });
+        }
         let merge_base = git(
             parent_worktree,
-            &["merge-base", &child.branch, &parent_branch],
+            &["merge-base", &delivery.head_commit, &parent_branch],
         )?;
         if merge_base.trim() != child.base_commit {
             return Err(WorktreeError::UnknownBase {
@@ -124,7 +175,7 @@ impl WorktreeService {
             });
         }
         let output = Command::new("git")
-            .args(["merge", "--no-ff", &child.branch, "-m", message])
+            .args(["merge", "--no-ff", &delivery.head_commit, "-m", message])
             .current_dir(parent_worktree)
             .output()
             .map_err(|error| WorktreeError::Git {
@@ -192,6 +243,32 @@ impl WorktreeService {
             });
         }
         Ok(())
+    }
+
+    fn resolve_parent_base(
+        &self,
+        parent_worktree: &Path,
+        base: &str,
+    ) -> Result<String, WorktreeError> {
+        let resolved_base = git(
+            parent_worktree,
+            &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        )
+        .map_err(|_| WorktreeError::UnknownBase {
+            base: base.to_owned(),
+        })?
+        .trim()
+        .to_owned();
+        let parent_head = git(parent_worktree, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        if resolved_base != parent_head {
+            return Err(WorktreeError::BaseIsNotParentHead {
+                base: resolved_base,
+                head: parent_head,
+            });
+        }
+        Ok(parent_head)
     }
 }
 

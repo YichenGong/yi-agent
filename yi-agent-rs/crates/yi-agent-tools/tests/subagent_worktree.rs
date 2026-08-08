@@ -71,6 +71,34 @@ fn child_worktree_is_created_from_the_recorded_parent_commit() {
 }
 
 #[test]
+fn child_base_must_be_the_parent_current_head_and_is_recorded_as_a_sha() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    let stale_commit = git(repo.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(repo.path().join("README.md"), "new parent head\n").unwrap();
+    git(repo.path(), &["add", "README.md"]);
+    git(repo.path(), &["commit", "-m", "new parent head"]);
+
+    assert!(matches!(
+        service.validate_parent_base(repo.path(), &stale_commit),
+        Err(WorktreeError::BaseIsNotParentHead { .. })
+    ));
+
+    let child_root = TempDir::new().unwrap();
+    let child = service
+        .create_child(
+            repo.path(),
+            "HEAD",
+            "child/resolved-base",
+            &child_root.path().join("child"),
+        )
+        .unwrap();
+    assert_ne!(child.base_commit, "HEAD");
+    assert_eq!(child.base_commit, git(repo.path(), &["rev-parse", "HEAD"]));
+    assert_ne!(head, child.base_commit);
+}
+
+#[test]
 fn dirty_child_worktree_is_not_removed() {
     let (repo, head) = repository();
     let child_root = TempDir::new().unwrap();
@@ -141,4 +169,40 @@ fn clean_accepted_child_can_be_removed_after_direct_parent_merge() {
 
     service.remove_accepted_clean(repo.path(), &child).unwrap();
     assert!(!child_path.exists());
+}
+
+#[test]
+fn inspected_delivery_pins_the_exact_reviewed_head_for_merge() {
+    let (repo, head) = repository();
+    let child_root = TempDir::new().unwrap();
+    let child_path = child_root.path().join("pinned-head-child");
+    let service = WorktreeService::new();
+    let child = service
+        .create_child(repo.path(), &head, "child/pinned-head", &child_path)
+        .unwrap();
+    git(&child_path, &["config", "user.email", "test@example.com"]);
+    git(&child_path, &["config", "user.name", "Test"]);
+
+    std::fs::write(child_path.join("reviewed.txt"), "reviewed\n").unwrap();
+    git(&child_path, &["add", "reviewed.txt"]);
+    git(&child_path, &["commit", "-m", "reviewed delivery"]);
+    let delivery = service.inspect_delivery(&child).unwrap();
+
+    std::fs::write(child_path.join("unreviewed.txt"), "unreviewed\n").unwrap();
+    git(&child_path, &["add", "unreviewed.txt"]);
+    git(&child_path, &["commit", "-m", "unreviewed followup"]);
+
+    service
+        .merge_inspected_delivery(repo.path(), &child, &delivery, "accept reviewed delivery")
+        .unwrap();
+    assert_eq!(
+        git(repo.path(), &["rev-parse", "HEAD^2"]),
+        delivery.head_commit
+    );
+    assert_eq!(git(repo.path(), &["show", "HEAD:reviewed.txt"]), "reviewed");
+    assert!(
+        !git(repo.path(), &["ls-tree", "--name-only", "HEAD"])
+            .lines()
+            .any(|path| path == "unreviewed.txt")
+    );
 }
