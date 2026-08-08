@@ -68,6 +68,16 @@ pub struct PersistedTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTaskDetail {
+    pub task_id: String,
+    pub session_id: String,
+    pub parent_task_id: Option<String>,
+    pub depth: u8,
+    pub state: String,
+    pub delivery_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSubscriptionSnapshot {
     pub high_water_event_id: i64,
     pub tasks: Vec<PersistedTask>,
@@ -122,6 +132,30 @@ impl RuntimeRepository {
             "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
              VALUES (?1, ?2, NULL, 0, ?3, 1, '', '{}')",
             params![task.to_string(), root.to_string(), state],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn create_child_task(
+        &mut self,
+        task: &TaskId,
+        root: &RootSessionId,
+        parent: &TaskId,
+        depth: u8,
+        state: &str,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, '', '{}')",
+            params![
+                task.to_string(),
+                root.to_string(),
+                parent.to_string(),
+                depth,
+                state,
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -297,6 +331,31 @@ impl RuntimeRepository {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn task_detail(&self, task: &TaskId) -> Result<PersistedTaskDetail, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT id, root_session_id, parent_id, depth, state_json, delivery_json
+                 FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| {
+                    Ok(PersistedTaskDetail {
+                        task_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        parent_task_id: row.get(2)?,
+                        depth: row.get(3)?,
+                        state: row.get(4)?,
+                        delivery_json: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => RepositoryError::TaskNotFound {
+                    task: task.to_string(),
+                },
+                error => RepositoryError::Sql(error),
+            })
     }
 
     /// Read task snapshots, a high-water mark, and replay in one SQLite read transaction.

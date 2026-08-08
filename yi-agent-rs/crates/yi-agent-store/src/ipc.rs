@@ -75,6 +75,9 @@ pub enum IpcRequest {
         caller_task_id: String,
         mode: String,
     },
+    InspectTask {
+        task_id: String,
+    },
     SubscribeEvents {
         after_event_id: i64,
     },
@@ -100,6 +103,7 @@ pub enum IpcResponse {
         status: String,
         children: Vec<String>,
     },
+    TaskDetail(IpcTaskDetail),
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
     ResyncRequired,
@@ -123,6 +127,16 @@ pub struct SubscriptionSnapshot {
 pub struct IpcTask {
     pub task_id: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcTaskDetail {
+    pub task_id: String,
+    pub session_id: String,
+    pub parent_task_id: Option<String>,
+    pub depth: u8,
+    pub state: String,
+    pub delivery_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,6 +648,18 @@ fn respond(
                 ),
             };
             Ok(IpcResponse::WaitCompleted { status, children })
+        }
+        IpcRequest::InspectTask { task_id } => {
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let detail = repository.task_detail(&task_id)?;
+            Ok(IpcResponse::TaskDetail(IpcTaskDetail {
+                task_id: detail.task_id,
+                session_id: detail.session_id,
+                parent_task_id: detail.parent_task_id,
+                depth: detail.depth,
+                state: detail.state,
+                delivery_json: detail.delivery_json,
+            }))
         }
         IpcRequest::SubscribeEvents { after_event_id } => {
             let snapshot = repository.subscription_snapshot(after_event_id)?;

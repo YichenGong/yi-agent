@@ -92,14 +92,24 @@ impl RuntimeCoordinator {
         objective: String,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let supervisor = self.supervisor(session)?;
-        let child = supervisor
-            .lock()
-            .await
-            .spawn_with_objective(parent.clone(), objective)?;
+        let (child, depth) = {
+            let mut supervisor = supervisor.lock().await;
+            let child = supervisor.spawn_with_objective(parent.clone(), objective)?;
+            let depth = match supervisor
+                .task(&child)
+                .expect("newly spawned task exists")
+                .depth
+            {
+                yi_agent_core::TaskDepth::Root => 0,
+                yi_agent_core::TaskDepth::Child => 1,
+                yi_agent_core::TaskDepth::Leaf => 2,
+            };
+            (child, depth)
+        };
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .create_task(&child, session, "queued")?;
+            .create_child_task(&child, session, parent, depth, "queued")?;
         Ok(child)
     }
 

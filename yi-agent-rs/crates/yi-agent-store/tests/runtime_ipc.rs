@@ -620,3 +620,46 @@ fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
             .any(|task| task.task_id == task_id && task.state == "running")
     );
 }
+
+#[test]
+fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            objective: "Inspect the target".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child");
+    };
+
+    let IpcResponse::TaskDetail(detail) = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectTask {
+            task_id: task_id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected task detail");
+    };
+    assert_eq!(detail.task_id, task_id);
+    assert_eq!(detail.session_id, session_id);
+    assert_eq!(
+        detail.parent_task_id.as_deref(),
+        Some(root_task_id.as_str())
+    );
+    assert_eq!(detail.depth, 1);
+    assert_eq!(detail.state, "queued");
+}
