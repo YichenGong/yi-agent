@@ -112,3 +112,243 @@ Worker output is converted to events; a worker cannot mutate task state directly
 - Contract amendment provenance and material-scope rejection.
 - Progress coalescing, terminal-message idempotency, and parent wake behavior.
 - `wait(all)`/`wait(any)` interruption by permission or blocking messages.
+
+## Canonical Rust Types
+
+The initial implementation uses opaque UUID-backed newtypes rendered as strings
+at the API boundary. Do not use a branch name, tool-use ID, or provider request
+ID as a task identity.
+
+```rust
+pub struct TaskId(pub Uuid);
+pub struct AttemptId(pub Uuid);
+pub struct RootSessionId(pub Uuid);
+pub struct MessageId(pub Uuid);
+pub struct ContractVersion(pub u32);
+
+pub enum TaskDepth { Root, Child, Leaf }
+
+pub enum TaskState {
+    Queued,
+    Running,
+    WaitingForResource(ResourceWait),
+    WaitingForPermission(PermissionRequestId),
+    WaitingForChildren(WaitSelector),
+    Paused(PauseReason),
+    AwaitingParentReview(DeliveryId),
+    Completed,
+    CompletedNoChanges,
+    Blocked(BlockReason),
+    Stalled(WatchdogEvidence),
+    TimedOut(TimeoutKind),
+    BudgetExhausted(BudgetKind),
+    Failed(TaskFailure),
+    Cancelled(CancelReason),
+    RecoveryRequired(RecoveryEvidence),
+}
+
+pub enum DeliveryState {
+    None,
+    ReadyForReview(DeliveryId),
+    Accepted { delivery: DeliveryId, integration: IntegrationId },
+    ReworkRequested { previous: DeliveryId, feedback: MessageId },
+    Rejected { delivery: DeliveryId, reason: MessageId },
+}
+```
+
+`CompletedNoChanges` is valid only for a contract whose delivery policy allows
+no-change completion. A coding task requiring a commit cannot enter it. All
+states after `AwaitingParentReview` describe task delivery, not whether a
+provider stream happened to return normally.
+
+The durable task record is intentionally split from mutable execution data:
+
+```rust
+pub struct AgentTask {
+    pub id: TaskId,
+    pub root_session_id: RootSessionId,
+    pub parent_id: Option<TaskId>,
+    pub depth: TaskDepth,
+    pub created_at: DateTime<Utc>,
+    pub current_contract: ContractVersion,
+    pub authority_id: AuthorityId,
+    pub active_attempt: AttemptId,
+    pub state: TaskState,
+    pub delivery: DeliveryState,
+    pub workspace: Option<WorkspaceLeaseId>,
+}
+
+pub struct TaskAttempt {
+    pub id: AttemptId,
+    pub task_id: TaskId,
+    pub number: u32,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub checkpoint: Option<StableCheckpoint>,
+    pub budget: EffectiveBudget,
+    pub usage: AttemptUsage,
+    pub terminal_reason: Option<TerminalReason>,
+}
+```
+
+An attempt owns a fresh cancellation token. `Agent::run()` already resets its
+token for sequential runs; the Supervisor must additionally ensure an old token
+is never reused for a retry, rework, or recovery attempt.
+
+## Event-Sourced Transition Contract
+
+Only `TaskEvent` changes `AgentTask.state`; workers, UI clients, and tools emit
+events through the Supervisor. Every accepted event creates exactly one durable
+event-journal row and one state snapshot update.
+
+```rust
+pub enum TaskEvent {
+    AdmissionGranted { permits: Vec<PermitId> },
+    ResourceUnavailable { wait: ResourceWait },
+    PermissionRequested { request: PermissionRequestId },
+    PermissionResolved { request: PermissionRequestId, decision: Decision },
+    ChildJoinRequested { selector: WaitSelector },
+    ChildJoinResolved { result: WaitResult },
+    WorkerDelivered { delivery: DeliveryReport },
+    ReviewAccepted { delivery: DeliveryId, integration: IntegrationId },
+    ReviewRework { delivery: DeliveryId, feedback: MessageId },
+    ReviewRejected { delivery: DeliveryId, reason: MessageId },
+    PauseRequested { reason: PauseReason },
+    ResumeRequested,
+    CancelRequested { reason: CancelReason, recursive: bool },
+    WatchdogExpired { evidence: WatchdogEvidence },
+    BudgetExceeded { kind: BudgetKind },
+    RuntimeInterrupted { evidence: RecoveryEvidence },
+    RetryRequested { actor: ActorId },
+}
+```
+
+Transition guards are normative:
+
+| Event | Source states | Guard | Result |
+|---|---|---|---|
+| `AdmissionGranted` | `Queued` | attempt is current; all required permits held | `Running` |
+| `ResourceUnavailable` | `Running` | no incompatible permit retained | `WaitingForResource` |
+| `PermissionRequested` | `Running` | request authority is valid | `WaitingForPermission` |
+| `PermissionResolved(allow)` | waiting permission | request ID matches active wait | `Queued` |
+| `PermissionResolved(deny)` | waiting permission | request ID matches active wait | `Blocked(PermissionDenied)` |
+| `WorkerDelivered` | `Running` | report validates against contract and workspace | `AwaitingParentReview` |
+| `ReviewAccepted` | awaiting review | actor is direct parent; integration succeeded | `Completed` |
+| `ReviewRework` | awaiting review | actor is direct parent; limit not exceeded | `Queued` with new attempt |
+| `CancelRequested` | any nonterminal state | actor has cancellation authority | `Cancelled` |
+| `RuntimeInterrupted` | running/waiting | daemon lost worker ownership | `RecoveryRequired` |
+
+`PauseRequested` records an intent while a worker is in a noninterruptible tool
+step; the state becomes `Paused` only at the next safe checkpoint. Cancellation
+is stronger: it signals the token immediately, rolls back incomplete model
+tool-use history to the last stable checkpoint, and recursively signals children
+when requested.
+
+## Contract Wire Format
+
+The draft submitted by `spawn_agent` is JSON-compatible and validated before it
+becomes `DelegationContract`:
+
+```json
+{
+  "title": "Implement task transitions",
+  "objective": "Add legal transition checks and tests.",
+  "non_goals": ["Do not modify TUI rendering."],
+  "context": [{"fact": "Root uses a two-level limit.", "source": "user-decision"}],
+  "scope": {"read_paths": ["crates/yi-agent-core/**"], "write_paths": ["crates/yi-agent-core/src/subagent/**"]},
+  "acceptance": {"commands": ["cargo test -p yi-agent-core subagent::task::tests"], "require_commit": true},
+  "delivery_policy": "immediate",
+  "budget": {"max_turns": 50, "max_wall_time_secs": 1800}
+}
+```
+
+The persisted version adds derived `task_id`, parent/root IDs, effective
+authority, effective budget, worktree/base commit, creation time, and a digest
+of the exact prompt fact packet. `context` is capped by a configured byte/token
+budget. A reference to a file/commit is preferred to copying large content.
+
+An amendment is one of `AddContext`, `NarrowScope`, `ExtendScope`,
+`ChangeAcceptance`, `ChangeBudget`, or `ChangeDeliveryPolicy`. It stores the
+parent event ID and reason. `ExtendScope` is rejected if it exceeds the parent
+authority; every amendment is presented to the worker as a new controller input
+at a safe checkpoint.
+
+## Authority Matrix
+
+| Operation | Contract authority | Additional decision |
+|---|---|---|
+| Read assigned paths | inherited read capability | none |
+| Write assigned worktree paths | worktree/path lease | none if session policy permits |
+| Run approved formatter/test | tool and resource lease | none |
+| Commit assigned branch | Git commit capability | required checks must pass |
+| Merge direct child branch | parent integration lease | direct-parent review decision |
+| Read ancestor/peer worktree | never inherited | lease-owner approval |
+| External network/secrets/privilege | never silently delegated | user-security approval |
+| Cross-project resource/configuration | never child delegated | user/coordinator approval |
+
+`DelegatedAuthority::derive_child` returns a typed error naming the attempted
+widening: `DepthExceeded`, `ToolNotDelegable`, `PathOutsideLease`,
+`BudgetOverallocated`, `DeadlineAfterParent`, or `GitOperationNotDelegable`.
+
+## Mailbox Payloads And Priority
+
+```rust
+pub enum MessageKind {
+    Progress(ProgressReport),
+    Completed(DeliveryReport),
+    Blocked(BlockReason),
+    Failed(TaskFailure),
+    PermissionRequest(PermissionRequestId),
+    ScopeChange(ScopeChangeDraft),
+    Rework(ReworkInstruction),
+    UserInstruction(UserInstruction),
+}
+
+pub enum MessagePriority { Critical, High, Normal, Background }
+```
+
+`PermissionRequest` is `Critical`; `Blocked`, `Failed`, `ScopeChange`, and
+`Completed` are `High`; `Progress` is `Normal` and is coalesced; background
+schedule notices are `Background`. Coalescing retains the newest payload and
+increments a count, so the parent can see that updates were compressed. A
+delivery message is never coalesced or dropped.
+
+## Supervisor Worker Boundary
+
+The Supervisor owns task state and worker handles. A worker receives immutable
+attempt input plus channels; it cannot receive an `&mut AgentTask`.
+
+```rust
+pub struct WorkerStart {
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub prompt: AssembledPrompt,
+    pub workdir: PathBuf,
+    pub cancellation: CancellationToken,
+}
+
+pub enum WorkerEvent {
+    Agent(AgentEvent),
+    SafeCheckpoint(StableCheckpoint),
+    Delivery(DeliveryReport),
+    Failure(TaskFailure),
+}
+```
+
+The worker forwards normal `AgentEvent` values for UI visibility, but the
+Supervisor interprets only `SafeCheckpoint`, `Delivery`, and `Failure` as task
+lifecycle input. A provider's `Done(EndTurn)` means the worker finished a model
+turn; it is not automatically a task delivery.
+
+## Core Test Matrix
+
+| Test name | Proves |
+|---|---|
+| `leaf_cannot_spawn_descendant` | depth 2 is a hard cap |
+| `retry_creates_new_attempt_without_erasing_previous` | attempt history remains auditable |
+| `cancel_wins_over_permission_resolution` | cancellation precedence |
+| `delivery_requires_validated_commit_report` | no false completed coding task |
+| `review_accept_requires_direct_parent_and_integration` | branch ownership chain |
+| `progress_messages_coalesce_without_waking_parent` | no notification storm |
+| `wait_is_interrupted_by_permission_request` | no parent/child wait deadlock |
+| `authority_derivation_is_monotonic` | children cannot escalate scope |

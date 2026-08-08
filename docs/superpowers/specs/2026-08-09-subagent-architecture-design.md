@@ -23,6 +23,14 @@ by independently deployable subsystem:
 - [Control surface](2026-08-09-subagent-control-surface-design.md): CLI, TUI,
   Slash commands, help, permission, review, and audit interaction.
 
+Implementation is likewise split by subsystem:
+
+- [Core plan](../plans/2026-08-09-subagent-core.md)
+- [Daemon plan](../plans/2026-08-09-runtime-daemon.md)
+- [Worktree plan](../plans/2026-08-09-subagent-worktree.md)
+- [Scheduling plan](../plans/2026-08-09-runtime-scheduling.md)
+- [Control-surface plan](../plans/2026-08-09-subagent-control-surface.md)
+
 ## Status And Scope
 
 This is a design specification. The current codebase has one `Agent`, one
