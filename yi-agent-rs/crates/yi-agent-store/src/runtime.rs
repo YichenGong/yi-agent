@@ -103,6 +103,28 @@ impl RuntimeCoordinator {
         Ok(child)
     }
 
+    /// Performs non-blocking scheduler admission after the task has been
+    /// durably queued. A capacity wait is represented by the existing queued
+    /// state; a real application worker starts immediately when capacity is
+    /// available.
+    pub async fn spawn_child_and_admit(
+        &self,
+        session: &RootSessionId,
+        parent: &TaskId,
+        objective: String,
+    ) -> Result<TaskId, RuntimeCoordinatorError> {
+        let child = self
+            .spawn_child_with_objective(session, parent, objective)
+            .await?;
+        if self.factory.is_available() {
+            match self.start_worker(session, &child).await {
+                Ok(()) | Err(RuntimeCoordinatorError::ResidentCapacityExhausted) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(child)
+    }
+
     pub async fn start_worker(
         &self,
         session: &RootSessionId,

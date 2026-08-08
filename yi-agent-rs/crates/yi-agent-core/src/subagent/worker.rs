@@ -155,5 +155,11 @@ pub enum WorkerError {
 /// Constructs an application-specific `Agent` worker without making core
 /// depend on the CLI, provider bootstrap, or tool registry construction.
 pub trait AgentWorkerFactory: Send + Sync {
+    /// Inspection-only daemon instances deliberately use an unavailable
+    /// factory, so they must retain queued tasks without starting them.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>>;
 }

@@ -542,7 +542,7 @@ fn respond(
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let task_id = runtime.block_on(coordinator.spawn_child_with_objective(
+            let task_id = runtime.block_on(coordinator.spawn_child_and_admit(
                 &session_id,
                 &parent_task_id,
                 objective,
@@ -678,6 +678,10 @@ where
 struct UnavailableWorkerFactory;
 
 impl AgentWorkerFactory for UnavailableWorkerFactory {
+    fn is_available(&self) -> bool {
+        false
+    }
+
     fn start(
         &self,
         _request: WorkerStart,

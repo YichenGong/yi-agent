@@ -576,3 +576,47 @@ fn daemon_starts_a_worker_through_its_injected_factory() {
     .unwrap();
     assert!(matches!(response, IpcResponse::TaskStarted));
 }
+
+#[test]
+fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(RecordingWorkerFactory),
+    )
+    .unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id,
+            parent_task_id: root_task_id,
+            objective: "Inspect child behavior".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child task");
+    };
+
+    let IpcResponse::Subscription(snapshot) = send_request(
+        daemon.socket_path(),
+        IpcRequest::SubscribeEvents { after_event_id: 0 },
+    )
+    .unwrap() else {
+        panic!("expected subscription snapshot");
+    };
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.task_id == task_id && task.state == "running")
+    );
+}
