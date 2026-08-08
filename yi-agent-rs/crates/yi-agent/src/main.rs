@@ -79,7 +79,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
         DaemonAction::Serve => yi_agent_store::ipc::Daemon::start_with_factory(
             &runtime_dir,
             &database,
-            build_daemon_worker_factory(cli)?,
+            build_daemon_worker_factory(cli, runtime_dir.join("runtime.sock"))?,
         )
         .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
         .wait()
@@ -90,6 +90,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
 
 fn build_daemon_worker_factory(
     cli: &Cli,
+    runtime_socket: std::path::PathBuf,
 ) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
     let config = config::load(cli)?;
     let provider: Arc<dyn Provider> = match config.provider.as_str() {
@@ -138,6 +139,7 @@ fn build_daemon_worker_factory(
         provider,
         Arc::new(registry),
         agent_config,
+        runtime_socket,
     )))
 }
 

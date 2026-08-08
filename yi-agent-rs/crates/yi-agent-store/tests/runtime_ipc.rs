@@ -286,6 +286,7 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
         IpcRequest::SpawnChild {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
+            objective: "Inspect child behavior".into(),
         },
     )
     .unwrap()

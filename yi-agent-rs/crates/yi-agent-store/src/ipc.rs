@@ -53,6 +53,7 @@ pub enum IpcRequest {
     SpawnChild {
         session_id: String,
         parent_task_id: String,
+        objective: String,
     },
     StartWorker {
         session_id: String,
@@ -511,14 +512,18 @@ fn respond(
         IpcRequest::SpawnChild {
             session_id,
             parent_task_id,
+            objective,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let task_id =
-                runtime.block_on(coordinator.spawn_child(&session_id, &parent_task_id))?;
+            let task_id = runtime.block_on(coordinator.spawn_child_with_objective(
+                &session_id,
+                &parent_task_id,
+                objective,
+            ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
             })

@@ -118,7 +118,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// Registry of tools keyed by name.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }

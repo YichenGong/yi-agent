@@ -81,8 +81,21 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
+        self.spawn_child_with_objective(session, parent, "Complete the delegated task.".into())
+            .await
+    }
+
+    pub async fn spawn_child_with_objective(
+        &self,
+        session: &RootSessionId,
+        parent: &TaskId,
+        objective: String,
+    ) -> Result<TaskId, RuntimeCoordinatorError> {
         let supervisor = self.supervisor(session)?;
-        let child = supervisor.lock().await.spawn(parent.clone())?;
+        let child = supervisor
+            .lock()
+            .await
+            .spawn_with_objective(parent.clone(), objective)?;
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
