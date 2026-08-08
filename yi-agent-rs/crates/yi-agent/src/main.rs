@@ -45,9 +45,7 @@ fn main() -> Result<()> {
 }
 
 fn control_daemon(action: DaemonAction) -> Result<()> {
-    let runtime_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-        .join(".yi-agent/runtime");
+    let runtime_dir = runtime_directory()?;
     let runtime = runtime_dir.join("runtime.sock");
     let database = runtime_dir.join("state.sqlite");
     match action {
@@ -83,6 +81,20 @@ fn control_daemon(action: DaemonAction) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}")),
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
     }
+}
+
+fn runtime_directory() -> Result<std::path::PathBuf> {
+    let override_path = std::env::var_os("YI_AGENT_RUNTIME_DIR").map(std::path::PathBuf::from);
+    runtime_directory_from(override_path, dirs::home_dir())
+}
+
+fn runtime_directory_from(
+    override_path: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    override_path
+        .or_else(|| home.map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
 }
 
 fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Result<()> {
@@ -1134,6 +1146,15 @@ mod tests {
         assert!(
             stderr.contains("[error:"),
             "stderr should contain error: {stderr}"
+        );
+    }
+
+    #[test]
+    fn runtime_directory_prefers_an_explicit_override() {
+        assert_eq!(
+            runtime_directory_from(Some(std::path::PathBuf::from("/tmp/yi-runtime")), None)
+                .unwrap(),
+            std::path::PathBuf::from("/tmp/yi-runtime")
         );
     }
 }
