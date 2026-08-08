@@ -2,6 +2,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
+use yi_agent_core::subagent::task::MessageId;
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
 const LATEST_SCHEMA_VERSION: i64 = 1;
@@ -10,6 +11,8 @@ const LATEST_SCHEMA_VERSION: i64 = 1;
 pub enum RepositoryError {
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error("unknown runtime event kind: {kind}")]
     UnknownEventKind { kind: String },
     #[error("task does not exist: {task}")]
@@ -23,6 +26,7 @@ pub enum RuntimeEvent {
     TaskCancelled,
     TaskFailed,
     TaskRecoveryRequired,
+    MailboxMessageDelivered,
 }
 
 impl RuntimeEvent {
@@ -33,6 +37,7 @@ impl RuntimeEvent {
             Self::TaskCancelled => "task_cancelled",
             Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
+            Self::MailboxMessageDelivered => "mailbox_message_delivered",
         }
     }
 
@@ -43,6 +48,7 @@ impl RuntimeEvent {
             "task_cancelled" => Ok(Self::TaskCancelled),
             "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
+            "mailbox_message_delivered" => Ok(Self::MailboxMessageDelivered),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -145,6 +151,44 @@ impl RuntimeRepository {
             params![attempt.to_string(), task.to_string(), number, state],
         )?;
         Ok(())
+    }
+
+    /// Persists a daemon-routed user instruction and its event together so a
+    /// reconnecting observer never sees an event without its mailbox record.
+    pub fn record_user_message(
+        &mut self,
+        sender: &TaskId,
+        recipient: &TaskId,
+        message: &str,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO mailbox_messages (id, recipient_task_id, sender_task_id, kind, priority, payload_json, delivered_at)
+             VALUES (?1, ?2, ?3, 'user_instruction', 2, ?4, CURRENT_TIMESTAMP)",
+            params![
+                MessageId::new().to_string(),
+                recipient.to_string(),
+                sender.to_string(),
+                serde_json::to_string(&serde_json::json!({ "message": message }))?,
+            ],
+        )?;
+        let event_id = append_event(
+            &transaction,
+            recipient,
+            RuntimeEvent::MailboxMessageDelivered,
+        )?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    pub fn mailbox_message_count(&self) -> Result<i64, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row("SELECT COUNT(*) FROM mailbox_messages", [], |row| {
+                row.get(0)
+            })?)
     }
 
     /// Atomically changes the task snapshot and appends its corresponding journal entry.

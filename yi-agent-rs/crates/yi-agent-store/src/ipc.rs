@@ -64,6 +64,12 @@ pub enum IpcRequest {
         task_id: String,
         recursive: bool,
     },
+    SendMessage {
+        session_id: String,
+        sender_task_id: String,
+        recipient_task_id: String,
+        message: String,
+    },
     SubscribeEvents {
         after_event_id: i64,
     },
@@ -84,6 +90,7 @@ pub enum IpcResponse {
     },
     TaskStarted,
     TaskCancelled,
+    MessageDelivered,
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
     ResyncRequired,
@@ -552,6 +559,26 @@ fn respond(
                 .build()?;
             runtime.block_on(coordinator.cancel_task(&session_id, &task_id, recursive))?;
             Ok(IpcResponse::TaskCancelled)
+        }
+        IpcRequest::SendMessage {
+            session_id,
+            sender_task_id,
+            recipient_task_id,
+            message,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let sender_task_id = parse_id::<TaskId>(&sender_task_id)?;
+            let recipient_task_id = parse_id::<TaskId>(&recipient_task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.send_message(
+                &session_id,
+                &sender_task_id,
+                recipient_task_id,
+                message,
+            ))?;
+            Ok(IpcResponse::MessageDelivered)
         }
         IpcRequest::SubscribeEvents { after_event_id } => {
             let snapshot = repository.subscription_snapshot(after_event_id)?;

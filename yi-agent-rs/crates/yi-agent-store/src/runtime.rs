@@ -184,6 +184,33 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// Routes external task messages through the owning supervisor before
+    /// recording an auditable mailbox row and runtime event.
+    pub async fn send_message(
+        &self,
+        session: &RootSessionId,
+        sender: &TaskId,
+        recipient: TaskId,
+        message: String,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if message.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "message must be non-empty".into(),
+            ));
+        }
+        let supervisor = self.supervisor(session)?;
+        supervisor
+            .lock()
+            .await
+            .send_user_message(sender, recipient.clone(), message.clone())
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_user_message(sender, &recipient, &message)?;
+        Ok(())
+    }
+
     /// Drains facts emitted by application workers and persists their reducer
     /// outcomes. Workers themselves never write task snapshots or events.
     pub async fn reconcile_worker_events(&self) -> Result<(), RuntimeCoordinatorError> {

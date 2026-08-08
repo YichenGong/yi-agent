@@ -333,6 +333,25 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    /// Delivers the daemon's text-only control message through the same
+    /// adjacency and terminal-state checks as the model-facing tool.
+    pub fn send_user_message(
+        &mut self,
+        sender: &TaskId,
+        recipient: TaskId,
+        message: String,
+    ) -> Result<(), MessageDeliveryError> {
+        self.send_message(
+            sender,
+            MailboxMessageDraft::new(
+                sender.clone(),
+                recipient,
+                MessageKind::UserInstruction(UserInstruction(message)),
+                None,
+            ),
+        )
+    }
+
     pub fn fail_task(
         &mut self,
         task_id: &TaskId,
