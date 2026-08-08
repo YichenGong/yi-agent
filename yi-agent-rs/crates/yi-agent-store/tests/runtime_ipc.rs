@@ -152,3 +152,14 @@ fn manually_stopped_daemon_releases_its_socket_and_instance_lock() {
     daemon.stop().unwrap();
     assert!(Daemon::start(&runtime, &database).is_ok());
 }
+
+#[test]
+fn daemon_reclaims_a_stale_lock_when_no_socket_is_listening() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(runtime.join("runtime.lock"), "999999\n").unwrap();
+    let database = directory.path().join("runtime.sqlite");
+
+    assert!(Daemon::start(&runtime, &database).is_ok());
+}

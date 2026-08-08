@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -96,29 +97,10 @@ impl Daemon {
         fs::create_dir_all(runtime_dir)?;
         fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700))?;
 
-        let lock_path = runtime_dir.join("runtime.lock");
-        let mut lock = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    IpcError::AlreadyRunning {
-                        path: runtime_dir.to_path_buf(),
-                    }
-                } else {
-                    IpcError::Io(error)
-                }
-            })?;
-        writeln!(lock, "{}", std::process::id())?;
-
         let socket_path = runtime_dir.join("runtime.sock");
-        if socket_path.exists() {
-            let _ = fs::remove_file(&lock_path);
-            return Err(IpcError::AlreadyRunning {
-                path: runtime_dir.to_path_buf(),
-            });
-        }
+        let lock_path = runtime_dir.join("runtime.lock");
+        let mut lock = acquire_lock(runtime_dir, &lock_path, &socket_path)?;
+        writeln!(lock, "{}", std::process::id())?;
         let mut repository = RuntimeRepository::open(database_path.as_ref())?;
         repository.recover_inflight_tasks()?;
         let listener = UnixListener::bind(&socket_path)?;
@@ -165,6 +147,57 @@ impl Daemon {
         remove_if_exists(&self.lock_path)?;
         Ok(())
     }
+}
+
+fn acquire_lock(
+    runtime_dir: &Path,
+    lock_path: &Path,
+    socket_path: &Path,
+) -> Result<std::fs::File, IpcError> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+    {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if lock_owner_is_alive(lock_path) || UnixStream::connect(socket_path).is_ok() {
+                return Err(IpcError::AlreadyRunning {
+                    path: runtime_dir.to_path_buf(),
+                });
+            }
+            // Both checks failed, so this is a stale local runtime left by a dead process.
+            remove_if_exists(lock_path)?;
+            remove_if_exists(socket_path)?;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(lock_path)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        IpcError::AlreadyRunning {
+                            path: runtime_dir.to_path_buf(),
+                        }
+                    } else {
+                        IpcError::Io(error)
+                    }
+                })
+        }
+        Err(error) => Err(IpcError::Io(error)),
+    }
+}
+
+fn lock_owner_is_alive(lock_path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(lock_path) else {
+        return false;
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return false;
+    };
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 impl Drop for Daemon {
