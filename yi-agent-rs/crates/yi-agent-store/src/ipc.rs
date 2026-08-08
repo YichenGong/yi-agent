@@ -172,6 +172,14 @@ impl Daemon {
         }
         Ok(())
     }
+
+    /// Block the owning daemon process until a local or IPC stop completes.
+    pub fn wait(mut self) -> Result<(), IpcError> {
+        if let Some(listener) = self.listener.take() {
+            listener.join().map_err(|_| IpcError::ListenerPanicked)?;
+        }
+        Ok(())
+    }
 }
 
 fn acquire_lock(

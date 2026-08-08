@@ -137,10 +137,15 @@ pub enum Command {
 
 #[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonAction {
+    /// Start a detached local daemon process.
+    Start,
     /// Report the daemon event high-water mark.
     Status,
     /// Request an orderly daemon stop.
     Stop,
+    /// Internal long-running daemon worker.
+    #[command(hide = true)]
+    Serve,
 }
 
 /// 解析 .env 文件路径：优先 workdir CLI 参数，否则 YI_AGENT_WORKDIR 环境变量，否则当前目录。
@@ -1133,6 +1138,7 @@ mod tests {
     fn cli_parses_daemon_status_and_stop() {
         use clap::Parser;
         for (argument, expected) in [
+            ("start", DaemonAction::Start),
             ("status", DaemonAction::Status),
             ("stop", DaemonAction::Stop),
         ] {

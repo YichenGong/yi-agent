@@ -45,12 +45,51 @@ fn main() -> Result<()> {
 }
 
 fn control_daemon(action: DaemonAction) -> Result<()> {
-    let runtime = dirs::home_dir()
+    let runtime_dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-        .join(".yi-agent/runtime/runtime.sock");
+        .join(".yi-agent/runtime");
+    let runtime = runtime_dir.join("runtime.sock");
+    let database = runtime_dir.join("state.sqlite");
+    match action {
+        DaemonAction::Start => {
+            if yi_agent_store::ipc::send_request(&runtime, yi_agent_store::ipc::IpcRequest::Status)
+                .is_ok()
+            {
+                anyhow::bail!("runtime daemon is already running")
+            }
+            std::process::Command::new(std::env::current_exe()?)
+                .args(["daemon", "serve"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            for _ in 0..50 {
+                if yi_agent_store::ipc::send_request(
+                    &runtime,
+                    yi_agent_store::ipc::IpcRequest::Status,
+                )
+                .is_ok()
+                {
+                    println!("daemon started");
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            anyhow::bail!("daemon process did not become ready")
+        }
+        DaemonAction::Serve => yi_agent_store::ipc::Daemon::start(&runtime_dir, &database)
+            .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
+            .wait()
+            .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}")),
+        DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
+    }
+}
+
+fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Result<()> {
     let request = match action {
         DaemonAction::Status => yi_agent_store::ipc::IpcRequest::Status,
         DaemonAction::Stop => yi_agent_store::ipc::IpcRequest::Stop,
+        DaemonAction::Start | DaemonAction::Serve => unreachable!("handled by launcher"),
     };
     let response = yi_agent_store::ipc::send_request(&runtime, request)
         .map_err(|error| anyhow::anyhow!("runtime daemon is unavailable: {error}"))?;
