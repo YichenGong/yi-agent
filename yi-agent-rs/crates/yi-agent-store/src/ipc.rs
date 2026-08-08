@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -11,8 +12,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use yi_agent_core::subagent::task::{RootSessionId, TaskId};
+use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 
 use crate::repository::RuntimeRepository;
+use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -25,6 +29,8 @@ pub enum IpcError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Repository(#[from] crate::repository::RepositoryError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeCoordinatorError),
     #[error("a daemon is already running for {path}")]
     AlreadyRunning { path: PathBuf },
     #[error("IPC frame exceeds {MAX_FRAME_BYTES} bytes")]
@@ -43,7 +49,19 @@ struct RequestEnvelope {
 pub enum IpcRequest {
     Status,
     Stop,
-    SubscribeEvents { after_event_id: i64 },
+    CreateSession,
+    SpawnChild {
+        session_id: String,
+        parent_task_id: String,
+    },
+    CancelTask {
+        session_id: String,
+        task_id: String,
+        recursive: bool,
+    },
+    SubscribeEvents {
+        after_event_id: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +70,14 @@ pub enum IpcResponse {
         high_water_event_id: i64,
     },
     Stopping,
+    SessionCreated {
+        session_id: String,
+        root_task_id: String,
+    },
+    TaskSpawned {
+        task_id: String,
+    },
+    TaskCancelled,
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
     ResyncRequired,
@@ -113,6 +139,21 @@ impl Daemon {
         runtime_dir: impl AsRef<Path>,
         database_path: impl AsRef<Path>,
     ) -> Result<Self, IpcError> {
+        Self::start_with_factory(
+            runtime_dir,
+            database_path,
+            Arc::new(UnavailableWorkerFactory),
+        )
+    }
+
+    /// Starts the daemon with application-owned worker construction. The
+    /// default `start` remains useful for inspection-only clients, but a
+    /// runnable daemon supplies its provider/tool factory here.
+    pub fn start_with_factory(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+    ) -> Result<Self, IpcError> {
         let runtime_dir = runtime_dir.as_ref();
         fs::create_dir_all(runtime_dir)?;
         fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700))?;
@@ -123,6 +164,8 @@ impl Daemon {
         writeln!(lock, "{}", std::process::id())?;
         let mut repository = RuntimeRepository::open(database_path.as_ref())?;
         repository.recover_inflight_tasks()?;
+        drop(repository);
+        let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
@@ -138,8 +181,9 @@ impl Daemon {
                     Ok((stream, _)) => {
                         let database_path = database_path.clone();
                         let stop = Arc::clone(&thread_stop);
+                        let coordinator = Arc::clone(&coordinator);
                         thread::spawn(move || {
-                            let _ = handle_client(stream, &database_path, &stop);
+                            let _ = handle_client(stream, &database_path, &stop, &coordinator);
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -307,6 +351,7 @@ fn handle_client(
     mut stream: UnixStream,
     database_path: &Path,
     stop: &AtomicBool,
+    coordinator: &RuntimeCoordinator,
 ) -> Result<(), IpcError> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -338,7 +383,7 @@ fn handle_client(
             IpcRequest::SubscribeEvents { after_event_id } => {
                 return stream_subscription(&mut stream, database_path, stop, after_event_id);
             }
-            request => match respond(database_path, request) {
+            request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
                 Err(_) => IpcResponse::Error {
                     code: "internal".into(),
@@ -424,13 +469,53 @@ fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
     }
 }
 
-fn respond(database_path: &Path, request: IpcRequest) -> Result<IpcResponse, IpcError> {
+fn respond(
+    database_path: &Path,
+    coordinator: &RuntimeCoordinator,
+    request: IpcRequest,
+) -> Result<IpcResponse, IpcError> {
     let mut repository = RuntimeRepository::open(database_path)?;
     match request {
         IpcRequest::Status => Ok(IpcResponse::Status {
             high_water_event_id: repository.latest_event_id()?,
         }),
         IpcRequest::Stop => Ok(IpcResponse::Stopping),
+        IpcRequest::CreateSession => {
+            let session_id = coordinator.create_session()?;
+            let root_task_id = coordinator.root_task_id(&session_id)?;
+            Ok(IpcResponse::SessionCreated {
+                session_id: session_id.to_string(),
+                root_task_id: root_task_id.to_string(),
+            })
+        }
+        IpcRequest::SpawnChild {
+            session_id,
+            parent_task_id,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let task_id =
+                runtime.block_on(coordinator.spawn_child(&session_id, &parent_task_id))?;
+            Ok(IpcResponse::TaskSpawned {
+                task_id: task_id.to_string(),
+            })
+        }
+        IpcRequest::CancelTask {
+            session_id,
+            task_id,
+            recursive,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.cancel_task(&session_id, &task_id, recursive))?;
+            Ok(IpcResponse::TaskCancelled)
+        }
         IpcRequest::SubscribeEvents { after_event_id } => {
             let snapshot = repository.subscription_snapshot(after_event_id)?;
             let tasks = snapshot
@@ -456,5 +541,32 @@ fn respond(database_path: &Path, request: IpcRequest) -> Result<IpcResponse, Ipc
                 events,
             }))
         }
+    }
+}
+
+fn parse_id<T>(value: &str) -> Result<T, IpcError>
+where
+    T: FromStr,
+{
+    value.parse().map_err(|_| {
+        IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid ID",
+        ))
+    })
+}
+
+struct UnavailableWorkerFactory;
+
+impl AgentWorkerFactory for UnavailableWorkerFactory {
+    fn start(
+        &self,
+        _request: WorkerStart,
+    ) -> futures::future::BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async {
+            Err(WorkerError::Startup(
+                "no application worker factory registered".into(),
+            ))
+        })
     }
 }

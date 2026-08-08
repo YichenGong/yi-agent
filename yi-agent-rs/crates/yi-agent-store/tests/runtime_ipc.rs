@@ -253,3 +253,56 @@ fn subscription_connection_receives_events_persisted_after_its_snapshot() {
     assert_eq!(event.task_id, task.to_string());
     assert_eq!(event.event_id, 1);
 }
+
+#[test]
+fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::CancelTask {
+            session_id,
+            task_id: root_task_id,
+            recursive: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, IpcResponse::TaskCancelled));
+
+    let IpcResponse::Subscription(snapshot) = send_request(
+        daemon.socket_path(),
+        IpcRequest::SubscribeEvents { after_event_id: 0 },
+    )
+    .unwrap() else {
+        panic!("expected subscription snapshot");
+    };
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.task_id == child_task_id && task.state == "cancelled")
+    );
+}
