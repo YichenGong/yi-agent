@@ -191,6 +191,28 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    pub async fn retry_task(
+        &self,
+        session: &RootSessionId,
+        task: &TaskId,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        let attempt = supervisor
+            .lock()
+            .await
+            .retry_task(task)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
+            repository.create_attempt(&attempt.id, task, attempt.number, "queued")?;
+        }
+        self.start_worker(session, task).await
+    }
+
     pub async fn cancel_task(
         &self,
         session: &RootSessionId,

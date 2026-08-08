@@ -92,3 +92,21 @@ async fn global_resident_capacity_leaves_excess_child_queued() {
     assert!(coordinator.start_worker(session, child).await.is_err());
     assert_eq!(coordinator.task_state(child).unwrap(), "queued");
 }
+
+#[tokio::test]
+async fn coordinator_retries_a_terminal_task_as_a_new_running_attempt() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    coordinator
+        .cancel_task(&session, &root, false)
+        .await
+        .unwrap();
+
+    coordinator.retry_task(&session, &root).await.unwrap();
+
+    assert_eq!(coordinator.task_state(&root).unwrap(), "running");
+}

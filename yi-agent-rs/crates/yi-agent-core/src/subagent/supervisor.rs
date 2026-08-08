@@ -445,6 +445,35 @@ impl AgentSupervisor {
         self.notify_update();
         Ok(())
     }
+
+    /// Creates a fresh attempt only after a terminal outcome, preserving the
+    /// prior attempt's evidence for later user inspection.
+    pub fn retry_task(&mut self, task_id: &TaskId) -> Result<super::task::TaskAttempt, String> {
+        if !self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .state()
+            .is_terminal()
+        {
+            return Err("retry requires a terminal task state".into());
+        }
+        // A cancelled worker may still have a handle until its asynchronous
+        // event is reconciled; a successor attempt must not inherit it.
+        self.workers.remove(task_id);
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        let next = task
+            .reduce(TaskEvent::RetryRequested { attempt_id }, chrono::Utc::now())
+            .map_err(|error| error.to_string())?
+            .new_attempt
+            .expect("retry creates a successor attempt");
+        self.notify_update();
+        Ok(next)
+    }
 }
 
 /// The per-task built-in tool set. Tool calls delegate to the Supervisor; they
