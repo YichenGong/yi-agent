@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
@@ -14,6 +15,19 @@ struct RecordingWorkerFactory;
 impl AgentWorkerFactory for RecordingWorkerFactory {
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+#[derive(Clone)]
+struct ReportingWorkerFactory {
+    handle: Arc<Mutex<Option<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for ReportingWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation);
+        *self.handle.lock().unwrap() = Some(handle.clone());
+        Box::pin(async move { Ok(handle) })
     }
 }
 
@@ -459,6 +473,78 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
         IpcResponse::WaitCompleted { status, children }
             if status == "completed" && children == vec![child_task_id]
     ));
+}
+
+#[test]
+fn worker_lifecycle_is_reconciled_without_another_client_request() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = ReportingWorkerFactory {
+        handle: Arc::new(Mutex::new(None)),
+    };
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(factory.clone()),
+    )
+    .unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            objective: "Inspect child behavior".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::StartWorker {
+            session_id: session_id.clone(),
+            task_id: child_task_id,
+        },
+    )
+    .unwrap();
+
+    let socket = daemon.socket_path().to_path_buf();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let response = send_request(
+            socket,
+            IpcRequest::WaitAgent {
+                session_id,
+                caller_task_id: root_task_id,
+                mode: "all".into(),
+            },
+        );
+        done_tx.send(response).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    factory
+        .handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .report_failure("worker stopped");
+
+    let response = done_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("worker completion must wake wait_agent without another client request")
+        .unwrap();
+    assert!(matches!(response, IpcResponse::WaitCompleted { status, .. } if status == "completed"));
 }
 
 #[test]

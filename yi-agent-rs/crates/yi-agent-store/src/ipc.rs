@@ -198,7 +198,14 @@ impl Daemon {
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
         let listener = thread::spawn(move || {
+            // Worker facts arrive independently of client traffic. Reconcile
+            // them here so a parent blocked in wait_agent is always woken.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("daemon reconciliation runtime must initialize");
             while !thread_stop.load(Ordering::Acquire) {
+                let _ = runtime.block_on(coordinator.reconcile_worker_events());
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let database_path = database_path.clone();
