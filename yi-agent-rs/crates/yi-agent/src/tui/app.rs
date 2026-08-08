@@ -24,7 +24,7 @@ use super::cell::HistoryCell;
 use super::cost::CostTracker;
 use super::history::{HistoryState, HistoryView, ViewportAnchor};
 use super::input::{InputAction, InputLine};
-use super::slash::{CommandPopup, SlashCommand};
+use super::slash::{CommandPopup, SlashCommand, help_text};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
 
@@ -1040,11 +1040,12 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Help => {
-            let mut help_text = String::from("可用命令:\n");
-            for c in SlashCommand::all() {
-                help_text.push_str(&format!("  /{:<10} {}\n", c.name(), c.description()));
-            }
-            history.push(HistoryCell::UserMessage { text: help_text }, width);
+            history.push(
+                HistoryCell::UserMessage {
+                    text: help_text(args.as_deref()),
+                },
+                width,
+            );
             KeyOutcome::None
         }
         SlashCommand::Cost => {
@@ -1089,6 +1090,30 @@ fn execute_slash_command(
                     width,
                 );
             }
+            KeyOutcome::None
+        }
+        SlashCommand::Agents
+        | SlashCommand::Agent
+        | SlashCommand::Message
+        | SlashCommand::Pause
+        | SlashCommand::Resume
+        | SlashCommand::Cancel
+        | SlashCommand::Retry
+        | SlashCommand::Approve
+        | SlashCommand::Review
+        | SlashCommand::Accept
+        | SlashCommand::Rework
+        | SlashCommand::Budget
+        | SlashCommand::Daemon => {
+            history.push(
+                HistoryCell::Separator {
+                    label: Some(format!(
+                        "/{} 将由本地 daemon runtime 执行 (控制客户端接入中)",
+                        cmd.name()
+                    )),
+                },
+                width,
+            );
             KeyOutcome::None
         }
     }

@@ -12,6 +12,19 @@ pub enum SlashCommand {
     Compact,
     Config,
     Help,
+    Agents,
+    Agent,
+    Message,
+    Pause,
+    Resume,
+    Cancel,
+    Retry,
+    Approve,
+    Review,
+    Accept,
+    Rework,
+    Budget,
+    Daemon,
 }
 
 impl SlashCommand {
@@ -25,6 +38,19 @@ impl SlashCommand {
             SlashCommand::Compact => "compact",
             SlashCommand::Config => "config",
             SlashCommand::Help => "help",
+            SlashCommand::Agents => "agents",
+            SlashCommand::Agent => "agent",
+            SlashCommand::Message => "message",
+            SlashCommand::Pause => "pause",
+            SlashCommand::Resume => "resume",
+            SlashCommand::Cancel => "cancel",
+            SlashCommand::Retry => "retry",
+            SlashCommand::Approve => "approve",
+            SlashCommand::Review => "review",
+            SlashCommand::Accept => "accept",
+            SlashCommand::Rework => "rework",
+            SlashCommand::Budget => "budget",
+            SlashCommand::Daemon => "daemon",
         }
     }
 
@@ -38,6 +64,19 @@ impl SlashCommand {
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
             SlashCommand::Help => "显示帮助信息",
+            SlashCommand::Agents => "显示 agent 任务树",
+            SlashCommand::Agent => "显示单个 agent 详情 (需要任务 ID)",
+            SlashCommand::Message => "向相邻 agent 发送消息",
+            SlashCommand::Pause => "暂停任务",
+            SlashCommand::Resume => "恢复任务",
+            SlashCommand::Cancel => "取消任务",
+            SlashCommand::Retry => "创建新的重试 attempt",
+            SlashCommand::Approve => "批准权限请求",
+            SlashCommand::Review => "查看 delivery 审查",
+            SlashCommand::Accept => "接受并集成子任务 delivery",
+            SlashCommand::Rework => "请求子任务返工",
+            SlashCommand::Budget => "查看或收窄任务预算",
+            SlashCommand::Daemon => "管理本地 runtime daemon",
         }
     }
 
@@ -57,12 +96,52 @@ impl SlashCommand {
             SlashCommand::Compact,
             SlashCommand::Config,
             SlashCommand::Help,
+            SlashCommand::Agents,
+            SlashCommand::Agent,
+            SlashCommand::Message,
+            SlashCommand::Pause,
+            SlashCommand::Resume,
+            SlashCommand::Cancel,
+            SlashCommand::Retry,
+            SlashCommand::Approve,
+            SlashCommand::Review,
+            SlashCommand::Accept,
+            SlashCommand::Rework,
+            SlashCommand::Budget,
+            SlashCommand::Daemon,
         ]
     }
 
     /// Look up a command by its name (without leading `/`).
     pub fn from_name(name: &str) -> Option<SlashCommand> {
+        if name == "?" {
+            return Some(Self::Help);
+        }
         Self::all().iter().copied().find(|cmd| cmd.name() == name)
+    }
+}
+
+/// Render the same command catalog used by slash completion and dispatch.
+pub fn help_text(target: Option<&str>) -> String {
+    match target
+        .map(|name| name.trim_start_matches('/'))
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => match SlashCommand::from_name(name) {
+            Some(command) => format!("/{}\n{}", command.name(), command.description()),
+            None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
+        },
+        None => {
+            let mut text = String::from("可用命令:\n");
+            for command in SlashCommand::all() {
+                text.push_str(&format!(
+                    "  /{:<10} {}\n",
+                    command.name(),
+                    command.description()
+                ));
+            }
+            text
+        }
     }
 }
 
@@ -222,6 +301,13 @@ mod tests {
         assert_eq!(SlashCommand::from_name("quit"), Some(SlashCommand::Quit));
         assert_eq!(SlashCommand::from_name("clear"), Some(SlashCommand::Clear));
         assert_eq!(SlashCommand::from_name("xyz"), None);
+    }
+
+    #[test]
+    fn help_alias_and_contextual_help_use_the_command_catalog() {
+        assert_eq!(SlashCommand::from_name("?"), Some(SlashCommand::Help));
+        assert!(help_text(Some("agents")).contains("/agents"));
+        assert!(help_text(Some("missing")).contains("未知命令"));
     }
 
     #[test]
