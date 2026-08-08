@@ -20,6 +20,7 @@ pub enum RepositoryError {
 pub enum RuntimeEvent {
     TaskQueued,
     TaskStarted,
+    TaskCancelled,
     TaskRecoveryRequired,
 }
 
@@ -28,6 +29,7 @@ impl RuntimeEvent {
         match self {
             Self::TaskQueued => "task_queued",
             Self::TaskStarted => "task_started",
+            Self::TaskCancelled => "task_cancelled",
             Self::TaskRecoveryRequired => "task_recovery_required",
         }
     }
@@ -36,6 +38,7 @@ impl RuntimeEvent {
         match kind.as_str() {
             "task_queued" => Ok(Self::TaskQueued),
             "task_started" => Ok(Self::TaskStarted),
+            "task_cancelled" => Ok(Self::TaskCancelled),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }

@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
-use super::task::{AgentTask, RootSessionId, TaskEvent, TaskFailure, TaskId};
+use super::task::{AgentTask, CancelReason, RootSessionId, TaskEvent, TaskFailure, TaskId};
 use super::worker::{AgentWorkerFactory, WorkerHandle, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
@@ -132,6 +132,54 @@ impl AgentSupervisor {
             .ok_or_else(|| "worker does not exist".to_string())?
             .cancel();
         Ok(())
+    }
+
+    /// Cancels a task and, when requested, every descendant owned by this
+    /// supervisor. State reduction accompanies token cancellation so callers
+    /// never see a running task after its worker was signalled.
+    pub fn cancel_task_tree(
+        &mut self,
+        task_id: &TaskId,
+        recursive: bool,
+    ) -> Result<Vec<TaskId>, String> {
+        if !self.tasks.contains_key(task_id) {
+            return Err("task does not exist".into());
+        }
+        let mut task_ids = Vec::new();
+        self.collect_cancellation_targets(task_id, recursive, &mut task_ids);
+        for id in &task_ids {
+            if let Some(worker) = self.workers.get(id) {
+                worker.cancel();
+            }
+            let task = self.tasks.get_mut(id).expect("collected task exists");
+            if !task.state().is_terminal() {
+                let attempt_id = task.active_attempt_id().clone();
+                task.reduce(
+                    TaskEvent::CancelRequested {
+                        attempt_id,
+                        reason: CancelReason("cancelled by runtime coordinator".into()),
+                    },
+                    chrono::Utc::now(),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        self.notify_update();
+        Ok(task_ids)
+    }
+
+    fn collect_cancellation_targets(
+        &self,
+        task_id: &TaskId,
+        recursive: bool,
+        targets: &mut Vec<TaskId>,
+    ) {
+        targets.push(task_id.clone());
+        if recursive {
+            for child_id in self.children_of(task_id) {
+                self.collect_cancellation_targets(child_id, true, targets);
+            }
+        }
     }
 
     fn subscribe_updates(&self) -> watch::Receiver<u64> {
