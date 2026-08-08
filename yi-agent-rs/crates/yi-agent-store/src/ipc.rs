@@ -53,6 +53,7 @@ pub enum IpcResponse {
     },
     Stopping,
     Subscription(SubscriptionSnapshot),
+    Event(IpcEvent),
     UnsupportedProtocol {
         supported_min: u32,
         supported_max: u32,
@@ -80,6 +81,24 @@ pub struct IpcEvent {
     pub event_id: i64,
     pub task_id: String,
     pub kind: String,
+}
+
+/// A client-side event stream. The first frame is always a `Subscription` snapshot.
+pub struct Subscription {
+    reader: BufReader<UnixStream>,
+}
+
+impl Subscription {
+    pub fn next_response(&mut self) -> Result<IpcResponse, IpcError> {
+        let mut response = String::new();
+        if self.reader.read_line(&mut response)? == 0 {
+            return Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon closed subscription",
+            )));
+        }
+        Ok(serde_json::from_str(&response)?)
+    }
 }
 
 /// A manually owned, current-user-only local daemon socket.
@@ -117,7 +136,11 @@ impl Daemon {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = handle_client(stream, &database_path, &thread_stop);
+                        let database_path = database_path.clone();
+                        let stop = Arc::clone(&thread_stop);
+                        thread::spawn(move || {
+                            let _ = handle_client(stream, &database_path, &stop);
+                        });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -229,6 +252,32 @@ pub fn send_request_with_version(
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
     let mut stream = UnixStream::connect(socket_path)?;
+    write_request(&mut stream, protocol_version, request)?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    Ok(serde_json::from_str(&response)?)
+}
+
+pub fn subscribe(
+    socket_path: impl AsRef<Path>,
+    after_event_id: i64,
+) -> Result<Subscription, IpcError> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    write_request(
+        &mut stream,
+        PROTOCOL_VERSION,
+        IpcRequest::SubscribeEvents { after_event_id },
+    )?;
+    Ok(Subscription {
+        reader: BufReader::new(stream),
+    })
+}
+
+fn write_request(
+    stream: &mut UnixStream,
+    protocol_version: u32,
+    request: IpcRequest,
+) -> Result<(), IpcError> {
     let frame = serde_json::to_vec(&RequestEnvelope {
         protocol_version,
         request,
@@ -239,9 +288,7 @@ pub fn send_request_with_version(
     stream.write_all(&frame)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
-    Ok(serde_json::from_str(&response)?)
+    Ok(())
 }
 
 fn handle_client(
@@ -249,6 +296,8 @@ fn handle_client(
     database_path: &Path,
     stop: &AtomicBool,
 ) -> Result<(), IpcError> {
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     let mut frame = String::new();
     let bytes = BufReader::new(stream.try_clone()?).read_line(&mut frame)?;
     let response = if bytes > MAX_FRAME_BYTES {
@@ -263,14 +312,19 @@ fn handle_client(
                     supported_max: PROTOCOL_VERSION,
                 }
             }
-            Ok(envelope) if matches!(envelope.request, IpcRequest::Stop) => {
-                stop.store(true, Ordering::Release);
-                IpcResponse::Stopping
-            }
-            Ok(envelope) => match respond(database_path, envelope.request) {
-                Ok(response) => response,
-                Err(_) => IpcResponse::Error {
-                    code: "internal".into(),
+            Ok(envelope) => match envelope.request {
+                IpcRequest::Stop => {
+                    stop.store(true, Ordering::Release);
+                    IpcResponse::Stopping
+                }
+                IpcRequest::SubscribeEvents { after_event_id } => {
+                    return stream_subscription(&mut stream, database_path, stop, after_event_id);
+                }
+                request => match respond(database_path, request) {
+                    Ok(response) => response,
+                    Err(_) => IpcResponse::Error {
+                        code: "internal".into(),
+                    },
                 },
             },
             Err(_) => IpcResponse::Error {
@@ -278,10 +332,58 @@ fn handle_client(
             },
         }
     };
-    serde_json::to_writer(&mut stream, &response)?;
+    write_response(&mut stream, &response)
+}
+
+fn stream_subscription(
+    stream: &mut UnixStream,
+    database_path: &Path,
+    stop: &AtomicBool,
+    after_event_id: i64,
+) -> Result<(), IpcError> {
+    let mut repository = RuntimeRepository::open(database_path)?;
+    let snapshot = repository.subscription_snapshot(after_event_id)?;
+    let mut cursor = snapshot.high_water_event_id;
+    write_response(
+        stream,
+        &IpcResponse::Subscription(SubscriptionSnapshot {
+            high_water_event_id: snapshot.high_water_event_id,
+            tasks: snapshot
+                .tasks
+                .into_iter()
+                .map(|task| IpcTask {
+                    task_id: task.task_id,
+                    state: task.state,
+                })
+                .collect(),
+            events: snapshot.events.into_iter().map(ipc_event).collect(),
+        }),
+    )?;
+    while !stop.load(Ordering::Acquire) {
+        let repository = RuntimeRepository::open(database_path)?;
+        let events = repository.event_records_after(cursor)?;
+        for event in events {
+            cursor = event.id;
+            write_response(stream, &IpcResponse::Event(ipc_event(event)))?;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+fn write_response(stream: &mut UnixStream, response: &IpcResponse) -> Result<(), IpcError> {
+    serde_json::to_writer(&mut *stream, response)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
+    IpcEvent {
+        event_id: event.id,
+        task_id: event.task_id.to_string(),
+        kind: format!("{:?}", event.event),
+    }
 }
 
 fn respond(database_path: &Path, request: IpcRequest) -> Result<IpcResponse, IpcError> {

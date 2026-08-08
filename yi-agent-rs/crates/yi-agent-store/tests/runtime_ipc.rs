@@ -1,7 +1,7 @@
 use tempfile::TempDir;
 use yi_agent_core::{RootSessionId, TaskId};
 use yi_agent_store::ipc::{
-    Daemon, IpcRequest, IpcResponse, send_request, send_request_with_version,
+    Daemon, IpcRequest, IpcResponse, send_request, send_request_with_version, subscribe,
 };
 use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
 
@@ -206,4 +206,30 @@ fn daemon_stop_request_releases_the_runtime_for_a_future_manual_start() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("daemon stop request did not release runtime lock");
+}
+
+#[test]
+fn subscription_connection_receives_events_persisted_after_its_snapshot() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+
+    let mut subscription = subscribe(daemon.socket_path(), 0).unwrap();
+    assert!(matches!(
+        subscription.next_response().unwrap(),
+        IpcResponse::Subscription(_)
+    ));
+    repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+
+    let IpcResponse::Event(event) = subscription.next_response().unwrap() else {
+        panic!("expected live event");
+    };
+    assert_eq!(event.task_id, task.to_string());
+    assert_eq!(event.event_id, 1);
 }
