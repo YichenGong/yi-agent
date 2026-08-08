@@ -137,3 +137,49 @@ assert!(TaskDepth::Leaf.can_spawn_child().is_err());
 - [ ] Run `cargo clippy -p yi-agent-core -p yi-agent-tools -p yi-agent-store -p yi-agent -- -D warnings` and `git diff --check main...HEAD`.
 - [ ] Update each `[ ]` project-management item to `[x]` only when its named verification command passes; update the module index count in the same commit.
 - [ ] Commit `test: cover subagent runtime recovery and controls`.
+
+## Required Execution Checkpoints
+
+The eight component tasks above are delivery milestones. Execute them through
+the following small, ordered checkpoints; do not begin a later checkpoint while
+the previous one lacks its named test and commit.
+
+1. Add task IDs/depth/state enums and transition-table tests.
+2. Add attempt records and tests that retries preserve old attempt evidence.
+3. Add contract serialization and tests for immutable contract versions.
+4. Add delegated-authority intersection tests before permission integration.
+5. Add mailbox message kinds, progress coalescing, and wake-policy tests.
+6. Add the supervisor task index and cancellation-tree tests.
+7. Add `spawn_agent` schema and leaf-depth rejection tests.
+8. Add `wait_agent` one/all/any join tests and high-priority interruption tests.
+9. Add `send_message` safe-checkpoint delivery and terminal-task rejection tests.
+10. Add generic permit accounting and per-session fairness tests with fake time.
+11. Add root/parent LLM coordination-reserve tests.
+12. Add worktree base-ref validation tests before any branch creation code.
+13. Add child-delivery report validation and direct-parent merge-direction tests.
+14. Add rework-on-new-base and dirty-worktree-retention tests.
+15. Add SQLite migration and append-only event-transaction tests.
+16. Add daemon single-instance, socket permission, snapshot, and replay tests.
+17. Add graceful-stop checkpoint and crash-to-`RecoveryRequired` tests.
+18. Add schedule overlap, missed-run, and read-only-default tests.
+19. Add shared command-schema, `/help`, completion, and daemon-unavailable tests.
+20. Add end-to-end two-level delegation, review, cancellation, and recovery tests.
+
+After each checkpoint, run the single affected crate/test target, then
+`cargo fmt --all`, inspect `git diff --check`, and create the conventional
+commit named by its parent milestone. For this repository, never run two Cargo
+test commands in parallel even when worktrees differ.
+
+## Spec Coverage Review
+
+| Design requirement | Implementation milestone |
+|---|---|
+| Two-level task tree, attempts, watchdog states | Tasks 1 and 8; checkpoints 1-2 and 20 |
+| Contract, prompt scope, authority narrowing | Task 2; checkpoints 3-4 |
+| Mailbox, wake-up, wait, and messages | Tasks 2-3; checkpoints 5 and 7-9 |
+| Fair global capacity and generic resource leases | Task 4; checkpoints 10-11 |
+| Committed Git baselines and parent-only integration | Task 4; checkpoints 12-14 |
+| Manual daemon, SQLite, IPC replay, recovery | Task 5; checkpoints 15-17 |
+| Scheduling defaults and effective configuration | Task 6; checkpoint 18 |
+| User controls, Slash commands, generated help | Task 7; checkpoint 19 |
+| Failure, cancellation, recovery, documentation | Task 8; checkpoint 20 |

@@ -281,3 +281,185 @@ have deadlines and report `Blocked` or `TimedOut` with evidence.
   task state and audit history.
 - Add TUI/Slash/CLI tests for command-schema help, invalid state actions,
   confirmations, and daemon-unavailable diagnostics.
+
+## Decision Record
+
+The following decisions are accepted product requirements, not implementation
+suggestions:
+
+1. `spawn_agent`, `wait_agent`, and `send_message` are all first-class tools.
+2. A root agent may delegate to depth 1; depth 1 may delegate to depth 2; depth
+   2 cannot delegate further.
+3. Subagents reuse the root agent's capabilities and base instructions. Their
+   only extra prompt is an operational subagent layer plus a concrete contract.
+4. Coding work is isolated in a dedicated worktree and is delivered as a commit.
+5. A direct parent reviews and integrates a child's commit into its own branch.
+   It may never integrate a descendant directly into an ancestor branch.
+6. A parent must create a committed, reviewable Git base before delegating code
+   that depends on its own changes.
+7. The default target is high concurrency: 16 resident subagents globally, with
+   resource-specific limits rather than 16 simultaneous builds or LLM calls.
+8. Global coordination spans projects; project-specific build constraints use
+   generic resource leases rather than Rust-specific scheduler logic.
+9. Users inspect and intervene in every task through the same daemon API used
+   by CLI, TUI, Web UI, and Slash commands.
+10. The daemon is manually started. It may run schedules once started, but it
+    is not silently auto-started and missed schedules do not run by default.
+11. Mailbox delivery is hybrid: completion and blocking events wake an idle
+    parent, while progress is coalesced and never creates notification storms.
+12. Every attempt is bounded by system budgets and watchdogs; the Supervisor,
+    not the model, terminates loops and stalled work.
+
+## Detailed Task Protocols
+
+### Spawn
+
+`spawn_agent` accepts a task contract draft, not an arbitrary prompt string.
+The Supervisor validates the draft before it allocates an ID or worker:
+
+```text
+1. Verify parent is depth 0 or 1 and has direct-child capacity.
+2. Verify root-session and global resident-task capacity; otherwise create Queued.
+3. Intersect requested authority with the parent's authority.
+4. Validate all requested write paths are covered by the parent lease.
+5. For coding work, resolve the parent's committed base and create a child branch/worktree.
+6. Allocate a child budget from the parent's remaining allocation.
+7. Persist Task, Attempt(1), Contract(v1), authority, and Spawned event atomically.
+8. Return task ID and status immediately; worker admission occurs asynchronously.
+```
+
+The response includes `task_id`, `status`, `depth`, `branch`, `worktree`, and
+the effective budget. A rejected spawn returns a normal tool error explaining
+the limiting invariant: maximum depth, quota, authority, uncommitted base, or
+invalid worktree scope.
+
+### Wait And Message
+
+`wait_agent` never blocks the runtime thread. It changes the caller to
+`WaitingForChildren`, registers an interruptible join condition, and yields its
+LLM permit. A high-priority mailbox item causes `NeedsAttention`, so a parent
+cannot deadlock while a descendant waits for its decision.
+
+`send_message` records a mailbox message and optionally sets `trigger_turn`.
+It cannot mutate another task's contract, authority, worktree, or history.
+Those changes have dedicated control events. Messages to a nonterminal task are
+consumed at the next safe checkpoint; a terminal task only starts a new attempt
+after an explicit `ReworkRequested` or user retry.
+
+### Commit Delivery And Review
+
+Before `AwaitingParentReview`, a coding worker must report a clean worktree,
+base commit, branch head, commit range, required verification results, and any
+known limitation. The Supervisor verifies the branch is a descendant of the
+recorded base before it emits the delivery event.
+
+The parent's three review decisions are:
+
+```text
+Accept:  merge --no-ff child's branch into the parent's integration branch,
+         run the parent's integration validation, then mark the child Completed.
+Rework:  record feedback; create a new attempt. If the parent HEAD changed,
+         create a fresh child branch from it instead of rewriting old history.
+Reject:  retain all evidence and mark the task terminal; do not merge.
+```
+
+Only a clean, accepted worktree is eligible for removal. Dirty, failed, rejected,
+blocked, cancelled, and recovery-required worktrees remain inspectable until a
+user-controlled cleanup action.
+
+## Detailed State Transition Rules
+
+| Current state | Allowed transition | Trigger |
+|---|---|---|
+| `Queued` | `Running` | Coordinator grants all required admission permits. |
+| `Queued` | `Cancelled` | User or ancestor cancels before admission. |
+| `Running` | waiting state | Agent requests resource, permission, or child join. |
+| `Running` | `AwaitingParentReview` | Delivery is complete and evidence is persisted. |
+| `Running` | terminal failure state | Budget, watchdog, cancellation, or unrecoverable error. |
+| waiting state | `Running` | Named condition resolves and a permit is available. |
+| `AwaitingParentReview` | `Completed` | Direct parent accepts and integration validates. |
+| `AwaitingParentReview` | `Queued` | Direct parent requests rework; new attempt is created. |
+| `Paused` | `Queued` | User or parent resumes. |
+| `RecoveryRequired` | `Queued` | Explicit resume creates a recovery attempt. |
+| terminal state | `Queued` | Explicit retry creates a new attempt, never rewrites history. |
+
+No transition implicitly reuses a cancelled cancellation token, copies an
+unfinished assistant/tool-use pair into a recovery session, or removes evidence.
+Attempt checkpoints occur only after a stable model turn and persisted tool
+result. A crash during a side-effecting tool call always requires reconciliation.
+
+## Watchdogs And Loop Prevention
+
+The runtime evaluates these independent conditions at every state transition:
+
+```text
+turn budget             -> BudgetExhausted
+token/cost budget       -> BudgetExhausted
+wall-clock deadline     -> TimedOut
+no meaningful progress  -> Stalled
+resource queue deadline -> Blocked or TimedOut
+retry/rework limit      -> Failed
+```
+
+Meaningful progress is a completed tool terminal event, new verified fact,
+commit, acquired lease, accepted/rejected review, satisfied dependency, or legal
+state transition. Model text, repeating stdout, identical progress updates, and
+repeated `send_message` calls are not progress. Mailbox messages carry
+correlation and causation IDs; an identical terminal report on the same causal
+chain is stored once and does not wake a parent again.
+
+## Coordinator Admission Algorithm
+
+The coordinator maintains separate queues for resident-task admission, provider
+LLM permits, coding permits, host build permits, and named resource leases.
+For each queue it:
+
+```text
+1. Discards cancelled, expired, or no-longer-runnable requests.
+2. Selects a root session using weighted fair rotation plus wait-time aging.
+3. Selects a runnable subtree within that session using the same rotation.
+4. Reserves one LLM permit for root/parent coordination when any parent has
+   a high-priority mailbox event; unused reserved capacity can be borrowed.
+5. Grants only the permits requested by the next task; a task waits rather than
+   holding unrelated permits.
+```
+
+Interactive root sessions have a higher weight than scheduled background roots.
+An idle session lends unused capacity. A project can set a stricter session
+ceiling, but no project can increase the user's global capacity.
+
+## IPC And Persistence Contract
+
+Every API command is a versioned envelope with a request ID and caller identity.
+Every durable state change appends an event in the same database transaction as
+its snapshot update. Client subscription has this shape:
+
+```text
+SubscribeEvents { after_event_id, filters }
+  -> Snapshot { event_id, sessions, tasks }
+  -> Event { event_id, timestamp, actor, subject, kind, payload }
+```
+
+If a client reconnects with a retained cursor, the daemon replays later events;
+if retention no longer covers the cursor, it returns a fresh snapshot. Socket
+permissions and OS-user checks protect local access. Database and log records
+redact tool inputs classified as secret and never contain provider credentials.
+
+## Human Intervention Semantics
+
+The following controls have defined effects:
+
+| Action | Effect |
+|---|---|
+| Pause | Stop admission after the next safe checkpoint; retain state and worktree. |
+| Resume | Move `Paused` to `Queued`; do not discard prior evidence. |
+| Cancel | Cancel the target; default recursive mode cancels descendants and preserves worktrees. |
+| Retry | Create a new attempt with the same immutable contract version. |
+| Message | Append a mailbox item; may request a next turn. |
+| Priority/budget | Apply within inherited ceilings and log the actor/reason. |
+| Approve/deny | Resolve a named permission request with the requested scope. |
+| Accept/rework/reject | Apply the direct-parent delivery workflow described above. |
+
+All destructive actions show affected descendants, leases, worktrees, and
+unmerged commits before confirmation. A user may target a leaf directly, but
+the direct parent receives a visible override notification.
