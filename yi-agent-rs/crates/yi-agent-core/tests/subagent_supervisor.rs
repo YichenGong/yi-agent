@@ -1,4 +1,6 @@
 use std::sync::{Arc, Mutex};
+
+use futures::future::BoxFuture;
 use std::time::Duration;
 
 use serde_json::json;
@@ -7,6 +9,7 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
 use yi_agent_core::subagent::task::{PermissionRequestId, RootSessionId, TaskDepth};
+use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerHandle, WorkerStart};
 use yi_agent_core::{ContentBlock, ToolRegistry};
 
 #[test]
@@ -43,6 +46,33 @@ fn spawning_enqueues_child_and_emits_a_structured_event() {
         supervisor.events().last(),
         Some(SupervisorEvent::TaskSpawned { parent_id, task_id }) if parent_id == &root && task_id == &child
     ));
+}
+
+struct ImmediateWorkerFactory;
+
+impl AgentWorkerFactory for ImmediateWorkerFactory {
+    fn start(
+        &self,
+        request: WorkerStart,
+    ) -> BoxFuture<'static, Result<WorkerHandle, yi_agent_core::subagent::worker::WorkerError>>
+    {
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+#[tokio::test]
+async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+
+    supervisor
+        .start_worker(&ImmediateWorkerFactory, &child)
+        .await
+        .unwrap();
+    assert!(supervisor.has_worker(&child));
+    let cancellation = supervisor.worker_cancellation(&child).unwrap();
+    supervisor.cancel_worker(&child).unwrap();
+    assert!(cancellation.is_cancelled());
 }
 
 #[tokio::test]

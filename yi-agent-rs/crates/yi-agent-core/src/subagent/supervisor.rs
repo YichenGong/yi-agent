@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{AgentTask, RootSessionId, TaskEvent, TaskFailure, TaskId};
+use super::worker::{AgentWorkerFactory, WorkerHandle, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
@@ -43,6 +44,7 @@ pub struct AgentSupervisor {
     tasks: HashMap<TaskId, AgentTask>,
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
+    workers: HashMap<TaskId, WorkerHandle>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
 }
@@ -61,6 +63,7 @@ impl AgentSupervisor {
             tasks,
             children: HashMap::new(),
             mailboxes,
+            workers: HashMap::new(),
             events: Vec::new(),
             updates,
         }
@@ -84,6 +87,51 @@ impl AgentSupervisor {
 
     pub fn mailbox(&self, task_id: &TaskId) -> Option<&Mailbox> {
         self.mailboxes.get(task_id)
+    }
+
+    pub fn has_worker(&self, task_id: &TaskId) -> bool {
+        self.workers.contains_key(task_id)
+    }
+
+    pub fn worker_cancellation(
+        &self,
+        task_id: &TaskId,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        self.workers
+            .get(task_id)
+            .map(WorkerHandle::cancellation_token)
+    }
+
+    /// Creates a worker only after the task has passed supervised admission.
+    pub async fn start_worker(
+        &mut self,
+        factory: &dyn AgentWorkerFactory,
+        task_id: &TaskId,
+    ) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let start = WorkerStart::new(
+            task.id.clone(),
+            task.active_attempt_id().clone(),
+            task.root_session_id.clone(),
+        );
+        let handle = factory
+            .start(start)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.start_task(task_id)?;
+        self.workers.insert(task_id.clone(), handle);
+        Ok(())
+    }
+
+    pub fn cancel_worker(&mut self, task_id: &TaskId) -> Result<(), String> {
+        self.workers
+            .get(task_id)
+            .ok_or_else(|| "worker does not exist".to_string())?
+            .cancel();
+        Ok(())
     }
 
     fn subscribe_updates(&self) -> watch::Receiver<u64> {
