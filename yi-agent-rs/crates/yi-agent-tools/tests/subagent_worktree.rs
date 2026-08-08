@@ -169,6 +169,19 @@ fn clean_accepted_child_can_be_removed_after_direct_parent_merge() {
 
     service.remove_accepted_clean(repo.path(), &child).unwrap();
     assert!(!child_path.exists());
+    assert!(
+        !Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/child/clean-accepted"
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]

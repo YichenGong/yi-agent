@@ -215,7 +215,20 @@ impl WorktreeService {
                 parent: parent_branch,
             });
         }
-        self.remove_clean(owner_worktree, &child.path)
+        self.remove_clean(owner_worktree, &child.path)?;
+        let output = Command::new("git")
+            .args(["branch", "-d", &child.branch])
+            .current_dir(owner_worktree)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub fn remove_clean(
