@@ -2,6 +2,7 @@
 
 mod config;
 mod llm_prefix;
+mod subagent_runtime;
 mod tracing_init;
 mod tui;
 
@@ -39,12 +40,12 @@ fn main() -> Result<()> {
             let prompt = prompt.clone();
             run_headless(cli, prompt, json, stdin, naked)
         }
-        Some(Command::Daemon { action }) => control_daemon(action),
+        Some(Command::Daemon { action }) => control_daemon(&cli, action),
         None => run_agent(cli),
     }
 }
 
-fn control_daemon(action: DaemonAction) -> Result<()> {
+fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     let runtime_dir = runtime_directory()?;
     let runtime = runtime_dir.join("runtime.sock");
     let database = runtime_dir.join("state.sqlite");
@@ -75,12 +76,69 @@ fn control_daemon(action: DaemonAction) -> Result<()> {
             }
             anyhow::bail!("daemon process did not become ready")
         }
-        DaemonAction::Serve => yi_agent_store::ipc::Daemon::start(&runtime_dir, &database)
-            .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
-            .wait()
-            .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}")),
+        DaemonAction::Serve => yi_agent_store::ipc::Daemon::start_with_factory(
+            &runtime_dir,
+            &database,
+            build_daemon_worker_factory(cli)?,
+        )
+        .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
+        .wait()
+        .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}")),
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
     }
+}
+
+fn build_daemon_worker_factory(
+    cli: &Cli,
+) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
+    let config = config::load(cli)?;
+    let provider: Arc<dyn Provider> = match config.provider.as_str() {
+        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
+            yi_agent_llm::AnthropicProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
+            yi_agent_llm::OpenaiProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        other => anyhow::bail!("unknown provider '{other}': expected 'anthropic' or 'openai'"),
+    };
+
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_tools::register_builtin_tools_with_sandbox(
+        &mut registry,
+        config.workdir.clone(),
+        config.sandbox,
+        config.sandbox_writable_roots.clone(),
+    );
+    let skills = setup_skills(&config)?;
+    if let Some(skills) = &skills {
+        registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
+    }
+    let agent_config = yi_agent_core::AgentConfig {
+        model: config.model,
+        system_prompt: resolve_system_prompt_with_skills(
+            config.system_prompt,
+            &skills,
+            config.skills_catalog_budget,
+            config.skills_catalog_budget_explicit,
+        ),
+        max_turns: Some(config.max_turns),
+        compact_threshold: Some(config.compact_threshold),
+        compact_keep_turns: Some(config.compact_keep_turns),
+        ..Default::default()
+    };
+    Ok(Arc::new(subagent_runtime::DaemonAgentWorkerFactory::new(
+        provider,
+        Arc::new(registry),
+        agent_config,
+    )))
 }
 
 fn runtime_directory() -> Result<std::path::PathBuf> {
