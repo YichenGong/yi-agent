@@ -44,6 +44,17 @@ fn child_creation_requires_a_clean_committed_parent_base() {
 }
 
 #[test]
+fn child_creation_rejects_reusing_the_parent_worktree_path() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+
+    assert!(matches!(
+        service.create_child(repo.path(), &head, "child/reused-path", repo.path()),
+        Err(WorktreeError::ParentPathReuse { .. })
+    ));
+}
+
+#[test]
 fn child_worktree_is_created_from_the_recorded_parent_commit() {
     let (repo, head) = repository();
     let child_root = TempDir::new().unwrap();
@@ -75,4 +86,59 @@ fn dirty_child_worktree_is_not_removed() {
         Err(WorktreeError::DirtyChild { .. })
     ));
     assert!(child_path.exists());
+}
+
+#[test]
+fn accepted_child_merges_only_into_its_recorded_direct_parent() {
+    let (repo, head) = repository();
+    let child_root = TempDir::new().unwrap();
+    let child_path = child_root.path().join("accepted-child");
+    let service = WorktreeService::new();
+    let child = service
+        .create_child(repo.path(), &head, "child/accepted", &child_path)
+        .unwrap();
+
+    git(&child_path, &["config", "user.email", "test@example.com"]);
+    git(&child_path, &["config", "user.name", "Test"]);
+    std::fs::write(child_path.join("delivery.txt"), "delivered\n").unwrap();
+    git(&child_path, &["add", "delivery.txt"]);
+    git(&child_path, &["commit", "-m", "delivery"]);
+
+    git(repo.path(), &["switch", "-c", "other-parent"]);
+    assert!(matches!(
+        service.merge_accepted(repo.path(), &child, "accept delivery"),
+        Err(WorktreeError::WrongParentBranch { .. })
+    ));
+
+    git(repo.path(), &["switch", "main"]);
+    service
+        .merge_accepted(repo.path(), &child, "accept delivery")
+        .unwrap();
+    assert_eq!(
+        git(repo.path(), &["show", "HEAD:delivery.txt"]),
+        "delivered"
+    );
+}
+
+#[test]
+fn clean_accepted_child_can_be_removed_after_direct_parent_merge() {
+    let (repo, head) = repository();
+    let child_root = TempDir::new().unwrap();
+    let child_path = child_root.path().join("clean-accepted-child");
+    let service = WorktreeService::new();
+    let child = service
+        .create_child(repo.path(), &head, "child/clean-accepted", &child_path)
+        .unwrap();
+
+    git(&child_path, &["config", "user.email", "test@example.com"]);
+    git(&child_path, &["config", "user.name", "Test"]);
+    std::fs::write(child_path.join("delivery.txt"), "delivered\n").unwrap();
+    git(&child_path, &["add", "delivery.txt"]);
+    git(&child_path, &["commit", "-m", "delivery"]);
+    service
+        .merge_accepted(repo.path(), &child, "accept delivery")
+        .unwrap();
+
+    service.remove_accepted_clean(repo.path(), &child).unwrap();
+    assert!(!child_path.exists());
 }
