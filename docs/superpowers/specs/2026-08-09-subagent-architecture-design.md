@@ -7,6 +7,22 @@ delegate independent work to child agents, and a child agent can delegate once
 more to leaf agents. Every coding agent works in an isolated Git worktree and
 delivers a verified commit for its parent to review and integrate.
 
+## Companion Specifications
+
+This document is the decision index. Normative implementation detail is split
+by independently deployable subsystem:
+
+- [Core task runtime](2026-08-09-subagent-core-design.md): task/attempt data,
+  transition guards, contracts, authority, mailbox, and Supervisor APIs.
+- [Git worktree delivery](2026-08-09-subagent-worktree-design.md): branch
+  ownership, committed bases, review, rework, merge, and cleanup.
+- [Daemon and persistence](2026-08-09-runtime-daemon-design.md): process
+  lifecycle, SQLite records, IPC protocol, credentials, and recovery.
+- [Scheduling and budgets](2026-08-09-runtime-scheduling-design.md): global
+  fairness, resource leases, limits, watchdogs, and scheduled roots.
+- [Control surface](2026-08-09-subagent-control-surface-design.md): CLI, TUI,
+  Slash commands, help, permission, review, and audit interaction.
+
 ## Status And Scope
 
 This is a design specification. The current codebase has one `Agent`, one
