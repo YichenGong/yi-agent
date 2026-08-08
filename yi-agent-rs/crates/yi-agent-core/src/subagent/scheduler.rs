@@ -101,6 +101,15 @@ impl ResourceCoordinator {
         let queued = queue
             .remove(selected_index)
             .expect("selected queue entry exists");
+        let incompatible_lease = self.active.values().any(|lease| {
+            lease.request.key == queued.request.key
+                && (lease.request.mode == LeaseMode::Exclusive
+                    || queued.request.mode == LeaseMode::Exclusive)
+        });
+        if incompatible_lease {
+            queue.insert(selected_index, queued);
+            return None;
+        }
         let lease = GrantedLease {
             lease_id: LeaseId::new(),
             task_id: queued.task_id,

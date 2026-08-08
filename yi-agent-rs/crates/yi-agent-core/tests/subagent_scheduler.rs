@@ -12,6 +12,15 @@ fn request(key: &str) -> ResourceRequest {
     }
 }
 
+fn shared_request(key: &str, units: u16) -> ResourceRequest {
+    ResourceRequest {
+        scope: ResourceScope::Global,
+        key: key.into(),
+        mode: LeaseMode::Shared,
+        units,
+    }
+}
+
 #[test]
 fn roots_take_turns_when_contending_for_a_permit() {
     let mut coordinator = ResourceCoordinator::new();
@@ -45,4 +54,38 @@ fn exclusive_workspace_lease_rejects_a_second_holder_until_release() {
     assert!(coordinator.grant_next("cargo:/repo").is_none());
     coordinator.release(lease.lease_id).unwrap();
     assert!(coordinator.grant_next("cargo:/repo").is_some());
+}
+
+#[test]
+fn resource_units_never_exceed_the_configured_capacity() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("build:host", 3);
+    let root = RootSessionId::new();
+    coordinator.enqueue(root.clone(), TaskId::new(), shared_request("build:host", 2));
+    coordinator.enqueue(root, TaskId::new(), shared_request("build:host", 2));
+
+    assert!(coordinator.grant_next("build:host").is_some());
+    assert!(coordinator.grant_next("build:host").is_none());
+}
+
+#[test]
+fn exclusive_lease_blocks_shared_holders_even_when_capacity_remains() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("git-integrate:/repo:main", 2);
+    let root = RootSessionId::new();
+    coordinator.enqueue(
+        root.clone(),
+        TaskId::new(),
+        request("git-integrate:/repo:main"),
+    );
+    coordinator.enqueue(
+        root,
+        TaskId::new(),
+        shared_request("git-integrate:/repo:main", 1),
+    );
+
+    let exclusive = coordinator.grant_next("git-integrate:/repo:main").unwrap();
+    assert!(coordinator.grant_next("git-integrate:/repo:main").is_none());
+    coordinator.release(exclusive.lease_id).unwrap();
+    assert!(coordinator.grant_next("git-integrate:/repo:main").is_some());
 }
