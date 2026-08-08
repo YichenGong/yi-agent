@@ -16,6 +16,13 @@ pub enum WorktreeError {
 #[derive(Debug, Default)]
 pub struct WorktreeService;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildWorktree {
+    pub path: PathBuf,
+    pub branch: String,
+    pub base_commit: String,
+}
+
 impl WorktreeService {
     pub fn new() -> Self {
         Self
@@ -46,6 +53,35 @@ impl WorktreeService {
             });
         }
         Ok(())
+    }
+
+    pub fn create_child(
+        &self,
+        parent_worktree: &Path,
+        base: &str,
+        branch: &str,
+        child_path: &Path,
+    ) -> Result<ChildWorktree, WorktreeError> {
+        self.validate_parent_base(parent_worktree, base)?;
+        let output = Command::new("git")
+            .args(["worktree", "add"])
+            .arg(child_path)
+            .args(["-b", branch, base])
+            .current_dir(parent_worktree)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(ChildWorktree {
+            path: child_path.to_path_buf(),
+            branch: branch.to_owned(),
+            base_commit: base.to_owned(),
+        })
     }
 }
 

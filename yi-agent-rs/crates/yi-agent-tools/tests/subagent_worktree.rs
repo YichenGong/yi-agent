@@ -42,3 +42,18 @@ fn child_creation_requires_a_clean_committed_parent_base() {
         Err(WorktreeError::DirtyParent { .. })
     ));
 }
+
+#[test]
+fn child_worktree_is_created_from_the_recorded_parent_commit() {
+    let (repo, head) = repository();
+    let child_path = repo.path().parent().unwrap().join("child-worktree");
+    let service = WorktreeService::new();
+
+    let child = service
+        .create_child(repo.path(), &head, "child/task", &child_path)
+        .unwrap();
+
+    assert_eq!(child.base_commit, head);
+    assert_eq!(child.branch, "child/task");
+    assert_eq!(git(&child_path, &["rev-parse", "HEAD"]), child.base_commit);
+}
