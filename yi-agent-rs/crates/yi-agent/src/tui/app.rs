@@ -1092,8 +1092,15 @@ fn execute_slash_command(
             }
             KeyOutcome::None
         }
-        SlashCommand::Agents
-        | SlashCommand::Agent
+        SlashCommand::Agents => {
+            let label = match daemon_agents_summary() {
+                Ok(summary) => summary,
+                Err(error) => format!("无法读取本地 daemon runtime: {error}"),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Agent
         | SlashCommand::Message
         | SlashCommand::Pause
         | SlashCommand::Resume
@@ -1117,6 +1124,33 @@ fn execute_slash_command(
             KeyOutcome::None
         }
     }
+}
+
+fn daemon_agents_summary() -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_agents_summary_at(&runtime_dir.join("runtime.sock"))
+}
+
+fn daemon_agents_summary_at(socket: &std::path::Path) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::SubscribeEvents { after_event_id: 0 },
+    )
+    .map_err(|error| error.to_string())?;
+    let yi_agent_store::ipc::IpcResponse::Subscription(snapshot) = response else {
+        return Err("daemon 返回了非订阅快照响应".into());
+    };
+    if snapshot.tasks.is_empty() {
+        return Ok("Agents: 暂无任务".into());
+    }
+    let mut output = format!("Agents ({})", snapshot.tasks.len());
+    for task in snapshot.tasks {
+        output.push_str(&format!("\n{}  {}", task.task_id, task.state));
+    }
+    Ok(output)
 }
 
 /// Build the popup widget for rendering.
@@ -1344,8 +1378,9 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
     use tokio::sync::mpsc;
-    use yi_agent_core::OutputStream;
+    use yi_agent_core::{OutputStream, RootSessionId, TaskId};
 
     #[test]
     fn test_route_event_full_flow() {
@@ -1423,6 +1458,26 @@ mod tests {
         );
         sb.tick();
         assert!(sb.display_input_tokens() > 0);
+    }
+
+    #[test]
+    fn agents_summary_reads_daemon_task_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let mut repository =
+            yi_agent_store::repository::RuntimeRepository::open(&database).unwrap();
+        let task = TaskId::new();
+        repository
+            .create_task(&task, &RootSessionId::new(), "queued")
+            .unwrap();
+
+        let summary = daemon_agents_summary_at(daemon.socket_path()).unwrap();
+
+        assert!(summary.contains(&task.to_string()));
+        assert!(summary.contains("queued"));
     }
 
     #[test]
