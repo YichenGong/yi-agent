@@ -1,9 +1,21 @@
+use std::sync::Arc;
+
+use futures::future::BoxFuture;
 use tempfile::TempDir;
+use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     Daemon, IpcRequest, IpcResponse, send_request, send_request_with_version, subscribe,
 };
 use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
+
+struct RecordingWorkerFactory;
+
+impl AgentWorkerFactory for RecordingWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
 
 #[test]
 fn task_snapshot_and_event_log_replay_from_cursor() {
@@ -305,4 +317,34 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
             .iter()
             .any(|task| task.task_id == child_task_id && task.state == "cancelled")
     );
+}
+
+#[test]
+fn daemon_starts_a_worker_through_its_injected_factory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(RecordingWorkerFactory),
+    )
+    .unwrap();
+
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::StartWorker {
+            session_id,
+            task_id: root_task_id,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, IpcResponse::TaskStarted));
 }

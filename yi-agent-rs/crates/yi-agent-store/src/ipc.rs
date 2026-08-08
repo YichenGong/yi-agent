@@ -54,6 +54,10 @@ pub enum IpcRequest {
         session_id: String,
         parent_task_id: String,
     },
+    StartWorker {
+        session_id: String,
+        task_id: String,
+    },
     CancelTask {
         session_id: String,
         task_id: String,
@@ -77,6 +81,7 @@ pub enum IpcResponse {
     TaskSpawned {
         task_id: String,
     },
+    TaskStarted,
     TaskCancelled,
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
@@ -502,6 +507,18 @@ fn respond(
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
             })
+        }
+        IpcRequest::StartWorker {
+            session_id,
+            task_id,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.start_worker(&session_id, &task_id))?;
+            Ok(IpcResponse::TaskStarted)
         }
         IpcRequest::CancelTask {
             session_id,
