@@ -11,6 +11,10 @@ pub enum WorktreeError {
     ParentPathReuse { path: PathBuf },
     #[error("child worktree is dirty: {path}")]
     DirtyChild { path: PathBuf },
+    #[error("child delivery has no commits beyond its recorded base {base}")]
+    EmptyDelivery { base: String },
+    #[error("reviewed child HEAD {reviewed} changed to {current}")]
+    ReviewedHeadChanged { reviewed: String, current: String },
     #[error("parent base commit is not available: {base}")]
     UnknownBase { base: String },
     #[error("recorded base {base} is not the current parent HEAD {head}")]
@@ -39,6 +43,7 @@ pub struct InspectedDelivery {
     pub branch: String,
     pub base_commit: String,
     pub head_commit: String,
+    pub clean: bool,
 }
 
 impl WorktreeService {
@@ -122,8 +127,13 @@ impl WorktreeService {
             &child.path,
             &["merge-base", &child.base_commit, &head_commit],
         )?;
-        if merge_base.trim() != child.base_commit || head_commit == child.base_commit {
+        if merge_base.trim() != child.base_commit {
             return Err(WorktreeError::UnknownBase {
+                base: child.base_commit.clone(),
+            });
+        }
+        if head_commit == child.base_commit {
+            return Err(WorktreeError::EmptyDelivery {
                 base: child.base_commit.clone(),
             });
         }
@@ -131,18 +141,19 @@ impl WorktreeService {
             branch: child.branch.clone(),
             base_commit: child.base_commit.clone(),
             head_commit,
+            clean: true,
         })
     }
 
-    /// Integrate a clean delivery into exactly the branch that created it.
+    /// Integrate the reviewed delivery into exactly the branch that created it.
     pub fn merge_accepted(
         &self,
         parent_worktree: &Path,
         child: &ChildWorktree,
+        delivery: &InspectedDelivery,
         message: &str,
     ) -> Result<(), WorktreeError> {
-        let delivery = self.inspect_delivery(child)?;
-        self.merge_inspected_delivery(parent_worktree, child, &delivery, message)
+        self.merge_inspected_delivery(parent_worktree, child, delivery, message)
     }
 
     /// Merge only a previously inspected commit, never the moving child branch tip.
@@ -153,6 +164,11 @@ impl WorktreeService {
         delivery: &InspectedDelivery,
         message: &str,
     ) -> Result<(), WorktreeError> {
+        if !delivery.clean {
+            return Err(WorktreeError::DirtyChild {
+                path: child.path.clone(),
+            });
+        }
         let parent_branch = current_branch(parent_worktree)?;
         if parent_branch != child.parent_branch {
             return Err(WorktreeError::WrongParentBranch {
@@ -163,6 +179,31 @@ impl WorktreeService {
         if delivery.branch != child.branch || delivery.base_commit != child.base_commit {
             return Err(WorktreeError::UnknownBase {
                 base: delivery.base_commit.clone(),
+            });
+        }
+        let status = git(&child.path, &["status", "--porcelain"])?;
+        if !status.trim().is_empty() {
+            return Err(WorktreeError::DirtyChild {
+                path: child.path.clone(),
+            });
+        }
+        let child_branch = current_branch(&child.path)?;
+        if child_branch != child.branch {
+            return Err(WorktreeError::WrongParentBranch {
+                expected: child.branch.clone(),
+                actual: child_branch,
+            });
+        }
+        let child_head = git(&child.path, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if child_head != delivery.head_commit {
+            return Err(WorktreeError::ReviewedHeadChanged {
+                reviewed: delivery.head_commit.clone(),
+                current: child_head,
+            });
+        }
+        if delivery.head_commit == child.base_commit {
+            return Err(WorktreeError::EmptyDelivery {
+                base: child.base_commit.clone(),
             });
         }
         let merge_base = git(
