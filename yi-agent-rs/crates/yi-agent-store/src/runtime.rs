@@ -129,6 +129,47 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// Drains facts emitted by application workers and persists their reducer
+    /// outcomes. Workers themselves never write task snapshots or events.
+    pub async fn reconcile_worker_events(&self) -> Result<(), RuntimeCoordinatorError> {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut updates = Vec::new();
+        for supervisor in supervisors {
+            let mut supervisor = supervisor.lock().await;
+            let changed = supervisor
+                .reconcile_worker_events()
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            for task_id in changed {
+                let state = supervisor
+                    .task(&task_id)
+                    .expect("reconciled task exists")
+                    .state();
+                let (state, event) = match state {
+                    yi_agent_core::TaskState::Cancelled(_) => {
+                        ("cancelled", RuntimeEvent::TaskCancelled)
+                    }
+                    yi_agent_core::TaskState::Failed(_) => ("failed", RuntimeEvent::TaskFailed),
+                    _ => continue,
+                };
+                updates.push((task_id, state, event));
+            }
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        for (task_id, state, event) in updates {
+            repository.transition_task(&task_id, state, event)?;
+        }
+        Ok(())
+    }
+
     pub async fn worker_cancellation(
         &self,
         session: &RootSessionId,

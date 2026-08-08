@@ -14,6 +14,18 @@ impl AgentWorkerFactory for RecordingFactory {
     }
 }
 
+struct FailingFactory;
+
+impl AgentWorkerFactory for FailingFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async move {
+            let handle = WorkerHandle::new(request.cancellation);
+            handle.report_failure("provider disconnected");
+            Ok(handle)
+        })
+    }
+}
+
 #[tokio::test]
 async fn coordinator_starts_root_worker_and_cancels_its_tree() {
     let directory = TempDir::new().unwrap();
@@ -44,4 +56,18 @@ async fn coordinator_starts_root_worker_and_cancels_its_tree() {
     assert!(child_cancellation.is_cancelled());
     assert_eq!(coordinator.task_state(&root).unwrap(), "cancelled");
     assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
+}
+
+#[tokio::test]
+async fn coordinator_persists_worker_failure_reported_by_the_factory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(FailingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    coordinator.start_worker(&session, &root).await.unwrap();
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert_eq!(coordinator.task_state(&root).unwrap(), "failed");
 }

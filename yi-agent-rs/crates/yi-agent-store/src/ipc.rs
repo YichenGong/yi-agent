@@ -386,7 +386,13 @@ fn handle_client(
                 IpcResponse::Stopping
             }
             IpcRequest::SubscribeEvents { after_event_id } => {
-                return stream_subscription(&mut stream, database_path, stop, after_event_id);
+                return stream_subscription(
+                    &mut stream,
+                    database_path,
+                    stop,
+                    coordinator,
+                    after_event_id,
+                );
             }
             request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
@@ -406,6 +412,7 @@ fn stream_subscription(
     stream: &mut UnixStream,
     database_path: &Path,
     stop: &AtomicBool,
+    coordinator: &RuntimeCoordinator,
     after_event_id: i64,
 ) -> Result<(), IpcError> {
     let mut repository = RuntimeRepository::open(database_path)?;
@@ -427,6 +434,10 @@ fn stream_subscription(
         }),
     )?;
     while !stop.load(Ordering::Acquire) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(coordinator.reconcile_worker_events())?;
         let repository = RuntimeRepository::open(database_path)?;
         let events = repository.event_records_after(cursor)?;
         for event in events {
@@ -479,6 +490,10 @@ fn respond(
     coordinator: &RuntimeCoordinator,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(coordinator.reconcile_worker_events())?;
     let mut repository = RuntimeRepository::open(database_path)?;
     match request {
         IpcRequest::Status => Ok(IpcResponse::Status {

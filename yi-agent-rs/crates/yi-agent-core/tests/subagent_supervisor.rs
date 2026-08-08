@@ -86,6 +86,18 @@ impl AgentWorkerFactory for FailingWorkerFactory {
     }
 }
 
+struct ReportingWorkerFactory;
+
+impl AgentWorkerFactory for ReportingWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async move {
+            let handle = WorkerHandle::new(request.cancellation);
+            handle.report_failure("provider stream disconnected");
+            Ok(handle)
+        })
+    }
+}
+
 #[tokio::test]
 async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -111,6 +123,27 @@ async fn worker_startup_failure_is_recorded_after_admission_without_a_handle() {
             .start_worker(&FailingWorkerFactory, &child)
             .await
             .is_err()
+    );
+
+    assert!(!supervisor.has_worker(&child));
+    assert!(matches!(
+        supervisor.task(&child).unwrap().state(),
+        TaskState::Failed(_)
+    ));
+}
+
+#[tokio::test]
+async fn supervisor_reduces_worker_failure_events_and_releases_the_handle() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+    supervisor
+        .start_worker(&ReportingWorkerFactory, &child)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        supervisor.reconcile_worker_events().unwrap(),
+        vec![child.clone()]
     );
 
     assert!(!supervisor.has_worker(&child));

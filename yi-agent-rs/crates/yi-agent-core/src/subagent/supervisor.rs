@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{AgentTask, CancelReason, RootSessionId, TaskEvent, TaskFailure, TaskId};
-use super::worker::{AgentWorkerFactory, WorkerHandle, WorkerStart};
+use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
@@ -155,6 +155,54 @@ impl AgentSupervisor {
             .ok_or_else(|| "worker does not exist".to_string())?
             .cancel();
         Ok(())
+    }
+
+    /// Applies worker facts through the task reducer and discards handles for
+    /// terminal tasks. A normal model completion without a structured delivery
+    /// is intentionally a failure: coding completion requires review evidence.
+    pub fn reconcile_worker_events(&mut self) -> Result<Vec<TaskId>, String> {
+        let events = self
+            .workers
+            .iter()
+            .flat_map(|(task_id, handle)| {
+                handle
+                    .take_events()
+                    .into_iter()
+                    .map(|event| (task_id.clone(), event))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut changed = Vec::new();
+        for (task_id, event) in events {
+            let task = self
+                .tasks
+                .get(&task_id)
+                .ok_or_else(|| "worker task does not exist".to_string())?;
+            if task.state().is_terminal() {
+                continue;
+            }
+            match event {
+                WorkerEvent::Failed(message) => self.fail_task(&task_id, message)?,
+                WorkerEvent::Cancelled => {
+                    self.cancel_task_tree(&task_id, false)?;
+                }
+                WorkerEvent::CompletedWithoutDelivery => {
+                    self.fail_task(
+                        &task_id,
+                        "worker completed without a structured delivery report",
+                    )?;
+                }
+            }
+            if self
+                .tasks
+                .get(&task_id)
+                .is_some_and(|task| task.state().is_terminal())
+            {
+                self.workers.remove(&task_id);
+                changed.push(task_id);
+            }
+        }
+        Ok(changed)
     }
 
     /// Cancels a task and, when requested, every descendant owned by this

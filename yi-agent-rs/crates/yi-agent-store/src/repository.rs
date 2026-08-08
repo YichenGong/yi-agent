@@ -21,6 +21,7 @@ pub enum RuntimeEvent {
     TaskQueued,
     TaskStarted,
     TaskCancelled,
+    TaskFailed,
     TaskRecoveryRequired,
 }
 
@@ -30,6 +31,7 @@ impl RuntimeEvent {
             Self::TaskQueued => "task_queued",
             Self::TaskStarted => "task_started",
             Self::TaskCancelled => "task_cancelled",
+            Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
         }
     }
@@ -39,6 +41,7 @@ impl RuntimeEvent {
             "task_queued" => Ok(Self::TaskQueued),
             "task_started" => Ok(Self::TaskStarted),
             "task_cancelled" => Ok(Self::TaskCancelled),
+            "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }

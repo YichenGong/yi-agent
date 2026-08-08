@@ -1,5 +1,7 @@
 //! Application-owned worker construction boundary for the runtime daemon.
 
+use std::sync::{Arc, Mutex};
+
 use futures::future::BoxFuture;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -36,11 +38,24 @@ impl WorkerStart {
 #[derive(Debug, Clone)]
 pub struct WorkerHandle {
     cancellation: CancellationToken,
+    events: Arc<Mutex<Vec<WorkerEvent>>>,
+}
+
+/// Facts reported by a worker. The supervisor remains the only component that
+/// converts these into task-state transitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerEvent {
+    CompletedWithoutDelivery,
+    Cancelled,
+    Failed(String),
 }
 
 impl WorkerHandle {
     pub fn new(cancellation: CancellationToken) -> Self {
-        Self { cancellation }
+        Self {
+            cancellation,
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -49,6 +64,34 @@ impl WorkerHandle {
 
     pub fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    pub fn report_completed_without_delivery(&self) {
+        self.report(WorkerEvent::CompletedWithoutDelivery);
+    }
+
+    pub fn report_cancelled(&self) {
+        self.report(WorkerEvent::Cancelled);
+    }
+
+    pub fn report_failure(&self, message: impl Into<String>) {
+        self.report(WorkerEvent::Failed(message.into()));
+    }
+
+    pub fn take_events(&self) -> Vec<WorkerEvent> {
+        std::mem::take(
+            &mut *self
+                .events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn report(&self, event: WorkerEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
     }
 }
 
