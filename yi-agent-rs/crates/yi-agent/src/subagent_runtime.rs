@@ -52,6 +52,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             }
             let handle = WorkerHandle::new(cancellation.clone());
             let reporter = handle.clone();
+            let mut mailbox = handle.subscribe_messages();
             let mut worker_tools = (*tools).clone();
             worker_tools.register(Arc::new(DaemonSpawnAgentTool {
                 runtime_socket: runtime_socket.clone(),
@@ -78,37 +79,62 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                     };
                     runtime.block_on(async move {
                         let mut agent = Agent::new(provider, worker_tools, config);
-                        let stream = match agent.run(objective).await {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                reporter.report_failure(error.to_string());
-                                return;
-                            }
-                        };
-                        let agent_cancellation = agent.cancel_token();
-                        let mut stream = Box::pin(stream);
-                        let mut cancellation_forwarded = false;
-                        loop {
-                            tokio::select! {
-                                _ = cancellation.cancelled(), if !cancellation_forwarded => {
-                                    agent_cancellation.cancel();
-                                    cancellation_forwarded = true;
+                        let mut prompt = objective;
+                        'run: loop {
+                            let stream = match agent.run(prompt).await {
+                                Ok(stream) => stream,
+                                Err(error) => {
+                                    reporter.report_failure(error.to_string());
+                                    return;
                                 }
-                                event = stream.next() => match event {
-                                    Some(AgentEvent::Done { .. }) | None => {
-                                        reporter.report_completed_without_delivery();
-                                        break;
+                            };
+                            let agent_cancellation = agent.cancel_token();
+                            let mut stream = Box::pin(stream);
+                            let mut cancellation_forwarded = false;
+                            let mut message_prompt = None;
+                            loop {
+                                tokio::select! {
+                                    message = mailbox.recv(), if message_prompt.is_none() => {
+                                        let Some(message) = message else {
+                                            reporter.report_failure("worker mailbox closed");
+                                            break 'run;
+                                        };
+                                        // Agent cancellation rolls back an incomplete tool turn.
+                                        // The next run keeps the session and adds this message.
+                                        message_prompt = Some(format!(
+                                            "Direct task message received. Incorporate it before continuing:\n{}",
+                                            message.body,
+                                        ));
+                                        agent_cancellation.cancel();
+                                    },
+                                    _ = cancellation.cancelled(), if !cancellation_forwarded => {
+                                        agent_cancellation.cancel();
+                                        cancellation_forwarded = true;
+                                    },
+                                    event = stream.next() => match event {
+                                        Some(AgentEvent::Done { .. }) | None => {
+                                            if let Some(next_prompt) = message_prompt.take() {
+                                                prompt = next_prompt;
+                                                continue 'run;
+                                            }
+                                            reporter.report_completed_without_delivery();
+                                            break 'run;
+                                        }
+                                        Some(AgentEvent::Cancelled) => {
+                                            if let Some(next_prompt) = message_prompt.take() {
+                                                prompt = next_prompt;
+                                                continue 'run;
+                                            }
+                                            reporter.report_cancelled();
+                                            break 'run;
+                                        }
+                                        Some(AgentEvent::Error(error)) => {
+                                            reporter.report_failure(error.to_string());
+                                            break 'run;
+                                        }
+                                        Some(_) => {}
                                     }
-                                    Some(AgentEvent::Cancelled) => {
-                                        reporter.report_cancelled();
-                                        break;
-                                    }
-                                    Some(AgentEvent::Error(error)) => {
-                                        reporter.report_failure(error.to_string());
-                                        break;
-                                    }
-                                    Some(_) => {}
-                                },
+                                }
                             }
                         }
                     });

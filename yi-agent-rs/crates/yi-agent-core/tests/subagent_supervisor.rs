@@ -98,6 +98,19 @@ impl AgentWorkerFactory for ReportingWorkerFactory {
     }
 }
 
+#[derive(Clone)]
+struct InboxWorkerFactory {
+    handle: Arc<Mutex<Option<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for InboxWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation);
+        *self.handle.lock().unwrap() = Some(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+}
+
 #[tokio::test]
 async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -200,6 +213,40 @@ async fn send_message_delivers_to_a_direct_child_mailbox() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn send_message_wakes_the_recipient_worker_inbox() {
+    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
+    let root = supervisor.lock().unwrap().root_task_id().clone();
+    let child = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
+    let factory = InboxWorkerFactory {
+        handle: Arc::new(Mutex::new(None)),
+    };
+    supervisor
+        .lock()
+        .unwrap()
+        .start_worker(&factory, &child)
+        .await
+        .unwrap();
+    let mut inbox = factory
+        .handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .subscribe_messages();
+
+    let tools = SupervisorTools::new(supervisor, root);
+    assert!(
+        !tools
+            .send_message()
+            .call(json!({ "recipient": child.to_string(), "message": "check progress" }))
+            .await
+            .is_error
+    );
+    let message = inbox.recv().await.unwrap();
+    assert_eq!(message.body, "check progress");
 }
 
 #[tokio::test]

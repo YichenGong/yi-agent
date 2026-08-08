@@ -346,6 +346,10 @@ impl AgentSupervisor {
         draft: MailboxMessageDraft,
     ) -> Result<(), MessageDeliveryError> {
         let recipient = draft.recipient().clone();
+        let worker_message = match draft.kind() {
+            MessageKind::UserInstruction(UserInstruction(body)) => Some(body.clone()),
+            _ => None,
+        };
         let recipient_task = self
             .tasks
             .get(&recipient)
@@ -368,6 +372,9 @@ impl AgentSupervisor {
             .get_mut(&recipient)
             .expect("task mailbox is created with task")
             .push(draft);
+        if let (Some(body), Some(worker)) = (worker_message, self.workers.get(&recipient)) {
+            worker.deliver_message(body);
+        }
         self.notify_update();
         Ok(())
     }
@@ -384,7 +391,7 @@ impl AgentSupervisor {
             sender,
             MailboxMessageDraft::new(
                 sender.clone(),
-                recipient,
+                recipient.clone(),
                 MessageKind::UserInstruction(UserInstruction(message)),
                 None,
             ),

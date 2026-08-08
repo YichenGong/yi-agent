@@ -1,9 +1,11 @@
 //! Application-owned worker construction boundary for the runtime daemon.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use thiserror::Error;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::task::{AttemptId, RootSessionId, TaskId};
@@ -39,6 +41,36 @@ impl WorkerStart {
 pub struct WorkerHandle {
     cancellation: CancellationToken,
     events: Arc<Mutex<Vec<WorkerEvent>>>,
+    messages: Arc<Mutex<VecDeque<WorkerMessage>>>,
+    message_updates: watch::Sender<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerMessage {
+    pub body: String,
+}
+
+/// A single-worker inbox. Its update channel allows an idle worker to await a
+/// message without polling while the queue preserves messages until consumed.
+pub struct WorkerMailbox {
+    messages: Arc<Mutex<VecDeque<WorkerMessage>>>,
+    updates: watch::Receiver<u64>,
+}
+
+impl WorkerMailbox {
+    pub async fn recv(&mut self) -> Option<WorkerMessage> {
+        loop {
+            if let Some(message) = self
+                .messages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+            {
+                return Some(message);
+            }
+            self.updates.changed().await.ok()?;
+        }
+    }
 }
 
 /// Facts reported by a worker. The supervisor remains the only component that
@@ -52,9 +84,12 @@ pub enum WorkerEvent {
 
 impl WorkerHandle {
     pub fn new(cancellation: CancellationToken) -> Self {
+        let (message_updates, _) = watch::channel(0_u64);
         Self {
             cancellation,
             events: Arc::new(Mutex::new(Vec::new())),
+            messages: Arc::new(Mutex::new(VecDeque::new())),
+            message_updates,
         }
     }
 
@@ -85,6 +120,22 @@ impl WorkerHandle {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    pub fn subscribe_messages(&self) -> WorkerMailbox {
+        WorkerMailbox {
+            messages: Arc::clone(&self.messages),
+            updates: self.message_updates.subscribe(),
+        }
+    }
+
+    pub fn deliver_message(&self, body: impl Into<String>) {
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(WorkerMessage { body: body.into() });
+        self.message_updates
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
     }
 
     fn report(&self, event: WorkerEvent) {

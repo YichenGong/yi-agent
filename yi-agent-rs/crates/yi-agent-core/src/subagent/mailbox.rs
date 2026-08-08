@@ -107,6 +107,10 @@ impl MailboxMessageDraft {
     pub fn recipient(&self) -> &TaskId {
         &self.recipient
     }
+
+    pub fn kind(&self) -> &MessageKind {
+        &self.kind
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
