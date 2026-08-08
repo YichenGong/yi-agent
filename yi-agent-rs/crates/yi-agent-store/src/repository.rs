@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
-use yi_agent_core::{RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
 const LATEST_SCHEMA_VERSION: i64 = 1;
 
@@ -126,6 +126,21 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    pub fn create_attempt(
+        &mut self,
+        attempt: &AttemptId,
+        task: &TaskId,
+        number: u32,
+        state: &str,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "INSERT INTO attempts (id, task_id, number, state, budget_json, usage_json)
+             VALUES (?1, ?2, ?3, ?4, '{}', '{}')",
+            params![attempt.to_string(), task.to_string(), number, state],
+        )?;
+        Ok(())
+    }
+
     /// Atomically changes the task snapshot and appends its corresponding journal entry.
     pub fn transition_task(
         &mut self,
@@ -179,6 +194,11 @@ impl RuntimeRepository {
              WHERE state = 'active' AND resource_key NOT LIKE 'worktree:%'",
             [],
         )?;
+        transaction.execute(
+            "UPDATE attempts SET state = 'recovery_required', ended_at = CURRENT_TIMESTAMP
+             WHERE state IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children')",
+            [],
+        )?;
         transaction.commit()?;
         Ok(task_ids.len())
     }
@@ -187,6 +207,14 @@ impl RuntimeRepository {
         Ok(self.connection.query_row(
             "SELECT state_json FROM tasks WHERE id = ?1",
             params![task.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT state FROM attempts WHERE id = ?1",
+            params![attempt.to_string()],
             |row| row.get(0),
         )?)
     }

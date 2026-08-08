@@ -1,5 +1,5 @@
 use tempfile::TempDir;
-use yi_agent_core::{RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     Daemon, IpcRequest, IpcResponse, send_request, send_request_with_version, subscribe,
 };
@@ -108,6 +108,26 @@ fn startup_recovery_marks_live_tasks_without_replaying_work() {
     assert_eq!(
         repository.event_records_after(0).unwrap()[0].event,
         RuntimeEvent::TaskRecoveryRequired
+    );
+}
+
+#[test]
+fn startup_recovery_marks_live_attempts_with_their_parent_tasks() {
+    let directory = TempDir::new().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    let attempt = AttemptId::new();
+    repository.create_task(&task, &root, "running").unwrap();
+    repository
+        .create_attempt(&attempt, &task, 1, "running")
+        .unwrap();
+
+    repository.recover_inflight_tasks().unwrap();
+    assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
+    assert_eq!(
+        repository.attempt_state(&attempt).unwrap(),
+        "recovery_required"
     );
 }
 
