@@ -249,6 +249,19 @@ async fn send_message_wakes_the_recipient_worker_inbox() {
     assert_eq!(message.body, "check progress");
 }
 
+#[test]
+fn terminal_task_cannot_send_a_message_to_its_parent() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    supervisor.start_task(&child).unwrap();
+    supervisor.fail_task(&child, "worker stopped").unwrap();
+
+    let result = supervisor.send_user_message(&child, root, "late message".into());
+
+    assert!(result.is_err());
+}
+
 #[tokio::test]
 async fn wait_all_returns_only_after_all_direct_children_are_terminal() {
     let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));

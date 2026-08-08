@@ -31,6 +31,10 @@ pub enum SpawnError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MessageDeliveryError {
+    #[error("sender task does not exist")]
+    SenderNotFound,
+    #[error("terminal tasks cannot send mailbox messages")]
+    SenderTerminal,
     #[error("recipient task does not exist")]
     RecipientNotFound,
     #[error("messages may only be sent to a direct parent or child")]
@@ -350,6 +354,13 @@ impl AgentSupervisor {
             MessageKind::UserInstruction(UserInstruction(body)) => Some(body.clone()),
             _ => None,
         };
+        let sender_task = self
+            .tasks
+            .get(sender)
+            .ok_or(MessageDeliveryError::SenderNotFound)?;
+        if sender_task.state().is_terminal() {
+            return Err(MessageDeliveryError::SenderTerminal);
+        }
         let recipient_task = self
             .tasks
             .get(&recipient)
