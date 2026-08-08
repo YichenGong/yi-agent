@@ -4,4 +4,5 @@
 //! 依赖 `yi-agent-core` 的 `Session` 抽象,具体存储后端(如 SQLite)
 //! 在本 crate 内实现。
 
+pub mod ipc;
 pub mod repository;

@@ -1,5 +1,8 @@
 use tempfile::TempDir;
 use yi_agent_core::{RootSessionId, TaskId};
+use yi_agent_store::ipc::{
+    Daemon, IpcRequest, IpcResponse, send_request, send_request_with_version,
+};
 use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
 
 #[test]
@@ -93,4 +96,48 @@ fn transition_of_an_unknown_task_does_not_create_an_orphan_event() {
         Err(RepositoryError::TaskNotFound { .. })
     ));
     assert!(repository.event_records_after(0).unwrap().is_empty());
+}
+
+#[test]
+fn second_client_receives_a_snapshot_and_events_after_its_cursor() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_event(&task, RuntimeEvent::TaskQueued)
+        .unwrap();
+    repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SubscribeEvents { after_event_id: 1 },
+    )
+    .unwrap();
+    let IpcResponse::Subscription(snapshot) = response else {
+        panic!("expected subscription snapshot");
+    };
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.tasks[0].task_id, task.to_string());
+    assert_eq!(snapshot.tasks[0].state, "running");
+    assert_eq!(snapshot.events.len(), 1);
+    assert_eq!(snapshot.events[0].event_id, 2);
+    assert!(snapshot.high_water_event_id >= snapshot.events[0].event_id);
+}
+
+#[test]
+fn daemon_rejects_second_instance_and_reports_protocol_mismatch() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(&runtime, &database).unwrap();
+
+    assert!(Daemon::start(&runtime, &database).is_err());
+    let response = send_request_with_version(daemon.socket_path(), 2, IpcRequest::Status).unwrap();
+    assert!(matches!(response, IpcResponse::UnsupportedProtocol { .. }));
 }

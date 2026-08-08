@@ -3637,6 +3637,8 @@ name = "yi-agent-store"
 version = "0.1.2"
 dependencies = [
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "yi-agent-core",

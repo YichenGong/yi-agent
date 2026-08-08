@@ -49,6 +49,12 @@ pub struct PersistedEvent {
     pub event: RuntimeEvent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTask {
+    pub task_id: String,
+    pub state: String,
+}
+
 pub struct RuntimeRepository {
     connection: Connection,
 }
@@ -184,6 +190,28 @@ impl RuntimeRepository {
             .into_iter()
             .map(|record| record.event)
             .collect())
+    }
+
+    pub fn latest_event_id(&self) -> Result<i64, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    pub fn task_snapshots(&self) -> Result<Vec<PersistedTask>, RepositoryError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, state_json FROM tasks ORDER BY created_at, id")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(PersistedTask {
+                    task_id: row.get(0)?,
+                    state: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn event_records_after(&self, cursor: i64) -> Result<Vec<PersistedEvent>, RepositoryError> {
