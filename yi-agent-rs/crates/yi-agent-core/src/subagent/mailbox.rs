@@ -76,18 +76,32 @@ pub struct MailboxMessageDraft {
 }
 
 impl MailboxMessageDraft {
+    pub fn new(
+        sender: TaskId,
+        recipient: TaskId,
+        kind: MessageKind,
+        correlation_id: Option<AttemptId>,
+    ) -> Self {
+        Self {
+            sender,
+            recipient,
+            kind,
+            correlation_id,
+        }
+    }
+
     pub fn progress(
         sender: TaskId,
         recipient: TaskId,
         correlation_id: AttemptId,
         text: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::new(
             sender,
             recipient,
-            kind: MessageKind::Progress(ProgressReport(text.into())),
-            correlation_id: Some(correlation_id),
-        }
+            MessageKind::Progress(ProgressReport(text.into())),
+            Some(correlation_id),
+        )
     }
 }
 

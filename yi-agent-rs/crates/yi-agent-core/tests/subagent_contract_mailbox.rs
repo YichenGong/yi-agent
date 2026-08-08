@@ -67,3 +67,24 @@ fn repeated_progress_coalesces_without_waking_the_parent() {
     ));
     assert_eq!(mailbox.messages()[0].priority, MessagePriority::Normal);
 }
+
+#[test]
+fn completion_message_wakes_the_parent_and_is_not_coalesced() {
+    let parent = TaskId::new();
+    let child = TaskId::new();
+    let mut mailbox = Mailbox::default();
+
+    let receipt = mailbox.push(MailboxMessageDraft::new(
+        child,
+        parent,
+        MessageKind::Blocked(yi_agent_core::subagent::task::BlockReason(
+            "needs input".into(),
+        )),
+        None,
+    ));
+
+    assert!(receipt.wakes_recipient);
+    assert!(!receipt.coalesced);
+    assert_eq!(mailbox.messages().len(), 1);
+    assert_eq!(mailbox.messages()[0].priority, MessagePriority::High);
+}
