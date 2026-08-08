@@ -2,12 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
-use yi_agent_core::ContentBlock;
 use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
 use yi_agent_core::subagent::task::{PermissionRequestId, RootSessionId, TaskDepth};
+use yi_agent_core::{ContentBlock, ToolRegistry};
 
 #[test]
 fn spawn_enforces_depth_two_and_four_direct_children() {
@@ -180,4 +180,21 @@ async fn wait_is_interrupted_by_a_permission_request() {
     assert!(
         matches!(&result.content[0], ContentBlock::Text(text) if text.contains("needs_attention"))
     );
+}
+
+#[test]
+fn supervisor_toolset_registers_all_three_builtin_schemas() {
+    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
+    let root = supervisor.lock().unwrap().root_task_id().clone();
+    let tools = SupervisorTools::new(supervisor, root);
+    let mut registry = ToolRegistry::new();
+
+    tools.register_into(&mut registry);
+
+    let names = registry
+        .schemas()
+        .into_iter()
+        .map(|schema| schema.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["send_message", "spawn_agent", "wait_agent"]);
 }

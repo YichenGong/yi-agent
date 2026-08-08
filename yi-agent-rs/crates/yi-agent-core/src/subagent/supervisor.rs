@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{AgentTask, RootSessionId, TaskEvent, TaskFailure, TaskId};
-use crate::tool::{Tool, ToolResult};
+use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
 
@@ -233,6 +233,12 @@ impl SupervisorTools {
         Arc::new(SendMessageTool {
             tools: self.clone(),
         })
+    }
+
+    pub fn register_into(&self, registry: &mut ToolRegistry) {
+        registry.register(self.spawn_agent());
+        registry.register(self.wait_agent());
+        registry.register(self.send_message());
     }
 }
 
