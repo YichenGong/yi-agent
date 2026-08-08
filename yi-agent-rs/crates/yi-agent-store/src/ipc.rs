@@ -275,23 +275,23 @@ fn handle_client(mut stream: UnixStream, database_path: &Path) -> Result<(), Ipc
 }
 
 fn respond(database_path: &Path, request: IpcRequest) -> Result<IpcResponse, IpcError> {
-    let repository = RuntimeRepository::open(database_path)?;
-    let high_water_event_id = repository.latest_event_id()?;
+    let mut repository = RuntimeRepository::open(database_path)?;
     match request {
         IpcRequest::Status => Ok(IpcResponse::Status {
-            high_water_event_id,
+            high_water_event_id: repository.latest_event_id()?,
         }),
         IpcRequest::SubscribeEvents { after_event_id } => {
-            let tasks = repository
-                .task_snapshots()?
+            let snapshot = repository.subscription_snapshot(after_event_id)?;
+            let tasks = snapshot
+                .tasks
                 .into_iter()
                 .map(|task| IpcTask {
                     task_id: task.task_id,
                     state: task.state,
                 })
                 .collect();
-            let events = repository
-                .event_records_after(after_event_id)?
+            let events = snapshot
+                .events
                 .into_iter()
                 .map(|event| IpcEvent {
                     event_id: event.id,
@@ -300,7 +300,7 @@ fn respond(database_path: &Path, request: IpcRequest) -> Result<IpcResponse, Ipc
                 })
                 .collect();
             Ok(IpcResponse::Subscription(SubscriptionSnapshot {
-                high_water_event_id,
+                high_water_event_id: snapshot.high_water_event_id,
                 tasks,
                 events,
             }))

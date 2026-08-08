@@ -55,6 +55,13 @@ pub struct PersistedTask {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSubscriptionSnapshot {
+    pub high_water_event_id: i64,
+    pub tasks: Vec<PersistedTask>,
+    pub events: Vec<PersistedEvent>,
+}
+
 pub struct RuntimeRepository {
     connection: Connection,
 }
@@ -212,6 +219,62 @@ impl RuntimeRepository {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Read task snapshots, a high-water mark, and replay in one SQLite read transaction.
+    pub fn subscription_snapshot(
+        &mut self,
+        after_event_id: i64,
+    ) -> Result<RuntimeSubscriptionSnapshot, RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        let high_water_event_id =
+            transaction.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+        let tasks = {
+            let mut statement =
+                transaction.prepare("SELECT id, state_json FROM tasks ORDER BY created_at, id")?;
+            statement
+                .query_map([], |row| {
+                    Ok(PersistedTask {
+                        task_id: row.get(0)?,
+                        state: row.get(1)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let events = {
+            let mut statement = transaction.prepare(
+                "SELECT id, task_id, kind FROM events WHERE id > ?1 AND id <= ?2 ORDER BY id",
+            )?;
+            statement
+                .query_map(params![after_event_id, high_water_event_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .map(|row| {
+                    let (id, task_id, kind) = row?;
+                    Ok(PersistedEvent {
+                        id,
+                        task_id: task_id.parse().map_err(|_| {
+                            RepositoryError::UnknownEventKind {
+                                kind: format!("invalid task ID in store: {task_id}"),
+                            }
+                        })?,
+                        event: RuntimeEvent::parse(kind)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RepositoryError>>()?
+        };
+        transaction.commit()?;
+        Ok(RuntimeSubscriptionSnapshot {
+            high_water_event_id,
+            tasks,
+            events,
+        })
     }
 
     pub fn event_records_after(&self, cursor: i64) -> Result<Vec<PersistedEvent>, RepositoryError> {

@@ -70,6 +70,32 @@ fn transition_updates_task_snapshot_and_event_journal_together() {
 }
 
 #[test]
+fn subscription_snapshot_uses_one_high_water_boundary_for_replay() {
+    let directory = TempDir::new().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_event(&task, RuntimeEvent::TaskQueued)
+        .unwrap();
+    repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+
+    let snapshot = repository.subscription_snapshot(1).unwrap();
+    assert_eq!(snapshot.high_water_event_id, 2);
+    assert_eq!(snapshot.tasks[0].state, "running");
+    assert_eq!(snapshot.events.len(), 1);
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .all(|event| event.id <= snapshot.high_water_event_id)
+    );
+}
+
+#[test]
 fn startup_recovery_marks_live_tasks_without_replaying_work() {
     let directory = TempDir::new().unwrap();
     let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
