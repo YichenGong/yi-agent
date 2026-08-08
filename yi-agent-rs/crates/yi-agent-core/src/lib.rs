@@ -5,6 +5,7 @@ pub mod compact;
 pub mod message;
 pub mod permission;
 pub mod provider;
+pub mod subagent;
 pub mod tool;
 
 // Re-export most-used types at crate root.
@@ -14,6 +15,9 @@ pub use message::{ContentBlock, ImageSource, Message, Role};
 pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
     StopReason, TokenUsage,
+};
+pub use subagent::task::{
+    AgentTask, AttemptId, RootSessionId, TaskAttempt, TaskDepth, TaskId, TaskState,
 };
 pub use tool::{
     OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,
