@@ -80,6 +80,9 @@ impl DelegatedAuthority {
     }
 
     pub fn derive_child(&self, proposed: &Self) -> Result<Self, AuthorityDerivationError> {
+        if proposed.root_session_id != self.root_session_id {
+            return Err(AuthorityDerivationError::RootSessionMismatch);
+        }
         if !proposed.tools.is_subset(&self.tools) {
             let tool = proposed
                 .tools
@@ -115,6 +118,8 @@ fn exceeds<T: Ord>(child: Option<T>, parent: Option<T>) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AuthorityDerivationError {
+    #[error("child authority belongs to a different root session")]
+    RootSessionMismatch,
     #[error("tool {tool} is not delegable")]
     ToolNotDelegable { tool: String },
     #[error("path is outside the parent lease")]

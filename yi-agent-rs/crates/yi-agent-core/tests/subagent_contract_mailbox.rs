@@ -9,10 +9,18 @@ use yi_agent_core::subagent::mailbox::{
 use yi_agent_core::subagent::task::{AttemptId, RootSessionId, TaskId};
 
 fn authority(tools: &[&str], paths: &[&str]) -> DelegatedAuthority {
+    authority_for_root(RootSessionId::new(), tools, paths)
+}
+
+fn authority_for_root(
+    root_session_id: RootSessionId,
+    tools: &[&str],
+    paths: &[&str],
+) -> DelegatedAuthority {
     DelegatedAuthority::new(
         TaskId::new(),
         TaskId::new(),
-        RootSessionId::new(),
+        root_session_id,
         tools
             .iter()
             .map(|tool| (*tool).to_string())
@@ -29,11 +37,26 @@ fn authority(tools: &[&str], paths: &[&str]) -> DelegatedAuthority {
 #[test]
 fn child_authority_cannot_widen_parent_tools_or_paths() {
     let parent = authority(&["read", "write"], &["crates/core/**"]);
-    let child = authority(&["read", "bash"], &["crates/**"]);
+    let child = authority_for_root(
+        parent.root_session_id.clone(),
+        &["read", "bash"],
+        &["crates/**"],
+    );
 
     assert!(matches!(
         parent.derive_child(&child),
         Err(AuthorityDerivationError::ToolNotDelegable { .. })
+    ));
+}
+
+#[test]
+fn child_authority_cannot_cross_root_session_boundary() {
+    let parent = authority(&["read"], &["crates/core/**"]);
+    let child = authority(&["read"], &["crates/core/src/**"]);
+
+    assert!(matches!(
+        parent.derive_child(&child),
+        Err(AuthorityDerivationError::RootSessionMismatch)
     ));
 }
 
