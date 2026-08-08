@@ -17,7 +17,8 @@ pub use provider::{
     StopReason, TokenUsage,
 };
 pub use subagent::task::{
-    AgentTask, AttemptId, RootSessionId, TaskAttempt, TaskDepth, TaskId, TaskState,
+    AgentTask, AttemptId, RootSessionId, TaskAttempt, TaskDepth, TaskEvent, TaskId,
+    TaskReduceError, TaskState, TransitionResult, reduce,
 };
 pub use tool::{
     OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,

@@ -38,6 +38,8 @@ uuid_id!(TaskId);
 uuid_id!(AttemptId);
 uuid_id!(RootSessionId);
 uuid_id!(DeliveryId);
+uuid_id!(MessageId);
+uuid_id!(IntegrationId);
 uuid_id!(PermissionRequestId);
 uuid_id!(AuthorityId);
 uuid_id!(WorkspaceLeaseId);
@@ -212,9 +214,33 @@ pub struct TaskTransitionError {
 pub enum DeliveryState {
     None,
     ReadyForReview(DeliveryId),
-    Accepted { delivery: DeliveryId },
-    ReworkRequested { previous: DeliveryId },
-    Rejected { delivery: DeliveryId },
+    Accepted {
+        delivery: DeliveryId,
+        integration: IntegrationId,
+    },
+    ReworkRequested {
+        previous: DeliveryId,
+        feedback: MessageId,
+    },
+    Rejected {
+        delivery: DeliveryId,
+        reason: MessageId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryReport {
+    pub id: DeliveryId,
+    pub evidence: String,
+}
+
+impl DeliveryReport {
+    pub fn new(evidence: impl Into<String>) -> Self {
+        Self {
+            id: DeliveryId::new(),
+            evidence: evidence.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +285,7 @@ pub struct TaskAttempt {
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub checkpoint: Option<StableCheckpoint>,
+    pub delivery: Option<DeliveryReport>,
     pub budget: EffectiveBudget,
     pub usage: AttemptUsage,
     pub terminal_reason: Option<TerminalReason>,
@@ -273,6 +300,7 @@ impl TaskAttempt {
             started_at: Utc::now(),
             ended_at: None,
             checkpoint: None,
+            delivery: None,
             budget: EffectiveBudget::default(),
             usage: AttemptUsage::default(),
             terminal_reason: None,
@@ -287,6 +315,7 @@ impl TaskAttempt {
             started_at: Utc::now(),
             ended_at: None,
             checkpoint: None,
+            delivery: None,
             budget: self.budget.clone(),
             usage: AttemptUsage::default(),
             terminal_reason: None,
@@ -303,11 +332,11 @@ pub struct AgentTask {
     pub created_at: DateTime<Utc>,
     pub current_contract: ContractVersion,
     pub authority_id: AuthorityId,
-    pub active_attempt: AttemptId,
-    pub state: TaskState,
-    pub delivery: DeliveryState,
+    active_attempt: AttemptId,
+    state: TaskState,
+    delivery: DeliveryState,
     pub workspace: Option<WorkspaceLeaseId>,
-    pub attempts: Vec<TaskAttempt>,
+    attempts: Vec<TaskAttempt>,
 }
 
 impl AgentTask {
@@ -337,49 +366,62 @@ impl AgentTask {
             .expect("active attempt must be retained in attempt history")
     }
 
-    pub fn active_attempt_mut(&mut self) -> &mut TaskAttempt {
+    pub fn active_attempt_id(&self) -> &AttemptId {
+        &self.active_attempt
+    }
+
+    pub fn attempts(&self) -> &[TaskAttempt] {
+        &self.attempts
+    }
+
+    pub fn state(&self) -> &TaskState {
+        &self.state
+    }
+
+    pub fn delivery(&self) -> &DeliveryState {
+        &self.delivery
+    }
+
+    fn active_attempt_mut(&mut self) -> &mut TaskAttempt {
         self.attempts
             .iter_mut()
             .find(|attempt| attempt.id == self.active_attempt)
             .expect("active attempt must be retained in attempt history")
     }
 
-    pub fn transition_to(&mut self, next: TaskState) -> Result<(), TaskTransitionError> {
-        self.state.can_transition_to(next.clone())?;
-        self.state = next;
-        Ok(())
-    }
-
-    pub fn retry(&mut self) -> Result<TaskAttempt, AttemptLifecycleError> {
-        if !self.state.is_terminal() {
-            return Err(AttemptLifecycleError::RetryRequiresTerminalState);
-        }
-        self.start_next_attempt(self.terminal_reason())
-    }
-
-    pub fn rework(&mut self) -> Result<TaskAttempt, AttemptLifecycleError> {
-        if !matches!(self.state, TaskState::AwaitingParentReview(_)) {
-            return Err(AttemptLifecycleError::ReworkRequiresReviewState);
-        }
-        self.start_next_attempt(TerminalReason::ReworkRequested)
+    pub fn reduce(
+        &mut self,
+        event: TaskEvent,
+        now: DateTime<Utc>,
+    ) -> Result<TransitionResult, TaskReduceError> {
+        reduce(self, event, now)
     }
 
     fn start_next_attempt(
         &mut self,
         terminal_reason: TerminalReason,
+        clear_delivery: bool,
+        now: DateTime<Utc>,
     ) -> Result<TaskAttempt, AttemptLifecycleError> {
         let current = self.active_attempt_mut();
-        if current.ended_at.is_some() {
-            return Err(AttemptLifecycleError::ActiveAttemptAlreadyClosed);
+        if current.ended_at.is_none() {
+            current.ended_at = Some(now);
+            current.terminal_reason = Some(terminal_reason);
         }
-        current.ended_at = Some(Utc::now());
-        current.terminal_reason = Some(terminal_reason);
         let next = current.successor();
         self.active_attempt = next.id.clone();
         self.attempts.push(next.clone());
         self.state = TaskState::Queued;
-        self.delivery = DeliveryState::None;
+        if clear_delivery {
+            self.delivery = DeliveryState::None;
+        }
         Ok(next)
+    }
+
+    fn close_active_attempt(&mut self, reason: TerminalReason, now: DateTime<Utc>) {
+        let attempt = self.active_attempt_mut();
+        attempt.ended_at = Some(now);
+        attempt.terminal_reason = Some(reason);
     }
 
     fn terminal_reason(&self) -> TerminalReason {
@@ -406,8 +448,280 @@ pub enum AttemptLifecycleError {
     RetryRequiresTerminalState,
     #[error("rework requires awaiting parent review")]
     ReworkRequiresReviewState,
-    #[error("the active attempt is already closed")]
-    ActiveAttemptAlreadyClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskEvent {
+    AdmissionGranted {
+        attempt_id: AttemptId,
+    },
+    ResourceUnavailable {
+        attempt_id: AttemptId,
+        wait: ResourceWait,
+    },
+    PermissionRequested {
+        attempt_id: AttemptId,
+        request: PermissionRequestId,
+    },
+    PermissionResolved {
+        attempt_id: AttemptId,
+        request: PermissionRequestId,
+        decision: PermissionDecision,
+    },
+    WorkerDelivered {
+        attempt_id: AttemptId,
+        delivery: DeliveryReport,
+    },
+    WorkerFailed {
+        attempt_id: AttemptId,
+        failure: TaskFailure,
+    },
+    ReviewAccepted {
+        attempt_id: AttemptId,
+        delivery_id: DeliveryId,
+        integration: IntegrationId,
+    },
+    ReviewRework {
+        attempt_id: AttemptId,
+        delivery_id: DeliveryId,
+        feedback: MessageId,
+    },
+    ReviewRejected {
+        attempt_id: AttemptId,
+        delivery_id: DeliveryId,
+        reason: MessageId,
+    },
+    CancelRequested {
+        attempt_id: AttemptId,
+        reason: CancelReason,
+    },
+    RuntimeInterrupted {
+        attempt_id: AttemptId,
+        evidence: RecoveryEvidence,
+    },
+    RetryRequested {
+        attempt_id: AttemptId,
+    },
+}
+
+impl TaskEvent {
+    fn attempt_id(&self) -> &AttemptId {
+        match self {
+            Self::AdmissionGranted { attempt_id }
+            | Self::ResourceUnavailable { attempt_id, .. }
+            | Self::PermissionRequested { attempt_id, .. }
+            | Self::PermissionResolved { attempt_id, .. }
+            | Self::WorkerDelivered { attempt_id, .. }
+            | Self::WorkerFailed { attempt_id, .. }
+            | Self::ReviewAccepted { attempt_id, .. }
+            | Self::ReviewRework { attempt_id, .. }
+            | Self::ReviewRejected { attempt_id, .. }
+            | Self::CancelRequested { attempt_id, .. }
+            | Self::RuntimeInterrupted { attempt_id, .. }
+            | Self::RetryRequested { attempt_id } => attempt_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionResult {
+    pub new_attempt: Option<TaskAttempt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum TaskReduceError {
+    #[error("event attempt {event_attempt} is not active attempt {active_attempt}")]
+    StaleAttempt {
+        event_attempt: AttemptId,
+        active_attempt: AttemptId,
+    },
+    #[error("event delivery does not match the delivery awaiting review")]
+    DeliveryMismatch {
+        expected: DeliveryId,
+        actual: DeliveryId,
+    },
+    #[error("permission resolution does not match the active wait")]
+    PermissionMismatch {
+        expected: PermissionRequestId,
+        actual: PermissionRequestId,
+    },
+    #[error(transparent)]
+    Transition(#[from] TaskTransitionError),
+    #[error(transparent)]
+    Attempt(#[from] AttemptLifecycleError),
+}
+
+pub fn reduce(
+    task: &mut AgentTask,
+    event: TaskEvent,
+    now: DateTime<Utc>,
+) -> Result<TransitionResult, TaskReduceError> {
+    if event.attempt_id() != task.active_attempt_id() {
+        return Err(TaskReduceError::StaleAttempt {
+            event_attempt: event.attempt_id().clone(),
+            active_attempt: task.active_attempt_id().clone(),
+        });
+    }
+
+    let mut result = TransitionResult { new_attempt: None };
+    match event {
+        TaskEvent::AdmissionGranted { .. } => transition(task, TaskState::Running, now)?,
+        TaskEvent::ResourceUnavailable { wait, .. } => {
+            transition(task, TaskState::WaitingForResource(wait), now)?
+        }
+        TaskEvent::PermissionRequested { request, .. } => {
+            transition(task, TaskState::WaitingForPermission(request), now)?
+        }
+        TaskEvent::PermissionResolved {
+            request, decision, ..
+        } => {
+            let TaskState::WaitingForPermission(expected) = task.state() else {
+                return Err(TaskTransitionError {
+                    from: task.state().clone(),
+                    to: TaskState::Queued,
+                }
+                .into());
+            };
+            if expected != &request {
+                return Err(TaskReduceError::PermissionMismatch {
+                    expected: expected.clone(),
+                    actual: request,
+                });
+            }
+            match decision {
+                PermissionDecision::Allow => transition(task, TaskState::Queued, now)?,
+                PermissionDecision::Deny => transition(
+                    task,
+                    TaskState::Blocked(BlockReason("permission denied".into())),
+                    now,
+                )?,
+            }
+        }
+        TaskEvent::WorkerDelivered { delivery, .. } => {
+            transition(
+                task,
+                TaskState::AwaitingParentReview(delivery.id.clone()),
+                now,
+            )?;
+            task.active_attempt_mut().delivery = Some(delivery.clone());
+            task.delivery = DeliveryState::ReadyForReview(delivery.id);
+        }
+        TaskEvent::WorkerFailed { failure, .. } => {
+            transition(task, TaskState::Failed(failure), now)?
+        }
+        TaskEvent::ReviewAccepted {
+            delivery_id,
+            integration,
+            ..
+        } => {
+            require_review_delivery(task, &delivery_id)?;
+            task.delivery = DeliveryState::Accepted {
+                delivery: delivery_id,
+                integration,
+            };
+            transition(task, TaskState::Completed, now)?;
+        }
+        TaskEvent::ReviewRework {
+            delivery_id,
+            feedback,
+            ..
+        } => {
+            require_review_delivery(task, &delivery_id)?;
+            task.delivery = DeliveryState::ReworkRequested {
+                previous: delivery_id,
+                feedback,
+            };
+            result.new_attempt =
+                Some(task.start_next_attempt(TerminalReason::ReworkRequested, false, now)?);
+        }
+        TaskEvent::ReviewRejected {
+            delivery_id,
+            reason,
+            ..
+        } => {
+            require_review_delivery(task, &delivery_id)?;
+            task.delivery = DeliveryState::Rejected {
+                delivery: delivery_id,
+                reason,
+            };
+            transition(
+                task,
+                TaskState::Blocked(BlockReason("review rejected".into())),
+                now,
+            )?;
+        }
+        TaskEvent::CancelRequested { reason, .. } => {
+            transition(task, TaskState::Cancelled(reason), now)?
+        }
+        TaskEvent::RuntimeInterrupted { evidence, .. } => {
+            transition(task, TaskState::RecoveryRequired(evidence), now)?
+        }
+        TaskEvent::RetryRequested { .. } => {
+            if !task.state().is_terminal() {
+                return Err(AttemptLifecycleError::RetryRequiresTerminalState.into());
+            }
+            result.new_attempt =
+                Some(task.start_next_attempt(task.terminal_reason(), true, now)?);
+        }
+    }
+    Ok(result)
+}
+
+fn require_review_delivery(
+    task: &AgentTask,
+    delivery_id: &DeliveryId,
+) -> Result<(), TaskReduceError> {
+    let TaskState::AwaitingParentReview(expected) = task.state() else {
+        return Err(TaskTransitionError {
+            from: task.state().clone(),
+            to: TaskState::Completed,
+        }
+        .into());
+    };
+    if expected != delivery_id {
+        return Err(TaskReduceError::DeliveryMismatch {
+            expected: expected.clone(),
+            actual: delivery_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn transition(
+    task: &mut AgentTask,
+    next: TaskState,
+    now: DateTime<Utc>,
+) -> Result<(), TaskReduceError> {
+    task.state.can_transition_to(next.clone())?;
+    let terminal_reason = terminal_reason_for(&next);
+    task.state = next;
+    if let Some(reason) = terminal_reason {
+        task.close_active_attempt(reason, now);
+    }
+    Ok(())
+}
+
+fn terminal_reason_for(state: &TaskState) -> Option<TerminalReason> {
+    match state {
+        TaskState::Completed => Some(TerminalReason::Completed),
+        TaskState::CompletedNoChanges => Some(TerminalReason::CompletedNoChanges),
+        TaskState::Blocked(reason) => Some(TerminalReason::Blocked(reason.clone())),
+        TaskState::Stalled(evidence) => Some(TerminalReason::Stalled(evidence.clone())),
+        TaskState::TimedOut(kind) => Some(TerminalReason::TimedOut(kind.clone())),
+        TaskState::BudgetExhausted(kind) => Some(TerminalReason::BudgetExhausted(kind.clone())),
+        TaskState::Failed(failure) => Some(TerminalReason::Failed(failure.clone())),
+        TaskState::Cancelled(reason) => Some(TerminalReason::Cancelled(reason.clone())),
+        TaskState::RecoveryRequired(evidence) => {
+            Some(TerminalReason::RecoveryRequired(evidence.clone()))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -443,29 +757,191 @@ mod tests {
     }
 
     #[test]
-    fn retry_and_rework_create_attempts_without_erasing_evidence() {
+    fn stale_attempt_events_are_rejected() {
         let mut task = AgentTask::new_root(RootSessionId::new());
-        let original_id = task.active_attempt().id.clone();
-        task.active_attempt_mut().checkpoint = Some(StableCheckpoint::new("before failure"));
-        task.transition_to(TaskState::Running).unwrap();
-        task.transition_to(TaskState::Failed(TaskFailure::new("worker failed")))
-            .unwrap();
-
-        let retry = task.retry().unwrap();
-        assert_ne!(retry.id, original_id);
-        assert_eq!(task.attempts.len(), 2);
-        assert_eq!(task.attempts[0].id, original_id);
-        assert_eq!(
-            task.attempts[0].checkpoint,
-            Some(StableCheckpoint::new("before failure"))
+        let result = task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: AttemptId::new(),
+            },
+            Utc::now(),
         );
 
-        task.transition_to(TaskState::Running).unwrap();
-        task.transition_to(TaskState::AwaitingParentReview(DeliveryId::new()))
+        assert!(matches!(result, Err(TaskReduceError::StaleAttempt { .. })));
+        assert_eq!(task.state(), &TaskState::Queued);
+    }
+
+    #[test]
+    fn permission_resolution_must_match_the_active_wait() {
+        let mut task = AgentTask::new_root(RootSessionId::new());
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        let request = PermissionRequestId::new();
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::PermissionRequested {
+                attempt_id: attempt_id.clone(),
+                request: request.clone(),
+            },
+            now,
+        )
+        .unwrap();
+
+        let result = task.reduce(
+            TaskEvent::PermissionResolved {
+                attempt_id,
+                request: PermissionRequestId::new(),
+                decision: PermissionDecision::Allow,
+            },
+            now,
+        );
+        assert!(matches!(
+            result,
+            Err(TaskReduceError::PermissionMismatch { .. })
+        ));
+        assert_eq!(task.state(), &TaskState::WaitingForPermission(request));
+    }
+
+    #[test]
+    fn review_events_require_the_current_delivery() {
+        let mut task = AgentTask::new_root(RootSessionId::new());
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        let delivery = DeliveryReport::new("commit abc123");
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::WorkerDelivered {
+                attempt_id: attempt_id.clone(),
+                delivery: delivery.clone(),
+            },
+            now,
+        )
+        .unwrap();
+
+        let result = task.reduce(
+            TaskEvent::ReviewAccepted {
+                attempt_id,
+                delivery_id: DeliveryId::new(),
+                integration: IntegrationId::new(),
+            },
+            now,
+        );
+        assert!(matches!(
+            result,
+            Err(TaskReduceError::DeliveryMismatch { .. })
+        ));
+        assert_eq!(task.state(), &TaskState::AwaitingParentReview(delivery.id));
+    }
+
+    #[test]
+    fn terminal_events_close_the_active_attempt() {
+        let mut task = AgentTask::new_root(RootSessionId::new());
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::WorkerFailed {
+                attempt_id,
+                failure: TaskFailure::new("worker failed"),
+            },
+            now,
+        )
+        .unwrap();
+
+        assert!(task.active_attempt().ended_at.is_some());
+        assert_eq!(
+            task.active_attempt().terminal_reason,
+            Some(TerminalReason::Failed(TaskFailure::new("worker failed")))
+        );
+    }
+
+    #[test]
+    fn retry_and_rework_create_attempts_without_erasing_evidence() {
+        let mut task = AgentTask::new_root(RootSessionId::new());
+        let now = Utc::now();
+        let original_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: original_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::WorkerFailed {
+                attempt_id: original_id.clone(),
+                failure: TaskFailure::new("worker failed"),
+            },
+            now,
+        )
+        .unwrap();
+
+        let retry = task
+            .reduce(
+                TaskEvent::RetryRequested {
+                    attempt_id: original_id,
+                },
+                now,
+            )
+            .unwrap()
+            .new_attempt
             .unwrap();
-        let rework = task.rework().unwrap();
+        assert_eq!(task.attempts().len(), 2);
+        assert_eq!(
+            task.attempts()[0].terminal_reason,
+            Some(TerminalReason::Failed(TaskFailure::new("worker failed")))
+        );
+
+        let delivery = DeliveryReport::new("commit def456");
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: retry.id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::WorkerDelivered {
+                attempt_id: retry.id.clone(),
+                delivery: delivery.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        let rework = task
+            .reduce(
+                TaskEvent::ReviewRework {
+                    attempt_id: retry.id.clone(),
+                    delivery_id: delivery.id.clone(),
+                    feedback: MessageId::new(),
+                },
+                now,
+            )
+            .unwrap()
+            .new_attempt
+            .unwrap();
         assert_ne!(rework.id, retry.id);
-        assert_eq!(task.attempts.len(), 3);
-        assert_eq!(task.attempts[1].id, retry.id);
+        assert_eq!(task.attempts().len(), 3);
+        assert_eq!(task.attempts()[1].delivery, Some(delivery.clone()));
+        assert!(
+            matches!(task.delivery(), DeliveryState::ReworkRequested { previous, .. } if *previous == delivery.id)
+        );
     }
 }
