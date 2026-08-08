@@ -1,11 +1,13 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::json;
 use yi_agent_core::ContentBlock;
+use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
-use yi_agent_core::subagent::task::{RootSessionId, TaskDepth};
+use yi_agent_core::subagent::task::{PermissionRequestId, RootSessionId, TaskDepth};
 
 #[test]
 fn spawn_enforces_depth_two_and_four_direct_children() {
@@ -147,5 +149,35 @@ async fn wait_any_returns_after_the_first_terminal_child() {
             .state()
             .is_terminal(),
         false
+    );
+}
+
+#[tokio::test]
+async fn wait_is_interrupted_by_a_permission_request() {
+    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
+    let root = supervisor.lock().unwrap().root_task_id().clone();
+    let child = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
+    let wait_tool = SupervisorTools::new(supervisor.clone(), root.clone()).wait_agent();
+
+    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "any" })).await });
+    tokio::task::yield_now().await;
+    let request = MailboxMessageDraft::new(
+        child.clone(),
+        root,
+        MessageKind::PermissionRequest(PermissionRequestId::new()),
+        None,
+    );
+    supervisor
+        .lock()
+        .unwrap()
+        .send_message(&child, request)
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("permission request should interrupt the wait")
+        .unwrap();
+    assert!(
+        matches!(&result.content[0], ContentBlock::Text(text) if text.contains("needs_attention"))
     );
 }

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, UserInstruction};
+use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{AgentTask, RootSessionId, TaskEvent, TaskFailure, TaskId};
 use crate::tool::{Tool, ToolResult};
 
@@ -138,7 +138,10 @@ impl AgentSupervisor {
         if recipient_task.state().is_terminal() {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
-        let is_parent = recipient_task.parent_id.as_ref() == Some(sender);
+        let is_parent = self
+            .tasks
+            .get(sender)
+            .is_some_and(|sender_task| sender_task.parent_id.as_ref() == Some(&recipient));
         let is_child = self
             .children_of(sender)
             .iter()
@@ -308,27 +311,44 @@ impl Tool for WaitAgentTool {
                     .supervisor
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let children = supervisor.children_of(&self.tools.caller);
-                let complete = match mode {
-                    WaitMode::Any => children.iter().any(|child| {
-                        supervisor
-                            .task(child)
-                            .is_some_and(|task| task.state().is_terminal())
-                    }),
-                    WaitMode::All => {
-                        !children.is_empty()
-                            && children.iter().all(|child| {
-                                supervisor
-                                    .task(child)
-                                    .is_some_and(|task| task.state().is_terminal())
-                            })
-                    }
-                };
-                complete.then(|| children.iter().map(ToString::to_string).collect::<Vec<_>>())
+                if supervisor
+                    .mailbox(&self.tools.caller)
+                    .is_some_and(|mailbox| {
+                        mailbox
+                            .messages()
+                            .iter()
+                            .any(|message| message.priority <= MessagePriority::High)
+                    })
+                {
+                    Some(("needs_attention", Vec::new()))
+                } else {
+                    let children = supervisor.children_of(&self.tools.caller);
+                    let complete = match mode {
+                        WaitMode::Any => children.iter().any(|child| {
+                            supervisor
+                                .task(child)
+                                .is_some_and(|task| task.state().is_terminal())
+                        }),
+                        WaitMode::All => {
+                            !children.is_empty()
+                                && children.iter().all(|child| {
+                                    supervisor
+                                        .task(child)
+                                        .is_some_and(|task| task.state().is_terminal())
+                                })
+                        }
+                    };
+                    complete.then(|| {
+                        (
+                            "completed",
+                            children.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        )
+                    })
+                }
             };
-            if let Some(children) = status {
+            if let Some((status, children)) = status {
                 return ToolResult::text(
-                    json!({ "status": "completed", "children": children }).to_string(),
+                    json!({ "status": status, "children": children }).to_string(),
                 );
             }
             if updates.changed().await.is_err() {
