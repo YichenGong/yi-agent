@@ -1,6 +1,17 @@
 use yi_agent_core::subagent::scheduler::{
     LeaseMode, ResourceCoordinator, ResourceRequest, ResourceScope,
 };
+
+#[test]
+fn coordinator_exposes_the_confirmed_global_default_capacities() {
+    let coordinator = ResourceCoordinator::new();
+
+    assert_eq!(coordinator.capacity("resident:global"), Some(16));
+    assert_eq!(coordinator.capacity("coding:global"), Some(6));
+    assert_eq!(coordinator.capacity("build:host"), Some(2));
+    assert_eq!(ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY, 8);
+    assert_eq!(ResourceCoordinator::RESERVED_COORDINATION_LLM_PERMITS, 1);
+}
 use yi_agent_core::subagent::task::{RootSessionId, TaskId};
 
 fn request(key: &str) -> ResourceRequest {

@@ -60,7 +60,7 @@ pub enum ReleaseError {
     UnknownLease,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ResourceCoordinator {
     capacities: HashMap<String, u16>,
     in_use: HashMap<String, u16>,
@@ -69,13 +69,50 @@ pub struct ResourceCoordinator {
     last_grant_root: HashMap<String, RootSessionId>,
 }
 
+impl Default for ResourceCoordinator {
+    fn default() -> Self {
+        let mut capacities = HashMap::new();
+        capacities.insert("resident:global".into(), 16);
+        capacities.insert("coding:global".into(), 6);
+        capacities.insert("build:host".into(), 2);
+        Self {
+            capacities,
+            in_use: HashMap::new(),
+            queues: HashMap::new(),
+            active: HashMap::new(),
+            last_grant_root: HashMap::new(),
+        }
+    }
+}
+
 impl ResourceCoordinator {
+    pub const DEFAULT_LLM_PER_PROVIDER_KEY: u16 = 8;
+    pub const RESERVED_COORDINATION_LLM_PERMITS: u16 = 1;
+
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn set_capacity(&mut self, key: impl Into<String>, units: u16) {
         self.capacities.insert(key.into(), units);
+    }
+
+    /// Configure the regular and coordination-reserved LLM pools for a
+    /// provider/API-key profile. A caller may borrow the reserve only when no
+    /// coordination request is eligible.
+    pub fn configure_provider_llm_capacity(&mut self, provider_key: &str) {
+        self.set_capacity(
+            format!("llm:{provider_key}"),
+            Self::DEFAULT_LLM_PER_PROVIDER_KEY - Self::RESERVED_COORDINATION_LLM_PERMITS,
+        );
+        self.set_capacity(
+            format!("llm-coordination:{provider_key}"),
+            Self::RESERVED_COORDINATION_LLM_PERMITS,
+        );
+    }
+
+    pub fn capacity(&self, key: &str) -> Option<u16> {
+        self.capacities.get(key).copied()
     }
 
     pub fn enqueue(&mut self, root_id: RootSessionId, task_id: TaskId, request: ResourceRequest) {
