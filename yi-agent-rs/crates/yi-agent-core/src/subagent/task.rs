@@ -216,7 +216,7 @@ pub enum DeliveryState {
     ReadyForReview(DeliveryId),
     Accepted {
         delivery: DeliveryId,
-        integration: IntegrationId,
+        integration: IntegrationValidation,
     },
     ReworkRequested {
         previous: DeliveryId,
@@ -231,15 +231,71 @@ pub enum DeliveryState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryReport {
     pub id: DeliveryId,
+    pub commit: String,
+    pub base_ref: String,
+    pub workspace: WorkspaceLeaseId,
     pub evidence: String,
 }
 
 impl DeliveryReport {
-    pub fn new(evidence: impl Into<String>) -> Self {
+    pub fn coding(
+        commit: impl Into<String>,
+        base_ref: impl Into<String>,
+        workspace: WorkspaceLeaseId,
+        evidence: impl Into<String>,
+    ) -> Self {
         Self {
             id: DeliveryId::new(),
+            commit: commit.into(),
+            base_ref: base_ref.into(),
+            workspace,
             evidence: evidence.into(),
         }
+    }
+
+    fn validate_for(&self, task: &AgentTask) -> Result<(), &'static str> {
+        if self.commit.trim().is_empty() {
+            return Err("commit is required for coding delivery");
+        }
+        if self.base_ref.trim().is_empty() {
+            return Err("base ref is required for coding delivery");
+        }
+        if self.evidence.trim().is_empty() {
+            return Err("delivery evidence is required");
+        }
+        if task.workspace.as_ref() != Some(&self.workspace) {
+            return Err("delivery workspace does not match task workspace");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationValidation {
+    pub id: IntegrationId,
+    pub succeeded: bool,
+    pub evidence: String,
+}
+
+impl IntegrationValidation {
+    pub fn passed(evidence: impl Into<String>) -> Self {
+        Self {
+            id: IntegrationId::new(),
+            succeeded: true,
+            evidence: evidence.into(),
+        }
+    }
+
+    pub fn failed(evidence: impl Into<String>) -> Self {
+        Self {
+            id: IntegrationId::new(),
+            succeeded: false,
+            evidence: evidence.into(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.succeeded && !self.evidence.trim().is_empty()
     }
 }
 
@@ -359,6 +415,18 @@ impl AgentTask {
         }
     }
 
+    pub fn new_child(root_session_id: RootSessionId, parent_id: TaskId) -> Self {
+        let mut task = Self::new_root(root_session_id);
+        task.parent_id = Some(parent_id);
+        task.depth = TaskDepth::Child;
+        task
+    }
+
+    pub fn with_workspace(mut self, workspace: WorkspaceLeaseId) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
     pub fn active_attempt(&self) -> &TaskAttempt {
         self.attempts
             .iter()
@@ -465,6 +533,10 @@ pub enum TaskEvent {
         attempt_id: AttemptId,
         wait: ResourceWait,
     },
+    ResourceAvailable {
+        attempt_id: AttemptId,
+        wait: ResourceWait,
+    },
     PermissionRequested {
         attempt_id: AttemptId,
         request: PermissionRequestId,
@@ -484,8 +556,9 @@ pub enum TaskEvent {
     },
     ReviewAccepted {
         attempt_id: AttemptId,
+        actor: TaskId,
         delivery_id: DeliveryId,
-        integration: IntegrationId,
+        integration: IntegrationValidation,
     },
     ReviewRework {
         attempt_id: AttemptId,
@@ -515,6 +588,7 @@ impl TaskEvent {
         match self {
             Self::AdmissionGranted { attempt_id }
             | Self::ResourceUnavailable { attempt_id, .. }
+            | Self::ResourceAvailable { attempt_id, .. }
             | Self::PermissionRequested { attempt_id, .. }
             | Self::PermissionResolved { attempt_id, .. }
             | Self::WorkerDelivered { attempt_id, .. }
@@ -551,6 +625,19 @@ pub enum TaskReduceError {
         expected: PermissionRequestId,
         actual: PermissionRequestId,
     },
+    #[error("resource resolution does not match the active wait")]
+    ResourceMismatch {
+        expected: ResourceWait,
+        actual: ResourceWait,
+    },
+    #[error("invalid coding delivery evidence: {reason}")]
+    InvalidDeliveryEvidence { reason: &'static str },
+    #[error("review acceptance requires a non-root task")]
+    ReviewRequiresParent,
+    #[error("review actor does not match direct parent")]
+    ReviewActorMismatch { expected: TaskId, actual: TaskId },
+    #[error("integration validation did not succeed with evidence")]
+    IntegrationNotValidated,
     #[error(transparent)]
     Transition(#[from] TaskTransitionError),
     #[error(transparent)]
@@ -574,6 +661,22 @@ pub fn reduce(
         TaskEvent::AdmissionGranted { .. } => transition(task, TaskState::Running, now)?,
         TaskEvent::ResourceUnavailable { wait, .. } => {
             transition(task, TaskState::WaitingForResource(wait), now)?
+        }
+        TaskEvent::ResourceAvailable { wait, .. } => {
+            let TaskState::WaitingForResource(expected) = task.state() else {
+                return Err(TaskTransitionError {
+                    from: task.state().clone(),
+                    to: TaskState::Queued,
+                }
+                .into());
+            };
+            if expected != &wait {
+                return Err(TaskReduceError::ResourceMismatch {
+                    expected: expected.clone(),
+                    actual: wait,
+                });
+            }
+            transition(task, TaskState::Queued, now)?;
         }
         TaskEvent::PermissionRequested { request, .. } => {
             transition(task, TaskState::WaitingForPermission(request), now)?
@@ -604,6 +707,9 @@ pub fn reduce(
             }
         }
         TaskEvent::WorkerDelivered { delivery, .. } => {
+            delivery
+                .validate_for(task)
+                .map_err(|reason| TaskReduceError::InvalidDeliveryEvidence { reason })?;
             transition(
                 task,
                 TaskState::AwaitingParentReview(delivery.id.clone()),
@@ -617,10 +723,24 @@ pub fn reduce(
         }
         TaskEvent::ReviewAccepted {
             delivery_id,
+            actor,
             integration,
             ..
         } => {
             require_review_delivery(task, &delivery_id)?;
+            let parent_id = task
+                .parent_id
+                .as_ref()
+                .ok_or(TaskReduceError::ReviewRequiresParent)?;
+            if parent_id != &actor {
+                return Err(TaskReduceError::ReviewActorMismatch {
+                    expected: parent_id.clone(),
+                    actual: actor,
+                });
+            }
+            if !integration.is_valid() {
+                return Err(TaskReduceError::IntegrationNotValidated);
+            }
             task.delivery = DeliveryState::Accepted {
                 delivery: delivery_id,
                 integration,
@@ -728,6 +848,18 @@ fn terminal_reason_for(state: &TaskState) -> Option<TerminalReason> {
 mod tests {
     use super::*;
 
+    fn task_with_workspace() -> (AgentTask, WorkspaceLeaseId) {
+        let workspace = WorkspaceLeaseId::new();
+        (
+            AgentTask::new_root(RootSessionId::new()).with_workspace(workspace.clone()),
+            workspace,
+        )
+    }
+
+    fn coding_delivery(workspace: WorkspaceLeaseId) -> DeliveryReport {
+        DeliveryReport::coding("abc123", "main", workspace, "validated commit")
+    }
+
     #[test]
     fn leaf_cannot_spawn_descendant() {
         assert!(TaskDepth::Leaf.can_spawn_child().is_err());
@@ -808,11 +940,68 @@ mod tests {
     }
 
     #[test]
-    fn review_events_require_the_current_delivery() {
+    fn resolved_resource_wait_returns_to_queued() {
         let mut task = AgentTask::new_root(RootSessionId::new());
         let now = Utc::now();
         let attempt_id = task.active_attempt_id().clone();
-        let delivery = DeliveryReport::new("commit abc123");
+        let wait = ResourceWait("llm permit".into());
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::ResourceUnavailable {
+                attempt_id: attempt_id.clone(),
+                wait: wait.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(TaskEvent::ResourceAvailable { attempt_id, wait }, now)
+            .unwrap();
+
+        assert_eq!(task.state(), &TaskState::Queued);
+    }
+
+    #[test]
+    fn worker_delivery_requires_coding_evidence() {
+        let (mut task, workspace) = task_with_workspace();
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+
+        let result = task.reduce(
+            TaskEvent::WorkerDelivered {
+                attempt_id,
+                delivery: DeliveryReport::coding("", "main", workspace, "validated commit"),
+            },
+            now,
+        );
+        assert!(matches!(
+            result,
+            Err(TaskReduceError::InvalidDeliveryEvidence { .. })
+        ));
+        assert_eq!(task.state(), &TaskState::Running);
+    }
+
+    #[test]
+    fn review_events_require_the_current_delivery() {
+        let parent_id = TaskId::new();
+        let workspace = WorkspaceLeaseId::new();
+        let mut task = AgentTask::new_child(RootSessionId::new(), parent_id.clone())
+            .with_workspace(workspace.clone());
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        let delivery = coding_delivery(workspace);
         task.reduce(
             TaskEvent::AdmissionGranted {
                 attempt_id: attempt_id.clone(),
@@ -832,8 +1021,9 @@ mod tests {
         let result = task.reduce(
             TaskEvent::ReviewAccepted {
                 attempt_id,
+                actor: parent_id,
                 delivery_id: DeliveryId::new(),
-                integration: IntegrationId::new(),
+                integration: IntegrationValidation::passed("integration test"),
             },
             now,
         );
@@ -874,7 +1064,7 @@ mod tests {
 
     #[test]
     fn retry_and_rework_create_attempts_without_erasing_evidence() {
-        let mut task = AgentTask::new_root(RootSessionId::new());
+        let (mut task, workspace) = task_with_workspace();
         let now = Utc::now();
         let original_id = task.active_attempt_id().clone();
         task.reduce(
@@ -909,7 +1099,7 @@ mod tests {
             Some(TerminalReason::Failed(TaskFailure::new("worker failed")))
         );
 
-        let delivery = DeliveryReport::new("commit def456");
+        let delivery = coding_delivery(workspace);
         task.reduce(
             TaskEvent::AdmissionGranted {
                 attempt_id: retry.id.clone(),
@@ -943,5 +1133,92 @@ mod tests {
         assert!(
             matches!(task.delivery(), DeliveryState::ReworkRequested { previous, .. } if *previous == delivery.id)
         );
+    }
+
+    #[test]
+    fn only_parent_with_successful_integration_can_accept_review() {
+        let parent_id = TaskId::new();
+        let workspace = WorkspaceLeaseId::new();
+        let mut task = AgentTask::new_child(RootSessionId::new(), parent_id.clone())
+            .with_workspace(workspace.clone());
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        let delivery = coding_delivery(workspace);
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::WorkerDelivered {
+                attempt_id: attempt_id.clone(),
+                delivery: delivery.clone(),
+            },
+            now,
+        )
+        .unwrap();
+
+        let wrong_actor = task.reduce(
+            TaskEvent::ReviewAccepted {
+                attempt_id: attempt_id.clone(),
+                actor: TaskId::new(),
+                delivery_id: delivery.id.clone(),
+                integration: IntegrationValidation::passed("integration test"),
+            },
+            now,
+        );
+        assert!(matches!(
+            wrong_actor,
+            Err(TaskReduceError::ReviewActorMismatch { .. })
+        ));
+        let failed_integration = task.reduce(
+            TaskEvent::ReviewAccepted {
+                attempt_id,
+                actor: parent_id,
+                delivery_id: delivery.id,
+                integration: IntegrationValidation::failed("integration failed"),
+            },
+            now,
+        );
+        assert!(matches!(
+            failed_integration,
+            Err(TaskReduceError::IntegrationNotValidated)
+        ));
+    }
+
+    #[test]
+    fn root_task_cannot_accept_its_own_review() {
+        let (mut task, workspace) = task_with_workspace();
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        let delivery = coding_delivery(workspace);
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::WorkerDelivered {
+                attempt_id: attempt_id.clone(),
+                delivery: delivery.clone(),
+            },
+            now,
+        )
+        .unwrap();
+
+        let result = task.reduce(
+            TaskEvent::ReviewAccepted {
+                attempt_id,
+                actor: TaskId::new(),
+                delivery_id: delivery.id,
+                integration: IntegrationValidation::passed("integration test"),
+            },
+            now,
+        );
+        assert!(matches!(result, Err(TaskReduceError::ReviewRequiresParent)));
     }
 }
