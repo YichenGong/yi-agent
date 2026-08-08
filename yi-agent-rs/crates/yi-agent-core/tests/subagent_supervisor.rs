@@ -48,6 +48,21 @@ fn spawning_enqueues_child_and_emits_a_structured_event() {
     ));
 }
 
+#[test]
+fn spawning_with_an_objective_retains_the_worker_instruction() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+
+    let child = supervisor
+        .spawn_with_objective(root, "Audit the scheduler fairness tests".into())
+        .unwrap();
+
+    assert_eq!(
+        supervisor.objective(&child),
+        Some("Audit the scheduler fairness tests")
+    );
+}
+
 struct ImmediateWorkerFactory;
 
 impl AgentWorkerFactory for ImmediateWorkerFactory {
@@ -113,7 +128,13 @@ async fn built_in_spawn_tool_returns_immediately_and_rejects_leaf_spawn() {
 
     let spawn = tools.spawn_agent();
     assert_eq!(spawn.name(), "spawn_agent");
-    assert!(!spawn.call(json!({})).await.is_error);
+    assert!(spawn.call(json!({})).await.is_error);
+    assert!(
+        !spawn
+            .call(json!({ "task": "Inspect the current task state." }))
+            .await
+            .is_error
+    );
 
     let child = supervisor.lock().unwrap().children_of(&root)[0].clone();
     let leaf = supervisor.lock().unwrap().spawn(child).unwrap();

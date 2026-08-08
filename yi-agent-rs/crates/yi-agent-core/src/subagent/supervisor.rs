@@ -42,6 +42,7 @@ pub enum MessageDeliveryError {
 pub struct AgentSupervisor {
     root_task_id: TaskId,
     tasks: HashMap<TaskId, AgentTask>,
+    objectives: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
@@ -57,10 +58,16 @@ impl AgentSupervisor {
         tasks.insert(root_task_id.clone(), root);
         let mut mailboxes = HashMap::new();
         mailboxes.insert(root_task_id.clone(), Mailbox::default());
+        let mut objectives = HashMap::new();
+        objectives.insert(
+            root_task_id.clone(),
+            "Root session objective not specified.".into(),
+        );
         let (updates, _) = watch::channel(0_u64);
         Self {
             root_task_id,
             tasks,
+            objectives,
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -75,6 +82,10 @@ impl AgentSupervisor {
 
     pub fn task(&self, task_id: &TaskId) -> Option<&AgentTask> {
         self.tasks.get(task_id)
+    }
+
+    pub fn objective(&self, task_id: &TaskId) -> Option<&str> {
+        self.objectives.get(task_id).map(String::as_str)
     }
 
     pub fn children_of(&self, task_id: &TaskId) -> &[TaskId] {
@@ -115,11 +126,15 @@ impl AgentSupervisor {
             .tasks
             .get(task_id)
             .ok_or_else(|| "task does not exist".to_string())?;
+        let objective = self
+            .objective(task_id)
+            .ok_or_else(|| "task objective does not exist".to_string())?;
         let start = WorkerStart::new(
             task.id.clone(),
             task.active_attempt_id().clone(),
             task.root_session_id.clone(),
-        );
+        )
+        .with_objective(objective);
         // Admission is visible before the application factory can create any
         // side effects. A factory failure is reduced to a terminal task state.
         self.start_task(task_id)?;
@@ -200,6 +215,14 @@ impl AgentSupervisor {
     }
 
     pub fn spawn(&mut self, parent_id: TaskId) -> Result<TaskId, SpawnError> {
+        self.spawn_with_objective(parent_id, "Complete the delegated task.".into())
+    }
+
+    pub fn spawn_with_objective(
+        &mut self,
+        parent_id: TaskId,
+        objective: String,
+    ) -> Result<TaskId, SpawnError> {
         let parent = self
             .tasks
             .get(&parent_id)
@@ -216,6 +239,7 @@ impl AgentSupervisor {
         child.depth = child_depth;
         let child_id = child.id.clone();
         self.tasks.insert(child_id.clone(), child);
+        self.objectives.insert(child_id.clone(), objective);
         self.mailboxes.insert(child_id.clone(), Mailbox::default());
         self.children
             .entry(parent_id.clone())
@@ -369,13 +393,19 @@ impl Tool for SpawnAgentTool {
         })
     }
 
-    async fn call(&self, _args: Value) -> ToolResult {
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task) = args.get("task").and_then(Value::as_str) else {
+            return ToolResult::error("task is required");
+        };
+        if task.trim().is_empty() {
+            return ToolResult::error("task must not be empty");
+        }
         let mut supervisor = self
             .tools
             .supervisor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match supervisor.spawn(self.tools.caller.clone()) {
+        match supervisor.spawn_with_objective(self.tools.caller.clone(), task.to_string()) {
             Ok(task_id) => ToolResult::text(
                 json!({ "task_id": task_id.to_string(), "status": "queued" }).to_string(),
             ),

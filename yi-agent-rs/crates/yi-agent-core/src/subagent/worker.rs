@@ -12,6 +12,8 @@ pub struct WorkerStart {
     pub attempt_id: AttemptId,
     pub root_session_id: RootSessionId,
     pub cancellation: CancellationToken,
+    /// Narrow task instruction supplied by the parent supervisor.
+    pub objective: String,
 }
 
 impl WorkerStart {
@@ -21,7 +23,13 @@ impl WorkerStart {
             attempt_id,
             root_session_id,
             cancellation: CancellationToken::new(),
+            objective: String::new(),
         }
+    }
+
+    pub fn with_objective(mut self, objective: impl Into<String>) -> Self {
+        self.objective = objective.into();
+        self
     }
 }
 
