@@ -7,6 +7,8 @@ use thiserror::Error;
 pub enum WorktreeError {
     #[error("parent worktree is dirty: {path}")]
     DirtyParent { path: PathBuf },
+    #[error("child worktree is dirty: {path}")]
+    DirtyChild { path: PathBuf },
     #[error("parent base commit is not available: {base}")]
     UnknownBase { base: String },
     #[error("git command failed: {message}")]
@@ -82,6 +84,33 @@ impl WorktreeService {
             branch: branch.to_owned(),
             base_commit: base.to_owned(),
         })
+    }
+
+    pub fn remove_clean(
+        &self,
+        owner_worktree: &Path,
+        child_path: &Path,
+    ) -> Result<(), WorktreeError> {
+        let status = git(child_path, &["status", "--porcelain"])?;
+        if !status.trim().is_empty() {
+            return Err(WorktreeError::DirtyChild {
+                path: child_path.to_path_buf(),
+            });
+        }
+        let output = Command::new("git")
+            .args(["worktree", "remove"])
+            .arg(child_path)
+            .current_dir(owner_worktree)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
