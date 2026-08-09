@@ -25,6 +25,7 @@ yi-agent 的 LLM provider 实现层。基于 `yi-agent-core` 的 `Provider` trai
 - [x] AnthropicProvider 设计 — `crates/yi-agent-llm/src/anthropic/` 目录存在 — [设计](../plans/2026-07-19-yi-agent-llm-design.md)
 - [x] AnthropicProvider 实现 — `anthropic/{types,stream,client}.rs` + wiremock 测试通过 — [实现](../plans/2026-07-19-yi-agent-llm-impl.md)
 - [x] OpenAI provider — `crates/yi-agent-llm/src/openai/` 目录存在 + wiremock 测试通过 — [实现](../plans/2026-07-24-openai-provider-impl.md)
+- [x] 流式请求默认总超时 5 分钟 — `anthropic/client.rs` 与 `openai/client.rs` 的 `DEFAULT_TIMEOUT_SECS = 300`，并有单元测试验证 — `cargo test -p yi-agent-llm --lib default_stream_timeout_is_five_minutes`
 - [ ] 本地模型 (Ollama) provider — 无 `crates/yi-agent-llm/src/ollama/`
 - [ ] Bedrock / Vertex AI 适配 — 无对应模块
 - [ ] 重试与流断连重连 — `ProviderError` 无 retry 逻辑
