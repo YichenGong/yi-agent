@@ -348,6 +348,8 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let daemon_coordinator = Arc::clone(&coordinator);
+        let client_handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+        let listener_handlers = Arc::clone(&client_handlers);
         let database_path = database_path.as_ref().to_path_buf();
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
@@ -365,15 +367,27 @@ impl Daemon {
                         let database_path = database_path.clone();
                         let stop = Arc::clone(&thread_stop);
                         let coordinator = Arc::clone(&coordinator);
-                        thread::spawn(move || {
+                        let handler = thread::spawn(move || {
                             let _ = handle_client(stream, &database_path, &stop, &coordinator);
                         });
+                        listener_handlers
+                            .lock()
+                            .expect("client handler list mutex poisoned")
+                            .push(handler);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break,
                 }
+            }
+            let handlers = std::mem::take(
+                &mut *listener_handlers
+                    .lock()
+                    .expect("client handler list mutex poisoned"),
+            );
+            for handler in handlers {
+                let _ = handler.join();
             }
             let _ = remove_if_exists(&cleanup_socket);
             let _ = remove_if_exists(&cleanup_lock);

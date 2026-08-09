@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -860,6 +860,28 @@ fn daemon_stop_request_releases_the_runtime_for_a_future_manual_start() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("daemon stop request did not release runtime lock");
+}
+
+#[test]
+fn daemon_stop_joins_an_incomplete_client_handler_before_releasing_runtime_files() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    let database = directory.path().join("runtime.sqlite");
+    let mut daemon = Daemon::start(&runtime, &database).unwrap();
+    let mut client = UnixStream::connect(daemon.socket_path()).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    // Give the listener an opportunity to hand this incomplete frame to a
+    // client handler that is blocked in its framed read.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    daemon.stop().unwrap();
+
+    let mut byte = [0_u8; 1];
+    assert_eq!(client.read(&mut byte).unwrap(), 0, "handler must be joined");
+    assert!(!runtime.join("runtime.sock").exists());
+    assert!(!runtime.join("runtime.lock").exists());
 }
 
 #[test]
