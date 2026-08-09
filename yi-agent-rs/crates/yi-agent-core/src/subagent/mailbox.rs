@@ -182,7 +182,7 @@ impl Mailbox {
         let priority = draft.kind.priority();
         let wakes_recipient = draft.kind.wakes_recipient();
         let message = MailboxMessage {
-            id: draft.id.unwrap_or_else(MessageId::new),
+            id: draft.id.unwrap_or_default(),
             sender: draft.sender,
             recipient: draft.recipient,
             kind: draft.kind,

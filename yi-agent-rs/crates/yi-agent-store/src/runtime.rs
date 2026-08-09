@@ -401,21 +401,23 @@ impl RuntimeCoordinator {
             }
             consumed_overrides.extend(supervisor.pending_user_override_acks().iter().cloned());
         }
-        let mut repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
-        for (task_id, message_id) in consumed_overrides {
-            repository.mark_user_override_consumed(&task_id, &message_id)?;
+        for (task_id, message_id) in &consumed_overrides {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .mark_user_override_consumed(task_id, message_id)?;
             for supervisor in &supervisors {
                 supervisor
                     .lock()
                     .await
-                    .confirm_user_override_consumed(&task_id, &message_id);
+                    .confirm_user_override_consumed(task_id, message_id);
             }
         }
         for (task_id, state, event) in updates {
-            repository.transition_task(&task_id, state, event)?;
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .transition_task(&task_id, state, event)?;
             self.resident_tasks
                 .lock()
                 .expect("runtime resident task mutex poisoned")
