@@ -126,6 +126,10 @@ impl AgentSupervisor {
         self.workers.contains_key(task_id)
     }
 
+    pub fn worker_task_ids(&self) -> impl Iterator<Item = &TaskId> {
+        self.workers.keys()
+    }
+
     pub fn worker_cancellation(
         &self,
         task_id: &TaskId,
@@ -133,6 +137,16 @@ impl AgentSupervisor {
         self.workers
             .get(task_id)
             .map(WorkerHandle::cancellation_token)
+    }
+
+    /// Requests a cooperative safe checkpoint from every active worker. The
+    /// caller is responsible for durably recording the paired runtime events.
+    pub fn request_safe_checkpoints(&mut self) -> Result<Vec<TaskId>, String> {
+        let task_ids = self.workers.keys().cloned().collect::<Vec<_>>();
+        for task_id in &task_ids {
+            self.pause_task(task_id, PauseReason("daemon is draining".into()))?;
+        }
+        Ok(task_ids)
     }
 
     /// Creates a worker only after the task has passed supervised admission.

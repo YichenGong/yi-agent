@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
@@ -25,6 +26,8 @@ pub enum RuntimeCoordinatorError {
     Spawn(#[from] SpawnError),
     #[error("global resident subagent capacity is exhausted")]
     ResidentCapacityExhausted,
+    #[error("runtime is draining and rejects new admissions")]
+    Draining,
 }
 
 /// Owns all supervisor instances and their worker handles for one daemon.
@@ -36,6 +39,7 @@ pub struct RuntimeCoordinator {
     factory: Arc<dyn AgentWorkerFactory>,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
     resident_tasks: Mutex<HashSet<TaskId>>,
+    draining: AtomicBool,
 }
 
 impl RuntimeCoordinator {
@@ -48,10 +52,12 @@ impl RuntimeCoordinator {
             factory,
             supervisors: Mutex::new(HashMap::new()),
             resident_tasks: Mutex::new(HashSet::new()),
+            draining: AtomicBool::new(false),
         })
     }
 
     pub fn create_session(&self) -> Result<RootSessionId, RuntimeCoordinatorError> {
+        self.ensure_admitting()?;
         let session_id = RootSessionId::new();
         let supervisor = AgentSupervisor::new(session_id.clone());
         let root_id = supervisor.root_task_id().clone();
@@ -91,6 +97,7 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         objective: String,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
+        self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
         let (child, depth) = {
             let mut supervisor = supervisor.lock().await;
@@ -140,6 +147,7 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         task: &TaskId,
     ) -> Result<(), RuntimeCoordinatorError> {
+        self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
         let mut supervisor = supervisor.lock().await;
         let is_subagent = !matches!(
@@ -196,6 +204,7 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         task: &TaskId,
     ) -> Result<(), RuntimeCoordinatorError> {
+        self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
         let attempt = supervisor
             .lock()
@@ -264,6 +273,7 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         task: &TaskId,
     ) -> Result<(), RuntimeCoordinatorError> {
+        self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
         supervisor
             .lock()
@@ -445,6 +455,71 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime repository mutex poisoned")
             .task_state(task)?)
+    }
+
+    /// Starts the stop admission barrier before workers are asked to reach a
+    /// safe checkpoint. Once set, it deliberately never reopens for this
+    /// daemon process; restart owns recovery and future admissions.
+    pub async fn begin_draining(&self) -> Result<(), RuntimeCoordinatorError> {
+        self.draining.store(true, Ordering::Release);
+        let supervisors = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut worker_tasks = Vec::new();
+        for supervisor in supervisors {
+            let supervisor = supervisor.lock().await;
+            worker_tasks.extend(supervisor.worker_task_ids().cloned());
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        for task in worker_tasks {
+            repository.append_event(&task, RuntimeEvent::RuntimeDraining)?;
+        }
+        Ok(())
+    }
+
+    /// Requests cooperative checkpoints only after `begin_draining` has
+    /// durably announced the transition. Paused snapshots are persisted by
+    /// normal worker reconciliation after each worker acknowledges.
+    pub async fn request_safe_checkpoints(&self) -> Result<(), RuntimeCoordinatorError> {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut requested = Vec::new();
+        for supervisor in supervisors {
+            requested.extend(
+                supervisor
+                    .lock()
+                    .await
+                    .request_safe_checkpoints()
+                    .map_err(RuntimeCoordinatorError::Supervisor)?,
+            );
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        for task in requested {
+            repository.append_event(&task, RuntimeEvent::TaskPauseRequested)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_admitting(&self) -> Result<(), RuntimeCoordinatorError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(RuntimeCoordinatorError::Draining);
+        }
+        Ok(())
     }
 
     fn supervisor(

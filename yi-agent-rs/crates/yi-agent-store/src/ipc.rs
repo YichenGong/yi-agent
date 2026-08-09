@@ -305,6 +305,7 @@ impl Subscription {
 pub struct Daemon {
     socket_path: PathBuf,
     stop: Arc<AtomicBool>,
+    coordinator: Arc<RuntimeCoordinator>,
     listener: Option<JoinHandle<()>>,
 }
 
@@ -346,6 +347,7 @@ impl Daemon {
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let daemon_coordinator = Arc::clone(&coordinator);
         let database_path = database_path.as_ref().to_path_buf();
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
@@ -379,6 +381,7 @@ impl Daemon {
         Ok(Self {
             socket_path,
             stop,
+            coordinator: daemon_coordinator,
             listener: Some(listener),
         })
     }
@@ -389,6 +392,7 @@ impl Daemon {
 
     /// Stop this manually started daemon and release its local runtime files.
     pub fn stop(&mut self) -> Result<(), IpcError> {
+        prepare_coordinator_for_stop(&self.coordinator)?;
         self.stop.store(true, Ordering::Release);
         // Wake the nonblocking accept loop so shutdown does not wait for its sleep interval.
         let _ = UnixStream::connect(&self.socket_path);
@@ -584,6 +588,7 @@ fn handle_client(
         }
         Ok(envelope) => match envelope.command {
             IpcRequest::Stop => {
+                prepare_coordinator_for_stop(coordinator)?;
                 stop.store(true, Ordering::Release);
                 IpcResponse::Stopping
             }
@@ -621,6 +626,18 @@ fn handle_client(
         },
     };
     write_response_frame(&mut stream, &request_id, None, &response)
+}
+
+fn prepare_coordinator_for_stop(coordinator: &RuntimeCoordinator) -> Result<(), IpcError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(IpcError::Io)?;
+    runtime.block_on(async {
+        coordinator.begin_draining().await?;
+        coordinator.request_safe_checkpoints().await
+    })?;
+    Ok(())
 }
 
 fn stream_subscription(
@@ -1414,6 +1431,7 @@ fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
 
 fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
     match event {
+        crate::repository::RuntimeEvent::RuntimeDraining => "runtime_draining",
         crate::repository::RuntimeEvent::TaskQueued => "task_queued",
         crate::repository::RuntimeEvent::TaskStarted => "task_started",
         crate::repository::RuntimeEvent::TaskCancelled => "task_cancelled",

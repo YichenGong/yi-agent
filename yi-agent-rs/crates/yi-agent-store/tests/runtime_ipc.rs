@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::MessageId;
@@ -1152,6 +1152,61 @@ fn daemon_starts_a_worker_through_its_injected_factory() {
     )
     .unwrap();
     assert!(matches!(response, IpcResponse::TaskStarted));
+}
+
+#[test]
+fn local_daemon_stop_announces_draining_before_requesting_worker_checkpoints() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ReportingWorkerFactory {
+        handle: Arc::new(Mutex::new(None)),
+    });
+    let mut daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::StartWorker {
+            session_id,
+            task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap();
+
+    daemon.stop().unwrap();
+
+    let events = RuntimeRepository::open(&database)
+        .unwrap()
+        .event_records_after(0)
+        .unwrap();
+    let draining = events
+        .iter()
+        .position(|event| event.event == RuntimeEvent::RuntimeDraining)
+        .unwrap();
+    let checkpoint = events
+        .iter()
+        .position(|event| event.event == RuntimeEvent::TaskPauseRequested)
+        .unwrap();
+    assert!(draining < checkpoint);
+    assert!(
+        factory
+            .handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .subscribe_pause()
+            .requested()
+            .now_or_never()
+            .unwrap()
+    );
 }
 
 #[test]

@@ -141,6 +141,55 @@ async fn coordinator_retries_a_terminal_task_as_a_new_running_attempt() {
 }
 
 #[tokio::test]
+async fn draining_rejects_all_new_runtime_admissions() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    coordinator.begin_draining().await.unwrap();
+
+    assert!(coordinator.create_session().is_err());
+    assert!(coordinator.spawn_child(&session, &root).await.is_err());
+    assert!(coordinator.start_worker(&session, &root).await.is_err());
+    assert!(coordinator.retry_task(&session, &root).await.is_err());
+    assert!(coordinator.resume_task(&session, &root).await.is_err());
+}
+
+#[tokio::test]
+async fn draining_is_persisted_before_safe_checkpoint_requests() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(PauseRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    coordinator.begin_draining().await.unwrap();
+    coordinator.request_safe_checkpoints().await.unwrap();
+
+    let events = RuntimeRepository::open(&database)
+        .unwrap()
+        .event_records_after(0)
+        .unwrap();
+    let draining = events
+        .iter()
+        .position(|event| event.event == RuntimeEvent::RuntimeDraining)
+        .expect("draining must be persisted before checkpoint requests");
+    let pause_requested = events
+        .iter()
+        .position(|event| event.event == RuntimeEvent::TaskPauseRequested)
+        .expect("safe checkpoint request must be persisted");
+    assert!(draining < pause_requested);
+
+    factory.handles.lock().unwrap()[0].report_paused();
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(coordinator.task_state(&root).unwrap(), "paused");
+}
+
+#[tokio::test]
 async fn coordinator_persists_pause_only_after_worker_safe_checkpoint_acknowledgement() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

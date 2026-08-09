@@ -23,6 +23,7 @@ pub enum RepositoryError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeEvent {
+    RuntimeDraining,
     TaskQueued,
     TaskStarted,
     TaskCancelled,
@@ -37,6 +38,7 @@ pub enum RuntimeEvent {
 impl RuntimeEvent {
     fn name(self) -> &'static str {
         match self {
+            Self::RuntimeDraining => "runtime_draining",
             Self::TaskQueued => "task_queued",
             Self::TaskStarted => "task_started",
             Self::TaskCancelled => "task_cancelled",
@@ -51,6 +53,7 @@ impl RuntimeEvent {
 
     fn parse(kind: String) -> Result<Self, RepositoryError> {
         match kind.as_str() {
+            "runtime_draining" => Ok(Self::RuntimeDraining),
             "task_queued" => Ok(Self::TaskQueued),
             "task_started" => Ok(Self::TaskStarted),
             "task_cancelled" => Ok(Self::TaskCancelled),
