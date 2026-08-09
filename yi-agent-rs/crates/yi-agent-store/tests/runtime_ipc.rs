@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -94,14 +95,96 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, project_root TEXT NOT NULL, state TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, config_json TEXT NOT NULL
+            );
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, root_session_id TEXT NOT NULL REFERENCES sessions(id),
+                parent_id TEXT REFERENCES tasks(id), depth INTEGER NOT NULL, state_json TEXT NOT NULL,
+                contract_version INTEGER NOT NULL, active_attempt_id TEXT NOT NULL,
+                delivery_json TEXT NOT NULL, workspace_lease_id TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id), task_id TEXT REFERENCES tasks(id),
+                attempt_id TEXT, actor_json TEXT NOT NULL, kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             INSERT INTO schema_migrations (version) VALUES (1);",
         )
         .unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    connection
+        .execute(
+            "INSERT INTO sessions (id, project_root, state, config_json) VALUES (?1, '', 'active', '{}')",
+            rusqlite::params![root.to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks
+             (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
+             VALUES (?1, ?2, NULL, 0, 'running', 1, '', '{}')",
+            rusqlite::params![task.to_string(), root.to_string()],
+        )
+        .unwrap();
+    for (event_id, kind) in [(3, "task_queued"), (7, "task_started")] {
+        connection
+            .execute(
+                "INSERT INTO events
+                 (id, session_id, task_id, actor_json, kind, payload_json)
+                 VALUES (?1, ?2, ?3, '{\"kind\":\"runtime\"}', ?4, '{}')",
+                rusqlite::params![event_id, root.to_string(), task.to_string(), kind],
+            )
+            .unwrap();
+    }
     drop(connection);
 
-    let repository = RuntimeRepository::open(&database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
     assert_eq!(repository.schema_version().unwrap(), 2);
     assert!(repository.has_table("runtime_metadata").unwrap());
+    assert_eq!(
+        repository
+            .event_records_after(0)
+            .unwrap()
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        vec![3, 7]
+    );
+
+    let replayable = repository.subscription_snapshot(1).unwrap();
+    assert_eq!(replayable.cursor_state, RuntimeCursorState::Replayable);
+    assert_eq!(
+        replayable
+            .events
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        vec![3, 7]
+    );
+    repository.advance_event_replay_floor_through(3).unwrap();
+    assert_eq!(
+        repository.subscription_snapshot(2).unwrap().cursor_state,
+        RuntimeCursorState::Expired {
+            oldest_replayable_event_id: 4,
+        }
+    );
+    let boundary = repository.subscription_snapshot(3).unwrap();
+    assert_eq!(boundary.cursor_state, RuntimeCursorState::Replayable);
+    assert_eq!(
+        boundary
+            .events
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        vec![7]
+    );
 }
 
 #[test]
@@ -530,6 +613,113 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
     assert_eq!(event["event_id"], 1);
     assert_eq!(event["event"]["type"], "task_started");
     assert_eq!(event["event"]["task_id"], task.to_string());
+}
+
+#[test]
+fn slow_daemon_subscriber_gets_one_framed_resync_without_affecting_another_client() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let slow_task = TaskId::new();
+    let healthy_task = TaskId::new();
+    repository.create_task(&slow_task, &root, "queued").unwrap();
+    repository
+        .create_task(&healthy_task, &root, "queued")
+        .unwrap();
+
+    let request_id = "real-slow-subscriber";
+    let mut slow_stream = UnixStream::connect(daemon.socket_path()).unwrap();
+    set_receive_buffer(&slow_stream, 4 * 1024);
+    writeln!(
+        slow_stream,
+        "{}",
+        serde_json::to_string(&json!({
+            "protocol_version": 1,
+            "request_id": request_id,
+            "command": {
+                "type": "SubscribeEvents",
+                "after_event_id": 0,
+                "filters": {"task_ids": [slow_task.to_string()]}
+            },
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    slow_stream.flush().unwrap();
+    let mut slow_reader = BufReader::new(slow_stream);
+    let snapshot = raw_response(&mut slow_reader);
+    assert_eq!(snapshot["result"]["type"], "Subscription");
+    slow_reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+
+    let mut healthy = subscribe_with_filters(
+        daemon.socket_path(),
+        0,
+        SubscriptionFilters {
+            task_ids: vec![healthy_task.to_string()],
+            kinds: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        healthy.next_response().unwrap(),
+        IpcResponse::Subscription(_)
+    ));
+
+    for _ in 0..1_400 {
+        repository
+            .append_event(&slow_task, RuntimeEvent::TaskStarted)
+            .unwrap();
+    }
+    let healthy_event_id = repository
+        .transition_task(&healthy_task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+    let IpcResponse::Event(healthy_event) = healthy.next_response().unwrap() else {
+        panic!("healthy subscriber did not receive its event");
+    };
+    assert_eq!(healthy_event.event_id, healthy_event_id);
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let mut frames = Vec::new();
+    loop {
+        let mut line = String::new();
+        let read = slow_reader.read_line(&mut line).unwrap();
+        if read == 0 {
+            break;
+        }
+        frames.push(
+            serde_json::from_str::<Value>(&line).expect("every frame must remain valid JSON"),
+        );
+    }
+
+    assert!(!frames.is_empty());
+    assert!(frames.iter().all(|frame| frame["request_id"] == request_id));
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["result"]["type"] == "ResyncRequired")
+            .count(),
+        1
+    );
+    assert_eq!(frames.last().unwrap()["result"]["type"], "ResyncRequired");
+}
+
+fn set_receive_buffer(stream: &UnixStream, bytes: libc::c_int) {
+    // SAFETY: the file descriptor and option pointer are valid for this call.
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of!(bytes).cast(),
+            std::mem::size_of_val(&bytes) as libc::socklen_t,
+        )
+    };
+    assert_eq!(result, 0);
 }
 
 fn raw_request(socket_path: &std::path::Path, request: Value) -> Value {

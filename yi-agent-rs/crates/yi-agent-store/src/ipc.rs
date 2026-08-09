@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -664,13 +665,16 @@ fn stream_subscription(
     let subscription_stop = Arc::new(AtomicBool::new(false));
     let producer_pending = Arc::clone(&pending);
     let producer_stop = Arc::clone(&subscription_stop);
+    let producer_daemon_stop = Arc::clone(&stop);
     let database_path = database_path.to_path_buf();
     let producer = thread::spawn(move || -> Result<(), IpcError> {
         let result = (|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            while !stop.load(Ordering::Acquire) && !producer_stop.load(Ordering::Acquire) {
+            while !producer_daemon_stop.load(Ordering::Acquire)
+                && !producer_stop.load(Ordering::Acquire)
+            {
                 runtime.block_on(coordinator.reconcile_worker_events())?;
                 let repository = RuntimeRepository::open(&database_path)?;
                 let events = repository.event_records_after(cursor)?;
@@ -689,16 +693,7 @@ fn stream_subscription(
         result
     });
 
-    let write_result = loop {
-        match pending.pop_wait() {
-            Some(envelope) => {
-                if let Err(error) = write_envelope_frame(stream, &envelope) {
-                    break Err(error);
-                }
-            }
-            None => break Ok(()),
-        }
-    };
+    let write_result = write_subscription_frames(stream, &pending, &stop);
     subscription_stop.store(true, Ordering::Release);
     pending.close();
     let producer_result = producer.join().map_err(|_| {
@@ -720,6 +715,7 @@ struct PendingSubscriptionFrames {
 struct PendingSubscriptionState {
     frames: VecDeque<ResponseEnvelope>,
     closed: bool,
+    overflowed: bool,
 }
 
 impl PendingSubscriptionFrames {
@@ -731,6 +727,7 @@ impl PendingSubscriptionFrames {
             state: Mutex::new(PendingSubscriptionState {
                 frames: VecDeque::new(),
                 closed: false,
+                overflowed: false,
             }),
             available: Condvar::new(),
         }
@@ -750,6 +747,7 @@ impl PendingSubscriptionFrames {
                 IpcResponse::ResyncRequired,
             ));
             state.closed = true;
+            state.overflowed = true;
             self.available.notify_one();
             return false;
         }
@@ -777,6 +775,10 @@ impl PendingSubscriptionFrames {
         self.available.notify_all();
     }
 
+    fn overflowed(&self) -> bool {
+        self.state.lock().unwrap().overflowed
+    }
+
     #[cfg(test)]
     fn drain_for_test(&self) -> Vec<ResponseEnvelope> {
         self.state.lock().unwrap().frames.drain(..).collect()
@@ -785,6 +787,84 @@ impl PendingSubscriptionFrames {
     #[cfg(test)]
     fn is_closed(&self) -> bool {
         self.state.lock().unwrap().closed
+    }
+}
+
+struct PendingFrameWrite {
+    bytes: Vec<u8>,
+    written: usize,
+    is_event: bool,
+    is_resync: bool,
+}
+
+impl PendingFrameWrite {
+    fn new(envelope: &ResponseEnvelope) -> Result<Self, IpcError> {
+        let (mut bytes, is_event, is_resync) = encode_envelope(envelope)?;
+        bytes.push(b'\n');
+        Ok(Self {
+            bytes,
+            written: 0,
+            is_event,
+            is_resync,
+        })
+    }
+}
+
+fn write_subscription_frames(
+    stream: &mut UnixStream,
+    pending: &PendingSubscriptionFrames,
+    stop: &AtomicBool,
+) -> Result<(), IpcError> {
+    stream.set_write_timeout(None)?;
+    stream.set_nonblocking(true)?;
+    let mut current: Option<PendingFrameWrite> = None;
+    loop {
+        if stop.load(Ordering::Acquire) && !pending.overflowed() {
+            stream.shutdown(Shutdown::Write)?;
+            return Ok(());
+        }
+        if current.is_none() {
+            let Some(envelope) = pending.pop_wait() else {
+                stream.shutdown(Shutdown::Write)?;
+                return Ok(());
+            };
+            current = Some(PendingFrameWrite::new(&envelope)?);
+        }
+
+        let frame = current.as_mut().expect("pending frame was initialized");
+        if frame.written == 0 && frame.is_event && pending.overflowed() {
+            current = None;
+            continue;
+        }
+        match stream.write(&frame.bytes[frame.written..]) {
+            Ok(0) => {
+                return Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write subscription frame",
+                )));
+            }
+            Ok(written) => {
+                frame.written += written;
+                if frame.written == frame.bytes.len() {
+                    let sent_resync = frame.is_resync;
+                    current = None;
+                    if sent_resync {
+                        stream.shutdown(Shutdown::Write)?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(IpcError::Io(error)),
+        }
     }
 }
 
@@ -821,22 +901,33 @@ fn write_envelope_frame(
     stream: &mut UnixStream,
     envelope: &ResponseEnvelope,
 ) -> Result<(), IpcError> {
-    let frame = serde_json::to_vec(&envelope)?;
-    let frame = if frame.len() <= MAX_FRAME_BYTES {
-        frame
-    } else {
+    let (frame, _, _) = encode_envelope(envelope)?;
+    stream.write_all(&frame)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn encode_envelope(envelope: &ResponseEnvelope) -> Result<(Vec<u8>, bool, bool), IpcError> {
+    let frame = serde_json::to_vec(envelope)?;
+    if frame.len() <= MAX_FRAME_BYTES {
+        return Ok((
+            frame,
+            matches!(envelope.result, IpcResponse::Event(_)),
+            matches!(envelope.result, IpcResponse::ResyncRequired),
+        ));
+    }
+    Ok((
         serde_json::to_vec(&ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id: envelope.request_id.clone(),
             event_id: None,
             event: None,
             result: IpcResponse::ResyncRequired,
-        })?
-    };
-    stream.write_all(&frame)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
+        })?,
+        false,
+        true,
+    ))
 }
 
 fn next_request_id() -> String {
@@ -850,6 +941,7 @@ fn next_request_id() -> String {
 #[cfg(test)]
 mod subscription_queue_tests {
     use super::*;
+    use std::os::fd::AsRawFd;
 
     fn event(event_id: i64) -> IpcEvent {
         IpcEvent {
@@ -909,6 +1001,81 @@ mod subscription_queue_tests {
             Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
         ));
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn partial_event_frame_finishes_before_resync_frame() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        set_send_buffer(&writer, 4 * 1024);
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let queue = Arc::new(PendingSubscriptionFrames::new("partial-client", 2));
+        let mut large_event = event(1);
+        large_event.task_id = "x".repeat(256 * 1024);
+        assert!(queue.push_event(large_event));
+
+        let writer_queue = Arc::clone(&queue);
+        let writer = thread::spawn(move || {
+            write_subscription_frames(&mut writer, &writer_queue, &AtomicBool::new(false)).unwrap();
+        });
+        assert!(wait_until_socket_has_bytes(&reader));
+        assert!(queue.push_event(event(2)));
+        assert!(queue.push_event(event(3)));
+        assert!(!queue.push_event(event(4)));
+
+        let mut subscription = Subscription {
+            reader: BufReader::new(reader),
+            request_id: "partial-client".into(),
+        };
+        let first = subscription.next_frame().unwrap();
+        assert!(matches!(
+            first.result,
+            IpcResponse::Event(IpcEvent { event_id: 1, .. })
+        ));
+        assert_eq!(
+            subscription.next_response().unwrap(),
+            IpcResponse::ResyncRequired
+        );
+        assert!(matches!(
+            subscription.next_response(),
+            Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        writer.join().unwrap();
+    }
+
+    fn set_send_buffer(stream: &UnixStream, bytes: libc::c_int) {
+        // SAFETY: the file descriptor and option pointer are valid for this call.
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::addr_of!(bytes).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0);
+    }
+
+    fn wait_until_socket_has_bytes(stream: &UnixStream) -> bool {
+        for _ in 0..1_000 {
+            let mut byte = 0_u8;
+            // SAFETY: the one-byte output buffer and file descriptor are valid.
+            let received = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    std::ptr::addr_of_mut!(byte).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if received > 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
     }
 }
 

@@ -3637,6 +3637,7 @@ name = "yi-agent-store"
 version = "0.1.2"
 dependencies = [
  "futures",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
