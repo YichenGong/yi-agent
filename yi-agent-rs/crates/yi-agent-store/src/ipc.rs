@@ -714,8 +714,20 @@ struct PendingSubscriptionFrames {
 
 struct PendingSubscriptionState {
     frames: VecDeque<ResponseEnvelope>,
-    closed: bool,
-    overflowed: bool,
+    close_reason: SubscriptionQueueClose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionQueueClose {
+    Open,
+    ProducerClosed,
+    Overflowed,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SubscriptionFrameWrite {
+    Dropped,
+    Written(usize),
 }
 
 impl PendingSubscriptionFrames {
@@ -726,8 +738,7 @@ impl PendingSubscriptionFrames {
             capacity,
             state: Mutex::new(PendingSubscriptionState {
                 frames: VecDeque::new(),
-                closed: false,
-                overflowed: false,
+                close_reason: SubscriptionQueueClose::Open,
             }),
             available: Condvar::new(),
         }
@@ -736,7 +747,7 @@ impl PendingSubscriptionFrames {
     /// Returns false once this event caused overflow or the subscription was closed.
     fn push_event(&self, event: IpcEvent) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.closed {
+        if state.close_reason != SubscriptionQueueClose::Open {
             return false;
         }
         if state.frames.len() == self.capacity {
@@ -746,8 +757,7 @@ impl PendingSubscriptionFrames {
                 None,
                 IpcResponse::ResyncRequired,
             ));
-            state.closed = true;
-            state.overflowed = true;
+            state.close_reason = SubscriptionQueueClose::Overflowed;
             self.available.notify_one();
             return false;
         }
@@ -763,7 +773,7 @@ impl PendingSubscriptionFrames {
 
     fn pop_wait(&self) -> Option<ResponseEnvelope> {
         let mut state = self.state.lock().unwrap();
-        while state.frames.is_empty() && !state.closed {
+        while state.frames.is_empty() && state.close_reason == SubscriptionQueueClose::Open {
             state = self.available.wait(state).unwrap();
         }
         state.frames.pop_front()
@@ -771,12 +781,35 @@ impl PendingSubscriptionFrames {
 
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
-        state.closed = true;
+        if state.close_reason == SubscriptionQueueClose::Open {
+            state.close_reason = SubscriptionQueueClose::ProducerClosed;
+        }
         self.available.notify_all();
     }
 
-    fn overflowed(&self) -> bool {
-        self.state.lock().unwrap().overflowed
+    fn close_reason(&self) -> SubscriptionQueueClose {
+        self.state.lock().unwrap().close_reason
+    }
+
+    fn write_frame_chunk(
+        &self,
+        writer: &mut impl Write,
+        frame: &PendingFrameWrite,
+    ) -> Result<SubscriptionFrameWrite, IpcError> {
+        if frame.written == 0 {
+            let state = self.state.lock().unwrap();
+            if frame.is_event && state.close_reason == SubscriptionQueueClose::Overflowed {
+                return Ok(SubscriptionFrameWrite::Dropped);
+            }
+            return writer
+                .write(&frame.bytes)
+                .map(SubscriptionFrameWrite::Written)
+                .map_err(IpcError::Io);
+        }
+        writer
+            .write(&frame.bytes[frame.written..])
+            .map(SubscriptionFrameWrite::Written)
+            .map_err(IpcError::Io)
     }
 
     #[cfg(test)]
@@ -786,7 +819,7 @@ impl PendingSubscriptionFrames {
 
     #[cfg(test)]
     fn is_closed(&self) -> bool {
-        self.state.lock().unwrap().closed
+        self.state.lock().unwrap().close_reason != SubscriptionQueueClose::Open
     }
 }
 
@@ -819,7 +852,10 @@ fn write_subscription_frames(
     stream.set_nonblocking(true)?;
     let mut current: Option<PendingFrameWrite> = None;
     loop {
-        if stop.load(Ordering::Acquire) && !pending.overflowed() {
+        let close_reason = pending.close_reason();
+        if close_reason == SubscriptionQueueClose::ProducerClosed
+            || (stop.load(Ordering::Acquire) && close_reason != SubscriptionQueueClose::Overflowed)
+        {
             stream.shutdown(Shutdown::Write)?;
             return Ok(());
         }
@@ -832,18 +868,17 @@ fn write_subscription_frames(
         }
 
         let frame = current.as_mut().expect("pending frame was initialized");
-        if frame.written == 0 && frame.is_event && pending.overflowed() {
-            current = None;
-            continue;
-        }
-        match stream.write(&frame.bytes[frame.written..]) {
-            Ok(0) => {
+        match pending.write_frame_chunk(stream, frame) {
+            Ok(SubscriptionFrameWrite::Dropped) => {
+                current = None;
+            }
+            Ok(SubscriptionFrameWrite::Written(0)) => {
                 return Err(IpcError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write subscription frame",
                 )));
             }
-            Ok(written) => {
+            Ok(SubscriptionFrameWrite::Written(written)) => {
                 frame.written += written;
                 if frame.written == frame.bytes.len() {
                     let sent_resync = frame.is_resync;
@@ -854,7 +889,7 @@ fn write_subscription_frames(
                     }
                 }
             }
-            Err(error)
+            Err(IpcError::Io(error))
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -862,8 +897,8 @@ fn write_subscription_frames(
             {
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(IpcError::Io(error)),
+            Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
 }
@@ -942,6 +977,7 @@ fn next_request_id() -> String {
 mod subscription_queue_tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
 
     fn event(event_id: i64) -> IpcEvent {
         IpcEvent {
@@ -1042,6 +1078,82 @@ mod subscription_queue_tests {
             Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
         ));
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn producer_close_interrupts_a_blocked_partial_frame_writer() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        set_send_buffer(&writer, 4 * 1024);
+        let queue = Arc::new(PendingSubscriptionFrames::new("closed-client", 2));
+        let mut large_event = event(1);
+        large_event.task_id = "x".repeat(256 * 1024);
+        assert!(queue.push_event(large_event));
+
+        let writer_queue = Arc::clone(&queue);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let result =
+                write_subscription_frames(&mut writer, &writer_queue, &AtomicBool::new(false));
+            let _ = finished_tx.send(result);
+        });
+        assert!(wait_until_socket_has_bytes(&reader));
+
+        queue.close();
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(250)).is_ok(),
+            "producer close must stop a writer blocked on an unread peer"
+        );
+        drop(reader);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn overflow_cannot_race_between_the_initial_check_and_first_write() {
+        struct LockCheckingWriter<'a> {
+            state: &'a Mutex<PendingSubscriptionState>,
+            observed_locked_state: bool,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for LockCheckingWriter<'_> {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                if self.state.try_lock().is_err() {
+                    self.observed_locked_state = true;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                self.bytes.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let queue = PendingSubscriptionFrames::new("racing-client", 1);
+        assert!(queue.push_event(event(1)));
+        let envelope = queue.pop_wait().unwrap();
+        let frame = PendingFrameWrite::new(&envelope).unwrap();
+        let mut writer = LockCheckingWriter {
+            state: &queue.state,
+            observed_locked_state: false,
+            bytes: Vec::new(),
+        };
+
+        let first = queue.write_frame_chunk(&mut writer, &frame);
+        assert!(matches!(
+            first,
+            Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(writer.observed_locked_state);
+
+        assert!(queue.push_event(event(2)));
+        assert!(!queue.push_event(event(3)));
+        assert_eq!(
+            queue.write_frame_chunk(&mut writer, &frame).unwrap(),
+            SubscriptionFrameWrite::Dropped
+        );
+        assert!(writer.bytes.is_empty());
     }
 
     fn set_send_buffer(stream: &UnixStream, bytes: libc::c_int) {
