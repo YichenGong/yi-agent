@@ -11,8 +11,9 @@ use uuid::Uuid;
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::scheduler::AdmissionPriority;
 use super::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, PauseReason, RecoveryEvidence,
-    RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind, WatchdogEvidence,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, PauseReason, PermissionDecision,
+    PermissionRequestId, RecoveryEvidence, RootSessionId, TaskEvent, TaskFailure, TaskId,
+    TaskState, TimeoutKind, WatchdogEvidence,
 };
 use super::worker::{
     AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
@@ -950,6 +951,55 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    /// Places a running task in its reducer-owned permission wait state.
+    pub fn request_permission(
+        &mut self,
+        task_id: &TaskId,
+        request: PermissionRequestId,
+    ) -> Result<AttemptId, String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::PermissionRequested {
+                attempt_id: attempt_id.clone(),
+                request,
+            },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(attempt_id)
+    }
+
+    /// Applies an immutable permission decision through the same task reducer
+    /// used by workers, so an external control surface cannot invent state.
+    pub fn resolve_permission(
+        &mut self,
+        task_id: &TaskId,
+        request: PermissionRequestId,
+        decision: PermissionDecision,
+    ) -> Result<AttemptId, String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::PermissionResolved {
+                attempt_id: attempt_id.clone(),
+                request,
+                decision,
+            },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(attempt_id)
+    }
+
     pub fn record_recovery_conflict(
         &mut self,
         task_id: &TaskId,
@@ -1185,6 +1235,7 @@ struct SendMessageTool {
 mod provider_turn_priority_tests {
     use super::*;
     use crate::subagent::mailbox::ReworkInstruction;
+    use crate::subagent::task::{PermissionDecision, PermissionRequestId};
 
     #[test]
     fn parent_routes_pending_high_priority_mail_to_the_coordination_reserve() {
@@ -1212,6 +1263,27 @@ mod provider_turn_priority_tests {
             supervisor.provider_turn_admission_priority(&root),
             AdmissionPriority::High
         );
+    }
+
+    #[test]
+    fn permission_resolution_is_reduced_by_the_owning_supervisor() {
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let root = supervisor.root_task_id().clone();
+        let request = PermissionRequestId::new();
+        supervisor.start_task(&root).unwrap();
+
+        supervisor
+            .request_permission(&root, request.clone())
+            .unwrap();
+        assert_eq!(
+            supervisor.task(&root).unwrap().state(),
+            &TaskState::WaitingForPermission(request.clone())
+        );
+
+        supervisor
+            .resolve_permission(&root, request, PermissionDecision::Allow)
+            .unwrap();
+        assert_eq!(supervisor.task(&root).unwrap().state(), &TaskState::Queued);
     }
 }
 

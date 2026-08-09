@@ -28,6 +28,8 @@ pub enum RepositoryError {
     MailboxMessageNotFound { message_id: String },
     #[error("permission request is not pending: {request}")]
     PermissionRequestNotPending { request: String },
+    #[error("permission request does not exist: {request}")]
+    PermissionRequestNotFound { request: String },
     #[error("worker recovery context is not durable: {reason}")]
     InvalidWorkerRecoveryContext { reason: String },
     #[error("admission cursor is invalid for {key}: {reason}")]
@@ -1980,6 +1982,33 @@ impl RuntimeRepository {
                 |row| row.get(0),
             )
             .map_err(RepositoryError::from)
+    }
+
+    /// Locates the task owning a still-pending request without accepting an
+    /// actor- or client-supplied task ID at the daemon boundary.
+    pub fn pending_permission_task(
+        &self,
+        request: &PermissionRequestId,
+    ) -> Result<TaskId, RepositoryError> {
+        let (task_id, state) = self
+            .connection
+            .query_row(
+                "SELECT task_id, state FROM permission_requests WHERE id = ?1",
+                [request.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| RepositoryError::PermissionRequestNotFound {
+                request: request.to_string(),
+            })?;
+        if state != "pending" {
+            return Err(RepositoryError::PermissionRequestNotPending {
+                request: request.to_string(),
+            });
+        }
+        task_id
+            .parse()
+            .map_err(|_| RepositoryError::TaskNotFound { task: task_id })
     }
 
     pub fn task_state(&self, task: &TaskId) -> Result<String, RepositoryError> {

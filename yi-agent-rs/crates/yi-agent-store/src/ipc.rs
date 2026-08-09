@@ -16,7 +16,9 @@ use chrono::{Local, Timelike};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-use yi_agent_core::subagent::task::{RootSessionId, TaskId};
+use yi_agent_core::subagent::task::{
+    PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
+};
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 
 use crate::repository::RuntimeRepository;
@@ -174,6 +176,10 @@ pub enum IpcRequest {
         session_id: String,
         task_id: String,
     },
+    ResolvePermission {
+        request_id: String,
+        decision: IpcPermissionDecision,
+    },
     SendMessage {
         session_id: String,
         sender_task_id: String,
@@ -260,6 +266,7 @@ pub enum IpcResponse {
     TaskRetried,
     TaskPaused,
     TaskResumed,
+    PermissionResolved,
     MessageQueued,
     WaitCompleted {
         status: String,
@@ -300,6 +307,23 @@ pub struct IpcCancelDelivery {
     pub delivery_id: String,
     pub task_id: String,
     pub payload_json: String,
+}
+
+/// Stable, actor-free decision vocabulary for local daemon controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcPermissionDecision {
+    Allow,
+    Deny,
+}
+
+impl From<IpcPermissionDecision> for PermissionDecision {
+    fn from(decision: IpcPermissionDecision) -> Self {
+        match decision {
+            IpcPermissionDecision::Allow => Self::Allow,
+            IpcPermissionDecision::Deny => Self::Deny,
+        }
+    }
 }
 
 /// Stable public error categories for IPC consumers. Error responses never
@@ -1700,7 +1724,8 @@ fn read_incoming_frame<R: BufRead>(reader: &mut R) -> Result<Option<IncomingFram
 fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcErrorCode {
     match error {
         crate::repository::RepositoryError::TaskNotFound { .. }
-        | crate::repository::RepositoryError::MailboxMessageNotFound { .. } => {
+        | crate::repository::RepositoryError::MailboxMessageNotFound { .. }
+        | crate::repository::RepositoryError::PermissionRequestNotFound { .. } => {
             IpcErrorCode::NotFound
         }
         crate::repository::RepositoryError::PermissionRequestNotPending { .. } => {
@@ -1894,6 +1919,17 @@ fn respond(
                 .build()?;
             runtime.block_on(coordinator.resume_task(&session_id, &task_id))?;
             Ok(IpcResponse::TaskResumed)
+        }
+        IpcRequest::ResolvePermission {
+            request_id,
+            decision,
+        } => {
+            let request_id = parse_id::<PermissionRequestId>(&request_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.resolve_permission(&request_id, decision.into()))?;
+            Ok(IpcResponse::PermissionResolved)
         }
         IpcRequest::SendMessage {
             session_id,

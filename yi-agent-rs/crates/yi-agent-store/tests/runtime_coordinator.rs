@@ -7,7 +7,9 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
-use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
+use yi_agent_core::subagent::task::{
+    BudgetKind, PermissionDecision, PermissionRequestId, TimeoutKind,
+};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
@@ -1677,4 +1679,44 @@ async fn coordinator_persists_worker_usage_and_meaningful_progress() {
             .into_iter()
             .any(|event| event.event == RuntimeEvent::TaskProgress)
     );
+}
+
+#[tokio::test]
+async fn coordinator_resolves_permission_with_a_daemon_owned_actor() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+    let request = PermissionRequestId::new();
+    coordinator.start_worker(&session, &task).await.unwrap();
+
+    coordinator
+        .request_permission(&session, &task, request.clone(), r#"{"tool":"shell"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.task_state(&task).unwrap(),
+        "waiting_for_permission"
+    );
+
+    coordinator
+        .resolve_permission(&request, PermissionDecision::Allow)
+        .await
+        .unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.permission_request_state(&request).unwrap(),
+        "allowed"
+    );
+    assert_eq!(repository.task_state(&task).unwrap(), "queued");
+    let event = repository
+        .event_records_after(0)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event == RuntimeEvent::PermissionResolved)
+        .expect("permission resolution is audited");
+    assert!(event.payload_json.contains("local_user"));
+    assert!(!event.payload_json.contains(&task.to_string()));
 }

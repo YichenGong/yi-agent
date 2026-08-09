@@ -16,7 +16,8 @@ use yi_agent_core::subagent::scheduler::{
 };
 use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError, WaitMode, WaitOutcome};
 use yi_agent_core::subagent::task::{
-    MessageId, PauseReason, RootSessionId, TaskId, WatchdogEvidence as CoreWatchdogEvidence,
+    MessageId, PauseReason, PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
+    TaskState, WatchdogEvidence as CoreWatchdogEvidence,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerRecoveryContext, WorkerRecoveryPreflight,
@@ -965,6 +966,99 @@ impl RuntimeCoordinator {
         }
         if self.factory.is_available() {
             self.start_worker(session, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Records a tool/security permission wait through both durable and
+    /// reducer-owned state before it becomes visible to control clients.
+    pub async fn request_permission(
+        &self,
+        session: &RootSessionId,
+        task: &TaskId,
+        request: PermissionRequestId,
+        payload_json: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        let mut supervisor = supervisor.lock().await;
+        let attempt = supervisor
+            .task(task)
+            .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
+            .active_attempt_id()
+            .clone();
+        if !matches!(
+            supervisor.task(task).map(|task| task.state()),
+            Some(TaskState::Running)
+        ) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "permission requests require a running task".into(),
+            ));
+        }
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .request_permission(task, &attempt, &request, payload_json)?;
+        supervisor
+            .request_permission(task, request)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        Ok(())
+    }
+
+    /// Applies a daemon-owned local-user decision. The request itself resolves
+    /// its task and session, so an IPC caller cannot impersonate a task actor.
+    pub async fn resolve_permission(
+        &self,
+        request: &PermissionRequestId,
+        decision: PermissionDecision,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let (task, session) = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            let task = repository.pending_permission_task(request)?;
+            let session = repository
+                .task_detail(&task)?
+                .session_id
+                .parse()
+                .map_err(|_| {
+                    RuntimeCoordinatorError::Supervisor(
+                        "persisted task has an invalid session ID".into(),
+                    )
+                })?;
+            (task, session)
+        };
+        let supervisor = self.supervisor(&session)?;
+        let mut supervisor = supervisor.lock().await;
+        if !matches!(
+            supervisor.task(&task).map(|task| task.state()),
+            Some(TaskState::WaitingForPermission(expected)) if expected == request
+        ) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "permission request does not match the active task wait".into(),
+            ));
+        }
+        // Unix-domain IPC peer authentication establishes this local principal;
+        // control clients never get to choose an arbitrary task identity.
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .resolve_permission(
+                request,
+                decision.clone(),
+                r#"{"kind":"local_user","source":"daemon"}"#,
+            )?;
+        supervisor
+            .resolve_permission(&task, request.clone(), decision.clone())
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        if matches!(decision, PermissionDecision::Deny)
+            && !matches!(
+                supervisor.task(&task).expect("task was checked").depth,
+                yi_agent_core::TaskDepth::Root
+            )
+        {
+            drop(supervisor);
+            self.release_resident_lease(&task);
         }
         Ok(())
     }

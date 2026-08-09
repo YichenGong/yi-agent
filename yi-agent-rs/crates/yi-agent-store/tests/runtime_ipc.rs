@@ -8,7 +8,7 @@ use futures::{FutureExt, future::BoxFuture};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use yi_agent_core::subagent::task::MessageId;
+use yi_agent_core::subagent::task::{MessageId, PermissionRequestId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
 };
@@ -1880,6 +1880,28 @@ fn cancel_confirmation_rejects_a_preview_when_its_active_lease_scope_changes() {
         .unwrap(),
         IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+        }
+    ));
+}
+
+#[test]
+fn resolve_permission_ipc_uses_only_the_daemon_owned_request_identity() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ResolvePermission {
+            request_id: PermissionRequestId::new().to_string(),
+            decision: yi_agent_store::ipc::IpcPermissionDecision::Allow,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        response,
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound
         }
     ));
 }
