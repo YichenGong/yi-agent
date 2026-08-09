@@ -116,6 +116,7 @@ pub struct PersistedRecoveredTask {
     pub worktree_lease: Option<String>,
     pub checkpoint_json: Option<String>,
     pub tool_state_json: String,
+    pub objective: String,
     pub recovery_gated: bool,
     pub recovery_attested: bool,
 }
@@ -248,10 +249,35 @@ impl RuntimeRepository {
         attempt_number: u32,
         state: &str,
     ) -> Result<(), RepositoryError> {
+        self.create_child_task_with_attempt_and_objective(
+            task,
+            root,
+            parent,
+            depth,
+            attempt,
+            attempt_number,
+            state,
+            "Complete the delegated task.",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_child_task_with_attempt_and_objective(
+        &mut self,
+        task: &TaskId,
+        root: &RootSessionId,
+        parent: &TaskId,
+        depth: u8,
+        attempt: &AttemptId,
+        attempt_number: u32,
+        state: &str,
+        objective: &str,
+    ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
+        let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
             "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, '{}')",
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -259,6 +285,7 @@ impl RuntimeRepository {
                 depth,
                 state,
                 attempt.to_string(),
+                delivery_json,
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -503,6 +530,15 @@ impl RuntimeRepository {
              WHERE id = ?2 AND task_id = ?3",
             params![state, attempt.to_string(), task.to_string()],
         )?;
+        // A worker that has reached a terminal state no longer owns admission
+        // resources, including failures reported after a factory accepted it.
+        if matches!(state, "blocked" | "cancelled" | "failed") {
+            transaction.execute(
+                "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1 AND state = 'active'",
+                params![task.to_string()],
+            )?;
+        }
         let event_id = append_event(&transaction, task, event)?;
         transaction.commit()?;
         Ok(event_id)
@@ -901,7 +937,7 @@ impl RuntimeRepository {
                     (SELECT resource_key FROM resource_leases
                      WHERE task_id = tasks.id AND state = 'active' AND resource_key LIKE 'worktree:%'
                      ORDER BY acquired_at DESC, id DESC LIMIT 1),
-                    attempts.checkpoint_json, attempts.usage_json, tasks.state_json
+                    attempts.checkpoint_json, attempts.usage_json, tasks.state_json, tasks.delivery_json
              FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.state_json IN ('recovery_required', 'recovery_gated', 'recovery_attested')
              ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
@@ -920,6 +956,7 @@ impl RuntimeRepository {
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })?
             .map(|row| {
@@ -935,6 +972,7 @@ impl RuntimeRepository {
                     checkpoint_json,
                     tool_state_json,
                     task_state,
+                    delivery_json,
                 ) = row?;
                 Ok(PersistedRecoveredTask {
                     session_id: session_id.parse().map_err(|_| {
@@ -967,6 +1005,17 @@ impl RuntimeRepository {
                     worktree_lease,
                     checkpoint_json,
                     tool_state_json,
+                    objective: serde_json::from_str::<serde_json::Value>(&delivery_json)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("objective")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| {
+                            "Recover safely: inspect the recorded worktree before changes.".into()
+                        }),
                     recovery_gated: task_state == "recovery_gated",
                     recovery_attested: task_state == "recovery_attested",
                 })

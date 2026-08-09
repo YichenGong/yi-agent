@@ -39,10 +39,27 @@ impl DaemonAgentWorkerFactory {
         }
     }
 
-    #[cfg(test)]
-    fn with_workspace(mut self, workspace: PathBuf) -> Self {
+    /// Must match the directory passed to builtin filesystem and shell tools.
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
         self.workspace = workspace;
         self
+    }
+
+    fn worker_tool_names(&self) -> Vec<String> {
+        let mut names = self
+            .tools
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<Vec<_>>();
+        names.extend([
+            "spawn_agent".to_string(),
+            "send_message".to_string(),
+            "wait_agent".to_string(),
+        ]);
+        names.sort();
+        names.dedup();
+        names
     }
 }
 
@@ -52,12 +69,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let git_root = git_output(workspace, &["rev-parse", "--show-toplevel"]);
         let git_head = git_output(workspace, &["rev-parse", "HEAD"]);
         let git_status = git_command_output(workspace, &["status", "--porcelain"]).ok();
-        let tool_names = self
-            .tools
-            .schemas()
-            .into_iter()
-            .map(|schema| schema.name)
-            .collect::<Vec<_>>();
+        let tool_names = self.worker_tool_names();
         WorkerRecoveryContext {
             workspace_lease_id: Some(format!("workspace:{}", workspace.display())),
             worktree_lease: git_root.map(|directory| format!("worktree:{directory}")),
@@ -79,7 +91,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         &self,
         request: WorkerRecoveryPreflight,
     ) -> WorkerRecoveryPreflightResult {
-        match validate_recovery_context(&request.context, &self.tools) {
+        match validate_recovery_context(&request.context, self.worker_tool_names()) {
             Ok(attestation) => WorkerRecoveryPreflightResult::Attested(attestation),
             Err(reason) => WorkerRecoveryPreflightResult::Conflict(reason),
         }
@@ -241,7 +253,7 @@ fn git_command_output(directory: &std::path::Path, args: &[&str]) -> Result<Stri
 /// Performs the recovery gate before an Agent or ordinary worker tool exists.
 fn validate_recovery_context(
     context: &WorkerRecoveryContext,
-    tools: &ToolRegistry,
+    mut actual: Vec<String>,
 ) -> Result<WorkerRecoveryAttestation, String> {
     let workspace = context
         .workspace_lease_id
@@ -298,11 +310,6 @@ fn validate_recovery_context(
                 .ok_or_else(|| "recorded tool list is invalid".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut actual = tools
-        .schemas()
-        .into_iter()
-        .map(|schema| schema.name)
-        .collect::<Vec<_>>();
     expected.sort();
     actual.sort();
     if expected != actual {

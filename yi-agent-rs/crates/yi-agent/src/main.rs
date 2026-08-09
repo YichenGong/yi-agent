@@ -135,12 +135,16 @@ fn build_daemon_worker_factory(
         compact_keep_turns: Some(config.compact_keep_turns),
         ..Default::default()
     };
-    Ok(Arc::new(subagent_runtime::DaemonAgentWorkerFactory::new(
-        provider,
-        Arc::new(registry),
-        agent_config,
-        runtime_socket,
-    )))
+    Ok(Arc::new(
+        subagent_runtime::DaemonAgentWorkerFactory::new(
+            provider,
+            Arc::new(registry),
+            agent_config,
+            runtime_socket,
+        )
+        // Recovery must inspect the same worktree ordinary builtin tools use.
+        .with_workspace(config.workdir),
+    ))
 }
 
 fn runtime_directory() -> Result<std::path::PathBuf> {

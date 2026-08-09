@@ -115,6 +115,7 @@ impl RuntimeCoordinator {
                         task.attempt_id,
                         task.attempt_number,
                         task.recovery_gated || task.recovery_attested,
+                        task.objective,
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
             } else {
@@ -124,6 +125,7 @@ impl RuntimeCoordinator {
                         task.task_id,
                         task.attempt_id,
                         task.attempt_number,
+                        task.objective,
                     )
                 } else {
                     AgentSupervisor::from_recovered_root(
@@ -131,6 +133,7 @@ impl RuntimeCoordinator {
                         task.task_id,
                         task.attempt_id,
                         task.attempt_number,
+                        task.objective,
                     )
                 };
                 supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
@@ -202,7 +205,7 @@ impl RuntimeCoordinator {
         let supervisor = self.supervisor(session)?;
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
-            let child = supervisor.spawn_with_objective(parent.clone(), objective)?;
+            let child = supervisor.spawn_with_objective(parent.clone(), objective.clone())?;
             let depth = match supervisor
                 .task(&child)
                 .expect("newly spawned task exists")
@@ -222,7 +225,7 @@ impl RuntimeCoordinator {
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .create_child_task_with_attempt(
+            .create_child_task_with_attempt_and_objective(
                 &child,
                 session,
                 parent,
@@ -230,6 +233,7 @@ impl RuntimeCoordinator {
                 &attempt.id,
                 attempt.number,
                 "queued",
+                &objective,
             )?;
         Ok(child)
     }

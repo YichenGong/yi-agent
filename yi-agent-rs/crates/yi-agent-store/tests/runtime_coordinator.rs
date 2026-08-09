@@ -568,7 +568,16 @@ async fn recovered_child_resumes_after_runtime_restart() {
         .create_task_with_attempt(&root, &session, &root_attempt, 1, "running")
         .unwrap();
     repository
-        .create_child_task_with_attempt(&child, &session, &root, 1, &child_attempt, 1, "running")
+        .create_child_task_with_attempt_and_objective(
+            &child,
+            &session,
+            &root,
+            1,
+            &child_attempt,
+            1,
+            "running",
+            "Preserve this recovered child objective.",
+        )
         .unwrap();
     repository.recover_inflight_tasks().unwrap();
     drop(repository);
@@ -577,6 +586,10 @@ async fn recovered_child_resumes_after_runtime_restart() {
     let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
     coordinator.resume_task(&session, &child).await.unwrap();
     assert_eq!(factory.starts.lock().unwrap()[0].task_id, child);
+    assert_eq!(
+        factory.starts.lock().unwrap()[0].objective,
+        "Preserve this recovered child objective."
+    );
 }
 
 #[tokio::test]

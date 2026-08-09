@@ -104,6 +104,7 @@ impl AgentSupervisor {
         root_task_id: TaskId,
         attempt_id: super::task::AttemptId,
         attempt_number: u32,
+        objective: String,
     ) -> Self {
         let root = AgentTask::recovered_root(
             root_session_id,
@@ -116,10 +117,7 @@ impl AgentSupervisor {
         let mut mailboxes = HashMap::new();
         mailboxes.insert(root_task_id.clone(), Mailbox::default());
         let mut objectives = HashMap::new();
-        objectives.insert(
-            root_task_id.clone(),
-            "Recover safely: inspect the recorded worktree before changes.".into(),
-        );
+        objectives.insert(root_task_id.clone(), objective);
         let (updates, _) = watch::channel(0_u64);
         Self {
             root_task_id,
@@ -140,12 +138,14 @@ impl AgentSupervisor {
         root_task_id: TaskId,
         attempt_id: super::task::AttemptId,
         attempt_number: u32,
+        objective: String,
     ) -> Self {
         let mut supervisor = Self::from_recovered_root(
             root_session_id.clone(),
             root_task_id.clone(),
             attempt_id.clone(),
             attempt_number,
+            objective,
         );
         supervisor.tasks.insert(
             root_task_id.clone(),
@@ -167,6 +167,7 @@ impl AgentSupervisor {
         attempt_id: super::task::AttemptId,
         attempt_number: u32,
         recovery_gated: bool,
+        objective: String,
     ) -> Result<(), String> {
         if !self.tasks.contains_key(&parent_id) {
             return Err("recovered child parent is missing".into());
@@ -201,10 +202,7 @@ impl AgentSupervisor {
         };
         self.tasks.insert(task_id.clone(), task);
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
-        self.objectives.insert(
-            task_id.clone(),
-            "Recover safely: inspect the recorded worktree before changes.".into(),
-        );
+        self.objectives.insert(task_id.clone(), objective);
         self.children.entry(parent_id).or_default().push(task_id);
         Ok(())
     }
