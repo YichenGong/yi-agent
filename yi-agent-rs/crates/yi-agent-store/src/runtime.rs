@@ -1138,9 +1138,15 @@ impl RuntimeCoordinator {
 struct ProviderTurnAdmissions {
     resources: Arc<Mutex<ResourceCoordinator>>,
     repository: Arc<Mutex<RuntimeRepository>>,
-    queued: Mutex<HashSet<TaskId>>,
+    queued: Mutex<HashMap<TaskId, QueuedProviderTurn>>,
     assigned: Mutex<HashMap<TaskId, LeaseId>>,
     notify: Arc<Notify>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedProviderTurn {
+    resource_key: String,
+    priority: AdmissionPriority,
 }
 
 impl ProviderTurnAdmissions {
@@ -1151,7 +1157,7 @@ impl ProviderTurnAdmissions {
         Self {
             resources,
             repository,
-            queued: Mutex::new(HashSet::new()),
+            queued: Mutex::new(HashMap::new()),
             assigned: Mutex::new(HashMap::new()),
             notify: Arc::new(Notify::new()),
         }
@@ -1187,7 +1193,21 @@ impl ProviderTurnAdmissions {
             .queued
             .lock()
             .expect("provider turn queue mutex poisoned");
-        if queued.insert(task_id.clone()) {
+        let queued_request = QueuedProviderTurn {
+            resource_key: resource_key.into(),
+            priority,
+        };
+        if queued
+            .get(&task_id)
+            .is_some_and(|existing| *existing != queued_request)
+        {
+            // A turn can become coordination-eligible while it waits. Remove
+            // its former request before queueing the replacement so one task
+            // cannot receive grants from both provider pools.
+            resources.cancel_task_requests(&task_id);
+            queued.remove(&task_id);
+        }
+        if !queued.contains_key(&task_id) {
             resources.enqueue_with_priority_for_parent_at(
                 root_id,
                 parent_id,
@@ -1202,6 +1222,7 @@ impl ProviderTurnAdmissions {
                 priority,
                 Utc::now(),
             );
+            queued.insert(task_id.clone(), queued_request);
         }
         let Some(grant) = resources.grant_next(resource_key) else {
             return Ok(None);
@@ -1529,6 +1550,95 @@ mod provider_turn_admission_tests {
         assert!(
             coordination.is_some(),
             "parent coordination uses the reserve"
+        );
+        drop(coordination);
+        drop(regular_leases);
+    }
+
+    #[test]
+    fn queued_provider_turn_migrates_to_coordination_reserve_without_duplicate_request() {
+        let mut resources = ResourceCoordinator::new();
+        resources.configure_provider_llm_capacity("test");
+        let root = RootSessionId::new();
+        let tasks = (0..9).map(|_| TaskId::new()).collect::<Vec<_>>();
+        let repository = test_repository(&root, &tasks);
+        let admissions =
+            ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources)), Arc::clone(&repository));
+        let mut regular_leases = Vec::new();
+
+        for task in &tasks[..7] {
+            regular_leases.push(
+                admissions
+                    .acquire_now(
+                        root.clone(),
+                        task.clone(),
+                        task.clone(),
+                        "llm:test",
+                        AdmissionPriority::Normal,
+                    )
+                    .unwrap()
+                    .expect("regular pool has seven permits"),
+            );
+        }
+
+        // An already eligible coordination request prevents a regular turn
+        // from borrowing the reserve, so the target is deterministically
+        // queued on the regular key.
+        admissions
+            .resources
+            .lock()
+            .unwrap()
+            .enqueue_with_priority_for_parent_at(
+                root.clone(),
+                tasks[8].clone(),
+                tasks[8].clone(),
+                ResourceRequest {
+                    scope: ResourceScope::ProviderKey,
+                    key: "llm-coordination:test".into(),
+                    mode: LeaseMode::Shared,
+                    units: 1,
+                    deadline: None,
+                },
+                AdmissionPriority::High,
+                Utc::now(),
+            );
+
+        assert!(
+            admissions
+                .acquire_now(
+                    root.clone(),
+                    tasks[7].clone(),
+                    tasks[7].clone(),
+                    "llm:test",
+                    AdmissionPriority::Normal,
+                )
+                .unwrap()
+                .is_none(),
+            "the eighth normal request waits for a regular permit"
+        );
+        admissions
+            .resources
+            .lock()
+            .unwrap()
+            .cancel_task_requests(&tasks[8]);
+
+        let coordination = admissions
+            .acquire_now(
+                root,
+                tasks[7].clone(),
+                tasks[7].clone(),
+                "llm-coordination:test",
+                AdmissionPriority::High,
+            )
+            .unwrap();
+        assert!(
+            coordination.is_some(),
+            "a waiting task becomes eligible for the coordination reserve"
+        );
+        assert_eq!(
+            admissions.resources.lock().unwrap().queued_request_count(),
+            0,
+            "migration removes the obsolete normal queue request"
         );
         drop(coordination);
         drop(regular_leases);
