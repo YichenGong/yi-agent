@@ -1157,10 +1157,18 @@ fn watchdog_terminal_is_durable_once_and_releases_every_lease() {
     assert_eq!(repository.task_state(&task).unwrap(), "stalled");
     assert_eq!(repository.attempt_state(&attempt).unwrap(), "stalled");
     assert!(repository.attempt_ended_at(&attempt).unwrap().is_some());
+    let terminal: serde_json::Value = serde_json::from_str(
+        &repository
+            .attempt_terminal_json_for_task(&task)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
-        repository.attempt_terminal_json_for_task(&task).unwrap(),
-        Some(serde_json::to_string(&evidence).unwrap())
+        terminal["watchdog"],
+        serde_json::to_value(&evidence).unwrap()
     );
+    assert_eq!(terminal["outcome"]["kind"], "stalled");
     assert!(
         !repository
             .has_active_lease_prefix(&task, "workspace:")
@@ -1222,12 +1230,17 @@ async fn runtime_watchdog_stalls_a_running_worker_once() {
             .cancellation_token()
             .is_cancelled()
     );
-    assert_eq!(
-        RuntimeRepository::open(&database)
+    let terminal: serde_json::Value = serde_json::from_str(
+        &RuntimeRepository::open(&database)
             .unwrap()
             .attempt_terminal_json_for_task(&task)
+            .unwrap()
             .unwrap(),
-        Some(serde_json::to_string(&evidence).unwrap())
+    )
+    .unwrap();
+    assert_eq!(
+        terminal["watchdog"],
+        serde_json::to_value(&evidence).unwrap()
     );
     assert!(
         !coordinator
@@ -1276,6 +1289,14 @@ fn watchdog_terminal_variants_emit_their_distinct_event_kinds() {
             .unwrap();
 
         assert_eq!(repository.task_state(&task).unwrap(), expected_state);
+        let terminal: serde_json::Value = serde_json::from_str(
+            &repository
+                .attempt_terminal_json_for_task(&task)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(terminal["outcome"]["kind"], expected_state);
         assert!(
             repository
                 .event_records_after(0)

@@ -135,6 +135,24 @@ impl WatchdogTerminal {
             Self::BudgetExhausted(_) => RuntimeEvent::TaskBudgetExhausted,
         }
     }
+
+    fn terminal_json(&self, evidence: &WatchdogEvidence) -> Result<String, serde_json::Error> {
+        let outcome = match self {
+            Self::Stalled => serde_json::json!({ "kind": "stalled" }),
+            Self::TimedOut(kind) => serde_json::json!({
+                "kind": "timed_out",
+                "timeout_kind": kind,
+            }),
+            Self::BudgetExhausted(kind) => serde_json::json!({
+                "kind": "budget_exhausted",
+                "budget_kind": kind,
+            }),
+        };
+        serde_json::to_string(&serde_json::json!({
+            "watchdog": evidence,
+            "outcome": outcome,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -915,7 +933,7 @@ impl RuntimeRepository {
             return Ok(None);
         }
 
-        let terminal_json = serde_json::to_string(evidence)?;
+        let terminal_json = terminal.terminal_json(evidence)?;
         transaction.execute(
             "UPDATE attempts SET state = ?1, ended_at = CURRENT_TIMESTAMP, terminal_json = ?2
              WHERE id = ?3 AND task_id = ?4",
