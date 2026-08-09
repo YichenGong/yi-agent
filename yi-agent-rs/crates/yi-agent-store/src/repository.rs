@@ -10,7 +10,9 @@ use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
-const LATEST_SCHEMA_VERSION: i64 = 3;
+use crate::schedule::{WatchdogLimits, WatchdogObservation, WatchdogUsage};
+
+const LATEST_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -28,6 +30,8 @@ pub enum RepositoryError {
     InvalidWorkerRecoveryContext { reason: String },
     #[error("admission cursor is invalid for {key}: {reason}")]
     InvalidAdmissionCursor { key: String, reason: String },
+    #[error("watchdog snapshot is invalid for {attempt}: {reason}")]
+    InvalidWatchdogSnapshot { attempt: String, reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +114,13 @@ pub struct WatchdogEvidence {
     pub last_meaningful_at: DateTime<Utc>,
     pub elapsed_secs: u64,
     pub current_wait: Option<WatchdogResourceWait>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedAttemptWatchdog {
+    pub limits: WatchdogLimits,
+    pub observation: WatchdogObservation,
+    pub last_meaningful_event_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,6 +557,134 @@ impl RuntimeRepository {
             params![attempt.to_string(), task.to_string(), number, state],
         )?;
         Ok(())
+    }
+
+    /// Stores watchdog facts separately from recovery's tool-state payload.
+    /// The upsert lets the daemon persist each meaningful progress or resource
+    /// queue transition without creating another attempt.
+    pub fn save_attempt_watchdog_snapshot(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        limits: &WatchdogLimits,
+        usage: &WatchdogUsage,
+        last_meaningful_event_id: Option<i64>,
+        last_meaningful_at: DateTime<Utc>,
+        current_wait: Option<&WatchdogResourceWait>,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ?1 AND task_id = ?2)",
+            params![attempt.to_string(), task.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO attempt_watchdogs (
+                attempt_id, task_id, limits_json, usage_json, last_meaningful_event_id,
+                last_meaningful_at, resource_wait_key, resource_wait_started_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                limits_json = excluded.limits_json,
+                usage_json = excluded.usage_json,
+                last_meaningful_event_id = excluded.last_meaningful_event_id,
+                last_meaningful_at = excluded.last_meaningful_at,
+                resource_wait_key = excluded.resource_wait_key,
+                resource_wait_started_at = excluded.resource_wait_started_at",
+            params![
+                attempt.to_string(),
+                task.to_string(),
+                serde_json::to_string(limits)?,
+                serde_json::to_string(usage)?,
+                last_meaningful_event_id,
+                last_meaningful_at.to_rfc3339(),
+                current_wait.map(|wait| wait.resource_key.as_str()),
+                current_wait.map(|wait| wait.queued_at.to_rfc3339()),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn attempt_watchdog_snapshot(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<Option<PersistedAttemptWatchdog>, RepositoryError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT attempts.started_at, attempt_watchdogs.limits_json,
+                        attempt_watchdogs.usage_json, attempt_watchdogs.last_meaningful_event_id,
+                        attempt_watchdogs.last_meaningful_at,
+                        attempt_watchdogs.resource_wait_started_at
+                 FROM attempt_watchdogs JOIN attempts ON attempts.id = attempt_watchdogs.attempt_id
+                 WHERE attempt_watchdogs.attempt_id = ?1",
+                params![attempt.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(
+                started_at,
+                limits_json,
+                usage_json,
+                last_event,
+                last_meaningful_at,
+                wait_started_at,
+            )| {
+                let parse_time = |value: &str| {
+                    DateTime::parse_from_rfc3339(value)
+                        .map(|time| time.with_timezone(&Utc))
+                        .or_else(|_| {
+                            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+                                .map(|time| time.and_utc())
+                        })
+                        .map_err(|error| RepositoryError::InvalidWatchdogSnapshot {
+                            attempt: attempt.to_string(),
+                            reason: format!("invalid timestamp {value:?}: {error}"),
+                        })
+                };
+                Ok(PersistedAttemptWatchdog {
+                    limits: serde_json::from_str(&limits_json).map_err(|error| {
+                        RepositoryError::InvalidWatchdogSnapshot {
+                            attempt: attempt.to_string(),
+                            reason: format!("invalid limits JSON: {error}"),
+                        }
+                    })?,
+                    observation: WatchdogObservation {
+                        attempt_started_at: parse_time(&started_at)?,
+                        last_meaningful_at: parse_time(&last_meaningful_at)?,
+                        resource_wait_started_at: wait_started_at
+                            .as_deref()
+                            .map(parse_time)
+                            .transpose()?,
+                        usage: serde_json::from_str(&usage_json).map_err(|error| {
+                            RepositoryError::InvalidWatchdogSnapshot {
+                                attempt: attempt.to_string(),
+                                reason: format!("invalid usage JSON: {error}"),
+                            }
+                        })?,
+                    },
+                    last_meaningful_event_id: last_event,
+                })
+            },
+        )
+        .transpose()
     }
 
     /// Test/support API for recording the durable facts a resumed worker must
@@ -1677,6 +1816,24 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
                 ON resource_admission_cursors(root_session_id);",
         )?;
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])?;
+        transaction.commit()?;
+    }
+    if current_version < 4 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE attempt_watchdogs (
+                attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                limits_json TEXT NOT NULL,
+                usage_json TEXT NOT NULL,
+                last_meaningful_event_id INTEGER,
+                last_meaningful_at TEXT NOT NULL,
+                resource_wait_key TEXT,
+                resource_wait_started_at TEXT
+            );
+            CREATE INDEX attempt_watchdogs_task_idx ON attempt_watchdogs(task_id);",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (4)", [])?;
         transaction.commit()?;
     }
     Ok(())

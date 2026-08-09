@@ -16,6 +16,7 @@ use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
 };
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
+use yi_agent_store::schedule::{WatchdogLimits, WatchdogUsage};
 
 #[derive(Default)]
 struct RecordingFactory;
@@ -1337,4 +1338,68 @@ fn watchdog_terminal_variants_emit_their_distinct_event_kinds() {
                 .any(|event| event.event == expected_event)
         );
     }
+}
+
+#[test]
+fn attempt_watchdog_snapshot_survives_a_repository_reopen() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let limits = WatchdogLimits {
+        max_turns: Some(30),
+        max_tokens: Some(1_000),
+        max_cost_micros: Some(2_000),
+        max_wall_time_secs: Some(900),
+        max_idle_time_secs: Some(300),
+        max_resource_wait_secs: Some(60),
+        max_provider_retries: Some(3),
+        max_tool_retries: Some(2),
+        max_rework_cycles: Some(2),
+    };
+    let usage = WatchdogUsage {
+        turns: 4,
+        tokens: 100,
+        cost_micros: 30,
+        provider_retries: 1,
+        tool_retries: 0,
+        rework_cycles: 0,
+    };
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository
+        .save_attempt_watchdog_snapshot(
+            &task,
+            &attempt,
+            &limits,
+            &usage,
+            Some(42),
+            timestamp,
+            Some(&WatchdogResourceWait {
+                resource_key: "llm:test".into(),
+                queued_at: timestamp,
+            }),
+        )
+        .unwrap();
+    drop(repository);
+
+    let persisted = RuntimeRepository::open(&database)
+        .unwrap()
+        .attempt_watchdog_snapshot(&attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.limits, limits);
+    assert_eq!(persisted.observation.usage, usage);
+    assert_eq!(persisted.last_meaningful_event_id, Some(42));
+    assert_eq!(persisted.observation.last_meaningful_at, timestamp);
+    assert_eq!(
+        persisted.observation.resource_wait_started_at,
+        Some(timestamp)
+    );
 }

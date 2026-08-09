@@ -1,12 +1,12 @@
 //! Effective runtime and scheduled-session policy values.
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 
 /// Immutable limits applied by the daemon to one attempt. Optional ceilings
 /// remain unbounded until configured by the user or a narrower project policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchdogLimits {
     pub max_turns: Option<u32>,
     pub max_tokens: Option<u64>,
@@ -19,7 +19,7 @@ pub struct WatchdogLimits {
     pub max_rework_cycles: Option<u16>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchdogUsage {
     pub turns: u32,
     pub tokens: u64,
