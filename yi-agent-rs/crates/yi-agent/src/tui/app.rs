@@ -1111,9 +1111,7 @@ fn execute_slash_command(
             history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
-        SlashCommand::Pause
-        | SlashCommand::Resume
-        | SlashCommand::Approve
+        SlashCommand::Approve
         | SlashCommand::Review
         | SlashCommand::Accept
         | SlashCommand::Rework
@@ -1128,6 +1126,28 @@ fn execute_slash_command(
                 },
                 width,
             );
+            KeyOutcome::None
+        }
+        SlashCommand::Pause => {
+            let label = match parse_pause_resume_args(args.as_deref(), "pause") {
+                Ok((session_id, task_id)) => match daemon_pause(session_id, task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法暂停任务: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Resume => {
+            let label = match parse_pause_resume_args(args.as_deref(), "resume") {
+                Ok((session_id, task_id)) => match daemon_resume(session_id, task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法恢复任务: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
         SlashCommand::Cancel => {
@@ -1226,15 +1246,23 @@ fn parse_cancel_args(args: Option<&str>) -> Result<(&str, &str, bool), String> {
 }
 
 fn parse_retry_args(args: Option<&str>) -> Result<(&str, &str), String> {
+    parse_pause_resume_args(args, "retry")
+}
+
+fn parse_pause_resume_args<'a>(
+    args: Option<&'a str>,
+    command: &str,
+) -> Result<(&'a str, &'a str), String> {
+    let usage = || format!("用法: /{command} <session-id> <task-id>");
     let Some(args) = args else {
-        return Err("用法: /retry <session-id> <task-id>".into());
+        return Err(usage());
     };
     let mut parts = args.split_whitespace();
     let (Some(session_id), Some(task_id)) = (parts.next(), parts.next()) else {
-        return Err("用法: /retry <session-id> <task-id>".into());
+        return Err(usage());
     };
     if parts.next().is_some() {
-        return Err("用法: /retry <session-id> <task-id>".into());
+        return Err(usage());
     }
     Ok((session_id, task_id))
 }
@@ -1286,6 +1314,60 @@ fn daemon_retry(session_id: &str, task_id: &str) -> Result<String, String> {
         .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
         .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
     daemon_retry_at(&runtime_dir.join("runtime.sock"), session_id, task_id)
+}
+
+fn daemon_pause(session_id: &str, task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_pause_at(&runtime_dir.join("runtime.sock"), session_id, task_id)
+}
+
+fn daemon_pause_at(
+    socket: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::PauseTask {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskPaused) {
+        return Err("daemon 返回了非暂停响应".into());
+    }
+    Ok(format!("已请求暂停任务: {task_id}"))
+}
+
+fn daemon_resume(session_id: &str, task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_resume_at(&runtime_dir.join("runtime.sock"), session_id, task_id)
+}
+
+fn daemon_resume_at(
+    socket: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ResumeTask {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskResumed) {
+        return Err("daemon 返回了非恢复响应".into());
+    }
+    Ok(format!("已请求恢复任务: {task_id}"))
 }
 
 fn daemon_retry_at(
@@ -1583,6 +1665,7 @@ mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use futures::future::BoxFuture;
     use ratatui::backend::TestBackend;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -1591,7 +1674,21 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+    use yi_agent_core::subagent::worker::{
+        AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart,
+    };
     use yi_agent_core::{OutputStream, RootSessionId, TaskId};
+
+    struct RecordingWorkerFactory;
+
+    impl AgentWorkerFactory for RecordingWorkerFactory {
+        fn start(
+            &self,
+            request: WorkerStart,
+        ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+            Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+        }
+    }
 
     #[test]
     fn test_route_event_full_flow() {
@@ -1773,6 +1870,59 @@ mod tests {
         let result = daemon_retry_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
 
         assert!(result.contains("已请求重试"));
+    }
+
+    #[test]
+    fn pause_and_resume_controls_require_explicit_session_scope() {
+        assert_eq!(
+            parse_pause_resume_args(Some("session-1 task-1"), "pause").unwrap(),
+            ("session-1", "task-1")
+        );
+        assert_eq!(
+            parse_pause_resume_args(Some("session-1"), "pause").unwrap_err(),
+            "用法: /pause <session-id> <task-id>"
+        );
+        assert_eq!(
+            parse_pause_resume_args(None, "resume").unwrap_err(),
+            "用法: /resume <session-id> <task-id>"
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_controls_route_to_the_daemon_with_explicit_session_scope() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon = yi_agent_store::ipc::Daemon::start_with_factory(
+            directory.path().join("runtime"),
+            &database,
+            Arc::new(RecordingWorkerFactory),
+        )
+        .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated {
+            session_id,
+            root_task_id,
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::CreateSession,
+        )
+        .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::StartWorker {
+                session_id: session_id.clone(),
+                task_id: root_task_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let paused = daemon_pause_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+        let resumed = daemon_resume_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+
+        assert!(paused.contains("已请求暂停"));
+        assert!(resumed.contains("已请求恢复"));
     }
 
     #[test]
