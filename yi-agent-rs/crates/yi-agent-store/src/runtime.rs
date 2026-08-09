@@ -1495,6 +1495,45 @@ mod provider_turn_admission_tests {
         );
     }
 
+    #[test]
+    fn failed_provider_turn_persistence_returns_its_in_memory_permit() {
+        let mut resources = ResourceCoordinator::new();
+        resources.set_capacity("llm:test", 1);
+        let root = RootSessionId::new();
+        let missing_task = TaskId::new();
+        let valid_task = TaskId::new();
+        let repository = test_repository(&root, &[valid_task.clone()]);
+        let admissions = ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources)), repository);
+
+        // The foreign-key write fails because this task was never persisted.
+        assert!(
+            admissions
+                .acquire_now(
+                    root.clone(),
+                    missing_task.clone(),
+                    missing_task,
+                    "llm:test",
+                    AdmissionPriority::Normal,
+                )
+                .is_err()
+        );
+
+        // A later valid task must not inherit a leaked permit from the failed
+        // durable grant.
+        assert!(
+            admissions
+                .acquire_now(
+                    root,
+                    valid_task.clone(),
+                    valid_task,
+                    "llm:test",
+                    AdmissionPriority::Normal,
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn waiting_provider_turn_gate_wakes_after_a_lease_releases() {
         let mut resources = ResourceCoordinator::new();
