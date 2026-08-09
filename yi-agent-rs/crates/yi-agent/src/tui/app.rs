@@ -1159,10 +1159,12 @@ fn execute_slash_command(
         }
         SlashCommand::Cancel => {
             let label = match parse_cancel_args(args.as_deref()) {
-                Ok((task_id, recursive)) => match daemon_cancel(task_id, recursive) {
-                    Ok(message) => message,
-                    Err(error) => format!("无法取消任务: {error}"),
-                },
+                Ok((task_id, recursive, confirmation)) => {
+                    match daemon_cancel(task_id, recursive, confirmation) {
+                        Ok(message) => message,
+                        Err(error) => format!("无法取消任务: {error}"),
+                    }
+                }
                 Err(error) => error,
             };
             history.push(HistoryCell::Separator { label: Some(label) }, width);
@@ -1231,23 +1233,27 @@ fn daemon_agent_detail_at(socket: &std::path::Path, task_id: &str) -> Result<Str
     ))
 }
 
-fn parse_cancel_args(args: Option<&str>) -> Result<(&str, bool), String> {
+fn parse_cancel_args(args: Option<&str>) -> Result<(&str, bool, Option<&str>), String> {
+    let usage = "用法: /cancel <task-id> [--recursive] [--confirm <token>]";
     let Some(args) = args else {
-        return Err("用法: /cancel <task-id> [--recursive]".into());
+        return Err(usage.into());
     };
     let mut parts = args.split_whitespace();
     let Some(task_id) = parts.next() else {
-        return Err("用法: /cancel <task-id> [--recursive]".into());
+        return Err(usage.into());
     };
-    let recursive = match parts.next() {
-        None => false,
-        Some("--recursive") => true,
-        Some(_) => return Err("第二个参数只能是 --recursive".into()),
-    };
-    if parts.next().is_some() {
-        return Err("用法: /cancel <task-id> [--recursive]".into());
+    let mut recursive = false;
+    let mut confirmation = None;
+    while let Some(argument) = parts.next() {
+        match argument {
+            "--recursive" if !recursive => recursive = true,
+            "--confirm" if confirmation.is_none() => {
+                confirmation = Some(parts.next().ok_or_else(|| usage.to_string())?);
+            }
+            _ => return Err(usage.into()),
+        }
     }
-    Ok((task_id, recursive))
+    Ok((task_id, recursive, confirmation))
 }
 
 fn parse_retry_args(args: Option<&str>) -> Result<&str, String> {
@@ -1412,39 +1418,59 @@ fn daemon_retry_at(
     Ok(format!("已请求重试任务: {task_id}"))
 }
 
-fn daemon_cancel(task_id: &str, recursive: bool) -> Result<String, String> {
+fn daemon_cancel(
+    task_id: &str,
+    recursive: bool,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
     let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
         .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
     let socket = runtime_dir.join("runtime.sock");
-    let session_id = daemon_task_session_at(&socket, task_id)?;
-    daemon_cancel_at(&socket, &session_id, task_id, recursive)
+    daemon_cancel_at(&socket, task_id, recursive, confirmation)
 }
 
 fn daemon_cancel_at(
     socket: &std::path::Path,
-    session_id: &str,
     task_id: &str,
     recursive: bool,
+    confirmation: Option<&str>,
 ) -> Result<String, String> {
-    let response = yi_agent_store::ipc::send_request(
-        socket,
-        yi_agent_store::ipc::IpcRequest::CancelTask {
-            session_id: session_id.to_owned(),
+    let request = match confirmation {
+        Some(confirmation_token) => yi_agent_store::ipc::IpcRequest::ConfirmCancel {
+            task_id: task_id.to_owned(),
+            recursive,
+            confirmation_token: confirmation_token.to_owned(),
+        },
+        None => yi_agent_store::ipc::IpcRequest::PreviewCancel {
             task_id: task_id.to_owned(),
             recursive,
         },
-    )
-    .map_err(|error| error.to_string())?;
-    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskCancelled) {
-        return Err("daemon 返回了非取消响应".into());
+    };
+    let response =
+        yi_agent_store::ipc::send_request(socket, request).map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token,
+            task_ids,
+            expires_in_secs,
+        } => Ok(format!(
+            "取消预览（{} 个任务）: {}；使用 /cancel {task_id}{} --confirm {confirmation_token} 在 {expires_in_secs}s 内确认",
+            task_ids.len(),
+            task_ids.join(", "),
+            if recursive { " --recursive" } else { "" },
+        )),
+        yi_agent_store::ipc::IpcResponse::TaskCancelled => Ok(if recursive {
+            format!("已递归取消任务树: {task_id}")
+        } else {
+            format!("已取消任务: {task_id}")
+        }),
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            Err(format!("daemon 拒绝取消请求: {code}"))
+        }
+        _ => Err("daemon 返回了非取消响应".into()),
     }
-    Ok(if recursive {
-        format!("已递归取消任务树: {task_id}")
-    } else {
-        format!("已取消任务: {task_id}")
-    })
 }
 
 fn daemon_agents_summary_at(socket: &std::path::Path) -> Result<String, String> {
@@ -1866,26 +1892,44 @@ mod tests {
     }
 
     #[test]
-    fn cancel_control_routes_to_the_daemon_with_explicit_session_scope() {
+    fn cancel_control_requires_a_preview_token_before_cancelling() {
         let directory = TempDir::new().unwrap();
         let database = directory.path().join("runtime.sqlite");
         let daemon =
             yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
                 .unwrap();
-        let yi_agent_store::ipc::IpcResponse::SessionCreated {
-            session_id,
-            root_task_id,
-        } = yi_agent_store::ipc::send_request(
-            daemon.socket_path(),
-            yi_agent_store::ipc::IpcRequest::CreateSession,
-        )
-        .unwrap()
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
         else {
             panic!("expected a created session");
         };
 
-        let result =
-            daemon_cancel_at(daemon.socket_path(), &session_id, &root_task_id, true).unwrap();
+        let preview = daemon_cancel_at(daemon.socket_path(), &root_task_id, true, None).unwrap();
+        assert!(preview.contains("取消预览"));
+        let yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token, ..
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::PreviewCancel {
+                task_id: root_task_id.clone(),
+                recursive: true,
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected a cancel preview");
+        };
+        let result = daemon_cancel_at(
+            daemon.socket_path(),
+            &root_task_id,
+            true,
+            Some(&confirmation_token),
+        )
+        .unwrap();
 
         assert!(result.contains("递归"));
         let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
@@ -1910,12 +1954,25 @@ mod tests {
         else {
             panic!("expected a created session");
         };
-        yi_agent_store::ipc::send_request(
+        let yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token, ..
+        } = yi_agent_store::ipc::send_request(
             daemon.socket_path(),
-            yi_agent_store::ipc::IpcRequest::CancelTask {
-                session_id: session_id.clone(),
+            yi_agent_store::ipc::IpcRequest::PreviewCancel {
                 task_id: root_task_id.clone(),
                 recursive: false,
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected a cancel preview");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::ConfirmCancel {
+                task_id: root_task_id.clone(),
+                recursive: false,
+                confirmation_token,
             },
         )
         .unwrap();

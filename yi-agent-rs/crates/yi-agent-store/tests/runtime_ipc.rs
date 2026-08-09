@@ -42,6 +42,31 @@ impl AgentWorkerFactory for RecordingWorkerFactory {
     }
 }
 
+fn confirm_cancel(socket: &std::path::Path, task_id: String, recursive: bool) -> IpcResponse {
+    let IpcResponse::CancelPreview {
+        confirmation_token, ..
+    } = send_request(
+        socket,
+        IpcRequest::PreviewCancel {
+            task_id: task_id.clone(),
+            recursive,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a cancel preview");
+    };
+    send_request(
+        socket,
+        IpcRequest::ConfirmCancel {
+            task_id,
+            recursive,
+            confirmation_token,
+        },
+    )
+    .unwrap()
+}
+
 #[derive(Clone, Default)]
 struct StartCountingFactory {
     starts: Arc<Mutex<usize>>,
@@ -1118,15 +1143,7 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
         panic!("expected a spawned child task");
     };
 
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::CancelTask {
-            session_id,
-            task_id: root_task_id,
-            recursive: true,
-        },
-    )
-    .unwrap();
+    let response = confirm_cancel(daemon.socket_path(), root_task_id, true);
     assert!(matches!(response, IpcResponse::TaskCancelled));
 
     let IpcResponse::Subscription(snapshot) = send_request(
@@ -1256,15 +1273,8 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
     else {
         panic!("expected a spawned child task");
     };
-    send_request(
-        daemon.socket_path(),
-        IpcRequest::CancelTask {
-            session_id: session_id.clone(),
-            task_id: child_task_id.clone(),
-            recursive: false,
-        },
-    )
-    .unwrap();
+    let response = confirm_cancel(daemon.socket_path(), child_task_id.clone(), false);
+    assert!(matches!(response, IpcResponse::TaskCancelled));
 
     let response = send_request(
         daemon.socket_path(),
@@ -1765,6 +1775,37 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
 }
 
 #[test]
+fn raw_cancel_request_cannot_bypass_confirmation() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::CancelTask {
+            session_id,
+            task_id: root_task_id,
+            recursive: false,
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        response,
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+        }
+    ));
+}
+
+#[test]
 fn daemon_retries_a_terminal_task_through_its_control_api() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -1789,15 +1830,8 @@ fn daemon_retries_a_terminal_task_through_its_control_api() {
         },
     )
     .unwrap();
-    send_request(
-        daemon.socket_path(),
-        IpcRequest::CancelTask {
-            session_id: session_id.clone(),
-            task_id: root_task_id.clone(),
-            recursive: false,
-        },
-    )
-    .unwrap();
+    let response = confirm_cancel(daemon.socket_path(), root_task_id.clone(), false);
+    assert!(matches!(response, IpcResponse::TaskCancelled));
 
     let response = send_request(
         daemon.socket_path(),

@@ -1788,19 +1788,9 @@ fn respond(
             runtime.block_on(coordinator.start_worker(&session_id, &task_id))?;
             Ok(IpcResponse::TaskStarted)
         }
-        IpcRequest::CancelTask {
-            session_id,
-            task_id,
-            recursive,
-        } => {
-            let session_id = parse_id::<RootSessionId>(&session_id)?;
-            let task_id = parse_id::<TaskId>(&task_id)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            runtime.block_on(coordinator.cancel_task(&session_id, &task_id, recursive))?;
-            Ok(IpcResponse::TaskCancelled)
-        }
+        IpcRequest::CancelTask { .. } => Ok(IpcResponse::Error {
+            code: IpcErrorCode::ConfirmationRequired,
+        }),
         IpcRequest::PreviewCancel { .. } | IpcRequest::ConfirmCancel { .. } => {
             Err(IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
