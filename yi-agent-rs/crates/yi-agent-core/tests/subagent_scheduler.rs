@@ -163,3 +163,32 @@ fn high_priority_request_precedes_a_normal_request() {
         high
     );
 }
+
+#[test]
+fn aged_background_request_eventually_precedes_normal_work() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 1);
+    let background = TaskId::new();
+    let now = Utc::now();
+    coordinator.enqueue_with_priority_at(
+        RootSessionId::new(),
+        background.clone(),
+        request("resident:global"),
+        AdmissionPriority::Background,
+        now - Duration::minutes(10),
+    );
+    coordinator.enqueue_with_priority(
+        RootSessionId::new(),
+        TaskId::new(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+    );
+
+    assert_eq!(
+        coordinator
+            .grant_next_at("resident:global", now)
+            .unwrap()
+            .task_id,
+        background
+    );
+}

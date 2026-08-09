@@ -64,6 +64,7 @@ struct QueuedRequest {
     task_id: TaskId,
     request: ResourceRequest,
     priority: AdmissionPriority,
+    enqueued_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -171,6 +172,17 @@ impl ResourceCoordinator {
         request: ResourceRequest,
         priority: AdmissionPriority,
     ) {
+        self.enqueue_with_priority_at(root_id, task_id, request, priority, Utc::now());
+    }
+
+    pub fn enqueue_with_priority_at(
+        &mut self,
+        root_id: RootSessionId,
+        task_id: TaskId,
+        request: ResourceRequest,
+        priority: AdmissionPriority,
+        enqueued_at: DateTime<Utc>,
+    ) {
         self.queues
             .entry(request.key.clone())
             .or_default()
@@ -179,20 +191,24 @@ impl ResourceCoordinator {
                 task_id,
                 request,
                 priority,
+                enqueued_at,
             });
     }
 
     pub fn grant_next(&mut self, key: &str) -> Option<GrantedLease> {
+        self.grant_next_at(key, Utc::now())
+    }
+
+    pub fn grant_next_at(&mut self, key: &str, now: DateTime<Utc>) -> Option<GrantedLease> {
         let capacity = *self.capacities.get(key).unwrap_or(&0);
         let used = *self.in_use.get(key).unwrap_or(&0);
         let queue = self.queues.get_mut(key)?;
-        let now = Utc::now();
         queue.retain(|entry| entry.request.deadline.is_none_or(|deadline| deadline > now));
         if used >= capacity {
             return None;
         }
         let last_root = self.last_grant_root.get(key).cloned();
-        let selected_index = select_fair_request(queue, last_root.as_ref(), capacity - used)?;
+        let selected_index = select_fair_request(queue, last_root.as_ref(), capacity - used, now)?;
         let queued = queue
             .remove(selected_index)
             .expect("selected queue entry exists");
@@ -234,8 +250,12 @@ fn select_fair_request(
     queue: &VecDeque<QueuedRequest>,
     last_root: Option<&RootSessionId>,
     available: u16,
+    now: DateTime<Utc>,
 ) -> Option<usize> {
-    let highest_priority = queue.iter().map(|entry| entry.priority).max()?;
+    let highest_score = queue
+        .iter()
+        .map(|entry| admission_score(entry, now))
+        .max()?;
     let roots =
         queue
             .iter()
@@ -258,11 +278,23 @@ fn select_fair_request(
         let root = &roots[(start + offset) % roots.len()];
         if let Some((index, _)) = queue.iter().enumerate().find(|(_, entry)| {
             &entry.root_id == root
-                && entry.priority == highest_priority
+                && admission_score(entry, now) == highest_score
                 && entry.request.units <= available
         }) {
             return Some(index);
         }
     }
     None
+}
+
+fn admission_score(entry: &QueuedRequest, now: DateTime<Utc>) -> i64 {
+    let priority = match entry.priority {
+        AdmissionPriority::Background => 0,
+        AdmissionPriority::Normal => 10,
+        AdmissionPriority::High => 20,
+        AdmissionPriority::Critical => 40,
+    };
+    let wait_seconds = (now - entry.enqueued_at).num_seconds().max(0);
+    let age_boost = (wait_seconds / 30).min(20);
+    priority + age_boost
 }
