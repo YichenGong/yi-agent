@@ -184,6 +184,11 @@ pub enum AgentEvent {
         old_msg_count: usize,
         new_msg_count: usize,
     },
+    /// Manual `/compact` completed and replaced the current session.
+    ManualCompacted {
+        old_msg_count: usize,
+        new_msg_count: usize,
+    },
     Cancelled,
     Error(AgentError),
     PermissionRequest {

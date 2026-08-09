@@ -286,6 +286,22 @@ impl HistoryState {
 }
 
 impl HistoryState {
+    /// Replaces the latest manual compact progress separator, if it exists.
+    fn replace_pending_compaction(&mut self, label: String) {
+        if let Some(HistoryCell::Separator {
+            label: pending_label,
+        }) = self.cells.iter_mut().rev().find(|cell| {
+            matches!(
+                cell,
+                HistoryCell::Separator {
+                    label: Some(label)
+                } if label == "正在压缩对话..."
+            )
+        }) {
+            *pending_label = Some(label);
+        }
+    }
+
     /// Process an AgentEvent and update the cell list accordingly.
     pub fn push_event(&mut self, event: AgentEvent, width: u16) {
         let was_scrolled = self.scroll_offset != 0;
@@ -403,6 +419,14 @@ impl HistoryState {
                 }
                 self.cells
                     .push(HistoryCell::PermissionResolved { decision });
+            }
+            AgentEvent::ManualCompacted {
+                old_msg_count,
+                new_msg_count,
+            } => {
+                self.replace_pending_compaction(format!(
+                    "压缩完成（{old_msg_count} → {new_msg_count} 条消息）"
+                ));
             }
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
@@ -1451,5 +1475,31 @@ mod tests {
         s.push(HistoryCell::Separator { label: None }, width);
 
         assert_eq!(s.scroll_offset, 0);
+    }
+
+    #[test]
+    fn manual_compaction_success_replaces_pending_status() {
+        let mut history = HistoryState::new();
+        history.push(
+            HistoryCell::Separator {
+                label: Some("正在压缩对话...".into()),
+            },
+            80,
+        );
+
+        history.push_event(
+            AgentEvent::ManualCompacted {
+                old_msg_count: 12,
+                new_msg_count: 5,
+            },
+            80,
+        );
+
+        assert_eq!(history.cells.len(), 1);
+        assert!(matches!(
+            &history.cells[0],
+            HistoryCell::Separator { label: Some(label) }
+                if label == "压缩完成（12 → 5 条消息）"
+        ));
     }
 }
