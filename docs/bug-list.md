@@ -1,10 +1,17 @@
 # Bug 列表
 
-- [x] web-fetch 存在 render 失败问题（markdown 渲染改进后修复）
-- [x] bash 执行过程时间统计没有停止（`tui/state.rs` 在 exit/timeout/abort 时冻结 `end_time`）
 - [ ] bash 执行过程中，如何停止当前的 bash 进程方式不明确
-- [x] TUI render markdown 表格格式失败（`tui/markdown.rs` Unicode box drawing 已实现）
 - [ ] 当前一些测试需要手工测试验证，无法自动化验证
 - [ ] 显示内容太密集，user 和 system 的内容之间加空行
 - [ ] bash 目前没有后台模式
 - [ ] sandbox没有，目前命令执行危险。
+- [ ] 命令行需要输入密码的话，TUI会出现显示故障。
+- [ ] 上下scroll速度过慢。比现在的速度应该调快一倍。
+- [ ] 排队user request加入对话的逻辑不是很清晰。
+- [x] 长输出流在约 4000 Token 时出现 `error decoding response body` — Provider 默认总超时已从 60 秒提高到 5 分钟：`yi-agent-rs/crates/yi-agent-llm/src/{anthropic,openai}/client.rs`；验证：`cargo test -p yi-agent-llm --lib default_stream_timeout_is_five_minutes`
+- [ ] bash执行结果现在显示的只有一行，多给几行结果，会更好。
+- [ ] 每次大模型的一个调用间的TUI显示，最好都有
+- [ ] 我希望在运行的时候能够切换模型。目前看起来没什么选择
+- [ ] 确认是否支持图片读取。
+- [ ] 如果输入框输入的是一个路径开始的内容。系统会把他当成slash command，然后会反馈说“未知命令”
+- [ ] 当遇到一系列的待确认项的时候，最好有进度条。
