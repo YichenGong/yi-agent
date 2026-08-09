@@ -10,7 +10,7 @@
 - [ ] 排队user request加入对话的逻辑不是很清晰。
 - [x] 长输出流在约 4000 Token 时出现 `error decoding response body` — Provider 默认总超时已从 60 秒提高到 5 分钟：`yi-agent-rs/crates/yi-agent-llm/src/{anthropic,openai}/client.rs`；验证：`cargo test -p yi-agent-llm --lib default_stream_timeout_is_five_minutes`
 - [ ] bash执行结果现在显示的只有一行，多给几行结果，会更好。
-- [ ] 每次大模型的一个调用间的TUI显示，最好都有
+- [ ] 每次大模型的一个调用间的TUI显示，最好都有空格。
 - [ ] 我希望在运行的时候能够切换模型。目前看起来没什么选择
 - [ ] 确认是否支持图片读取。
 - [ ] 如果输入框输入的是一个路径开始的内容。系统会把他当成slash command，然后会反馈说“未知命令”
