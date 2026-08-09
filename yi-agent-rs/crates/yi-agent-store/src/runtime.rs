@@ -1077,6 +1077,138 @@ impl RuntimeCoordinator {
     }
 }
 
+struct ProviderTurnAdmissions {
+    resources: Arc<Mutex<ResourceCoordinator>>,
+    queued: Mutex<HashSet<TaskId>>,
+    assigned: Mutex<HashMap<TaskId, LeaseId>>,
+}
+
+impl ProviderTurnAdmissions {
+    fn new(resources: Arc<Mutex<ResourceCoordinator>>) -> Self {
+        Self {
+            resources,
+            queued: Mutex::new(HashSet::new()),
+            assigned: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire_now(
+        &self,
+        root_id: RootSessionId,
+        parent_id: TaskId,
+        task_id: TaskId,
+        resource_key: &str,
+    ) -> Option<ProviderTurnLeaseHandle> {
+        if let Some(lease_id) = self
+            .assigned
+            .lock()
+            .expect("provider turn assignment mutex poisoned")
+            .remove(&task_id)
+        {
+            return Some(ProviderTurnLeaseHandle {
+                resources: Arc::clone(&self.resources),
+                lease_id,
+            });
+        }
+
+        let mut resources = self
+            .resources
+            .lock()
+            .expect("resource coordinator mutex poisoned");
+        let mut queued = self
+            .queued
+            .lock()
+            .expect("provider turn queue mutex poisoned");
+        if queued.insert(task_id.clone()) {
+            resources.enqueue_with_priority_for_parent_at(
+                root_id,
+                parent_id,
+                task_id.clone(),
+                ResourceRequest {
+                    scope: ResourceScope::ProviderKey,
+                    key: resource_key.into(),
+                    mode: LeaseMode::Shared,
+                    units: 1,
+                    deadline: None,
+                },
+                AdmissionPriority::Normal,
+                Utc::now(),
+            );
+        }
+        let grant = resources.grant_next(resource_key)?;
+        queued.remove(&grant.task_id);
+        let granted_task = grant.task_id.clone();
+        let lease_id = grant.lease_id;
+        if granted_task == task_id {
+            return Some(ProviderTurnLeaseHandle {
+                resources: Arc::clone(&self.resources),
+                lease_id,
+            });
+        }
+        self.assigned
+            .lock()
+            .expect("provider turn assignment mutex poisoned")
+            .insert(granted_task, lease_id);
+        None
+    }
+}
+
+struct ProviderTurnLeaseHandle {
+    resources: Arc<Mutex<ResourceCoordinator>>,
+    lease_id: LeaseId,
+}
+
+impl Drop for ProviderTurnLeaseHandle {
+    fn drop(&mut self) {
+        self.resources
+            .lock()
+            .expect("resource coordinator mutex poisoned")
+            .release(self.lease_id.clone())
+            .expect("provider turn lease release is idempotent");
+    }
+}
+
+#[cfg(test)]
+mod provider_turn_admission_tests {
+    use super::*;
+
+    #[test]
+    fn queued_provider_turn_is_assigned_to_its_selected_task_after_release() {
+        let mut resources = ResourceCoordinator::new();
+        resources.set_capacity("llm:test", 1);
+        let admissions = ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources)));
+        let root = RootSessionId::new();
+        let first_task = TaskId::new();
+        let second_task = TaskId::new();
+
+        let first = admissions.acquire_now(
+            root.clone(),
+            first_task.clone(),
+            first_task.clone(),
+            "llm:test",
+        );
+        assert!(first.is_some());
+        assert!(
+            admissions
+                .acquire_now(
+                    root.clone(),
+                    second_task.clone(),
+                    second_task.clone(),
+                    "llm:test"
+                )
+                .is_none()
+        );
+
+        drop(first);
+
+        assert!(
+            admissions
+                .acquire_now(root, second_task.clone(), second_task, "llm:test")
+                .is_some()
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 struct RecoveryContext {
     workspace_lease_id: Option<String>,
