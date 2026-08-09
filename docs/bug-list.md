@@ -16,4 +16,4 @@
 - [ ] 如果输入框输入的是一个路径开始的内容。系统会把他当成slash command，然后会反馈说“未知命令”
 - [ ] 当遇到一系列的待确认项的时候，最好有进度条。
 - [ ] 两次ESC不应该直接退出Agent的进程。ESC可以打断命令执行，可以打断对话，但是不应该退出整体进程。
-- [ ] --yolo 条件下，受沙箱限制，/dev/null 的访问限制阻断。这个是否符合预期？
+- [x] `--yolo` 条件下，`/dev/null` 受 sandbox 限制阻断 — `crates/yi-agent/src/config.rs` 在未显式指定 `--sandbox` 或 `YI_AGENT_SANDBOX` 时选择 `danger-full-access`，从而不经 sandbox wrapper 执行；验证：`cargo test -p yi-agent --bin yi-agent config::tests::load_yolo_from_cli_flag`。
