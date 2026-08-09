@@ -29,6 +29,7 @@ use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
 
 const HISTORY_WHEEL_LINES: usize = 3;
+const HISTORY_KEY_LINES: usize = 3;
 
 /// Run the ratatui TUI main loop with the real terminal.
 ///
@@ -902,11 +903,11 @@ fn handle_key(
 
     match key.code {
         KeyCode::Up if key.modifiers.is_empty() => {
-            history.scroll_up(1, max_scroll_offset);
+            history.scroll_up(HISTORY_KEY_LINES, max_scroll_offset);
             return KeyOutcome::None;
         }
         KeyCode::Down if key.modifiers.is_empty() => {
-            history.scroll_down(1);
+            history.scroll_down(HISTORY_KEY_LINES);
             return KeyOutcome::None;
         }
         KeyCode::PageUp if key.modifiers.is_empty() => {
@@ -3805,7 +3806,7 @@ mod tests {
         history.scroll_offset = 5;
 
         for (key, expected_offset) in [
-            (KeyCode::Up, 6),
+            (KeyCode::Up, 8),
             (KeyCode::Down, 5),
             (KeyCode::PageUp, 25),
             (KeyCode::PageDown, 5),
