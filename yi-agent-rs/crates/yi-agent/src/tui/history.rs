@@ -431,12 +431,21 @@ impl HistoryState {
             AgentEvent::ManualCompactFailed { message } => {
                 self.replace_pending_compaction(format!("压缩失败：{message}"));
             }
+            AgentEvent::AutoCompacting {
+                old_msg_count,
+                new_msg_count,
+            } => {
+                self.cells.push(HistoryCell::Separator {
+                    label: Some(format!(
+                        "已自动压缩（{old_msg_count} → {new_msg_count} 条消息）"
+                    )),
+                });
+            }
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
             | AgentEvent::ToolTimeout { .. }
             | AgentEvent::EstimatedPrefill(_)
-            | AgentEvent::DecodeDelta(_)
-            | AgentEvent::AutoCompacting { .. } => {
+            | AgentEvent::DecodeDelta(_) => {
                 // Not tracked in history
             }
         }
@@ -1527,6 +1536,25 @@ mod tests {
             &history.cells[0],
             HistoryCell::Separator { label: Some(label) }
                 if label == "压缩失败：provider unavailable"
+        ));
+    }
+
+    #[test]
+    fn auto_compaction_appends_completed_status() {
+        let mut history = HistoryState::new();
+
+        history.push_event(
+            AgentEvent::AutoCompacting {
+                old_msg_count: 10,
+                new_msg_count: 4,
+            },
+            80,
+        );
+
+        assert!(matches!(
+            &history.cells[0],
+            HistoryCell::Separator { label: Some(label) }
+                if label == "已自动压缩（10 → 4 条消息）"
         ));
     }
 }
