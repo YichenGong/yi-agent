@@ -7,6 +7,19 @@ use yi_agent_core::{AgentEvent, DoneReason};
 
 use super::cell::HistoryCell;
 
+/// Whether the boundary after `cell` needs a blank visual spacer.
+fn has_spacer_after(cell: &HistoryCell, next_cell: Option<&HistoryCell>) -> bool {
+    next_cell.is_some()
+        && (matches!(cell, HistoryCell::UserMessage { .. })
+            || matches!(
+                (cell, next_cell),
+                (
+                    HistoryCell::ToolResult { .. },
+                    Some(HistoryCell::AssistantMessage { .. })
+                )
+            ))
+}
+
 /// A location in the history content, independent of its current wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ViewportAnchor {
@@ -59,16 +72,14 @@ impl HistoryState {
         self.cells.iter().map(|c| c.line_count(width)).sum()
     }
 
-    /// Number of display lines including the blank spacer inserted after
-    /// each `UserMessage` cell (except the last). This matches the line count
-    /// used by `HistoryView::flattened_lines` / `render`.
+    /// Number of display lines including semantic blank spacers. This matches
+    /// the line count used by `HistoryView::flattened_lines` / `render`.
     pub fn flattened_line_count(&self, width: u16) -> usize {
-        let n = self.cells.len();
         let mut count = 0usize;
         for (i, cell) in self.cells.iter().enumerate() {
             count += cell.line_count(width);
-            if matches!(cell, HistoryCell::UserMessage { .. }) && i + 1 < n {
-                count += 1; // spacer line
+            if has_spacer_after(cell, self.cells.get(i + 1)) {
+                count += 1;
             }
         }
         count
@@ -105,7 +116,7 @@ impl HistoryState {
     }
 
     /// Capture the top visible content location when the viewport is not
-    /// following the bottom. A user-message spacer belongs to that user cell.
+    /// following the bottom. A semantic spacer belongs to its preceding cell.
     pub(super) fn capture_viewport_anchor(
         &self,
         text_width: u16,
@@ -131,8 +142,7 @@ impl HistoryState {
             }
             lines_before += cell_lines;
 
-            if matches!(cell, HistoryCell::UserMessage { .. }) && cell_index + 1 < self.cells.len()
-            {
+            if has_spacer_after(cell, self.cells.get(cell_index + 1)) {
                 if anchor_top == lines_before {
                     return Some(ViewportAnchor {
                         cell_index,
@@ -171,7 +181,7 @@ impl HistoryState {
             }
 
             anchor_top += cell.line_count(text_width);
-            if matches!(cell, HistoryCell::UserMessage { .. }) {
+            if has_spacer_after(cell, self.cells.get(cell_index + 1)) {
                 anchor_top += 1;
             }
         }
@@ -468,19 +478,15 @@ pub struct HistoryView<'a> {
 }
 
 impl<'a> HistoryView<'a> {
-    /// Flatten all cells into display lines, inserting a blank spacer line
-    /// after each `UserMessage` cell (unless it is the last cell) to
-    /// visually separate user input from the system reply.
+    /// Flatten all cells into display lines, inserting blank spacers at
+    /// semantic boundaries while keeping tool work compact.
     fn flattened_lines(&self, text_width: u16) -> Vec<(usize, ratatui::text::Line<'static>)> {
-        let n = self.state.cells.len();
         let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
         for (i, cell) in self.state.cells.iter().enumerate() {
             for line in cell.lines(text_width) {
                 all_lines.push((i, line));
             }
-            // Insert a blank spacer line after user messages (except the last
-            // cell) to visually separate user input from the system reply.
-            if matches!(cell, HistoryCell::UserMessage { .. }) && i + 1 < n {
+            if has_spacer_after(cell, self.state.cells.get(i + 1)) {
                 all_lines.push((i, ratatui::text::Line::raw("")));
             }
         }
@@ -804,6 +810,16 @@ mod tests {
 
     use yi_agent_core::{AgentEvent, DoneReason, ToolResult};
 
+    fn tool_result(id: &str, is_error: bool) -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: id.into(),
+            result: ToolResult {
+                content: vec![yi_agent_core::ContentBlock::Text("result".into())],
+                is_error,
+            },
+        }
+    }
+
     #[test]
     fn push_event_assistant_text_appends_to_existing() {
         let mut s = HistoryState::new();
@@ -1125,6 +1141,155 @@ mod tests {
         // cell index 0 (the UserMessage).
         assert_eq!(lines[1].0, 0, "spacer should be attributed to user cell");
         assert!(lines[1].1.spans.is_empty(), "spacer line should be empty");
+    }
+
+    #[test]
+    fn flattened_lines_inserts_spacer_before_assistant_after_tool_result() {
+        let mut state = HistoryState::new();
+        state.push_event(AgentEvent::AssistantText("checking".into()), 80);
+        state.push_event(
+            AgentEvent::ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+            80,
+        );
+        state.push_event(tool_result("1", false), 80);
+        state.push_event(AgentEvent::AssistantText("done".into()), 80);
+
+        let view = HistoryView {
+            state: &state,
+            width: 80,
+        };
+        let lines = view.flattened_lines(80);
+        let result_index = state
+            .cells
+            .iter()
+            .position(|cell| matches!(cell, HistoryCell::ToolResult { .. }))
+            .expect("tool result cell");
+        let tool_call_index = state
+            .cells
+            .iter()
+            .position(|cell| matches!(cell, HistoryCell::ToolCall { .. }))
+            .expect("tool call cell");
+        let final_response_index = state.cells.len() - 1;
+        let tool_call_line = lines
+            .iter()
+            .position(|(cell_index, _)| *cell_index == tool_call_index)
+            .expect("tool call line");
+        let result_line = lines
+            .iter()
+            .position(|(cell_index, _)| *cell_index == result_index)
+            .expect("tool result line");
+
+        assert_eq!(lines[tool_call_line + 1].0, result_index);
+        assert_eq!(lines[result_line + 1].0, result_index);
+        assert!(
+            lines[result_line + 1].1.spans.is_empty(),
+            "tool result should own one blank spacer before the resumed assistant response"
+        );
+        assert_eq!(lines[result_line + 2].0, final_response_index);
+    }
+
+    #[test]
+    fn assistant_chunks_after_tool_result_share_one_spacer() {
+        let mut state = HistoryState::new();
+        state.push_event(
+            AgentEvent::ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+            80,
+        );
+        state.push_event(tool_result("1", false), 80);
+        state.push_event(AgentEvent::AssistantText("done".into()), 80);
+        state.push_event(AgentEvent::AssistantText(" again".into()), 80);
+
+        let view = HistoryView {
+            state: &state,
+            width: 80,
+        };
+        let spacer_count = view
+            .flattened_lines(80)
+            .iter()
+            .filter(|(cell_index, line)| {
+                line.spans.is_empty()
+                    && matches!(state.cells[*cell_index], HistoryCell::ToolResult { .. })
+            })
+            .count();
+
+        assert_eq!(spacer_count, 1);
+        assert!(matches!(
+            state.cells.last(),
+            Some(HistoryCell::AssistantMessage { markdown }) if markdown == "done again"
+        ));
+    }
+
+    #[test]
+    fn consecutive_tool_results_create_one_spacer_before_response() {
+        let mut state = HistoryState::new();
+        for id in ["1", "2"] {
+            state.push_event(
+                AgentEvent::ToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+                80,
+            );
+            state.push_event(tool_result(id, false), 80);
+        }
+        state.push_event(AgentEvent::AssistantText("summary".into()), 80);
+
+        let view = HistoryView {
+            state: &state,
+            width: 80,
+        };
+        let spacer_count = view
+            .flattened_lines(80)
+            .iter()
+            .filter(|(cell_index, line)| {
+                line.spans.is_empty()
+                    && matches!(state.cells[*cell_index], HistoryCell::ToolResult { .. })
+            })
+            .count();
+
+        assert_eq!(spacer_count, 1);
+    }
+
+    #[test]
+    fn failed_tool_result_still_separates_follow_up_assistant_text() {
+        let mut state = HistoryState::new();
+        state.push_event(
+            AgentEvent::ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+            80,
+        );
+        state.push_event(tool_result("1", true), 80);
+        state.push_event(AgentEvent::AssistantText("fallback".into()), 80);
+
+        let view = HistoryView {
+            state: &state,
+            width: 80,
+        };
+        let lines = view.flattened_lines(80);
+        let result_index = state
+            .cells
+            .iter()
+            .position(|cell| matches!(cell, HistoryCell::ToolResult { is_error: true, .. }))
+            .expect("failed tool result cell");
+        let result_line = lines
+            .iter()
+            .position(|(cell_index, _)| *cell_index == result_index)
+            .expect("failed tool result line");
+
+        assert_eq!(lines[result_line + 1].0, result_index);
+        assert!(lines[result_line + 1].1.spans.is_empty());
     }
 
     #[test]

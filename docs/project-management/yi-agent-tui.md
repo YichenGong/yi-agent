@@ -43,4 +43,5 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] Markdown 表格渲染 — commit `2e9da9e` 用 Unicode box drawing 修复
 - [x] 终端原生复制与 bracketed paste — `tui/app.rs` 不启用 mouse capture，并路由 `Event::Paste`; 验证：`cargo test -p yi-agent tui::app::tests::paste_`
 - [x] 对话历史滚动与滚动条 — `tui/history.rs` 的 `HistoryState` / `HistoryView` 处理当前宽度重排、锚点位置保持和右侧滚动条；`tui/app.rs` 路由键盘与鼠标滚动及本地插入后的最终宽度锚点恢复；未修饰 `Up` / `Down` 每次滚动 3 行，适配终端将触控板滚动转换为方向键的行为；验证：`cargo test -p yi-agent --bin yi-agent tui::app::tests::history_anchor_survives_local_user_insertion_at_scrollbar_width`、`cargo test -p yi-agent --bin yi-agent tui::app::tests`、`cargo test -p yi-agent --bin yi-agent tui::history::tests`、`cargo test -p yi-agent --bin yi-agent tui::app::tests::normal_navigation_keys_route_to_history_without_affecting_shift_selection`
+- [x] 语义化对话留白 — `tui/history.rs` 在用户输入后、工具结果后的首段模型回复前各保留一行空白，工具调用/结果连续显示；验证：`cargo test -p yi-agent --bin yi-agent tui::history::tests`
 - [ ] InlineRenderer 退役 — `tui/` 仍保留 deprecated 的 InlineRenderer 代码，待删除
