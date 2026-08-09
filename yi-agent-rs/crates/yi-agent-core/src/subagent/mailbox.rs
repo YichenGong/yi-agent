@@ -68,10 +68,14 @@ pub struct MailboxMessage {
     /// In-memory acknowledgement that this daemon process handed the item to
     /// a worker inbox. Durable consumption is tracked separately by runtime.
     pub delivered_to_worker: bool,
+    /// The worker has committed to injecting this external override into its
+    /// next prompt. The runtime persists the corresponding acknowledgement.
+    pub consumed_by_worker: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct MailboxMessageDraft {
+    id: Option<MessageId>,
     sender: Option<TaskId>,
     recipient: TaskId,
     kind: MessageKind,
@@ -86,6 +90,7 @@ impl MailboxMessageDraft {
         correlation_id: Option<AttemptId>,
     ) -> Self {
         Self {
+            id: None,
             sender: Some(sender),
             recipient,
             kind,
@@ -96,6 +101,22 @@ impl MailboxMessageDraft {
     /// User interventions are external inputs, not forged task messages.
     pub fn user_override(recipient: TaskId, message: impl Into<String>) -> Self {
         Self {
+            id: None,
+            sender: None,
+            recipient,
+            kind: MessageKind::UserInstruction(UserInstruction(message.into())),
+            correlation_id: None,
+        }
+    }
+
+    /// Uses the ID allocated by the durable mailbox row.
+    pub fn user_override_with_id(
+        id: MessageId,
+        recipient: TaskId,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Some(id),
             sender: None,
             recipient,
             kind: MessageKind::UserInstruction(UserInstruction(message.into())),
@@ -161,7 +182,7 @@ impl Mailbox {
         let priority = draft.kind.priority();
         let wakes_recipient = draft.kind.wakes_recipient();
         let message = MailboxMessage {
-            id: MessageId::new(),
+            id: draft.id.unwrap_or_else(MessageId::new),
             sender: draft.sender,
             recipient: draft.recipient,
             kind: draft.kind,
@@ -170,6 +191,7 @@ impl Mailbox {
             created_at: Utc::now(),
             coalesced_count: 1,
             delivered_to_worker: false,
+            consumed_by_worker: false,
         };
         let receipt = DeliveryReceipt {
             message_id: message.id.clone(),
@@ -191,7 +213,7 @@ impl Mailbox {
             .iter()
             .filter_map(|message| match (&message.sender, &message.kind) {
                 (None, MessageKind::UserInstruction(UserInstruction(body)))
-                    if !message.delivered_to_worker =>
+                    if !message.consumed_by_worker =>
                 {
                     Some((message.id.clone(), body.clone()))
                 }
@@ -203,6 +225,23 @@ impl Mailbox {
     pub fn mark_delivered_to_worker(&mut self, id: &MessageId) {
         if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
             message.delivered_to_worker = true;
+        }
+    }
+
+    /// Only external user overrides participate in the durable consumption
+    /// protocol. Agent-to-agent mail must not be mistaken for user input.
+    pub fn mark_user_override_consumed(&mut self, id: &MessageId) -> bool {
+        let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) else {
+            return false;
+        };
+        if message.sender.is_none()
+            && matches!(message.kind, MessageKind::UserInstruction(_))
+            && !message.consumed_by_worker
+        {
+            message.consumed_by_worker = true;
+            true
+        } else {
+            false
         }
     }
 }

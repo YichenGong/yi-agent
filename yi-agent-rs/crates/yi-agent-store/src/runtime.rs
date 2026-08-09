@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use yi_agent_core::subagent::scheduler::ResourceCoordinator;
 use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError, WaitMode, WaitOutcome};
-use yi_agent_core::subagent::task::{PauseReason, RootSessionId, TaskId};
+use yi_agent_core::subagent::task::{MessageId, PauseReason, RootSessionId, TaskId};
 use yi_agent_core::subagent::worker::AgentWorkerFactory;
 
 use crate::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
@@ -336,12 +336,13 @@ impl RuntimeCoordinator {
         supervisor
             .can_accept_user_override(recipient)
             .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        let message_id = MessageId::new();
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .record_user_override_message(recipient, &message)?;
+            .record_user_override_message_with_id(&message_id, recipient, &message)?;
         supervisor
-            .send_user_override(recipient.clone(), message)
+            .send_user_override_with_id(message_id, recipient.clone(), message)
             .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
         Ok(())
     }
@@ -377,6 +378,7 @@ impl RuntimeCoordinator {
             .cloned()
             .collect::<Vec<_>>();
         let mut updates = Vec::new();
+        let mut consumed_overrides = Vec::new();
         for supervisor in supervisors {
             let mut supervisor = supervisor.lock().await;
             let changed = supervisor
@@ -397,11 +399,15 @@ impl RuntimeCoordinator {
                 };
                 updates.push((task_id, state, event));
             }
+            consumed_overrides.extend(supervisor.take_consumed_user_override_ids());
         }
         let mut repository = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned");
+        for (task_id, message_id) in consumed_overrides {
+            repository.mark_user_override_consumed(&task_id, &message_id)?;
+        }
         for (task_id, state, event) in updates {
             repository.transition_task(&task_id, state, event)?;
             self.resident_tasks

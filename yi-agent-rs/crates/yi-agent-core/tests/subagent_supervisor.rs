@@ -139,7 +139,7 @@ impl AgentWorkerFactory for InboxWorkerFactory {
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let handle = WorkerHandle::new(request.cancellation);
         for message in request.initial_user_messages {
-            handle.deliver_message(message);
+            handle.deliver_worker_message(message);
         }
         *self.handle.lock().unwrap() = Some(handle.clone());
         Box::pin(async move { Ok(handle) })
@@ -257,6 +257,74 @@ async fn queued_user_override_is_delivered_when_its_worker_starts() {
         .expect("worker inbox remains open");
 
     assert_eq!(message.body, "explain the blocker first");
+}
+
+#[tokio::test]
+async fn worker_consumption_acknowledges_a_user_override_only_after_inbox_receipt() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+    supervisor
+        .send_user_override(child.clone(), "explain the blocker first".into())
+        .unwrap();
+    let message_id = supervisor.mailbox(&child).unwrap().messages()[0].id.clone();
+    let handle = Arc::new(Mutex::new(None));
+    let factory = InboxWorkerFactory {
+        handle: Arc::clone(&handle),
+    };
+
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    assert!(supervisor.take_consumed_user_override_ids().is_empty());
+
+    let received = handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .subscribe_messages()
+        .recv()
+        .await
+        .unwrap();
+    assert_eq!(received.id, message_id);
+    assert!(supervisor.take_consumed_user_override_ids().is_empty());
+
+    handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .report_message_consumed(received.id);
+    supervisor.reconcile_worker_events().unwrap();
+
+    assert_eq!(
+        supervisor.take_consumed_user_override_ids(),
+        vec![(child, message_id)]
+    );
+}
+
+#[tokio::test]
+async fn worker_consumption_does_not_classify_agent_mail_as_an_external_override() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let handle = Arc::new(Mutex::new(None));
+    let factory = InboxWorkerFactory {
+        handle: Arc::clone(&handle),
+    };
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    supervisor
+        .send_user_message(&root, child.clone(), "report status".into())
+        .unwrap();
+    let message_id = supervisor.mailbox(&child).unwrap().messages()[0].id.clone();
+
+    handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .report_message_consumed(message_id);
+    supervisor.reconcile_worker_events().unwrap();
+
+    assert!(supervisor.take_consumed_user_override_ids().is_empty());
 }
 
 #[tokio::test]

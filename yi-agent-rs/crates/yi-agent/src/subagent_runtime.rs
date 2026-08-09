@@ -53,7 +53,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             }
             let handle = WorkerHandle::new(cancellation.clone());
             for message in initial_user_messages {
-                handle.deliver_message(message);
+                handle.deliver_worker_message(message);
             }
             let reporter = handle.clone();
             let mut mailbox = handle.subscribe_messages();
@@ -112,6 +112,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             "Direct task message received. Incorporate it before continuing:\n{}",
                                             message.body,
                                         ));
+                                        // The message is now bound to the next prompt. Report this
+                                        // checkpoint so the daemon can durably prevent replay.
+                                        reporter.report_message_consumed(message.id);
                                         agent_cancellation.cancel();
                                     },
                                     _ = cancellation.cancelled(), if !cancellation_forwarded => {
@@ -329,10 +332,71 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
     use tempfile::TempDir;
+    use yi_agent_core::subagent::task::{AttemptId, MessageId, RootSessionId, TaskId};
+    use yi_agent_core::subagent::worker::{
+        AgentWorkerFactory, WorkerEvent, WorkerMessage, WorkerStart,
+    };
+    use yi_agent_core::{ProviderError, ProviderEvent, ProviderRequest};
     use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
 
     use super::*;
+
+    struct HangingProvider;
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        async fn call_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_reports_consumption_after_preloaded_message_reaches_prompt_checkpoint() {
+        let message_id = MessageId::new();
+        let directory = TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(HangingProvider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Continue the delegated task.")
+            .with_initial_user_messages(vec![WorkerMessage {
+                id: message_id.clone(),
+                body: "continue with the fix".into(),
+            }]);
+        let handle = factory.start(request).await.unwrap();
+
+        let events = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let events = handle.take_events();
+                if events
+                    .iter()
+                    .any(|event| matches!(event, WorkerEvent::MessageConsumed { message_id: id } if id == &message_id))
+                {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should consume its preloaded override");
+        assert!(events.iter().any(
+            |event| matches!(event, WorkerEvent::MessageConsumed { message_id: id } if id == &message_id)
+        ));
+        handle.cancel();
+    }
 
     #[tokio::test]
     async fn unbound_worker_message_proxy_is_rejected_by_the_daemon() {

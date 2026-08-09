@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
+use yi_agent_core::subagent::task::MessageId;
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
@@ -93,6 +94,43 @@ fn transition_updates_task_snapshot_and_event_journal_together() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, event_id);
     assert_eq!(events[0].event, RuntimeEvent::TaskStarted);
+}
+
+#[test]
+fn consuming_an_external_override_marks_its_mailbox_row_and_appends_an_audit_event() {
+    let directory = TempDir::new().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    let message_id = MessageId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .record_user_override_message_with_id(&message_id, &task, "continue with the fix")
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .mailbox_message_delivered_at(&message_id)
+            .unwrap(),
+        None
+    );
+    repository
+        .mark_user_override_consumed(&task, &message_id)
+        .unwrap();
+
+    assert!(
+        repository
+            .mailbox_message_delivered_at(&message_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        repository
+            .event_records_after(0)
+            .unwrap()
+            .iter()
+            .any(|record| record.event == RuntimeEvent::MailboxMessageConsumed)
+    );
 }
 
 #[test]

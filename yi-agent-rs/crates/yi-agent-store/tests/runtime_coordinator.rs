@@ -28,6 +28,21 @@ impl AgentWorkerFactory for FailingFactory {
 }
 
 #[derive(Clone, Default)]
+struct MessageRecordingFactory {
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
+    handles: Arc<Mutex<Vec<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for MessageRecordingFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation.clone());
+        self.starts.lock().unwrap().push(request);
+        self.handles.lock().unwrap().push(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+}
+
+#[derive(Clone, Default)]
 struct PauseRecordingFactory {
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
 }
@@ -168,4 +183,85 @@ async fn coordinator_persists_pause_only_after_worker_safe_checkpoint_acknowledg
 
     coordinator.resume_task(&session, &root).await.unwrap();
     assert_eq!(coordinator.task_state(&root).unwrap(), "running");
+}
+
+#[tokio::test]
+async fn coordinator_persists_an_external_override_only_after_worker_consumes_it() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    coordinator
+        .send_user_override(&root, "continue with the fix".into())
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let initial = factory.starts.lock().unwrap()[0]
+        .initial_user_messages
+        .clone();
+    assert_eq!(initial.len(), 1);
+    let message_id = initial[0].id.clone();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .mailbox_message_delivered_at(&message_id)
+            .unwrap(),
+        None
+    );
+
+    factory.handles.lock().unwrap()[0].report_message_consumed(message_id.clone());
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .mailbox_message_delivered_at(&message_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn retry_replays_an_unconsumed_external_override_but_not_an_acknowledged_one() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    coordinator
+        .send_user_override(&root, "keep the existing scope".into())
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    coordinator
+        .cancel_task(&session, &root, false)
+        .await
+        .unwrap();
+    coordinator.retry_task(&session, &root).await.unwrap();
+
+    let starts = factory.starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].initial_user_messages.len(), 1);
+    let message_id = starts[1].initial_user_messages[0].id.clone();
+    drop(starts);
+
+    factory.handles.lock().unwrap()[1].report_message_consumed(message_id);
+    coordinator.reconcile_worker_events().await.unwrap();
+    coordinator
+        .cancel_task(&session, &root, false)
+        .await
+        .unwrap();
+    coordinator.retry_task(&session, &root).await.unwrap();
+
+    assert!(
+        factory.starts.lock().unwrap()[2]
+            .initial_user_messages
+            .is_empty()
+    );
 }

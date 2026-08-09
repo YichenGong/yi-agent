@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::task::{AttemptId, RootSessionId, TaskId};
+use super::task::{AttemptId, MessageId, RootSessionId, TaskId};
 
 #[derive(Debug, Clone)]
 pub struct WorkerStart {
@@ -20,7 +20,7 @@ pub struct WorkerStart {
     pub message_capability: String,
     /// User instructions queued before admission. Application factories must
     /// preload them before allowing the first Agent turn to start.
-    pub initial_user_messages: Vec<String>,
+    pub initial_user_messages: Vec<WorkerMessage>,
     /// Narrow task instruction supplied by the parent supervisor.
     pub objective: String,
 }
@@ -48,7 +48,7 @@ impl WorkerStart {
         self
     }
 
-    pub fn with_initial_user_messages(mut self, messages: Vec<String>) -> Self {
+    pub fn with_initial_user_messages(mut self, messages: Vec<WorkerMessage>) -> Self {
         self.initial_user_messages = messages;
         self
     }
@@ -65,6 +65,7 @@ pub struct WorkerHandle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerMessage {
+    pub id: MessageId,
     pub body: String,
 }
 
@@ -114,6 +115,10 @@ impl WorkerMailbox {
 /// converts these into task-state transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerEvent {
+    /// An inbox item was committed to the next Agent prompt.
+    MessageConsumed {
+        message_id: MessageId,
+    },
     CompletedWithoutDelivery,
     Paused,
     Cancelled,
@@ -155,6 +160,10 @@ impl WorkerHandle {
         self.report(WorkerEvent::CompletedWithoutDelivery);
     }
 
+    pub fn report_message_consumed(&self, message_id: MessageId) {
+        self.report(WorkerEvent::MessageConsumed { message_id });
+    }
+
     pub fn report_paused(&self) {
         self.report(WorkerEvent::Paused);
     }
@@ -184,10 +193,17 @@ impl WorkerHandle {
     }
 
     pub fn deliver_message(&self, body: impl Into<String>) {
+        self.deliver_worker_message(WorkerMessage {
+            id: MessageId::new(),
+            body: body.into(),
+        });
+    }
+
+    pub fn deliver_worker_message(&self, message: WorkerMessage) {
         self.messages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back(WorkerMessage { body: body.into() });
+            .push_back(message);
         self.message_updates
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));
     }

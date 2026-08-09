@@ -17,6 +17,8 @@ pub enum RepositoryError {
     UnknownEventKind { kind: String },
     #[error("task does not exist: {task}")]
     TaskNotFound { task: String },
+    #[error("external mailbox message does not exist: {message_id}")]
+    MailboxMessageNotFound { message_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +31,7 @@ pub enum RuntimeEvent {
     TaskFailed,
     TaskRecoveryRequired,
     MailboxMessageQueued,
+    MailboxMessageConsumed,
 }
 
 impl RuntimeEvent {
@@ -42,6 +45,7 @@ impl RuntimeEvent {
             Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
             Self::MailboxMessageQueued => "mailbox_message_queued",
+            Self::MailboxMessageConsumed => "mailbox_message_consumed",
         }
     }
 
@@ -55,6 +59,7 @@ impl RuntimeEvent {
             "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
             "mailbox_message_queued" => Ok(Self::MailboxMessageQueued),
+            "mailbox_message_consumed" => Ok(Self::MailboxMessageConsumed),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -226,19 +231,63 @@ impl RuntimeRepository {
         recipient: &TaskId,
         message: &str,
     ) -> Result<i64, RepositoryError> {
+        self.record_user_override_message_with_id(&MessageId::new(), recipient, message)
+    }
+
+    /// Uses the caller-supplied ID so the durable row and the in-memory
+    /// worker inbox can acknowledge the exact same external override.
+    pub fn record_user_override_message_with_id(
+        &mut self,
+        message_id: &MessageId,
+        recipient: &TaskId,
+        message: &str,
+    ) -> Result<i64, RepositoryError> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO mailbox_messages (id, recipient_task_id, sender_task_id, kind, priority, payload_json)
-             VALUES (?1, ?2, NULL, 'user_override', 2, ?3)",
+            VALUES (?1, ?2, NULL, 'user_override', 2, ?3)",
             params![
-                MessageId::new().to_string(),
+                message_id.to_string(),
                 recipient.to_string(),
                 serde_json::to_string(&serde_json::json!({ "message": message }))?,
             ],
         )?;
         let event_id = append_event(&transaction, recipient, RuntimeEvent::MailboxMessageQueued)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Records the application worker's prompt-injection checkpoint. The
+    /// row update and audit event commit atomically and are idempotent after a
+    /// successful acknowledgement.
+    pub fn mark_user_override_consumed(
+        &mut self,
+        recipient: &TaskId,
+        message_id: &MessageId,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE mailbox_messages
+             SET delivered_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND recipient_task_id = ?2
+               AND sender_task_id IS NULL AND kind = 'user_override'
+               AND delivered_at IS NULL",
+            params![message_id.to_string(), recipient.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::MailboxMessageNotFound {
+                message_id: message_id.to_string(),
+            });
+        }
+        let event_id = append_event(
+            &transaction,
+            recipient,
+            RuntimeEvent::MailboxMessageConsumed,
+        )?;
         transaction.commit()?;
         Ok(event_id)
     }
@@ -249,6 +298,21 @@ impl RuntimeRepository {
             .query_row("SELECT COUNT(*) FROM mailbox_messages", [], |row| {
                 row.get(0)
             })?)
+    }
+
+    pub fn mailbox_message_delivered_at(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT delivered_at FROM mailbox_messages WHERE id = ?1",
+                params![message_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Atomically changes the task snapshot and appends its corresponding journal entry.

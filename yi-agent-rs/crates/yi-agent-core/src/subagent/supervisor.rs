@@ -12,7 +12,7 @@ use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority,
 use super::task::{
     AgentTask, CancelReason, PauseReason, RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState,
 };
-use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerStart};
+use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
@@ -65,6 +65,7 @@ pub struct AgentSupervisor {
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
     worker_message_capabilities: HashMap<TaskId, String>,
+    consumed_user_override_ids: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
 }
@@ -91,6 +92,7 @@ impl AgentSupervisor {
             mailboxes,
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
+            consumed_user_override_ids: Vec::new(),
             events: Vec::new(),
             updates,
         }
@@ -164,7 +166,10 @@ impl AgentSupervisor {
         .with_initial_user_messages(
             initial_user_messages
                 .iter()
-                .map(|(_, body)| body.clone())
+                .map(|(id, body)| WorkerMessage {
+                    id: id.clone(),
+                    body: body.clone(),
+                })
                 .collect(),
         );
         let message_capability = start.message_capability.clone();
@@ -215,6 +220,19 @@ impl AgentSupervisor {
             .collect::<Vec<_>>();
         let mut changed = Vec::new();
         for (task_id, event) in events {
+            if let WorkerEvent::MessageConsumed { message_id } = event {
+                if self
+                    .mailboxes
+                    .get_mut(&task_id)
+                    .expect("worker task mailbox exists")
+                    .mark_user_override_consumed(&message_id)
+                {
+                    self.consumed_user_override_ids
+                        .push((task_id.clone(), message_id));
+                    self.notify_update();
+                }
+                continue;
+            }
             let task = self
                 .tasks
                 .get(&task_id)
@@ -223,6 +241,7 @@ impl AgentSupervisor {
                 continue;
             }
             match event {
+                WorkerEvent::MessageConsumed { .. } => unreachable!("handled before task state"),
                 WorkerEvent::Paused => {
                     let task = self
                         .tasks
@@ -255,6 +274,12 @@ impl AgentSupervisor {
             }
         }
         Ok(changed)
+    }
+
+    /// Drains external override acknowledgements for RuntimeCoordinator to
+    /// durably persist after its worker reconciliation pass.
+    pub fn take_consumed_user_override_ids(&mut self) -> Vec<(TaskId, super::task::MessageId)> {
+        std::mem::take(&mut self.consumed_user_override_ids)
     }
 
     /// Cancels a task and, when requested, every descendant owned by this
@@ -455,12 +480,16 @@ impl AgentSupervisor {
         if !is_parent && !is_child {
             return Err(MessageDeliveryError::RecipientNotAdjacent);
         }
-        self.mailboxes
+        let receipt = self
+            .mailboxes
             .get_mut(&recipient)
             .expect("task mailbox is created with task")
             .push(draft);
         if let (Some(body), Some(worker)) = (worker_message, self.workers.get(&recipient)) {
-            worker.deliver_message(body);
+            worker.deliver_worker_message(WorkerMessage {
+                id: receipt.message_id,
+                body,
+            });
         }
         self.notify_update();
         Ok(())
@@ -543,17 +572,31 @@ impl AgentSupervisor {
         recipient: TaskId,
         message: String,
     ) -> Result<(), MessageDeliveryError> {
+        self.send_user_override_with_id(super::task::MessageId::new(), recipient, message)
+    }
+
+    /// Delivers a persisted external override under its durable mailbox ID.
+    pub fn send_user_override_with_id(
+        &mut self,
+        message_id: super::task::MessageId,
+        recipient: TaskId,
+        message: String,
+    ) -> Result<(), MessageDeliveryError> {
         self.can_accept_user_override(&recipient)?;
         let receipt = self
             .mailboxes
             .get_mut(&recipient)
             .expect("task mailbox is created with task")
-            .push(MailboxMessageDraft::user_override(
+            .push(MailboxMessageDraft::user_override_with_id(
+                message_id,
                 recipient.clone(),
                 message.clone(),
             ));
         if let Some(worker) = self.workers.get(&recipient) {
-            worker.deliver_message(message);
+            worker.deliver_worker_message(WorkerMessage {
+                id: receipt.message_id.clone(),
+                body: message,
+            });
             self.mailboxes
                 .get_mut(&recipient)
                 .expect("task mailbox is created with task")
