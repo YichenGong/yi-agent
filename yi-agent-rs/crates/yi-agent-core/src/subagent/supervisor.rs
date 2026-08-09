@@ -440,6 +440,21 @@ impl AgentSupervisor {
             }
             match event {
                 WorkerEvent::MessageConsumed { .. } => unreachable!("handled before task state"),
+                WorkerEvent::Delivered(delivery) => {
+                    let task = self
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("worker task was checked above");
+                    let attempt_id = task.active_attempt_id().clone();
+                    task.reduce(
+                        TaskEvent::WorkerDelivered {
+                            attempt_id,
+                            delivery,
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
                 WorkerEvent::Paused => {
                     let task = self
                         .tasks
@@ -1235,7 +1250,9 @@ struct SendMessageTool {
 mod provider_turn_priority_tests {
     use super::*;
     use crate::subagent::mailbox::ReworkInstruction;
-    use crate::subagent::task::{PermissionDecision, PermissionRequestId};
+    use crate::subagent::task::{
+        DeliveryReport, PermissionDecision, PermissionRequestId, WorkspaceLeaseId,
+    };
 
     #[test]
     fn parent_routes_pending_high_priority_mail_to_the_coordination_reserve() {
@@ -1284,6 +1301,27 @@ mod provider_turn_priority_tests {
             .resolve_permission(&root, request, PermissionDecision::Allow)
             .unwrap();
         assert_eq!(supervisor.task(&root).unwrap().state(), &TaskState::Queued);
+    }
+
+    #[test]
+    fn worker_delivery_transitions_a_child_to_direct_parent_review() {
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let root = supervisor.root_task_id().clone();
+        let child = supervisor.spawn(root).unwrap();
+        let workspace = WorkspaceLeaseId::new();
+        supervisor.tasks.get_mut(&child).unwrap().workspace = Some(workspace.clone());
+        supervisor.start_task(&child).unwrap();
+        let handle = WorkerHandle::new(tokio_util::sync::CancellationToken::new());
+        supervisor.workers.insert(child.clone(), handle.clone());
+        let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "checks passed");
+
+        handle.report_delivery(delivery.clone());
+        supervisor.reconcile_worker_events().unwrap();
+
+        assert_eq!(
+            supervisor.task(&child).unwrap().state(),
+            &TaskState::AwaitingParentReview(delivery.id)
+        );
     }
 }
 

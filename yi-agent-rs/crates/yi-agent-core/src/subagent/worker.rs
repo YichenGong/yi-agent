@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::ProviderTurnGate;
 
-use super::task::{AttemptId, MessageId, RootSessionId, TaskId};
+use super::task::{AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId};
 
 #[derive(Debug, Clone)]
 pub struct WorkerStart {
@@ -163,6 +163,8 @@ pub enum WorkerEvent {
     MessageConsumed {
         message_id: MessageId,
     },
+    /// A validated coding result awaits inspection by the direct parent.
+    Delivered(DeliveryReport),
     CompletedWithoutDelivery,
     Paused,
     Cancelled,
@@ -217,6 +219,10 @@ impl WorkerHandle {
 
     pub fn report_completed_without_delivery(&self) {
         self.report(WorkerEvent::CompletedWithoutDelivery);
+    }
+
+    pub fn report_delivery(&self, delivery: DeliveryReport) {
+        self.report(WorkerEvent::Delivered(delivery));
     }
 
     pub fn report_message_consumed(&self, message_id: MessageId) {
