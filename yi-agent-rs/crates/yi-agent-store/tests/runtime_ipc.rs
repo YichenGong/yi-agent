@@ -1775,6 +1775,116 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
 }
 
 #[test]
+fn cancel_preview_includes_active_worktrees_leases_and_unmerged_deliveries() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let root: TaskId = root_task_id.parse().unwrap();
+    let attempt = RuntimeRepository::open(&database)
+        .unwrap()
+        .active_attempt_id(&root)
+        .unwrap();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+             VALUES ('preview-worktree', ?1, 'worktree:preview', 'exclusive', 1, 'active')",
+            [root_task_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+             VALUES ('preview-cargo', ?1, 'cargo:workspace', 'shared', 1, 'active')",
+            [root_task_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO deliveries (id, task_id, attempt_id, payload_json)
+             VALUES ('preview-delivery', ?1, ?2, '{\"base\":\"main\",\"head\":\"child\"}')",
+            rusqlite::params![root_task_id, attempt.to_string()],
+        )
+        .unwrap();
+
+    let IpcResponse::CancelPreview {
+        worktree_leases,
+        active_leases,
+        unmerged_deliveries,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PreviewCancel {
+            task_id: root.to_string(),
+            recursive: false,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a cancel preview");
+    };
+    assert_eq!(worktree_leases, vec!["worktree:preview"]);
+    assert_eq!(active_leases.len(), 2);
+    assert_eq!(active_leases[0].task_id, root.to_string());
+    assert_eq!(unmerged_deliveries.len(), 1);
+    assert_eq!(unmerged_deliveries[0].delivery_id, "preview-delivery");
+    assert!(unmerged_deliveries[0].payload_json.contains("child"));
+}
+
+#[test]
+fn cancel_confirmation_rejects_a_preview_when_its_active_lease_scope_changes() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::CancelPreview {
+        confirmation_token, ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PreviewCancel {
+            task_id: root_task_id.clone(),
+            recursive: false,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a cancel preview");
+    };
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+             VALUES ('new-preview-lease', ?1, 'worktree:changed', 'exclusive', 1, 'active')",
+            [root_task_id.as_str()],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ConfirmCancel {
+                task_id: root_task_id,
+                recursive: false,
+                confirmation_token,
+            },
+        )
+        .unwrap(),
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+        }
+    ));
+}
+
+#[test]
 fn raw_cancel_request_cannot_bypass_confirmation() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

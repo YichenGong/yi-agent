@@ -247,6 +247,29 @@ pub struct PersistedTaskDetail {
     pub delivery_json: String,
 }
 
+/// Active resource ownership which a destructive-control preview must expose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedActiveLease {
+    pub lease_id: String,
+    pub task_id: TaskId,
+    pub resource_key: String,
+}
+
+/// A delivery not yet accepted by a direct-parent review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedUnmergedDelivery {
+    pub delivery_id: String,
+    pub task_id: TaskId,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedCancelScope {
+    pub task_ids: Vec<TaskId>,
+    pub active_leases: Vec<PersistedActiveLease>,
+    pub unmerged_deliveries: Vec<PersistedUnmergedDelivery>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedRecoveredTask {
     pub session_id: RootSessionId,
@@ -2213,6 +2236,60 @@ impl RuntimeRepository {
                     })
             })
             .collect()
+    }
+
+    /// Resolves every durable effect a cancellation confirmation describes.
+    /// The stable ordering makes it safe to bind the preview to its action.
+    pub fn cancel_scope(
+        &self,
+        task: &TaskId,
+        recursive: bool,
+    ) -> Result<PersistedCancelScope, RepositoryError> {
+        let task_ids = self.task_tree_ids(task, recursive)?;
+        let mut active_leases = Vec::new();
+        let mut unmerged_deliveries = Vec::new();
+        for task_id in &task_ids {
+            let mut leases = self.connection.prepare(
+                "SELECT id, resource_key FROM resource_leases
+                 WHERE task_id = ?1 AND state = 'active' ORDER BY resource_key, id",
+            )?;
+            active_leases.extend(
+                leases
+                    .query_map([task_id.to_string()], |row| {
+                        Ok(PersistedActiveLease {
+                            lease_id: row.get(0)?,
+                            task_id: task_id.clone(),
+                            resource_key: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut deliveries = self.connection.prepare(
+                "SELECT deliveries.id, deliveries.payload_json FROM deliveries
+                 WHERE deliveries.task_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews
+                       WHERE reviews.delivery_id = deliveries.id AND reviews.decision = 'accepted'
+                   )
+                 ORDER BY deliveries.created_at, deliveries.id",
+            )?;
+            unmerged_deliveries.extend(
+                deliveries
+                    .query_map([task_id.to_string()], |row| {
+                        Ok(PersistedUnmergedDelivery {
+                            delivery_id: row.get(0)?,
+                            task_id: task_id.clone(),
+                            payload_json: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(PersistedCancelScope {
+            task_ids,
+            active_leases,
+            unmerged_deliveries,
+        })
     }
 
     /// Read task snapshots, a high-water mark, and replay in one SQLite read transaction.

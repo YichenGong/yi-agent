@@ -36,8 +36,15 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 struct PendingConfirmation {
     task_id: String,
     recursive: bool,
-    task_ids: Vec<String>,
+    scope: CancelScope,
     expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CancelScope {
+    task_ids: Vec<String>,
+    active_leases: Vec<IpcCancelLease>,
+    unmerged_deliveries: Vec<IpcCancelDelivery>,
 }
 
 #[derive(Default)]
@@ -46,7 +53,7 @@ struct ConfirmationStore {
 }
 
 impl ConfirmationStore {
-    fn issue(&self, task_id: String, recursive: bool, task_ids: Vec<String>) -> String {
+    fn issue(&self, task_id: String, recursive: bool, scope: CancelScope) -> String {
         let token = Uuid::new_v4().to_string();
         self.pending
             .lock()
@@ -56,14 +63,14 @@ impl ConfirmationStore {
                 PendingConfirmation {
                     task_id,
                     recursive,
-                    task_ids,
+                    scope,
                     expires_at: Instant::now() + CONFIRMATION_TTL,
                 },
             );
         token
     }
 
-    fn consume(&self, token: &str, task_id: &str, recursive: bool, task_ids: &[String]) -> bool {
+    fn consume(&self, token: &str, task_id: &str, recursive: bool, scope: &CancelScope) -> bool {
         let Some(pending) = self
             .pending
             .lock()
@@ -75,7 +82,7 @@ impl ConfirmationStore {
         pending.expires_at > Instant::now()
             && pending.task_id == task_id
             && pending.recursive == recursive
-            && pending.task_ids == task_ids
+            && pending.scope == *scope
     }
 }
 
@@ -245,6 +252,9 @@ pub enum IpcResponse {
     CancelPreview {
         confirmation_token: String,
         task_ids: Vec<String>,
+        worktree_leases: Vec<String>,
+        active_leases: Vec<IpcCancelLease>,
+        unmerged_deliveries: Vec<IpcCancelDelivery>,
         expires_in_secs: u64,
     },
     TaskRetried,
@@ -276,6 +286,20 @@ pub enum IpcResponse {
     Error {
         code: IpcErrorCode,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcCancelLease {
+    pub lease_id: String,
+    pub task_id: String,
+    pub resource_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcCancelDelivery {
+    pub delivery_id: String,
+    pub task_id: String,
+    pub payload_json: String,
 }
 
 /// Stable public error categories for IPC consumers. Error responses never
@@ -821,16 +845,53 @@ fn preview_cancel(
 ) -> Result<IpcResponse, IpcError> {
     let repository = RuntimeRepository::open(database_path)?;
     let task = parse_id::<TaskId>(&task_id)?;
-    let task_ids = repository
-        .task_tree_ids(&task, recursive)?
-        .into_iter()
-        .map(|task| task.to_string())
-        .collect::<Vec<_>>();
-    let confirmation_token = confirmations.issue(task_id, recursive, task_ids.clone());
+    let scope = cancellation_scope(&repository, &task, recursive)?;
+    let confirmation_token = confirmations.issue(task_id, recursive, scope.clone());
     Ok(IpcResponse::CancelPreview {
         confirmation_token,
-        task_ids,
+        worktree_leases: scope
+            .active_leases
+            .iter()
+            .filter(|lease| lease.resource_key.starts_with("worktree:"))
+            .map(|lease| lease.resource_key.clone())
+            .collect(),
+        task_ids: scope.task_ids,
+        active_leases: scope.active_leases,
+        unmerged_deliveries: scope.unmerged_deliveries,
         expires_in_secs: CONFIRMATION_TTL.as_secs(),
+    })
+}
+
+fn cancellation_scope(
+    repository: &RuntimeRepository,
+    task: &TaskId,
+    recursive: bool,
+) -> Result<CancelScope, IpcError> {
+    let scope = repository.cancel_scope(task, recursive)?;
+    Ok(CancelScope {
+        task_ids: scope
+            .task_ids
+            .into_iter()
+            .map(|task| task.to_string())
+            .collect(),
+        active_leases: scope
+            .active_leases
+            .into_iter()
+            .map(|lease| IpcCancelLease {
+                lease_id: lease.lease_id,
+                task_id: lease.task_id.to_string(),
+                resource_key: lease.resource_key,
+            })
+            .collect(),
+        unmerged_deliveries: scope
+            .unmerged_deliveries
+            .into_iter()
+            .map(|delivery| IpcCancelDelivery {
+                delivery_id: delivery.delivery_id,
+                task_id: delivery.task_id.to_string(),
+                payload_json: delivery.payload_json,
+            })
+            .collect(),
     })
 }
 
@@ -845,12 +906,8 @@ fn confirm_cancel(
     let repository = RuntimeRepository::open(database_path)?;
     let task = parse_id::<TaskId>(&task_id)?;
     let detail = repository.task_detail(&task)?;
-    let task_ids = repository
-        .task_tree_ids(&task, recursive)?
-        .into_iter()
-        .map(|task| task.to_string())
-        .collect::<Vec<_>>();
-    if !confirmations.consume(&confirmation_token, &task_id, recursive, &task_ids) {
+    let scope = cancellation_scope(&repository, &task, recursive)?;
+    if !confirmations.consume(&confirmation_token, &task_id, recursive, &scope) {
         return Ok(IpcResponse::Error {
             code: IpcErrorCode::ConfirmationRequired,
         });
