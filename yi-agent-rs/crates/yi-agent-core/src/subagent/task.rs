@@ -399,6 +399,7 @@ pub struct AgentTask {
     pub authority_id: AuthorityId,
     active_attempt: AttemptId,
     state: TaskState,
+    pause_request: Option<PauseReason>,
     delivery: DeliveryState,
     pub workspace: Option<WorkspaceLeaseId>,
     attempts: Vec<TaskAttempt>,
@@ -418,6 +419,7 @@ impl AgentTask {
             authority_id: AuthorityId::new(),
             active_attempt: attempt.id.clone(),
             state: TaskState::Queued,
+            pause_request: None,
             delivery: DeliveryState::None,
             workspace: None,
             attempts: vec![attempt],
@@ -453,6 +455,10 @@ impl AgentTask {
 
     pub fn state(&self) -> &TaskState {
         &self.state
+    }
+
+    pub fn pause_requested(&self) -> bool {
+        self.pause_request.is_some()
     }
 
     pub fn delivery(&self) -> &DeliveryState {
@@ -587,6 +593,9 @@ pub enum TaskEvent {
         attempt_id: AttemptId,
         reason: PauseReason,
     },
+    PauseAcknowledged {
+        attempt_id: AttemptId,
+    },
     ResumeRequested {
         attempt_id: AttemptId,
     },
@@ -614,6 +623,7 @@ impl TaskEvent {
             | Self::ReviewRejected { attempt_id, .. }
             | Self::CancelRequested { attempt_id, .. }
             | Self::PauseRequested { attempt_id, .. }
+            | Self::PauseAcknowledged { attempt_id }
             | Self::ResumeRequested { attempt_id }
             | Self::RuntimeInterrupted { attempt_id, .. }
             | Self::RetryRequested { attempt_id } => attempt_id,
@@ -798,6 +808,18 @@ pub fn reduce(
             transition(task, TaskState::Cancelled(reason), now)?
         }
         TaskEvent::PauseRequested { reason, .. } => {
+            if task.pause_request.is_none() {
+                task.pause_request = Some(reason);
+            }
+        }
+        TaskEvent::PauseAcknowledged { .. } => {
+            let reason = task
+                .pause_request
+                .take()
+                .ok_or_else(|| TaskTransitionError {
+                    from: task.state().clone(),
+                    to: TaskState::Paused(PauseReason("pause was not requested".into())),
+                })?;
             transition(task, TaskState::Paused(reason), now)?
         }
         TaskEvent::ResumeRequested { .. } => {
@@ -809,6 +831,7 @@ pub fn reduce(
                 .into());
             }
             transition(task, TaskState::Queued, now)?;
+            task.pause_request = None;
         }
         TaskEvent::RuntimeInterrupted { evidence, .. } => {
             transition(task, TaskState::RecoveryRequired(evidence), now)?
@@ -853,6 +876,7 @@ fn transition(
     let terminal_reason = terminal_reason_for(&next);
     task.state = next;
     if let Some(reason) = terminal_reason {
+        task.pause_request = None;
         task.close_active_attempt(reason, now);
     }
     Ok(())
@@ -1254,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_wins_over_running_state_and_resume_returns_to_queue() {
+    fn pause_intent_keeps_running_until_safe_checkpoint_acknowledgement() {
         let (mut task, _) = task_with_workspace();
         let now = Utc::now();
         let attempt_id = task.active_attempt_id().clone();
@@ -1273,9 +1297,56 @@ mod tests {
             now,
         )
         .unwrap();
+        assert_eq!(task.state(), &TaskState::Running);
+        assert!(task.pause_requested());
+        task.reduce(
+            TaskEvent::PauseAcknowledged {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
         assert!(matches!(task.state(), TaskState::Paused(_)));
         task.reduce(TaskEvent::ResumeRequested { attempt_id }, now)
             .unwrap();
         assert_eq!(task.state(), &TaskState::Queued);
+    }
+
+    #[test]
+    fn duplicate_pause_requests_preserve_the_original_intent_until_acknowledged() {
+        let (mut task, _) = task_with_workspace();
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::PauseRequested {
+                attempt_id: attempt_id.clone(),
+                reason: PauseReason("first request".into()),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::PauseRequested {
+                attempt_id: attempt_id.clone(),
+                reason: PauseReason("duplicate request".into()),
+            },
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(task.state(), &TaskState::Running);
+        task.reduce(TaskEvent::PauseAcknowledged { attempt_id }, now)
+            .unwrap();
+        assert_eq!(
+            task.state(),
+            &TaskState::Paused(PauseReason("first request".into()))
+        );
     }
 }

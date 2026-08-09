@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{
-    AgentTask, CancelReason, PauseReason, RootSessionId, TaskEvent, TaskFailure, TaskId,
+    AgentTask, CancelReason, PauseReason, RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState,
 };
 use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
@@ -223,9 +223,18 @@ impl AgentSupervisor {
                 continue;
             }
             match event {
-                // Pause acknowledgement is consumed by the control-plane
-                // reducer once it has recorded the requested pause.
-                WorkerEvent::Paused => {}
+                WorkerEvent::Paused => {
+                    let task = self
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("worker task was checked above");
+                    let attempt_id = task.active_attempt_id().clone();
+                    task.reduce(
+                        TaskEvent::PauseAcknowledged { attempt_id },
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
                 WorkerEvent::Failed(message) => self.fail_task(&task_id, message)?,
                 WorkerEvent::Cancelled => {
                     self.cancel_task_tree(&task_id, false)?;
@@ -237,11 +246,9 @@ impl AgentSupervisor {
                     )?;
                 }
             }
-            if self
-                .tasks
-                .get(&task_id)
-                .is_some_and(|task| task.state().is_terminal())
-            {
+            if self.tasks.get(&task_id).is_some_and(|task| {
+                task.state().is_terminal() || matches!(task.state(), TaskState::Paused(_))
+            }) {
                 self.workers.remove(&task_id);
                 self.worker_message_capabilities.remove(&task_id);
                 changed.push(task_id);

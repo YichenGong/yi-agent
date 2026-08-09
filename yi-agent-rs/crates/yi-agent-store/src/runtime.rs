@@ -255,7 +255,7 @@ impl RuntimeCoordinator {
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .transition_task(task, "paused", RuntimeEvent::TaskPaused)?;
+            .append_event(task, RuntimeEvent::TaskPauseRequested)?;
         Ok(())
     }
 
@@ -388,6 +388,7 @@ impl RuntimeCoordinator {
                     .expect("reconciled task exists")
                     .state();
                 let (state, event) = match state {
+                    yi_agent_core::TaskState::Paused(_) => ("paused", RuntimeEvent::TaskPaused),
                     yi_agent_core::TaskState::Cancelled(_) => {
                         ("cancelled", RuntimeEvent::TaskCancelled)
                     }

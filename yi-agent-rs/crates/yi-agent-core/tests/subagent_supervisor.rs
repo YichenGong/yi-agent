@@ -77,6 +77,23 @@ impl AgentWorkerFactory for ImmediateWorkerFactory {
     }
 }
 
+#[derive(Clone, Default)]
+struct PauseReportingWorkerFactory {
+    handle: Arc<Mutex<Option<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for PauseReportingWorkerFactory {
+    fn start(
+        &self,
+        request: WorkerStart,
+    ) -> BoxFuture<'static, Result<WorkerHandle, yi_agent_core::subagent::worker::WorkerError>>
+    {
+        let handle = WorkerHandle::new(request.cancellation);
+        *self.handle.lock().unwrap() = Some(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+}
+
 struct FailingWorkerFactory;
 
 impl AgentWorkerFactory for FailingWorkerFactory {
@@ -146,27 +163,42 @@ async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
 }
 
 #[tokio::test]
-async fn supervisor_pause_keeps_worker_alive_until_resume_releases_ownership() {
+async fn supervisor_marks_paused_only_after_worker_safe_checkpoint_acknowledgement() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
-    supervisor
-        .start_worker(&ImmediateWorkerFactory, &child)
-        .await
-        .unwrap();
+    let factory = PauseReportingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
     let cancellation = supervisor.worker_cancellation(&child).unwrap();
 
     supervisor
         .pause_task(&child, PauseReason("user requested pause".into()))
         .unwrap();
+    assert_eq!(
+        supervisor.task(&child).unwrap().state(),
+        &TaskState::Running
+    );
+    assert!(supervisor.has_worker(&child));
+    assert!(!cancellation.is_cancelled());
+
+    factory
+        .handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .report_paused();
+    assert_eq!(
+        supervisor.reconcile_worker_events().unwrap(),
+        vec![child.clone()]
+    );
     assert!(matches!(
         supervisor.task(&child).unwrap().state(),
         TaskState::Paused(_)
     ));
-    assert!(!cancellation.is_cancelled());
+    assert!(!supervisor.has_worker(&child));
 
     supervisor.resume_task(&child).unwrap();
     assert_eq!(supervisor.task(&child).unwrap().state(), &TaskState::Queued);
-    assert!(!supervisor.has_worker(&child));
 }
 
 #[tokio::test]

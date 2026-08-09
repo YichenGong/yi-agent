@@ -1678,6 +1678,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
     use yi_agent_core::subagent::worker::{
@@ -1692,7 +1693,21 @@ mod tests {
             &self,
             request: WorkerStart,
         ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-            Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+            Box::pin(async move {
+                let handle = WorkerHandle::new(request.cancellation);
+                let paused_handle = handle.clone();
+                let mut pause = handle.subscribe_pause();
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("test pause listener runtime must initialize");
+                    if runtime.block_on(pause.requested()) {
+                        paused_handle.report_paused();
+                    }
+                });
+                Ok(handle)
+            })
         }
     }
 
@@ -1925,7 +1940,17 @@ mod tests {
         .unwrap();
 
         let paused = daemon_pause_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
-        let paused_detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+        let paused_detail = (0..20)
+            .find_map(|_| {
+                let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+                if detail.contains("state: paused") {
+                    Some(detail)
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("worker pause acknowledgement should be reconciled");
         let resumed = daemon_resume_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
         let resumed_detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
 
