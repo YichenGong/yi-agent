@@ -12,6 +12,8 @@ pub struct RuntimePolicyLayer {
     resources: ResourceLimitsLayer,
     #[serde(default)]
     attempt_defaults: AttemptLimitsLayer,
+    #[serde(default)]
+    schedule_defaults: ScheduleDefaultsLayer,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -40,6 +42,17 @@ struct AttemptLimitsLayer {
     max_provider_retries: Option<u16>,
     max_tool_retries: Option<u16>,
     max_rework_cycles: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ScheduleDefaultsLayer {
+    max_resident_subagents: Option<u16>,
+    max_turns: Option<u32>,
+    max_wall_time_secs: Option<u64>,
+    priority: Option<SchedulePriority>,
+    read_only: Option<bool>,
+    overlap_policy: Option<OverlapPolicy>,
+    missed_run_policy: Option<MissedRunPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +183,65 @@ impl RuntimePolicyLayer {
                     || narrower.runtime.read_only.unwrap_or(false)),
         }
     }
+
+    /// Resolves a scheduled root selection against user, project, and global
+    /// runtime limits. Project schedule defaults can only further restrict it.
+    pub fn effective_schedule_with(
+        &self,
+        project: &Self,
+        selection: &SchedulePolicy,
+    ) -> SchedulePolicy {
+        let global = self.effective_with(project);
+        let user = &self.schedule_defaults;
+        let project = &project.schedule_defaults;
+        let read_only = selection.runtime.read_only
+            || user.read_only.unwrap_or(false)
+            || project.read_only.unwrap_or(false);
+
+        SchedulePolicy {
+            runtime: RuntimePolicy {
+                max_resident_subagents: selection
+                    .runtime
+                    .max_resident_subagents
+                    .min(global.max_resident_subagents)
+                    .min(user.max_resident_subagents.unwrap_or(u16::MAX))
+                    .min(project.max_resident_subagents.unwrap_or(u16::MAX)),
+                max_turns: selection
+                    .runtime
+                    .max_turns
+                    .min(global.max_turns)
+                    .min(user.max_turns.unwrap_or(u32::MAX))
+                    .min(project.max_turns.unwrap_or(u32::MAX)),
+                max_wall_time_secs: selection
+                    .runtime
+                    .max_wall_time_secs
+                    .min(global.max_wall_time_secs)
+                    .min(user.max_wall_time_secs.unwrap_or(u64::MAX))
+                    .min(project.max_wall_time_secs.unwrap_or(u64::MAX)),
+                read_only,
+                allow_coding: selection.runtime.allow_coding && !read_only,
+            },
+            priority: selection
+                .priority
+                .min(user.priority.unwrap_or(SchedulePriority::Critical))
+                .min(project.priority.unwrap_or(SchedulePriority::Critical)),
+            overlap_policy: selection
+                .overlap_policy
+                .min(user.overlap_policy.unwrap_or(OverlapPolicy::QueueOne))
+                .min(project.overlap_policy.unwrap_or(OverlapPolicy::QueueOne)),
+            missed_run_policy: selection
+                .missed_run_policy
+                .min(
+                    user.missed_run_policy
+                        .unwrap_or(MissedRunPolicy::CatchUpOnce),
+                )
+                .min(
+                    project
+                        .missed_run_policy
+                        .unwrap_or(MissedRunPolicy::CatchUpOnce),
+                ),
+        }
+    }
 }
 
 fn narrow<T: Ord + Copy>(default: T, broader: Option<T>, narrower: Option<T>) -> T {
@@ -180,6 +252,7 @@ fn narrow<T: Ord + Copy>(default: T, broader: Option<T>, narrower: Option<T>) ->
 pub struct RuntimePolicy {
     pub max_resident_subagents: u16,
     pub max_turns: u32,
+    pub max_wall_time_secs: u64,
     pub read_only: bool,
     pub allow_coding: bool,
 }
@@ -193,23 +266,42 @@ impl RuntimePolicy {
                 .max_resident_subagents
                 .min(narrower.max_resident_subagents),
             max_turns: self.max_turns.min(narrower.max_turns),
+            max_wall_time_secs: self.max_wall_time_secs.min(narrower.max_wall_time_secs),
             read_only,
             allow_coding: self.allow_coding && narrower.allow_coding && !read_only,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulePriority {
+    Background,
+    Normal,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OverlapPolicy {
     Skip,
     QueueOne,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissedRunPolicy {
+    Skip,
+    CatchUpOnce,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulePolicy {
     pub runtime: RuntimePolicy,
+    pub priority: SchedulePriority,
     pub overlap_policy: OverlapPolicy,
-    pub catch_up: bool,
+    pub missed_run_policy: MissedRunPolicy,
 }
 
 impl Default for SchedulePolicy {
@@ -218,11 +310,13 @@ impl Default for SchedulePolicy {
             runtime: RuntimePolicy {
                 max_resident_subagents: 4,
                 max_turns: 30,
+                max_wall_time_secs: 900,
                 read_only: true,
                 allow_coding: false,
             },
+            priority: SchedulePriority::Background,
             overlap_policy: OverlapPolicy::Skip,
-            catch_up: false,
+            missed_run_policy: MissedRunPolicy::Skip,
         }
     }
 }
