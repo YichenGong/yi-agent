@@ -1,6 +1,9 @@
+use chrono::{Duration, Utc};
+use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_store::schedule::{
     MissedRunPolicy, OverlapPolicy, RuntimePolicy, RuntimePolicyLayer, SchedulePolicy,
-    SchedulePriority,
+    SchedulePriority, WatchdogLimits, WatchdogObservation, WatchdogOutcome, WatchdogUsage,
+    evaluate_watchdog,
 };
 
 #[test]
@@ -359,4 +362,79 @@ fn schedule_selection_intersects_global_project_capabilities() {
     let no_coding = user.effective_schedule_with(&no_coding_project, &selection);
     assert!(!no_coding.runtime.read_only);
     assert!(!no_coding.runtime.allow_coding);
+}
+
+#[test]
+fn watchdog_uses_persisted_progress_and_resource_queue_time() {
+    let now = Utc::now();
+    let limits = WatchdogLimits {
+        max_turns: Some(30),
+        max_tokens: Some(1_000),
+        max_cost_micros: None,
+        max_wall_time_secs: Some(900),
+        max_idle_time_secs: Some(300),
+        max_resource_wait_secs: Some(60),
+        max_provider_retries: Some(3),
+        max_tool_retries: Some(2),
+        max_rework_cycles: Some(2),
+    };
+    let observation = WatchdogObservation {
+        attempt_started_at: now - Duration::seconds(30),
+        last_meaningful_at: now - Duration::seconds(1),
+        resource_wait_started_at: Some(now - Duration::seconds(61)),
+        usage: WatchdogUsage {
+            turns: 1,
+            tokens: 10,
+            cost_micros: 0,
+            provider_retries: 0,
+            tool_retries: 0,
+            rework_cycles: 0,
+        },
+    };
+
+    assert_eq!(
+        evaluate_watchdog(&limits, &observation, now),
+        Some(WatchdogOutcome::TimedOut(TimeoutKind::Deadline))
+    );
+}
+
+#[test]
+fn watchdog_classifies_turn_and_token_budgets_without_waiting_for_wall_clock() {
+    let now = Utc::now();
+    let limits = WatchdogLimits {
+        max_turns: Some(30),
+        max_tokens: Some(1_000),
+        max_cost_micros: None,
+        max_wall_time_secs: Some(900),
+        max_idle_time_secs: Some(300),
+        max_resource_wait_secs: None,
+        max_provider_retries: Some(3),
+        max_tool_retries: Some(2),
+        max_rework_cycles: Some(2),
+    };
+    let observation = WatchdogObservation {
+        attempt_started_at: now,
+        last_meaningful_at: now,
+        resource_wait_started_at: None,
+        usage: WatchdogUsage {
+            turns: 30,
+            tokens: 1_000,
+            cost_micros: 0,
+            provider_retries: 0,
+            tool_retries: 0,
+            rework_cycles: 0,
+        },
+    };
+
+    assert_eq!(
+        evaluate_watchdog(&limits, &observation, now),
+        Some(WatchdogOutcome::BudgetExhausted(BudgetKind::Turns))
+    );
+
+    let mut token_observation = observation;
+    token_observation.usage.turns = 29;
+    assert_eq!(
+        evaluate_watchdog(&limits, &token_observation, now),
+        Some(WatchdogOutcome::BudgetExhausted(BudgetKind::Tokens))
+    );
 }

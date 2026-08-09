@@ -121,6 +121,10 @@ pub enum BudgetKind {
     Turns,
     Tokens,
     WallTime,
+    Cost,
+    ProviderRetries,
+    ToolRetries,
+    ReworkCycles,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,113 @@
 //! Effective runtime and scheduled-session policy values.
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
+
+/// Immutable limits applied by the daemon to one attempt. Optional ceilings
+/// remain unbounded until configured by the user or a narrower project policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchdogLimits {
+    pub max_turns: Option<u32>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_micros: Option<u64>,
+    pub max_wall_time_secs: Option<u64>,
+    pub max_idle_time_secs: Option<u64>,
+    pub max_resource_wait_secs: Option<u64>,
+    pub max_provider_retries: Option<u16>,
+    pub max_tool_retries: Option<u16>,
+    pub max_rework_cycles: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchdogUsage {
+    pub turns: u32,
+    pub tokens: u64,
+    pub cost_micros: u64,
+    pub provider_retries: u16,
+    pub tool_retries: u16,
+    pub rework_cycles: u16,
+}
+
+/// Inputs originate in durable attempt facts. In particular,
+/// `last_meaningful_at` is never advanced by generated text or repeated stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchdogObservation {
+    pub attempt_started_at: DateTime<Utc>,
+    pub last_meaningful_at: DateTime<Utc>,
+    pub resource_wait_started_at: Option<DateTime<Utc>>,
+    pub usage: WatchdogUsage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogOutcome {
+    Stalled,
+    TimedOut(TimeoutKind),
+    BudgetExhausted(BudgetKind),
+}
+
+/// Applies deterministic bound precedence. Resource deadlines use the time a
+/// request joined the queue; idle time uses only a recorded meaningful event.
+pub fn evaluate_watchdog(
+    limits: &WatchdogLimits,
+    observation: &WatchdogObservation,
+    now: DateTime<Utc>,
+) -> Option<WatchdogOutcome> {
+    let reached = |used: u64, limit: Option<u64>| limit.is_some_and(|limit| used >= limit);
+    if reached(
+        observation.usage.turns.into(),
+        limits.max_turns.map(u64::from),
+    ) {
+        return Some(WatchdogOutcome::BudgetExhausted(BudgetKind::Turns));
+    }
+    if reached(observation.usage.tokens, limits.max_tokens) {
+        return Some(WatchdogOutcome::BudgetExhausted(BudgetKind::Tokens));
+    }
+    if reached(observation.usage.cost_micros, limits.max_cost_micros) {
+        return Some(WatchdogOutcome::BudgetExhausted(BudgetKind::Cost));
+    }
+    if reached(
+        observation.usage.provider_retries.into(),
+        limits.max_provider_retries.map(u64::from),
+    ) {
+        return Some(WatchdogOutcome::BudgetExhausted(
+            BudgetKind::ProviderRetries,
+        ));
+    }
+    if reached(
+        observation.usage.tool_retries.into(),
+        limits.max_tool_retries.map(u64::from),
+    ) {
+        return Some(WatchdogOutcome::BudgetExhausted(BudgetKind::ToolRetries));
+    }
+    if reached(
+        observation.usage.rework_cycles.into(),
+        limits.max_rework_cycles.map(u64::from),
+    ) {
+        return Some(WatchdogOutcome::BudgetExhausted(BudgetKind::ReworkCycles));
+    }
+
+    let elapsed = |from: DateTime<Utc>| now.signed_duration_since(from).num_seconds().max(0) as u64;
+    if reached(
+        elapsed(observation.attempt_started_at),
+        limits.max_wall_time_secs,
+    ) {
+        return Some(WatchdogOutcome::TimedOut(TimeoutKind::WallClock));
+    }
+    if observation
+        .resource_wait_started_at
+        .is_some_and(|queued_at| reached(elapsed(queued_at), limits.max_resource_wait_secs))
+    {
+        return Some(WatchdogOutcome::TimedOut(TimeoutKind::Deadline));
+    }
+    if reached(
+        elapsed(observation.last_meaningful_at),
+        limits.max_idle_time_secs,
+    ) {
+        return Some(WatchdogOutcome::Stalled);
+    }
+    None
+}
 
 /// A user, project, root, or child policy layer. Missing values inherit from
 /// the broader layer; a narrower layer can never raise a numeric ceiling.
