@@ -1442,6 +1442,7 @@ fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
 fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
     match event {
         crate::repository::RuntimeEvent::RuntimeDraining => "runtime_draining",
+        crate::repository::RuntimeEvent::RuntimeRecovered => "runtime_recovered",
         crate::repository::RuntimeEvent::TaskQueued => "task_queued",
         crate::repository::RuntimeEvent::TaskStarted => "task_started",
         crate::repository::RuntimeEvent::TaskCancelled => "task_cancelled",

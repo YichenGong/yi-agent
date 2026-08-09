@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use futures::{FutureExt, future::BoxFuture};
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::MessageId;
@@ -384,6 +385,81 @@ fn startup_recovery_marks_live_attempts_with_their_parent_tasks() {
         repository.attempt_state(&attempt).unwrap(),
         "recovery_required"
     );
+}
+
+#[test]
+fn daemon_start_publishes_one_runtime_recovered_event_for_reconciled_work() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let session = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &session, "running").unwrap();
+    drop(repository);
+
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let events = RuntimeRepository::open(&database)
+        .unwrap()
+        .event_records_after(0)
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event == RuntimeEvent::RuntimeRecovered)
+            .count(),
+        1
+    );
+    drop(daemon);
+}
+
+#[test]
+fn startup_recovery_keeps_workspace_and_worktree_leases_for_reconciliation() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let session = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &session, "running").unwrap();
+    drop(repository);
+
+    let connection = Connection::open(&database).unwrap();
+    for (id, resource_key) in [
+        ("process", "process:resident"),
+        ("tool", "tool:rate"),
+        ("worktree", "worktree:checkout"),
+        ("workspace", "workspace:project"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+                 VALUES (?1, ?2, ?3, 'exclusive', 1, 'active')",
+                params![id, task.to_string(), resource_key],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .recover_inflight_tasks()
+        .unwrap();
+
+    let connection = Connection::open(&database).unwrap();
+    for (id, expected) in [
+        ("process", "released"),
+        ("tool", "released"),
+        ("worktree", "active"),
+        ("workspace", "active"),
+    ] {
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM resource_leases WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, expected, "lease {id}");
+    }
 }
 
 #[test]

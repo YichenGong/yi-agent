@@ -24,6 +24,7 @@ pub enum RepositoryError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeEvent {
     RuntimeDraining,
+    RuntimeRecovered,
     TaskQueued,
     TaskStarted,
     TaskCancelled,
@@ -39,6 +40,7 @@ impl RuntimeEvent {
     fn name(self) -> &'static str {
         match self {
             Self::RuntimeDraining => "runtime_draining",
+            Self::RuntimeRecovered => "runtime_recovered",
             Self::TaskQueued => "task_queued",
             Self::TaskStarted => "task_started",
             Self::TaskCancelled => "task_cancelled",
@@ -54,6 +56,7 @@ impl RuntimeEvent {
     fn parse(kind: String) -> Result<Self, RepositoryError> {
         match kind.as_str() {
             "runtime_draining" => Ok(Self::RuntimeDraining),
+            "runtime_recovered" => Ok(Self::RuntimeRecovered),
             "task_queued" => Ok(Self::TaskQueued),
             "task_started" => Ok(Self::TaskStarted),
             "task_cancelled" => Ok(Self::TaskCancelled),
@@ -374,9 +377,22 @@ impl RuntimeRepository {
                 })?;
             append_event(&transaction, &task, RuntimeEvent::TaskRecoveryRequired)?;
         }
+        // Events are task-addressable on the v1 IPC surface. One recovered
+        // task carries the daemon-level recovery marker so subscribers still
+        // observe a single, durable restart boundary without a protocol break.
+        if let Some(task_id) = task_ids.first() {
+            let task = task_id
+                .parse()
+                .map_err(|_| RepositoryError::UnknownEventKind {
+                    kind: format!("invalid task ID in store: {task_id}"),
+                })?;
+            append_event(&transaction, &task, RuntimeEvent::RuntimeRecovered)?;
+        }
         transaction.execute(
             "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
-             WHERE state = 'active' AND resource_key NOT LIKE 'worktree:%'",
+             WHERE state = 'active'
+               AND resource_key NOT LIKE 'worktree:%'
+               AND resource_key NOT LIKE 'workspace:%'",
             [],
         )?;
         transaction.execute(
