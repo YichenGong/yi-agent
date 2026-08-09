@@ -45,16 +45,181 @@ fn roots_take_turns_when_contending_for_a_permit() {
     let a1 = TaskId::new();
     let a2 = TaskId::new();
     let b1 = TaskId::new();
+    let now = Utc::now();
 
-    coordinator.enqueue(root_a.clone(), a1.clone(), request("resident:global"));
-    coordinator.enqueue(root_a.clone(), a2, request("resident:global"));
-    coordinator.enqueue(root_b.clone(), b1.clone(), request("resident:global"));
-    let first = coordinator.grant_next("resident:global").unwrap();
+    coordinator.enqueue_with_priority_at(
+        root_a.clone(),
+        a1.clone(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+    coordinator.enqueue_with_priority_at(
+        root_a.clone(),
+        a2,
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+    coordinator.enqueue_with_priority_at(
+        root_b.clone(),
+        b1.clone(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+    let first = coordinator.grant_next_at("resident:global", now).unwrap();
     assert_eq!(first.task_id, a1);
     coordinator.release(first.lease_id).unwrap();
 
-    let second = coordinator.grant_next("resident:global").unwrap();
+    let second = coordinator.grant_next_at("resident:global", now).unwrap();
     assert_eq!(second.task_id, b1);
+}
+
+#[test]
+fn direct_parent_subtrees_take_turns_within_the_same_root() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 1);
+    let root = RootSessionId::new();
+    let parent_a = TaskId::new();
+    let parent_b = TaskId::new();
+    let a1 = TaskId::new();
+    let b1 = TaskId::new();
+    let a2 = TaskId::new();
+    let now = Utc::now();
+
+    coordinator.enqueue_with_priority_for_parent_at(
+        root.clone(),
+        parent_a.clone(),
+        a1.clone(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+    coordinator.enqueue_with_priority_for_parent_at(
+        root.clone(),
+        parent_b.clone(),
+        b1.clone(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+    coordinator.enqueue_with_priority_for_parent_at(
+        root,
+        parent_a,
+        a2.clone(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+
+    let first = coordinator.grant_next_at("resident:global", now).unwrap();
+    assert_eq!(first.task_id, a1);
+    coordinator.release(first.lease_id).unwrap();
+
+    let second = coordinator.grant_next_at("resident:global", now).unwrap();
+    assert_eq!(second.task_id, b1);
+    coordinator.release(second.lease_id).unwrap();
+
+    assert_eq!(
+        coordinator
+            .grant_next_at("resident:global", now)
+            .unwrap()
+            .task_id,
+        a2
+    );
+}
+
+#[test]
+fn outstanding_root_permits_softly_penalize_its_next_request() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 2);
+    let root_a = RootSessionId::new();
+    let root_b = RootSessionId::new();
+    let blocking_root = RootSessionId::new();
+    let now = Utc::now();
+
+    coordinator.enqueue_with_priority_at(
+        root_a.clone(),
+        TaskId::new(),
+        shared_request("resident:global", 1),
+        AdmissionPriority::Normal,
+        now,
+    );
+    let held = coordinator.grant_next_at("resident:global", now).unwrap();
+    coordinator.enqueue_with_priority_at(
+        blocking_root,
+        TaskId::new(),
+        shared_request("resident:global", 1),
+        AdmissionPriority::Normal,
+        now,
+    );
+    let blocker = coordinator.grant_next_at("resident:global", now).unwrap();
+    let a_waiting = TaskId::new();
+    let b_waiting = TaskId::new();
+    coordinator.enqueue_with_priority_at(
+        root_a,
+        a_waiting,
+        shared_request("resident:global", 1),
+        AdmissionPriority::Normal,
+        now,
+    );
+    coordinator.enqueue_with_priority_at(
+        root_b,
+        b_waiting.clone(),
+        shared_request("resident:global", 1),
+        AdmissionPriority::Normal,
+        now,
+    );
+
+    coordinator.release(blocker.lease_id).unwrap();
+    assert_eq!(
+        coordinator
+            .grant_next_at("resident:global", now)
+            .unwrap()
+            .task_id,
+        b_waiting
+    );
+    coordinator.release(held.lease_id).unwrap();
+}
+
+#[test]
+fn same_parent_requests_preserve_fifo_sequence_order() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 1);
+    let root = RootSessionId::new();
+    let parent = TaskId::new();
+    let first_task = TaskId::new();
+    let second_task = TaskId::new();
+    let now = Utc::now();
+
+    coordinator.enqueue_with_priority_for_parent_at(
+        root.clone(),
+        parent.clone(),
+        first_task.clone(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+    coordinator.enqueue_with_priority_for_parent_at(
+        root,
+        parent,
+        second_task.clone(),
+        request("resident:global"),
+        AdmissionPriority::Normal,
+        now,
+    );
+
+    let first = coordinator.grant_next_at("resident:global", now).unwrap();
+    assert_eq!(first.task_id, first_task);
+    coordinator.release(first.lease_id).unwrap();
+    assert_eq!(
+        coordinator
+            .grant_next_at("resident:global", now)
+            .unwrap()
+            .task_id,
+        second_task
+    );
 }
 
 #[test]
