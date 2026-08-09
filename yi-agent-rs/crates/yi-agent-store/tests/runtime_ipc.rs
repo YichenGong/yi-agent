@@ -9,7 +9,9 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::MessageId;
-use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
+use yi_agent_core::subagent::worker::{
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     Daemon, IpcRequest, IpcResponse, SubscriptionFilters, send_request, send_request_with_version,
@@ -21,7 +23,20 @@ use yi_agent_store::repository::{
 
 struct RecordingWorkerFactory;
 
+fn durable_context() -> WorkerRecoveryContext {
+    WorkerRecoveryContext {
+        workspace_lease_id: Some("workspace:test".into()),
+        worktree_lease: Some("worktree:test".into()),
+        checkpoint_json: r#"{"git_head":"test","git_status":""}"#.into(),
+        tool_state_json: r#"{"state":"available","registered_tools":[]}"#.into(),
+    }
+}
+
 impl AgentWorkerFactory for RecordingWorkerFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
     }
@@ -33,6 +48,10 @@ struct StartCountingFactory {
 }
 
 impl AgentWorkerFactory for StartCountingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         *self.starts.lock().unwrap() += 1;
         Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
@@ -45,6 +64,10 @@ struct ReportingWorkerFactory {
 }
 
 impl AgentWorkerFactory for ReportingWorkerFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let handle = WorkerHandle::new(request.cancellation);
         *self.handle.lock().unwrap() = Some(handle.clone());

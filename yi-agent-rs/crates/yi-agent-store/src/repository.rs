@@ -3,7 +3,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 use yi_agent_core::subagent::task::MessageId;
-use yi_agent_core::subagent::worker::WorkerRecoveryContext;
+use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
 const LATEST_SCHEMA_VERSION: i64 = 2;
@@ -20,6 +20,8 @@ pub enum RepositoryError {
     TaskNotFound { task: String },
     #[error("external mailbox message does not exist: {message_id}")]
     MailboxMessageNotFound { message_id: String },
+    #[error("worker recovery context is not durable: {reason}")]
+    InvalidWorkerRecoveryContext { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,7 @@ pub enum RuntimeEvent {
     TaskBlocked,
     TaskFailed,
     TaskRecoveryRequired,
+    TaskRecoveryAttested,
     MailboxMessageQueued,
     MailboxMessageConsumed,
 }
@@ -51,6 +54,7 @@ impl RuntimeEvent {
             Self::TaskBlocked => "task_blocked",
             Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
+            Self::TaskRecoveryAttested => "task_recovery_attested",
             Self::MailboxMessageQueued => "mailbox_message_queued",
             Self::MailboxMessageConsumed => "mailbox_message_consumed",
         }
@@ -68,6 +72,7 @@ impl RuntimeEvent {
             "task_blocked" => Ok(Self::TaskBlocked),
             "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
+            "task_recovery_attested" => Ok(Self::TaskRecoveryAttested),
             "mailbox_message_queued" => Ok(Self::MailboxMessageQueued),
             "mailbox_message_consumed" => Ok(Self::MailboxMessageConsumed),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
@@ -111,6 +116,8 @@ pub struct PersistedRecoveredTask {
     pub worktree_lease: Option<String>,
     pub checkpoint_json: Option<String>,
     pub tool_state_json: String,
+    pub recovery_gated: bool,
+    pub recovery_attested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +237,7 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_child_task_with_attempt(
         &mut self,
         task: &TaskId,
@@ -311,6 +319,15 @@ impl RuntimeRepository {
                 format!("recovery-worktree-{}", task),
                 task.to_string(),
                 worktree_lease
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+             VALUES (?1, ?2, ?3, 'exclusive', 1, 'active')",
+            params![
+                format!("recovery-workspace-{}", task),
+                task.to_string(),
+                workspace_lease
             ],
         )?;
         transaction.commit()?;
@@ -501,6 +518,7 @@ impl RuntimeRepository {
         event: RuntimeEvent,
         context: &WorkerRecoveryContext,
     ) -> Result<i64, RepositoryError> {
+        validate_recovery_context(context)?;
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -520,7 +538,8 @@ impl RuntimeRepository {
             });
         }
         transaction.execute(
-            "UPDATE attempts SET state = ?1, checkpoint_json = ?2, usage_json = ?3
+            "UPDATE attempts SET state = ?1, checkpoint_json = ?2, usage_json = ?3,
+                 ended_at = NULL, terminal_json = NULL
              WHERE id = ?4 AND task_id = ?5",
             params![
                 state,
@@ -533,11 +552,26 @@ impl RuntimeRepository {
         if let Some(worktree_lease) = &context.worktree_lease {
             transaction.execute(
                 "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
-                 VALUES (?1, ?2, ?3, 'exclusive', 1, 'active')",
+                 VALUES (?1, ?2, ?3, 'exclusive', 1, 'active')
+                 ON CONFLICT(id) DO UPDATE SET resource_key = excluded.resource_key,
+                     state = 'active', released_at = NULL",
                 params![
                     format!("worker-worktree-context-{attempt}"),
                     task.to_string(),
                     worktree_lease,
+                ],
+            )?;
+        }
+        if let Some(workspace_lease) = &context.workspace_lease_id {
+            transaction.execute(
+                "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+                 VALUES (?1, ?2, ?3, 'exclusive', 1, 'active')
+                 ON CONFLICT(id) DO UPDATE SET resource_key = excluded.resource_key,
+                     state = 'active', released_at = NULL",
+                params![
+                    format!("worker-workspace-context-{attempt}"),
+                    task.to_string(),
+                    workspace_lease,
                 ],
             )?;
         }
@@ -572,6 +606,11 @@ impl RuntimeRepository {
              WHERE id = ?3 AND task_id = ?4",
             params![state, terminal_json, attempt.to_string(), task.to_string()],
         )?;
+        transaction.execute(
+            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE task_id = ?1 AND state = 'active'",
+            params![task.to_string()],
+        )?;
         let event_id = append_event(&transaction, task, event)?;
         transaction.commit()?;
         Ok(event_id)
@@ -591,6 +630,17 @@ impl RuntimeRepository {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let recovery_context = if state == "recovery_gated" {
+            Some(transaction.query_row(
+                "SELECT attempts.checkpoint_json, attempts.usage_json
+                 FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
+                 WHERE tasks.id = ?1",
+                params![task.to_string()],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )?)
+        } else {
+            None
+        };
         let changed = transaction.execute(
             "UPDATE tasks SET state_json = ?1, active_attempt_id = ?2, updated_at = CURRENT_TIMESTAMP
              WHERE id = ?3",
@@ -602,7 +652,57 @@ impl RuntimeRepository {
             });
         }
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
+        if let Some((checkpoint_json, tool_state_json)) = recovery_context {
+            transaction.execute(
+                "UPDATE attempts SET checkpoint_json = ?1, usage_json = ?2 WHERE id = ?3",
+                params![checkpoint_json, tool_state_json, attempt.to_string()],
+            )?;
+        }
         let event_id = append_event(&transaction, task, event)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Commits deterministic inspection evidence before a gated successor can
+    /// enter ordinary worker admission.
+    pub fn attest_recovery_gate(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        attestation: &WorkerRecoveryAttestation,
+    ) -> Result<i64, RepositoryError> {
+        serde_json::from_str::<serde_json::Value>(&attestation.checkpoint_json)?;
+        serde_json::from_str::<serde_json::Value>(&attestation.tool_state_json)?;
+        serde_json::from_str::<serde_json::Value>(&attestation.evidence_json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = 'recovery_attested', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND active_attempt_id = ?2 AND state_json = 'recovery_gated'",
+            params![task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = 'recovery_attested', checkpoint_json = ?1, usage_json = ?2
+             WHERE id = ?3 AND task_id = ?4 AND state = 'recovery_gated'",
+            params![
+                attestation.checkpoint_json,
+                attestation.tool_state_json,
+                attempt.to_string(),
+                task.to_string()
+            ],
+        )?;
+        let event_id = append_event_with_payload(
+            &transaction,
+            task,
+            RuntimeEvent::TaskRecoveryAttested,
+            &attestation.evidence_json,
+        )?;
         transaction.commit()?;
         Ok(event_id)
     }
@@ -732,6 +832,19 @@ impl RuntimeRepository {
         )?)
     }
 
+    pub fn has_active_lease_prefix(
+        &self,
+        task: &TaskId,
+        prefix: &str,
+    ) -> Result<bool, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM resource_leases
+               WHERE task_id = ?1 AND state = 'active' AND resource_key LIKE ?2)",
+            params![task.to_string(), format!("{prefix}%")],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn attempt_ended_at(&self, attempt: &AttemptId) -> Result<Option<String>, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT ended_at FROM attempts WHERE id = ?1",
@@ -788,9 +901,9 @@ impl RuntimeRepository {
                     (SELECT resource_key FROM resource_leases
                      WHERE task_id = tasks.id AND state = 'active' AND resource_key LIKE 'worktree:%'
                      ORDER BY acquired_at DESC, id DESC LIMIT 1),
-                    attempts.checkpoint_json, attempts.usage_json
+                    attempts.checkpoint_json, attempts.usage_json, tasks.state_json
              FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
-             WHERE tasks.state_json = 'recovery_required'
+             WHERE tasks.state_json IN ('recovery_required', 'recovery_gated', 'recovery_attested')
              ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
         )?;
         statement
@@ -806,6 +919,7 @@ impl RuntimeRepository {
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             })?
             .map(|row| {
@@ -820,6 +934,7 @@ impl RuntimeRepository {
                     worktree_lease,
                     checkpoint_json,
                     tool_state_json,
+                    task_state,
                 ) = row?;
                 Ok(PersistedRecoveredTask {
                     session_id: session_id.parse().map_err(|_| {
@@ -852,6 +967,8 @@ impl RuntimeRepository {
                     worktree_lease,
                     checkpoint_json,
                     tool_state_json,
+                    recovery_gated: task_state == "recovery_gated",
+                    recovery_attested: task_state == "recovery_attested",
                 })
             })
             .collect()
@@ -1057,6 +1174,39 @@ fn insert_attempt(
          VALUES (?1, ?2, ?3, ?4, '{}', '{}')",
         params![attempt.to_string(), task.to_string(), number, state],
     )?;
+    Ok(())
+}
+
+fn validate_recovery_context(context: &WorkerRecoveryContext) -> Result<(), RepositoryError> {
+    let workspace = context
+        .workspace_lease_id
+        .as_deref()
+        .filter(|lease| lease.starts_with("workspace:") && lease.len() > "workspace:".len())
+        .ok_or_else(|| RepositoryError::InvalidWorkerRecoveryContext {
+            reason: "workspace lease is missing".into(),
+        })?;
+    let worktree = context
+        .worktree_lease
+        .as_deref()
+        .filter(|lease| lease.starts_with("worktree:") && lease.len() > "worktree:".len())
+        .ok_or_else(|| RepositoryError::InvalidWorkerRecoveryContext {
+            reason: "worktree lease is missing".into(),
+        })?;
+    if workspace == "workspace:" || worktree == "worktree:" {
+        return Err(RepositoryError::InvalidWorkerRecoveryContext {
+            reason: "resource lease key is empty".into(),
+        });
+    }
+    serde_json::from_str::<serde_json::Value>(&context.checkpoint_json).map_err(|error| {
+        RepositoryError::InvalidWorkerRecoveryContext {
+            reason: format!("checkpoint evidence is invalid JSON: {error}"),
+        }
+    })?;
+    serde_json::from_str::<serde_json::Value>(&context.tool_state_json).map_err(|error| {
+        RepositoryError::InvalidWorkerRecoveryContext {
+            reason: format!("tool-state evidence is invalid JSON: {error}"),
+        }
+    })?;
     Ok(())
 }
 

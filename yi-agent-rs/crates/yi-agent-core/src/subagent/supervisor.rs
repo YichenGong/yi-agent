@@ -66,7 +66,6 @@ pub struct AgentSupervisor {
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
     worker_message_capabilities: HashMap<TaskId, String>,
-    recovery_instructions: HashMap<TaskId, String>,
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
@@ -94,7 +93,6 @@ impl AgentSupervisor {
             mailboxes,
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
-            recovery_instructions: HashMap::new(),
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
             updates,
@@ -131,11 +129,34 @@ impl AgentSupervisor {
             mailboxes,
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
-            recovery_instructions: HashMap::new(),
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
             updates,
         }
+    }
+
+    pub fn from_recovered_gated_root(
+        root_session_id: RootSessionId,
+        root_task_id: TaskId,
+        attempt_id: super::task::AttemptId,
+        attempt_number: u32,
+    ) -> Self {
+        let mut supervisor = Self::from_recovered_root(
+            root_session_id.clone(),
+            root_task_id.clone(),
+            attempt_id.clone(),
+            attempt_number,
+        );
+        supervisor.tasks.insert(
+            root_task_id.clone(),
+            AgentTask::recovered_gated_root(
+                root_session_id,
+                root_task_id,
+                attempt_id,
+                attempt_number,
+            ),
+        );
+        supervisor
     }
 
     pub fn insert_recovered_child(
@@ -145,6 +166,7 @@ impl AgentSupervisor {
         depth: super::task::TaskDepth,
         attempt_id: super::task::AttemptId,
         attempt_number: u32,
+        recovery_gated: bool,
     ) -> Result<(), String> {
         if !self.tasks.contains_key(&parent_id) {
             return Err("recovered child parent is missing".into());
@@ -152,18 +174,31 @@ impl AgentSupervisor {
         if matches!(depth, super::task::TaskDepth::Root) {
             return Err("recovered child has root depth".into());
         }
-        let task = AgentTask::recovered_child(
-            self.tasks
-                .get(&parent_id)
-                .expect("recovered parent was checked")
-                .root_session_id
-                .clone(),
-            task_id.clone(),
-            parent_id.clone(),
-            depth,
-            attempt_id,
-            attempt_number,
-        );
+        let root_session_id = self
+            .tasks
+            .get(&parent_id)
+            .expect("recovered parent was checked")
+            .root_session_id
+            .clone();
+        let task = if recovery_gated {
+            AgentTask::recovered_gated_child(
+                root_session_id,
+                task_id.clone(),
+                parent_id.clone(),
+                depth,
+                attempt_id,
+                attempt_number,
+            )
+        } else {
+            AgentTask::recovered_child(
+                root_session_id,
+                task_id.clone(),
+                parent_id.clone(),
+                depth,
+                attempt_id,
+                attempt_number,
+            )
+        };
         self.tasks.insert(task_id.clone(), task);
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(
@@ -279,7 +314,7 @@ impl AgentSupervisor {
             .get(task_id)
             .expect("task mailbox is created with task")
             .pending_user_overrides();
-        let mut start = WorkerStart::new(
+        let start = WorkerStart::new(
             task.id.clone(),
             task.active_attempt_id().clone(),
             task.root_session_id.clone(),
@@ -295,9 +330,6 @@ impl AgentSupervisor {
                 })
                 .collect(),
         );
-        if let Some(instruction) = self.recovery_instructions.get(task_id) {
-            start = start.with_recovery_instruction(instruction.clone());
-        }
         let message_capability = start.message_capability.clone();
         // Admission is visible before the application factory can create any
         // side effects. A factory failure is reduced to a terminal task state.
@@ -311,7 +343,6 @@ impl AgentSupervisor {
         };
         self.worker_message_capabilities
             .insert(task_id.clone(), message_capability);
-        self.recovery_instructions.remove(task_id);
         for (id, _) in initial_user_messages {
             self.mailboxes
                 .get_mut(task_id)
@@ -817,6 +848,34 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    pub fn record_recovery_conflict(
+        &mut self,
+        task_id: &TaskId,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        if matches!(
+            self.task(task_id).map(AgentTask::state),
+            Some(TaskState::Queued)
+        ) {
+            self.start_task(task_id)?;
+        }
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::RecoveryConflict {
+                attempt_id,
+                reason: BlockReason(format!("recovery_conflict: {}", message.into())),
+            },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(())
+    }
+
     /// Creates a fresh attempt only after a terminal outcome, preserving the
     /// prior attempt's evidence for later user inspection.
     pub fn retry_task(&mut self, task_id: &TaskId) -> Result<super::task::TaskAttempt, String> {
@@ -850,7 +909,6 @@ impl AgentSupervisor {
     pub fn resume_recovery_task(
         &mut self,
         task_id: &TaskId,
-        instruction: String,
     ) -> Result<super::task::TaskAttempt, String> {
         if !matches!(
             self.task(task_id).map(|task| task.state()),
@@ -858,10 +916,7 @@ impl AgentSupervisor {
         ) {
             return Err("recovery resume requires a recovery-required task".into());
         }
-        let attempt = self.retry_task(task_id)?;
-        self.recovery_instructions
-            .insert(task_id.clone(), instruction);
-        Ok(attempt)
+        self.retry_task(task_id)
     }
 }
 

@@ -2,9 +2,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use rusqlite::Connection;
 use tempfile::TempDir;
 use yi_agent_core::RootSessionId;
-use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
+use yi_agent_core::subagent::worker::{
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
+    WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
+};
 use yi_agent_store::repository::{RuntimeEvent, RuntimeRepository};
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
 
@@ -12,6 +16,10 @@ use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
 struct RecordingFactory;
 
 impl AgentWorkerFactory for RecordingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
     }
@@ -20,6 +28,10 @@ impl AgentWorkerFactory for RecordingFactory {
 struct FailingFactory;
 
 impl AgentWorkerFactory for FailingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         Box::pin(async move {
             let handle = WorkerHandle::new(request.cancellation);
@@ -36,6 +48,17 @@ struct MessageRecordingFactory {
 }
 
 impl AgentWorkerFactory for MessageRecordingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn preflight_recovery(
+        &self,
+        _request: WorkerRecoveryPreflight,
+    ) -> WorkerRecoveryPreflightResult {
+        WorkerRecoveryPreflightResult::Attested(durable_attestation())
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let handle = WorkerHandle::new(request.cancellation.clone());
         self.starts.lock().unwrap().push(request);
@@ -49,7 +72,138 @@ struct PauseRecordingFactory {
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
 }
 
+struct AdmissionObservingFactory {
+    database: std::path::PathBuf,
+}
+
+struct RecoveryStartObservingFactory {
+    database: std::path::PathBuf,
+    starts: Arc<Mutex<usize>>,
+}
+
+#[derive(Default)]
+struct ConflictReportingFactory {
+    starts: Arc<Mutex<usize>>,
+}
+
+struct StartupErrorFactory;
+
+fn durable_context() -> WorkerRecoveryContext {
+    WorkerRecoveryContext {
+        workspace_lease_id: Some("workspace:test".into()),
+        worktree_lease: Some("worktree:test".into()),
+        checkpoint_json: r#"{"git_head":"test"}"#.into(),
+        tool_state_json: r#"{"state":"available","registered_tools":[]}"#.into(),
+    }
+}
+
+fn durable_attestation() -> WorkerRecoveryAttestation {
+    WorkerRecoveryAttestation {
+        checkpoint_json: r#"{"kind":"recovery_attestation","git_head":"test","git_status":""}"#
+            .into(),
+        tool_state_json: r#"{"state":"available","registered_tools":[]}"#.into(),
+        evidence_json: r#"{"kind":"deterministic_recovery_preflight","result":"attested"}"#.into(),
+    }
+}
+
+impl AgentWorkerFactory for AdmissionObservingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let repository =
+            RuntimeRepository::open(&self.database).expect("factory can inspect runtime store");
+        assert_eq!(repository.task_state(&request.task_id).unwrap(), "running");
+        assert!(
+            repository
+                .has_active_lease_prefix(&request.task_id, "workspace:")
+                .unwrap()
+        );
+        assert!(
+            repository
+                .has_active_lease_prefix(&request.task_id, "worktree:")
+                .unwrap()
+        );
+        let connection = Connection::open(&self.database).unwrap();
+        let (checkpoint, tool_state): (String, String) = connection
+            .query_row(
+                "SELECT checkpoint_json, usage_json FROM attempts WHERE id = ?1",
+                [request.attempt_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, durable_context().checkpoint_json);
+        assert_eq!(tool_state, durable_context().tool_state_json);
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+impl AgentWorkerFactory for RecoveryStartObservingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn preflight_recovery(
+        &self,
+        _request: WorkerRecoveryPreflight,
+    ) -> WorkerRecoveryPreflightResult {
+        WorkerRecoveryPreflightResult::Attested(durable_attestation())
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        *self.starts.lock().unwrap() += 1;
+        let connection = Connection::open(&self.database).unwrap();
+        let attested: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE task_id = ?1 AND kind = 'task_recovery_attested'",
+                [request.task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attested, 1, "recovery attestation must precede start");
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+impl AgentWorkerFactory for ConflictReportingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn preflight_recovery(
+        &self,
+        _request: WorkerRecoveryPreflight,
+    ) -> WorkerRecoveryPreflightResult {
+        WorkerRecoveryPreflightResult::Conflict(
+            "recorded Git HEAD no longer matches checkpoint".into(),
+        )
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        *self.starts.lock().unwrap() += 1;
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+impl AgentWorkerFactory for StartupErrorFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn start(
+        &self,
+        _request: WorkerStart,
+    ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async { Err(WorkerError::Startup("provider bootstrap failed".into())) })
+    }
+}
+
 impl AgentWorkerFactory for PauseRecordingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let handle = WorkerHandle::new(request.cancellation);
         self.handles.lock().unwrap().push(handle.clone());
@@ -122,6 +276,23 @@ async fn runtime_persists_initial_attempts_for_root_and_child_workers() {
 }
 
 #[tokio::test]
+async fn admission_persists_recovery_boundary_before_worker_start() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(
+        &database,
+        Arc::new(AdmissionObservingFactory {
+            database: database.clone(),
+        }),
+    )
+    .unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    coordinator.start_worker(&session, &root).await.unwrap();
+}
+
+#[tokio::test]
 async fn recovered_root_resumes_in_a_fresh_attempt_after_runtime_restart() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -153,18 +324,216 @@ async fn recovered_root_resumes_in_a_fresh_attempt_after_runtime_restart() {
     let starts = factory.starts.lock().unwrap();
     assert_eq!(starts.len(), 1);
     assert_ne!(starts[0].attempt_id, attempt);
-    assert!(
-        starts[0]
-            .recovery_instruction
-            .as_deref()
+    drop(starts);
+    let events = RuntimeRepository::open(&database)
+        .unwrap()
+        .event_records_after(0)
+        .unwrap();
+    let attested = events
+        .iter()
+        .position(|event| event.event == RuntimeEvent::TaskRecoveryAttested)
+        .unwrap();
+    let started = events
+        .iter()
+        .rposition(|event| event.event == RuntimeEvent::TaskStarted)
+        .unwrap();
+    assert!(attested < started);
+}
+
+#[test]
+fn recovered_successor_remains_gated_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let interrupted_attempt = yi_agent_core::AttemptId::new();
+    let successor_attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &interrupted_attempt, 1, "running")
+        .unwrap();
+    repository
+        .record_recovery_context(
+            &task,
+            &interrupted_attempt,
+            "workspace:test",
+            "worktree:test",
+            &durable_context().checkpoint_json,
+            &durable_context().tool_state_json,
+        )
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    repository
+        .activate_successor_attempt(
+            &task,
+            &successor_attempt,
+            2,
+            "recovery_gated",
+            RuntimeEvent::TaskQueued,
+        )
+        .unwrap();
+    drop(repository);
+
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+
+    assert_eq!(coordinator.root_task_id(&session).unwrap(), task);
+    assert_eq!(coordinator.task_state(&task).unwrap(), "recovery_gated");
+    assert_eq!(
+        RuntimeRepository::open(&database)
             .unwrap()
-            .contains("git status")
+            .attempt_state(&successor_attempt)
+            .unwrap(),
+        "recovery_gated"
     );
-    let instruction = starts[0].recovery_instruction.as_deref().unwrap();
-    assert!(instruction.contains("workspace:project"));
-    assert!(instruction.contains("worktree:feature/recovery"));
-    assert!(instruction.contains("before restart"));
-    assert!(instruction.contains("\"status\":\"clean\""));
+}
+
+#[tokio::test]
+async fn attested_successor_remains_resumable_after_restart_before_start() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "recovery_gated")
+        .unwrap();
+    repository
+        .record_recovery_context(
+            &task,
+            &attempt,
+            "workspace:test",
+            "worktree:test",
+            &durable_context().checkpoint_json,
+            &durable_context().tool_state_json,
+        )
+        .unwrap();
+    repository
+        .attest_recovery_gate(&task, &attempt, &durable_attestation())
+        .unwrap();
+    drop(repository);
+
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+
+    assert_eq!(coordinator.root_task_id(&session).unwrap(), task);
+    assert_eq!(coordinator.task_state(&task).unwrap(), "recovery_attested");
+    coordinator.resume_task(&session, &task).await.unwrap();
+    assert_eq!(coordinator.task_state(&task).unwrap(), "running");
+}
+
+#[tokio::test]
+async fn recovery_attestation_is_durable_before_worker_start() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository
+        .record_recovery_context(
+            &task,
+            &attempt,
+            "workspace:test",
+            "worktree:test",
+            &durable_context().checkpoint_json,
+            &durable_context().tool_state_json,
+        )
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+    let starts = Arc::new(Mutex::new(0));
+    let coordinator = RuntimeCoordinator::open(
+        &database,
+        Arc::new(RecoveryStartObservingFactory {
+            database: database.clone(),
+            starts: starts.clone(),
+        }),
+    )
+    .unwrap();
+
+    coordinator.resume_task(&session, &task).await.unwrap();
+
+    assert_eq!(*starts.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn recovery_conflict_is_durable_without_factory_start() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+    let factory = Arc::new(ConflictReportingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    coordinator.resume_task(&session, &task).await.unwrap();
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert_eq!(*factory.starts.lock().unwrap(), 0);
+    assert_eq!(coordinator.task_state(&task).unwrap(), "blocked");
+    let terminal = RuntimeRepository::open(&database)
+        .unwrap()
+        .attempt_terminal_json_for_task(&task)
+        .unwrap()
+        .unwrap();
+    let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+    assert_eq!(terminal["reason"], "recovery_conflict");
+    assert!(terminal["evidence"].as_str().unwrap().contains("Git HEAD"));
+}
+
+#[tokio::test]
+async fn recovery_required_task_rejects_direct_start_without_factory_action() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    assert!(coordinator.start_worker(&session, &task).await.is_err());
+
+    assert!(factory.starts.lock().unwrap().is_empty());
+    assert_eq!(coordinator.task_state(&task).unwrap(), "recovery_required");
+}
+
+#[tokio::test]
+async fn startup_failure_closes_attempt_and_releases_admission_leases() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(StartupErrorFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+
+    assert!(coordinator.start_worker(&session, &task).await.is_err());
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&task).unwrap(), "failed");
+    assert!(
+        !repository
+            .has_active_lease_prefix(&task, "workspace:")
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .has_active_lease_prefix(&task, "worktree:")
+            .unwrap()
+    );
 }
 
 #[tokio::test]

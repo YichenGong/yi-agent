@@ -11,7 +11,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use yi_agent_core::subagent::scheduler::ResourceCoordinator;
 use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError, WaitMode, WaitOutcome};
 use yi_agent_core::subagent::task::{MessageId, PauseReason, RootSessionId, TaskId};
-use yi_agent_core::subagent::worker::AgentWorkerFactory;
+use yi_agent_core::subagent::worker::{
+    AgentWorkerFactory, WorkerRecoveryContext, WorkerRecoveryPreflight,
+    WorkerRecoveryPreflightResult,
+};
 
 use crate::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
 
@@ -70,7 +73,8 @@ impl RuntimeCoordinator {
     ) -> Result<Self, RuntimeCoordinatorError> {
         let repository = RuntimeRepository::open(database_path)?;
         let recovered_tasks = repository.recovered_tasks()?;
-        let mut supervisors = HashMap::new();
+        let mut supervisors: HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>> =
+            HashMap::new();
         let mut recovery_contexts = HashMap::new();
         for task in recovered_tasks {
             recovery_contexts.insert(
@@ -80,19 +84,11 @@ impl RuntimeCoordinator {
                     worktree_lease: task.worktree_lease.clone(),
                     checkpoint_json: task.checkpoint_json.clone(),
                     tool_state_json: task.tool_state_json.clone(),
+                    recovery_gated: task.recovery_gated,
+                    recovery_attested: task.recovery_attested,
                 },
             );
-            if task.parent_id.is_none() {
-                supervisors.insert(
-                    task.session_id.clone(),
-                    Arc::new(AsyncMutex::new(AgentSupervisor::from_recovered_root(
-                        task.session_id,
-                        task.task_id,
-                        task.attempt_id,
-                        task.attempt_number,
-                    ))),
-                );
-            } else {
+            if let Some(parent_id) = task.parent_id {
                 let depth = match task.depth {
                     1 => yi_agent_core::TaskDepth::Child,
                     2 => yi_agent_core::TaskDepth::Leaf,
@@ -114,12 +110,30 @@ impl RuntimeCoordinator {
                     })?
                     .insert_recovered_child(
                         task.task_id,
-                        task.parent_id.expect("child parent was checked"),
+                        parent_id,
                         depth,
                         task.attempt_id,
                         task.attempt_number,
+                        task.recovery_gated || task.recovery_attested,
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
+            } else {
+                let supervisor = if task.recovery_gated || task.recovery_attested {
+                    AgentSupervisor::from_recovered_gated_root(
+                        task.session_id.clone(),
+                        task.task_id,
+                        task.attempt_id,
+                        task.attempt_number,
+                    )
+                } else {
+                    AgentSupervisor::from_recovered_root(
+                        task.session_id.clone(),
+                        task.task_id,
+                        task.attempt_id,
+                        task.attempt_number,
+                    )
+                };
+                supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
             }
         }
         Ok(Self {
@@ -250,6 +264,20 @@ impl RuntimeCoordinator {
         self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
         let mut supervisor = supervisor.lock().await;
+        let recovery_boundary = self
+            .recovery_contexts
+            .lock()
+            .expect("runtime recovery context mutex poisoned")
+            .get(task)
+            .cloned();
+        if recovery_boundary
+            .as_ref()
+            .is_some_and(|context| !context.recovery_gated && !context.recovery_attested)
+        {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "recovery-required task must be explicitly resumed".into(),
+            ));
+        }
         let is_subagent = !matches!(
             supervisor
                 .task(task)
@@ -269,44 +297,122 @@ impl RuntimeCoordinator {
             }
             residents.insert(task.clone());
         }
-        let recovery_context = self.factory.recovery_context();
-        supervisor
-            .start_worker(self.factory.as_ref(), task)
-            .await
-            .map_err(|error| {
-                if is_subagent {
-                    self.resident_tasks
-                        .lock()
-                        .expect("runtime resident task mutex poisoned")
-                        .remove(task);
-                }
-                RuntimeCoordinatorError::Supervisor(error)
-            })?;
         let attempt = supervisor
             .task(task)
-            .expect("started worker task exists")
+            .expect("worker task exists")
             .active_attempt_id()
             .clone();
-        if let Err(error) = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .transition_task_and_attempt_with_recovery_context(
-                task,
-                &attempt,
-                "running",
-                RuntimeEvent::TaskStarted,
-                &recovery_context,
-            )
-        {
-            let _ = supervisor.cancel_task_tree(task, false);
+        let gate = recovery_boundary
+            .as_ref()
+            .filter(|context| context.recovery_gated)
+            .cloned();
+        if let Some(gate) = gate {
+            match self.factory.preflight_recovery(WorkerRecoveryPreflight {
+                task_id: task.clone(),
+                attempt_id: attempt.clone(),
+                context: gate.worker_context(),
+            }) {
+                WorkerRecoveryPreflightResult::Attested(attestation) => {
+                    self.repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned")
+                        .attest_recovery_gate(task, &attempt, &attestation)?;
+                    self.recovery_contexts
+                        .lock()
+                        .expect("runtime recovery context mutex poisoned")
+                        .remove(task);
+                }
+                WorkerRecoveryPreflightResult::Conflict(reason) => {
+                    supervisor
+                        .record_recovery_conflict(task, reason.clone())
+                        .map_err(RuntimeCoordinatorError::Supervisor)?;
+                    let evidence = serde_json::to_string(&serde_json::json!({
+                        "reason": "recovery_conflict",
+                        "evidence": reason,
+                    }))
+                    .expect("recovery conflict payload is serializable");
+                    self.repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned")
+                        .transition_task_and_attempt_with_terminal(
+                            task,
+                            &attempt,
+                            "blocked",
+                            RuntimeEvent::TaskBlocked,
+                            &evidence,
+                        )?;
+                    self.recovery_contexts
+                        .lock()
+                        .expect("runtime recovery context mutex poisoned")
+                        .remove(task);
+                    if is_subagent {
+                        self.resident_tasks
+                            .lock()
+                            .expect("runtime resident task mutex poisoned")
+                            .remove(task);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        let recovery_context = self.factory.recovery_context();
+        let admission = {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .transition_task_and_attempt_with_recovery_context(
+                    task,
+                    &attempt,
+                    "running",
+                    RuntimeEvent::TaskStarted,
+                    &recovery_context,
+                )
+        };
+        if let Err(error) = admission {
+            supervisor
+                .start_task(task)
+                .and_then(|()| supervisor.fail_task(task, error.to_string()))
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .transition_task_and_attempt_with_terminal(
+                    task,
+                    &attempt,
+                    "failed",
+                    RuntimeEvent::TaskFailed,
+                    r#"{"reason":"invalid_worker_recovery_context"}"#,
+                )?;
             if is_subagent {
                 self.resident_tasks
                     .lock()
                     .expect("runtime resident task mutex poisoned")
                     .remove(task);
             }
-            return Err(error.into());
+            return Err(RuntimeCoordinatorError::Repository(error));
+        }
+        self.recovery_contexts
+            .lock()
+            .expect("runtime recovery context mutex poisoned")
+            .remove(task);
+        if let Err(error) = supervisor.start_worker(self.factory.as_ref(), task).await {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .transition_task_and_attempt_with_terminal(
+                    task,
+                    &attempt,
+                    "failed",
+                    RuntimeEvent::TaskFailed,
+                    r#"{"reason":"worker_start_failed"}"#,
+                )?;
+            if is_subagent {
+                self.resident_tasks
+                    .lock()
+                    .expect("runtime resident task mutex poisoned")
+                    .remove(task);
+            }
+            return Err(RuntimeCoordinatorError::Supervisor(error));
         }
         Ok(())
     }
@@ -409,18 +515,23 @@ impl RuntimeCoordinator {
     ) -> Result<(), RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
+        let already_prepared = self
+            .recovery_contexts
+            .lock()
+            .expect("runtime recovery context mutex poisoned")
+            .get(task)
+            .is_some_and(|context| context.recovery_gated || context.recovery_attested);
         let recovery_attempt = {
             let mut supervisor = supervisor.lock().await;
-            if matches!(
+            if already_prepared {
+                None
+            } else if matches!(
                 supervisor.task(task).map(|task| task.state()),
                 Some(yi_agent_core::TaskState::RecoveryRequired(_))
             ) {
                 Some(
                     supervisor
-                        .resume_recovery_task(
-                            task,
-                            recovery_inspection_instruction(&self.recovery_context(task)),
-                        )
+                        .resume_recovery_task(task)
                         .map_err(RuntimeCoordinatorError::Supervisor)?,
                 )
             } else {
@@ -440,14 +551,16 @@ impl RuntimeCoordinator {
                     task,
                     &attempt.id,
                     attempt.number,
-                    "queued",
+                    "recovery_gated",
                     RuntimeEvent::TaskQueued,
                 )?;
                 self.recovery_contexts
                     .lock()
                     .expect("runtime recovery context mutex poisoned")
-                    .remove(task);
-            } else {
+                    .entry(task.clone())
+                    .or_default()
+                    .recovery_gated = true;
+            } else if !already_prepared {
                 repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
             }
         }
@@ -832,15 +945,6 @@ impl RuntimeCoordinator {
             .cloned()
             .ok_or_else(|| RuntimeCoordinatorError::SessionNotFound(session.clone()))
     }
-
-    fn recovery_context(&self, task: &TaskId) -> RecoveryContext {
-        self.recovery_contexts
-            .lock()
-            .expect("runtime recovery context mutex poisoned")
-            .get(task)
-            .cloned()
-            .unwrap_or_default()
-    }
 }
 
 #[derive(Clone, Default)]
@@ -849,53 +953,17 @@ struct RecoveryContext {
     worktree_lease: Option<String>,
     checkpoint_json: Option<String>,
     tool_state_json: String,
-}
-
-fn recovery_inspection_instruction(context: &RecoveryContext) -> String {
-    if !context.has_safe_base() {
-        return format!(
-            "RECOVERY_CONTROLLER_UNSAFE: durable recovery evidence is incomplete: workspace={}; worktree={}; checkpoint={}; tool_state={}. Report RecoveryConflict before any provider call, objective, tool, command, or Git action; do not run git status.",
-            context
-                .workspace_lease_id
-                .as_deref()
-                .unwrap_or("<none recorded>"),
-            context
-                .worktree_lease
-                .as_deref()
-                .unwrap_or("<none recorded>"),
-            context
-                .checkpoint_json
-                .as_deref()
-                .unwrap_or("<none recorded>"),
-            context.tool_state_json,
-        );
-    }
-    format!(
-        "Recovery required before changes: inspect the recorded workspace lease: {}; recorded worktree: {}; run git status, identify the latest commit, inspect required tool state evidence: {}; compare the prior checkpoint evidence: {}; and stop with RecoveryConflict if a safe base cannot be proven. Do not replay prior provider, tool, command, or Git actions.",
-        context
-            .workspace_lease_id
-            .as_deref()
-            .unwrap_or("<none recorded>"),
-        context
-            .worktree_lease
-            .as_deref()
-            .unwrap_or("<none recorded>"),
-        context.tool_state_json,
-        context
-            .checkpoint_json
-            .as_deref()
-            .unwrap_or("<none recorded>"),
-    )
+    recovery_gated: bool,
+    recovery_attested: bool,
 }
 
 impl RecoveryContext {
-    fn has_safe_base(&self) -> bool {
-        self.workspace_lease_id.is_some()
-            && self.worktree_lease.is_some()
-            && self
-                .checkpoint_json
-                .as_ref()
-                .is_some_and(|checkpoint| checkpoint.contains("\"git_head\":\""))
-            && self.tool_state_json.contains("\"state\":\"available\"")
+    fn worker_context(&self) -> WorkerRecoveryContext {
+        WorkerRecoveryContext {
+            workspace_lease_id: self.workspace_lease_id.clone(),
+            worktree_lease: self.worktree_lease.clone(),
+            checkpoint_json: self.checkpoint_json.clone().unwrap_or_default(),
+            tool_state_json: self.tool_state_json.clone(),
+        }
     }
 }

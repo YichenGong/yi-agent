@@ -1685,13 +1685,22 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
     use yi_agent_core::subagent::worker::{
-        AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart,
+        AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     };
     use yi_agent_core::{OutputStream, RootSessionId, TaskId};
 
     struct RecordingWorkerFactory;
 
     impl AgentWorkerFactory for RecordingWorkerFactory {
+        fn recovery_context(&self) -> WorkerRecoveryContext {
+            WorkerRecoveryContext {
+                workspace_lease_id: Some("workspace:test".into()),
+                worktree_lease: Some("worktree:test".into()),
+                checkpoint_json: r#"{"git_head":"test","git_status":""}"#.into(),
+                tool_state_json: r#"{"state":"available","registered_tools":[]}"#.into(),
+            }
+        }
+
         fn start(
             &self,
             request: WorkerStart,

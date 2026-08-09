@@ -468,6 +468,22 @@ impl AgentTask {
         }
     }
 
+    /// Rehydrates a successor attempt that was durably persisted behind the
+    /// recovery gate but not yet attested or admitted to a worker.
+    pub fn recovered_gated_root(
+        root_session_id: RootSessionId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+    ) -> Self {
+        let mut task = Self::recovered_root(root_session_id, task_id, attempt_id, attempt_number);
+        task.state = TaskState::Queued;
+        let attempt = task.active_attempt_mut();
+        attempt.ended_at = None;
+        attempt.terminal_reason = None;
+        task
+    }
+
     pub fn recovered_child(
         root_session_id: RootSessionId,
         task_id: TaskId,
@@ -477,6 +493,21 @@ impl AgentTask {
         attempt_number: u32,
     ) -> Self {
         let mut task = Self::recovered_root(root_session_id, task_id, attempt_id, attempt_number);
+        task.parent_id = Some(parent_id);
+        task.depth = depth;
+        task
+    }
+
+    pub fn recovered_gated_child(
+        root_session_id: RootSessionId,
+        task_id: TaskId,
+        parent_id: TaskId,
+        depth: TaskDepth,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+    ) -> Self {
+        let mut task =
+            Self::recovered_gated_root(root_session_id, task_id, attempt_id, attempt_number);
         task.parent_id = Some(parent_id);
         task.depth = depth;
         task
