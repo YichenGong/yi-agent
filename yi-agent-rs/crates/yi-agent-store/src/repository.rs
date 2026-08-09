@@ -313,14 +313,14 @@ impl RuntimeRepository {
         Ok(())
     }
 
-    /// Process-local permits cannot survive a daemon restart. This leaves
-    /// durable workspace/worktree ownership intact for normal recovery.
-    pub fn release_process_local_leases(&mut self) -> Result<usize, RepositoryError> {
+    /// Provider turns are process-local. Other leases retain their recovery
+    /// semantics and must not be released merely because the daemon restarted.
+    pub fn release_provider_turn_leases(&mut self) -> Result<usize, RepositoryError> {
         Ok(self.connection.execute(
             "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
              WHERE state = 'active'
-               AND resource_key NOT LIKE 'worktree:%'
-               AND resource_key NOT LIKE 'workspace:%'",
+               AND (resource_key LIKE 'llm:%'
+                    OR resource_key LIKE 'llm-coordination:%')",
             [],
         )?)
     }

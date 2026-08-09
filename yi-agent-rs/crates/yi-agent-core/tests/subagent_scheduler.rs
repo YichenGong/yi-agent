@@ -474,12 +474,13 @@ fn cancelled_task_is_removed_from_resource_wait_queue() {
 }
 
 #[test]
-fn coordination_reserve_unblocks_parent_under_leaf_saturation() {
+fn coordination_reserve_waits_for_a_borrower_to_reach_its_next_turn_boundary() {
     let mut coordinator = ResourceCoordinator::new();
     coordinator.configure_provider_llm_capacity("test-key");
     let regular_key = "llm:test-key";
     let coordination_key = "llm-coordination:test-key";
 
+    let mut regular_leases = Vec::new();
     for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
         coordinator.enqueue(
             RootSessionId::new(),
@@ -488,7 +489,7 @@ fn coordination_reserve_unblocks_parent_under_leaf_saturation() {
         );
     }
     for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
-        assert!(coordinator.grant_next(regular_key).is_some());
+        regular_leases.push(coordinator.grant_next(regular_key).unwrap());
     }
 
     let parent = TaskId::new();
@@ -498,6 +499,13 @@ fn coordination_reserve_unblocks_parent_under_leaf_saturation() {
         shared_request(coordination_key, 1),
     );
 
+    // The eighth regular lease is borrowing the reserve. It must yield at its
+    // next provider-turn boundary before coordination can start, rather than
+    // allowing a ninth concurrent request.
+    assert!(coordinator.grant_next(coordination_key).is_none());
+    coordinator
+        .release(regular_leases.pop().unwrap().lease_id)
+        .unwrap();
     assert_eq!(
         coordinator.grant_next(coordination_key).unwrap().task_id,
         parent

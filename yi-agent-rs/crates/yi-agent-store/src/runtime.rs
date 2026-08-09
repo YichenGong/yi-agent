@@ -140,7 +140,7 @@ impl RuntimeCoordinator {
         let mut repository = RuntimeRepository::open(database_path)?;
         // Provider-turn leases are process-local. A restarted daemon must not
         // count an abandoned request against the new process's capacity.
-        repository.release_process_local_leases()?;
+        repository.release_provider_turn_leases()?;
         let resident_cursor = repository.admission_cursor("resident:global")?;
         let mut resource_coordinator = ResourceCoordinator::new();
         if let Some(cursor) = resident_cursor {
@@ -1177,12 +1177,27 @@ impl ProviderTurnAdmissions {
             .expect("provider turn assignment mutex poisoned")
             .remove(&task_id)
         {
-            return Ok(Some(ProviderTurnLeaseHandle {
-                resources: Arc::clone(&self.resources),
-                repository: Arc::clone(&self.repository),
-                lease_id,
-                notify: Arc::clone(&self.notify),
-            }));
+            if priority == AdmissionPriority::Normal {
+                return Ok(Some(ProviderTurnLeaseHandle {
+                    resources: Arc::clone(&self.resources),
+                    repository: Arc::clone(&self.repository),
+                    lease_id,
+                    notify: Arc::clone(&self.notify),
+                }));
+            }
+            // Mailbox work became coordination-eligible after fair selection
+            // but before the worker consumed its assigned normal turn. Yield
+            // that assignment and re-enter through the coordination pool.
+            self.resources
+                .lock()
+                .expect("resource coordinator mutex poisoned")
+                .release(lease_id.clone())
+                .expect("assigned provider turn lease release is idempotent");
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .release_provider_turn_lease(&lease_id.to_string())?;
+            self.notify.notify_waiters();
         }
 
         let mut resources = self
@@ -1228,7 +1243,8 @@ impl ProviderTurnAdmissions {
             return Ok(None);
         };
         let cursor = resources.admission_cursor(resource_key);
-        self.repository
+        if let Err(error) = self
+            .repository
             .lock()
             .expect("runtime repository mutex poisoned")
             .save_provider_turn_grant(
@@ -1241,7 +1257,17 @@ impl ProviderTurnAdmissions {
                     .as_ref()
                     .expect("granted lease has parent cursor"),
                 cursor.sequence,
-            )?;
+            )
+        {
+            // A selected request cannot run until its durable grant and
+            // cursor commit. Undo the in-memory selection on write failure so
+            // it never leaks capacity until the daemon restarts.
+            resources
+                .release(grant.lease_id.clone())
+                .expect("provider turn grant can be rolled back");
+            self.notify.notify_waiters();
+            return Err(error);
+        }
         queued.remove(&grant.task_id);
         let granted_task = grant.task_id.clone();
         let lease_id = grant.lease_id;

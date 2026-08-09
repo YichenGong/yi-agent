@@ -297,9 +297,17 @@ impl ResourceCoordinator {
                 *grants.entry(lease.root_id.clone()).or_insert(0_u16) += lease.request.units;
                 grants
             });
+        // A normal request may borrow the coordination slot only until its
+        // next provider-turn boundary. Account for that outstanding loan when
+        // admitting coordination work so the two pools never exceed the
+        // provider profile's combined capacity.
+        let coordination_loan = borrowed_coordination_units(self, key);
         let queue = self.queues.get_mut(key)?;
         queue.retain(|entry| entry.request.deadline.is_none_or(|deadline| deadline > now));
-        let available = capacity.saturating_sub(used) + borrowed_coordination_capacity;
+        let available = capacity
+            .saturating_sub(used)
+            .saturating_sub(coordination_loan)
+            + borrowed_coordination_capacity;
         if available == 0 {
             return None;
         }
@@ -398,6 +406,24 @@ fn coordination_reserve_capacity(
     coordination_capacity
         .saturating_sub(coordination_used)
         .saturating_sub(already_borrowed)
+}
+
+fn borrowed_coordination_units(coordinator: &ResourceCoordinator, key: &str) -> u16 {
+    let Some(provider_key) = key.strip_prefix("llm-coordination:") else {
+        return 0;
+    };
+    let regular_key = format!("llm:{provider_key}");
+    let regular_capacity = coordinator
+        .capacities
+        .get(&regular_key)
+        .copied()
+        .unwrap_or(0);
+    coordinator
+        .in_use
+        .get(&regular_key)
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(regular_capacity)
 }
 
 struct FairSelection {
