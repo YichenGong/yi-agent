@@ -27,6 +27,18 @@ impl AgentWorkerFactory for RecordingWorkerFactory {
     }
 }
 
+#[derive(Clone, Default)]
+struct StartCountingFactory {
+    starts: Arc<Mutex<usize>>,
+}
+
+impl AgentWorkerFactory for StartCountingFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        *self.starts.lock().unwrap() += 1;
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
 #[derive(Clone)]
 struct ReportingWorkerFactory {
     handle: Arc<Mutex<Option<WorkerHandle>>>,
@@ -408,6 +420,34 @@ fn daemon_start_publishes_one_runtime_recovered_event_for_reconciled_work() {
             .filter(|event| event.event == RuntimeEvent::RuntimeRecovered)
             .count(),
         1
+    );
+    drop(daemon);
+}
+
+#[test]
+fn startup_recovery_never_starts_a_worker_or_replays_actions() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = TaskId::new();
+    let attempt = AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    drop(repository);
+
+    let factory = Arc::new(StartCountingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    assert_eq!(*factory.starts.lock().unwrap(), 0);
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&task)
+            .unwrap(),
+        "recovery_required"
     );
     drop(daemon);
 }
