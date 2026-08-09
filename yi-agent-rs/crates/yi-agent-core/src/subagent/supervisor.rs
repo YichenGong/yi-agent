@@ -9,7 +9,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
-use super::task::{AgentTask, CancelReason, RootSessionId, TaskEvent, TaskFailure, TaskId};
+use super::task::{
+    AgentTask, CancelReason, PauseReason, RootSessionId, TaskEvent, TaskFailure, TaskId,
+};
 use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
@@ -280,6 +282,45 @@ impl AgentSupervisor {
         }
         self.notify_update();
         Ok(task_ids)
+    }
+
+    pub fn pause_task(&mut self, task_id: &TaskId, reason: PauseReason) -> Result<(), String> {
+        let worker = self
+            .workers
+            .get(task_id)
+            .ok_or_else(|| "worker does not exist".to_string())?;
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::PauseRequested { attempt_id, reason },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        worker.request_pause();
+        self.notify_update();
+        Ok(())
+    }
+
+    pub fn resume_task(&mut self, task_id: &TaskId) -> Result<(), String> {
+        {
+            let task = self
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| "task does not exist".to_string())?;
+            let attempt_id = task.active_attempt_id().clone();
+            task.reduce(
+                TaskEvent::ResumeRequested { attempt_id },
+                chrono::Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        self.workers.remove(task_id);
+        self.worker_message_capabilities.remove(task_id);
+        self.notify_update();
+        Ok(())
     }
 
     fn collect_cancellation_targets(
