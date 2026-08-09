@@ -1402,4 +1402,60 @@ fn attempt_watchdog_snapshot_survives_a_repository_reopen() {
         persisted.observation.resource_wait_started_at,
         Some(timestamp)
     );
+    assert_eq!(
+        persisted.current_wait,
+        Some(WatchdogResourceWait {
+            resource_key: "llm:test".into(),
+            queued_at: timestamp,
+        })
+    );
+}
+
+#[tokio::test]
+async fn coordinator_evaluates_a_persisted_watchdog_budget_once() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+    let attempt: yi_agent_core::AttemptId = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+            [task.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    let now = Utc::now();
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .save_attempt_watchdog_snapshot(
+            &task,
+            &attempt,
+            &WatchdogLimits {
+                max_turns: Some(1),
+                max_tokens: None,
+                max_cost_micros: None,
+                max_wall_time_secs: None,
+                max_idle_time_secs: None,
+                max_resource_wait_secs: None,
+                max_provider_retries: None,
+                max_tool_retries: None,
+                max_rework_cycles: None,
+            },
+            &WatchdogUsage {
+                turns: 1,
+                ..WatchdogUsage::default()
+            },
+            None,
+            now,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(coordinator.evaluate_watchdogs(now).await.unwrap(), 1);
+    assert_eq!(coordinator.task_state(&task).unwrap(), "budget_exhausted");
+    assert_eq!(coordinator.evaluate_watchdogs(now).await.unwrap(), 0);
 }

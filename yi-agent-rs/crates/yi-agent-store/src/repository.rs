@@ -121,6 +121,15 @@ pub struct PersistedAttemptWatchdog {
     pub limits: WatchdogLimits,
     pub observation: WatchdogObservation,
     pub last_meaningful_event_id: Option<i64>,
+    pub current_wait: Option<WatchdogResourceWait>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedWatchdogTask {
+    pub session_id: RootSessionId,
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub snapshot: PersistedAttemptWatchdog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +631,7 @@ impl RuntimeRepository {
                 "SELECT attempts.started_at, attempt_watchdogs.limits_json,
                         attempt_watchdogs.usage_json, attempt_watchdogs.last_meaningful_event_id,
                         attempt_watchdogs.last_meaningful_at,
+                        attempt_watchdogs.resource_wait_key,
                         attempt_watchdogs.resource_wait_started_at
                  FROM attempt_watchdogs JOIN attempts ON attempts.id = attempt_watchdogs.attempt_id
                  WHERE attempt_watchdogs.attempt_id = ?1",
@@ -634,6 +644,7 @@ impl RuntimeRepository {
                         row.get::<_, Option<i64>>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -645,6 +656,7 @@ impl RuntimeRepository {
                 usage_json,
                 last_event,
                 last_meaningful_at,
+                wait_key,
                 wait_started_at,
             )| {
                 let parse_time = |value: &str| {
@@ -681,10 +693,84 @@ impl RuntimeRepository {
                         })?,
                     },
                     last_meaningful_event_id: last_event,
+                    current_wait: match (wait_key, wait_started_at) {
+                        (Some(resource_key), Some(queued_at)) => Some(WatchdogResourceWait {
+                            resource_key,
+                            queued_at: parse_time(&queued_at)?,
+                        }),
+                        (None, None) => None,
+                        _ => {
+                            return Err(RepositoryError::InvalidWatchdogSnapshot {
+                                attempt: attempt.to_string(),
+                                reason: "resource wait key and timestamp must both be present"
+                                    .into(),
+                            });
+                        }
+                    },
                 })
             },
         )
         .transpose()
+    }
+
+    /// Returns watchdog facts only for the currently active attempt of a task
+    /// that remains eligible for a terminal watchdog decision.
+    pub fn active_attempt_watchdogs(&self) -> Result<Vec<PersistedWatchdogTask>, RepositoryError> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT tasks.root_session_id, tasks.id, attempt_watchdogs.attempt_id
+                 FROM attempt_watchdogs
+                 JOIN tasks ON tasks.id = attempt_watchdogs.task_id
+                 WHERE tasks.active_attempt_id = attempt_watchdogs.attempt_id
+                   AND tasks.state_json IN (
+                       'queued', 'running', 'waiting_for_resource',
+                       'waiting_for_permission', 'waiting_for_children'
+                   )",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        rows.into_iter()
+            .map(|(session_id, task_id, attempt_id)| {
+                let attempt_id =
+                    attempt_id
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidWatchdogSnapshot {
+                            attempt: attempt_id.clone(),
+                            reason: "invalid attempt ID".into(),
+                        })?;
+                let snapshot = self
+                    .attempt_watchdog_snapshot(&attempt_id)?
+                    .ok_or_else(|| RepositoryError::InvalidWatchdogSnapshot {
+                        attempt: attempt_id.to_string(),
+                        reason: "active watchdog snapshot disappeared".into(),
+                    })?;
+                Ok(PersistedWatchdogTask {
+                    session_id: session_id.parse().map_err(|_| {
+                        RepositoryError::InvalidWatchdogSnapshot {
+                            attempt: attempt_id.to_string(),
+                            reason: "invalid root session ID".into(),
+                        }
+                    })?,
+                    task_id: task_id.parse().map_err(|_| {
+                        RepositoryError::InvalidWatchdogSnapshot {
+                            attempt: attempt_id.to_string(),
+                            reason: "invalid task ID".into(),
+                        }
+                    })?,
+                    attempt_id,
+                    snapshot,
+                })
+            })
+            .collect()
     }
 
     /// Test/support API for recording the durable facts a resumed worker must

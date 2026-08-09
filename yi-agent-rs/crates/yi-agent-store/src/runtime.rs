@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use yi_agent_core::ProviderTurnGate;
@@ -26,6 +26,7 @@ use yi_agent_core::subagent::worker::{
 use crate::repository::{
     RepositoryError, RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogTerminal,
 };
+use crate::schedule::{WatchdogOutcome, evaluate_watchdog};
 
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
@@ -693,6 +694,58 @@ impl RuntimeCoordinator {
         drop(supervisor);
         self.release_resident_lease(task);
         Ok(true)
+    }
+
+    /// Evaluates durable watchdog snapshots without holding either coordinator
+    /// mutex across an await. The terminal transaction makes repeated scans
+    /// idempotent even when another scan wins the race.
+    pub async fn evaluate_watchdogs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize, RuntimeCoordinatorError> {
+        let watchdogs = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .active_attempt_watchdogs()?;
+        let mut terminal_count = 0;
+
+        for watchdog in watchdogs {
+            let Some(outcome) = evaluate_watchdog(
+                &watchdog.snapshot.limits,
+                &watchdog.snapshot.observation,
+                now,
+            ) else {
+                continue;
+            };
+            let terminal = match outcome {
+                WatchdogOutcome::Stalled => WatchdogTerminal::Stalled,
+                WatchdogOutcome::TimedOut(kind) => WatchdogTerminal::TimedOut(kind),
+                WatchdogOutcome::BudgetExhausted(kind) => WatchdogTerminal::BudgetExhausted(kind),
+            };
+            let elapsed_secs = now
+                .signed_duration_since(watchdog.snapshot.observation.last_meaningful_at)
+                .num_seconds()
+                .max(0) as u64;
+            let evidence = WatchdogEvidence {
+                last_meaningful_event_id: watchdog.snapshot.last_meaningful_event_id,
+                last_meaningful_at: watchdog.snapshot.observation.last_meaningful_at,
+                elapsed_secs,
+                current_wait: watchdog.snapshot.current_wait,
+            };
+            if self
+                .record_watchdog_terminal(
+                    &watchdog.session_id,
+                    &watchdog.task_id,
+                    terminal,
+                    evidence,
+                )
+                .await?
+            {
+                terminal_count += 1;
+            }
+        }
+        Ok(terminal_count)
     }
 
     pub async fn cancel_task(
