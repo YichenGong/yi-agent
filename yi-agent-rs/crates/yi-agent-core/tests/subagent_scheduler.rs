@@ -472,3 +472,81 @@ fn cancelled_task_is_removed_from_resource_wait_queue() {
     assert_eq!(coordinator.queued_request_count(), 0);
     assert!(coordinator.grant_next("resident:global").is_none());
 }
+
+#[test]
+fn coordination_reserve_unblocks_parent_under_leaf_saturation() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.configure_provider_llm_capacity("test-key");
+    let regular_key = "llm:test-key";
+    let coordination_key = "llm-coordination:test-key";
+
+    for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
+        coordinator.enqueue(
+            RootSessionId::new(),
+            TaskId::new(),
+            shared_request(regular_key, 1),
+        );
+    }
+    for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
+        assert!(coordinator.grant_next(regular_key).is_some());
+    }
+
+    let parent = TaskId::new();
+    coordinator.enqueue(
+        RootSessionId::new(),
+        parent.clone(),
+        shared_request(coordination_key, 1),
+    );
+
+    assert_eq!(
+        coordinator.grant_next(coordination_key).unwrap().task_id,
+        parent
+    );
+}
+
+#[test]
+fn coordination_wait_prevents_leaf_from_borrowing_its_reserve() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.configure_provider_llm_capacity("test-key");
+    let regular_key = "llm:test-key";
+    coordinator.enqueue(
+        RootSessionId::new(),
+        TaskId::new(),
+        shared_request("llm-coordination:test-key", 1),
+    );
+    for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
+        coordinator.enqueue(
+            RootSessionId::new(),
+            TaskId::new(),
+            shared_request(regular_key, 1),
+        );
+    }
+
+    for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY - 1 {
+        assert!(coordinator.grant_next(regular_key).is_some());
+    }
+    assert!(coordinator.grant_next(regular_key).is_none());
+}
+
+#[test]
+fn unrunnable_coordination_request_does_not_block_reserve_borrowing() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.configure_provider_llm_capacity("test-key");
+    let regular_key = "llm:test-key";
+    coordinator.enqueue(
+        RootSessionId::new(),
+        TaskId::new(),
+        shared_request("llm-coordination:test-key", 2),
+    );
+    for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
+        coordinator.enqueue(
+            RootSessionId::new(),
+            TaskId::new(),
+            shared_request(regular_key, 1),
+        );
+    }
+
+    for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
+        assert!(coordinator.grant_next(regular_key).is_some());
+    }
+}

@@ -276,6 +276,7 @@ impl ResourceCoordinator {
     pub fn grant_next_at(&mut self, key: &str, now: DateTime<Utc>) -> Option<GrantedLease> {
         let capacity = *self.capacities.get(key).unwrap_or(&0);
         let used = *self.in_use.get(key).unwrap_or(&0);
+        let borrowed_coordination_capacity = coordination_reserve_capacity(self, key, used, now);
         let has_active_lease = self.active.values().any(|lease| lease.request.key == key);
         let has_exclusive_lease = self
             .active
@@ -291,7 +292,8 @@ impl ResourceCoordinator {
             });
         let queue = self.queues.get_mut(key)?;
         queue.retain(|entry| entry.request.deadline.is_none_or(|deadline| deadline > now));
-        if used >= capacity {
+        let available = capacity.saturating_sub(used) + borrowed_coordination_capacity;
+        if available == 0 {
             return None;
         }
         let last_root = self.last_grant_root.get(key).cloned();
@@ -301,7 +303,7 @@ impl ResourceCoordinator {
             &self.last_grant_parent,
             key,
             &outstanding_by_root,
-            capacity - used,
+            available,
             now,
             has_active_lease,
             has_exclusive_lease,
@@ -334,6 +336,61 @@ impl ResourceCoordinator {
         *used = used.saturating_sub(lease.request.units);
         Ok(())
     }
+}
+
+fn coordination_reserve_capacity(
+    coordinator: &ResourceCoordinator,
+    key: &str,
+    used: u16,
+    now: DateTime<Utc>,
+) -> u16 {
+    let Some(provider_key) = key.strip_prefix("llm:") else {
+        return 0;
+    };
+    let regular_capacity = coordinator.capacities.get(key).copied().unwrap_or(0);
+    if used < regular_capacity {
+        return 0;
+    }
+    let coordination_key = format!("llm-coordination:{provider_key}");
+    let coordination_capacity = coordinator
+        .capacities
+        .get(&coordination_key)
+        .copied()
+        .unwrap_or(0);
+    let coordination_used = coordinator
+        .in_use
+        .get(&coordination_key)
+        .copied()
+        .unwrap_or(0);
+    let coordination_available = coordination_capacity.saturating_sub(coordination_used);
+    let coordination_has_active_lease = coordinator
+        .active
+        .values()
+        .any(|lease| lease.request.key == coordination_key);
+    let coordination_has_exclusive_lease = coordinator.active.values().any(|lease| {
+        lease.request.key == coordination_key && lease.request.mode == LeaseMode::Exclusive
+    });
+    let coordination_queued = coordinator
+        .queues
+        .get(&coordination_key)
+        .is_some_and(|queue| {
+            queue.iter().any(|entry| {
+                entry.request.deadline.is_none_or(|deadline| deadline > now)
+                    && entry.request.units <= coordination_available
+                    && request_is_compatible(
+                        entry,
+                        coordination_has_active_lease,
+                        coordination_has_exclusive_lease,
+                    )
+            })
+        });
+    if coordination_queued || coordination_used >= coordination_capacity {
+        return 0;
+    }
+    let already_borrowed = used.saturating_sub(regular_capacity);
+    coordination_capacity
+        .saturating_sub(coordination_used)
+        .saturating_sub(already_borrowed)
 }
 
 struct FairSelection {
