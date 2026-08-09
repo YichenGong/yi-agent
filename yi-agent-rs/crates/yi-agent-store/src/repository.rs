@@ -5,7 +5,7 @@ use thiserror::Error;
 use yi_agent_core::subagent::task::MessageId;
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -100,7 +100,7 @@ pub struct RuntimeSubscriptionSnapshot {
 pub enum RuntimeCursorState {
     Fresh,
     Replayable,
-    Expired { oldest_retained_event_id: i64 },
+    Expired { oldest_replayable_event_id: i64 },
 }
 
 pub struct RuntimeRepository {
@@ -467,16 +467,16 @@ impl RuntimeRepository {
             [],
             |row| row.get(0),
         )?;
-        let oldest_retained_event_id: i64 = transaction.query_row(
-            "SELECT COALESCE(MIN(id), ?1) FROM events",
-            params![high_water_event_id.saturating_add(1)],
+        let oldest_replayable_event_id: i64 = transaction.query_row(
+            "SELECT value FROM runtime_metadata WHERE key = 'event_replay_floor'",
+            [],
             |row| row.get(0),
         )?;
-        let cursor_state = if after_event_id < oldest_retained_event_id.saturating_sub(1)
+        let cursor_state = if after_event_id < oldest_replayable_event_id.saturating_sub(1)
             || after_event_id > high_water_event_id
         {
             RuntimeCursorState::Expired {
-                oldest_retained_event_id,
+                oldest_replayable_event_id,
             }
         } else if after_event_id == 0 {
             RuntimeCursorState::Fresh
@@ -532,14 +532,30 @@ impl RuntimeRepository {
         })
     }
 
-    /// Removes a retained event prefix. Subscribers behind the new oldest
-    /// retained ID receive a replacement snapshot instead of a partial replay.
-    pub fn prune_events_through(&mut self, event_id: i64) -> Result<usize, RepositoryError> {
-        let transaction = self.connection.transaction()?;
-        let removed =
-            transaction.execute("DELETE FROM events WHERE id <= ?1", params![event_id])?;
+    /// Advances the replay window without deleting the append-only audit journal.
+    pub fn advance_event_replay_floor_through(
+        &mut self,
+        event_id: i64,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let high_water_event_id: i64 = transaction.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        let requested_floor = event_id
+            .saturating_add(1)
+            .clamp(1, high_water_event_id.saturating_add(1));
+        transaction.execute(
+            "UPDATE runtime_metadata
+             SET value = MAX(value, ?1)
+             WHERE key = 'event_replay_floor'",
+            params![requested_floor],
+        )?;
         transaction.commit()?;
-        Ok(removed)
+        Ok(())
     }
 
     pub fn event_records_after(&self, cursor: i64) -> Result<Vec<PersistedEvent>, RepositoryError> {
@@ -590,18 +606,17 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
     )?;
-    let applied: Option<i64> = connection
-        .query_row(
-            "SELECT version FROM schema_migrations WHERE version = ?1",
-            params![LATEST_SCHEMA_VERSION],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if applied.is_some() {
+    let current_version: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current_version >= LATEST_SCHEMA_VERSION {
         return Ok(());
     }
-    let transaction = connection.unchecked_transaction()?;
-    transaction.execute_batch(
+    if current_version < 1 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
         "CREATE TABLE sessions (
             id TEXT PRIMARY KEY, project_root TEXT NOT NULL, state TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -664,11 +679,21 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         CREATE INDEX mailbox_recipient_idx ON mailbox_messages(recipient_task_id, delivered_at, priority);
         CREATE INDEX leases_resource_idx ON resource_leases(resource_key, state);
         CREATE INDEX events_session_id_idx ON events(session_id, id);",
-    )?;
-    transaction.execute(
-        "INSERT INTO schema_migrations (version) VALUES (?1)",
-        params![LATEST_SCHEMA_VERSION],
-    )?;
-    transaction.commit()?;
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (1)", [])?;
+        transaction.commit()?;
+    }
+    if current_version < 2 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE runtime_metadata (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT INTO runtime_metadata (key, value) VALUES ('event_replay_floor', 1);",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])?;
+        transaction.commit()?;
+    }
     Ok(())
 }

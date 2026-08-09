@@ -877,6 +877,39 @@ mod subscription_queue_tests {
         assert_eq!(frames[0].result, IpcResponse::ResyncRequired);
         assert!(queue.is_closed());
     }
+
+    #[test]
+    fn slow_subscriber_receives_resync_then_socket_closes() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let queue = Arc::new(PendingSubscriptionFrames::new("slow-client", 2));
+        assert!(queue.push_event(event(1)));
+        assert!(queue.push_event(event(2)));
+        assert!(!queue.push_event(event(3)));
+
+        let writer_queue = Arc::clone(&queue);
+        let writer = thread::spawn(move || {
+            while let Some(frame) = writer_queue.pop_wait() {
+                write_envelope_frame(&mut writer, &frame).unwrap();
+            }
+        });
+        let mut subscription = Subscription {
+            reader: BufReader::new(reader),
+            request_id: "slow-client".into(),
+        };
+
+        assert_eq!(
+            subscription.next_response().unwrap(),
+            IpcResponse::ResyncRequired
+        );
+        assert!(matches!(
+            subscription.next_response(),
+            Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        writer.join().unwrap();
+    }
 }
 
 fn request_id_from_frame(frame: &[u8]) -> String {

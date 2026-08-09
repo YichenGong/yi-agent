@@ -63,7 +63,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 1);
+    assert_eq!(repository.schema_version().unwrap(), 2);
     for table in [
         "sessions",
         "tasks",
@@ -77,9 +77,31 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
         "permission_requests",
         "schedules",
         "events",
+        "runtime_metadata",
     ] {
         assert!(repository.has_table(table).unwrap(), "missing {table}");
     }
+}
+
+#[test]
+fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO schema_migrations (version) VALUES (1);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 2);
+    assert!(repository.has_table("runtime_metadata").unwrap());
 }
 
 #[test]
@@ -200,13 +222,15 @@ fn expired_cursor_gets_replacement_snapshot_then_ordered_events_after_boundary()
     let boundary = repository
         .transition_task(&task, "paused", RuntimeEvent::TaskPaused)
         .unwrap();
-    repository.prune_events_through(1).unwrap();
+    repository.advance_event_replay_floor_through(1).unwrap();
+
+    assert_eq!(repository.event_records_after(0).unwrap().len(), 3);
 
     let snapshot = repository.subscription_snapshot(0).unwrap();
     assert_eq!(
         snapshot.cursor_state,
         RuntimeCursorState::Expired {
-            oldest_retained_event_id: 2,
+            oldest_replayable_event_id: 2,
         }
     );
     assert_eq!(snapshot.high_water_event_id, boundary);
