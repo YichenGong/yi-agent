@@ -316,7 +316,46 @@ fn raw_ipc_replies_are_versioned_and_echo_the_request_id() {
     assert_eq!(malformed["protocol_version"], 1);
     assert_eq!(malformed["request_id"], "");
     assert_eq!(malformed["result"]["type"], "Error");
-    assert_eq!(malformed["result"]["code"], "invalid_request");
+    assert_eq!(malformed["result"]["code"], "validation");
+}
+
+#[test]
+fn oversized_request_echoes_an_id_available_in_its_bounded_prefix() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let oversized = format!(
+        r#"{{"protocol_version":1,"request_id":"oversized-request","command":{{"type":"Status"}},"padding":"{}"}}"#,
+        "x".repeat(1024 * 1024)
+    );
+
+    let response = raw_request_text_allowing_peer_close(daemon.socket_path(), &oversized);
+    assert_eq!(response["protocol_version"], 1);
+    assert_eq!(response["request_id"], "oversized-request");
+    assert_eq!(response["result"]["type"], "Error");
+    assert_eq!(response["result"]["code"], "validation");
+}
+
+#[test]
+fn subscription_initialization_failure_returns_an_internal_error_frame() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    std::fs::remove_file(&database).unwrap();
+    std::fs::create_dir(&database).unwrap();
+
+    let response = raw_request(
+        daemon.socket_path(),
+        json!({
+            "protocol_version": 1,
+            "request_id": "failed-subscription",
+            "command": {"type": "SubscribeEvents", "after_event_id": 0},
+        }),
+    );
+    assert_eq!(response["protocol_version"], 1);
+    assert_eq!(response["request_id"], "failed-subscription");
+    assert_eq!(response["result"]["type"], "Error");
+    assert_eq!(response["result"]["code"], "internal");
 }
 
 #[test]
@@ -352,7 +391,8 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
     assert_eq!(event["protocol_version"], 1);
     assert_eq!(event["request_id"], request_id);
     assert_eq!(event["event_id"], 1);
-    assert_eq!(event["result"]["type"], "Event");
+    assert_eq!(event["event"]["type"], "task_started");
+    assert_eq!(event["event"]["task_id"], task.to_string());
 }
 
 fn raw_request(socket_path: &std::path::Path, request: Value) -> Value {
@@ -363,6 +403,13 @@ fn raw_request_text(socket_path: &std::path::Path, request: &str) -> Value {
     let mut stream = UnixStream::connect(socket_path).unwrap();
     writeln!(stream, "{request}").unwrap();
     stream.flush().unwrap();
+    raw_response(&mut BufReader::new(stream))
+}
+
+fn raw_request_text_allowing_peer_close(socket_path: &std::path::Path, request: &str) -> Value {
+    let mut stream = UnixStream::connect(socket_path).unwrap();
+    let _ = writeln!(stream, "{request}");
+    let _ = stream.flush();
     raw_response(&mut BufReader::new(stream))
 }
 

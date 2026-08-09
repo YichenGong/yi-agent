@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -59,6 +59,8 @@ pub struct ResponseEnvelope {
     pub request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<IpcEventPayload>,
     pub result: IpcResponse,
 }
 
@@ -169,9 +171,6 @@ pub enum IpcErrorCode {
     Validation,
     RateLimited,
     Internal,
-    InvalidRequest,
-    FrameTooLarge,
-    UnsupportedProtocol,
 }
 
 impl std::fmt::Display for IpcErrorCode {
@@ -186,9 +185,6 @@ impl std::fmt::Display for IpcErrorCode {
             Self::Validation => "validation",
             Self::RateLimited => "rate_limited",
             Self::Internal => "internal",
-            Self::InvalidRequest => "invalid_request",
-            Self::FrameTooLarge => "frame_too_large",
-            Self::UnsupportedProtocol => "unsupported_protocol",
         };
         formatter.write_str(code)
     }
@@ -224,6 +220,23 @@ pub struct IpcEvent {
     pub kind: String,
 }
 
+/// The stable wire payload for a top-level subscription event frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEventPayload {
+    pub task_id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl From<&IpcEvent> for IpcEventPayload {
+    fn from(event: &IpcEvent) -> Self {
+        Self {
+            task_id: event.task_id.clone(),
+            kind: event.kind.clone(),
+        }
+    }
+}
+
 /// A client-side event stream. The first frame is always a `Subscription` snapshot.
 pub struct Subscription {
     reader: BufReader<UnixStream>,
@@ -249,6 +262,16 @@ impl Subscription {
                 std::io::ErrorKind::InvalidData,
                 "subscription response envelope identity mismatch",
             )));
+        }
+        if let IpcResponse::Event(event) = &envelope.result {
+            if envelope.event_id != Some(event.event_id)
+                || envelope.event.as_ref() != Some(&IpcEventPayload::from(event))
+            {
+                return Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "subscription event envelope identity mismatch",
+                )));
+            }
         }
         Ok(envelope)
     }
@@ -506,20 +529,19 @@ fn handle_client(
 ) -> Result<(), IpcError> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-    let frame = match read_limited_frame(&mut BufReader::new(stream.try_clone()?)) {
-        Err(IpcError::FrameTooLarge) => {
+    let frame = match read_incoming_frame(&mut BufReader::new(stream.try_clone()?))? {
+        Some(IncomingFrame::TooLarge(prefix)) => {
             return write_response_frame(
                 &mut stream,
-                MISSING_REQUEST_ID,
+                &request_id_from_prefix(&prefix),
                 None,
                 &IpcResponse::Error {
-                    code: IpcErrorCode::FrameTooLarge,
+                    code: IpcErrorCode::Validation,
                 },
             );
         }
-        Err(error) => return Err(error),
-        Ok(None) => return Ok(()),
-        Ok(Some(frame)) => frame,
+        None => return Ok(()),
+        Some(IncomingFrame::Complete(frame)) => frame,
     };
     let request_id = request_id_from_frame(&frame);
     let response = match serde_json::from_slice::<RequestEnvelope>(&frame) {
@@ -535,14 +557,24 @@ fn handle_client(
                 IpcResponse::Stopping
             }
             IpcRequest::SubscribeEvents { after_event_id } => {
-                return stream_subscription(
+                return match stream_subscription(
                     &mut stream,
                     database_path,
                     stop,
                     coordinator,
                     after_event_id,
                     &envelope.request_id,
-                );
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(_) => write_response_frame(
+                        &mut stream,
+                        &envelope.request_id,
+                        None,
+                        &IpcResponse::Error {
+                            code: IpcErrorCode::Internal,
+                        },
+                    ),
+                };
             }
             request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
@@ -550,7 +582,7 @@ fn handle_client(
             },
         },
         Err(_) => IpcResponse::Error {
-            code: IpcErrorCode::InvalidRequest,
+            code: IpcErrorCode::Validation,
         },
     };
     write_response_frame(&mut stream, &request_id, None, &response)
@@ -616,6 +648,10 @@ fn write_response_frame(
         protocol_version: PROTOCOL_VERSION,
         request_id: request_id.into(),
         event_id,
+        event: match response {
+            IpcResponse::Event(event) => Some(IpcEventPayload::from(event)),
+            _ => None,
+        },
         result: response.clone(),
     };
     let frame = serde_json::to_vec(&envelope)?;
@@ -626,6 +662,7 @@ fn write_response_frame(
             protocol_version: PROTOCOL_VERSION,
             request_id: request_id.into(),
             event_id: None,
+            event: None,
             result: IpcResponse::ResyncRequired,
         })?
     };
@@ -644,10 +681,56 @@ fn next_request_id() -> String {
 }
 
 fn request_id_from_frame(frame: &[u8]) -> String {
+    request_id_from_json(frame).unwrap_or_else(|| MISSING_REQUEST_ID.into())
+}
+
+fn request_id_from_json(frame: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(frame)
         .ok()
         .and_then(|value| value.get("request_id")?.as_str().map(str::to_owned))
+}
+
+fn request_id_from_prefix(prefix: &[u8]) -> String {
+    request_id_from_json(prefix)
+        .or_else(|| json_string_field(prefix, b"\"request_id\""))
         .unwrap_or_else(|| MISSING_REQUEST_ID.into())
+}
+
+fn json_string_field(frame: &[u8], key: &[u8]) -> Option<String> {
+    for key_start in frame
+        .windows(key.len())
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == key).then_some(index))
+    {
+        let mut value_start = key_start + key.len();
+        while frame.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+            value_start += 1;
+        }
+        if frame.get(value_start) != Some(&b':') {
+            continue;
+        }
+        value_start += 1;
+        while frame.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+            value_start += 1;
+        }
+        if frame.get(value_start) != Some(&b'\"') {
+            continue;
+        }
+        let mut escaped = false;
+        for value_end in value_start + 1..frame.len() {
+            match frame[value_end] {
+                b'\\' if !escaped => escaped = true,
+                b'\"' if !escaped => {
+                    if let Ok(value) = serde_json::from_slice(&frame[value_start..=value_end]) {
+                        return Some(value);
+                    }
+                    break;
+                }
+                _ => escaped = false,
+            }
+        }
+    }
+    None
 }
 
 fn error_response(error: &IpcError) -> IpcResponse {
@@ -671,9 +754,44 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             IpcErrorCode::Validation
         }
-        IpcError::Json(_) => IpcErrorCode::Validation,
-        IpcError::FrameTooLarge => IpcErrorCode::FrameTooLarge,
+        IpcError::Json(_) | IpcError::FrameTooLarge => IpcErrorCode::Validation,
         _ => IpcErrorCode::Internal,
+    }
+}
+
+enum IncomingFrame {
+    Complete(Vec<u8>),
+    TooLarge(Vec<u8>),
+}
+
+/// Retain at most one frame prefix; oversized input is never buffered in full.
+fn read_incoming_frame<R: BufRead>(reader: &mut R) -> Result<Option<IncomingFrame>, IpcError> {
+    let mut prefix = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let remaining = (MAX_FRAME_BYTES + 1).saturating_sub(prefix.len());
+        if remaining == 0 {
+            return Ok(Some(IncomingFrame::TooLarge(prefix)));
+        }
+        match reader.take(remaining as u64).read_until(b'\n', &mut prefix) {
+            Ok(0) if prefix.is_empty() => return Ok(None),
+            Ok(0) => return Ok(Some(IncomingFrame::TooLarge(prefix))),
+            Ok(_) if prefix.ends_with(b"\n") => {
+                prefix.pop();
+                return Ok(Some(IncomingFrame::Complete(prefix)));
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(IpcError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out reading IPC frame",
+                    )));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(IpcError::Io(error)),
+        }
     }
 }
 
@@ -708,7 +826,21 @@ fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
     IpcEvent {
         event_id: event.id,
         task_id: event.task_id.to_string(),
-        kind: format!("{:?}", event.event),
+        kind: runtime_event_name(event.event).into(),
+    }
+}
+
+fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
+    match event {
+        crate::repository::RuntimeEvent::TaskQueued => "task_queued",
+        crate::repository::RuntimeEvent::TaskStarted => "task_started",
+        crate::repository::RuntimeEvent::TaskCancelled => "task_cancelled",
+        crate::repository::RuntimeEvent::TaskPauseRequested => "task_pause_requested",
+        crate::repository::RuntimeEvent::TaskPaused => "task_paused",
+        crate::repository::RuntimeEvent::TaskFailed => "task_failed",
+        crate::repository::RuntimeEvent::TaskRecoveryRequired => "task_recovery_required",
+        crate::repository::RuntimeEvent::MailboxMessageQueued => "mailbox_message_queued",
+        crate::repository::RuntimeEvent::MailboxMessageConsumed => "mailbox_message_consumed",
     }
 }
 
