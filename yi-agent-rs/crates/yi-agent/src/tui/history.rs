@@ -428,6 +428,9 @@ impl HistoryState {
                     "压缩完成（{old_msg_count} → {new_msg_count} 条消息）"
                 ));
             }
+            AgentEvent::ManualCompactFailed { message } => {
+                self.replace_pending_compaction(format!("压缩失败：{message}"));
+            }
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
             | AgentEvent::ToolTimeout { .. }
@@ -1500,6 +1503,30 @@ mod tests {
             &history.cells[0],
             HistoryCell::Separator { label: Some(label) }
                 if label == "压缩完成（12 → 5 条消息）"
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_failure_replaces_pending_status() {
+        let mut history = HistoryState::new();
+        history.push(
+            HistoryCell::Separator {
+                label: Some("正在压缩对话...".into()),
+            },
+            80,
+        );
+
+        history.push_event(
+            AgentEvent::ManualCompactFailed {
+                message: "provider unavailable".into(),
+            },
+            80,
+        );
+
+        assert!(matches!(
+            &history.cells[0],
+            HistoryCell::Separator { label: Some(label) }
+                if label == "压缩失败：provider unavailable"
         ));
     }
 }
