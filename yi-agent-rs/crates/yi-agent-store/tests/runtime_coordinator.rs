@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Timelike, Utc};
 use futures::future::BoxFuture;
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -16,7 +16,9 @@ use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
 };
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
-use yi_agent_store::schedule::{WatchdogLimits, WatchdogUsage};
+use yi_agent_store::schedule::{
+    MissedRunPolicy, ScheduleDefinition, WatchdogLimits, WatchdogUsage,
+};
 
 #[derive(Default)]
 struct RecordingFactory;
@@ -292,9 +294,123 @@ fn coordinator_creates_an_isolated_root_with_its_objective_snapshot() {
         .task_detail(&root)
         .unwrap();
     assert_eq!(detail.session_id, session.to_string());
+    let delivery = serde_json::from_str::<serde_json::Value>(&detail.delivery_json).unwrap();
+    assert_eq!(delivery["objective"], "Produce the scheduled report.");
+    assert!(delivery.get("schedule_policy").is_none());
+}
+
+#[test]
+fn due_schedule_creates_a_new_isolated_root_with_its_objective() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let interactive = coordinator.create_session().unwrap();
+    let definition = ScheduleDefinition::new("* * * * *", "Produce the scheduled report.").unwrap();
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .create_schedule(&definition, Local::now())
+        .unwrap();
+
+    let sessions = coordinator.evaluate_schedules(Local::now()).unwrap();
+
+    assert_eq!(sessions.len(), 1);
+    assert_ne!(sessions[0], interactive);
+    let root = coordinator.root_task_id(&sessions[0]).unwrap();
+    let detail = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_detail(&root)
+        .unwrap();
+    let delivery = serde_json::from_str::<serde_json::Value>(&detail.delivery_json).unwrap();
+    assert_eq!(delivery["objective"], "Produce the scheduled report.");
+    assert_eq!(delivery["schedule_policy"]["runtime"]["max_turns"], 30);
+}
+
+#[test]
+fn active_schedule_instance_skips_a_later_overlapping_occurrence() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let definition = ScheduleDefinition::new("* * * * *", "Produce the scheduled report.").unwrap();
+    let first_due = Local::now();
+    let schedule = RuntimeRepository::open(&database)
+        .unwrap()
+        .create_schedule(&definition, first_due)
+        .unwrap();
+
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&detail.delivery_json).unwrap()["objective"],
-        "Produce the scheduled report."
+        coordinator.evaluate_schedules(Local::now()).unwrap().len(),
+        1
+    );
+    let second_due = Local::now();
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .advance_schedule(&schedule.id, second_due)
+        .unwrap();
+
+    assert!(
+        coordinator
+            .evaluate_schedules(Local::now())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .schedule_occurrence_outcomes(&schedule.id)
+            .unwrap(),
+        vec!["fired", "skipped_overlap"]
+    );
+}
+
+#[test]
+fn offline_default_skips_elapsed_schedule_occurrences() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let now = Local::now()
+        .with_second(0)
+        .and_then(|value| value.with_nanosecond(0))
+        .unwrap();
+    let definition = ScheduleDefinition::new("* * * * *", "Produce the scheduled report.").unwrap();
+    let schedule = RuntimeRepository::open(&database)
+        .unwrap()
+        .create_schedule(&definition, now - ChronoDuration::minutes(3))
+        .unwrap();
+
+    assert!(coordinator.evaluate_schedules(now).unwrap().is_empty());
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .schedule_occurrence_outcomes(&schedule.id)
+            .unwrap(),
+        vec!["missed", "missed", "missed"]
+    );
+}
+
+#[test]
+fn catch_up_once_fires_only_the_latest_elapsed_occurrence() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let now = Local::now()
+        .with_second(0)
+        .and_then(|value| value.with_nanosecond(0))
+        .unwrap();
+    let mut definition =
+        ScheduleDefinition::new("* * * * *", "Produce the scheduled report.").unwrap();
+    definition.policy.missed_run_policy = MissedRunPolicy::CatchUpOnce;
+    let schedule = RuntimeRepository::open(&database)
+        .unwrap()
+        .create_schedule(&definition, now - ChronoDuration::minutes(3))
+        .unwrap();
+
+    assert_eq!(coordinator.evaluate_schedules(now).unwrap().len(), 1);
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .schedule_occurrence_outcomes(&schedule.id)
+            .unwrap(),
+        vec!["missed", "missed", "fired"]
     );
 }
 

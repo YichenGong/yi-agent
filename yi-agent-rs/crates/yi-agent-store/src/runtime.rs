@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use yi_agent_core::ProviderTurnGate;
@@ -24,9 +24,10 @@ use yi_agent_core::subagent::worker::{
 };
 
 use crate::repository::{
-    RepositoryError, RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogTerminal,
+    RepositoryError, RuntimeEvent, RuntimeRepository, ScheduleOccurrenceResult, WatchdogEvidence,
+    WatchdogTerminal,
 };
-use crate::schedule::{WatchdogOutcome, evaluate_watchdog};
+use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
@@ -312,6 +313,97 @@ impl RuntimeCoordinator {
             .root_task_id()
             .clone();
         Ok(root_id)
+    }
+
+    /// Fires all schedules due at `now` into newly isolated root sessions.
+    /// The occurrence claim is durable, so repeated daemon ticks cannot create
+    /// a duplicate root for the same due time.
+    pub fn evaluate_schedules(
+        &self,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Result<Vec<RootSessionId>, RuntimeCoordinatorError> {
+        self.ensure_admitting()?;
+        let due = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .schedules()?
+            .into_iter()
+            .filter(|schedule| schedule.state == "active" && schedule.next_run_at <= now)
+            .collect::<Vec<_>>();
+        let mut sessions = Vec::new();
+        for schedule in due {
+            let current_minute = now
+                .with_second(0)
+                .and_then(|value| value.with_nanosecond(0))
+                .expect("valid local minute");
+            let mut due_at = schedule.next_run_at;
+            let mut missed = Vec::new();
+            while due_at < current_minute {
+                let next = schedule
+                    .definition
+                    .next_run_after(due_at)
+                    .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+                missed.push((due_at, next));
+                due_at = next;
+            }
+            if !missed.is_empty() {
+                if schedule.definition.policy.missed_run_policy == MissedRunPolicy::Skip {
+                    for (missed_at, next) in missed {
+                        self.repository
+                            .lock()
+                            .expect("runtime repository mutex poisoned")
+                            .skip_schedule_occurrence(&schedule.id, missed_at, next, "missed")?;
+                    }
+                    continue;
+                }
+                for (missed_at, next) in missed.iter().take(missed.len().saturating_sub(1)) {
+                    self.repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned")
+                        .skip_schedule_occurrence(&schedule.id, *missed_at, *next, "missed")?;
+                }
+                if let Some((latest, _)) = missed.last() {
+                    due_at = *latest;
+                }
+            }
+            let next_run_at = schedule
+                .definition
+                .next_run_after(due_at)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+            let session = RootSessionId::new();
+            let supervisor = AgentSupervisor::new_with_objective(
+                session.clone(),
+                schedule.definition.objective.clone(),
+            );
+            let root_id = supervisor.root_task_id().clone();
+            let root_attempt = supervisor
+                .task(&root_id)
+                .expect("new root task exists")
+                .active_attempt()
+                .clone();
+            let result = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .evaluate_schedule_occurrence(
+                    &schedule.id,
+                    due_at,
+                    next_run_at,
+                    &session,
+                    &root_id,
+                    &root_attempt.id,
+                    &schedule.definition,
+                )?;
+            if result == ScheduleOccurrenceResult::Fired {
+                self.supervisors
+                    .lock()
+                    .expect("runtime supervisor mutex poisoned")
+                    .insert(session.clone(), Arc::new(AsyncMutex::new(supervisor)));
+                sessions.push(session);
+            }
+        }
+        Ok(sessions)
     }
 
     pub async fn spawn_child(

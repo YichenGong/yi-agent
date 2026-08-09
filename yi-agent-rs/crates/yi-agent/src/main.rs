@@ -2,6 +2,7 @@
 
 mod config;
 mod llm_prefix;
+mod schedule_intent;
 mod subagent_runtime;
 mod tracing_init;
 mod tui;
@@ -12,7 +13,7 @@ use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
 
-use crate::config::{Cli, Command, DaemonAction};
+use crate::config::{Cli, Command, DaemonAction, ScheduleAction};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -41,8 +42,59 @@ fn main() -> Result<()> {
             run_headless(cli, prompt, json, stdin, naked)
         }
         Some(Command::Daemon { action }) => control_daemon(&cli, action),
+        Some(Command::Schedule { ref action }) => control_schedule(&cli, action),
         None => run_agent(cli),
     }
+}
+
+fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
+    let ScheduleAction::Add { request, confirm } = action;
+    let config = config::load(cli)?;
+    let provider: Arc<dyn Provider> = match config.provider.as_str() {
+        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
+            yi_agent_llm::AnthropicProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
+            yi_agent_llm::OpenaiProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        other => anyhow::bail!("unknown provider '{other}': expected 'anthropic' or 'openai'"),
+    };
+    let runtime = tokio::runtime::Runtime::new()?;
+    let preview = runtime.block_on(
+        schedule_intent::ScheduleIntentParser::new(provider, config.model).preview(&request),
+    )?;
+    if !*confirm {
+        println!(
+            "Schedule preview (not saved): {} -> {}\nRun again with --confirm to create it.",
+            preview.definition.cron, preview.definition.objective
+        );
+        return Ok(());
+    }
+    let socket = runtime_directory()?.join("runtime.sock");
+    match yi_agent_store::ipc::send_request(
+        &socket,
+        yi_agent_store::ipc::IpcRequest::CreateSchedule {
+            cron: preview.definition.cron,
+            objective: preview.definition.objective,
+        },
+    )? {
+        yi_agent_store::ipc::IpcResponse::ScheduleCreated { schedule_id } => {
+            println!("schedule created: {schedule_id}")
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            anyhow::bail!("runtime daemon rejected schedule: {code}")
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+    Ok(())
 }
 
 fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {

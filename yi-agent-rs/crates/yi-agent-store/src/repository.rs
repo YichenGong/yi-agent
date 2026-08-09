@@ -12,7 +12,7 @@ use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -142,6 +142,15 @@ pub struct PersistedSchedule {
     pub definition: ScheduleDefinition,
     pub state: String,
     pub next_run_at: DateTime<Local>,
+}
+
+/// Result of evaluating one unique scheduled occurrence in a repository
+/// transaction. A duplicate means a prior daemon tick already owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleOccurrenceResult {
+    Fired,
+    SkippedOverlap,
+    Duplicate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +337,13 @@ impl RuntimeRepository {
             .collect()
     }
 
+    pub fn delete_schedule(&mut self, schedule_id: &str) -> Result<bool, RepositoryError> {
+        let changed = self
+            .connection
+            .execute("DELETE FROM schedules WHERE id = ?1", [schedule_id])?;
+        Ok(changed == 1)
+    }
+
     /// Claims a due occurrence exactly once. A duplicate tick returns false.
     pub fn claim_schedule_occurrence(
         &mut self,
@@ -341,6 +357,194 @@ impl RuntimeRepository {
             params![schedule_id, due_at.to_rfc3339()],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn advance_schedule(
+        &mut self,
+        schedule_id: &str,
+        next_run_at: DateTime<Local>,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "UPDATE schedules SET next_run_at = ?1 WHERE id = ?2",
+            params![next_run_at.to_rfc3339(), schedule_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn schedule_has_active_instance(&self, schedule_id: &str) -> Result<bool, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM schedule_occurrences
+                JOIN tasks ON tasks.root_session_id = schedule_occurrences.root_session_id
+                WHERE schedule_occurrences.schedule_id = ?1
+                  AND tasks.depth = 0
+                  AND tasks.state_json NOT IN (
+                    'completed', 'cancelled', 'failed', 'blocked', 'stalled',
+                    'timed_out', 'budget_exhausted'
+                  )
+            )",
+                [schedule_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(RepositoryError::from)
+    }
+
+    pub fn record_schedule_occurrence_outcome(
+        &mut self,
+        schedule_id: &str,
+        due_at: DateTime<Local>,
+        outcome: &str,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "UPDATE schedule_occurrences SET outcome = ?1
+             WHERE schedule_id = ?2 AND due_at = ?3",
+            params![outcome, schedule_id, due_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn attach_schedule_occurrence_root(
+        &mut self,
+        schedule_id: &str,
+        due_at: DateTime<Local>,
+        root_session_id: &RootSessionId,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "UPDATE schedule_occurrences
+             SET outcome = 'fired', root_session_id = ?1
+             WHERE schedule_id = ?2 AND due_at = ?3",
+            params![
+                root_session_id.to_string(),
+                schedule_id,
+                due_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn schedule_occurrence_outcomes(
+        &self,
+        schedule_id: &str,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT outcome FROM schedule_occurrences
+             WHERE schedule_id = ?1 ORDER BY due_at",
+        )?;
+        statement
+            .query_map([schedule_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RepositoryError::from)
+    }
+
+    /// Atomically records one occurrence and, when admitted, its isolated
+    /// root. A failed root insert rolls the claim back with the transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_schedule_occurrence(
+        &mut self,
+        schedule_id: &str,
+        due_at: DateTime<Local>,
+        next_run_at: DateTime<Local>,
+        root: &RootSessionId,
+        task: &TaskId,
+        attempt: &AttemptId,
+        definition: &ScheduleDefinition,
+    ) -> Result<ScheduleOccurrenceResult, RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        let claimed = transaction.execute(
+            "INSERT INTO schedule_occurrences (schedule_id, due_at, outcome)
+             VALUES (?1, ?2, 'claimed') ON CONFLICT(schedule_id, due_at) DO NOTHING",
+            params![schedule_id, due_at.to_rfc3339()],
+        )?;
+        if claimed == 0 {
+            transaction.commit()?;
+            return Ok(ScheduleOccurrenceResult::Duplicate);
+        }
+        let active_instance = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM schedule_occurrences
+                JOIN tasks ON tasks.root_session_id = schedule_occurrences.root_session_id
+                WHERE schedule_occurrences.schedule_id = ?1 AND tasks.depth = 0
+                  AND tasks.state_json NOT IN (
+                    'completed', 'completed_no_changes', 'cancelled', 'failed', 'blocked',
+                    'stalled', 'timed_out', 'budget_exhausted'
+                  )
+            )",
+            [schedule_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if active_instance {
+            transaction.execute(
+                "UPDATE schedule_occurrences SET outcome = 'skipped_overlap'
+                 WHERE schedule_id = ?1 AND due_at = ?2",
+                params![schedule_id, due_at.to_rfc3339()],
+            )?;
+            transaction.execute(
+                "UPDATE schedules SET next_run_at = ?1 WHERE id = ?2",
+                params![next_run_at.to_rfc3339(), schedule_id],
+            )?;
+            transaction.commit()?;
+            return Ok(ScheduleOccurrenceResult::SkippedOverlap);
+        }
+        let delivery_json = serde_json::to_string(&serde_json::json!({
+            "objective": definition.objective,
+            "schedule_policy": definition.policy,
+        }))?;
+        transaction.execute(
+            "INSERT INTO sessions (id, project_root, state, config_json) VALUES (?1, '', 'active', '{}')",
+            params![root.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
+             VALUES (?1, ?2, NULL, 0, 'queued', 1, ?3, ?4)",
+            params![task.to_string(), root.to_string(), attempt.to_string(), delivery_json],
+        )?;
+        insert_attempt(&transaction, attempt, task, 1, "queued")?;
+        let limits = WatchdogLimits {
+            max_turns: Some(definition.policy.runtime.max_turns),
+            max_wall_time_secs: Some(definition.policy.runtime.max_wall_time_secs),
+            ..WatchdogLimits::default()
+        };
+        transaction.execute(
+            "UPDATE attempt_watchdogs SET limits_json = ?1 WHERE attempt_id = ?2",
+            params![serde_json::to_string(&limits)?, attempt.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE schedule_occurrences SET outcome = 'fired', root_session_id = ?1
+             WHERE schedule_id = ?2 AND due_at = ?3",
+            params![root.to_string(), schedule_id, due_at.to_rfc3339()],
+        )?;
+        transaction.execute(
+            "UPDATE schedules SET next_run_at = ?1 WHERE id = ?2",
+            params![next_run_at.to_rfc3339(), schedule_id],
+        )?;
+        transaction.commit()?;
+        Ok(ScheduleOccurrenceResult::Fired)
+    }
+
+    /// Persists a non-firing occurrence and advances the schedule as one
+    /// transaction, so an offline daemon cannot accumulate duplicate backlog.
+    pub fn skip_schedule_occurrence(
+        &mut self,
+        schedule_id: &str,
+        due_at: DateTime<Local>,
+        next_run_at: DateTime<Local>,
+        outcome: &str,
+    ) -> Result<bool, RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        let claimed = transaction.execute(
+            "INSERT INTO schedule_occurrences (schedule_id, due_at, outcome)
+             VALUES (?1, ?2, ?3) ON CONFLICT(schedule_id, due_at) DO NOTHING",
+            params![schedule_id, due_at.to_rfc3339(), outcome],
+        )?;
+        if claimed != 0 {
+            transaction.execute(
+                "UPDATE schedules SET next_run_at = ?1 WHERE id = ?2",
+                params![next_run_at.to_rfc3339(), schedule_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(claimed != 0)
     }
 
     pub fn has_table(&self, table: &str) -> Result<bool, RepositoryError> {
@@ -2124,8 +2328,15 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         let transaction = connection.unchecked_transaction()?;
         // Schedules formerly referenced one session, but each fire now owns a
         // new root. Rebuild the unused early table without that false link.
-        transaction.execute_batch(
-            "ALTER TABLE schedules RENAME TO schedules_legacy;
+        let schedules_exist = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schedules')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if schedules_exist {
+            transaction.execute_batch(
+                "ALTER TABLE schedules RENAME TO schedules_legacy;
              CREATE TABLE schedules (
                 id TEXT PRIMARY KEY,
                 definition_json TEXT NOT NULL,
@@ -2145,8 +2356,36 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
                 PRIMARY KEY(schedule_id, due_at)
              );
              CREATE INDEX schedule_next_run_idx ON schedules(state, next_run_at);",
-        )?;
+            )?;
+        } else {
+            transaction.execute_batch(
+                "CREATE TABLE schedules (
+                    id TEXT PRIMARY KEY,
+                    definition_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    next_run_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+             CREATE TABLE schedule_occurrences (
+                schedule_id TEXT NOT NULL REFERENCES schedules(id),
+                due_at TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(schedule_id, due_at)
+             );
+             CREATE INDEX schedule_next_run_idx ON schedules(state, next_run_at);",
+            )?;
+        }
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (5)", [])?;
+        transaction.commit()?;
+    }
+    if current_version < 6 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE schedule_occurrences
+             ADD COLUMN root_session_id TEXT REFERENCES sessions(id);",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (6)", [])?;
         transaction.commit()?;
     }
     Ok(())

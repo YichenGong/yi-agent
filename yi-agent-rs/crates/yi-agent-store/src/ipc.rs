@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use chrono::{Local, Timelike};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yi_agent_core::subagent::task::{RootSessionId, TaskId};
@@ -19,6 +20,7 @@ use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHan
 
 use crate::repository::RuntimeRepository;
 use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
+use crate::schedule::ScheduleDefinition;
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -73,6 +75,14 @@ pub enum IpcRequest {
     Status,
     Stop,
     CreateSession,
+    CreateSchedule {
+        cron: String,
+        objective: String,
+    },
+    ListSchedules,
+    DeleteSchedule {
+        schedule_id: String,
+    },
     SpawnChild {
         session_id: String,
         parent_task_id: String,
@@ -151,6 +161,13 @@ pub enum IpcResponse {
         session_id: String,
         root_task_id: String,
     },
+    ScheduleCreated {
+        schedule_id: String,
+    },
+    Schedules {
+        schedules: Vec<IpcSchedule>,
+    },
+    ScheduleDeleted,
     TaskSpawned {
         task_id: String,
     },
@@ -221,6 +238,14 @@ pub struct SubscriptionSnapshot {
 pub struct IpcTask {
     pub task_id: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSchedule {
+    pub schedule_id: String,
+    pub cron: String,
+    pub objective: String,
+    pub next_run_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,8 +388,17 @@ impl Daemon {
                 .enable_all()
                 .build()
                 .expect("daemon reconciliation runtime must initialize");
+            let mut last_schedule_minute = None;
             while !thread_stop.load(Ordering::Acquire) {
                 let _ = runtime.block_on(coordinator.reconcile_worker_events());
+                let now = Local::now();
+                let minute = now
+                    .with_second(0)
+                    .and_then(|value| value.with_nanosecond(0));
+                if minute != last_schedule_minute {
+                    let _ = coordinator.evaluate_schedules(now);
+                    last_schedule_minute = minute;
+                }
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let database_path = database_path.clone();
@@ -1512,6 +1546,39 @@ fn respond(
                 session_id: session_id.to_string(),
                 root_task_id: root_task_id.to_string(),
             })
+        }
+        IpcRequest::CreateSchedule { cron, objective } => {
+            let definition = ScheduleDefinition::new(cron, objective).map_err(|error| {
+                IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+            })?;
+            let next_run_at = definition.next_run_after(Local::now()).map_err(|error| {
+                IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+            })?;
+            let schedule = repository.create_schedule(&definition, next_run_at)?;
+            Ok(IpcResponse::ScheduleCreated {
+                schedule_id: schedule.id,
+            })
+        }
+        IpcRequest::ListSchedules => Ok(IpcResponse::Schedules {
+            schedules: repository
+                .schedules()?
+                .into_iter()
+                .map(|schedule| IpcSchedule {
+                    schedule_id: schedule.id,
+                    cron: schedule.definition.cron,
+                    objective: schedule.definition.objective,
+                    next_run_at: schedule.next_run_at.to_rfc3339(),
+                })
+                .collect(),
+        }),
+        IpcRequest::DeleteSchedule { schedule_id } => {
+            if !repository.delete_schedule(&schedule_id)? {
+                return Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "schedule does not exist",
+                )));
+            }
+            Ok(IpcResponse::ScheduleDeleted)
         }
         IpcRequest::SpawnChild {
             session_id,

@@ -133,6 +133,23 @@ pub enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Preview or confirm a natural-language Cron schedule.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ScheduleAction {
+    /// Ask the configured model for a preview; persistence requires --confirm.
+    Add {
+        /// Natural-language recurrence and objective.
+        request: String,
+        /// Persist the validated preview through the local daemon.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]

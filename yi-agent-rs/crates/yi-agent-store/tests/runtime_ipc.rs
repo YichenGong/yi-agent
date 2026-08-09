@@ -100,7 +100,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 4);
+    assert_eq!(repository.schema_version().unwrap(), 6);
     for table in [
         "sessions",
         "tasks",
@@ -120,6 +120,52 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     ] {
         assert!(repository.has_table(table).unwrap(), "missing {table}");
     }
+}
+
+#[test]
+fn schedule_ipc_validates_creates_lists_and_deletes() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::CreateSchedule {
+                cron: "0 0 0 * * *".into(),
+                objective: "bad cron".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::Validation
+        }
+    ));
+    let IpcResponse::ScheduleCreated { schedule_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::CreateSchedule {
+            cron: "0 9 * * 1-5".into(),
+            objective: "Write the weekly report".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected schedule creation");
+    };
+    let IpcResponse::Schedules { schedules } =
+        send_request(daemon.socket_path(), IpcRequest::ListSchedules).unwrap()
+    else {
+        panic!("expected schedule listing");
+    };
+    assert_eq!(schedules.len(), 1);
+    assert_eq!(schedules[0].objective, "Write the weekly report");
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DeleteSchedule { schedule_id },
+        )
+        .unwrap(),
+        IpcResponse::ScheduleDeleted
+    ));
 }
 
 #[test]
@@ -184,7 +230,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 4);
+    assert_eq!(repository.schema_version().unwrap(), 6);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
