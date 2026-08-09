@@ -162,6 +162,31 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    /// Creates a task and its active attempt in one transaction. Runtime-owned
+    /// tasks use this path so crash recovery never sees an empty attempt ID.
+    pub fn create_task_with_attempt(
+        &mut self,
+        task: &TaskId,
+        root: &RootSessionId,
+        attempt: &AttemptId,
+        attempt_number: u32,
+        state: &str,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO sessions (id, project_root, state, config_json) VALUES (?1, '', 'active', '{}') ON CONFLICT(id) DO NOTHING",
+            params![root.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
+             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, '{}')",
+            params![task.to_string(), root.to_string(), state, attempt.to_string()],
+        )?;
+        insert_attempt(&transaction, attempt, task, attempt_number, state)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn create_child_task(
         &mut self,
         task: &TaskId,
@@ -182,6 +207,34 @@ impl RuntimeRepository {
                 state,
             ],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn create_child_task_with_attempt(
+        &mut self,
+        task: &TaskId,
+        root: &RootSessionId,
+        parent: &TaskId,
+        depth: u8,
+        attempt: &AttemptId,
+        attempt_number: u32,
+        state: &str,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, '{}')",
+            params![
+                task.to_string(),
+                root.to_string(),
+                parent.to_string(),
+                depth,
+                state,
+                attempt.to_string(),
+            ],
+        )?;
+        insert_attempt(&transaction, attempt, task, attempt_number, state)?;
         transaction.commit()?;
         Ok(())
     }
@@ -348,6 +401,66 @@ impl RuntimeRepository {
                 task: task.to_string(),
             });
         }
+        let event_id = append_event(&transaction, task, event)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Keeps the task snapshot, active attempt, and audit event aligned.
+    pub fn transition_task_and_attempt(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        state: &str,
+        event: RuntimeEvent,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3",
+            params![state, task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = ?1 WHERE id = ?2 AND task_id = ?3",
+            params![state, attempt.to_string(), task.to_string()],
+        )?;
+        let event_id = append_event(&transaction, task, event)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Activates a successor attempt while returning the task to the queue.
+    /// The task's active-attempt pointer and attempt row must commit together
+    /// before a worker may receive the new attempt ID.
+    pub fn activate_successor_attempt(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        attempt_number: u32,
+        state: &str,
+        event: RuntimeEvent,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = ?1, active_attempt_id = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3",
+            params![state, attempt.to_string(), task.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        insert_attempt(&transaction, attempt, task, attempt_number, state)?;
         let event_id = append_event(&transaction, task, event)?;
         transaction.commit()?;
         Ok(event_id)
@@ -619,6 +732,21 @@ fn append_event(
         });
     }
     Ok(transaction.last_insert_rowid())
+}
+
+fn insert_attempt(
+    transaction: &Transaction<'_>,
+    attempt: &AttemptId,
+    task: &TaskId,
+    number: u32,
+    state: &str,
+) -> Result<(), RepositoryError> {
+    transaction.execute(
+        "INSERT INTO attempts (id, task_id, number, state, budget_json, usage_json)
+         VALUES (?1, ?2, ?3, ?4, '{}', '{}')",
+        params![attempt.to_string(), task.to_string(), number, state],
+    )?;
+    Ok(())
 }
 
 fn migrate(connection: &Connection) -> Result<(), RepositoryError> {

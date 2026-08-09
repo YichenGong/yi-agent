@@ -393,6 +393,10 @@ impl Daemon {
     /// Stop this manually started daemon and release its local runtime files.
     pub fn stop(&mut self) -> Result<(), IpcError> {
         prepare_coordinator_for_stop(&self.coordinator)?;
+        self.stop_listener()
+    }
+
+    fn stop_listener(&mut self) -> Result<(), IpcError> {
         self.stop.store(true, Ordering::Release);
         // Wake the nonblocking accept loop so shutdown does not wait for its sleep interval.
         let _ = UnixStream::connect(&self.socket_path);
@@ -464,7 +468,10 @@ fn lock_owner_is_alive(lock_path: &Path) -> bool {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.stop();
+        // Destructors can run while Tokio is driving an async test or caller.
+        // Starting a second current-thread runtime here panics, so only an
+        // explicit `stop()` performs the cooperative checkpoint protocol.
+        let _ = self.stop_listener();
     }
 }
 

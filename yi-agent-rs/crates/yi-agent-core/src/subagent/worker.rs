@@ -23,6 +23,9 @@ pub struct WorkerStart {
     pub initial_user_messages: Vec<WorkerMessage>,
     /// Narrow task instruction supplied by the parent supervisor.
     pub objective: String,
+    /// Mandatory controller instruction attached to a fresh recovery attempt.
+    /// A worker must inspect this boundary before replaying any side effect.
+    pub recovery_instruction: Option<String>,
 }
 
 impl WorkerStart {
@@ -35,6 +38,7 @@ impl WorkerStart {
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
             objective: String::new(),
+            recovery_instruction: None,
         }
     }
 
@@ -50,6 +54,11 @@ impl WorkerStart {
 
     pub fn with_initial_user_messages(mut self, messages: Vec<WorkerMessage>) -> Self {
         self.initial_user_messages = messages;
+        self
+    }
+
+    pub fn with_recovery_instruction(mut self, instruction: impl Into<String>) -> Self {
+        self.recovery_instruction = Some(instruction.into());
         self
     }
 }

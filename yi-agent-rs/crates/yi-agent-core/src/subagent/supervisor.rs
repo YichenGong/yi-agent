@@ -66,6 +66,7 @@ pub struct AgentSupervisor {
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
     worker_message_capabilities: HashMap<TaskId, String>,
+    recovery_instructions: HashMap<TaskId, String>,
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
@@ -93,6 +94,7 @@ impl AgentSupervisor {
             mailboxes,
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
+            recovery_instructions: HashMap::new(),
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
             updates,
@@ -204,7 +206,7 @@ impl AgentSupervisor {
             .get(task_id)
             .expect("task mailbox is created with task")
             .pending_user_overrides();
-        let start = WorkerStart::new(
+        let mut start = WorkerStart::new(
             task.id.clone(),
             task.active_attempt_id().clone(),
             task.root_session_id.clone(),
@@ -220,6 +222,9 @@ impl AgentSupervisor {
                 })
                 .collect(),
         );
+        if let Some(instruction) = self.recovery_instructions.get(task_id) {
+            start = start.with_recovery_instruction(instruction.clone());
+        }
         let message_capability = start.message_capability.clone();
         // Admission is visible before the application factory can create any
         // side effects. A factory failure is reduced to a terminal task state.
@@ -233,6 +238,7 @@ impl AgentSupervisor {
         };
         self.worker_message_capabilities
             .insert(task_id.clone(), message_capability);
+        self.recovery_instructions.remove(task_id);
         for (id, _) in initial_user_messages {
             self.mailboxes
                 .get_mut(task_id)
@@ -751,6 +757,23 @@ impl AgentSupervisor {
             .expect("retry creates a successor attempt");
         self.notify_update();
         Ok(next)
+    }
+
+    pub fn resume_recovery_task(
+        &mut self,
+        task_id: &TaskId,
+        instruction: String,
+    ) -> Result<super::task::TaskAttempt, String> {
+        if !matches!(
+            self.task(task_id).map(|task| task.state()),
+            Some(TaskState::RecoveryRequired(_))
+        ) {
+            return Err("recovery resume requires a recovery-required task".into());
+        }
+        let attempt = self.retry_task(task_id)?;
+        self.recovery_instructions
+            .insert(task_id.clone(), instruction);
+        Ok(attempt)
     }
 }
 

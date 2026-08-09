@@ -81,10 +81,21 @@ impl RuntimeCoordinator {
         let session_id = RootSessionId::new();
         let supervisor = AgentSupervisor::new(session_id.clone());
         let root_id = supervisor.root_task_id().clone();
+        let root_attempt = supervisor
+            .task(&root_id)
+            .expect("new root task exists")
+            .active_attempt()
+            .clone();
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .create_task(&root_id, &session_id, "queued")?;
+            .create_task_with_attempt(
+                &root_id,
+                &session_id,
+                &root_attempt.id,
+                root_attempt.number,
+                "queued",
+            )?;
         self.supervisors
             .lock()
             .expect("runtime supervisor mutex poisoned")
@@ -119,7 +130,7 @@ impl RuntimeCoordinator {
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
-        let (child, depth) = {
+        let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(parent.clone(), objective)?;
             let depth = match supervisor
@@ -131,12 +142,25 @@ impl RuntimeCoordinator {
                 yi_agent_core::TaskDepth::Child => 1,
                 yi_agent_core::TaskDepth::Leaf => 2,
             };
-            (child, depth)
+            let attempt = supervisor
+                .task(&child)
+                .expect("newly spawned task exists")
+                .active_attempt()
+                .clone();
+            (child, depth, attempt)
         };
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .create_child_task(&child, session, parent, depth, "queued")?;
+            .create_child_task_with_attempt(
+                &child,
+                session,
+                parent,
+                depth,
+                &attempt.id,
+                attempt.number,
+                "queued",
+            )?;
         Ok(child)
     }
 
@@ -201,11 +225,16 @@ impl RuntimeCoordinator {
                 }
                 RuntimeCoordinatorError::Supervisor(error)
             })?;
+        let attempt = supervisor
+            .task(task)
+            .expect("started worker task exists")
+            .active_attempt_id()
+            .clone();
         if let Err(error) = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .transition_task(task, "running", RuntimeEvent::TaskStarted)
+            .transition_task_and_attempt(task, &attempt, "running", RuntimeEvent::TaskStarted)
         {
             let _ = supervisor.cancel_task_tree(task, false);
             if is_subagent {
@@ -236,8 +265,13 @@ impl RuntimeCoordinator {
                 .repository
                 .lock()
                 .expect("runtime repository mutex poisoned");
-            repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
-            repository.create_attempt(&attempt.id, task, attempt.number, "queued")?;
+            repository.activate_successor_attempt(
+                task,
+                &attempt.id,
+                attempt.number,
+                "queued",
+                RuntimeEvent::TaskQueued,
+            )?;
         }
         if self.factory.is_available() {
             self.start_worker(session, task).await?;
@@ -295,15 +329,40 @@ impl RuntimeCoordinator {
     ) -> Result<(), RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let supervisor = self.supervisor(session)?;
-        supervisor
+        let recovery_attempt = {
+            let mut supervisor = supervisor.lock().await;
+            if matches!(
+                supervisor.task(task).map(|task| task.state()),
+                Some(yi_agent_core::TaskState::RecoveryRequired(_))
+            ) {
+                Some(
+                    supervisor
+                        .resume_recovery_task(task, recovery_inspection_instruction())
+                        .map_err(RuntimeCoordinatorError::Supervisor)?,
+                )
+            } else {
+                supervisor
+                    .resume_task(task)
+                    .map_err(RuntimeCoordinatorError::Supervisor)?;
+                None
+            }
+        };
+        let mut repository = self
+            .repository
             .lock()
-            .await
-            .resume_task(task)
-            .map_err(RuntimeCoordinatorError::Supervisor)?;
-        self.repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
+            .expect("runtime repository mutex poisoned");
+        if let Some(attempt) = recovery_attempt {
+            repository.activate_successor_attempt(
+                task,
+                &attempt.id,
+                attempt.number,
+                "queued",
+                RuntimeEvent::TaskQueued,
+            )?;
+        } else {
+            repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
+        }
+        drop(repository);
         if self.factory.is_available() {
             self.start_worker(session, task).await?;
         }
@@ -419,6 +478,11 @@ impl RuntimeCoordinator {
                     .task(&task_id)
                     .expect("reconciled task exists")
                     .state();
+                let attempt = supervisor
+                    .task(&task_id)
+                    .expect("reconciled task exists")
+                    .active_attempt_id()
+                    .clone();
                 let (state, event) = match state {
                     yi_agent_core::TaskState::Paused(_) => ("paused", RuntimeEvent::TaskPaused),
                     yi_agent_core::TaskState::Cancelled(_) => {
@@ -427,7 +491,7 @@ impl RuntimeCoordinator {
                     yi_agent_core::TaskState::Failed(_) => ("failed", RuntimeEvent::TaskFailed),
                     _ => continue,
                 };
-                updates.push((task_id, state, event));
+                updates.push((task_id, attempt, state, event));
             }
             consumed_overrides.extend(supervisor.pending_user_override_acks().iter().cloned());
         }
@@ -443,11 +507,11 @@ impl RuntimeCoordinator {
                     .confirm_user_override_consumed(task_id, message_id);
             }
         }
-        for (task_id, state, event) in updates {
+        for (task_id, attempt, state, event) in updates {
             self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
-                .transition_task(&task_id, state, event)?;
+                .transition_task_and_attempt(&task_id, &attempt, state, event)?;
             self.resident_tasks
                 .lock()
                 .expect("runtime resident task mutex poisoned")
@@ -548,21 +612,29 @@ impl RuntimeCoordinator {
             .collect::<Vec<_>>();
         let mut interrupted = Vec::new();
         for supervisor in supervisors {
-            interrupted.extend(
-                supervisor
-                    .lock()
-                    .await
-                    .interrupt_unacknowledged_workers()
-                    .map_err(RuntimeCoordinatorError::Supervisor)?,
-            );
+            let mut supervisor = supervisor.lock().await;
+            let tasks = supervisor
+                .interrupt_unacknowledged_workers()
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            for task in tasks {
+                let attempt = supervisor
+                    .task(&task)
+                    .expect("interrupted task is retained by its supervisor")
+                    .active_attempt_id()
+                    .clone();
+                interrupted.push((task, attempt));
+            }
         }
         let mut repository = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned");
-        for task in interrupted {
-            repository.transition_task(
+        for (task, attempt) in interrupted {
+            // The core reducer retains the same active attempt while marking
+            // an interruption, so the durable attempt closes with the task.
+            repository.transition_task_and_attempt(
                 &task,
+                &attempt,
                 "recovery_required",
                 RuntimeEvent::TaskRecoveryRequired,
             )?;
@@ -649,4 +721,8 @@ impl RuntimeCoordinator {
             .cloned()
             .ok_or_else(|| RuntimeCoordinatorError::SessionNotFound(session.clone()))
     }
+}
+
+fn recovery_inspection_instruction() -> String {
+    "Recovery required before changes: inspect the recorded worktree, run git status, identify the latest commit, inspect required tool state, compare the prior checkpoint, and stop with RecoveryConflict if a safe base cannot be proven. Do not replay prior provider, tool, command, or Git actions.".into()
 }

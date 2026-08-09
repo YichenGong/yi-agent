@@ -89,6 +89,38 @@ async fn coordinator_starts_root_worker_and_cancels_its_tree() {
 }
 
 #[tokio::test]
+async fn runtime_persists_initial_attempts_for_root_and_child_workers() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+
+    coordinator.start_worker(&session, &root).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let starts = factory.starts.lock().unwrap();
+    let root_attempt = starts
+        .iter()
+        .find(|start| start.task_id == root)
+        .unwrap()
+        .attempt_id
+        .clone();
+    let child_attempt = starts
+        .iter()
+        .find(|start| start.task_id == child)
+        .unwrap()
+        .attempt_id
+        .clone();
+    drop(starts);
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.attempt_state(&root_attempt).unwrap(), "running");
+    assert_eq!(repository.attempt_state(&child_attempt).unwrap(), "running");
+}
+
+#[tokio::test]
 async fn coordinator_persists_worker_failure_reported_by_the_factory() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
