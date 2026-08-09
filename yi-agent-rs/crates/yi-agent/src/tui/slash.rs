@@ -1,5 +1,7 @@
 //! Slash command definitions and popup state for the TUI.
 
+use crate::control_commands::{CommandSpec, ControlCommand};
+
 /// A slash command the user can invoke from the TUI input.
 ///
 /// Adds metadata (description, arg requirements) needed for the popup UI.
@@ -14,22 +16,60 @@ pub enum SlashCommand {
     Help,
     Agents,
     Agent,
+    Events,
+    Diff,
+    Mailbox,
     Message,
     Pause,
     Resume,
     Cancel,
     Retry,
+    Priority,
     Approve,
+    Deny,
     Review,
     Accept,
     Rework,
+    Reject,
     Budget,
     Daemon,
 }
 
 impl SlashCommand {
+    fn control_spec(self) -> Option<CommandSpec> {
+        let command = match self {
+            Self::Agents => ControlCommand::Agents,
+            Self::Agent => ControlCommand::Agent,
+            Self::Events => ControlCommand::Events,
+            Self::Diff => ControlCommand::Diff,
+            Self::Mailbox => ControlCommand::Mailbox,
+            Self::Message => ControlCommand::Message,
+            Self::Pause => ControlCommand::Pause,
+            Self::Resume => ControlCommand::Resume,
+            Self::Cancel => ControlCommand::Cancel,
+            Self::Retry => ControlCommand::Retry,
+            Self::Priority => ControlCommand::Priority,
+            Self::Approve => ControlCommand::Approve,
+            Self::Deny => ControlCommand::Deny,
+            Self::Review => ControlCommand::Review,
+            Self::Accept => ControlCommand::Accept,
+            Self::Rework => ControlCommand::Rework,
+            Self::Reject => ControlCommand::Reject,
+            Self::Budget => ControlCommand::Budget,
+            Self::Daemon => ControlCommand::Daemon,
+            Self::Help => ControlCommand::Help,
+            Self::Quit | Self::Clear | Self::Model | Self::Cost | Self::Compact | Self::Config => {
+                return None;
+            }
+        };
+        Some(command.spec())
+    }
+
     /// The serialized command name (without the leading `/`).
     pub fn name(&self) -> &'static str {
+        if let Some(spec) = self.control_spec() {
+            return spec.slash_name;
+        }
         match self {
             SlashCommand::Quit => "quit",
             SlashCommand::Clear => "clear",
@@ -40,15 +80,21 @@ impl SlashCommand {
             SlashCommand::Help => "help",
             SlashCommand::Agents => "agents",
             SlashCommand::Agent => "agent",
+            SlashCommand::Events => "events",
+            SlashCommand::Diff => "diff",
+            SlashCommand::Mailbox => "mailbox",
             SlashCommand::Message => "message",
             SlashCommand::Pause => "pause",
             SlashCommand::Resume => "resume",
             SlashCommand::Cancel => "cancel",
             SlashCommand::Retry => "retry",
+            SlashCommand::Priority => "priority",
             SlashCommand::Approve => "approve",
+            SlashCommand::Deny => "deny",
             SlashCommand::Review => "review",
             SlashCommand::Accept => "accept",
             SlashCommand::Rework => "rework",
+            SlashCommand::Reject => "reject",
             SlashCommand::Budget => "budget",
             SlashCommand::Daemon => "daemon",
         }
@@ -56,6 +102,9 @@ impl SlashCommand {
 
     /// Short Chinese description shown in the popup.
     pub fn description(&self) -> &'static str {
+        if let Some(spec) = self.control_spec() {
+            return spec.description;
+        }
         match self {
             SlashCommand::Quit => "退出程序",
             SlashCommand::Clear => "清空对话上下文",
@@ -66,15 +115,21 @@ impl SlashCommand {
             SlashCommand::Help => "显示帮助信息",
             SlashCommand::Agents => "显示 agent 任务树",
             SlashCommand::Agent => "显示单个 agent 详情 (需要任务 ID)",
+            SlashCommand::Events => "查看任务事件 (需要任务 ID)",
+            SlashCommand::Diff => "查看任务 diff (需要任务 ID)",
+            SlashCommand::Mailbox => "查看任务 mailbox (需要任务 ID)",
             SlashCommand::Message => "向相邻 agent 发送消息",
             SlashCommand::Pause => "暂停任务",
             SlashCommand::Resume => "恢复任务",
             SlashCommand::Cancel => "取消任务",
             SlashCommand::Retry => "创建新的重试 attempt",
+            SlashCommand::Priority => "调整任务优先级",
             SlashCommand::Approve => "批准权限请求",
+            SlashCommand::Deny => "拒绝权限请求",
             SlashCommand::Review => "查看 delivery 审查",
             SlashCommand::Accept => "接受并集成子任务 delivery",
             SlashCommand::Rework => "请求子任务返工",
+            SlashCommand::Reject => "拒绝子任务 delivery",
             SlashCommand::Budget => "查看或收窄任务预算",
             SlashCommand::Daemon => "管理本地 runtime daemon",
         }
@@ -82,14 +137,23 @@ impl SlashCommand {
 
     /// Required positional arguments, rendered consistently in help and completion.
     pub fn argument_usage(&self) -> Option<&'static str> {
+        if let Some(spec) = self.control_spec() {
+            return (!spec.usage.is_empty()).then_some(spec.usage);
+        }
         match self {
             SlashCommand::Model => Some("<model-name>"),
             SlashCommand::Agent => Some("<task-id>"),
+            SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
             SlashCommand::Message => Some("<task-id> <text>"),
             SlashCommand::Cancel => Some("<session-id> <task-id> [recursive]"),
             SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => {
                 Some("<session-id> <task-id>")
             }
+            SlashCommand::Priority => Some("<task-id> <level>"),
+            SlashCommand::Approve => Some("<request-id> [once|task]"),
+            SlashCommand::Deny => Some("<request-id>"),
+            SlashCommand::Rework => Some("<task-id> <feedback>"),
+            SlashCommand::Reject => Some("<task-id> <reason>"),
             _ => None,
         }
     }
@@ -111,15 +175,21 @@ impl SlashCommand {
             SlashCommand::Help,
             SlashCommand::Agents,
             SlashCommand::Agent,
+            SlashCommand::Events,
+            SlashCommand::Diff,
+            SlashCommand::Mailbox,
             SlashCommand::Message,
             SlashCommand::Pause,
             SlashCommand::Resume,
             SlashCommand::Cancel,
             SlashCommand::Retry,
+            SlashCommand::Priority,
             SlashCommand::Approve,
+            SlashCommand::Deny,
             SlashCommand::Review,
             SlashCommand::Accept,
             SlashCommand::Rework,
+            SlashCommand::Reject,
             SlashCommand::Budget,
             SlashCommand::Daemon,
         ]
@@ -343,11 +413,10 @@ mod tests {
             SlashCommand::Resume,
             SlashCommand::Retry,
         ] {
-            assert_eq!(command.argument_usage(), Some("<session-id> <task-id>"));
+            assert_eq!(command.argument_usage(), Some("<task-id>"));
             assert!(command.needs_arg());
             assert!(
-                help_text(Some(command.name()))
-                    .contains(&format!("/{} <session-id> <task-id>", command.name()))
+                help_text(Some(command.name())).contains(&format!("/{} <task-id>", command.name()))
             );
         }
     }
@@ -357,7 +426,7 @@ mod tests {
         for (command, usage) in [
             (SlashCommand::Agent, "<task-id>"),
             (SlashCommand::Message, "<task-id> <text>"),
-            (SlashCommand::Cancel, "<session-id> <task-id> [recursive]"),
+            (SlashCommand::Cancel, "<task-id> [--recursive]"),
             (SlashCommand::Model, "<model-name>"),
         ] {
             assert_eq!(command.argument_usage(), Some(usage));

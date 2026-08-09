@@ -133,6 +133,20 @@ pub enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// List daemon-owned agent tasks.
+    Agents {
+        /// Limit to a project path when the daemon supports project filtering.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Include terminal tasks.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Inspect or control one daemon-owned agent task.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
     /// Preview or confirm a natural-language Cron schedule.
     Schedule {
         #[command(subcommand)]
@@ -149,6 +163,76 @@ pub enum ScheduleAction {
         /// Persist the validated preview through the local daemon.
         #[arg(long)]
         confirm: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, PartialEq, Eq)]
+pub enum AgentAction {
+    Show {
+        task_id: String,
+    },
+    Events {
+        task_id: String,
+        #[arg(long)]
+        follow: bool,
+    },
+    Diff {
+        task_id: String,
+    },
+    Mailbox {
+        task_id: String,
+    },
+    Message {
+        task_id: String,
+        text: String,
+        #[arg(long)]
+        trigger: bool,
+    },
+    Pause {
+        task_id: String,
+    },
+    Resume {
+        task_id: String,
+    },
+    Cancel {
+        task_id: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    Retry {
+        task_id: String,
+    },
+    Priority {
+        task_id: String,
+        level: String,
+    },
+    Budget {
+        task_id: String,
+        #[arg(long)]
+        turns: Option<u32>,
+        #[arg(long)]
+        tokens: Option<u64>,
+        #[arg(long)]
+        deadline: Option<u64>,
+    },
+    Accept {
+        task_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Rework {
+        task_id: String,
+        feedback: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Reject {
+        task_id: String,
+        reason: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1319,5 +1403,37 @@ mod tests {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
         assert!(!cli.debug);
+    }
+
+    #[test]
+    fn cli_parses_documented_agent_control_grammar() {
+        use clap::Parser;
+
+        let agents = Cli::parse_from(["yi-agent", "agents", "--all"]);
+        assert!(matches!(
+            agents.command,
+            Some(Command::Agents { all: true, .. })
+        ));
+
+        let cancel = Cli::parse_from([
+            "yi-agent",
+            "agent",
+            "cancel",
+            "task-123",
+            "--recursive",
+            "--yes",
+        ]);
+        assert!(matches!(
+            cancel.command,
+            Some(Command::Agent { action: AgentAction::Cancel { task_id, recursive: true, yes: true } })
+                if task_id == "task-123"
+        ));
+
+        let rework = Cli::parse_from(["yi-agent", "agent", "rework", "task-123", "tighten tests"]);
+        assert!(matches!(
+            rework.command,
+            Some(Command::Agent { action: AgentAction::Rework { task_id, feedback, .. } })
+                if task_id == "task-123" && feedback == "tighten tests"
+        ));
     }
 }

@@ -1113,10 +1113,16 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Approve
+        | SlashCommand::Deny
         | SlashCommand::Review
         | SlashCommand::Accept
         | SlashCommand::Rework
+        | SlashCommand::Reject
         | SlashCommand::Budget
+        | SlashCommand::Priority
+        | SlashCommand::Events
+        | SlashCommand::Diff
+        | SlashCommand::Mailbox
         | SlashCommand::Daemon => {
             history.push(
                 HistoryCell::Separator {
@@ -1131,7 +1137,7 @@ fn execute_slash_command(
         }
         SlashCommand::Pause => {
             let label = match parse_pause_resume_args(args.as_deref(), "pause") {
-                Ok((session_id, task_id)) => match daemon_pause(session_id, task_id) {
+                Ok(task_id) => match daemon_pause(task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法暂停任务: {error}"),
                 },
@@ -1142,7 +1148,7 @@ fn execute_slash_command(
         }
         SlashCommand::Resume => {
             let label = match parse_pause_resume_args(args.as_deref(), "resume") {
-                Ok((session_id, task_id)) => match daemon_resume(session_id, task_id) {
+                Ok(task_id) => match daemon_resume(task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法恢复任务: {error}"),
                 },
@@ -1153,12 +1159,10 @@ fn execute_slash_command(
         }
         SlashCommand::Cancel => {
             let label = match parse_cancel_args(args.as_deref()) {
-                Ok((session_id, task_id, recursive)) => {
-                    match daemon_cancel(session_id, task_id, recursive) {
-                        Ok(message) => message,
-                        Err(error) => format!("无法取消任务: {error}"),
-                    }
-                }
+                Ok((task_id, recursive)) => match daemon_cancel(task_id, recursive) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法取消任务: {error}"),
+                },
                 Err(error) => error,
             };
             history.push(HistoryCell::Separator { label: Some(label) }, width);
@@ -1166,7 +1170,7 @@ fn execute_slash_command(
         }
         SlashCommand::Retry => {
             let label = match parse_retry_args(args.as_deref()) {
-                Ok((session_id, task_id)) => match daemon_retry(session_id, task_id) {
+                Ok(task_id) => match daemon_retry(task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法重试任务: {error}"),
                 },
@@ -1227,45 +1231,42 @@ fn daemon_agent_detail_at(socket: &std::path::Path, task_id: &str) -> Result<Str
     ))
 }
 
-fn parse_cancel_args(args: Option<&str>) -> Result<(&str, &str, bool), String> {
+fn parse_cancel_args(args: Option<&str>) -> Result<(&str, bool), String> {
     let Some(args) = args else {
-        return Err("用法: /cancel <session-id> <task-id> [recursive]".into());
+        return Err("用法: /cancel <task-id> [--recursive]".into());
     };
     let mut parts = args.split_whitespace();
-    let (Some(session_id), Some(task_id)) = (parts.next(), parts.next()) else {
-        return Err("用法: /cancel <session-id> <task-id> [recursive]".into());
+    let Some(task_id) = parts.next() else {
+        return Err("用法: /cancel <task-id> [--recursive]".into());
     };
     let recursive = match parts.next() {
         None => false,
-        Some("recursive") => true,
-        Some(_) => return Err("第三个参数只能是 recursive".into()),
+        Some("--recursive") => true,
+        Some(_) => return Err("第二个参数只能是 --recursive".into()),
     };
     if parts.next().is_some() {
-        return Err("用法: /cancel <session-id> <task-id> [recursive]".into());
+        return Err("用法: /cancel <task-id> [--recursive]".into());
     }
-    Ok((session_id, task_id, recursive))
+    Ok((task_id, recursive))
 }
 
-fn parse_retry_args(args: Option<&str>) -> Result<(&str, &str), String> {
+fn parse_retry_args(args: Option<&str>) -> Result<&str, String> {
     parse_pause_resume_args(args, "retry")
 }
 
-fn parse_pause_resume_args<'a>(
-    args: Option<&'a str>,
-    command: &str,
-) -> Result<(&'a str, &'a str), String> {
-    let usage = || format!("用法: /{command} <session-id> <task-id>");
+fn parse_pause_resume_args<'a>(args: Option<&'a str>, command: &str) -> Result<&'a str, String> {
+    let usage = || format!("用法: /{command} <task-id>");
     let Some(args) = args else {
         return Err(usage());
     };
     let mut parts = args.split_whitespace();
-    let (Some(session_id), Some(task_id)) = (parts.next(), parts.next()) else {
+    let Some(task_id) = parts.next() else {
         return Err(usage());
     };
     if parts.next().is_some() {
         return Err(usage());
     }
-    Ok((session_id, task_id))
+    Ok(task_id)
 }
 
 fn parse_user_message_args(args: Option<&str>) -> Result<(&str, &str), String> {
@@ -1309,20 +1310,39 @@ fn daemon_user_message_at(
     Ok(format!("已排队用户指令至任务: {task_id}"))
 }
 
-fn daemon_retry(session_id: &str, task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_retry_at(&runtime_dir.join("runtime.sock"), session_id, task_id)
+fn daemon_task_session_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::InspectTask {
+            task_id: task_id.into(),
+        },
+    )
+    .map_err(|error| error.to_string())?
+    {
+        yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => Ok(detail.session_id),
+        yi_agent_store::ipc::IpcResponse::Error { code } => Err(code.to_string()),
+        _ => Err("daemon 返回了非任务详情响应".into()),
+    }
 }
 
-fn daemon_pause(session_id: &str, task_id: &str) -> Result<String, String> {
+fn daemon_retry(task_id: &str) -> Result<String, String> {
     let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
         .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_pause_at(&runtime_dir.join("runtime.sock"), session_id, task_id)
+    let socket = runtime_dir.join("runtime.sock");
+    let session_id = daemon_task_session_at(&socket, task_id)?;
+    daemon_retry_at(&socket, &session_id, task_id)
+}
+
+fn daemon_pause(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    let socket = runtime_dir.join("runtime.sock");
+    let session_id = daemon_task_session_at(&socket, task_id)?;
+    daemon_pause_at(&socket, &session_id, task_id)
 }
 
 fn daemon_pause_at(
@@ -1344,12 +1364,14 @@ fn daemon_pause_at(
     Ok(format!("已请求暂停任务: {task_id}"))
 }
 
-fn daemon_resume(session_id: &str, task_id: &str) -> Result<String, String> {
+fn daemon_resume(task_id: &str) -> Result<String, String> {
     let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
         .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_resume_at(&runtime_dir.join("runtime.sock"), session_id, task_id)
+    let socket = runtime_dir.join("runtime.sock");
+    let session_id = daemon_task_session_at(&socket, task_id)?;
+    daemon_resume_at(&socket, &session_id, task_id)
 }
 
 fn daemon_resume_at(
@@ -1390,17 +1412,14 @@ fn daemon_retry_at(
     Ok(format!("已请求重试任务: {task_id}"))
 }
 
-fn daemon_cancel(session_id: &str, task_id: &str, recursive: bool) -> Result<String, String> {
+fn daemon_cancel(task_id: &str, recursive: bool) -> Result<String, String> {
     let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
         .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_cancel_at(
-        &runtime_dir.join("runtime.sock"),
-        session_id,
-        task_id,
-        recursive,
-    )
+    let socket = runtime_dir.join("runtime.sock");
+    let session_id = daemon_task_session_at(&socket, task_id)?;
+    daemon_cancel_at(&socket, &session_id, task_id, recursive)
 }
 
 fn daemon_cancel_at(
@@ -1907,18 +1926,18 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_resume_controls_require_explicit_session_scope() {
+    fn pause_and_resume_controls_require_a_task_id() {
         assert_eq!(
-            parse_pause_resume_args(Some("session-1 task-1"), "pause").unwrap(),
-            ("session-1", "task-1")
+            parse_pause_resume_args(Some("task-1"), "pause").unwrap(),
+            "task-1"
         );
         assert_eq!(
-            parse_pause_resume_args(Some("session-1"), "pause").unwrap_err(),
-            "用法: /pause <session-id> <task-id>"
+            parse_pause_resume_args(Some("task-1 extra"), "pause").unwrap_err(),
+            "用法: /pause <task-id>"
         );
         assert_eq!(
             parse_pause_resume_args(None, "resume").unwrap_err(),
-            "用法: /resume <session-id> <task-id>"
+            "用法: /resume <task-id>"
         );
     }
 

@@ -1,11 +1,15 @@
 //! yi-agent CLI 入口。
 
 mod config;
+mod control_commands;
 mod llm_prefix;
 mod schedule_intent;
 mod subagent_runtime;
 mod tracing_init;
 mod tui;
+
+#[cfg(test)]
+mod control_commands_tests;
 
 use std::sync::Arc;
 
@@ -13,7 +17,7 @@ use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
 
-use crate::config::{Cli, Command, DaemonAction, ScheduleAction};
+use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -42,8 +46,54 @@ fn main() -> Result<()> {
             run_headless(cli, prompt, json, stdin, naked)
         }
         Some(Command::Daemon { action }) => control_daemon(&cli, action),
+        Some(Command::Agents { project, all }) => control_agents(project, all),
+        Some(Command::Agent { action }) => control_agent(action),
         Some(Command::Schedule { ref action }) => control_schedule(&cli, action),
         None => run_agent(cli),
+    }
+}
+
+fn control_agents(project: Option<std::path::PathBuf>, all: bool) -> Result<()> {
+    if project.is_some() {
+        anyhow::bail!("project filtering is not available from this daemon version")
+    }
+    let socket = runtime_directory()?.join("runtime.sock");
+    let mut subscription = yi_agent_store::ipc::subscribe(&socket, 0).map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })?;
+    let yi_agent_store::ipc::IpcResponse::Subscription(snapshot) = subscription.next_response()?
+    else {
+        anyhow::bail!("runtime daemon returned an invalid task snapshot")
+    };
+    for task in snapshot
+        .tasks
+        .into_iter()
+        .filter(|task| all || !matches!(task.state.as_str(), "completed" | "cancelled" | "failed"))
+    {
+        println!("{} {}", task.task_id, task.state);
+    }
+    Ok(())
+}
+
+fn control_agent(action: AgentAction) -> Result<()> {
+    let socket = runtime_directory()?.join("runtime.sock");
+    let request = match action {
+        AgentAction::Show { task_id } => yi_agent_store::ipc::IpcRequest::InspectTask { task_id },
+        other => {
+            anyhow::bail!("agent control `{other:?}` is not yet supported by this daemon version")
+        }
+    };
+    match yi_agent_store::ipc::send_request(&socket, request).map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })? {
+        yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => {
+            println!("{} {}", detail.task_id, detail.state);
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            anyhow::bail!("runtime daemon rejected request: {code}")
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
     }
 }
 
