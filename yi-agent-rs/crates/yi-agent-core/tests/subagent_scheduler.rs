@@ -184,6 +184,49 @@ fn outstanding_root_permits_softly_penalize_its_next_request() {
 }
 
 #[test]
+fn recent_grants_penalty_counts_permit_units() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 3);
+    let root_a = RootSessionId::new();
+    let root_b = RootSessionId::new();
+    let now = Utc::now();
+
+    coordinator.enqueue_with_priority_at(
+        root_a.clone(),
+        TaskId::new(),
+        shared_request("resident:global", 2),
+        AdmissionPriority::Normal,
+        now,
+    );
+    let held = coordinator.grant_next_at("resident:global", now).unwrap();
+    let a_waiting = TaskId::new();
+    let b_waiting = TaskId::new();
+    coordinator.enqueue_with_priority_at(
+        root_a,
+        a_waiting,
+        shared_request("resident:global", 1),
+        AdmissionPriority::Normal,
+        now,
+    );
+    coordinator.enqueue_with_priority_at(
+        root_b,
+        b_waiting.clone(),
+        shared_request("resident:global", 1),
+        AdmissionPriority::Background,
+        now - Duration::seconds(240),
+    );
+
+    assert_eq!(
+        coordinator
+            .grant_next_at("resident:global", now)
+            .unwrap()
+            .task_id,
+        b_waiting
+    );
+    coordinator.release(held.lease_id).unwrap();
+}
+
+#[test]
 fn same_parent_requests_preserve_fifo_sequence_order() {
     let mut coordinator = ResourceCoordinator::new();
     coordinator.set_capacity("resident:global", 1);

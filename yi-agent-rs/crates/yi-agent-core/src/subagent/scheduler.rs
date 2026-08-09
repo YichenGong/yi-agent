@@ -245,7 +245,7 @@ impl ResourceCoordinator {
             .values()
             .filter(|lease| lease.request.key == key)
             .fold(HashMap::new(), |mut grants, lease| {
-                *grants.entry(lease.root_id.clone()).or_insert(0_u16) += 1;
+                *grants.entry(lease.root_id.clone()).or_insert(0_u16) += lease.request.units;
                 grants
             });
         let queue = self.queues.get_mut(key)?;
