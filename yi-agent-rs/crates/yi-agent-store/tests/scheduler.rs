@@ -43,6 +43,47 @@ fn toml_policy_layers_can_only_narrow_the_user_ceiling() {
 }
 
 #[test]
+fn effective_policy_narrows_resource_and_retry_limits() {
+    let user = RuntimePolicyLayer::from_toml(
+        r#"
+            [resources]
+            max_llm_requests_per_provider_key = 8
+            reserved_coordination_llm_requests = 1
+            max_coding_agents = 6
+            max_host_build_jobs = 2
+            [attempt_defaults]
+            max_provider_retries = 3
+            max_tool_retries = 2
+            max_rework_cycles = 2
+        "#,
+    )
+    .unwrap();
+    let project = RuntimePolicyLayer::from_toml(
+        r#"
+            [resources]
+            max_llm_requests_per_provider_key = 5
+            reserved_coordination_llm_requests = 2
+            max_coding_agents = 4
+            max_host_build_jobs = 1
+            [attempt_defaults]
+            max_provider_retries = 1
+            max_tool_retries = 3
+            max_rework_cycles = 1
+        "#,
+    )
+    .unwrap();
+
+    let effective = user.effective_with(&project);
+    assert_eq!(effective.max_llm_requests_per_provider_key, 5);
+    assert_eq!(effective.reserved_coordination_llm_requests, 1);
+    assert_eq!(effective.max_coding_agents, 4);
+    assert_eq!(effective.max_host_build_jobs, 1);
+    assert_eq!(effective.max_provider_retries, 1);
+    assert_eq!(effective.max_tool_retries, 2);
+    assert_eq!(effective.max_rework_cycles, 1);
+}
+
+#[test]
 fn effective_policy_only_narrows_numeric_limits_and_capabilities() {
     let user = RuntimePolicy {
         max_resident_subagents: 16,

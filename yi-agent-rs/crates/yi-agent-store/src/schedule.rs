@@ -9,6 +9,8 @@ pub struct RuntimePolicyLayer {
     #[serde(default)]
     runtime: RuntimeLimitsLayer,
     #[serde(default)]
+    resources: ResourceLimitsLayer,
+    #[serde(default)]
     attempt_defaults: AttemptLimitsLayer,
 }
 
@@ -23,10 +25,21 @@ struct RuntimeLimitsLayer {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+struct ResourceLimitsLayer {
+    max_llm_requests_per_provider_key: Option<u16>,
+    reserved_coordination_llm_requests: Option<u16>,
+    max_coding_agents: Option<u16>,
+    max_host_build_jobs: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 struct AttemptLimitsLayer {
     max_turns: Option<u32>,
     max_wall_time_secs: Option<u64>,
     max_idle_time_secs: Option<u64>,
+    max_provider_retries: Option<u16>,
+    max_tool_retries: Option<u16>,
+    max_rework_cycles: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +51,13 @@ pub struct EffectiveRuntimePolicy {
     pub max_turns: u32,
     pub max_wall_time_secs: u64,
     pub max_idle_time_secs: u64,
+    pub max_llm_requests_per_provider_key: u16,
+    pub reserved_coordination_llm_requests: u16,
+    pub max_coding_agents: u16,
+    pub max_host_build_jobs: u16,
+    pub max_provider_retries: u16,
+    pub max_tool_retries: u16,
+    pub max_rework_cycles: u16,
     pub read_only: bool,
     pub allow_coding: bool,
 }
@@ -56,9 +76,21 @@ impl RuntimePolicyLayer {
             max_turns: 100,
             max_wall_time_secs: 2700,
             max_idle_time_secs: 300,
+            max_llm_requests_per_provider_key: 8,
+            reserved_coordination_llm_requests: 1,
+            max_coding_agents: 6,
+            max_host_build_jobs: 2,
+            max_provider_retries: 3,
+            max_tool_retries: 2,
+            max_rework_cycles: 2,
             read_only: false,
             allow_coding: true,
         };
+        let max_llm_requests_per_provider_key = narrow(
+            defaults.max_llm_requests_per_provider_key,
+            self.resources.max_llm_requests_per_provider_key,
+            narrower.resources.max_llm_requests_per_provider_key,
+        );
         EffectiveRuntimePolicy {
             max_resident_subagents: narrow(
                 defaults.max_resident_subagents,
@@ -94,6 +126,38 @@ impl RuntimePolicyLayer {
                 defaults.max_idle_time_secs,
                 self.attempt_defaults.max_idle_time_secs,
                 narrower.attempt_defaults.max_idle_time_secs,
+            ),
+            max_llm_requests_per_provider_key,
+            reserved_coordination_llm_requests: narrow(
+                defaults.reserved_coordination_llm_requests,
+                self.resources.reserved_coordination_llm_requests,
+                narrower.resources.reserved_coordination_llm_requests,
+            )
+            .min(max_llm_requests_per_provider_key),
+            max_coding_agents: narrow(
+                defaults.max_coding_agents,
+                self.resources.max_coding_agents,
+                narrower.resources.max_coding_agents,
+            ),
+            max_host_build_jobs: narrow(
+                defaults.max_host_build_jobs,
+                self.resources.max_host_build_jobs,
+                narrower.resources.max_host_build_jobs,
+            ),
+            max_provider_retries: narrow(
+                defaults.max_provider_retries,
+                self.attempt_defaults.max_provider_retries,
+                narrower.attempt_defaults.max_provider_retries,
+            ),
+            max_tool_retries: narrow(
+                defaults.max_tool_retries,
+                self.attempt_defaults.max_tool_retries,
+                narrower.attempt_defaults.max_tool_retries,
+            ),
+            max_rework_cycles: narrow(
+                defaults.max_rework_cycles,
+                self.attempt_defaults.max_rework_cycles,
+                narrower.attempt_defaults.max_rework_cycles,
             ),
             read_only: self.runtime.read_only.unwrap_or(defaults.read_only)
                 || narrower.runtime.read_only.unwrap_or(false),
