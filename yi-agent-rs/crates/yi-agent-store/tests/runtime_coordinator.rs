@@ -281,6 +281,82 @@ async fn coordinator_starts_root_worker_and_cancels_its_tree() {
     assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
 }
 
+#[tokio::test]
+async fn child_workspace_lease_identity_reaches_worker_and_durable_task() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let start = factory.starts.lock().unwrap()[0].clone();
+    let workspace = start
+        .workspace_lease_id
+        .expect("coding child receives a workspace lease identity");
+    let persisted: String = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT workspace_lease_id FROM tasks WHERE id = ?1",
+            [child.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, format!("workspace:{workspace}"));
+}
+
+#[tokio::test]
+async fn coordinator_persists_worker_delivery_and_notifies_direct_parent() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let parent = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0]
+        .workspace_lease_id
+        .clone()
+        .unwrap();
+    let delivery = yi_agent_core::subagent::task::DeliveryReport::coding(
+        "deadbeef",
+        "main",
+        workspace,
+        "cargo test -p child",
+    );
+
+    factory.handles.lock().unwrap()[0].report_delivery(delivery.clone());
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.task_state(&child).unwrap(),
+        "awaiting_parent_review"
+    );
+    let mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
+    assert_eq!(mailbox.len(), 1);
+    assert!(mailbox[0].payload_json.contains(&delivery.id.to_string()));
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(50),
+        coordinator.wait_for_children(
+            &session,
+            &parent,
+            yi_agent_core::subagent::supervisor::WaitMode::All,
+        ),
+    )
+    .await
+    .expect("delivery wakes the direct parent")
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention
+    ));
+}
+
 #[test]
 fn coordinator_creates_an_isolated_root_with_its_objective_snapshot() {
     let directory = TempDir::new().unwrap();

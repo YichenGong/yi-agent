@@ -642,7 +642,15 @@ impl RuntimeCoordinator {
                 }
             }
         }
-        let recovery_context = self.factory.recovery_context();
+        let mut recovery_context = self.factory.recovery_context();
+        if let Some(workspace) = supervisor
+            .task(task)
+            .expect("worker task exists")
+            .workspace
+            .as_ref()
+        {
+            recovery_context.workspace_lease_id = Some(format!("workspace:{workspace}"));
+        }
         let admission = {
             self.repository
                 .lock()
@@ -1161,6 +1169,7 @@ impl RuntimeCoordinator {
             .cloned()
             .collect::<Vec<_>>();
         let mut updates = Vec::new();
+        let mut deliveries = Vec::new();
         let mut consumed_overrides = Vec::new();
         let mut watchdog_updates = Vec::new();
         for supervisor in &supervisors {
@@ -1170,15 +1179,18 @@ impl RuntimeCoordinator {
                 .reconcile_worker_events()
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             for task_id in changed {
-                let state = supervisor
-                    .task(&task_id)
-                    .expect("reconciled task exists")
-                    .state();
-                let attempt = supervisor
-                    .task(&task_id)
-                    .expect("reconciled task exists")
-                    .active_attempt_id()
-                    .clone();
+                let task = supervisor.task(&task_id).expect("reconciled task exists");
+                let state = task.state();
+                let attempt = task.active_attempt_id().clone();
+                if matches!(state, yi_agent_core::TaskState::AwaitingParentReview(_)) {
+                    let delivery = task
+                        .active_attempt()
+                        .delivery
+                        .clone()
+                        .expect("review wait retains its delivery report");
+                    deliveries.push((task_id, attempt, delivery));
+                    continue;
+                }
                 let (state, event, terminal_json) = match state {
                     yi_agent_core::TaskState::Paused(_) => {
                         ("paused", RuntimeEvent::TaskPaused, None)
@@ -1241,6 +1253,13 @@ impl RuntimeCoordinator {
                     .await
                     .confirm_user_override_consumed(task_id, message_id);
             }
+        }
+        for (task_id, attempt, delivery) in deliveries {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .record_delivery_for_review(&task_id, &attempt, &delivery)?;
+            self.release_resident_lease(&task_id);
         }
         for (task_id, attempt, state, event, terminal_json) in updates {
             let mut repository = self

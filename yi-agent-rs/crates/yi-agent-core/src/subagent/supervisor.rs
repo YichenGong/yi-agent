@@ -13,7 +13,7 @@ use super::scheduler::AdmissionPriority;
 use super::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, PauseReason, PermissionDecision,
     PermissionRequestId, RecoveryEvidence, RootSessionId, TaskEvent, TaskFailure, TaskId,
-    TaskState, TimeoutKind, WatchdogEvidence,
+    TaskState, TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::worker::{
     AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
@@ -446,17 +446,33 @@ impl AgentSupervisor {
             match event {
                 WorkerEvent::MessageConsumed { .. } => unreachable!("handled before task state"),
                 WorkerEvent::Delivered(delivery) => {
-                    let task = self
-                        .tasks
-                        .get_mut(&task_id)
-                        .expect("worker task was checked above");
-                    let attempt_id = task.active_attempt_id().clone();
-                    task.reduce(
-                        TaskEvent::WorkerDelivered {
-                            attempt_id,
-                            delivery,
-                        },
-                        chrono::Utc::now(),
+                    let (attempt_id, parent_id) = {
+                        let task = self
+                            .tasks
+                            .get_mut(&task_id)
+                            .expect("worker task was checked above");
+                        let attempt_id = task.active_attempt_id().clone();
+                        let parent_id = task.parent_id.clone().ok_or_else(|| {
+                            "root tasks cannot submit parent delivery".to_string()
+                        })?;
+                        task.reduce(
+                            TaskEvent::WorkerDelivered {
+                                attempt_id: attempt_id.clone(),
+                                delivery: delivery.clone(),
+                            },
+                            chrono::Utc::now(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        (attempt_id, parent_id)
+                    };
+                    self.send_message(
+                        &task_id,
+                        MailboxMessageDraft::new(
+                            task_id.clone(),
+                            parent_id,
+                            MessageKind::Completed(delivery),
+                            Some(attempt_id),
+                        ),
                     )
                     .map_err(|error| error.to_string())?;
                 }
@@ -499,7 +515,11 @@ impl AgentSupervisor {
                 }
             }
             if self.tasks.get(&task_id).is_some_and(|task| {
-                task.state().is_terminal() || matches!(task.state(), TaskState::Paused(_))
+                task.state().is_terminal()
+                    || matches!(
+                        task.state(),
+                        TaskState::Paused(_) | TaskState::AwaitingParentReview(_)
+                    )
             }) {
                 self.workers.remove(&task_id);
                 self.worker_message_capabilities.remove(&task_id);
@@ -696,7 +716,8 @@ impl AgentSupervisor {
             return Err(SpawnError::DirectChildLimitReached);
         }
 
-        let mut child = AgentTask::new_child(parent.root_session_id.clone(), parent_id.clone());
+        let mut child = AgentTask::new_child(parent.root_session_id.clone(), parent_id.clone())
+            .with_workspace(WorkspaceLeaseId::new());
         child.depth = child_depth;
         let child_id = child.id.clone();
         self.tasks.insert(child_id.clone(), child);
