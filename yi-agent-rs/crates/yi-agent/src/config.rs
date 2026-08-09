@@ -332,6 +332,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
                     "invalid YI_AGENT_SANDBOX: expected read-only, workspace-write, or danger-full-access"
                 )
             })?,
+            Err(_) if cli.yolo => yi_agent_tools::SandboxMode::DangerFullAccess,
             Err(_) => yi_agent_tools::SandboxMode::default(),
         },
     };
@@ -1184,34 +1185,8 @@ mod tests {
         assert!(cli.skip_permissions);
     }
 
-    #[test]
-    fn load_yolo_from_cli_flag() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            yolo: true,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert!(config.yolo);
-    }
-
-    #[test]
-    fn load_yolo_from_skip_permissions_flag() {
-        let cli = Cli {
+    fn test_cli() -> Cli {
+        Cli {
             command: None,
             provider: None,
             api_url: None,
@@ -1226,12 +1201,80 @@ mod tests {
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
-            skip_permissions: true,
+            skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
-        };
+        }
+    }
+
+    #[test]
+    fn load_yolo_from_cli_flag() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
+        env.remove("YI_AGENT_SANDBOX");
+        let mut cli = test_cli();
+        cli.yolo = true;
         let config = load(&cli).unwrap();
         assert!(config.yolo);
+        assert_eq!(
+            config.sandbox,
+            yi_agent_tools::SandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn explicit_cli_sandbox_overrides_yolo() {
+        let mut cli = test_cli();
+        cli.yolo = true;
+        cli.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
+        assert_eq!(
+            load(&cli).unwrap().sandbox,
+            yi_agent_tools::SandboxMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn environment_sandbox_overrides_yolo() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
+        env.set("YI_AGENT_SANDBOX", "read-only");
+        let mut cli = test_cli();
+        cli.yolo = true;
+        assert_eq!(
+            load(&cli).unwrap().sandbox,
+            yi_agent_tools::SandboxMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn skip_permissions_keeps_default_sandbox() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
+        env.remove("YI_AGENT_SANDBOX");
+        let mut cli = test_cli();
+        cli.skip_permissions = true;
+        let config = load(&cli).unwrap();
+        assert!(config.yolo);
+        assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
+    }
+
+    #[test]
+    fn yolo_environment_variable_keeps_default_sandbox() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_YOLO", "YI_AGENT_SANDBOX"]);
+        env.set("YI_AGENT_YOLO", "true");
+        env.remove("YI_AGENT_SANDBOX");
+        let config = load(&test_cli()).unwrap();
+        assert!(config.yolo);
+        assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
     }
 
     #[test]
