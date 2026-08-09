@@ -798,7 +798,9 @@ impl PendingSubscriptionFrames {
     ) -> Result<SubscriptionFrameWrite, IpcError> {
         if frame.written == 0 {
             let state = self.state.lock().unwrap();
-            if frame.is_event && state.close_reason == SubscriptionQueueClose::Overflowed {
+            if state.close_reason == SubscriptionQueueClose::ProducerClosed
+                || (frame.is_event && state.close_reason == SubscriptionQueueClose::Overflowed)
+            {
                 return Ok(SubscriptionFrameWrite::Dropped);
             }
             return writer
@@ -1154,6 +1156,22 @@ mod subscription_queue_tests {
             SubscriptionFrameWrite::Dropped
         );
         assert!(writer.bytes.is_empty());
+    }
+
+    #[test]
+    fn producer_close_drops_a_frame_that_has_not_started_writing() {
+        let queue = PendingSubscriptionFrames::new("closing-client", 1);
+        assert!(queue.push_event(event(1)));
+        let envelope = queue.pop_wait().unwrap();
+        let frame = PendingFrameWrite::new(&envelope).unwrap();
+        queue.close();
+
+        let mut writer = Vec::new();
+        assert_eq!(
+            queue.write_frame_chunk(&mut writer, &frame).unwrap(),
+            SubscriptionFrameWrite::Dropped
+        );
+        assert!(writer.is_empty());
     }
 
     fn set_send_buffer(stream: &UnixStream, bytes: libc::c_int) {
