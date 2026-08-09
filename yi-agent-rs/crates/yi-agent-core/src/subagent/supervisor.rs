@@ -1110,7 +1110,9 @@ struct SendMessageTool {
     tools: SupervisorTools,
 }
 
+// This focused test intentionally sits beside the provider-turn routing API.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod provider_turn_priority_tests {
     use super::*;
     use crate::subagent::mailbox::ReworkInstruction;

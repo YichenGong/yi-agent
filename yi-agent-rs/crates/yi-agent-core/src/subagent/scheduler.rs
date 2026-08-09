@@ -430,6 +430,9 @@ struct FairSelection {
     index: usize,
 }
 
+// The values are the independent fairness inputs; grouping them would obscure
+// which admission invariant each score calculation consumes.
+#[allow(clippy::too_many_arguments)]
 fn select_fair_request(
     queue: &VecDeque<QueuedRequest>,
     last_root: Option<&RootSessionId>,
@@ -525,13 +528,9 @@ fn parent_score(
         .max()
 }
 
-fn rotate_after<T: PartialEq>(
-    entries: &[T],
-    cursor: Option<&T>,
-    eligible: impl Fn(&T) -> bool,
-) -> Option<T>
+fn rotate_after<T>(entries: &[T], cursor: Option<&T>, eligible: impl Fn(&T) -> bool) -> Option<T>
 where
-    T: Clone,
+    T: Clone + PartialEq,
 {
     let start = cursor
         .and_then(|last| {
