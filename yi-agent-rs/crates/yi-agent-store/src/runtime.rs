@@ -677,9 +677,14 @@ impl RuntimeCoordinator {
         match terminal {
             WatchdogTerminal::Stalled => supervisor.stall_task(
                 task,
-                CoreWatchdogEvidence(
-                    serde_json::to_string(&evidence).expect("watchdog evidence is serializable"),
-                ),
+                CoreWatchdogEvidence {
+                    last_meaningful_event_id: evidence.last_meaningful_event_id,
+                    last_meaningful_at: evidence.last_meaningful_at,
+                    elapsed_secs: evidence.elapsed_secs,
+                    current_wait: evidence.current_wait.as_ref().map(|wait| {
+                        yi_agent_core::subagent::task::ResourceWait(wait.resource_key.clone())
+                    }),
+                },
             ),
             WatchdogTerminal::TimedOut(kind) => supervisor.timeout_task(task, kind),
             WatchdogTerminal::BudgetExhausted(kind) => supervisor.exhaust_task_budget(task, kind),

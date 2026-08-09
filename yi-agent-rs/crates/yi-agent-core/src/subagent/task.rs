@@ -100,8 +100,15 @@ pub struct PauseReason(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockReason(pub String);
 
+/// Core's immutable record of the last progress point used for a watchdog
+/// decision. Runtime storage adds the queue timestamp for resource waits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WatchdogEvidence(pub String);
+pub struct WatchdogEvidence {
+    pub last_meaningful_event_id: Option<i64>,
+    pub last_meaningful_at: DateTime<Utc>,
+    pub elapsed_secs: u64,
+    pub current_wait: Option<ResourceWait>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeoutKind {
@@ -1478,5 +1485,36 @@ mod tests {
             task.state(),
             &TaskState::Paused(PauseReason("first request".into()))
         );
+    }
+
+    #[test]
+    fn watchdog_terminal_keeps_structured_meaningful_progress_evidence() {
+        let (mut task, _) = task_with_workspace();
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        let evidence = WatchdogEvidence {
+            last_meaningful_event_id: Some(7),
+            last_meaningful_at: now,
+            elapsed_secs: 301,
+            current_wait: None,
+        };
+
+        task.reduce(
+            TaskEvent::WatchdogStalled {
+                attempt_id,
+                evidence: evidence.clone(),
+            },
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(task.state(), &TaskState::Stalled(evidence));
     }
 }
