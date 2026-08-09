@@ -7,6 +7,19 @@ use yi_agent_core::{AgentEvent, DoneReason};
 
 use super::cell::HistoryCell;
 
+/// Whether the boundary after `cell` needs a blank visual spacer.
+fn has_spacer_after(cell: &HistoryCell, next_cell: Option<&HistoryCell>) -> bool {
+    next_cell.is_some()
+        && (matches!(cell, HistoryCell::UserMessage { .. })
+            || matches!(
+                (cell, next_cell),
+                (
+                    HistoryCell::ToolResult { .. },
+                    Some(HistoryCell::AssistantMessage { .. })
+                )
+            ))
+}
+
 /// A location in the history content, independent of its current wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ViewportAnchor {
@@ -59,16 +72,14 @@ impl HistoryState {
         self.cells.iter().map(|c| c.line_count(width)).sum()
     }
 
-    /// Number of display lines including the blank spacer inserted after
-    /// each `UserMessage` cell (except the last). This matches the line count
-    /// used by `HistoryView::flattened_lines` / `render`.
+    /// Number of display lines including semantic blank spacers. This matches
+    /// the line count used by `HistoryView::flattened_lines` / `render`.
     pub fn flattened_line_count(&self, width: u16) -> usize {
-        let n = self.cells.len();
         let mut count = 0usize;
         for (i, cell) in self.cells.iter().enumerate() {
             count += cell.line_count(width);
-            if matches!(cell, HistoryCell::UserMessage { .. }) && i + 1 < n {
-                count += 1; // spacer line
+            if has_spacer_after(cell, self.cells.get(i + 1)) {
+                count += 1;
             }
         }
         count
@@ -105,7 +116,7 @@ impl HistoryState {
     }
 
     /// Capture the top visible content location when the viewport is not
-    /// following the bottom. A user-message spacer belongs to that user cell.
+    /// following the bottom. A semantic spacer belongs to its preceding cell.
     pub(super) fn capture_viewport_anchor(
         &self,
         text_width: u16,
@@ -131,8 +142,7 @@ impl HistoryState {
             }
             lines_before += cell_lines;
 
-            if matches!(cell, HistoryCell::UserMessage { .. }) && cell_index + 1 < self.cells.len()
-            {
+            if has_spacer_after(cell, self.cells.get(cell_index + 1)) {
                 if anchor_top == lines_before {
                     return Some(ViewportAnchor {
                         cell_index,
@@ -171,7 +181,7 @@ impl HistoryState {
             }
 
             anchor_top += cell.line_count(text_width);
-            if matches!(cell, HistoryCell::UserMessage { .. }) {
+            if has_spacer_after(cell, self.cells.get(cell_index + 1)) {
                 anchor_top += 1;
             }
         }
@@ -468,19 +478,15 @@ pub struct HistoryView<'a> {
 }
 
 impl<'a> HistoryView<'a> {
-    /// Flatten all cells into display lines, inserting a blank spacer line
-    /// after each `UserMessage` cell (unless it is the last cell) to
-    /// visually separate user input from the system reply.
+    /// Flatten all cells into display lines, inserting blank spacers at
+    /// semantic boundaries while keeping tool work compact.
     fn flattened_lines(&self, text_width: u16) -> Vec<(usize, ratatui::text::Line<'static>)> {
-        let n = self.state.cells.len();
         let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
         for (i, cell) in self.state.cells.iter().enumerate() {
             for line in cell.lines(text_width) {
                 all_lines.push((i, line));
             }
-            // Insert a blank spacer line after user messages (except the last
-            // cell) to visually separate user input from the system reply.
-            if matches!(cell, HistoryCell::UserMessage { .. }) && i + 1 < n {
+            if has_spacer_after(cell, self.state.cells.get(i + 1)) {
                 all_lines.push((i, ratatui::text::Line::raw("")));
             }
         }
