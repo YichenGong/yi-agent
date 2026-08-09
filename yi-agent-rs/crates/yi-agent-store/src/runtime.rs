@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
+use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::subagent::scheduler::{
     AdmissionCursor, AdmissionPriority, LeaseId, LeaseMode, ResourceCoordinator, ResourceRequest,
     ResourceScope,
@@ -1081,6 +1082,7 @@ struct ProviderTurnAdmissions {
     resources: Arc<Mutex<ResourceCoordinator>>,
     queued: Mutex<HashSet<TaskId>>,
     assigned: Mutex<HashMap<TaskId, LeaseId>>,
+    notify: Arc<Notify>,
 }
 
 impl ProviderTurnAdmissions {
@@ -1089,6 +1091,7 @@ impl ProviderTurnAdmissions {
             resources,
             queued: Mutex::new(HashSet::new()),
             assigned: Mutex::new(HashMap::new()),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -1108,6 +1111,7 @@ impl ProviderTurnAdmissions {
             return Some(ProviderTurnLeaseHandle {
                 resources: Arc::clone(&self.resources),
                 lease_id,
+                notify: Arc::clone(&self.notify),
             });
         }
 
@@ -1143,6 +1147,7 @@ impl ProviderTurnAdmissions {
             return Some(ProviderTurnLeaseHandle {
                 resources: Arc::clone(&self.resources),
                 lease_id,
+                notify: Arc::clone(&self.notify),
             });
         }
         self.assigned
@@ -1151,11 +1156,36 @@ impl ProviderTurnAdmissions {
             .insert(granted_task, lease_id);
         None
     }
+
+    fn cancel_task(&self, task_id: &TaskId) {
+        self.resources
+            .lock()
+            .expect("resource coordinator mutex poisoned")
+            .cancel_task_requests(task_id);
+        self.queued
+            .lock()
+            .expect("provider turn queue mutex poisoned")
+            .remove(task_id);
+        if let Some(lease_id) = self
+            .assigned
+            .lock()
+            .expect("provider turn assignment mutex poisoned")
+            .remove(task_id)
+        {
+            self.resources
+                .lock()
+                .expect("resource coordinator mutex poisoned")
+                .release(lease_id)
+                .expect("provider turn lease release is idempotent");
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 struct ProviderTurnLeaseHandle {
     resources: Arc<Mutex<ResourceCoordinator>>,
     lease_id: LeaseId,
+    notify: Arc<Notify>,
 }
 
 impl Drop for ProviderTurnLeaseHandle {
@@ -1165,6 +1195,64 @@ impl Drop for ProviderTurnLeaseHandle {
             .expect("resource coordinator mutex poisoned")
             .release(self.lease_id.clone())
             .expect("provider turn lease release is idempotent");
+        self.notify.notify_waiters();
+    }
+}
+
+struct RuntimeProviderTurnGate {
+    admissions: Arc<ProviderTurnAdmissions>,
+    root_id: RootSessionId,
+    parent_id: TaskId,
+    task_id: TaskId,
+    resource_key: String,
+}
+
+impl ProviderTurnGate for RuntimeProviderTurnGate {
+    fn acquire(
+        &self,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Box<dyn yi_agent_core::ProviderTurnLease>, String>,
+    > {
+        let admissions = Arc::clone(&self.admissions);
+        let root_id = self.root_id.clone();
+        let parent_id = self.parent_id.clone();
+        let task_id = self.task_id.clone();
+        let resource_key = self.resource_key.clone();
+        Box::pin(async move {
+            let mut cleanup = ProviderTurnWaitCleanup {
+                admissions: Arc::clone(&admissions),
+                task_id: task_id.clone(),
+                active: true,
+            };
+            loop {
+                let notified = admissions.notify.notified();
+                if let Some(lease) = admissions.acquire_now(
+                    root_id.clone(),
+                    parent_id.clone(),
+                    task_id.clone(),
+                    &resource_key,
+                ) {
+                    cleanup.active = false;
+                    return Ok(Box::new(lease) as Box<dyn yi_agent_core::ProviderTurnLease>);
+                }
+                notified.await;
+            }
+        })
+    }
+}
+
+struct ProviderTurnWaitCleanup {
+    admissions: Arc<ProviderTurnAdmissions>,
+    task_id: TaskId,
+    active: bool,
+}
+
+impl Drop for ProviderTurnWaitCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            self.admissions.cancel_task(&self.task_id);
+        }
     }
 }
 
@@ -1206,6 +1294,37 @@ mod provider_turn_admission_tests {
                 .acquire_now(root, second_task.clone(), second_task, "llm:test")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn waiting_provider_turn_gate_wakes_after_a_lease_releases() {
+        let mut resources = ResourceCoordinator::new();
+        resources.set_capacity("llm:test", 1);
+        let admissions = Arc::new(ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources))));
+        let root = RootSessionId::new();
+        let first_task = TaskId::new();
+        let second_task = TaskId::new();
+        let first = admissions
+            .acquire_now(root.clone(), first_task.clone(), first_task, "llm:test")
+            .unwrap();
+        let gate = RuntimeProviderTurnGate {
+            admissions,
+            root_id: root,
+            parent_id: second_task.clone(),
+            task_id: second_task,
+            resource_key: "llm:test".into(),
+        };
+
+        let waiter = tokio::spawn(async move { gate.acquire().await });
+        tokio::task::yield_now().await;
+        drop(first);
+
+        let lease = tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("release must wake the queued provider turn")
+            .unwrap()
+            .unwrap();
+        drop(lease);
     }
 }
 
