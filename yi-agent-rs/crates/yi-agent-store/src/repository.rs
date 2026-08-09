@@ -643,6 +643,20 @@ impl RuntimeRepository {
         event: RuntimeEvent,
         context: &WorkerRecoveryContext,
     ) -> Result<i64, RepositoryError> {
+        self.transition_task_and_attempt_with_recovery_context_and_resident_lease(
+            task, attempt, state, event, context, None,
+        )
+    }
+
+    pub fn transition_task_and_attempt_with_recovery_context_and_resident_lease(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        state: &str,
+        event: RuntimeEvent,
+        context: &WorkerRecoveryContext,
+        resident_resource_key: Option<&str>,
+    ) -> Result<i64, RepositoryError> {
         validate_recovery_context(context)?;
         let transaction = self
             .connection
@@ -697,6 +711,19 @@ impl RuntimeRepository {
                     format!("worker-workspace-context-{attempt}"),
                     task.to_string(),
                     workspace_lease,
+                ],
+            )?;
+        }
+        if let Some(resource_key) = resident_resource_key {
+            transaction.execute(
+                "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+                 VALUES (?1, ?2, ?3, 'shared', 1, 'active')
+                 ON CONFLICT(id) DO UPDATE SET resource_key = excluded.resource_key,
+                     state = 'active', released_at = NULL",
+                params![
+                    format!("worker-resident-{attempt}"),
+                    task.to_string(),
+                    resource_key,
                 ],
             )?;
         }

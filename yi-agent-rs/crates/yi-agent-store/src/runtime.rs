@@ -504,12 +504,13 @@ impl RuntimeCoordinator {
             self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
-                .transition_task_and_attempt_with_recovery_context(
+                .transition_task_and_attempt_with_recovery_context_and_resident_lease(
                     task,
                     &attempt,
                     "running",
                     RuntimeEvent::TaskStarted,
                     &recovery_context,
+                    is_subagent.then_some("resident:global"),
                 )
         };
         if let Err(error) = admission {

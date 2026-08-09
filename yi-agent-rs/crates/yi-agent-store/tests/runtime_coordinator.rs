@@ -537,6 +537,26 @@ async fn startup_failure_closes_attempt_and_releases_admission_leases() {
 }
 
 #[tokio::test]
+async fn resident_lease_is_released_after_child_startup_failure() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(StartupErrorFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+
+    assert!(coordinator.start_worker(&session, &child).await.is_err());
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&child).unwrap(), "failed");
+    assert!(
+        !repository
+            .has_active_lease_prefix(&child, "resident:")
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn recovered_legacy_empty_attempt_task_resumes_with_a_successor_attempt() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -687,6 +707,12 @@ async fn resident_admission_persists_and_restores_the_fairness_cursor() {
         .admission_cursor("resident:global")
         .unwrap();
     assert!(cursor.is_some());
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "resident:")
+            .unwrap()
+    );
     assert_eq!(cursor.as_ref().unwrap().sequence, in_memory_cursor.sequence);
     drop(coordinator);
 
