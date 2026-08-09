@@ -1759,6 +1759,20 @@ fn insert_attempt(
          VALUES (?1, ?2, ?3, ?4, '{}', '{}')",
         params![attempt.to_string(), task.to_string(), number, state],
     )?;
+    let limits = WatchdogLimits::default();
+    transaction.execute(
+        "INSERT INTO attempt_watchdogs (
+            attempt_id, task_id, limits_json, usage_json, last_meaningful_event_id,
+            last_meaningful_at, resource_wait_key, resource_wait_started_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, NULL)",
+        params![
+            attempt.to_string(),
+            task.to_string(),
+            serde_json::to_string(&limits)?,
+            serde_json::to_string(&WatchdogUsage::default())?,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
     Ok(())
 }
 

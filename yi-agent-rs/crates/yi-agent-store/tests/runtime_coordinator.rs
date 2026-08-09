@@ -1459,3 +1459,39 @@ async fn coordinator_evaluates_a_persisted_watchdog_budget_once() {
     assert_eq!(coordinator.task_state(&task).unwrap(), "budget_exhausted");
     assert_eq!(coordinator.evaluate_watchdogs(now).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn coordinator_seeds_watchdog_snapshots_for_root_and_child_attempts() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    let repository = RuntimeRepository::open(&database).unwrap();
+
+    for task in [&root, &child] {
+        let attempt: yi_agent_core::AttemptId = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                [task.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        let snapshot = repository
+            .attempt_watchdog_snapshot(&attempt)
+            .unwrap()
+            .expect("new attempts have a watchdog snapshot");
+        assert_eq!(snapshot.limits.max_turns, Some(100));
+        assert_eq!(snapshot.limits.max_wall_time_secs, Some(2_700));
+        assert_eq!(snapshot.limits.max_idle_time_secs, Some(300));
+        assert_eq!(snapshot.limits.max_provider_retries, Some(3));
+        assert_eq!(snapshot.limits.max_tool_retries, Some(2));
+        assert_eq!(snapshot.limits.max_rework_cycles, Some(2));
+        assert_eq!(snapshot.observation.usage, WatchdogUsage::default());
+        assert_eq!(snapshot.current_wait, None);
+    }
+}

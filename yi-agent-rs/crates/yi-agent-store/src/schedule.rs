@@ -19,6 +19,22 @@ pub struct WatchdogLimits {
     pub max_rework_cycles: Option<u16>,
 }
 
+impl Default for WatchdogLimits {
+    fn default() -> Self {
+        Self {
+            max_turns: Some(100),
+            max_tokens: None,
+            max_cost_micros: None,
+            max_wall_time_secs: Some(2_700),
+            max_idle_time_secs: Some(300),
+            max_resource_wait_secs: None,
+            max_provider_retries: Some(3),
+            max_tool_retries: Some(2),
+            max_rework_cycles: Some(2),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchdogUsage {
     pub turns: u32,
