@@ -2,9 +2,35 @@ use chrono::{Duration, Utc};
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_store::schedule::{
     MissedRunPolicy, OverlapPolicy, RetryDecision, RetryFailure, RuntimePolicy, RuntimePolicyLayer,
-    SchedulePolicy, SchedulePriority, WatchdogLimits, WatchdogObservation, WatchdogOutcome,
-    WatchdogUsage, evaluate_retry, evaluate_watchdog,
+    ScheduleDefinition, SchedulePolicy, SchedulePriority, WatchdogLimits, WatchdogObservation,
+    WatchdogOutcome, WatchdogUsage, evaluate_retry, evaluate_watchdog,
 };
+
+#[test]
+fn schedule_definition_requires_exactly_five_cron_fields() {
+    let definition = ScheduleDefinition::new("0 9 * * 1-5", "inspect project tasks").unwrap();
+
+    assert_eq!(definition.cron, "0 9 * * 1-5");
+    assert_eq!(definition.objective, "inspect project tasks");
+    assert!(ScheduleDefinition::new("0 0 9 * * 1-5", "inspect project tasks").is_err());
+    assert!(ScheduleDefinition::new("0 9 * *", "inspect project tasks").is_err());
+    assert!(ScheduleDefinition::new("0 9 * * 1-5", "   ").is_err());
+}
+
+#[test]
+fn schedule_definition_embeds_conservative_defaults() {
+    let definition = ScheduleDefinition::new("0 9 * * 1-5", "inspect project tasks").unwrap();
+
+    assert_eq!(definition.policy, SchedulePolicy::default());
+    assert!(definition.policy.runtime.read_only);
+    assert!(!definition.policy.runtime.allow_coding);
+    assert_eq!(definition.policy.runtime.max_resident_subagents, 4);
+    assert_eq!(definition.policy.runtime.max_turns, 30);
+    assert_eq!(definition.policy.runtime.max_wall_time_secs, 900);
+    assert_eq!(definition.policy.priority, SchedulePriority::Background);
+    assert_eq!(definition.policy.overlap_policy, OverlapPolicy::Skip);
+    assert_eq!(definition.policy.missed_run_policy, MissedRunPolicy::Skip);
+}
 
 #[test]
 fn toml_policy_layers_can_only_narrow_the_user_ceiling() {

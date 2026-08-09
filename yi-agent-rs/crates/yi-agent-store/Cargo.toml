@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 yi-agent-core = { workspace = true }
 chrono = { workspace = true }
+croner = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

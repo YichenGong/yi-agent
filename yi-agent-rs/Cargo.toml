@@ -54,3 +54,4 @@ tracing-appender = "0.2"
 
 # date/time for system prompt
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+croner = "3"

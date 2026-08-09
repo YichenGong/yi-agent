@@ -1,8 +1,82 @@
 //! Effective runtime and scheduled-session policy values.
 
-use chrono::{DateTime, Utc};
+use std::fmt;
+
+use chrono::{DateTime, Local, Utc};
+use croner::parser::{CronParser, Seconds};
 use serde::{Deserialize, Serialize};
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
+
+/// A validated user-facing schedule. The expression always uses standard
+/// five-field cron; the parser is explicitly configured to reject seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleDefinition {
+    pub cron: String,
+    pub objective: String,
+    pub policy: SchedulePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleDefinitionError {
+    EmptyObjective,
+    InvalidCron(String),
+}
+
+impl fmt::Display for ScheduleDefinitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyObjective => formatter.write_str("schedule objective must not be empty"),
+            Self::InvalidCron(reason) => write!(formatter, "invalid five-field cron: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ScheduleDefinitionError {}
+
+impl ScheduleDefinition {
+    pub fn new(
+        cron: impl AsRef<str>,
+        objective: impl Into<String>,
+    ) -> Result<Self, ScheduleDefinitionError> {
+        let cron = cron
+            .as_ref()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let objective = objective.into().trim().to_owned();
+        if objective.is_empty() {
+            return Err(ScheduleDefinitionError::EmptyObjective);
+        }
+        parse_five_field_cron(&cron)?;
+        Ok(Self {
+            cron,
+            objective,
+            policy: SchedulePolicy::default(),
+        })
+    }
+
+    pub fn next_run_after(
+        &self,
+        now: DateTime<Local>,
+    ) -> Result<DateTime<Local>, ScheduleDefinitionError> {
+        parse_five_field_cron(&self.cron)?
+            .find_next_occurrence(&now, false)
+            .map_err(|error| ScheduleDefinitionError::InvalidCron(error.to_string()))
+    }
+}
+
+fn parse_five_field_cron(cron: &str) -> Result<croner::Cron, ScheduleDefinitionError> {
+    if cron.split_whitespace().count() != 5 {
+        return Err(ScheduleDefinitionError::InvalidCron(
+            "expected exactly five fields (minute hour day-of-month month day-of-week)".into(),
+        ));
+    }
+    CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .build()
+        .parse(cron)
+        .map_err(|error| ScheduleDefinitionError::InvalidCron(error.to_string()))
+}
 
 /// A classified failure reaching the runtime retry boundary. Tool callers must
 /// explicitly mark a failure retryable; error text is never used as policy.
@@ -448,7 +522,7 @@ fn narrow<T: Ord + Copy>(default: T, broader: Option<T>, narrower: Option<T>) ->
     narrower.unwrap_or(default).min(broader.unwrap_or(default))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePolicy {
     pub max_resident_subagents: u16,
     pub max_turns: u32,
@@ -473,7 +547,7 @@ impl RuntimePolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulePriority {
     Background,
@@ -482,21 +556,21 @@ pub enum SchedulePriority {
     Critical,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlapPolicy {
     Skip,
     QueueOne,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissedRunPolicy {
     Skip,
     CatchUpOnce,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulePolicy {
     pub runtime: RuntimePolicy,
     pub priority: SchedulePriority,
