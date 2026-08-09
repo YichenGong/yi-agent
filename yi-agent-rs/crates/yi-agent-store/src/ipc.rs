@@ -238,6 +238,7 @@ pub struct IpcEvent {
     pub event_id: i64,
     pub task_id: String,
     pub kind: String,
+    pub payload_json: String,
 }
 
 /// The stable wire payload for a top-level subscription event frame.
@@ -246,6 +247,7 @@ pub struct IpcEventPayload {
     pub task_id: String,
     #[serde(rename = "type")]
     pub kind: String,
+    pub payload_json: String,
 }
 
 impl From<&IpcEvent> for IpcEventPayload {
@@ -253,6 +255,7 @@ impl From<&IpcEvent> for IpcEventPayload {
         Self {
             task_id: event.task_id.clone(),
             kind: event.kind.clone(),
+            payload_json: event.payload_json.clone(),
         }
     }
 }
@@ -1046,6 +1049,7 @@ mod subscription_queue_tests {
             event_id,
             task_id: format!("task-{event_id}"),
             kind: "task_started".into(),
+            payload_json: "{}".into(),
         }
     }
 
@@ -1457,6 +1461,7 @@ fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
         event_id: event.id,
         task_id: event.task_id.to_string(),
         kind: runtime_event_name(event.event).into(),
+        payload_json: event.payload_json,
     }
 }
 

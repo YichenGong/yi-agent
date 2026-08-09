@@ -79,6 +79,7 @@ pub struct PersistedEvent {
     pub id: i64,
     pub task_id: TaskId,
     pub event: RuntimeEvent,
+    pub payload_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,10 @@ pub struct PersistedRecoveredTask {
     pub depth: u8,
     pub attempt_id: AttemptId,
     pub attempt_number: u32,
+    pub workspace_lease_id: Option<String>,
+    pub worktree_lease: Option<String>,
+    pub checkpoint_json: Option<String>,
+    pub tool_state_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +283,39 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    /// Test/support API for recording the durable facts a resumed worker must
+    /// inspect before it can issue new side effects.
+    pub fn record_recovery_context(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        workspace_lease: &str,
+        worktree_lease: &str,
+        checkpoint_json: &str,
+        tool_state_json: &str,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE tasks SET workspace_lease_id = ?1 WHERE id = ?2",
+            params![workspace_lease, task.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET checkpoint_json = ?1, usage_json = ?2 WHERE id = ?3 AND task_id = ?4",
+            params![checkpoint_json, tool_state_json, attempt.to_string(), task.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+             VALUES (?1, ?2, ?3, 'exclusive', 1, 'active')",
+            params![
+                format!("recovery-worktree-{}", task),
+                task.to_string(),
+                worktree_lease
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Persists a daemon-routed user instruction and its event together so a
     /// reconnecting observer never sees an event without its mailbox record.
     pub fn record_user_message(
@@ -441,8 +479,42 @@ impl RuntimeRepository {
             });
         }
         transaction.execute(
-            "UPDATE attempts SET state = ?1 WHERE id = ?2 AND task_id = ?3",
+            "UPDATE attempts SET state = ?1, ended_at = CASE
+                WHEN ?1 IN ('paused', 'blocked', 'cancelled', 'failed', 'recovery_required')
+                THEN CURRENT_TIMESTAMP ELSE ended_at END
+             WHERE id = ?2 AND task_id = ?3",
             params![state, attempt.to_string(), task.to_string()],
+        )?;
+        let event_id = append_event(&transaction, task, event)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    pub fn transition_task_and_attempt_with_terminal(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        state: &str,
+        event: RuntimeEvent,
+        terminal_json: &str,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3",
+            params![state, task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = ?1, ended_at = CURRENT_TIMESTAMP, terminal_json = ?2
+             WHERE id = ?3 AND task_id = ?4",
+            params![state, terminal_json, attempt.to_string(), task.to_string()],
         )?;
         let event_id = append_event(&transaction, task, event)?;
         transaction.commit()?;
@@ -491,6 +563,38 @@ impl RuntimeRepository {
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        // v2 compatibility rows were allowed to have no active attempt. Give
+        // each live task a closed recovery attempt so hydration can resume it.
+        for task_id in &task_ids {
+            let active_attempt: String = transaction.query_row(
+                "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )?;
+            if active_attempt.is_empty() {
+                let task: TaskId =
+                    task_id
+                        .parse()
+                        .map_err(|_| RepositoryError::UnknownEventKind {
+                            kind: format!("invalid task ID in store: {task_id}"),
+                        })?;
+                let attempt = AttemptId::new();
+                let number: u32 = transaction.query_row(
+                    "SELECT COALESCE(MAX(number), 0) + 1 FROM attempts WHERE task_id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )?;
+                transaction.execute(
+                    "UPDATE tasks SET active_attempt_id = ?1 WHERE id = ?2",
+                    params![attempt.to_string(), task_id],
+                )?;
+                insert_attempt(&transaction, &attempt, &task, number, "running")?;
+            }
+        }
+        let recovered_attempts: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE state IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children')",
+            [], |row| row.get(0),
+        )?;
         for task_id in &task_ids {
             transaction.execute(
                 "UPDATE tasks SET state_json = 'recovery_required', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -512,15 +616,41 @@ impl RuntimeRepository {
                 .map_err(|_| RepositoryError::UnknownEventKind {
                     kind: format!("invalid task ID in store: {task_id}"),
                 })?;
-            append_event(&transaction, &task, RuntimeEvent::RuntimeRecovered)?;
+            let released_process_leases = transaction.execute(
+                "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+                 WHERE state = 'active'
+                   AND resource_key NOT LIKE 'worktree:%'
+                   AND resource_key NOT LIKE 'workspace:%'",
+                [],
+            )?;
+            let retained_workspace_worktree_leases: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM resource_leases WHERE state = 'active'
+                 AND (resource_key LIKE 'worktree:%' OR resource_key LIKE 'workspace:%')",
+                [],
+                |row| row.get(0),
+            )?;
+            let payload = serde_json::to_string(&serde_json::json!({
+                "recovered_tasks": task_ids.len(),
+                "recovered_attempts": recovered_attempts,
+                "released_process_leases": released_process_leases,
+                "retained_workspace_worktree_leases": retained_workspace_worktree_leases,
+            }))?;
+            append_event_with_payload(
+                &transaction,
+                &task,
+                RuntimeEvent::RuntimeRecovered,
+                &payload,
+            )?;
         }
-        transaction.execute(
-            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
-             WHERE state = 'active'
-               AND resource_key NOT LIKE 'worktree:%'
-               AND resource_key NOT LIKE 'workspace:%'",
-            [],
-        )?;
+        if task_ids.is_empty() {
+            transaction.execute(
+                "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+                 WHERE state = 'active'
+                   AND resource_key NOT LIKE 'worktree:%'
+                   AND resource_key NOT LIKE 'workspace:%'",
+                [],
+            )?;
+        }
         transaction.execute(
             "UPDATE attempts SET state = 'recovery_required', ended_at = CURRENT_TIMESTAMP
              WHERE state IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children')",
@@ -542,6 +672,25 @@ impl RuntimeRepository {
         Ok(self.connection.query_row(
             "SELECT state FROM attempts WHERE id = ?1",
             params![attempt.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn attempt_ended_at(&self, attempt: &AttemptId) -> Result<Option<String>, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT ended_at FROM attempts WHERE id = ?1",
+            params![attempt.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn attempt_terminal_json_for_task(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT terminal_json FROM attempts WHERE task_id = ?1 ORDER BY number DESC LIMIT 1",
+            params![task.to_string()],
             |row| row.get(0),
         )?)
     }
@@ -578,7 +727,12 @@ impl RuntimeRepository {
 
     pub fn recovered_tasks(&self) -> Result<Vec<PersistedRecoveredTask>, RepositoryError> {
         let mut statement = self.connection.prepare(
-            "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth, attempts.id, attempts.number
+            "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth, attempts.id, attempts.number,
+                    tasks.workspace_lease_id,
+                    (SELECT resource_key FROM resource_leases
+                     WHERE task_id = tasks.id AND state = 'active' AND resource_key LIKE 'worktree:%'
+                     ORDER BY acquired_at DESC, id DESC LIMIT 1),
+                    attempts.checkpoint_json, attempts.usage_json
              FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.state_json = 'recovery_required'
              ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
@@ -592,10 +746,25 @@ impl RuntimeRepository {
                     row.get::<_, u8>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, u32>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })?
             .map(|row| {
-                let (session_id, task_id, parent_id, depth, attempt_id, attempt_number) = row?;
+                let (
+                    session_id,
+                    task_id,
+                    parent_id,
+                    depth,
+                    attempt_id,
+                    attempt_number,
+                    workspace_lease_id,
+                    worktree_lease,
+                    checkpoint_json,
+                    tool_state_json,
+                ) = row?;
                 Ok(PersistedRecoveredTask {
                     session_id: session_id.parse().map_err(|_| {
                         RepositoryError::UnknownEventKind {
@@ -623,6 +792,10 @@ impl RuntimeRepository {
                         }
                     })?,
                     attempt_number,
+                    workspace_lease_id,
+                    worktree_lease,
+                    checkpoint_json,
+                    tool_state_json,
                 })
             })
             .collect()
@@ -694,7 +867,7 @@ impl RuntimeRepository {
         };
         let events = if matches!(cursor_state, RuntimeCursorState::Replayable) {
             let mut statement = transaction.prepare(
-                "SELECT id, task_id, kind FROM events WHERE id > ?1 AND id <= ?2 ORDER BY id",
+                "SELECT id, task_id, kind, payload_json FROM events WHERE id > ?1 AND id <= ?2 ORDER BY id",
             )?;
             statement
                 .query_map(params![after_event_id, high_water_event_id], |row| {
@@ -702,10 +875,11 @@ impl RuntimeRepository {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })?
                 .map(|row| {
-                    let (id, task_id, kind) = row?;
+                    let (id, task_id, kind, payload_json) = row?;
                     Ok(PersistedEvent {
                         id,
                         task_id: task_id.parse().map_err(|_| {
@@ -714,6 +888,7 @@ impl RuntimeRepository {
                             }
                         })?,
                         event: RuntimeEvent::parse(kind)?,
+                        payload_json,
                     })
                 })
                 .collect::<Result<Vec<_>, RepositoryError>>()?
@@ -756,16 +931,21 @@ impl RuntimeRepository {
     }
 
     pub fn event_records_after(&self, cursor: i64) -> Result<Vec<PersistedEvent>, RepositoryError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, task_id, kind FROM events WHERE id > ?1 ORDER BY id")?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, kind, payload_json FROM events WHERE id > ?1 ORDER BY id",
+        )?;
         statement
             .query_map(params![cursor], |row| {
                 let task_id = row.get::<_, String>(1)?;
-                Ok((row.get::<_, i64>(0)?, task_id, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    task_id,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             })?
             .map(|row| {
-                let (id, task_id, kind) = row?;
+                let (id, task_id, kind, payload_json) = row?;
                 Ok(PersistedEvent {
                     id,
                     task_id: task_id
@@ -774,6 +954,7 @@ impl RuntimeRepository {
                             kind: format!("invalid task ID in store: {task_id}"),
                         })?,
                     event: RuntimeEvent::parse(kind)?,
+                    payload_json,
                 })
             })
             .collect()
@@ -785,11 +966,20 @@ fn append_event(
     task: &TaskId,
     event: RuntimeEvent,
 ) -> Result<i64, RepositoryError> {
+    append_event_with_payload(transaction, task, event, "{}")
+}
+
+fn append_event_with_payload(
+    transaction: &Transaction<'_>,
+    task: &TaskId,
+    event: RuntimeEvent,
+    payload_json: &str,
+) -> Result<i64, RepositoryError> {
     let inserted = transaction.execute(
         "INSERT INTO events (session_id, task_id, actor_json, kind, payload_json)
-         SELECT root_session_id, id, '{\"kind\":\"runtime\"}', ?1, '{}'
-         FROM tasks WHERE id = ?2",
-        params![event.name(), task.to_string()],
+         SELECT root_session_id, id, '{\"kind\":\"runtime\"}', ?1, ?2
+         FROM tasks WHERE id = ?3",
+        params![event.name(), payload_json, task.to_string()],
     )?;
     if inserted == 0 {
         return Err(RepositoryError::TaskNotFound {

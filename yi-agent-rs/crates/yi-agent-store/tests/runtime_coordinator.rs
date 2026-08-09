@@ -132,6 +132,16 @@ async fn recovered_root_resumes_in_a_fresh_attempt_after_runtime_restart() {
     repository
         .create_task_with_attempt(&task, &session, &attempt, 1, "running")
         .unwrap();
+    repository
+        .record_recovery_context(
+            &task,
+            &attempt,
+            "workspace:project",
+            "worktree:feature/recovery",
+            r#"{"checkpoint":"before restart"}"#,
+            r#"{"tool":"git","status":"clean"}"#,
+        )
+        .unwrap();
     repository.recover_inflight_tasks().unwrap();
     drop(repository);
 
@@ -150,6 +160,29 @@ async fn recovered_root_resumes_in_a_fresh_attempt_after_runtime_restart() {
             .unwrap()
             .contains("git status")
     );
+    let instruction = starts[0].recovery_instruction.as_deref().unwrap();
+    assert!(instruction.contains("workspace:project"));
+    assert!(instruction.contains("worktree:feature/recovery"));
+    assert!(instruction.contains("before restart"));
+    assert!(instruction.contains("\"status\":\"clean\""));
+}
+
+#[tokio::test]
+async fn recovered_legacy_empty_attempt_task_resumes_with_a_successor_attempt() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository.create_task(&task, &session, "running").unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    assert_eq!(coordinator.root_task_id(&session).unwrap(), task);
+    coordinator.resume_task(&session, &task).await.unwrap();
+    assert_eq!(factory.starts.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -207,6 +240,39 @@ async fn unsafe_recovery_inspection_blocks_the_task_with_recovery_conflict() {
             .iter()
             .any(|event| event.event == RuntimeEvent::TaskBlocked)
     );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .attempt_terminal_json_for_task(&task)
+            .unwrap()
+            .as_deref(),
+        Some(r#"{"reason":"recovery_conflict"}"#)
+    );
+}
+
+#[tokio::test]
+async fn cancellation_closes_the_active_attempt_before_a_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &task).await.unwrap();
+    let attempt = factory.starts.lock().unwrap()[0].attempt_id.clone();
+
+    coordinator
+        .cancel_task(&session, &task, false)
+        .await
+        .unwrap();
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.attempt_state(&attempt).unwrap(), "cancelled");
+    assert!(repository.attempt_ended_at(&attempt).unwrap().is_some());
+    drop(repository);
+
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.recover_inflight_tasks().unwrap(), 0);
+    assert_eq!(repository.attempt_state(&attempt).unwrap(), "cancelled");
 }
 
 #[tokio::test]

@@ -59,6 +59,7 @@ pub struct RuntimeCoordinator {
     factory: Arc<dyn AgentWorkerFactory>,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
     resident_tasks: Mutex<HashSet<TaskId>>,
+    recovery_contexts: Mutex<HashMap<TaskId, RecoveryContext>>,
     draining: AtomicBool,
 }
 
@@ -70,7 +71,17 @@ impl RuntimeCoordinator {
         let repository = RuntimeRepository::open(database_path)?;
         let recovered_tasks = repository.recovered_tasks()?;
         let mut supervisors = HashMap::new();
+        let mut recovery_contexts = HashMap::new();
         for task in recovered_tasks {
+            recovery_contexts.insert(
+                task.task_id.clone(),
+                RecoveryContext {
+                    workspace_lease_id: task.workspace_lease_id.clone(),
+                    worktree_lease: task.worktree_lease.clone(),
+                    checkpoint_json: task.checkpoint_json.clone(),
+                    tool_state_json: task.tool_state_json.clone(),
+                },
+            );
             if task.parent_id.is_none() {
                 supervisors.insert(
                     task.session_id.clone(),
@@ -116,6 +127,7 @@ impl RuntimeCoordinator {
             factory,
             supervisors: Mutex::new(supervisors),
             resident_tasks: Mutex::new(HashSet::new()),
+            recovery_contexts: Mutex::new(recovery_contexts),
             draining: AtomicBool::new(false),
         })
     }
@@ -334,12 +346,29 @@ impl RuntimeCoordinator {
         let cancelled = supervisor
             .cancel_task_tree(task, recursive)
             .map_err(RuntimeCoordinatorError::Supervisor)?;
+        let cancelled_attempts = cancelled
+            .iter()
+            .map(|task| {
+                let attempt = supervisor
+                    .task(task)
+                    .expect("cancelled task exists")
+                    .active_attempt_id()
+                    .clone();
+                (task.clone(), attempt)
+            })
+            .collect::<Vec<_>>();
         let mut repository = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned");
-        for task in cancelled {
-            repository.transition_task(&task, "cancelled", RuntimeEvent::TaskCancelled)?;
+        for (task, attempt) in cancelled_attempts {
+            repository.transition_task_and_attempt_with_terminal(
+                &task,
+                &attempt,
+                "cancelled",
+                RuntimeEvent::TaskCancelled,
+                r#"{"reason":"cancelled"}"#,
+            )?;
             self.resident_tasks
                 .lock()
                 .expect("runtime resident task mutex poisoned")
@@ -381,7 +410,10 @@ impl RuntimeCoordinator {
             ) {
                 Some(
                     supervisor
-                        .resume_recovery_task(task, recovery_inspection_instruction())
+                        .resume_recovery_task(
+                            task,
+                            recovery_inspection_instruction(&self.recovery_context(task)),
+                        )
                         .map_err(RuntimeCoordinatorError::Supervisor)?,
                 )
             } else {
@@ -403,6 +435,10 @@ impl RuntimeCoordinator {
                 "queued",
                 RuntimeEvent::TaskQueued,
             )?;
+            self.recovery_contexts
+                .lock()
+                .expect("runtime recovery context mutex poisoned")
+                .remove(task);
         } else {
             repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
         }
@@ -527,16 +563,27 @@ impl RuntimeCoordinator {
                     .expect("reconciled task exists")
                     .active_attempt_id()
                     .clone();
-                let (state, event) = match state {
-                    yi_agent_core::TaskState::Paused(_) => ("paused", RuntimeEvent::TaskPaused),
-                    yi_agent_core::TaskState::Blocked(_) => ("blocked", RuntimeEvent::TaskBlocked),
-                    yi_agent_core::TaskState::Cancelled(_) => {
-                        ("cancelled", RuntimeEvent::TaskCancelled)
+                let (state, event, terminal_json) = match state {
+                    yi_agent_core::TaskState::Paused(_) => {
+                        ("paused", RuntimeEvent::TaskPaused, None)
                     }
-                    yi_agent_core::TaskState::Failed(_) => ("failed", RuntimeEvent::TaskFailed),
+                    yi_agent_core::TaskState::Blocked(reason) => (
+                        "blocked",
+                        RuntimeEvent::TaskBlocked,
+                        reason
+                            .0
+                            .strip_prefix("recovery_conflict:")
+                            .map(|_| r#"{"reason":"recovery_conflict"}"#),
+                    ),
+                    yi_agent_core::TaskState::Cancelled(_) => {
+                        ("cancelled", RuntimeEvent::TaskCancelled, None)
+                    }
+                    yi_agent_core::TaskState::Failed(_) => {
+                        ("failed", RuntimeEvent::TaskFailed, None)
+                    }
                     _ => continue,
                 };
-                updates.push((task_id, attempt, state, event));
+                updates.push((task_id, attempt, state, event, terminal_json));
             }
             consumed_overrides.extend(supervisor.pending_user_override_acks().iter().cloned());
         }
@@ -552,11 +599,22 @@ impl RuntimeCoordinator {
                     .confirm_user_override_consumed(task_id, message_id);
             }
         }
-        for (task_id, attempt, state, event) in updates {
-            self.repository
+        for (task_id, attempt, state, event, terminal_json) in updates {
+            let mut repository = self
+                .repository
                 .lock()
-                .expect("runtime repository mutex poisoned")
-                .transition_task_and_attempt(&task_id, &attempt, state, event)?;
+                .expect("runtime repository mutex poisoned");
+            if let Some(terminal_json) = terminal_json {
+                repository.transition_task_and_attempt_with_terminal(
+                    &task_id,
+                    &attempt,
+                    state,
+                    event,
+                    terminal_json,
+                )?;
+            } else {
+                repository.transition_task_and_attempt(&task_id, &attempt, state, event)?;
+            }
             self.resident_tasks
                 .lock()
                 .expect("runtime resident task mutex poisoned")
@@ -766,8 +824,40 @@ impl RuntimeCoordinator {
             .cloned()
             .ok_or_else(|| RuntimeCoordinatorError::SessionNotFound(session.clone()))
     }
+
+    fn recovery_context(&self, task: &TaskId) -> RecoveryContext {
+        self.recovery_contexts
+            .lock()
+            .expect("runtime recovery context mutex poisoned")
+            .get(task)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
-fn recovery_inspection_instruction() -> String {
-    "Recovery required before changes: inspect the recorded worktree, run git status, identify the latest commit, inspect required tool state, compare the prior checkpoint, and stop with RecoveryConflict if a safe base cannot be proven. Do not replay prior provider, tool, command, or Git actions.".into()
+#[derive(Clone, Default)]
+struct RecoveryContext {
+    workspace_lease_id: Option<String>,
+    worktree_lease: Option<String>,
+    checkpoint_json: Option<String>,
+    tool_state_json: String,
+}
+
+fn recovery_inspection_instruction(context: &RecoveryContext) -> String {
+    format!(
+        "Recovery required before changes: inspect the recorded workspace lease: {}; recorded worktree: {}; run git status, identify the latest commit, inspect required tool state evidence: {}; compare the prior checkpoint evidence: {}; and stop with RecoveryConflict if a safe base cannot be proven. Do not replay prior provider, tool, command, or Git actions.",
+        context
+            .workspace_lease_id
+            .as_deref()
+            .unwrap_or("<none recorded>"),
+        context
+            .worktree_lease
+            .as_deref()
+            .unwrap_or("<none recorded>"),
+        context.tool_state_json,
+        context
+            .checkpoint_json
+            .as_deref()
+            .unwrap_or("<none recorded>"),
+    )
 }

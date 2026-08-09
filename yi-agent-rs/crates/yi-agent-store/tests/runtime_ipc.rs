@@ -421,6 +421,27 @@ fn daemon_start_publishes_one_runtime_recovered_event_for_reconciled_work() {
             .count(),
         1
     );
+    let summary = events
+        .iter()
+        .find(|event| event.event == RuntimeEvent::RuntimeRecovered)
+        .unwrap();
+    assert_eq!(
+        summary.payload_json,
+        r#"{"recovered_attempts":1,"recovered_tasks":1,"released_process_leases":0,"retained_workspace_worktree_leases":0}"#
+    );
+    let recovery_required_id = events
+        .iter()
+        .find(|event| event.event == RuntimeEvent::TaskRecoveryRequired)
+        .unwrap()
+        .id;
+    let mut subscription = subscribe(daemon.socket_path(), recovery_required_id).unwrap();
+    let IpcResponse::Subscription(snapshot) = subscription.next_response().unwrap() else {
+        panic!("expected recovery replay snapshot");
+    };
+    assert_eq!(snapshot.events.len(), 1);
+    assert_eq!(snapshot.events[0].kind, "runtime_recovered");
+    assert_eq!(snapshot.events[0].payload_json, summary.payload_json);
+    drop(subscription);
     drop(daemon);
 }
 
