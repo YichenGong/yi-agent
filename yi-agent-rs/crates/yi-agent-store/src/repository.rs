@@ -3,6 +3,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 use yi_agent_core::subagent::task::MessageId;
+use yi_agent_core::subagent::worker::WorkerRecoveryContext;
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
 const LATEST_SCHEMA_VERSION: i64 = 2;
@@ -485,6 +486,61 @@ impl RuntimeRepository {
              WHERE id = ?2 AND task_id = ?3",
             params![state, attempt.to_string(), task.to_string()],
         )?;
+        let event_id = append_event(&transaction, task, event)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Commits worker admission and restart evidence together, so a running
+    /// attempt never becomes durable without a recoverable safety boundary.
+    pub fn transition_task_and_attempt_with_recovery_context(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        state: &str,
+        event: RuntimeEvent,
+        context: &WorkerRecoveryContext,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = ?1, workspace_lease_id = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3 AND active_attempt_id = ?4",
+            params![
+                state,
+                context.workspace_lease_id,
+                task.to_string(),
+                attempt.to_string()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = ?1, checkpoint_json = ?2, usage_json = ?3
+             WHERE id = ?4 AND task_id = ?5",
+            params![
+                state,
+                context.checkpoint_json,
+                context.tool_state_json,
+                attempt.to_string(),
+                task.to_string()
+            ],
+        )?;
+        if let Some(worktree_lease) = &context.worktree_lease {
+            transaction.execute(
+                "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+                 VALUES (?1, ?2, ?3, 'exclusive', 1, 'active')",
+                params![
+                    format!("worker-worktree-context-{attempt}"),
+                    task.to_string(),
+                    worktree_lease,
+                ],
+            )?;
+        }
         let event_id = append_event(&transaction, task, event)?;
         transaction.commit()?;
         Ok(event_id)

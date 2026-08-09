@@ -269,6 +269,7 @@ impl RuntimeCoordinator {
             }
             residents.insert(task.clone());
         }
+        let recovery_context = self.factory.recovery_context();
         supervisor
             .start_worker(self.factory.as_ref(), task)
             .await
@@ -290,7 +291,13 @@ impl RuntimeCoordinator {
             .repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .transition_task_and_attempt(task, &attempt, "running", RuntimeEvent::TaskStarted)
+            .transition_task_and_attempt_with_recovery_context(
+                task,
+                &attempt,
+                "running",
+                RuntimeEvent::TaskStarted,
+                &recovery_context,
+            )
         {
             let _ = supervisor.cancel_task_tree(task, false);
             if is_subagent {
@@ -423,26 +430,27 @@ impl RuntimeCoordinator {
                 None
             }
         };
-        let mut repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
-        if let Some(attempt) = recovery_attempt {
-            repository.activate_successor_attempt(
-                task,
-                &attempt.id,
-                attempt.number,
-                "queued",
-                RuntimeEvent::TaskQueued,
-            )?;
-            self.recovery_contexts
+        {
+            let mut repository = self
+                .repository
                 .lock()
-                .expect("runtime recovery context mutex poisoned")
-                .remove(task);
-        } else {
-            repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
+                .expect("runtime repository mutex poisoned");
+            if let Some(attempt) = recovery_attempt {
+                repository.activate_successor_attempt(
+                    task,
+                    &attempt.id,
+                    attempt.number,
+                    "queued",
+                    RuntimeEvent::TaskQueued,
+                )?;
+                self.recovery_contexts
+                    .lock()
+                    .expect("runtime recovery context mutex poisoned")
+                    .remove(task);
+            } else {
+                repository.transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
+            }
         }
-        drop(repository);
         if self.factory.is_available() {
             self.start_worker(session, task).await?;
         }
@@ -844,6 +852,24 @@ struct RecoveryContext {
 }
 
 fn recovery_inspection_instruction(context: &RecoveryContext) -> String {
+    if !context.has_safe_base() {
+        return format!(
+            "RECOVERY_CONTROLLER_UNSAFE: durable recovery evidence is incomplete: workspace={}; worktree={}; checkpoint={}; tool_state={}. Report RecoveryConflict before any provider call, objective, tool, command, or Git action; do not run git status.",
+            context
+                .workspace_lease_id
+                .as_deref()
+                .unwrap_or("<none recorded>"),
+            context
+                .worktree_lease
+                .as_deref()
+                .unwrap_or("<none recorded>"),
+            context
+                .checkpoint_json
+                .as_deref()
+                .unwrap_or("<none recorded>"),
+            context.tool_state_json,
+        );
+    }
     format!(
         "Recovery required before changes: inspect the recorded workspace lease: {}; recorded worktree: {}; run git status, identify the latest commit, inspect required tool state evidence: {}; compare the prior checkpoint evidence: {}; and stop with RecoveryConflict if a safe base cannot be proven. Do not replay prior provider, tool, command, or Git actions.",
         context
@@ -860,4 +886,16 @@ fn recovery_inspection_instruction(context: &RecoveryContext) -> String {
             .as_deref()
             .unwrap_or("<none recorded>"),
     )
+}
+
+impl RecoveryContext {
+    fn has_safe_base(&self) -> bool {
+        self.workspace_lease_id.is_some()
+            && self.worktree_lease.is_some()
+            && self
+                .checkpoint_json
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.contains("\"git_head\":\""))
+            && self.tool_state_json.contains("\"state\":\"available\"")
+    }
 }

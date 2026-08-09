@@ -1,12 +1,15 @@
 //! Application-owned construction for daemon subagent workers.
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
-use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
+use yi_agent_core::subagent::worker::{
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+};
 use yi_agent_core::{Agent, AgentConfig, AgentEvent, Provider, Tool, ToolRegistry, ToolResult};
 
 /// Reuses the selected provider, tool registry, and system prompt for each
@@ -35,6 +38,38 @@ impl DaemonAgentWorkerFactory {
 }
 
 impl AgentWorkerFactory for DaemonAgentWorkerFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        let workspace = std::env::current_dir().ok();
+        let git_root = workspace
+            .as_ref()
+            .and_then(|directory| git_output(directory, &["rev-parse", "--show-toplevel"]));
+        let git_head = workspace
+            .as_ref()
+            .and_then(|directory| git_output(directory, &["rev-parse", "HEAD"]));
+        let tool_names = self
+            .tools
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<Vec<_>>();
+        WorkerRecoveryContext {
+            workspace_lease_id: workspace
+                .as_ref()
+                .map(|directory| format!("workspace:{}", directory.display())),
+            worktree_lease: git_root.map(|directory| format!("worktree:{directory}")),
+            checkpoint_json: json!({
+                "kind": "worker_admission",
+                "git_head": git_head,
+            })
+            .to_string(),
+            tool_state_json: json!({
+                "state": "available",
+                "registered_tools": tool_names,
+            })
+            .to_string(),
+        }
+    }
+
     fn start(
         &self,
         request: WorkerStart,
@@ -45,6 +80,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
         let objective = request.objective;
+        let recovery_instruction = request.recovery_instruction;
         let initial_user_messages = request.initial_user_messages;
 
         Box::pin(async move {
@@ -52,6 +88,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 return Err(WorkerError::Startup("worker objective is required".into()));
             }
             let handle = WorkerHandle::new(cancellation.clone());
+            if let Some(instruction) = recovery_instruction.as_deref()
+                && instruction.starts_with("RECOVERY_CONTROLLER_UNSAFE:")
+            {
+                handle.report_recovery_conflict(instruction.to_owned());
+                return Ok(handle);
+            }
             for message in initial_user_messages {
                 handle.deliver_worker_message(message);
             }
@@ -85,7 +127,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                     };
                     runtime.block_on(async move {
                         let mut agent = Agent::new(provider, worker_tools, config);
-                        let mut prompt = objective;
+                        // Recovery is a separate agent turn so the original task cannot
+                        // begin until the durable recovery boundary has reached the provider.
+                        let mut recovery_phase = recovery_instruction.is_some();
+                        let mut prompt = recovery_instruction.unwrap_or_else(|| objective.clone());
                         'run: loop {
                             let stream = match agent.run(prompt).await {
                                 Ok(stream) => stream,
@@ -127,6 +172,11 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                     },
                                     event = stream.next() => match event {
                                         Some(AgentEvent::Done { .. }) | None => {
+                                            if recovery_phase {
+                                                recovery_phase = false;
+                                                prompt = objective.clone();
+                                                continue 'run;
+                                            }
                                             if pause_forwarded {
                                                 reporter.report_paused();
                                                 break 'run;
@@ -139,6 +189,11 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             break 'run;
                                         }
                                         Some(AgentEvent::Cancelled) => {
+                                            if recovery_phase {
+                                                recovery_phase = false;
+                                                prompt = objective.clone();
+                                                continue 'run;
+                                            }
                                             if pause_forwarded {
                                                 reporter.report_paused();
                                                 break 'run;
@@ -167,6 +222,19 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             Ok(handle)
         })
     }
+}
+
+fn git_output(directory: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 struct DaemonSendMessageTool {
@@ -332,7 +400,7 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -345,6 +413,8 @@ mod tests {
     };
     use yi_agent_core::{ProviderError, ProviderEvent, ProviderRequest};
     use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
+    use yi_agent_store::repository::RuntimeRepository;
+    use yi_agent_store::runtime::RuntimeCoordinator;
 
     use super::*;
 
@@ -358,6 +428,170 @@ mod tests {
         ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
             Ok(futures::stream::pending().boxed())
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(futures::stream::iter([ProviderEvent::Stop {
+                reason: yi_agent_core::StopReason::EndTurn,
+            }])
+            .boxed())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingHangingProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingHangingProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_runs_recovery_controller_before_original_objective() {
+        let directory = TempDir::new().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+        let recovery = "RECOVERY_CONTROLLER: inspect durable evidence before continuing";
+        let objective = "ORIGINAL_OBJECTIVE: modify the implementation";
+        let handle = factory
+            .start(
+                WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+                    .with_objective(objective)
+                    .with_recovery_instruction(recovery),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if provider.requests.lock().unwrap().len() == 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery and objective must use separate provider turns");
+
+        let requests = provider.requests.lock().unwrap();
+        let first = format!("{:?}", requests[0].messages);
+        let second = format!("{:?}", requests[1].messages);
+        assert!(first.contains(recovery));
+        assert!(!first.contains(objective));
+        assert!(second.contains(recovery));
+        assert!(second.contains(objective));
+        handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_blocks_unsafe_recovery_before_any_provider_action() {
+        let directory = TempDir::new().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+        let handle = factory
+            .start(
+                WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+                    .with_objective("ORIGINAL_OBJECTIVE: must not run")
+                    .with_recovery_instruction(
+                        "RECOVERY_CONTROLLER_UNSAFE: no recorded worktree is available",
+                    ),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if handle.take_events().iter().any(|event| {
+                    matches!(event, WorkerEvent::RecoveryConflict(message) if message.contains("no recorded worktree"))
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unsafe recovery must block before any provider call");
+        assert!(provider.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restarted_daemon_worker_receives_durable_recovery_evidence_from_normal_work() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let provider = Arc::new(RecordingHangingProvider::default());
+        let factory = Arc::new(DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        ));
+        let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+        let session = coordinator.create_session().unwrap();
+        let task = coordinator.root_task_id(&session).unwrap();
+        coordinator.start_worker(&session, &task).await.unwrap();
+        let first_worker = coordinator
+            .worker_cancellation(&session, &task)
+            .await
+            .unwrap();
+
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .recover_inflight_tasks()
+            .unwrap();
+        first_worker.cancel();
+
+        let restarted = RuntimeCoordinator::open(&database, factory).unwrap();
+        restarted.resume_task(&session, &task).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if provider.requests.lock().unwrap().len() == 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resumed daemon worker should begin at the recovery controller");
+
+        let requests = provider.requests.lock().unwrap();
+        let recovery_prompt = match &requests[1].messages[0].content[..] {
+            [yi_agent_core::ContentBlock::Text(text)] => text,
+            content => panic!("expected a text-only recovery prompt, got {content:?}"),
+        };
+        assert!(recovery_prompt.contains("recorded workspace lease: workspace:"));
+        assert!(recovery_prompt.contains("recorded worktree: worktree:"));
+        assert!(!recovery_prompt.contains("<none recorded>"));
+        assert!(recovery_prompt.contains("\"state\":\"available\""));
     }
 
     #[tokio::test]

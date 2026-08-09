@@ -28,6 +28,27 @@ pub struct WorkerStart {
     pub recovery_instruction: Option<String>,
 }
 
+/// Non-secret evidence recorded when a worker is admitted. The runtime keeps
+/// it with the attempt so a restart can establish a safe recovery boundary.
+#[derive(Debug, Clone)]
+pub struct WorkerRecoveryContext {
+    pub workspace_lease_id: Option<String>,
+    pub worktree_lease: Option<String>,
+    pub checkpoint_json: String,
+    pub tool_state_json: String,
+}
+
+impl Default for WorkerRecoveryContext {
+    fn default() -> Self {
+        Self {
+            workspace_lease_id: None,
+            worktree_lease: None,
+            checkpoint_json: r#"{"state":"unavailable","reason":"worker factory did not report a safe checkpoint"}"#.into(),
+            tool_state_json: r#"{"state":"unavailable","reason":"worker factory did not report tool state"}"#.into(),
+        }
+    }
+}
+
 impl WorkerStart {
     pub fn new(task_id: TaskId, attempt_id: AttemptId, root_session_id: RootSessionId) -> Self {
         Self {
@@ -243,6 +264,14 @@ pub trait AgentWorkerFactory: Send + Sync {
     /// factory, so they must retain queued tasks without starting them.
     fn is_available(&self) -> bool {
         true
+    }
+
+    /// Supplies the facts that must survive an interrupted worker attempt.
+    /// Factories without a workspace deliberately return explicit absence,
+    /// which turns a later recovery attempt into a conflict instead of a
+    /// replay from an unknown base.
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        WorkerRecoveryContext::default()
     }
 
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>>;
