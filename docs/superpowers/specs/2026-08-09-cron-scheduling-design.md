@@ -20,6 +20,19 @@ updated; it is never stored for deferred interpretation. The implementation
 uses a maintained Rust Cron parser rather than a project-local parser, with
 its parser configuration constrained to this five-field contract.
 
+## Natural-Language Creation
+
+The CLI and TUI may accept a natural-language schedule request such as
+"every weekday at 09:00, check project tasks." The parser produces a preview
+containing the five-field Cron expression, local time zone, objective, and
+conservative default policy. It does not create or modify a schedule.
+
+The user must explicitly confirm that preview before the normal validated
+schedule-create path persists it. Ambiguous input produces a clarification
+request; it never guesses a cadence, time zone, or permission elevation. The
+natural-language layer is therefore an ergonomic front end, not a second
+execution format or an authority bypass.
+
 ## Durable Model
 
 `schedules` owns an immutable `ScheduleDefinition`, a state, and the next due
@@ -64,6 +77,8 @@ tick more than once is idempotent.
 - The daemon tick invokes the runtime evaluator using its local current time.
 - IPC/CLI surface exposes only the validated five-field representation; it
   must not accept a second-based or system-cron alternative.
+- Natural-language input returns a confirmation preview and calls the same
+  validated create operation only after user confirmation.
 
 ## Failure Handling
 
@@ -77,6 +92,8 @@ visible to overlap logic until its task tree is terminal.
 ## Tests
 
 - A five-field expression is accepted and a six-field expression is rejected.
+- Natural-language input produces a five-field preview but creates no schedule
+  until the user confirms it; ambiguous input requires clarification.
 - The evaluator advances `next_run_at` in the daemon local time zone.
 - One due occurrence creates one isolated root whose objective and contract
   snapshot match the schedule, with no interactive mailbox/history.
