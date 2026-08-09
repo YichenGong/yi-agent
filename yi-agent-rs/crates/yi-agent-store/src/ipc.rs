@@ -834,7 +834,7 @@ struct PendingFrameWrite {
 
 impl PendingFrameWrite {
     fn new(envelope: &ResponseEnvelope) -> Result<Self, IpcError> {
-        let (mut bytes, is_event, is_resync) = encode_envelope(envelope)?;
+        let (mut bytes, is_event, is_resync) = encode_subscription_envelope(envelope)?;
         bytes.push(b'\n');
         Ok(Self {
             bytes,
@@ -938,16 +938,37 @@ fn write_envelope_frame(
     stream: &mut UnixStream,
     envelope: &ResponseEnvelope,
 ) -> Result<(), IpcError> {
-    let (frame, _, _) = encode_envelope(envelope)?;
+    let frame = match encode_envelope(envelope) {
+        Ok(frame) => frame,
+        // Resynchronization is meaningful only for event subscriptions. A
+        // regular command reply must retain its typed error semantics.
+        Err(IpcError::FrameTooLarge) => encode_envelope(&response_envelope(
+            &envelope.request_id,
+            None,
+            IpcResponse::Error {
+                code: IpcErrorCode::Internal,
+            },
+        ))?,
+        Err(error) => return Err(error),
+    };
     stream.write_all(&frame)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
 }
 
-fn encode_envelope(envelope: &ResponseEnvelope) -> Result<(Vec<u8>, bool, bool), IpcError> {
+fn encode_envelope(envelope: &ResponseEnvelope) -> Result<Vec<u8>, IpcError> {
     let frame = serde_json::to_vec(envelope)?;
     if frame.len() <= MAX_FRAME_BYTES {
+        return Ok(frame);
+    }
+    Err(IpcError::FrameTooLarge)
+}
+
+fn encode_subscription_envelope(
+    envelope: &ResponseEnvelope,
+) -> Result<(Vec<u8>, bool, bool), IpcError> {
+    if let Ok(frame) = encode_envelope(envelope) {
         return Ok((
             frame,
             matches!(envelope.result, IpcResponse::Event(_)),
@@ -1172,6 +1193,35 @@ mod subscription_queue_tests {
             SubscriptionFrameWrite::Dropped
         );
         assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn normal_oversized_response_uses_a_typed_error_not_subscription_resync() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let response = response_envelope(
+            "normal-client",
+            None,
+            IpcResponse::TaskDetail(IpcTaskDetail {
+                task_id: "task".into(),
+                session_id: "session".into(),
+                parent_task_id: None,
+                depth: 0,
+                state: "queued".into(),
+                delivery_json: "x".repeat(MAX_FRAME_BYTES),
+            }),
+        );
+
+        write_envelope_frame(&mut writer, &response).unwrap();
+        let mut reader = BufReader::new(reader);
+        let frame = read_limited_frame(&mut reader).unwrap().unwrap();
+        let response: ResponseEnvelope = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(response.request_id, "normal-client");
+        assert_eq!(
+            response.result,
+            IpcResponse::Error {
+                code: IpcErrorCode::Internal,
+            }
+        );
     }
 
     fn set_send_buffer(stream: &UnixStream, bytes: libc::c_int) {
