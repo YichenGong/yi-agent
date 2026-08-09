@@ -28,3 +28,4 @@ yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统
 - [x] Web 工具：WebFetch + WebSearch — `crates/yi-agent-tools/src/web/` 目录，WebSearch 在有 `BOCHA_API_KEY` 时注册 — [设计](../plans/2026-07-19-yi-agent-web-tools-design.md)
 - [x] Skill 工具：SkillTool — `crates/yi-agent-tools/src/skill_tool.rs` 实现 `Tool` trait — [设计](../plans/2026-07-25-skills-design.md)
 - [x] Sandbox（进程隔离）— `crates/yi-agent-tools/src/sandbox.rs` 实现 `read-only` / `workspace-write` / `danger-full-access`；macOS 通过 Seatbelt、Linux 通过 Bubblewrap 强制文件写入与网络策略；运行 `cargo test -p yi-agent-tools workspace_sandbox read_only_sandbox` 验证受限模式
+- [x] YOLO full bypass default — `crates/yi-agent/src/config.rs` 在未显式指定 `--sandbox` 或 `YI_AGENT_SANDBOX` 时为 `--yolo` 选择 `danger-full-access`；运行 `cargo test -p yi-agent --bin yi-agent config::tests::load_yolo_from_cli_flag` 验证
