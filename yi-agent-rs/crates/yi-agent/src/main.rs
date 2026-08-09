@@ -88,6 +88,9 @@ fn control_agent(action: AgentAction) -> Result<()> {
                 after_event_id: None,
             }
         }
+        AgentAction::Mailbox { task_id } => {
+            yi_agent_store::ipc::IpcRequest::ReadTaskMailbox { task_id }
+        }
         AgentAction::Message { task_id, text, .. } => {
             yi_agent_store::ipc::IpcRequest::SendUserMessage {
                 task_id,
@@ -144,6 +147,15 @@ fn control_agent(action: AgentAction) -> Result<()> {
         yi_agent_store::ipc::IpcResponse::TaskEvents { events } => {
             for event in events {
                 println!("{} {} {}", event.event_id, event.kind, event.payload_json);
+            }
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::TaskMailbox { messages } => {
+            for message in messages {
+                println!(
+                    "{} {} {} {}",
+                    message.message_id, message.kind, message.priority, message.payload_json
+                );
             }
             Ok(())
         }

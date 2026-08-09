@@ -133,6 +133,9 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after_event_id: Option<i64>,
     },
+    ReadTaskMailbox {
+        task_id: String,
+    },
     SubscribeEvents {
         after_event_id: i64,
         #[serde(default)]
@@ -189,6 +192,9 @@ pub enum IpcResponse {
     TaskDetail(IpcTaskDetail),
     TaskEvents {
         events: Vec<IpcEvent>,
+    },
+    TaskMailbox {
+        messages: Vec<IpcMailboxMessage>,
     },
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
@@ -272,6 +278,18 @@ pub struct IpcEvent {
     pub task_id: String,
     pub kind: String,
     pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcMailboxMessage {
+    pub message_id: String,
+    pub recipient_task_id: String,
+    pub sender_task_id: Option<String>,
+    pub kind: String,
+    pub priority: i64,
+    pub payload_json: String,
+    pub delivered_at: Option<String>,
+    pub created_at: String,
 }
 
 /// The stable wire payload for a top-level subscription event frame.
@@ -1760,6 +1778,24 @@ fn respond(
                 .map(ipc_event)
                 .collect();
             Ok(IpcResponse::TaskEvents { events })
+        }
+        IpcRequest::ReadTaskMailbox { task_id } => {
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let messages = repository
+                .mailbox_messages_for_task(&task_id)?
+                .into_iter()
+                .map(|message| IpcMailboxMessage {
+                    message_id: message.message_id,
+                    recipient_task_id: message.recipient_task_id.to_string(),
+                    sender_task_id: message.sender_task_id.map(|task_id| task_id.to_string()),
+                    kind: message.kind,
+                    priority: message.priority,
+                    payload_json: message.payload_json,
+                    delivered_at: message.delivered_at,
+                    created_at: message.created_at,
+                })
+                .collect();
+            Ok(IpcResponse::TaskMailbox { messages })
         }
         IpcRequest::SubscribeEvents {
             after_event_id,

@@ -205,6 +205,18 @@ pub struct PersistedEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedMailboxMessage {
+    pub message_id: String,
+    pub recipient_task_id: TaskId,
+    pub sender_task_id: Option<TaskId>,
+    pub kind: String,
+    pub priority: i64,
+    pub payload_json: String,
+    pub delivered_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedTask {
     pub task_id: String,
     pub state: String,
@@ -1298,6 +1310,71 @@ impl RuntimeRepository {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Returns a task's durable mailbox in enqueue order without acknowledging it.
+    pub fn mailbox_messages_for_task(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<PersistedMailboxMessage>, RepositoryError> {
+        self.task_detail(task)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, recipient_task_id, sender_task_id, kind, priority, payload_json,
+                    delivered_at, created_at
+             FROM mailbox_messages
+             WHERE recipient_task_id = ?1
+             ORDER BY rowid",
+        )?;
+        statement
+            .query_map(params![task.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (
+                    message_id,
+                    recipient_task_id,
+                    sender_task_id,
+                    kind,
+                    priority,
+                    payload_json,
+                    delivered_at,
+                    created_at,
+                ) = row?;
+                Ok(PersistedMailboxMessage {
+                    message_id,
+                    recipient_task_id: recipient_task_id.parse().map_err(|_| {
+                        RepositoryError::UnknownEventKind {
+                            kind: format!(
+                                "invalid recipient task ID in store: {recipient_task_id}"
+                            ),
+                        }
+                    })?,
+                    sender_task_id: sender_task_id
+                        .map(|sender| {
+                            sender
+                                .parse()
+                                .map_err(|_| RepositoryError::UnknownEventKind {
+                                    kind: format!("invalid sender task ID in store: {sender}"),
+                                })
+                        })
+                        .transpose()?,
+                    kind,
+                    priority,
+                    payload_json,
+                    delivered_at,
+                    created_at,
+                })
+            })
+            .collect()
     }
 
     /// Atomically changes the task snapshot and appends its corresponding journal entry.

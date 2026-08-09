@@ -1603,6 +1603,58 @@ fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
 }
 
 #[test]
+fn daemon_reads_a_task_mailbox_without_consuming_its_messages() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::SendUserMessage {
+            task_id: root_task_id.clone(),
+            message: "Prefer a focused status report".into(),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::TaskMailbox { messages } = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskMailbox {
+            task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected task mailbox");
+    };
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].recipient_task_id, root_task_id);
+    assert_eq!(messages[0].sender_task_id, None);
+    assert_eq!(messages[0].kind, "user_override");
+    assert_eq!(
+        messages[0].payload_json,
+        r#"{"message":"Prefer a focused status report"}"#
+    );
+    assert_eq!(messages[0].delivered_at, None);
+
+    let IpcResponse::TaskMailbox { messages } = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskMailbox {
+            task_id: root_task_id,
+        },
+    )
+    .unwrap() else {
+        panic!("expected task mailbox");
+    };
+    assert_eq!(messages.len(), 1, "reading must not consume messages");
+}
+
+#[test]
 fn daemon_retries_a_terminal_task_through_its_control_api() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
