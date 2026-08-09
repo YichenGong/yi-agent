@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -20,6 +20,10 @@ use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+// Invalid JSON has no trustworthy request ID to echo, so its error frame uses
+// this documented stable empty identifier.
+const MISSING_REQUEST_ID: &str = "";
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -40,12 +44,26 @@ pub enum IpcError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RequestEnvelope {
-    protocol_version: u32,
-    request: IpcRequest,
+pub struct RequestEnvelope {
+    pub protocol_version: u32,
+    pub request_id: String,
+    #[serde(rename = "command")]
+    pub command: IpcRequest,
+}
+
+/// One versioned response frame. Subscription event frames additionally carry
+/// their durable event ID while retaining the subscription request correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseEnvelope {
+    pub protocol_version: u32,
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<i64>,
+    pub result: IpcResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum IpcRequest {
     Status,
     Stop,
@@ -101,6 +119,7 @@ pub enum IpcRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum IpcResponse {
     Status {
         high_water_event_id: i64,
@@ -132,8 +151,47 @@ pub enum IpcResponse {
         supported_max: u32,
     },
     Error {
-        code: String,
+        code: IpcErrorCode,
     },
+}
+
+/// Stable public error categories for IPC consumers. Error responses never
+/// serialize their underlying database, environment, or implementation detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcErrorCode {
+    DaemonNotRunning,
+    NotFound,
+    InvalidState,
+    AuthorityDenied,
+    ConfirmationRequired,
+    Conflict,
+    Validation,
+    RateLimited,
+    Internal,
+    InvalidRequest,
+    FrameTooLarge,
+    UnsupportedProtocol,
+}
+
+impl std::fmt::Display for IpcErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = match self {
+            Self::DaemonNotRunning => "daemon_not_running",
+            Self::NotFound => "not_found",
+            Self::InvalidState => "invalid_state",
+            Self::AuthorityDenied => "authority_denied",
+            Self::ConfirmationRequired => "confirmation_required",
+            Self::Conflict => "conflict",
+            Self::Validation => "validation",
+            Self::RateLimited => "rate_limited",
+            Self::Internal => "internal",
+            Self::InvalidRequest => "invalid_request",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+        };
+        formatter.write_str(code)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,17 +227,34 @@ pub struct IpcEvent {
 /// A client-side event stream. The first frame is always a `Subscription` snapshot.
 pub struct Subscription {
     reader: BufReader<UnixStream>,
+    request_id: String,
 }
 
 impl Subscription {
-    pub fn next_response(&mut self) -> Result<IpcResponse, IpcError> {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Reads the next framed response while checking subscription correlation.
+    pub fn next_frame(&mut self) -> Result<ResponseEnvelope, IpcError> {
         let response = read_limited_frame(&mut self.reader)?.ok_or_else(|| {
             IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "daemon closed subscription",
             ))
         })?;
-        Ok(serde_json::from_slice(&response)?)
+        let envelope: ResponseEnvelope = serde_json::from_slice(&response)?;
+        if envelope.protocol_version != PROTOCOL_VERSION || envelope.request_id != self.request_id {
+            return Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "subscription response envelope identity mismatch",
+            )));
+        }
+        Ok(envelope)
+    }
+
+    pub fn next_response(&mut self) -> Result<IpcResponse, IpcError> {
+        Ok(self.next_frame()?.result)
     }
 }
 
@@ -367,14 +442,22 @@ pub fn send_request_with_version(
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
     let mut stream = UnixStream::connect(socket_path)?;
-    write_request(&mut stream, protocol_version, request)?;
+    let request_id = next_request_id();
+    write_request(&mut stream, protocol_version, request_id.clone(), request)?;
     let response = read_limited_frame(&mut BufReader::new(stream))?.ok_or_else(|| {
         IpcError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "daemon closed request connection",
         ))
     })?;
-    Ok(serde_json::from_slice(&response)?)
+    let envelope: ResponseEnvelope = serde_json::from_slice(&response)?;
+    if envelope.protocol_version != PROTOCOL_VERSION || envelope.request_id != request_id {
+        return Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response envelope identity mismatch",
+        )));
+    }
+    Ok(envelope.result)
 }
 
 pub fn subscribe(
@@ -382,24 +465,29 @@ pub fn subscribe(
     after_event_id: i64,
 ) -> Result<Subscription, IpcError> {
     let mut stream = UnixStream::connect(socket_path)?;
+    let request_id = next_request_id();
     write_request(
         &mut stream,
         PROTOCOL_VERSION,
+        request_id.clone(),
         IpcRequest::SubscribeEvents { after_event_id },
     )?;
     Ok(Subscription {
         reader: BufReader::new(stream),
+        request_id,
     })
 }
 
 fn write_request(
     stream: &mut UnixStream,
     protocol_version: u32,
+    request_id: String,
     request: IpcRequest,
 ) -> Result<(), IpcError> {
     let frame = serde_json::to_vec(&RequestEnvelope {
         protocol_version,
-        request,
+        request_id,
+        command: request,
     })?;
     if frame.len() > MAX_FRAME_BYTES {
         return Err(IpcError::FrameTooLarge);
@@ -420,10 +508,12 @@ fn handle_client(
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     let frame = match read_limited_frame(&mut BufReader::new(stream.try_clone()?)) {
         Err(IpcError::FrameTooLarge) => {
-            return write_response(
+            return write_response_frame(
                 &mut stream,
+                MISSING_REQUEST_ID,
+                None,
                 &IpcResponse::Error {
-                    code: "frame_too_large".into(),
+                    code: IpcErrorCode::FrameTooLarge,
                 },
             );
         }
@@ -431,6 +521,7 @@ fn handle_client(
         Ok(None) => return Ok(()),
         Ok(Some(frame)) => frame,
     };
+    let request_id = request_id_from_frame(&frame);
     let response = match serde_json::from_slice::<RequestEnvelope>(&frame) {
         Ok(envelope) if envelope.protocol_version != PROTOCOL_VERSION => {
             IpcResponse::UnsupportedProtocol {
@@ -438,7 +529,7 @@ fn handle_client(
                 supported_max: PROTOCOL_VERSION,
             }
         }
-        Ok(envelope) => match envelope.request {
+        Ok(envelope) => match envelope.command {
             IpcRequest::Stop => {
                 stop.store(true, Ordering::Release);
                 IpcResponse::Stopping
@@ -450,20 +541,19 @@ fn handle_client(
                     stop,
                     coordinator,
                     after_event_id,
+                    &envelope.request_id,
                 );
             }
             request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
-                Err(_) => IpcResponse::Error {
-                    code: "internal".into(),
-                },
+                Err(error) => error_response(&error),
             },
         },
         Err(_) => IpcResponse::Error {
-            code: "invalid_request".into(),
+            code: IpcErrorCode::InvalidRequest,
         },
     };
-    write_response(&mut stream, &response)
+    write_response_frame(&mut stream, &request_id, None, &response)
 }
 
 fn stream_subscription(
@@ -472,12 +562,15 @@ fn stream_subscription(
     stop: &AtomicBool,
     coordinator: &RuntimeCoordinator,
     after_event_id: i64,
+    request_id: &str,
 ) -> Result<(), IpcError> {
     let mut repository = RuntimeRepository::open(database_path)?;
     let snapshot = repository.subscription_snapshot(after_event_id)?;
     let mut cursor = snapshot.high_water_event_id;
-    write_response(
+    write_response_frame(
         stream,
+        request_id,
+        None,
         &IpcResponse::Subscription(SubscriptionSnapshot {
             high_water_event_id: snapshot.high_water_event_id,
             tasks: snapshot
@@ -500,24 +593,100 @@ fn stream_subscription(
         let events = repository.event_records_after(cursor)?;
         for event in events {
             cursor = event.id;
-            write_response(stream, &IpcResponse::Event(ipc_event(event)))?;
+            let event_id = event.id;
+            write_response_frame(
+                stream,
+                request_id,
+                Some(event_id),
+                &IpcResponse::Event(ipc_event(event)),
+            )?;
         }
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }
 
-fn write_response(stream: &mut UnixStream, response: &IpcResponse) -> Result<(), IpcError> {
-    let frame = serde_json::to_vec(response)?;
+fn write_response_frame(
+    stream: &mut UnixStream,
+    request_id: &str,
+    event_id: Option<i64>,
+    response: &IpcResponse,
+) -> Result<(), IpcError> {
+    let envelope = ResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: request_id.into(),
+        event_id,
+        result: response.clone(),
+    };
+    let frame = serde_json::to_vec(&envelope)?;
     let frame = if frame.len() <= MAX_FRAME_BYTES {
         frame
     } else {
-        serde_json::to_vec(&IpcResponse::ResyncRequired)?
+        serde_json::to_vec(&ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request_id.into(),
+            event_id: None,
+            result: IpcResponse::ResyncRequired,
+        })?
     };
     stream.write_all(&frame)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+fn next_request_id() -> String {
+    format!(
+        "request-{}-{}",
+        std::process::id(),
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn request_id_from_frame(frame: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|value| value.get("request_id")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| MISSING_REQUEST_ID.into())
+}
+
+fn error_response(error: &IpcError) -> IpcResponse {
+    IpcResponse::Error {
+        code: ipc_error_code(error),
+    }
+}
+
+fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
+    match error {
+        IpcError::Repository(error) => repository_error_code(error),
+        IpcError::Runtime(RuntimeCoordinatorError::SessionNotFound(_)) => IpcErrorCode::NotFound,
+        IpcError::Runtime(RuntimeCoordinatorError::Repository(error)) => {
+            repository_error_code(error)
+        }
+        IpcError::Runtime(RuntimeCoordinatorError::Supervisor(_))
+        | IpcError::Runtime(RuntimeCoordinatorError::Spawn(_)) => IpcErrorCode::InvalidState,
+        IpcError::Runtime(RuntimeCoordinatorError::ResidentCapacityExhausted) => {
+            IpcErrorCode::RateLimited
+        }
+        IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            IpcErrorCode::Validation
+        }
+        IpcError::Json(_) => IpcErrorCode::Validation,
+        IpcError::FrameTooLarge => IpcErrorCode::FrameTooLarge,
+        _ => IpcErrorCode::Internal,
+    }
+}
+
+fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcErrorCode {
+    match error {
+        crate::repository::RepositoryError::TaskNotFound { .. }
+        | crate::repository::RepositoryError::MailboxMessageNotFound { .. } => {
+            IpcErrorCode::NotFound
+        }
+        crate::repository::RepositoryError::Sql(_)
+        | crate::repository::RepositoryError::Json(_)
+        | crate::repository::RepositoryError::UnknownEventKind { .. } => IpcErrorCode::Internal,
+    }
 }
 
 fn read_limited_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, IpcError> {

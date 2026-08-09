@@ -1,7 +1,10 @@
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::MessageId;
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
@@ -250,6 +253,123 @@ fn daemon_rejects_second_instance_and_reports_protocol_mismatch() {
     assert!(Daemon::start(&runtime, &database).is_err());
     let response = send_request_with_version(daemon.socket_path(), 2, IpcRequest::Status).unwrap();
     assert!(matches!(response, IpcResponse::UnsupportedProtocol { .. }));
+}
+
+#[test]
+fn raw_ipc_replies_are_versioned_and_echo_the_request_id() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    for (request_id, protocol_version, command, expected_type, expected_error_code) in [
+        (
+            "status-request",
+            1,
+            json!({"type": "Status"}),
+            "Status",
+            None,
+        ),
+        (
+            "version-request",
+            99,
+            json!({"type": "Status"}),
+            "UnsupportedProtocol",
+            None,
+        ),
+        (
+            "missing-task-request",
+            1,
+            json!({"type": "InspectTask", "task_id": TaskId::new().to_string()}),
+            "Error",
+            Some("not_found"),
+        ),
+        (
+            "invalid-task-request",
+            1,
+            json!({"type": "InspectTask", "task_id": "not-a-task-id"}),
+            "Error",
+            Some("validation"),
+        ),
+    ] {
+        let response = raw_request(
+            daemon.socket_path(),
+            json!({
+                "protocol_version": protocol_version,
+                "request_id": request_id,
+                "command": command,
+            }),
+        );
+        assert_eq!(response["protocol_version"], 1);
+        assert_eq!(response["request_id"], request_id);
+        assert_eq!(response["result"]["type"], expected_type);
+        assert!(
+            response.get("Status").is_none(),
+            "response must not be bare"
+        );
+
+        if let Some(expected_error_code) = expected_error_code {
+            assert_eq!(response["result"]["code"], expected_error_code);
+        }
+    }
+
+    let malformed = raw_request_text(daemon.socket_path(), "{malformed");
+    assert_eq!(malformed["protocol_version"], 1);
+    assert_eq!(malformed["request_id"], "");
+    assert_eq!(malformed["result"]["type"], "Error");
+    assert_eq!(malformed["result"]["code"], "invalid_request");
+}
+
+#[test]
+fn subscription_frames_are_versioned_and_correlated_to_the_request() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+
+    let request_id = "subscription-request";
+    let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
+    let frame = json!({
+        "protocol_version": 1,
+        "request_id": request_id,
+        "command": {"type": "SubscribeEvents", "after_event_id": 0},
+    });
+    writeln!(stream, "{}", serde_json::to_string(&frame).unwrap()).unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+
+    let snapshot = raw_response(&mut reader);
+    assert_eq!(snapshot["protocol_version"], 1);
+    assert_eq!(snapshot["request_id"], request_id);
+    assert_eq!(snapshot["result"]["type"], "Subscription");
+
+    repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+    let event = raw_response(&mut reader);
+    assert_eq!(event["protocol_version"], 1);
+    assert_eq!(event["request_id"], request_id);
+    assert_eq!(event["event_id"], 1);
+    assert_eq!(event["result"]["type"], "Event");
+}
+
+fn raw_request(socket_path: &std::path::Path, request: Value) -> Value {
+    raw_request_text(socket_path, &serde_json::to_string(&request).unwrap())
+}
+
+fn raw_request_text(socket_path: &std::path::Path, request: &str) -> Value {
+    let mut stream = UnixStream::connect(socket_path).unwrap();
+    writeln!(stream, "{request}").unwrap();
+    stream.flush().unwrap();
+    raw_response(&mut BufReader::new(stream))
+}
+
+fn raw_response(reader: &mut BufReader<UnixStream>) -> Value {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
 }
 
 #[test]
