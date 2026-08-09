@@ -91,6 +91,7 @@ fn control_agent(action: AgentAction) -> Result<()> {
         AgentAction::Mailbox { task_id } => {
             yi_agent_store::ipc::IpcRequest::ReadTaskMailbox { task_id }
         }
+        AgentAction::Diff { task_id } => yi_agent_store::ipc::IpcRequest::ReadTaskDiff { task_id },
         AgentAction::Message { task_id, text, .. } => {
             yi_agent_store::ipc::IpcRequest::SendUserMessage {
                 task_id,
@@ -157,6 +158,13 @@ fn control_agent(action: AgentAction) -> Result<()> {
                     message.message_id, message.kind, message.priority, message.payload_json
                 );
             }
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::TaskDiff {
+            task_id,
+            delivery_json,
+        } => {
+            println!("{task_id} {delivery_json}");
             Ok(())
         }
         yi_agent_store::ipc::IpcResponse::TaskCancelled

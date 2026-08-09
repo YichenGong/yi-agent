@@ -136,6 +136,9 @@ pub enum IpcRequest {
     ReadTaskMailbox {
         task_id: String,
     },
+    ReadTaskDiff {
+        task_id: String,
+    },
     SubscribeEvents {
         after_event_id: i64,
         #[serde(default)]
@@ -195,6 +198,10 @@ pub enum IpcResponse {
     },
     TaskMailbox {
         messages: Vec<IpcMailboxMessage>,
+    },
+    TaskDiff {
+        task_id: String,
+        delivery_json: String,
     },
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
@@ -1796,6 +1803,14 @@ fn respond(
                 })
                 .collect();
             Ok(IpcResponse::TaskMailbox { messages })
+        }
+        IpcRequest::ReadTaskDiff { task_id } => {
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let detail = repository.task_detail(&task_id)?;
+            Ok(IpcResponse::TaskDiff {
+                task_id: detail.task_id,
+                delivery_json: detail.delivery_json,
+            })
         }
         IpcRequest::SubscribeEvents {
             after_event_id,

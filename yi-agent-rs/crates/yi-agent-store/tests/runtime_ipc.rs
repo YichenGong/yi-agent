@@ -1655,6 +1655,39 @@ fn daemon_reads_a_task_mailbox_without_consuming_its_messages() {
 }
 
 #[test]
+fn daemon_reads_task_delivery_evidence_for_diff_inspection() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    let IpcResponse::TaskDiff {
+        task_id,
+        delivery_json,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskDiff {
+            task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected task delivery evidence");
+    };
+
+    assert_eq!(task_id, root_task_id);
+    let evidence: Value = serde_json::from_str(&delivery_json).unwrap();
+    assert_eq!(
+        evidence["objective"],
+        "Root session objective not specified."
+    );
+}
+
+#[test]
 fn daemon_retries_a_terminal_task_through_its_control_api() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
