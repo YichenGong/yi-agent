@@ -694,6 +694,18 @@ pub enum TaskEvent {
         attempt_id: AttemptId,
         reason: BlockReason,
     },
+    WatchdogStalled {
+        attempt_id: AttemptId,
+        evidence: WatchdogEvidence,
+    },
+    WatchdogTimedOut {
+        attempt_id: AttemptId,
+        kind: TimeoutKind,
+    },
+    WatchdogBudgetExhausted {
+        attempt_id: AttemptId,
+        kind: BudgetKind,
+    },
     RetryRequested {
         attempt_id: AttemptId,
     },
@@ -718,6 +730,9 @@ impl TaskEvent {
             | Self::ResumeRequested { attempt_id }
             | Self::RuntimeInterrupted { attempt_id, .. }
             | Self::RecoveryConflict { attempt_id, .. }
+            | Self::WatchdogStalled { attempt_id, .. }
+            | Self::WatchdogTimedOut { attempt_id, .. }
+            | Self::WatchdogBudgetExhausted { attempt_id, .. }
             | Self::RetryRequested { attempt_id } => attempt_id,
         }
     }
@@ -930,6 +945,15 @@ pub fn reduce(
         }
         TaskEvent::RecoveryConflict { reason, .. } => {
             transition(task, TaskState::Blocked(reason), now)?
+        }
+        TaskEvent::WatchdogStalled { evidence, .. } => {
+            transition(task, TaskState::Stalled(evidence), now)?
+        }
+        TaskEvent::WatchdogTimedOut { kind, .. } => {
+            transition(task, TaskState::TimedOut(kind), now)?
+        }
+        TaskEvent::WatchdogBudgetExhausted { kind, .. } => {
+            transition(task, TaskState::BudgetExhausted(kind), now)?
         }
         TaskEvent::RetryRequested { .. } => {
             if !task.state().is_terminal() {

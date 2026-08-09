@@ -1,9 +1,12 @@
 use std::path::Path;
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yi_agent_core::subagent::task::MessageId;
+use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
@@ -37,6 +40,9 @@ pub enum RuntimeEvent {
     TaskPauseRequested,
     TaskPaused,
     TaskBlocked,
+    TaskStalled,
+    TaskTimedOut,
+    TaskBudgetExhausted,
     TaskFailed,
     TaskRecoveryRequired,
     TaskRecoveryAttested,
@@ -55,6 +61,9 @@ impl RuntimeEvent {
             Self::TaskPauseRequested => "task_pause_requested",
             Self::TaskPaused => "task_paused",
             Self::TaskBlocked => "task_blocked",
+            Self::TaskStalled => "task_stalled",
+            Self::TaskTimedOut => "task_timed_out",
+            Self::TaskBudgetExhausted => "task_budget_exhausted",
             Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
             Self::TaskRecoveryAttested => "task_recovery_attested",
@@ -73,12 +82,57 @@ impl RuntimeEvent {
             "task_pause_requested" => Ok(Self::TaskPauseRequested),
             "task_paused" => Ok(Self::TaskPaused),
             "task_blocked" => Ok(Self::TaskBlocked),
+            "task_stalled" => Ok(Self::TaskStalled),
+            "task_timed_out" => Ok(Self::TaskTimedOut),
+            "task_budget_exhausted" => Ok(Self::TaskBudgetExhausted),
             "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
             "task_recovery_attested" => Ok(Self::TaskRecoveryAttested),
             "mailbox_message_queued" => Ok(Self::MailboxMessageQueued),
             "mailbox_message_consumed" => Ok(Self::MailboxMessageConsumed),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
+        }
+    }
+}
+
+/// The queued resource wait that made an attempt eligible for a watchdog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchdogResourceWait {
+    pub resource_key: String,
+    pub queued_at: DateTime<Utc>,
+}
+
+/// Durable evidence for a watchdog decision. Generated model text is excluded:
+/// callers update this only from persisted meaningful worker events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchdogEvidence {
+    pub last_meaningful_event_id: Option<i64>,
+    pub last_meaningful_at: DateTime<Utc>,
+    pub elapsed_secs: u64,
+    pub current_wait: Option<WatchdogResourceWait>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogTerminal {
+    Stalled,
+    TimedOut(TimeoutKind),
+    BudgetExhausted(BudgetKind),
+}
+
+impl WatchdogTerminal {
+    const fn state_name(&self) -> &'static str {
+        match self {
+            Self::Stalled => "stalled",
+            Self::TimedOut(_) => "timed_out",
+            Self::BudgetExhausted(_) => "budget_exhausted",
+        }
+    }
+
+    const fn event(&self) -> RuntimeEvent {
+        match self {
+            Self::Stalled => RuntimeEvent::TaskStalled,
+            Self::TimedOut(_) => RuntimeEvent::TaskTimedOut,
+            Self::BudgetExhausted(_) => RuntimeEvent::TaskBudgetExhausted,
         }
     }
 }
@@ -834,6 +888,52 @@ impl RuntimeRepository {
         let event_id = append_event(&transaction, task, event)?;
         transaction.commit()?;
         Ok(event_id)
+    }
+
+    /// Commits a watchdog outcome exactly once for an active attempt. A later
+    /// scan sees the terminal task state and becomes a no-op rather than
+    /// duplicating the terminal audit event or lease release.
+    pub fn record_watchdog_terminal(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        terminal: WatchdogTerminal,
+        evidence: &WatchdogEvidence,
+    ) -> Result<Option<i64>, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3
+               AND state_json IN ('queued', 'running', 'waiting_for_resource',
+                                  'waiting_for_permission', 'waiting_for_children')",
+            params![terminal.state_name(), task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        let terminal_json = serde_json::to_string(evidence)?;
+        transaction.execute(
+            "UPDATE attempts SET state = ?1, ended_at = CURRENT_TIMESTAMP, terminal_json = ?2
+             WHERE id = ?3 AND task_id = ?4",
+            params![
+                terminal.state_name(),
+                terminal_json,
+                attempt.to_string(),
+                task.to_string()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE task_id = ?1 AND state = 'active'",
+            params![task.to_string()],
+        )?;
+        let event_id = append_event(&transaction, task, terminal.event())?;
+        transaction.commit()?;
+        Ok(Some(event_id))
     }
 
     /// Activates a successor attempt while returning the task to the queue.

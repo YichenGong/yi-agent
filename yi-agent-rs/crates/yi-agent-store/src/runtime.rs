@@ -15,13 +15,17 @@ use yi_agent_core::subagent::scheduler::{
     ResourceScope,
 };
 use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError, WaitMode, WaitOutcome};
-use yi_agent_core::subagent::task::{MessageId, PauseReason, RootSessionId, TaskId};
+use yi_agent_core::subagent::task::{
+    MessageId, PauseReason, RootSessionId, TaskId, WatchdogEvidence as CoreWatchdogEvidence,
+};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerRecoveryContext, WorkerRecoveryPreflight,
     WorkerRecoveryPreflightResult,
 };
 
-use crate::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
+use crate::repository::{
+    RepositoryError, RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogTerminal,
+};
 
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
@@ -643,6 +647,47 @@ impl RuntimeCoordinator {
             self.start_worker(session, task).await?;
         }
         Ok(())
+    }
+
+    /// Applies a durable watchdog terminal decision and stops the corresponding
+    /// worker. The repository transaction is the authority for duplicate scans.
+    pub async fn record_watchdog_terminal(
+        &self,
+        session: &RootSessionId,
+        task: &TaskId,
+        terminal: WatchdogTerminal,
+        evidence: WatchdogEvidence,
+    ) -> Result<bool, RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        let mut supervisor = supervisor.lock().await;
+        let attempt = supervisor
+            .task(task)
+            .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
+            .active_attempt_id()
+            .clone();
+        let committed = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_watchdog_terminal(task, &attempt, terminal.clone(), &evidence)?;
+        if committed.is_none() {
+            return Ok(false);
+        }
+
+        match terminal {
+            WatchdogTerminal::Stalled => supervisor.stall_task(
+                task,
+                CoreWatchdogEvidence(
+                    serde_json::to_string(&evidence).expect("watchdog evidence is serializable"),
+                ),
+            ),
+            WatchdogTerminal::TimedOut(kind) => supervisor.timeout_task(task, kind),
+            WatchdogTerminal::BudgetExhausted(kind) => supervisor.exhaust_task_budget(task, kind),
+        }
+        .map_err(RuntimeCoordinatorError::Supervisor)?;
+        drop(supervisor);
+        self.release_resident_lease(task);
+        Ok(true)
     }
 
     pub async fn cancel_task(

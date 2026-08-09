@@ -11,8 +11,8 @@ use uuid::Uuid;
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::scheduler::AdmissionPriority;
 use super::task::{
-    AgentTask, BlockReason, CancelReason, PauseReason, RecoveryEvidence, RootSessionId, TaskEvent,
-    TaskFailure, TaskId, TaskState,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, PauseReason, RecoveryEvidence,
+    RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind, WatchdogEvidence,
 };
 use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart};
 use crate::agent::ProviderTurnGate;
@@ -862,6 +862,54 @@ impl AgentSupervisor {
             chrono::Utc::now(),
         )
         .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(())
+    }
+
+    pub fn stall_task(
+        &mut self,
+        task_id: &TaskId,
+        evidence: WatchdogEvidence,
+    ) -> Result<(), String> {
+        self.reduce_watchdog_event(task_id, |attempt_id| TaskEvent::WatchdogStalled {
+            attempt_id,
+            evidence,
+        })
+    }
+
+    pub fn timeout_task(&mut self, task_id: &TaskId, kind: TimeoutKind) -> Result<(), String> {
+        self.reduce_watchdog_event(task_id, |attempt_id| TaskEvent::WatchdogTimedOut {
+            attempt_id,
+            kind,
+        })
+    }
+
+    pub fn exhaust_task_budget(
+        &mut self,
+        task_id: &TaskId,
+        kind: BudgetKind,
+    ) -> Result<(), String> {
+        self.reduce_watchdog_event(task_id, |attempt_id| TaskEvent::WatchdogBudgetExhausted {
+            attempt_id,
+            kind,
+        })
+    }
+
+    fn reduce_watchdog_event(
+        &mut self,
+        task_id: &TaskId,
+        event: impl FnOnce(AttemptId) -> TaskEvent,
+    ) -> Result<(), String> {
+        if let Some(worker) = self.workers.get(task_id) {
+            worker.cancel();
+        }
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(event(attempt_id), chrono::Utc::now())
+            .map_err(|error| error.to_string())?;
         self.notify_update();
         Ok(())
     }

@@ -1,16 +1,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use rusqlite::Connection;
 use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
+use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
 };
-use yi_agent_store::repository::{RuntimeEvent, RuntimeRepository};
+use yi_agent_store::repository::{
+    RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
+};
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
 
 #[derive(Default)]
@@ -1110,4 +1114,174 @@ async fn retry_replays_an_unconsumed_external_override_but_not_an_acknowledged_o
             .initial_user_messages
             .is_empty()
     );
+}
+
+#[test]
+fn watchdog_terminal_is_durable_once_and_releases_every_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository
+        .record_recovery_context(
+            &task,
+            &attempt,
+            "workspace:watchdog",
+            "worktree:watchdog",
+            r#"{"git_head":"test"}"#,
+            r#"{"state":"available"}"#,
+        )
+        .unwrap();
+
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let evidence = WatchdogEvidence {
+        last_meaningful_event_id: Some(42),
+        last_meaningful_at: timestamp,
+        elapsed_secs: 301,
+        current_wait: Some(WatchdogResourceWait {
+            resource_key: "llm:test".into(),
+            queued_at: timestamp,
+        }),
+    };
+    let event_id = repository
+        .record_watchdog_terminal(&task, &attempt, WatchdogTerminal::Stalled, &evidence)
+        .unwrap();
+    assert!(event_id.is_some());
+    assert_eq!(repository.task_state(&task).unwrap(), "stalled");
+    assert_eq!(repository.attempt_state(&attempt).unwrap(), "stalled");
+    assert!(repository.attempt_ended_at(&attempt).unwrap().is_some());
+    assert_eq!(
+        repository.attempt_terminal_json_for_task(&task).unwrap(),
+        Some(serde_json::to_string(&evidence).unwrap())
+    );
+    assert!(
+        !repository
+            .has_active_lease_prefix(&task, "workspace:")
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .has_active_lease_prefix(&task, "worktree:")
+            .unwrap()
+    );
+
+    // A repeated watchdog pass is a no-op: it cannot append a second terminal event.
+    assert_eq!(
+        repository
+            .record_watchdog_terminal(&task, &attempt, WatchdogTerminal::Stalled, &evidence)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        repository
+            .event_records_after(0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event == RuntimeEvent::TaskStalled)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn runtime_watchdog_stalls_a_running_worker_once() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &task).await.unwrap();
+
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let evidence = WatchdogEvidence {
+        last_meaningful_event_id: None,
+        last_meaningful_at: timestamp,
+        elapsed_secs: 301,
+        current_wait: None,
+    };
+    assert!(
+        coordinator
+            .record_watchdog_terminal(&session, &task, WatchdogTerminal::Stalled, evidence.clone())
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(coordinator.task_state(&task).unwrap(), "stalled");
+    assert!(
+        factory.handles.lock().unwrap()[0]
+            .cancellation_token()
+            .is_cancelled()
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .attempt_terminal_json_for_task(&task)
+            .unwrap(),
+        Some(serde_json::to_string(&evidence).unwrap())
+    );
+    assert!(
+        !coordinator
+            .record_watchdog_terminal(&session, &task, WatchdogTerminal::Stalled, evidence)
+            .await
+            .unwrap()
+    );
+}
+
+#[test]
+fn watchdog_terminal_variants_emit_their_distinct_event_kinds() {
+    for (terminal, expected_state, expected_event) in [
+        (
+            WatchdogTerminal::TimedOut(TimeoutKind::WallClock),
+            "timed_out",
+            RuntimeEvent::TaskTimedOut,
+        ),
+        (
+            WatchdogTerminal::BudgetExhausted(BudgetKind::Turns),
+            "budget_exhausted",
+            RuntimeEvent::TaskBudgetExhausted,
+        ),
+    ] {
+        let session = RootSessionId::new();
+        let task = yi_agent_core::TaskId::new();
+        let attempt = yi_agent_core::AttemptId::new();
+        let mut repository = RuntimeRepository::open(":memory:").unwrap();
+        repository
+            .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+            .unwrap();
+        let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        repository
+            .record_watchdog_terminal(
+                &task,
+                &attempt,
+                terminal,
+                &WatchdogEvidence {
+                    last_meaningful_event_id: None,
+                    last_meaningful_at: timestamp,
+                    elapsed_secs: 1,
+                    current_wait: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(repository.task_state(&task).unwrap(), expected_state);
+        assert!(
+            repository
+                .event_records_after(0)
+                .unwrap()
+                .into_iter()
+                .any(|event| event.event == expected_event)
+        );
+    }
 }
