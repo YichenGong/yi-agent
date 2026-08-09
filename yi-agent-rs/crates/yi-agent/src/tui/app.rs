@@ -692,6 +692,19 @@ fn route_event(
                 "auto-compact: session compressed"
             );
         }
+        AgentEvent::ManualCompacted {
+            old_msg_count,
+            new_msg_count,
+        } => {
+            tracing::info!(
+                old_msg_count,
+                new_msg_count,
+                "manual compact: session compressed"
+            );
+        }
+        AgentEvent::ManualCompactFailed { message } => {
+            tracing::warn!(%message, "manual compact failed");
+        }
         _ => {}
     }
 }

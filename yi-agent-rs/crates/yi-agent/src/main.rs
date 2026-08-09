@@ -459,6 +459,7 @@ fn run_tui_agent(
                         }
                         ControlCommand::Compact => {
                             let session = agent.session();
+                            let old_msg_count = session.messages().len();
                             let keep_turns = rebuild_config.compact_keep_turns.unwrap_or(4);
                             match yi_agent_core::compact_session(
                                 &rebuild_provider,
@@ -469,6 +470,10 @@ fn run_tui_agent(
                             .await
                             {
                                 Ok(new_session) => {
+                                    let event = manual_compaction_outcome_event(
+                                        old_msg_count,
+                                        Ok(new_session.messages().len()),
+                                    );
                                     agent = yi_agent_core::Agent::new(
                                         Arc::clone(&rebuild_provider),
                                         Arc::clone(&rebuild_tools),
@@ -479,12 +484,20 @@ fn run_tui_agent(
                                         Arc::clone(&rebuild_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                     );
-                                    tracing::info!("agent session compacted via /compact");
+                                    tracing::info!(
+                                        old_msg_count,
+                                        "agent session compacted via /compact"
+                                    );
+                                    let _ = agent_tx.send(event).await;
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
-                                    let _ =
-                                        agent_tx.send(yi_agent_core::AgentEvent::Error(e)).await;
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Err(e.to_string()),
+                                        ))
+                                        .await;
                                 }
                             }
                         }
@@ -578,6 +591,19 @@ pub(crate) enum ControlCommand {
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
+}
+
+fn manual_compaction_outcome_event(
+    old_msg_count: usize,
+    result: Result<usize, String>,
+) -> yi_agent_core::AgentEvent {
+    match result {
+        Ok(new_msg_count) => yi_agent_core::AgentEvent::ManualCompacted {
+            old_msg_count,
+            new_msg_count,
+        },
+        Err(message) => yi_agent_core::AgentEvent::ManualCompactFailed { message },
+    }
 }
 
 /// Resolve the effective system prompt: fall back to the built-in default
@@ -694,6 +720,22 @@ fn prompt_catalog_budget(total: usize, default: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_compaction_outcome_events_preserve_counts_and_errors() {
+        assert!(matches!(
+            manual_compaction_outcome_event(9, Ok(3)),
+            yi_agent_core::AgentEvent::ManualCompacted {
+                old_msg_count: 9,
+                new_msg_count: 3,
+            }
+        ));
+        assert!(matches!(
+            manual_compaction_outcome_event(9, Err("request failed".into())),
+            yi_agent_core::AgentEvent::ManualCompactFailed { message }
+                if message == "request failed"
+        ));
+    }
 
     #[test]
     fn resolve_system_prompt_none_uses_default() {
