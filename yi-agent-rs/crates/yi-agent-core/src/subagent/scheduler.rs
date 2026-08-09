@@ -58,6 +58,14 @@ pub struct GrantedLease {
     pub request: ResourceRequest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionCursor {
+    pub root_id: Option<RootSessionId>,
+    pub parent_id: Option<TaskId>,
+    /// Sequence to assign to the next request enqueued after restoration.
+    pub sequence: u64,
+}
+
 #[derive(Debug, Clone)]
 struct QueuedRequest {
     root_id: RootSessionId,
@@ -136,6 +144,16 @@ impl ResourceCoordinator {
         self.queues.values().map(VecDeque::len).sum()
     }
 
+    pub fn cancel_task_requests(&mut self, task_id: &TaskId) -> usize {
+        let mut removed = 0;
+        for queue in self.queues.values_mut() {
+            let before = queue.len();
+            queue.retain(|entry| &entry.task_id != task_id);
+            removed += before - queue.len();
+        }
+        removed
+    }
+
     pub fn try_enqueue(
         &mut self,
         root_id: RootSessionId,
@@ -165,6 +183,29 @@ impl ResourceCoordinator {
 
     pub fn capacity(&self, key: &str) -> Option<u16> {
         self.capacities.get(key).copied()
+    }
+
+    pub fn admission_cursor(&self, key: &str) -> AdmissionCursor {
+        AdmissionCursor {
+            root_id: self.last_grant_root.get(key).cloned(),
+            parent_id: self
+                .last_grant_root
+                .get(key)
+                .and_then(|root| self.last_grant_parent.get(&(key.to_owned(), root.clone())))
+                .cloned(),
+            sequence: self.next_sequence,
+        }
+    }
+
+    pub fn restore_admission_cursor(&mut self, key: &str, cursor: AdmissionCursor) {
+        if let Some(root) = cursor.root_id {
+            self.last_grant_root.insert(key.to_owned(), root.clone());
+            if let Some(parent) = cursor.parent_id {
+                self.last_grant_parent
+                    .insert((key.to_owned(), root), parent);
+            }
+        }
+        self.next_sequence = self.next_sequence.max(cursor.sequence);
     }
 
     pub fn enqueue(&mut self, root_id: RootSessionId, task_id: TaskId, request: ResourceRequest) {

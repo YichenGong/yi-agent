@@ -672,6 +672,30 @@ async fn coordinator_persists_worker_failure_reported_by_the_factory() {
 }
 
 #[tokio::test]
+async fn resident_admission_persists_and_restores_the_fairness_cursor() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+
+    coordinator.start_worker(&session, &child).await.unwrap();
+    let in_memory_cursor = coordinator.resident_admission_cursor();
+    let cursor = RuntimeRepository::open(&database)
+        .unwrap()
+        .admission_cursor("resident:global")
+        .unwrap();
+    assert!(cursor.is_some());
+    assert_eq!(cursor.as_ref().unwrap().sequence, in_memory_cursor.sequence);
+    drop(coordinator);
+
+    let reopened = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    assert_eq!(reopened.resident_admission_cursor(), in_memory_cursor);
+    drop(reopened);
+}
+
+#[tokio::test]
 async fn global_resident_capacity_leaves_excess_child_queued() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

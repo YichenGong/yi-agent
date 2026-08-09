@@ -457,3 +457,18 @@ fn incompatible_high_priority_request_does_not_block_a_compatible_request() {
     );
     coordinator.release(held_lease.lease_id).unwrap();
 }
+
+#[test]
+fn cancelled_task_is_removed_from_resource_wait_queue() {
+    let mut coordinator = ResourceCoordinator::new();
+    let task = TaskId::new();
+    coordinator.enqueue(
+        RootSessionId::new(),
+        task.clone(),
+        request("resident:global"),
+    );
+
+    assert_eq!(coordinator.cancel_task_requests(&task), 1);
+    assert_eq!(coordinator.queued_request_count(), 0);
+    assert!(coordinator.grant_next("resident:global").is_none());
+}

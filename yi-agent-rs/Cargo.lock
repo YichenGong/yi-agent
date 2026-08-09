@@ -3636,6 +3636,7 @@ dependencies = [
 name = "yi-agent-store"
 version = "0.1.2"
 dependencies = [
+ "chrono",
  "futures",
  "libc",
  "rusqlite",
