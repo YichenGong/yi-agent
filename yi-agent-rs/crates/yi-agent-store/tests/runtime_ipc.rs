@@ -335,7 +335,7 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
 }
 
 #[test]
-fn daemon_routes_adjacent_task_messages_and_persists_the_mailbox_record() {
+fn daemon_rejects_unbound_agent_message_requests_without_persisting_them() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
@@ -367,22 +367,16 @@ fn daemon_routes_adjacent_task_messages_and_persists_the_mailbox_record() {
         IpcRequest::SendMessage {
             session_id,
             sender_task_id: root_task_id,
+            worker_capability: "forged".into(),
             recipient_task_id: child_task_id,
             message: "Please report the changed files.".into(),
         },
     )
     .unwrap();
 
-    assert!(matches!(response, IpcResponse::MessageDelivered));
+    assert!(matches!(response, IpcResponse::Error { .. }));
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.mailbox_message_count().unwrap(), 1);
-    assert!(
-        repository
-            .event_records_after(0)
-            .unwrap()
-            .iter()
-            .any(|event| event.event == RuntimeEvent::MailboxMessageDelivered)
-    );
+    assert_eq!(repository.mailbox_message_count().unwrap(), 0);
 }
 
 #[test]
@@ -411,6 +405,7 @@ fn daemon_rejects_messages_to_unrelated_tasks_without_persisting_them() {
         IpcRequest::SendMessage {
             session_id,
             sender_task_id: root_task_id,
+            worker_capability: "forged".into(),
             recipient_task_id: unrelated_task_id,
             message: "This must not cross task trees.".into(),
         },

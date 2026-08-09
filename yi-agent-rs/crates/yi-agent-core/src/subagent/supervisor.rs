@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{AgentTask, CancelReason, RootSessionId, TaskEvent, TaskFailure, TaskId};
@@ -61,6 +62,7 @@ pub struct AgentSupervisor {
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
+    worker_message_capabilities: HashMap<TaskId, String>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
 }
@@ -86,6 +88,7 @@ impl AgentSupervisor {
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
+            worker_message_capabilities: HashMap::new(),
             events: Vec::new(),
             updates,
         }
@@ -144,12 +147,25 @@ impl AgentSupervisor {
         let objective = self
             .objective(task_id)
             .ok_or_else(|| "task objective does not exist".to_string())?;
+        let initial_user_messages = self
+            .mailboxes
+            .get(task_id)
+            .expect("task mailbox is created with task")
+            .pending_user_overrides();
         let start = WorkerStart::new(
             task.id.clone(),
             task.active_attempt_id().clone(),
             task.root_session_id.clone(),
         )
-        .with_objective(objective);
+        .with_objective(objective)
+        .with_message_capability(Uuid::new_v4().to_string())
+        .with_initial_user_messages(
+            initial_user_messages
+                .iter()
+                .map(|(_, body)| body.clone())
+                .collect(),
+        );
+        let message_capability = start.message_capability.clone();
         // Admission is visible before the application factory can create any
         // side effects. A factory failure is reduced to a terminal task state.
         self.start_task(task_id)?;
@@ -160,6 +176,14 @@ impl AgentSupervisor {
                 return Err(error.to_string());
             }
         };
+        self.worker_message_capabilities
+            .insert(task_id.clone(), message_capability);
+        for (id, _) in initial_user_messages {
+            self.mailboxes
+                .get_mut(task_id)
+                .expect("task mailbox is created with task")
+                .mark_delivered_to_worker(&id);
+        }
         self.workers.insert(task_id.clone(), handle);
         Ok(())
     }
@@ -214,6 +238,7 @@ impl AgentSupervisor {
                 .is_some_and(|task| task.state().is_terminal())
             {
                 self.workers.remove(&task_id);
+                self.worker_message_capabilities.remove(&task_id);
                 changed.push(task_id);
             }
         }
@@ -409,6 +434,95 @@ impl AgentSupervisor {
         )
     }
 
+    /// Authenticates daemon-worker IPC before applying the ordinary adjacency
+    /// rules. UI clients never receive this random per-worker capability.
+    pub fn send_worker_message(
+        &mut self,
+        sender: &TaskId,
+        capability: &str,
+        recipient: TaskId,
+        message: String,
+    ) -> Result<(), MessageDeliveryError> {
+        self.can_send_worker_message(sender, capability, &recipient)?;
+        self.send_user_message(sender, recipient, message)
+    }
+
+    pub fn can_send_worker_message(
+        &self,
+        sender: &TaskId,
+        capability: &str,
+        recipient: &TaskId,
+    ) -> Result<(), MessageDeliveryError> {
+        if self
+            .worker_message_capabilities
+            .get(sender)
+            .is_none_or(|expected| expected != capability)
+        {
+            return Err(MessageDeliveryError::SenderNotFound);
+        }
+        let sender_task = self
+            .tasks
+            .get(sender)
+            .ok_or(MessageDeliveryError::SenderNotFound)?;
+        if sender_task.state().is_terminal() {
+            return Err(MessageDeliveryError::SenderTerminal);
+        }
+        let recipient_task = self
+            .tasks
+            .get(recipient)
+            .ok_or(MessageDeliveryError::RecipientNotFound)?;
+        if recipient_task.state().is_terminal() {
+            return Err(MessageDeliveryError::RecipientTerminal);
+        }
+        let is_parent = sender_task.parent_id.as_ref() == Some(recipient);
+        let is_child = self
+            .children_of(sender)
+            .iter()
+            .any(|child| child == recipient);
+        if !is_parent && !is_child {
+            return Err(MessageDeliveryError::RecipientNotAdjacent);
+        }
+        Ok(())
+    }
+
+    /// User controls may cross the task tree, but may never target a terminal
+    /// task. The persisted sender is `None`, preserving the external actor.
+    pub fn send_user_override(
+        &mut self,
+        recipient: TaskId,
+        message: String,
+    ) -> Result<(), MessageDeliveryError> {
+        self.can_accept_user_override(&recipient)?;
+        let receipt = self
+            .mailboxes
+            .get_mut(&recipient)
+            .expect("task mailbox is created with task")
+            .push(MailboxMessageDraft::user_override(
+                recipient.clone(),
+                message.clone(),
+            ));
+        if let Some(worker) = self.workers.get(&recipient) {
+            worker.deliver_message(message);
+            self.mailboxes
+                .get_mut(&recipient)
+                .expect("task mailbox is created with task")
+                .mark_delivered_to_worker(&receipt.message_id);
+        }
+        self.notify_update();
+        Ok(())
+    }
+
+    pub fn can_accept_user_override(&self, recipient: &TaskId) -> Result<(), MessageDeliveryError> {
+        let recipient_task = self
+            .tasks
+            .get(recipient)
+            .ok_or(MessageDeliveryError::RecipientNotFound)?;
+        if recipient_task.state().is_terminal() {
+            return Err(MessageDeliveryError::RecipientTerminal);
+        }
+        Ok(())
+    }
+
     pub fn fail_task(
         &mut self,
         task_id: &TaskId,
@@ -461,6 +575,7 @@ impl AgentSupervisor {
         // A cancelled worker may still have a handle until its asynchronous
         // event is reconciled; a successor attempt must not inherit it.
         self.workers.remove(task_id);
+        self.worker_message_capabilities.remove(task_id);
         let task = self
             .tasks
             .get_mut(task_id)

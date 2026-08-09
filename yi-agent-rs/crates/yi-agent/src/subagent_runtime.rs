@@ -45,12 +45,16 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
         let objective = request.objective;
+        let initial_user_messages = request.initial_user_messages;
 
         Box::pin(async move {
             if objective.trim().is_empty() {
                 return Err(WorkerError::Startup("worker objective is required".into()));
             }
             let handle = WorkerHandle::new(cancellation.clone());
+            for message in initial_user_messages {
+                handle.deliver_message(message);
+            }
             let reporter = handle.clone();
             let mut mailbox = handle.subscribe_messages();
             let mut worker_tools = (*tools).clone();
@@ -63,6 +67,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 runtime_socket: runtime_socket.clone(),
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
+                worker_capability: request.message_capability.clone(),
             }));
             worker_tools.register(Arc::new(DaemonWaitAgentTool {
                 runtime_socket,
@@ -151,6 +156,7 @@ struct DaemonSendMessageTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
+    worker_capability: String,
 }
 
 #[async_trait]
@@ -193,12 +199,13 @@ impl Tool for DaemonSendMessageTool {
             yi_agent_store::ipc::IpcRequest::SendMessage {
                 session_id: self.session_id.clone(),
                 sender_task_id: self.caller_task_id.clone(),
+                worker_capability: self.worker_capability.clone(),
                 recipient_task_id: recipient.to_owned(),
                 message: message.to_owned(),
             },
         ) {
-            Ok(yi_agent_store::ipc::IpcResponse::MessageDelivered) => {
-                ToolResult::text("message delivered")
+            Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
+                ToolResult::text("message queued")
             }
             Ok(other) => ToolResult::error(format!("daemon rejected message: {other:?}")),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
@@ -314,7 +321,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn worker_message_proxy_routes_through_the_daemon() {
+    async fn unbound_worker_message_proxy_is_rejected_by_the_daemon() {
         let directory = TempDir::new().unwrap();
         let daemon = Daemon::start(
             directory.path().join("runtime"),
@@ -347,6 +354,7 @@ mod tests {
             runtime_socket: daemon.socket_path().to_path_buf(),
             session_id,
             caller_task_id: child_task_id,
+            worker_capability: "forged".into(),
         };
         let result = tool
             .call(json!({
@@ -355,11 +363,7 @@ mod tests {
             }))
             .await;
 
-        assert!(!result.is_error);
-        assert!(matches!(
-            result.content.as_slice(),
-            [yi_agent_core::ContentBlock::Text(text)] if text == "message delivered"
-        ));
+        assert!(result.is_error);
     }
 
     #[tokio::test]

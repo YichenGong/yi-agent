@@ -1111,8 +1111,7 @@ fn execute_slash_command(
             history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
-        SlashCommand::Message
-        | SlashCommand::Pause
+        SlashCommand::Pause
         | SlashCommand::Resume
         | SlashCommand::Approve
         | SlashCommand::Review
@@ -1149,6 +1148,17 @@ fn execute_slash_command(
                 Ok((session_id, task_id)) => match daemon_retry(session_id, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法重试任务: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Message => {
+            let label = match parse_user_message_args(args.as_deref()) {
+                Ok((task_id, message)) => match daemon_user_message(task_id, message) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法发送用户指令: {error}"),
                 },
                 Err(error) => error,
             };
@@ -1227,6 +1237,47 @@ fn parse_retry_args(args: Option<&str>) -> Result<(&str, &str), String> {
         return Err("用法: /retry <session-id> <task-id>".into());
     }
     Ok((session_id, task_id))
+}
+
+fn parse_user_message_args(args: Option<&str>) -> Result<(&str, &str), String> {
+    let Some(args) = args.map(str::trim).filter(|args| !args.is_empty()) else {
+        return Err("用法: /message <task-id> <text>".into());
+    };
+    let Some((task_id, message)) = args.split_once(char::is_whitespace) else {
+        return Err("用法: /message <task-id> <text>".into());
+    };
+    let message = message.trim();
+    if task_id.is_empty() || message.is_empty() {
+        return Err("用法: /message <task-id> <text>".into());
+    }
+    Ok((task_id, message))
+}
+
+fn daemon_user_message(task_id: &str, message: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_user_message_at(&runtime_dir.join("runtime.sock"), task_id, message)
+}
+
+fn daemon_user_message_at(
+    socket: &std::path::Path,
+    task_id: &str,
+    message: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::SendUserMessage {
+            task_id: task_id.to_owned(),
+            message: message.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::MessageQueued) {
+        return Err("daemon 返回了非消息响应".into());
+    }
+    Ok(format!("已排队用户指令至任务: {task_id}"))
 }
 
 fn daemon_retry(session_id: &str, task_id: &str) -> Result<String, String> {
@@ -1722,6 +1773,33 @@ mod tests {
         let result = daemon_retry_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
 
         assert!(result.contains("已请求重试"));
+    }
+
+    #[test]
+    fn message_control_routes_an_audited_user_override_to_the_daemon() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let result = daemon_user_message_at(
+            daemon.socket_path(),
+            &root_task_id,
+            "请暂停并说明当前阻塞原因",
+        )
+        .unwrap();
+
+        assert!(result.contains("已排队用户指令"));
     }
 
     #[test]

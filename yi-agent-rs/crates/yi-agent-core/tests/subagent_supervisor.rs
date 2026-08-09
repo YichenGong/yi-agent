@@ -103,9 +103,25 @@ struct InboxWorkerFactory {
     handle: Arc<Mutex<Option<WorkerHandle>>>,
 }
 
+#[derive(Clone)]
+struct CapabilityWorkerFactory {
+    start: Arc<Mutex<Option<WorkerStart>>>,
+}
+
+impl AgentWorkerFactory for CapabilityWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation.clone());
+        *self.start.lock().unwrap() = Some(request);
+        Box::pin(async move { Ok(handle) })
+    }
+}
+
 impl AgentWorkerFactory for InboxWorkerFactory {
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let handle = WorkerHandle::new(request.cancellation);
+        for message in request.initial_user_messages {
+            handle.deliver_message(message);
+        }
         *self.handle.lock().unwrap() = Some(handle.clone());
         Box::pin(async move { Ok(handle) })
     }
@@ -114,7 +130,8 @@ impl AgentWorkerFactory for InboxWorkerFactory {
 #[tokio::test]
 async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
-    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
 
     supervisor
         .start_worker(&ImmediateWorkerFactory, &child)
@@ -124,6 +141,64 @@ async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let cancellation = supervisor.worker_cancellation(&child).unwrap();
     supervisor.cancel_worker(&child).unwrap();
     assert!(cancellation.is_cancelled());
+}
+
+#[tokio::test]
+async fn worker_message_capability_is_required_and_bound_to_the_started_task() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = CapabilityWorkerFactory {
+        start: Arc::new(Mutex::new(None)),
+    };
+
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let capability = factory
+        .start
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .message_capability
+        .clone();
+
+    assert!(
+        supervisor
+            .send_worker_message(&child, &capability, root.clone(), "continue".into())
+            .is_ok()
+    );
+    assert!(
+        supervisor
+            .send_worker_message(&child, "forged", root, "continue".into())
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn queued_user_override_is_delivered_when_its_worker_starts() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+    supervisor
+        .send_user_override(child.clone(), "explain the blocker first".into())
+        .unwrap();
+    let handle = Arc::new(Mutex::new(None));
+    let factory = InboxWorkerFactory {
+        handle: Arc::clone(&handle),
+    };
+
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let mut mailbox = handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .subscribe_messages();
+    let message = tokio::time::timeout(Duration::from_millis(100), mailbox.recv())
+        .await
+        .expect("queued user message should reach the worker")
+        .expect("worker inbox remains open");
+
+    assert_eq!(message.body, "explain the blocker first");
 }
 
 #[tokio::test]

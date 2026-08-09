@@ -247,6 +247,7 @@ impl RuntimeCoordinator {
         &self,
         session: &RootSessionId,
         sender: &TaskId,
+        worker_capability: &str,
         recipient: TaskId,
         message: String,
     ) -> Result<(), RuntimeCoordinatorError> {
@@ -256,15 +257,53 @@ impl RuntimeCoordinator {
             ));
         }
         let supervisor = self.supervisor(session)?;
+        let mut supervisor = supervisor.lock().await;
         supervisor
-            .lock()
-            .await
-            .send_user_message(sender, recipient.clone(), message.clone())
+            .can_send_worker_message(sender, worker_capability, &recipient)
             .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
             .record_user_message(sender, &recipient, &message)?;
+        supervisor
+            .send_worker_message(sender, worker_capability, recipient, message)
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Resolves a task's owning session server-side so an external TUI/CLI
+    /// user cannot impersonate an adjacent agent as the message sender.
+    pub async fn send_user_override(
+        &self,
+        recipient: &TaskId,
+        message: String,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if message.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "message must be non-empty".into(),
+            ));
+        }
+        let session_id = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_detail(recipient)?
+            .session_id;
+        let session = session_id.parse().map_err(|_| {
+            RuntimeCoordinatorError::Supervisor("persisted task has an invalid session ID".into())
+        })?;
+        let supervisor = self.supervisor(&session)?;
+        let mut supervisor = supervisor.lock().await;
+        supervisor
+            .can_accept_user_override(recipient)
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_user_override_message(recipient, &message)?;
+        supervisor
+            .send_user_override(recipient.clone(), message)
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
         Ok(())
     }
 

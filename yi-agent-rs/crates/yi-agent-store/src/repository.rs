@@ -26,7 +26,7 @@ pub enum RuntimeEvent {
     TaskCancelled,
     TaskFailed,
     TaskRecoveryRequired,
-    MailboxMessageDelivered,
+    MailboxMessageQueued,
 }
 
 impl RuntimeEvent {
@@ -37,7 +37,7 @@ impl RuntimeEvent {
             Self::TaskCancelled => "task_cancelled",
             Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
-            Self::MailboxMessageDelivered => "mailbox_message_delivered",
+            Self::MailboxMessageQueued => "mailbox_message_queued",
         }
     }
 
@@ -48,7 +48,7 @@ impl RuntimeEvent {
             "task_cancelled" => Ok(Self::TaskCancelled),
             "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
-            "mailbox_message_delivered" => Ok(Self::MailboxMessageDelivered),
+            "mailbox_message_queued" => Ok(Self::MailboxMessageQueued),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -199,8 +199,8 @@ impl RuntimeRepository {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO mailbox_messages (id, recipient_task_id, sender_task_id, kind, priority, payload_json, delivered_at)
-             VALUES (?1, ?2, ?3, 'user_instruction', 2, ?4, CURRENT_TIMESTAMP)",
+            "INSERT INTO mailbox_messages (id, recipient_task_id, sender_task_id, kind, priority, payload_json)
+             VALUES (?1, ?2, ?3, 'user_instruction', 2, ?4)",
             params![
                 MessageId::new().to_string(),
                 recipient.to_string(),
@@ -208,11 +208,31 @@ impl RuntimeRepository {
                 serde_json::to_string(&serde_json::json!({ "message": message }))?,
             ],
         )?;
-        let event_id = append_event(
-            &transaction,
-            recipient,
-            RuntimeEvent::MailboxMessageDelivered,
+        let event_id = append_event(&transaction, recipient, RuntimeEvent::MailboxMessageQueued)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Persists an external user intervention without attributing it to a
+    /// task. The mailbox row and audit event commit atomically.
+    pub fn record_user_override_message(
+        &mut self,
+        recipient: &TaskId,
+        message: &str,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO mailbox_messages (id, recipient_task_id, sender_task_id, kind, priority, payload_json)
+             VALUES (?1, ?2, NULL, 'user_override', 2, ?3)",
+            params![
+                MessageId::new().to_string(),
+                recipient.to_string(),
+                serde_json::to_string(&serde_json::json!({ "message": message }))?,
+            ],
         )?;
+        let event_id = append_event(&transaction, recipient, RuntimeEvent::MailboxMessageQueued)?;
         transaction.commit()?;
         Ok(event_id)
     }

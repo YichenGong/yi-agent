@@ -16,6 +16,11 @@ pub struct WorkerStart {
     pub attempt_id: AttemptId,
     pub root_session_id: RootSessionId,
     pub cancellation: CancellationToken,
+    /// Opaque daemon-issued capability required for worker IPC mutations.
+    pub message_capability: String,
+    /// User instructions queued before admission. Application factories must
+    /// preload them before allowing the first Agent turn to start.
+    pub initial_user_messages: Vec<String>,
     /// Narrow task instruction supplied by the parent supervisor.
     pub objective: String,
 }
@@ -27,12 +32,24 @@ impl WorkerStart {
             attempt_id,
             root_session_id,
             cancellation: CancellationToken::new(),
+            message_capability: String::new(),
+            initial_user_messages: Vec::new(),
             objective: String::new(),
         }
     }
 
     pub fn with_objective(mut self, objective: impl Into<String>) -> Self {
         self.objective = objective.into();
+        self
+    }
+
+    pub fn with_message_capability(mut self, capability: impl Into<String>) -> Self {
+        self.message_capability = capability.into();
+        self
+    }
+
+    pub fn with_initial_user_messages(mut self, messages: Vec<String>) -> Self {
+        self.initial_user_messages = messages;
         self
     }
 }

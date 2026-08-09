@@ -71,7 +71,12 @@ pub enum IpcRequest {
     SendMessage {
         session_id: String,
         sender_task_id: String,
+        worker_capability: String,
         recipient_task_id: String,
+        message: String,
+    },
+    SendUserMessage {
+        task_id: String,
         message: String,
     },
     WaitAgent {
@@ -103,7 +108,7 @@ pub enum IpcResponse {
     TaskStarted,
     TaskCancelled,
     TaskRetried,
-    MessageDelivered,
+    MessageQueued,
     WaitCompleted {
         status: String,
         children: Vec<String>,
@@ -610,6 +615,7 @@ fn respond(
         IpcRequest::SendMessage {
             session_id,
             sender_task_id,
+            worker_capability,
             recipient_task_id,
             message,
         } => {
@@ -622,10 +628,19 @@ fn respond(
             runtime.block_on(coordinator.send_message(
                 &session_id,
                 &sender_task_id,
+                &worker_capability,
                 recipient_task_id,
                 message,
             ))?;
-            Ok(IpcResponse::MessageDelivered)
+            Ok(IpcResponse::MessageQueued)
+        }
+        IpcRequest::SendUserMessage { task_id, message } => {
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.send_user_override(&task_id, message))?;
+            Ok(IpcResponse::MessageQueued)
         }
         IpcRequest::WaitAgent {
             session_id,

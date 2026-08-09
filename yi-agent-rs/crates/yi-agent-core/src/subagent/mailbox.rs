@@ -58,18 +58,21 @@ impl MessageKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailboxMessage {
     pub id: MessageId,
-    pub sender: TaskId,
+    pub sender: Option<TaskId>,
     pub recipient: TaskId,
     pub kind: MessageKind,
     pub priority: MessagePriority,
     pub correlation_id: Option<AttemptId>,
     pub created_at: DateTime<Utc>,
     pub coalesced_count: u32,
+    /// In-memory acknowledgement that this daemon process handed the item to
+    /// a worker inbox. Durable consumption is tracked separately by runtime.
+    pub delivered_to_worker: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct MailboxMessageDraft {
-    sender: TaskId,
+    sender: Option<TaskId>,
     recipient: TaskId,
     kind: MessageKind,
     correlation_id: Option<AttemptId>,
@@ -83,10 +86,20 @@ impl MailboxMessageDraft {
         correlation_id: Option<AttemptId>,
     ) -> Self {
         Self {
-            sender,
+            sender: Some(sender),
             recipient,
             kind,
             correlation_id,
+        }
+    }
+
+    /// User interventions are external inputs, not forged task messages.
+    pub fn user_override(recipient: TaskId, message: impl Into<String>) -> Self {
+        Self {
+            sender: None,
+            recipient,
+            kind: MessageKind::UserInstruction(UserInstruction(message.into())),
+            correlation_id: None,
         }
     }
 
@@ -156,6 +169,7 @@ impl Mailbox {
             correlation_id: draft.correlation_id,
             created_at: Utc::now(),
             coalesced_count: 1,
+            delivered_to_worker: false,
         };
         let receipt = DeliveryReceipt {
             message_id: message.id.clone(),
@@ -168,5 +182,27 @@ impl Mailbox {
 
     pub fn messages(&self) -> &[MailboxMessage] {
         &self.messages
+    }
+
+    /// External user overrides are durable pending input. A worker that starts
+    /// after the user action must receive them before it can make progress.
+    pub fn pending_user_overrides(&self) -> Vec<(MessageId, String)> {
+        self.messages
+            .iter()
+            .filter_map(|message| match (&message.sender, &message.kind) {
+                (None, MessageKind::UserInstruction(UserInstruction(body)))
+                    if !message.delivered_to_worker =>
+                {
+                    Some((message.id.clone(), body.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn mark_delivered_to_worker(&mut self, id: &MessageId) {
+        if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
+            message.delivered_to_worker = true;
+        }
     }
 }
