@@ -66,6 +66,12 @@ impl DaemonAgentWorkerFactory {
 }
 
 impl AgentWorkerFactory for DaemonAgentWorkerFactory {
+    fn provider_profile_id(&self) -> Option<String> {
+        // A daemon owns one configured provider profile; this identifier never
+        // contains the API key or any other credential material.
+        Some("daemon-default".into())
+    }
+
     fn recovery_context(&self) -> WorkerRecoveryContext {
         let workspace = &self.workspace;
         let git_root = git_output(workspace, &["rev-parse", "--show-toplevel"]);

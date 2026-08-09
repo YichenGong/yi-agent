@@ -4,6 +4,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use rusqlite::Connection;
 use tempfile::TempDir;
+use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
@@ -26,6 +27,34 @@ impl AgentWorkerFactory for RecordingFactory {
 }
 
 struct FailingFactory;
+
+#[derive(Clone, Default)]
+struct ProviderGateRecordingFactory {
+    received_gate: Arc<Mutex<bool>>,
+}
+
+impl AgentWorkerFactory for ProviderGateRecordingFactory {
+    fn provider_profile_id(&self) -> Option<String> {
+        Some("test-profile".into())
+    }
+
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+
+    fn start_with_provider_turn_gate(
+        &self,
+        request: WorkerStart,
+        gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        *self.received_gate.lock().unwrap() = gate.is_some();
+        self.start(request)
+    }
+}
 
 impl AgentWorkerFactory for FailingFactory {
     fn recovery_context(&self) -> WorkerRecoveryContext {
@@ -241,6 +270,20 @@ async fn coordinator_starts_root_worker_and_cancels_its_tree() {
     assert!(child_cancellation.is_cancelled());
     assert_eq!(coordinator.task_state(&root).unwrap(), "cancelled");
     assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
+}
+
+#[tokio::test]
+async fn runtime_passes_an_llm_gate_to_a_profile_aware_worker_factory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ProviderGateRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    assert!(*factory.received_gate.lock().unwrap());
 }
 
 #[tokio::test]

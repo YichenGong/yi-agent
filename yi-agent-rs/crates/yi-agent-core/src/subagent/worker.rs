@@ -279,6 +279,12 @@ pub trait AgentWorkerFactory: Send + Sync {
         true
     }
 
+    /// A stable, non-secret provider/API-key profile identifier used for
+    /// daemon-wide LLM admission. Factories without one opt out of LLM gates.
+    fn provider_profile_id(&self) -> Option<String> {
+        None
+    }
+
     /// Supplies the facts that must survive an interrupted worker attempt.
     /// Factories without a workspace deliberately return explicit absence,
     /// which turns a later recovery attempt into a conflict instead of a

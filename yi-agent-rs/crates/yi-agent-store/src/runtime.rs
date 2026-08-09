@@ -71,7 +71,9 @@ pub struct RuntimeCoordinator {
     resident_tasks: Mutex<HashSet<TaskId>>,
     resident_leases: Mutex<HashMap<TaskId, LeaseId>>,
     resident_waiting: Mutex<HashSet<TaskId>>,
-    resource_coordinator: Mutex<ResourceCoordinator>,
+    resource_coordinator: Arc<Mutex<ResourceCoordinator>>,
+    provider_turn_admissions: Option<Arc<ProviderTurnAdmissions>>,
+    provider_profile_id: Option<String>,
     recovery_contexts: Mutex<HashMap<TaskId, RecoveryContext>>,
     draining: AtomicBool,
 }
@@ -215,6 +217,16 @@ impl RuntimeCoordinator {
                 supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
             }
         }
+        let provider_profile_id = factory.provider_profile_id();
+        if let Some(profile_id) = &provider_profile_id {
+            resource_coordinator.configure_provider_llm_capacity(profile_id);
+        }
+        let resource_coordinator = Arc::new(Mutex::new(resource_coordinator));
+        let provider_turn_admissions = provider_profile_id.as_ref().map(|_| {
+            Arc::new(ProviderTurnAdmissions::new(Arc::clone(
+                &resource_coordinator,
+            )))
+        });
         Ok(Self {
             repository: Mutex::new(repository),
             factory,
@@ -222,7 +234,9 @@ impl RuntimeCoordinator {
             resident_tasks: Mutex::new(HashSet::new()),
             resident_leases: Mutex::new(HashMap::new()),
             resident_waiting: Mutex::new(HashSet::new()),
-            resource_coordinator: Mutex::new(resource_coordinator),
+            resource_coordinator,
+            provider_turn_admissions,
+            provider_profile_id,
             recovery_contexts: Mutex::new(recovery_contexts),
             draining: AtomicBool::new(false),
         })
@@ -538,7 +552,29 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime recovery context mutex poisoned")
             .remove(task);
-        if let Err(error) = supervisor.start_worker(self.factory.as_ref(), task).await {
+        let provider_turn_gate = self
+            .provider_turn_admissions
+            .as_ref()
+            .and_then(|admissions| {
+                self.provider_profile_id.as_ref().map(|profile_id| {
+                    Arc::new(RuntimeProviderTurnGate {
+                        admissions: Arc::clone(admissions),
+                        root_id: session.clone(),
+                        parent_id: supervisor
+                            .task(task)
+                            .expect("worker task exists")
+                            .parent_id
+                            .clone()
+                            .unwrap_or_else(|| task.clone()),
+                        task_id: task.clone(),
+                        resource_key: format!("llm:{profile_id}"),
+                    }) as Arc<dyn ProviderTurnGate>
+                })
+            });
+        if let Err(error) = supervisor
+            .start_worker_with_provider_turn_gate(self.factory.as_ref(), task, provider_turn_gate)
+            .await
+        {
             self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
