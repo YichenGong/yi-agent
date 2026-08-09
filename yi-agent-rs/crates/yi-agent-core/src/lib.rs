@@ -9,7 +9,10 @@ pub mod subagent;
 pub mod tool;
 
 // Re-export most-used types at crate root.
-pub use agent::{Agent, AgentConfig, AgentError, AgentEvent, DoneReason, Session};
+pub use agent::{
+    Agent, AgentConfig, AgentError, AgentEvent, DoneReason, ProviderTurnGate, ProviderTurnLease,
+    Session,
+};
 pub use compact::compact_session;
 pub use message::{ContentBlock, ImageSource, Message, Role};
 pub use provider::{

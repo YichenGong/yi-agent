@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
@@ -18,6 +19,18 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 /// Shared decision channel used to gate tool execution behind user confirmation.
 type DecisionRx = Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>;
+
+/// A handle held only while one provider request is active. Implementations
+/// release their runtime lease when the boxed value is dropped.
+pub trait ProviderTurnLease: Send {}
+
+impl<T: Send> ProviderTurnLease for T {}
+
+/// Runtime-owned admission for individual provider turns. This keeps the core
+/// loop independent from the store while enforcing real provider boundaries.
+pub trait ProviderTurnGate: Send + Sync {
+    fn acquire(&self) -> BoxFuture<'static, Result<Box<dyn ProviderTurnLease>, String>>;
+}
 
 /// In-memory message container. No persistence.
 #[derive(Debug, Clone, Default)]
@@ -136,6 +149,7 @@ pub struct Agent {
     cancel_token: CancellationToken,
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
+    provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
 }
 
 /// Events emitted during agent loop.
@@ -215,6 +229,8 @@ const COMPLETION_AUDIT_PROMPT: &str =
 pub enum AgentError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
+    #[error("provider turn admission failed: {0}")]
+    ProviderTurnAdmission(String),
 }
 
 impl Agent {
@@ -227,6 +243,7 @@ impl Agent {
             cancel_token: CancellationToken::new(),
             permission_checker: None,
             decision_rx: None,
+            provider_turn_gate: None,
         }
     }
 
@@ -249,6 +266,12 @@ impl Agent {
     ) -> Self {
         self.permission_checker = Some(checker);
         self.decision_rx = Some(decision_rx);
+        self
+    }
+
+    /// Acquire a runtime permit around each actual provider request.
+    pub fn with_provider_turn_gate(mut self, gate: Arc<dyn ProviderTurnGate>) -> Self {
+        self.provider_turn_gate = Some(gate);
         self
     }
 
@@ -288,6 +311,7 @@ impl Agent {
         let cancel_token = self.cancel_token.clone();
         let permission_checker = self.permission_checker.clone();
         let decision_rx = self.decision_rx.clone();
+        let provider_turn_gate = self.provider_turn_gate.clone();
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
@@ -303,6 +327,7 @@ impl Agent {
                 cancel_token,
                 permission_checker,
                 decision_rx,
+                provider_turn_gate,
             )
             .await;
         });
@@ -321,6 +346,7 @@ async fn run_loop(
     cancel_token: CancellationToken,
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
+    provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     // 记录进入 run_loop 时的 session 长度(含 Agent::run push 的 user 消息,
@@ -427,6 +453,20 @@ async fn run_loop(
         let prefill_estimate = estimate_prefill_tokens(&req);
         let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
+        // A permit covers only the provider request and response stream. Tool,
+        // permission, and child-wait time deliberately run without one.
+        let _provider_turn_lease = match &provider_turn_gate {
+            Some(gate) => match gate.acquire().await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let _ = tx
+                        .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
+                        .await;
+                    return;
+                }
+            },
+            None => None,
+        };
         let stream = match provider.call_stream(req).await {
             Ok(s) => {
                 tracing::info!(
@@ -974,12 +1014,35 @@ mod tests {
     use crate::tool::{Tool, ToolMetadata, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Provider that returns a fixed sequence of events.
     /// Each call returns the next script; if scripts exhausted, returns empty (EndTurn).
     struct ScriptedProvider {
         scripts: Vec<Vec<ProviderEvent>>,
         call_index: std::sync::Mutex<usize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingTurnGate {
+        acquired: Arc<AtomicUsize>,
+        released: Arc<AtomicUsize>,
+    }
+
+    struct CountingTurnLease(Arc<AtomicUsize>);
+
+    impl Drop for CountingTurnLease {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ProviderTurnGate for CountingTurnGate {
+        fn acquire(&self) -> BoxFuture<'static, Result<Box<dyn ProviderTurnLease>, String>> {
+            self.acquired.fetch_add(1, Ordering::SeqCst);
+            let lease = CountingTurnLease(Arc::clone(&self.released));
+            Box::pin(async move { Ok(Box::new(lease) as Box<dyn ProviderTurnLease>) })
+        }
     }
 
     impl ScriptedProvider {
@@ -1125,6 +1188,31 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_turn_gate_acquires_and_releases_each_provider_turn() {
+        let provider = ScriptedProvider::new(vec![
+            vec![ProviderEvent::Stop {
+                reason: StopReason::MaxTokens,
+            }],
+            vec![ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            }],
+        ]);
+        let gate = CountingTurnGate::default();
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        )
+        .with_provider_turn_gate(Arc::new(gate.clone()));
+
+        let events = collect_events(agent.run("continue".into()).await.unwrap());
+
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+        assert_eq!(gate.acquired.load(Ordering::SeqCst), 2);
+        assert_eq!(gate.released.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
