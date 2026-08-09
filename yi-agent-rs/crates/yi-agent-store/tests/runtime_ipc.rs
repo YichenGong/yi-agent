@@ -320,6 +320,35 @@ fn raw_ipc_replies_are_versioned_and_echo_the_request_id() {
 }
 
 #[test]
+fn spawning_from_an_unknown_parent_returns_not_found() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated { session_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    let response = raw_request(
+        daemon.socket_path(),
+        json!({
+            "protocol_version": 1,
+            "request_id": "missing-parent",
+            "command": {
+                "type": "SpawnChild",
+                "session_id": session_id,
+                "parent_task_id": TaskId::new().to_string(),
+                "objective": "must not spawn"
+            },
+        }),
+    );
+
+    assert_eq!(response["result"]["type"], "Error");
+    assert_eq!(response["result"]["code"], "not_found");
+}
+
+#[test]
 fn oversized_request_echoes_an_id_available_in_its_bounded_prefix() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

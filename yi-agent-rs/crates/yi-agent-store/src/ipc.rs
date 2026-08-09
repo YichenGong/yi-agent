@@ -746,6 +746,9 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Runtime(RuntimeCoordinatorError::Repository(error)) => {
             repository_error_code(error)
         }
+        IpcError::Runtime(RuntimeCoordinatorError::Spawn(
+            yi_agent_core::subagent::supervisor::SpawnError::ParentNotFound,
+        )) => IpcErrorCode::NotFound,
         IpcError::Runtime(RuntimeCoordinatorError::Supervisor(_))
         | IpcError::Runtime(RuntimeCoordinatorError::Spawn(_)) => IpcErrorCode::InvalidState,
         IpcError::Runtime(RuntimeCoordinatorError::ResidentCapacityExhausted) => {
