@@ -100,3 +100,14 @@ fn exclusive_lease_blocks_shared_holders_even_when_capacity_remains() {
     coordinator.release(exclusive.lease_id).unwrap();
     assert!(coordinator.grant_next("git-integrate:/repo:main").is_some());
 }
+
+#[test]
+fn releasing_the_same_lease_twice_is_idempotent() {
+    let mut coordinator = ResourceCoordinator::new();
+    let root = RootSessionId::new();
+    coordinator.enqueue(root, TaskId::new(), request("resident:global"));
+    let lease = coordinator.grant_next("resident:global").unwrap();
+
+    coordinator.release(lease.lease_id.clone()).unwrap();
+    coordinator.release(lease.lease_id).unwrap();
+}

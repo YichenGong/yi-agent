@@ -165,10 +165,11 @@ impl ResourceCoordinator {
     }
 
     pub fn release(&mut self, lease_id: LeaseId) -> Result<(), ReleaseError> {
-        let lease = self
-            .active
-            .remove(&lease_id)
-            .ok_or(ReleaseError::UnknownLease)?;
+        let Some(lease) = self.active.remove(&lease_id) else {
+            // Terminal transitions can race with crash/stop cleanup. Releasing
+            // an already released ID must not double-decrement capacity.
+            return Ok(());
+        };
         let used = self.in_use.entry(lease.request.key).or_default();
         *used = used.saturating_sub(lease.request.units);
         Ok(())
