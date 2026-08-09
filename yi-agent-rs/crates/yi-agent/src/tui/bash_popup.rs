@@ -8,6 +8,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Top-level popup state.
 #[derive(Debug, Clone, Default)]
@@ -148,7 +149,22 @@ pub fn render_list_popup<'a>(
 }
 
 /// Render the detail-mode popup as a `Paragraph` with header + stdout/stderr.
-pub fn render_detail_popup<'a>(popup: &'a DetailPopup, task: &'a TaskState) -> Paragraph<'a> {
+pub fn render_detail_popup(
+    popup: &DetailPopup,
+    task: &TaskState,
+    area: Rect,
+) -> Paragraph<'static> {
+    Paragraph::new(detail_lines(task, area.width))
+        .alignment(Alignment::Left)
+        .scroll((popup.scroll as u16, 0))
+}
+
+/// Number of visual detail lines at the given terminal width.
+pub fn detail_line_count(task: &TaskState, width: u16) -> usize {
+    detail_lines(task, width).len()
+}
+
+fn detail_lines(task: &TaskState, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     let (sym, color) = match task.status {
@@ -179,7 +195,7 @@ pub fn render_detail_popup<'a>(popup: &'a DetailPopup, task: &'a TaskState) -> P
         ));
     }
 
-    lines.push(Line::raw(format!(" $ {}", task.command)));
+    lines.extend(wrap_text(&task.command, width, " $ ", "   "));
     lines.push(Line::raw(""));
 
     lines.push(Line::styled("stdout:", Style::new().fg(Color::DarkGray)));
@@ -187,9 +203,7 @@ pub fn render_detail_popup<'a>(popup: &'a DetailPopup, task: &'a TaskState) -> P
     if stdout_str.is_empty() {
         lines.push(Line::raw("(empty)").style(Style::new().fg(Color::DarkGray)));
     } else {
-        for l in stdout_str.lines() {
-            lines.push(Line::raw(l.to_string()));
-        }
+        lines.extend(wrap_text(&stdout_str, width, "", ""));
     }
     lines.push(Line::raw(""));
 
@@ -198,9 +212,7 @@ pub fn render_detail_popup<'a>(popup: &'a DetailPopup, task: &'a TaskState) -> P
     if stderr_str.is_empty() {
         lines.push(Line::raw("(empty)").style(Style::new().fg(Color::DarkGray)));
     } else {
-        for l in stderr_str.lines() {
-            lines.push(Line::raw(l.to_string()));
-        }
+        lines.extend(wrap_text(&stderr_str, width, "", ""));
     }
     lines.push(Line::raw(""));
 
@@ -210,9 +222,43 @@ pub fn render_detail_popup<'a>(popup: &'a DetailPopup, task: &'a TaskState) -> P
     );
     lines.push(footer);
 
-    Paragraph::new(lines)
-        .alignment(Alignment::Left)
-        .scroll((popup.scroll as u16, 0))
+    lines
+}
+
+/// Wrap text by terminal display width while preserving explicit newlines.
+fn wrap_text(
+    text: &str,
+    width: u16,
+    first_prefix: &str,
+    continuation_prefix: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut prefix = first_prefix;
+
+    for physical_line in text.split('\n') {
+        let available = (width as usize)
+            .saturating_sub(UnicodeWidthStr::width(prefix))
+            .max(1);
+        let mut current = String::new();
+        let mut current_width = 0;
+
+        for ch in physical_line.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width + char_width > available && !current.is_empty() {
+                lines.push(Line::raw(format!("{prefix}{current}")));
+                prefix = continuation_prefix;
+                current.clear();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += char_width;
+        }
+
+        lines.push(Line::raw(format!("{prefix}{current}")));
+        prefix = continuation_prefix;
+    }
+
+    lines
 }
 
 fn truncate_str(s: &str, n: usize) -> String {
@@ -229,6 +275,8 @@ fn truncate_str(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::tui::state::RunningTaskRegistry;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
     use std::time::Duration;
 
     #[test]
@@ -302,6 +350,49 @@ mod tests {
         tasks.on_exit("t1", Some(0));
         let d = DetailPopup::new("t1".into());
         let task = tasks.get("t1").unwrap();
-        let _ = render_detail_popup(&d, task);
+        let _ = render_detail_popup(&d, task, Rect::new(0, 0, 80, 24));
+    }
+
+    #[test]
+    fn detail_wraps_long_command_stdout_stderr_and_cjk() {
+        let mut tasks = RunningTaskRegistry::new();
+        tasks.on_tool_call(
+            "t1",
+            "bash",
+            "printf 'command content must remain fully visible 一二三四五六七'",
+            120,
+        );
+        tasks.on_output_delta(
+            "t1",
+            yi_agent_core::OutputStream::Stdout,
+            "stdout-content-must-remain-fully-visible\n",
+        );
+        tasks.on_output_delta(
+            "t1",
+            yi_agent_core::OutputStream::Stderr,
+            "stderr-content-must-remain-fully-visible\n",
+        );
+
+        let detail = DetailPopup::new("t1".into());
+        let task = tasks.get("t1").unwrap();
+        let area = Rect::new(0, 0, 16, 20);
+        let mut buffer = Buffer::empty(area);
+        render_detail_popup(&detail, task, area).render(area, &mut buffer);
+        let mut rendered = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+        }
+
+        assert!(
+            rendered.contains("visible"),
+            "missing command: {rendered:?}"
+        );
+        assert!(rendered.contains("stdout-content-must-remain-fully-visible"));
+        assert!(rendered.contains("stderr-content-must-remain-fully-visible"));
+        for ch in "一二三四五六七".chars() {
+            assert!(rendered.contains(ch), "missing {ch} in {rendered:?}");
+        }
     }
 }
