@@ -221,6 +221,9 @@ impl AgentSupervisor {
                 continue;
             }
             match event {
+                // Pause acknowledgement is consumed by the control-plane
+                // reducer once it has recorded the requested pause.
+                WorkerEvent::Paused => {}
                 WorkerEvent::Failed(message) => self.fail_task(&task_id, message)?,
                 WorkerEvent::Cancelled => {
                     self.cancel_task_tree(&task_id, false)?;

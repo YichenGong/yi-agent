@@ -57,6 +57,7 @@ impl WorkerStart {
 #[derive(Debug, Clone)]
 pub struct WorkerHandle {
     cancellation: CancellationToken,
+    pause_updates: watch::Sender<bool>,
     events: Arc<Mutex<Vec<WorkerEvent>>>,
     messages: Arc<Mutex<VecDeque<WorkerMessage>>>,
     message_updates: watch::Sender<u64>,
@@ -72,6 +73,25 @@ pub struct WorkerMessage {
 pub struct WorkerMailbox {
     messages: Arc<Mutex<VecDeque<WorkerMessage>>>,
     updates: watch::Receiver<u64>,
+}
+
+/// Receives a durable-in-process pause request. A worker acknowledges it by
+/// reporting `WorkerEvent::Paused` only after reaching its safe checkpoint.
+pub struct WorkerPauseSignal {
+    updates: watch::Receiver<bool>,
+}
+
+impl WorkerPauseSignal {
+    pub async fn requested(&mut self) -> bool {
+        loop {
+            if *self.updates.borrow() {
+                return true;
+            }
+            if self.updates.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
 }
 
 impl WorkerMailbox {
@@ -95,6 +115,7 @@ impl WorkerMailbox {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerEvent {
     CompletedWithoutDelivery,
+    Paused,
     Cancelled,
     Failed(String),
 }
@@ -102,8 +123,10 @@ pub enum WorkerEvent {
 impl WorkerHandle {
     pub fn new(cancellation: CancellationToken) -> Self {
         let (message_updates, _) = watch::channel(0_u64);
+        let (pause_updates, _) = watch::channel(false);
         Self {
             cancellation,
+            pause_updates,
             events: Arc::new(Mutex::new(Vec::new())),
             messages: Arc::new(Mutex::new(VecDeque::new())),
             message_updates,
@@ -118,8 +141,22 @@ impl WorkerHandle {
         self.cancellation.cancel();
     }
 
+    pub fn request_pause(&self) {
+        self.pause_updates.send_replace(true);
+    }
+
+    pub fn subscribe_pause(&self) -> WorkerPauseSignal {
+        WorkerPauseSignal {
+            updates: self.pause_updates.subscribe(),
+        }
+    }
+
     pub fn report_completed_without_delivery(&self) {
         self.report(WorkerEvent::CompletedWithoutDelivery);
+    }
+
+    pub fn report_paused(&self) {
+        self.report(WorkerEvent::Paused);
     }
 
     pub fn report_cancelled(&self) {

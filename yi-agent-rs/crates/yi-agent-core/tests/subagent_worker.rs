@@ -23,3 +23,19 @@ async fn worker_factory_receives_task_identity_and_cancellation_handle() {
     handle.cancel();
     assert!(request.cancellation.is_cancelled());
 }
+
+#[tokio::test]
+async fn pause_request_is_separate_from_worker_cancellation() {
+    let handle = WorkerHandle::new(tokio_util::sync::CancellationToken::new());
+    let mut pause = handle.subscribe_pause();
+
+    handle.request_pause();
+
+    assert!(pause.requested().await);
+    assert!(!handle.cancellation_token().is_cancelled());
+    handle.report_paused();
+    assert!(matches!(
+        handle.take_events().as_slice(),
+        [yi_agent_core::subagent::worker::WorkerEvent::Paused]
+    ));
+}
