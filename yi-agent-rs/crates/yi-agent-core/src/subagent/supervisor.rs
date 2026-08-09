@@ -65,7 +65,7 @@ pub struct AgentSupervisor {
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
     worker_message_capabilities: HashMap<TaskId, String>,
-    consumed_user_override_ids: Vec<(TaskId, super::task::MessageId)>,
+    pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
 }
@@ -92,7 +92,7 @@ impl AgentSupervisor {
             mailboxes,
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
-            consumed_user_override_ids: Vec::new(),
+            pending_user_override_acks: Vec::new(),
             events: Vec::new(),
             updates,
         }
@@ -221,13 +221,13 @@ impl AgentSupervisor {
         let mut changed = Vec::new();
         for (task_id, event) in events {
             if let WorkerEvent::MessageConsumed { message_id } = event {
-                if self
-                    .mailboxes
-                    .get_mut(&task_id)
-                    .expect("worker task mailbox exists")
-                    .mark_user_override_consumed(&message_id)
-                {
-                    self.consumed_user_override_ids
+                if self.mailboxes.get(&task_id).is_some_and(|mailbox| {
+                    mailbox
+                        .pending_user_overrides()
+                        .iter()
+                        .any(|(id, _)| id == &message_id)
+                }) {
+                    self.pending_user_override_acks
                         .push((task_id.clone(), message_id));
                     self.notify_update();
                 }
@@ -278,8 +278,29 @@ impl AgentSupervisor {
 
     /// Drains external override acknowledgements for RuntimeCoordinator to
     /// durably persist after its worker reconciliation pass.
-    pub fn take_consumed_user_override_ids(&mut self) -> Vec<(TaskId, super::task::MessageId)> {
-        std::mem::take(&mut self.consumed_user_override_ids)
+    pub fn pending_user_override_acks(&self) -> &[(TaskId, super::task::MessageId)] {
+        &self.pending_user_override_acks
+    }
+
+    /// Compatibility view for callers inspecting acknowledgements. Acks remain
+    /// staged until the coordinator confirms their durable transaction.
+    pub fn take_consumed_user_override_ids(&self) -> Vec<(TaskId, super::task::MessageId)> {
+        self.pending_user_override_acks.clone()
+    }
+
+    pub fn confirm_user_override_consumed(
+        &mut self,
+        task_id: &TaskId,
+        message_id: &super::task::MessageId,
+    ) {
+        if self
+            .mailboxes
+            .get_mut(task_id)
+            .is_some_and(|mailbox| mailbox.mark_user_override_consumed(message_id))
+        {
+            self.pending_user_override_acks
+                .retain(|ack| ack != &(task_id.clone(), message_id.clone()));
+        }
     }
 
     /// Cancels a task and, when requested, every descendant owned by this

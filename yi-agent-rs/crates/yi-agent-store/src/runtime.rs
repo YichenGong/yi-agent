@@ -379,7 +379,7 @@ impl RuntimeCoordinator {
             .collect::<Vec<_>>();
         let mut updates = Vec::new();
         let mut consumed_overrides = Vec::new();
-        for supervisor in supervisors {
+        for supervisor in &supervisors {
             let mut supervisor = supervisor.lock().await;
             let changed = supervisor
                 .reconcile_worker_events()
@@ -399,7 +399,7 @@ impl RuntimeCoordinator {
                 };
                 updates.push((task_id, state, event));
             }
-            consumed_overrides.extend(supervisor.take_consumed_user_override_ids());
+            consumed_overrides.extend(supervisor.pending_user_override_acks().iter().cloned());
         }
         let mut repository = self
             .repository
@@ -407,6 +407,12 @@ impl RuntimeCoordinator {
             .expect("runtime repository mutex poisoned");
         for (task_id, message_id) in consumed_overrides {
             repository.mark_user_override_consumed(&task_id, &message_id)?;
+            for supervisor in &supervisors {
+                supervisor
+                    .lock()
+                    .await
+                    .confirm_user_override_consumed(&task_id, &message_id);
+            }
         }
         for (task_id, state, event) in updates {
             repository.transition_task(&task_id, state, event)?;
