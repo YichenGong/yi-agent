@@ -583,6 +583,13 @@ pub enum TaskEvent {
         attempt_id: AttemptId,
         reason: CancelReason,
     },
+    PauseRequested {
+        attempt_id: AttemptId,
+        reason: PauseReason,
+    },
+    ResumeRequested {
+        attempt_id: AttemptId,
+    },
     RuntimeInterrupted {
         attempt_id: AttemptId,
         evidence: RecoveryEvidence,
@@ -606,6 +613,8 @@ impl TaskEvent {
             | Self::ReviewRework { attempt_id, .. }
             | Self::ReviewRejected { attempt_id, .. }
             | Self::CancelRequested { attempt_id, .. }
+            | Self::PauseRequested { attempt_id, .. }
+            | Self::ResumeRequested { attempt_id }
             | Self::RuntimeInterrupted { attempt_id, .. }
             | Self::RetryRequested { attempt_id } => attempt_id,
         }
@@ -787,6 +796,19 @@ pub fn reduce(
         }
         TaskEvent::CancelRequested { reason, .. } => {
             transition(task, TaskState::Cancelled(reason), now)?
+        }
+        TaskEvent::PauseRequested { reason, .. } => {
+            transition(task, TaskState::Paused(reason), now)?
+        }
+        TaskEvent::ResumeRequested { .. } => {
+            if !matches!(task.state(), TaskState::Paused(_)) {
+                return Err(TaskTransitionError {
+                    from: task.state().clone(),
+                    to: TaskState::Queued,
+                }
+                .into());
+            }
+            transition(task, TaskState::Queued, now)?;
         }
         TaskEvent::RuntimeInterrupted { evidence, .. } => {
             transition(task, TaskState::RecoveryRequired(evidence), now)?
@@ -1229,5 +1251,31 @@ mod tests {
             now,
         );
         assert!(matches!(result, Err(TaskReduceError::ReviewRequiresParent)));
+    }
+
+    #[test]
+    fn pause_wins_over_running_state_and_resume_returns_to_queue() {
+        let (mut task, _) = task_with_workspace();
+        let now = Utc::now();
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::AdmissionGranted {
+                attempt_id: attempt_id.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        task.reduce(
+            TaskEvent::PauseRequested {
+                attempt_id: attempt_id.clone(),
+                reason: PauseReason("user requested pause".into()),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(matches!(task.state(), TaskState::Paused(_)));
+        task.reduce(TaskEvent::ResumeRequested { attempt_id }, now)
+            .unwrap();
+        assert_eq!(task.state(), &TaskState::Queued);
     }
 }
