@@ -81,7 +81,7 @@ fn control_agent(action: AgentAction) -> Result<()> {
         AgentAction::Show { task_id } => yi_agent_store::ipc::IpcRequest::InspectTask { task_id },
         AgentAction::Events { task_id, follow } => {
             if follow {
-                anyhow::bail!("following task events is not yet supported by this daemon version")
+                return follow_task_events(&socket, task_id);
             }
             yi_agent_store::ipc::IpcRequest::ReadTaskEvents {
                 task_id,
@@ -147,7 +147,7 @@ fn control_agent(action: AgentAction) -> Result<()> {
         }
         yi_agent_store::ipc::IpcResponse::TaskEvents { events } => {
             for event in events {
-                println!("{} {} {}", event.event_id, event.kind, event.payload_json);
+                println!("{}", task_event_line(&event));
             }
             Ok(())
         }
@@ -177,6 +177,46 @@ fn control_agent(action: AgentAction) -> Result<()> {
         }
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
     }
+}
+
+fn follow_task_events(socket: &std::path::Path, task_id: String) -> Result<()> {
+    let mut subscription = yi_agent_store::ipc::subscribe_with_filters(
+        socket,
+        0,
+        yi_agent_store::ipc::SubscriptionFilters {
+            task_ids: vec![task_id],
+            kinds: Vec::new(),
+        },
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })?;
+
+    loop {
+        match subscription.next_response()? {
+            yi_agent_store::ipc::IpcResponse::Subscription(snapshot) => {
+                for event in snapshot.events {
+                    println!("{}", task_event_line(&event));
+                }
+            }
+            yi_agent_store::ipc::IpcResponse::Event(event) => {
+                println!("{}", task_event_line(&event));
+            }
+            yi_agent_store::ipc::IpcResponse::ResyncRequired => {
+                anyhow::bail!(
+                    "daemon event stream requires resync; rerun `yi-agent agent events --follow`"
+                )
+            }
+            yi_agent_store::ipc::IpcResponse::Error { code } => {
+                anyhow::bail!("runtime daemon rejected event subscription: {code}")
+            }
+            other => anyhow::bail!("unexpected runtime event subscription response: {other:?}"),
+        }
+    }
+}
+
+fn task_event_line(event: &yi_agent_store::ipc::IpcEvent) -> String {
+    format!("{} {} {}", event.event_id, event.kind, event.payload_json)
 }
 
 fn inspect_session(socket: &std::path::Path, task_id: &str) -> Result<String> {
@@ -1422,5 +1462,17 @@ mod tests {
                 .unwrap(),
             std::path::PathBuf::from("/tmp/yi-runtime")
         );
+    }
+
+    #[test]
+    fn task_event_line_uses_the_stable_event_wire_fields() {
+        let event = yi_agent_store::ipc::IpcEvent {
+            event_id: 42,
+            task_id: "task-1".into(),
+            kind: "task_progress".into(),
+            payload_json: r#"{"done":true}"#.into(),
+        };
+
+        assert_eq!(task_event_line(&event), "42 task_progress {\"done\":true}");
     }
 }
