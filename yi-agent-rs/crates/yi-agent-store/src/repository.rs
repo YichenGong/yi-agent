@@ -5,8 +5,8 @@ use chrono::{DateTime, Local, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use yi_agent_core::subagent::task::MessageId;
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
+use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionRequestId};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
@@ -26,6 +26,8 @@ pub enum RepositoryError {
     TaskNotFound { task: String },
     #[error("external mailbox message does not exist: {message_id}")]
     MailboxMessageNotFound { message_id: String },
+    #[error("permission request is not pending: {request}")]
+    PermissionRequestNotPending { request: String },
     #[error("worker recovery context is not durable: {reason}")]
     InvalidWorkerRecoveryContext { reason: String },
     #[error("admission cursor is invalid for {key}: {reason}")]
@@ -53,6 +55,8 @@ pub enum RuntimeEvent {
     TaskRecoveryAttested,
     MailboxMessageQueued,
     MailboxMessageConsumed,
+    PermissionRequested,
+    PermissionResolved,
 }
 
 impl RuntimeEvent {
@@ -75,6 +79,8 @@ impl RuntimeEvent {
             Self::TaskRecoveryAttested => "task_recovery_attested",
             Self::MailboxMessageQueued => "mailbox_message_queued",
             Self::MailboxMessageConsumed => "mailbox_message_consumed",
+            Self::PermissionRequested => "permission_requested",
+            Self::PermissionResolved => "permission_resolved",
         }
     }
 
@@ -97,6 +103,8 @@ impl RuntimeEvent {
             "task_recovery_attested" => Ok(Self::TaskRecoveryAttested),
             "mailbox_message_queued" => Ok(Self::MailboxMessageQueued),
             "mailbox_message_consumed" => Ok(Self::MailboxMessageConsumed),
+            "permission_requested" => Ok(Self::PermissionRequested),
+            "permission_resolved" => Ok(Self::PermissionResolved),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -1825,6 +1833,132 @@ impl RuntimeRepository {
         Ok(task_ids.len())
     }
 
+    /// Persists a permission wait with the immutable request payload before an
+    /// operator can see or resolve it.
+    pub fn request_permission(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        request: &PermissionRequestId,
+        payload_json: &str,
+    ) -> Result<i64, RepositoryError> {
+        serde_json::from_str::<serde_json::Value>(payload_json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = 'waiting_for_permission', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND active_attempt_id = ?2 AND state_json = 'running'",
+            params![task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = 'waiting_for_permission'
+             WHERE id = ?1 AND task_id = ?2",
+            params![attempt.to_string(), task.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO permission_requests (id, task_id, payload_json, state)
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![request.to_string(), task.to_string(), payload_json],
+        )?;
+        let event_payload = serde_json::to_string(&serde_json::json!({
+            "request_id": request,
+            "request": serde_json::from_str::<serde_json::Value>(payload_json)?,
+        }))?;
+        let event_id = append_event_with_payload(
+            &transaction,
+            task,
+            RuntimeEvent::PermissionRequested,
+            &event_payload,
+        )?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Resolves exactly one pending request and atomically aligns its request
+    /// record, task/attempt snapshot, and actor-attributed audit event.
+    pub fn resolve_permission(
+        &mut self,
+        request: &PermissionRequestId,
+        decision: PermissionDecision,
+        actor_json: &str,
+    ) -> Result<i64, RepositoryError> {
+        serde_json::from_str::<serde_json::Value>(actor_json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let task_id = transaction
+            .query_row(
+                "SELECT task_id FROM permission_requests WHERE id = ?1 AND state = 'pending'",
+                [request.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| RepositoryError::PermissionRequestNotPending {
+                request: request.to_string(),
+            })?;
+        let task: TaskId = task_id.parse().map_err(|_| RepositoryError::TaskNotFound {
+            task: task_id.clone(),
+        })?;
+        let (request_state, task_state) = match decision {
+            PermissionDecision::Allow => ("allowed", "queued"),
+            PermissionDecision::Deny => ("denied", "blocked"),
+        };
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND state_json = 'waiting_for_permission'",
+            params![task_state, task.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::PermissionRequestNotPending {
+                request: request.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = ?1, ended_at = CASE WHEN ?1 = 'blocked'
+                THEN CURRENT_TIMESTAMP ELSE ended_at END
+             WHERE id = (SELECT active_attempt_id FROM tasks WHERE id = ?2) AND task_id = ?2",
+            params![task_state, task.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE permission_requests SET state = ?1, decided_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND state = 'pending'",
+            params![request_state, request.to_string()],
+        )?;
+        let event_payload = serde_json::to_string(&serde_json::json!({
+            "request_id": request,
+            "decision": decision,
+            "actor": serde_json::from_str::<serde_json::Value>(actor_json)?,
+        }))?;
+        let event_id = append_event_with_actor_payload(
+            &transaction,
+            &task,
+            RuntimeEvent::PermissionResolved,
+            actor_json,
+            &event_payload,
+        )?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    pub fn permission_request_state(
+        &self,
+        request: &PermissionRequestId,
+    ) -> Result<String, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT state FROM permission_requests WHERE id = ?1",
+                [request.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(RepositoryError::from)
+    }
+
     pub fn task_state(&self, task: &TaskId) -> Result<String, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT state_json FROM tasks WHERE id = ?1",
@@ -2268,11 +2402,27 @@ fn append_event_with_payload(
     event: RuntimeEvent,
     payload_json: &str,
 ) -> Result<i64, RepositoryError> {
+    append_event_with_actor_payload(
+        transaction,
+        task,
+        event,
+        r#"{"kind":"runtime"}"#,
+        payload_json,
+    )
+}
+
+fn append_event_with_actor_payload(
+    transaction: &Transaction<'_>,
+    task: &TaskId,
+    event: RuntimeEvent,
+    actor_json: &str,
+    payload_json: &str,
+) -> Result<i64, RepositoryError> {
     let inserted = transaction.execute(
         "INSERT INTO events (session_id, task_id, actor_json, kind, payload_json)
-         SELECT root_session_id, id, '{\"kind\":\"runtime\"}', ?1, ?2
-         FROM tasks WHERE id = ?3",
-        params![event.name(), payload_json, task.to_string()],
+         SELECT root_session_id, id, ?1, ?2, ?3
+         FROM tasks WHERE id = ?4",
+        params![actor_json, event.name(), payload_json, task.to_string()],
     )?;
     if inserted == 0 {
         return Err(RepositoryError::TaskNotFound {
