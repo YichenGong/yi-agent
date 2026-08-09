@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -28,6 +29,8 @@ pub struct ResourceRequest {
     pub key: String,
     pub mode: LeaseMode,
     pub units: u16,
+    /// Resource-wait deadline. Expired requests never acquire a permit.
+    pub deadline: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -163,6 +166,8 @@ impl ResourceCoordinator {
         let capacity = *self.capacities.get(key).unwrap_or(&0);
         let used = *self.in_use.get(key).unwrap_or(&0);
         let queue = self.queues.get_mut(key)?;
+        let now = Utc::now();
+        queue.retain(|entry| entry.request.deadline.is_none_or(|deadline| deadline > now));
         if used >= capacity {
             return None;
         }

@@ -1,3 +1,4 @@
+use chrono::{Duration, Utc};
 use yi_agent_core::subagent::scheduler::{
     AdmissionError, LeaseMode, ResourceCoordinator, ResourceRequest, ResourceScope,
 };
@@ -20,6 +21,7 @@ fn request(key: &str) -> ResourceRequest {
         key: key.into(),
         mode: LeaseMode::Exclusive,
         units: 1,
+        deadline: None,
     }
 }
 
@@ -29,6 +31,7 @@ fn shared_request(key: &str, units: u16) -> ResourceRequest {
         key: key.into(),
         mode: LeaseMode::Shared,
         units,
+        deadline: None,
     }
 }
 
@@ -126,4 +129,16 @@ fn queue_capacity_rejects_without_allocating_a_hidden_request() {
         Err(AdmissionError::QueueCapacityExceeded)
     ));
     assert_eq!(coordinator.queued_request_count(), 1);
+}
+
+#[test]
+fn expired_resource_request_is_removed_before_grant() {
+    let mut coordinator = ResourceCoordinator::new();
+    let root = RootSessionId::new();
+    let mut expired = request("resident:global");
+    expired.deadline = Some(Utc::now() - Duration::seconds(1));
+    coordinator.enqueue(root, TaskId::new(), expired);
+
+    assert!(coordinator.grant_next("resident:global").is_none());
+    assert_eq!(coordinator.queued_request_count(), 0);
 }
