@@ -5,7 +5,7 @@ use chrono::{DateTime, Local, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
+use yi_agent_core::subagent::task::{BudgetKind, DeliveryReport, TimeoutKind};
 use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionRequestId};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
@@ -30,6 +30,10 @@ pub enum RepositoryError {
     PermissionRequestNotPending { request: String },
     #[error("permission request does not exist: {request}")]
     PermissionRequestNotFound { request: String },
+    #[error("delivery requires a direct parent task: {task}")]
+    DeliveryRequiresParent { task: String },
+    #[error("task is not running its expected attempt for delivery: {task}")]
+    TaskNotReadyForDelivery { task: String },
     #[error("worker recovery context is not durable: {reason}")]
     InvalidWorkerRecoveryContext { reason: String },
     #[error("admission cursor is invalid for {key}: {reason}")]
@@ -55,6 +59,7 @@ pub enum RuntimeEvent {
     TaskFailed,
     TaskRecoveryRequired,
     TaskRecoveryAttested,
+    TaskDelivered,
     MailboxMessageQueued,
     MailboxMessageConsumed,
     PermissionRequested,
@@ -79,6 +84,7 @@ impl RuntimeEvent {
             Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
             Self::TaskRecoveryAttested => "task_recovery_attested",
+            Self::TaskDelivered => "task_delivered",
             Self::MailboxMessageQueued => "mailbox_message_queued",
             Self::MailboxMessageConsumed => "mailbox_message_consumed",
             Self::PermissionRequested => "permission_requested",
@@ -103,6 +109,7 @@ impl RuntimeEvent {
             "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
             "task_recovery_attested" => Ok(Self::TaskRecoveryAttested),
+            "task_delivered" => Ok(Self::TaskDelivered),
             "mailbox_message_queued" => Ok(Self::MailboxMessageQueued),
             "mailbox_message_consumed" => Ok(Self::MailboxMessageConsumed),
             "permission_requested" => Ok(Self::PermissionRequested),
@@ -1328,6 +1335,96 @@ impl RuntimeRepository {
             .query_row("SELECT COUNT(*) FROM mailbox_messages", [], |row| {
                 row.get(0)
             })?)
+    }
+
+    /// Commits a child delivery, its review wait, and the direct parent's
+    /// high-priority mailbox notification as one durable transaction.
+    pub fn record_delivery_for_review(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        delivery: &DeliveryReport,
+    ) -> Result<i64, RepositoryError> {
+        let delivery_json = serde_json::to_string(delivery)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let parent_id = transaction
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id = ?1",
+                [task.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            })?
+            .ok_or_else(|| RepositoryError::DeliveryRequiresParent {
+                task: task.to_string(),
+            })?;
+        let parent: TaskId = parent_id
+            .parse()
+            .map_err(|_| RepositoryError::TaskNotFound {
+                task: parent_id.clone(),
+            })?;
+        let changed = transaction.execute(
+            "UPDATE tasks
+             SET state_json = 'awaiting_parent_review', delivery_json = ?1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3 AND state_json = 'running'",
+            params![delivery_json, task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotReadyForDelivery {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = 'awaiting_parent_review'
+             WHERE id = ?1 AND task_id = ?2",
+            params![attempt.to_string(), task.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO deliveries (id, task_id, attempt_id, payload_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                delivery.id.to_string(),
+                task.to_string(),
+                attempt.to_string(),
+                serde_json::to_string(delivery)?,
+            ],
+        )?;
+        let message_id = MessageId::new();
+        transaction.execute(
+            "INSERT INTO mailbox_messages
+             (id, recipient_task_id, sender_task_id, kind, priority, correlation_id, payload_json)
+             VALUES (?1, ?2, ?3, 'completed', 1, ?4, ?5)",
+            params![
+                message_id.to_string(),
+                parent.to_string(),
+                task.to_string(),
+                attempt.to_string(),
+                serde_json::to_string(delivery)?,
+            ],
+        )?;
+        let event_id = append_event_with_payload(
+            &transaction,
+            task,
+            RuntimeEvent::TaskDelivered,
+            &serde_json::to_string(&serde_json::json!({ "delivery_id": delivery.id }))?,
+        )?;
+        append_event_with_payload(
+            &transaction,
+            &parent,
+            RuntimeEvent::MailboxMessageQueued,
+            &serde_json::to_string(&serde_json::json!({
+                "message_id": message_id,
+                "sender_task_id": task,
+                "delivery_id": delivery.id,
+            }))?,
+        )?;
+        transaction.commit()?;
+        Ok(event_id)
     }
 
     pub fn mailbox_message_delivered_at(

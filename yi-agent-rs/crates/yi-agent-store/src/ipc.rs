@@ -1731,6 +1731,10 @@ fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcError
         crate::repository::RepositoryError::PermissionRequestNotPending { .. } => {
             IpcErrorCode::InvalidState
         }
+        crate::repository::RepositoryError::DeliveryRequiresParent { .. }
+        | crate::repository::RepositoryError::TaskNotReadyForDelivery { .. } => {
+            IpcErrorCode::InvalidState
+        }
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
@@ -1781,6 +1785,7 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::TaskFailed => "task_failed",
         crate::repository::RuntimeEvent::TaskRecoveryRequired => "task_recovery_required",
         crate::repository::RuntimeEvent::TaskRecoveryAttested => "task_recovery_attested",
+        crate::repository::RuntimeEvent::TaskDelivered => "task_delivered",
         crate::repository::RuntimeEvent::MailboxMessageQueued => "mailbox_message_queued",
         crate::repository::RuntimeEvent::MailboxMessageConsumed => "mailbox_message_consumed",
         crate::repository::RuntimeEvent::PermissionRequested => "permission_requested",
