@@ -157,7 +157,12 @@ impl TaskState {
             (self, &next),
             (
                 Self::Queued,
-                Self::Running | Self::Paused(_) | Self::Cancelled(_)
+                Self::Running
+                    | Self::Paused(_)
+                    | Self::Stalled(_)
+                    | Self::TimedOut(_)
+                    | Self::BudgetExhausted(_)
+                    | Self::Cancelled(_)
             ) | (
                 Self::Running,
                 Self::WaitingForResource(_)
@@ -176,7 +181,13 @@ impl TaskState {
                 Self::WaitingForResource(_)
                     | Self::WaitingForPermission(_)
                     | Self::WaitingForChildren(_),
-                Self::Queued | Self::Paused(_) | Self::Cancelled(_) | Self::RecoveryRequired(_)
+                Self::Queued
+                    | Self::Paused(_)
+                    | Self::Stalled(_)
+                    | Self::TimedOut(_)
+                    | Self::BudgetExhausted(_)
+                    | Self::Cancelled(_)
+                    | Self::RecoveryRequired(_)
             ) | (
                 Self::Paused(_),
                 Self::Queued | Self::Cancelled(_) | Self::RecoveryRequired(_)

@@ -1249,6 +1249,39 @@ async fn runtime_watchdog_stalls_a_running_worker_once() {
     );
 }
 
+#[tokio::test]
+async fn runtime_watchdog_can_timeout_a_queued_resource_wait() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    assert!(
+        coordinator
+            .record_watchdog_terminal(
+                &session,
+                &task,
+                WatchdogTerminal::TimedOut(TimeoutKind::Deadline),
+                WatchdogEvidence {
+                    last_meaningful_event_id: None,
+                    last_meaningful_at: timestamp,
+                    elapsed_secs: 60,
+                    current_wait: Some(WatchdogResourceWait {
+                        resource_key: "resident:global".into(),
+                        queued_at: timestamp,
+                    }),
+                },
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(coordinator.task_state(&task).unwrap(), "timed_out");
+}
+
 #[test]
 fn watchdog_terminal_variants_emit_their_distinct_event_kinds() {
     for (terminal, expected_state, expected_event) in [
