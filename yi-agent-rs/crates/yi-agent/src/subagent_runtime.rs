@@ -207,6 +207,17 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                         pause_forwarded = true;
                                     },
                                     event = stream.next() => match event {
+                                        Some(AgentEvent::Usage { usage, .. }) => {
+                                            reporter.report_provider_usage(
+                                                u64::from(usage.input_tokens),
+                                                u64::from(usage.output_tokens),
+                                            );
+                                        }
+                                        Some(AgentEvent::ToolResult { result, .. }) if !result.is_error => {
+                                            // A successful tool result is external, durable progress;
+                                            // generated text and streamed stdout are intentionally excluded.
+                                            reporter.report_meaningful_progress();
+                                        }
                                         Some(AgentEvent::Done { .. }) | None => {
                                             if pause_forwarded {
                                                 reporter.report_paused();
@@ -528,9 +539,9 @@ mod tests {
     use tempfile::TempDir;
     use yi_agent_core::subagent::task::{AttemptId, MessageId, RootSessionId, TaskId};
     use yi_agent_core::subagent::worker::{
-        AgentWorkerFactory, WorkerEvent, WorkerMessage, WorkerStart,
+        AgentWorkerFactory, WorkerEvent, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
     };
-    use yi_agent_core::{ProviderError, ProviderEvent, ProviderRequest};
+    use yi_agent_core::{ProviderError, ProviderEvent, ProviderRequest, TokenUsage};
     use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
     use yi_agent_store::repository::RuntimeRepository;
     use yi_agent_store::runtime::RuntimeCoordinator;
@@ -571,6 +582,28 @@ mod tests {
     #[derive(Default)]
     struct RecordingHangingProvider {
         requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct UsageReportingProvider;
+
+    #[async_trait]
+    impl Provider for UsageReportingProvider {
+        async fn call_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            Ok(futures::stream::iter([
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 11,
+                    output_tokens: 5,
+                    ..TokenUsage::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                },
+            ])
+            .boxed())
+        }
     }
 
     #[async_trait]
@@ -783,6 +816,39 @@ mod tests {
             |event| matches!(event, WorkerEvent::MessageConsumed { message_id: id } if id == &message_id)
         ));
         handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_reports_provider_usage_to_the_watchdog() {
+        let directory = TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(UsageReportingProvider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Complete the delegated task.");
+        let handle = factory.start(request).await.unwrap();
+
+        let events = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let events = handle.take_watchdog_events();
+                if !events.is_empty() {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should report provider usage");
+        assert_eq!(
+            events,
+            vec![WorkerWatchdogEvent::ProviderUsage {
+                input_tokens: 11,
+                output_tokens: 5,
+            }]
+        );
     }
 
     #[tokio::test]

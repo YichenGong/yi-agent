@@ -1495,3 +1495,45 @@ async fn coordinator_seeds_watchdog_snapshots_for_root_and_child_attempts() {
         assert_eq!(snapshot.current_wait, None);
     }
 }
+
+#[tokio::test]
+async fn coordinator_persists_worker_usage_and_meaningful_progress() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &task).await.unwrap();
+
+    factory.handles.lock().unwrap()[0].report_provider_usage(11, 5);
+    factory.handles.lock().unwrap()[0].report_meaningful_progress();
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    let attempt: yi_agent_core::AttemptId = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+            [task.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    let snapshot = RuntimeRepository::open(&database)
+        .unwrap()
+        .attempt_watchdog_snapshot(&attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.observation.usage.turns, 1);
+    assert_eq!(snapshot.observation.usage.tokens, 16);
+    assert!(snapshot.last_meaningful_event_id.is_some());
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .event_records_after(0)
+            .unwrap()
+            .into_iter()
+            .any(|event| event.event == RuntimeEvent::TaskProgress)
+    );
+}

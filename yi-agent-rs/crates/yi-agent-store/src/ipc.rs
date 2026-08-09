@@ -1477,6 +1477,7 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::TaskCancelled => "task_cancelled",
         crate::repository::RuntimeEvent::TaskPauseRequested => "task_pause_requested",
         crate::repository::RuntimeEvent::TaskPaused => "task_paused",
+        crate::repository::RuntimeEvent::TaskProgress => "task_progress",
         crate::repository::RuntimeEvent::TaskBlocked => "task_blocked",
         crate::repository::RuntimeEvent::TaskStalled => "task_stalled",
         crate::repository::RuntimeEvent::TaskTimedOut => "task_timed_out",

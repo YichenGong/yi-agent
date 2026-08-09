@@ -102,6 +102,7 @@ pub struct WorkerHandle {
     cancellation: CancellationToken,
     pause_updates: watch::Sender<bool>,
     events: Arc<Mutex<Vec<WorkerEvent>>>,
+    watchdog_events: Arc<Mutex<Vec<WorkerWatchdogEvent>>>,
     messages: Arc<Mutex<VecDeque<WorkerMessage>>>,
     message_updates: watch::Sender<u64>,
 }
@@ -169,6 +170,17 @@ pub enum WorkerEvent {
     RecoveryConflict(String),
 }
 
+/// Non-terminal facts used by the runtime watchdog. Generated model text is
+/// deliberately absent: it must not reset the idle-progress deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerWatchdogEvent {
+    ProviderUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    MeaningfulProgress,
+}
+
 impl WorkerHandle {
     pub fn new(cancellation: CancellationToken) -> Self {
         let (message_updates, _) = watch::channel(0_u64);
@@ -177,6 +189,7 @@ impl WorkerHandle {
             cancellation,
             pause_updates,
             events: Arc::new(Mutex::new(Vec::new())),
+            watchdog_events: Arc::new(Mutex::new(Vec::new())),
             messages: Arc::new(Mutex::new(VecDeque::new())),
             message_updates,
         }
@@ -224,10 +237,33 @@ impl WorkerHandle {
         self.report(WorkerEvent::RecoveryConflict(message.into()));
     }
 
+    /// Records one completed provider turn. The runtime persists this as
+    /// budget usage without treating generated model text as progress.
+    pub fn report_provider_usage(&self, input_tokens: u64, output_tokens: u64) {
+        self.report_watchdog(WorkerWatchdogEvent::ProviderUsage {
+            input_tokens,
+            output_tokens,
+        });
+    }
+
+    /// Records a durable progress point such as a successful tool result.
+    pub fn report_meaningful_progress(&self) {
+        self.report_watchdog(WorkerWatchdogEvent::MeaningfulProgress);
+    }
+
     pub fn take_events(&self) -> Vec<WorkerEvent> {
         std::mem::take(
             &mut *self
                 .events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    pub fn take_watchdog_events(&self) -> Vec<WorkerWatchdogEvent> {
+        std::mem::take(
+            &mut *self
+                .watchdog_events
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
@@ -258,6 +294,13 @@ impl WorkerHandle {
 
     fn report(&self, event: WorkerEvent) {
         self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
+    }
+
+    fn report_watchdog(&self, event: WorkerWatchdogEvent) {
+        self.watchdog_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(event);

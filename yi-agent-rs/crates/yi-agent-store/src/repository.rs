@@ -43,6 +43,7 @@ pub enum RuntimeEvent {
     TaskCancelled,
     TaskPauseRequested,
     TaskPaused,
+    TaskProgress,
     TaskBlocked,
     TaskStalled,
     TaskTimedOut,
@@ -64,6 +65,7 @@ impl RuntimeEvent {
             Self::TaskCancelled => "task_cancelled",
             Self::TaskPauseRequested => "task_pause_requested",
             Self::TaskPaused => "task_paused",
+            Self::TaskProgress => "task_progress",
             Self::TaskBlocked => "task_blocked",
             Self::TaskStalled => "task_stalled",
             Self::TaskTimedOut => "task_timed_out",
@@ -85,6 +87,7 @@ impl RuntimeEvent {
             "task_cancelled" => Ok(Self::TaskCancelled),
             "task_pause_requested" => Ok(Self::TaskPauseRequested),
             "task_paused" => Ok(Self::TaskPaused),
+            "task_progress" => Ok(Self::TaskProgress),
             "task_blocked" => Ok(Self::TaskBlocked),
             "task_stalled" => Ok(Self::TaskStalled),
             "task_timed_out" => Ok(Self::TaskTimedOut),
@@ -711,6 +714,61 @@ impl RuntimeRepository {
             },
         )
         .transpose()
+    }
+
+    /// Atomically adds durable worker usage and, for a non-generated progress
+    /// point, records the event ID used by the idle watchdog.
+    pub fn record_watchdog_progress(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        turn_delta: u32,
+        token_delta: u64,
+        meaningful: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (usage_json, exists): (String, bool) = transaction.query_row(
+            "SELECT attempt_watchdogs.usage_json,
+                    tasks.active_attempt_id = attempt_watchdogs.attempt_id
+             FROM attempt_watchdogs JOIN tasks ON tasks.id = attempt_watchdogs.task_id
+             WHERE attempt_watchdogs.task_id = ?1 AND attempt_watchdogs.attempt_id = ?2",
+            params![task.to_string(), attempt.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if !exists {
+            return Ok(());
+        }
+        let mut usage: WatchdogUsage = serde_json::from_str(&usage_json).map_err(|error| {
+            RepositoryError::InvalidWatchdogSnapshot {
+                attempt: attempt.to_string(),
+                reason: format!("invalid usage JSON: {error}"),
+            }
+        })?;
+        usage.turns = usage.turns.saturating_add(turn_delta);
+        usage.tokens = usage.tokens.saturating_add(token_delta);
+        let progress_event_id = meaningful
+            .then(|| append_event(&transaction, task, RuntimeEvent::TaskProgress))
+            .transpose()?;
+        transaction.execute(
+            "UPDATE attempt_watchdogs
+             SET usage_json = ?1,
+                 last_meaningful_event_id = CASE WHEN ?2 THEN ?3 ELSE last_meaningful_event_id END,
+                 last_meaningful_at = CASE WHEN ?2 THEN ?4 ELSE last_meaningful_at END
+             WHERE task_id = ?5 AND attempt_id = ?6",
+            params![
+                serde_json::to_string(&usage)?,
+                meaningful,
+                progress_event_id,
+                now.to_rfc3339(),
+                task.to_string(),
+                attempt.to_string(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Returns watchdog facts only for the currently active attempt of a task
@@ -1386,6 +1444,26 @@ impl RuntimeRepository {
             params![task.to_string()],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn active_attempt_id(&self, task: &TaskId) -> Result<AttemptId, RepositoryError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            })?;
+        value
+            .parse()
+            .map_err(|_| RepositoryError::InvalidWatchdogSnapshot {
+                attempt: value,
+                reason: "task has an invalid active attempt ID".into(),
+            })
     }
 
     pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {

@@ -14,7 +14,9 @@ use super::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, PauseReason, RecoveryEvidence,
     RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind, WatchdogEvidence,
 };
-use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart};
+use super::worker::{
+    AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
+};
 use crate::agent::ProviderTurnGate;
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
@@ -480,6 +482,21 @@ impl AgentSupervisor {
             }
         }
         Ok(changed)
+    }
+
+    /// Drains non-terminal watchdog facts without applying task transitions.
+    /// The coordinator persists these separately from reducer-owned events.
+    pub fn take_worker_watchdog_events(&self) -> Vec<(TaskId, WorkerWatchdogEvent)> {
+        self.workers
+            .iter()
+            .flat_map(|(task_id, handle)| {
+                handle
+                    .take_watchdog_events()
+                    .into_iter()
+                    .map(|event| (task_id.clone(), event))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Drains external override acknowledgements for RuntimeCoordinator to

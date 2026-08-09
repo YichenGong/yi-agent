@@ -100,7 +100,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 3);
+    assert_eq!(repository.schema_version().unwrap(), 4);
     for table in [
         "sessions",
         "tasks",
@@ -113,6 +113,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
         "reviews",
         "permission_requests",
         "schedules",
+        "attempt_watchdogs",
         "events",
         "runtime_metadata",
         "resource_admission_cursors",
@@ -183,7 +184,8 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 3);
+    assert_eq!(repository.schema_version().unwrap(), 4);
+    assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
         repository

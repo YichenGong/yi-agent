@@ -20,7 +20,7 @@ use yi_agent_core::subagent::task::{
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult,
+    WorkerRecoveryPreflightResult, WorkerWatchdogEvent,
 };
 
 use crate::repository::{
@@ -966,8 +966,10 @@ impl RuntimeCoordinator {
             .collect::<Vec<_>>();
         let mut updates = Vec::new();
         let mut consumed_overrides = Vec::new();
+        let mut watchdog_updates = Vec::new();
         for supervisor in &supervisors {
             let mut supervisor = supervisor.lock().await;
+            watchdog_updates.extend(supervisor.take_worker_watchdog_events());
             let changed = supervisor
                 .reconcile_worker_events()
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
@@ -1004,6 +1006,28 @@ impl RuntimeCoordinator {
                 updates.push((task_id, attempt, state, event, terminal_json));
             }
             consumed_overrides.extend(supervisor.pending_user_override_acks().iter().cloned());
+        }
+        for (task_id, update) in watchdog_updates {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            let attempt = repository.active_attempt_id(&task_id)?;
+            let (turn_delta, token_delta, meaningful) = match update {
+                WorkerWatchdogEvent::ProviderUsage {
+                    input_tokens,
+                    output_tokens,
+                } => (1, input_tokens.saturating_add(output_tokens), false),
+                WorkerWatchdogEvent::MeaningfulProgress => (0, 0, true),
+            };
+            repository.record_watchdog_progress(
+                &task_id,
+                &attempt,
+                turn_delta,
+                token_delta,
+                meaningful,
+                Utc::now(),
+            )?;
         }
         for (task_id, message_id) in &consumed_overrides {
             self.repository
