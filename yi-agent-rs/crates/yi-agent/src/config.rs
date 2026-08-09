@@ -200,6 +200,9 @@ pub enum AgentAction {
         recursive: bool,
         #[arg(long)]
         yes: bool,
+        /// Single-use token returned by the preceding cancel preview.
+        #[arg(long)]
+        confirmation: Option<String>,
     },
     Retry {
         task_id: String,
@@ -1422,11 +1425,13 @@ mod tests {
             "task-123",
             "--recursive",
             "--yes",
+            "--confirmation",
+            "preview-token",
         ]);
         assert!(matches!(
             cancel.command,
-            Some(Command::Agent { action: AgentAction::Cancel { task_id, recursive: true, yes: true } })
-                if task_id == "task-123"
+            Some(Command::Agent { action: AgentAction::Cancel { task_id, recursive: true, yes: true, confirmation: Some(confirmation) } })
+                if task_id == "task-123" && confirmation == "preview-token"
         ));
 
         let rework = Cli::parse_from(["yi-agent", "agent", "rework", "task-123", "tighten tests"]);

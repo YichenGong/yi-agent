@@ -1688,6 +1688,83 @@ fn daemon_reads_task_delivery_evidence_for_diff_inspection() {
 }
 
 #[test]
+fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id,
+            parent_task_id: root_task_id.clone(),
+            objective: "Child task".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child");
+    };
+
+    let IpcResponse::CancelPreview {
+        confirmation_token,
+        task_ids,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PreviewCancel {
+            task_id: root_task_id.clone(),
+            recursive: true,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a cancel preview");
+    };
+    assert_eq!(task_ids, vec![root_task_id.clone(), child_task_id.clone()]);
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmCancel {
+            task_id: root_task_id.clone(),
+            recursive: true,
+            confirmation_token: confirmation_token.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, IpcResponse::TaskCancelled));
+
+    let reused = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmCancel {
+            task_id: root_task_id,
+            recursive: true,
+            confirmation_token,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        reused,
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+        }
+    ));
+    let detail = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_detail(&child_task_id.parse().unwrap())
+        .unwrap();
+    assert_eq!(detail.state, "cancelled");
+}
+
+#[test]
 fn daemon_retries_a_terminal_task_through_its_control_api() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

@@ -102,15 +102,20 @@ fn control_agent(action: AgentAction) -> Result<()> {
             task_id,
             recursive,
             yes,
+            confirmation,
         } => {
             if !yes {
-                anyhow::bail!("cancel preview: task {task_id}; rerun with --yes to confirm")
+                return show_cancel_preview(&socket, task_id, recursive);
             }
-            let session_id = inspect_session(&socket, &task_id)?;
-            yi_agent_store::ipc::IpcRequest::CancelTask {
-                session_id,
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cancel confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmCancel {
                 task_id,
                 recursive,
+                confirmation_token,
             }
         }
         AgentAction::Pause { task_id } => {
@@ -176,6 +181,32 @@ fn control_agent(action: AgentAction) -> Result<()> {
             anyhow::bail!("runtime daemon rejected request: {code}")
         }
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+}
+
+fn show_cancel_preview(socket: &std::path::Path, task_id: String, recursive: bool) -> Result<()> {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::PreviewCancel { task_id, recursive },
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })? {
+        yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token,
+            task_ids,
+            expires_in_secs,
+        } => {
+            println!("affected tasks: {}", task_ids.join(", "));
+            println!(
+                "rerun with --yes --confirmation {confirmation_token} within {expires_in_secs}s"
+            );
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            anyhow::bail!("runtime daemon rejected cancel preview: {code}")
+        }
+        other => anyhow::bail!("unexpected runtime cancel preview response: {other:?}"),
     }
 }
 

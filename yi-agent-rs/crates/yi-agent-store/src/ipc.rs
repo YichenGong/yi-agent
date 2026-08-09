@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use chrono::{Local, Timelike};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 use yi_agent_core::subagent::task::{RootSessionId, TaskId};
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 
@@ -25,10 +26,58 @@ use crate::schedule::ScheduleDefinition;
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_EVENT_FRAMES: usize = 1024;
+const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 // Invalid JSON has no trustworthy request ID to echo, so its error frame uses
 // this documented stable empty identifier.
 const MISSING_REQUEST_ID: &str = "";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+struct PendingConfirmation {
+    task_id: String,
+    recursive: bool,
+    task_ids: Vec<String>,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct ConfirmationStore {
+    pending: Mutex<HashMap<String, PendingConfirmation>>,
+}
+
+impl ConfirmationStore {
+    fn issue(&self, task_id: String, recursive: bool, task_ids: Vec<String>) -> String {
+        let token = Uuid::new_v4().to_string();
+        self.pending
+            .lock()
+            .expect("confirmation store mutex poisoned")
+            .insert(
+                token.clone(),
+                PendingConfirmation {
+                    task_id,
+                    recursive,
+                    task_ids,
+                    expires_at: Instant::now() + CONFIRMATION_TTL,
+                },
+            );
+        token
+    }
+
+    fn consume(&self, token: &str, task_id: &str, recursive: bool, task_ids: &[String]) -> bool {
+        let Some(pending) = self
+            .pending
+            .lock()
+            .expect("confirmation store mutex poisoned")
+            .remove(token)
+        else {
+            return false;
+        };
+        pending.expires_at > Instant::now()
+            && pending.task_id == task_id
+            && pending.recursive == recursive
+            && pending.task_ids == task_ids
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -96,6 +145,15 @@ pub enum IpcRequest {
         session_id: String,
         task_id: String,
         recursive: bool,
+    },
+    PreviewCancel {
+        task_id: String,
+        recursive: bool,
+    },
+    ConfirmCancel {
+        task_id: String,
+        recursive: bool,
+        confirmation_token: String,
     },
     RetryTask {
         session_id: String,
@@ -184,6 +242,11 @@ pub enum IpcResponse {
     },
     TaskStarted,
     TaskCancelled,
+    CancelPreview {
+        confirmation_token: String,
+        task_ids: Vec<String>,
+        expires_in_secs: u64,
+    },
     TaskRetried,
     TaskPaused,
     TaskResumed,
@@ -409,6 +472,8 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let daemon_coordinator = Arc::clone(&coordinator);
+        let confirmations = Arc::new(ConfirmationStore::default());
+        let listener_confirmations = Arc::clone(&confirmations);
         let client_handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let listener_handlers = Arc::clone(&client_handlers);
         let database_path = database_path.as_ref().to_path_buf();
@@ -437,8 +502,15 @@ impl Daemon {
                         let database_path = database_path.clone();
                         let stop = Arc::clone(&thread_stop);
                         let coordinator = Arc::clone(&coordinator);
+                        let confirmations = Arc::clone(&listener_confirmations);
                         let handler = thread::spawn(move || {
-                            let _ = handle_client(stream, &database_path, &stop, &coordinator);
+                            let _ = handle_client(
+                                stream,
+                                &database_path,
+                                &stop,
+                                &coordinator,
+                                &confirmations,
+                            );
                         });
                         listener_handlers
                             .lock()
@@ -652,6 +724,7 @@ fn handle_client(
     database_path: &Path,
     stop: &Arc<AtomicBool>,
     coordinator: &Arc<RuntimeCoordinator>,
+    confirmations: &Arc<ConfirmationStore>,
 ) -> Result<(), IpcError> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -707,6 +780,27 @@ fn handle_client(
                     ),
                 };
             }
+            IpcRequest::PreviewCancel { task_id, recursive } => {
+                match preview_cancel(database_path, confirmations, task_id, recursive) {
+                    Ok(response) => response,
+                    Err(error) => error_response(&error),
+                }
+            }
+            IpcRequest::ConfirmCancel {
+                task_id,
+                recursive,
+                confirmation_token,
+            } => match confirm_cancel(
+                database_path,
+                coordinator,
+                confirmations,
+                task_id,
+                recursive,
+                confirmation_token,
+            ) {
+                Ok(response) => response,
+                Err(error) => error_response(&error),
+            },
             request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
                 Err(error) => error_response(&error),
@@ -717,6 +811,56 @@ fn handle_client(
         },
     };
     write_response_frame(&mut stream, &request_id, None, &response)
+}
+
+fn preview_cancel(
+    database_path: &Path,
+    confirmations: &ConfirmationStore,
+    task_id: String,
+    recursive: bool,
+) -> Result<IpcResponse, IpcError> {
+    let repository = RuntimeRepository::open(database_path)?;
+    let task = parse_id::<TaskId>(&task_id)?;
+    let task_ids = repository
+        .task_tree_ids(&task, recursive)?
+        .into_iter()
+        .map(|task| task.to_string())
+        .collect::<Vec<_>>();
+    let confirmation_token = confirmations.issue(task_id, recursive, task_ids.clone());
+    Ok(IpcResponse::CancelPreview {
+        confirmation_token,
+        task_ids,
+        expires_in_secs: CONFIRMATION_TTL.as_secs(),
+    })
+}
+
+fn confirm_cancel(
+    database_path: &Path,
+    coordinator: &RuntimeCoordinator,
+    confirmations: &ConfirmationStore,
+    task_id: String,
+    recursive: bool,
+    confirmation_token: String,
+) -> Result<IpcResponse, IpcError> {
+    let repository = RuntimeRepository::open(database_path)?;
+    let task = parse_id::<TaskId>(&task_id)?;
+    let detail = repository.task_detail(&task)?;
+    let task_ids = repository
+        .task_tree_ids(&task, recursive)?
+        .into_iter()
+        .map(|task| task.to_string())
+        .collect::<Vec<_>>();
+    if !confirmations.consume(&confirmation_token, &task_id, recursive, &task_ids) {
+        return Ok(IpcResponse::Error {
+            code: IpcErrorCode::ConfirmationRequired,
+        });
+    }
+    let session = parse_id::<RootSessionId>(&detail.session_id)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(coordinator.cancel_task(&session, &task, recursive))?;
+    Ok(IpcResponse::TaskCancelled)
 }
 
 fn prepare_coordinator_for_stop(coordinator: &RuntimeCoordinator) -> Result<(), IpcError> {
@@ -1656,6 +1800,12 @@ fn respond(
                 .build()?;
             runtime.block_on(coordinator.cancel_task(&session_id, &task_id, recursive))?;
             Ok(IpcResponse::TaskCancelled)
+        }
+        IpcRequest::PreviewCancel { .. } | IpcRequest::ConfirmCancel { .. } => {
+            Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "confirmation requests require daemon state",
+            )))
         }
         IpcRequest::RetryTask {
             session_id,

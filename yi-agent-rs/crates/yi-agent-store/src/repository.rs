@@ -2049,6 +2049,38 @@ impl RuntimeRepository {
             })
     }
 
+    /// Returns a task and, when requested, all descendants in stable tree order.
+    pub fn task_tree_ids(
+        &self,
+        task: &TaskId,
+        recursive: bool,
+    ) -> Result<Vec<TaskId>, RepositoryError> {
+        self.task_detail(task)?;
+        let mut statement = self.connection.prepare(
+            "WITH RECURSIVE affected(id, tree_depth) AS (
+                SELECT id, 0 FROM tasks WHERE id = ?1
+                UNION ALL
+                SELECT tasks.id, affected.tree_depth + 1
+                FROM tasks JOIN affected ON tasks.parent_id = affected.id
+                WHERE ?2
+             )
+             SELECT id FROM affected ORDER BY tree_depth, id",
+        )?;
+        statement
+            .query_map(params![task.to_string(), recursive], |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|row| {
+                let task_id = row?;
+                task_id
+                    .parse()
+                    .map_err(|_| RepositoryError::UnknownEventKind {
+                        kind: format!("invalid task ID in store: {task_id}"),
+                    })
+            })
+            .collect()
+    }
+
     /// Read task snapshots, a high-water mark, and replay in one SQLite read transaction.
     pub fn subscription_snapshot(
         &mut self,
