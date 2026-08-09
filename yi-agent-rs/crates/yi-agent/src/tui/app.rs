@@ -1430,7 +1430,10 @@ fn daemon_cancel_at(
 fn daemon_agents_summary_at(socket: &std::path::Path) -> Result<String, String> {
     let response = yi_agent_store::ipc::send_request(
         socket,
-        yi_agent_store::ipc::IpcRequest::SubscribeEvents { after_event_id: 0 },
+        yi_agent_store::ipc::IpcRequest::SubscribeEvents {
+            after_event_id: 0,
+            filters: yi_agent_store::ipc::SubscriptionFilters::default(),
+        },
     )
     .map_err(|error| error.to_string())?;
     let yi_agent_store::ipc::IpcResponse::Subscription(snapshot) = response else {

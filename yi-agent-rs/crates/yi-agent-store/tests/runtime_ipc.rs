@@ -10,9 +10,12 @@ use yi_agent_core::subagent::task::MessageId;
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
-    Daemon, IpcRequest, IpcResponse, send_request, send_request_with_version, subscribe,
+    Daemon, IpcRequest, IpcResponse, SubscriptionFilters, send_request, send_request_with_version,
+    subscribe, subscribe_with_filters,
 };
-use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
+use yi_agent_store::repository::{
+    RepositoryError, RuntimeCursorState, RuntimeEvent, RuntimeRepository,
+};
 
 struct RecordingWorkerFactory;
 
@@ -163,6 +166,84 @@ fn subscription_snapshot_uses_one_high_water_boundary_for_replay() {
 }
 
 #[test]
+fn fresh_cursor_gets_current_replacement_snapshot_without_event_history() {
+    let directory = TempDir::new().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+
+    let snapshot = repository.subscription_snapshot(0).unwrap();
+    assert_eq!(snapshot.cursor_state, RuntimeCursorState::Fresh);
+    assert_eq!(snapshot.tasks[0].state, "running");
+    assert_eq!(snapshot.high_water_event_id, 1);
+    assert!(snapshot.events.is_empty());
+}
+
+#[test]
+fn expired_cursor_gets_replacement_snapshot_then_ordered_events_after_boundary() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_event(&task, RuntimeEvent::TaskQueued)
+        .unwrap();
+    repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+    let boundary = repository
+        .transition_task(&task, "paused", RuntimeEvent::TaskPaused)
+        .unwrap();
+    repository.prune_events_through(1).unwrap();
+
+    let snapshot = repository.subscription_snapshot(0).unwrap();
+    assert_eq!(
+        snapshot.cursor_state,
+        RuntimeCursorState::Expired {
+            oldest_retained_event_id: 2,
+        }
+    );
+    assert_eq!(snapshot.high_water_event_id, boundary);
+    assert_eq!(snapshot.tasks[0].state, "paused");
+    assert!(snapshot.events.is_empty());
+    drop(repository);
+
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut subscription = subscribe(daemon.socket_path(), 0).unwrap();
+    let IpcResponse::Subscription(snapshot) = subscription.next_response().unwrap() else {
+        panic!("expected replacement snapshot");
+    };
+    assert_eq!(snapshot.high_water_event_id, boundary);
+    assert_eq!(snapshot.tasks[0].state, "paused");
+    assert!(snapshot.events.is_empty());
+
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let first = repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+    let second = repository
+        .transition_task(&task, "cancelled", RuntimeEvent::TaskCancelled)
+        .unwrap();
+
+    let IpcResponse::Event(first_event) = subscription.next_response().unwrap() else {
+        panic!("expected first live event");
+    };
+    let IpcResponse::Event(second_event) = subscription.next_response().unwrap() else {
+        panic!("expected second live event");
+    };
+    assert_eq!(
+        [first_event.event_id, second_event.event_id],
+        [first, second]
+    );
+}
+
+#[test]
 fn startup_recovery_marks_live_tasks_without_replaying_work() {
     let directory = TempDir::new().unwrap();
     let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
@@ -229,7 +310,10 @@ fn second_client_receives_a_snapshot_and_events_after_its_cursor() {
 
     let response = send_request(
         daemon.socket_path(),
-        IpcRequest::SubscribeEvents { after_event_id: 1 },
+        IpcRequest::SubscribeEvents {
+            after_event_id: 1,
+            filters: SubscriptionFilters::default(),
+        },
     )
     .unwrap();
     let IpcResponse::Subscription(snapshot) = response else {
@@ -515,6 +599,53 @@ fn subscription_connection_receives_events_persisted_after_its_snapshot() {
 }
 
 #[test]
+fn subscription_filters_apply_to_replay_and_live_events() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let selected = TaskId::new();
+    let ignored = TaskId::new();
+    repository.create_task(&selected, &root, "queued").unwrap();
+    repository.create_task(&ignored, &root, "queued").unwrap();
+    repository
+        .append_event(&ignored, RuntimeEvent::TaskQueued)
+        .unwrap();
+    repository
+        .append_event(&selected, RuntimeEvent::TaskQueued)
+        .unwrap();
+    let replayed = repository.latest_event_id().unwrap();
+
+    let mut subscription = subscribe_with_filters(
+        daemon.socket_path(),
+        1,
+        SubscriptionFilters {
+            task_ids: vec![selected.to_string()],
+            kinds: vec!["task_queued".into(), "task_started".into()],
+        },
+    )
+    .unwrap();
+    let IpcResponse::Subscription(snapshot) = subscription.next_response().unwrap() else {
+        panic!("expected filtered snapshot");
+    };
+    assert_eq!(snapshot.events.len(), 1);
+    assert_eq!(snapshot.events[0].event_id, replayed);
+
+    repository
+        .transition_task(&ignored, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+    let live = repository
+        .transition_task(&selected, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+    let IpcResponse::Event(event) = subscription.next_response().unwrap() else {
+        panic!("expected filtered live event");
+    };
+    assert_eq!(event.event_id, live);
+    assert_eq!(event.task_id, selected.to_string());
+}
+
+#[test]
 fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -555,7 +686,10 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
 
     let IpcResponse::Subscription(snapshot) = send_request(
         daemon.socket_path(),
-        IpcRequest::SubscribeEvents { after_event_id: 0 },
+        IpcRequest::SubscribeEvents {
+            after_event_id: 0,
+            filters: SubscriptionFilters::default(),
+        },
     )
     .unwrap() else {
         panic!("expected subscription snapshot");
@@ -837,7 +971,10 @@ fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
 
     let IpcResponse::Subscription(snapshot) = send_request(
         daemon.socket_path(),
-        IpcRequest::SubscribeEvents { after_event_id: 0 },
+        IpcRequest::SubscribeEvents {
+            after_event_id: 0,
+            filters: SubscriptionFilters::default(),
+        },
     )
     .unwrap() else {
         panic!("expected subscription snapshot");

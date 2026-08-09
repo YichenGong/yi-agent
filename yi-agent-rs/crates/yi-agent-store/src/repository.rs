@@ -91,8 +91,16 @@ pub struct PersistedTaskDetail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSubscriptionSnapshot {
     pub high_water_event_id: i64,
+    pub cursor_state: RuntimeCursorState,
     pub tasks: Vec<PersistedTask>,
     pub events: Vec<PersistedEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCursorState {
+    Fresh,
+    Replayable,
+    Expired { oldest_retained_event_id: i64 },
 }
 
 pub struct RuntimeRepository {
@@ -402,11 +410,11 @@ impl RuntimeRepository {
     }
 
     pub fn latest_event_id(&self) -> Result<i64, RepositoryError> {
-        Ok(self
-            .connection
-            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
-                row.get(0)
-            })?)
+        Ok(self.connection.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn task_snapshots(&self) -> Result<Vec<PersistedTask>, RepositoryError> {
@@ -454,10 +462,27 @@ impl RuntimeRepository {
         after_event_id: i64,
     ) -> Result<RuntimeSubscriptionSnapshot, RepositoryError> {
         let transaction = self.connection.transaction()?;
-        let high_water_event_id =
-            transaction.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
-                row.get(0)
-            })?;
+        let high_water_event_id: i64 = transaction.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        let oldest_retained_event_id: i64 = transaction.query_row(
+            "SELECT COALESCE(MIN(id), ?1) FROM events",
+            params![high_water_event_id.saturating_add(1)],
+            |row| row.get(0),
+        )?;
+        let cursor_state = if after_event_id < oldest_retained_event_id.saturating_sub(1)
+            || after_event_id > high_water_event_id
+        {
+            RuntimeCursorState::Expired {
+                oldest_retained_event_id,
+            }
+        } else if after_event_id == 0 {
+            RuntimeCursorState::Fresh
+        } else {
+            RuntimeCursorState::Replayable
+        };
         let tasks = {
             let mut statement =
                 transaction.prepare("SELECT id, state_json FROM tasks ORDER BY created_at, id")?;
@@ -470,7 +495,7 @@ impl RuntimeRepository {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let events = {
+        let events = if matches!(cursor_state, RuntimeCursorState::Replayable) {
             let mut statement = transaction.prepare(
                 "SELECT id, task_id, kind FROM events WHERE id > ?1 AND id <= ?2 ORDER BY id",
             )?;
@@ -495,13 +520,26 @@ impl RuntimeRepository {
                     })
                 })
                 .collect::<Result<Vec<_>, RepositoryError>>()?
+        } else {
+            Vec::new()
         };
         transaction.commit()?;
         Ok(RuntimeSubscriptionSnapshot {
             high_water_event_id,
+            cursor_state,
             tasks,
             events,
         })
+    }
+
+    /// Removes a retained event prefix. Subscribers behind the new oldest
+    /// retained ID receive a replacement snapshot instead of a partial replay.
+    pub fn prune_events_through(&mut self, event_id: i64) -> Result<usize, RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        let removed =
+            transaction.execute("DELETE FROM events WHERE id <= ?1", params![event_id])?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     pub fn event_records_after(&self, cursor: i64) -> Result<Vec<PersistedEvent>, RepositoryError> {

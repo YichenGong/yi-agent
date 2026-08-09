@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -5,8 +6,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_EVENT_FRAMES: usize = 1024;
 // Invalid JSON has no trustworthy request ID to echo, so its error frame uses
 // this documented stable empty identifier.
 const MISSING_REQUEST_ID: &str = "";
@@ -117,7 +119,24 @@ pub enum IpcRequest {
     },
     SubscribeEvents {
         after_event_id: i64,
+        #[serde(default)]
+        filters: SubscriptionFilters,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionFilters {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+}
+
+impl SubscriptionFilters {
+    fn matches(&self, event: &IpcEvent) -> bool {
+        (self.task_ids.is_empty() || self.task_ids.contains(&event.task_id))
+            && (self.kinds.is_empty() || self.kinds.contains(&event.kind))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,13 +506,24 @@ pub fn subscribe(
     socket_path: impl AsRef<Path>,
     after_event_id: i64,
 ) -> Result<Subscription, IpcError> {
+    subscribe_with_filters(socket_path, after_event_id, SubscriptionFilters::default())
+}
+
+pub fn subscribe_with_filters(
+    socket_path: impl AsRef<Path>,
+    after_event_id: i64,
+    filters: SubscriptionFilters,
+) -> Result<Subscription, IpcError> {
     let mut stream = UnixStream::connect(socket_path)?;
     let request_id = next_request_id();
     write_request(
         &mut stream,
         PROTOCOL_VERSION,
         request_id.clone(),
-        IpcRequest::SubscribeEvents { after_event_id },
+        IpcRequest::SubscribeEvents {
+            after_event_id,
+            filters,
+        },
     )?;
     Ok(Subscription {
         reader: BufReader::new(stream),
@@ -524,8 +554,8 @@ fn write_request(
 fn handle_client(
     mut stream: UnixStream,
     database_path: &Path,
-    stop: &AtomicBool,
-    coordinator: &RuntimeCoordinator,
+    stop: &Arc<AtomicBool>,
+    coordinator: &Arc<RuntimeCoordinator>,
 ) -> Result<(), IpcError> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -556,13 +586,17 @@ fn handle_client(
                 stop.store(true, Ordering::Release);
                 IpcResponse::Stopping
             }
-            IpcRequest::SubscribeEvents { after_event_id } => {
+            IpcRequest::SubscribeEvents {
+                after_event_id,
+                filters,
+            } => {
                 return match stream_subscription(
                     &mut stream,
                     database_path,
-                    stop,
-                    coordinator,
+                    Arc::clone(stop),
+                    Arc::clone(coordinator),
                     after_event_id,
+                    filters,
                     &envelope.request_id,
                 ) {
                     Ok(()) => Ok(()),
@@ -591,9 +625,10 @@ fn handle_client(
 fn stream_subscription(
     stream: &mut UnixStream,
     database_path: &Path,
-    stop: &AtomicBool,
-    coordinator: &RuntimeCoordinator,
+    stop: Arc<AtomicBool>,
+    coordinator: Arc<RuntimeCoordinator>,
     after_event_id: i64,
+    filters: SubscriptionFilters,
     request_id: &str,
 ) -> Result<(), IpcError> {
     let mut repository = RuntimeRepository::open(database_path)?;
@@ -613,29 +648,144 @@ fn stream_subscription(
                     state: task.state,
                 })
                 .collect(),
-            events: snapshot.events.into_iter().map(ipc_event).collect(),
+            events: snapshot
+                .events
+                .into_iter()
+                .map(ipc_event)
+                .filter(|event| filters.matches(event))
+                .collect(),
         }),
     )?;
-    while !stop.load(Ordering::Acquire) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(coordinator.reconcile_worker_events())?;
-        let repository = RuntimeRepository::open(database_path)?;
-        let events = repository.event_records_after(cursor)?;
-        for event in events {
-            cursor = event.id;
-            let event_id = event.id;
-            write_response_frame(
-                stream,
-                request_id,
-                Some(event_id),
-                &IpcResponse::Event(ipc_event(event)),
-            )?;
+
+    let pending = Arc::new(PendingSubscriptionFrames::new(
+        request_id,
+        MAX_PENDING_EVENT_FRAMES,
+    ));
+    let subscription_stop = Arc::new(AtomicBool::new(false));
+    let producer_pending = Arc::clone(&pending);
+    let producer_stop = Arc::clone(&subscription_stop);
+    let database_path = database_path.to_path_buf();
+    let producer = thread::spawn(move || -> Result<(), IpcError> {
+        let result = (|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            while !stop.load(Ordering::Acquire) && !producer_stop.load(Ordering::Acquire) {
+                runtime.block_on(coordinator.reconcile_worker_events())?;
+                let repository = RuntimeRepository::open(&database_path)?;
+                let events = repository.event_records_after(cursor)?;
+                for event in events {
+                    cursor = event.id;
+                    let event = ipc_event(event);
+                    if filters.matches(&event) && !producer_pending.push_event(event) {
+                        return Ok(());
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        })();
+        producer_pending.close();
+        result
+    });
+
+    let write_result = loop {
+        match pending.pop_wait() {
+            Some(envelope) => {
+                if let Err(error) = write_envelope_frame(stream, &envelope) {
+                    break Err(error);
+                }
+            }
+            None => break Ok(()),
         }
-        thread::sleep(Duration::from_millis(10));
+    };
+    subscription_stop.store(true, Ordering::Release);
+    pending.close();
+    let producer_result = producer.join().map_err(|_| {
+        IpcError::Io(std::io::Error::other(
+            "subscription producer thread panicked",
+        ))
+    })?;
+    write_result?;
+    producer_result
+}
+
+struct PendingSubscriptionFrames {
+    request_id: String,
+    capacity: usize,
+    state: Mutex<PendingSubscriptionState>,
+    available: Condvar,
+}
+
+struct PendingSubscriptionState {
+    frames: VecDeque<ResponseEnvelope>,
+    closed: bool,
+}
+
+impl PendingSubscriptionFrames {
+    fn new(request_id: impl Into<String>, capacity: usize) -> Self {
+        assert!(capacity > 0, "subscription queue capacity must be positive");
+        Self {
+            request_id: request_id.into(),
+            capacity,
+            state: Mutex::new(PendingSubscriptionState {
+                frames: VecDeque::new(),
+                closed: false,
+            }),
+            available: Condvar::new(),
+        }
     }
-    Ok(())
+
+    /// Returns false once this event caused overflow or the subscription was closed.
+    fn push_event(&self, event: IpcEvent) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return false;
+        }
+        if state.frames.len() == self.capacity {
+            state.frames.clear();
+            state.frames.push_back(response_envelope(
+                &self.request_id,
+                None,
+                IpcResponse::ResyncRequired,
+            ));
+            state.closed = true;
+            self.available.notify_one();
+            return false;
+        }
+        let event_id = event.event_id;
+        state.frames.push_back(response_envelope(
+            &self.request_id,
+            Some(event_id),
+            IpcResponse::Event(event),
+        ));
+        self.available.notify_one();
+        true
+    }
+
+    fn pop_wait(&self) -> Option<ResponseEnvelope> {
+        let mut state = self.state.lock().unwrap();
+        while state.frames.is_empty() && !state.closed {
+            state = self.available.wait(state).unwrap();
+        }
+        state.frames.pop_front()
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        self.available.notify_all();
+    }
+
+    #[cfg(test)]
+    fn drain_for_test(&self) -> Vec<ResponseEnvelope> {
+        self.state.lock().unwrap().frames.drain(..).collect()
+    }
+
+    #[cfg(test)]
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
 }
 
 fn write_response_frame(
@@ -644,23 +794,40 @@ fn write_response_frame(
     event_id: Option<i64>,
     response: &IpcResponse,
 ) -> Result<(), IpcError> {
-    let envelope = ResponseEnvelope {
+    write_envelope_frame(
+        stream,
+        &response_envelope(request_id, event_id, response.clone()),
+    )
+}
+
+fn response_envelope(
+    request_id: &str,
+    event_id: Option<i64>,
+    response: IpcResponse,
+) -> ResponseEnvelope {
+    ResponseEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request_id: request_id.into(),
         event_id,
-        event: match response {
+        event: match &response {
             IpcResponse::Event(event) => Some(IpcEventPayload::from(event)),
             _ => None,
         },
-        result: response.clone(),
-    };
+        result: response,
+    }
+}
+
+fn write_envelope_frame(
+    stream: &mut UnixStream,
+    envelope: &ResponseEnvelope,
+) -> Result<(), IpcError> {
     let frame = serde_json::to_vec(&envelope)?;
     let frame = if frame.len() <= MAX_FRAME_BYTES {
         frame
     } else {
         serde_json::to_vec(&ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
-            request_id: request_id.into(),
+            request_id: envelope.request_id.clone(),
             event_id: None,
             event: None,
             result: IpcResponse::ResyncRequired,
@@ -678,6 +845,38 @@ fn next_request_id() -> String {
         std::process::id(),
         NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+#[cfg(test)]
+mod subscription_queue_tests {
+    use super::*;
+
+    fn event(event_id: i64) -> IpcEvent {
+        IpcEvent {
+            event_id,
+            task_id: format!("task-{event_id}"),
+            kind: "task_started".into(),
+        }
+    }
+
+    #[test]
+    fn pending_event_overflow_emits_one_correlated_resync_and_closes() {
+        assert_eq!(MAX_PENDING_EVENT_FRAMES, 1024);
+        let queue = PendingSubscriptionFrames::new("slow-client", 2);
+        assert!(queue.push_event(event(1)));
+        assert!(queue.push_event(event(2)));
+        assert!(!queue.push_event(event(3)));
+        assert!(!queue.push_event(event(4)));
+
+        let frames = queue.drain_for_test();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].protocol_version, PROTOCOL_VERSION);
+        assert_eq!(frames[0].request_id, "slow-client");
+        assert_eq!(frames[0].event_id, None);
+        assert_eq!(frames[0].event, None);
+        assert_eq!(frames[0].result, IpcResponse::ResyncRequired);
+        assert!(queue.is_closed());
+    }
 }
 
 fn request_id_from_frame(frame: &[u8]) -> String {
@@ -1031,7 +1230,10 @@ fn respond(
                 delivery_json: detail.delivery_json,
             }))
         }
-        IpcRequest::SubscribeEvents { after_event_id } => {
+        IpcRequest::SubscribeEvents {
+            after_event_id,
+            filters,
+        } => {
             let snapshot = repository.subscription_snapshot(after_event_id)?;
             let tasks = snapshot
                 .tasks
@@ -1044,11 +1246,8 @@ fn respond(
             let events = snapshot
                 .events
                 .into_iter()
-                .map(|event| IpcEvent {
-                    event_id: event.id,
-                    task_id: event.task_id.to_string(),
-                    kind: format!("{:?}", event.event),
-                })
+                .map(ipc_event)
+                .filter(|event| filters.matches(event))
                 .collect();
             Ok(IpcResponse::Subscription(SubscriptionSnapshot {
                 high_water_event_id: snapshot.high_water_event_id,
