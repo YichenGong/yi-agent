@@ -382,6 +382,26 @@ async fn run_loop(
                 let old_count = messages.len();
                 let keep_turns = config.compact_keep_turns.unwrap_or(4);
                 let session_snapshot = session.lock().unwrap().clone();
+                // Compaction performs its own provider request, so it needs
+                // the same short-lived admission as an ordinary THINK turn.
+                let compact_lease = match &provider_turn_gate {
+                    Some(gate) => match tokio::select! {
+                        lease = gate.acquire() => lease,
+                        _ = cancel_token.cancelled() => {
+                            let _ = tx.send(AgentEvent::Cancelled).await;
+                            return;
+                        }
+                    } {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            let _ = tx
+                                .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
+                                .await;
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 match crate::compact::compact_session(
                     &provider,
                     &config,
@@ -407,6 +427,7 @@ async fn run_loop(
                         tracing::warn!(error = %e, "auto-compact failed, will retry next turn");
                     }
                 }
+                drop(compact_lease);
             }
         }
 
@@ -2563,8 +2584,10 @@ mod tests {
         session.push(Message::assistant(vec![ContentBlock::Text(
             "reply2".into(),
         )]));
-        let mut agent =
-            Agent::new(Arc::new(provider), Arc::new(tools), config).with_session(session);
+        let gate = CountingTurnGate::default();
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), config)
+            .with_session(session)
+            .with_provider_turn_gate(Arc::new(gate.clone()));
 
         let stream = agent.run("prompt".into()).await.unwrap();
         let events = collect_events(stream);
@@ -2585,6 +2608,10 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
+        // Turn 1, automatic compaction, and turn 2 each require a provider
+        // lease. Compaction must not bypass daemon-wide admission.
+        assert_eq!(gate.acquired.load(Ordering::SeqCst), 3);
+        assert_eq!(gate.released.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]

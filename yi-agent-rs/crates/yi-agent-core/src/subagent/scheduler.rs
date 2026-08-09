@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,12 @@ pub struct LeaseId(Uuid);
 impl LeaseId {
     fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for LeaseId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 

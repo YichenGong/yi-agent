@@ -257,6 +257,74 @@ impl RuntimeRepository {
         }))
     }
 
+    /// Records a short process-local provider turn lease and its new fairness
+    /// cursor in one transaction before the selected worker is notified.
+    pub fn save_provider_turn_grant(
+        &mut self,
+        lease_id: &str,
+        task: &TaskId,
+        resource_key: &str,
+        root_id: &RootSessionId,
+        parent_id: &TaskId,
+        sequence: u64,
+    ) -> Result<(), RepositoryError> {
+        let sequence =
+            i64::try_from(sequence).map_err(|_| RepositoryError::InvalidAdmissionCursor {
+                key: resource_key.into(),
+                reason: "sequence exceeds SQLite integer range".into(),
+            })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO resource_leases (id, task_id, resource_key, mode, units, state)
+             VALUES (?1, ?2, ?3, 'shared', 1, 'active')
+             ON CONFLICT(id) DO UPDATE SET state = 'active', released_at = NULL",
+            params![lease_id, task.to_string(), resource_key],
+        )?;
+        transaction.execute(
+            "INSERT INTO resource_admission_cursors
+             (resource_key, root_session_id, parent_task_id, sequence)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(resource_key) DO UPDATE SET
+                 root_session_id = excluded.root_session_id,
+                 parent_task_id = excluded.parent_task_id,
+                 sequence = excluded.sequence,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![
+                resource_key,
+                root_id.to_string(),
+                parent_id.to_string(),
+                sequence
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Idempotently closes one provider-turn lease without touching unrelated
+    /// worker resources.
+    pub fn release_provider_turn_lease(&mut self, lease_id: &str) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND state = 'active'",
+            [lease_id],
+        )?;
+        Ok(())
+    }
+
+    /// Process-local permits cannot survive a daemon restart. This leaves
+    /// durable workspace/worktree ownership intact for normal recovery.
+    pub fn release_process_local_leases(&mut self) -> Result<usize, RepositoryError> {
+        Ok(self.connection.execute(
+            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE state = 'active'
+               AND resource_key NOT LIKE 'worktree:%'
+               AND resource_key NOT LIKE 'workspace:%'",
+            [],
+        )?)
+    }
+
     pub fn create_task(
         &mut self,
         task: &TaskId,

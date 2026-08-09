@@ -65,7 +65,7 @@ pub struct RuntimeStopSummary {
 /// The coordinator deliberately receives a factory instead of constructing an
 /// `Agent`: provider and tool bootstrapping remain an application concern.
 pub struct RuntimeCoordinator {
-    repository: Mutex<RuntimeRepository>,
+    repository: Arc<Mutex<RuntimeRepository>>,
     factory: Arc<dyn AgentWorkerFactory>,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
     resident_tasks: Mutex<HashSet<TaskId>>,
@@ -137,7 +137,10 @@ impl RuntimeCoordinator {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, RuntimeCoordinatorError> {
-        let repository = RuntimeRepository::open(database_path)?;
+        let mut repository = RuntimeRepository::open(database_path)?;
+        // Provider-turn leases are process-local. A restarted daemon must not
+        // count an abandoned request against the new process's capacity.
+        repository.release_process_local_leases()?;
         let resident_cursor = repository.admission_cursor("resident:global")?;
         let mut resource_coordinator = ResourceCoordinator::new();
         if let Some(cursor) = resident_cursor {
@@ -220,15 +223,32 @@ impl RuntimeCoordinator {
         let provider_profile_id = factory.provider_profile_id();
         if let Some(profile_id) = &provider_profile_id {
             resource_coordinator.configure_provider_llm_capacity(profile_id);
+            for resource_key in [
+                format!("llm:{profile_id}"),
+                format!("llm-coordination:{profile_id}"),
+            ] {
+                if let Some(cursor) = repository.admission_cursor(&resource_key)? {
+                    resource_coordinator.restore_admission_cursor(
+                        &resource_key,
+                        AdmissionCursor {
+                            root_id: cursor.root_id,
+                            parent_id: cursor.parent_id,
+                            sequence: cursor.sequence,
+                        },
+                    );
+                }
+            }
         }
+        let repository = Arc::new(Mutex::new(repository));
         let resource_coordinator = Arc::new(Mutex::new(resource_coordinator));
         let provider_turn_admissions = provider_profile_id.as_ref().map(|_| {
-            Arc::new(ProviderTurnAdmissions::new(Arc::clone(
-                &resource_coordinator,
-            )))
+            Arc::new(ProviderTurnAdmissions::new(
+                Arc::clone(&resource_coordinator),
+                Arc::clone(&repository),
+            ))
         });
         Ok(Self {
-            repository: Mutex::new(repository),
+            repository,
             factory,
             supervisors: Mutex::new(supervisors),
             resident_tasks: Mutex::new(HashSet::new()),
@@ -368,8 +388,8 @@ impl RuntimeCoordinator {
         task: &TaskId,
     ) -> Result<(), RuntimeCoordinatorError> {
         self.ensure_admitting()?;
-        let supervisor = self.supervisor(session)?;
-        let mut supervisor = supervisor.lock().await;
+        let supervisor_handle = self.supervisor(session)?;
+        let mut supervisor = supervisor_handle.lock().await;
         let recovery_boundary = self
             .recovery_contexts
             .lock()
@@ -567,7 +587,8 @@ impl RuntimeCoordinator {
                             .clone()
                             .unwrap_or_else(|| task.clone()),
                         task_id: task.clone(),
-                        resource_key: format!("llm:{profile_id}"),
+                        profile_id: profile_id.clone(),
+                        supervisor: Arc::clone(&supervisor_handle),
                     }) as Arc<dyn ProviderTurnGate>
                 })
             });
@@ -1116,15 +1137,20 @@ impl RuntimeCoordinator {
 
 struct ProviderTurnAdmissions {
     resources: Arc<Mutex<ResourceCoordinator>>,
+    repository: Arc<Mutex<RuntimeRepository>>,
     queued: Mutex<HashSet<TaskId>>,
     assigned: Mutex<HashMap<TaskId, LeaseId>>,
     notify: Arc<Notify>,
 }
 
 impl ProviderTurnAdmissions {
-    fn new(resources: Arc<Mutex<ResourceCoordinator>>) -> Self {
+    fn new(
+        resources: Arc<Mutex<ResourceCoordinator>>,
+        repository: Arc<Mutex<RuntimeRepository>>,
+    ) -> Self {
         Self {
             resources,
+            repository,
             queued: Mutex::new(HashSet::new()),
             assigned: Mutex::new(HashMap::new()),
             notify: Arc::new(Notify::new()),
@@ -1137,18 +1163,20 @@ impl ProviderTurnAdmissions {
         parent_id: TaskId,
         task_id: TaskId,
         resource_key: &str,
-    ) -> Option<ProviderTurnLeaseHandle> {
+        priority: AdmissionPriority,
+    ) -> Result<Option<ProviderTurnLeaseHandle>, RepositoryError> {
         if let Some(lease_id) = self
             .assigned
             .lock()
             .expect("provider turn assignment mutex poisoned")
             .remove(&task_id)
         {
-            return Some(ProviderTurnLeaseHandle {
+            return Ok(Some(ProviderTurnLeaseHandle {
                 resources: Arc::clone(&self.resources),
+                repository: Arc::clone(&self.repository),
                 lease_id,
                 notify: Arc::clone(&self.notify),
-            });
+            }));
         }
 
         let mut resources = self
@@ -1171,26 +1199,44 @@ impl ProviderTurnAdmissions {
                     units: 1,
                     deadline: None,
                 },
-                AdmissionPriority::Normal,
+                priority,
                 Utc::now(),
             );
         }
-        let grant = resources.grant_next(resource_key)?;
+        let Some(grant) = resources.grant_next(resource_key) else {
+            return Ok(None);
+        };
+        let cursor = resources.admission_cursor(resource_key);
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .save_provider_turn_grant(
+                &grant.lease_id.to_string(),
+                &grant.task_id,
+                resource_key,
+                &grant.root_id,
+                cursor
+                    .parent_id
+                    .as_ref()
+                    .expect("granted lease has parent cursor"),
+                cursor.sequence,
+            )?;
         queued.remove(&grant.task_id);
         let granted_task = grant.task_id.clone();
         let lease_id = grant.lease_id;
         if granted_task == task_id {
-            return Some(ProviderTurnLeaseHandle {
+            return Ok(Some(ProviderTurnLeaseHandle {
                 resources: Arc::clone(&self.resources),
+                repository: Arc::clone(&self.repository),
                 lease_id,
                 notify: Arc::clone(&self.notify),
-            });
+            }));
         }
         self.assigned
             .lock()
             .expect("provider turn assignment mutex poisoned")
             .insert(granted_task, lease_id);
-        None
+        Ok(None)
     }
 
     fn cancel_task(&self, task_id: &TaskId) {
@@ -1211,8 +1257,13 @@ impl ProviderTurnAdmissions {
             self.resources
                 .lock()
                 .expect("resource coordinator mutex poisoned")
-                .release(lease_id)
+                .release(lease_id.clone())
                 .expect("provider turn lease release is idempotent");
+            let _ = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .release_provider_turn_lease(&lease_id.to_string());
         }
         self.notify.notify_waiters();
     }
@@ -1220,6 +1271,7 @@ impl ProviderTurnAdmissions {
 
 struct ProviderTurnLeaseHandle {
     resources: Arc<Mutex<ResourceCoordinator>>,
+    repository: Arc<Mutex<RuntimeRepository>>,
     lease_id: LeaseId,
     notify: Arc<Notify>,
 }
@@ -1231,6 +1283,11 @@ impl Drop for ProviderTurnLeaseHandle {
             .expect("resource coordinator mutex poisoned")
             .release(self.lease_id.clone())
             .expect("provider turn lease release is idempotent");
+        let _ = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .release_provider_turn_lease(&self.lease_id.to_string());
         self.notify.notify_waiters();
     }
 }
@@ -1240,7 +1297,8 @@ struct RuntimeProviderTurnGate {
     root_id: RootSessionId,
     parent_id: TaskId,
     task_id: TaskId,
-    resource_key: String,
+    profile_id: String,
+    supervisor: Arc<AsyncMutex<AgentSupervisor>>,
 }
 
 impl ProviderTurnGate for RuntimeProviderTurnGate {
@@ -1254,7 +1312,8 @@ impl ProviderTurnGate for RuntimeProviderTurnGate {
         let root_id = self.root_id.clone();
         let parent_id = self.parent_id.clone();
         let task_id = self.task_id.clone();
-        let resource_key = self.resource_key.clone();
+        let profile_id = self.profile_id.clone();
+        let supervisor = Arc::clone(&self.supervisor);
         Box::pin(async move {
             let mut cleanup = ProviderTurnWaitCleanup {
                 admissions: Arc::clone(&admissions),
@@ -1263,12 +1322,25 @@ impl ProviderTurnGate for RuntimeProviderTurnGate {
             };
             loop {
                 let notified = admissions.notify.notified();
-                if let Some(lease) = admissions.acquire_now(
-                    root_id.clone(),
-                    parent_id.clone(),
-                    task_id.clone(),
-                    &resource_key,
-                ) {
+                let priority = supervisor
+                    .lock()
+                    .await
+                    .provider_turn_admission_priority(&task_id);
+                let resource_key = if priority == AdmissionPriority::Normal {
+                    format!("llm:{profile_id}")
+                } else {
+                    format!("llm-coordination:{profile_id}")
+                };
+                if let Some(lease) = admissions
+                    .acquire_now(
+                        root_id.clone(),
+                        parent_id.clone(),
+                        task_id.clone(),
+                        &resource_key,
+                        priority,
+                    )
+                    .map_err(|error| error.to_string())?
+                {
                     cleanup.active = false;
                     return Ok(Box::new(lease) as Box<dyn yi_agent_core::ProviderTurnLease>);
                 }
@@ -1296,38 +1368,82 @@ impl Drop for ProviderTurnWaitCleanup {
 mod provider_turn_admission_tests {
     use super::*;
 
+    fn test_repository(root: &RootSessionId, tasks: &[TaskId]) -> Arc<Mutex<RuntimeRepository>> {
+        let mut repository = RuntimeRepository::open(":memory:").unwrap();
+        for task in tasks {
+            repository.create_task(task, root, "running").unwrap();
+        }
+        Arc::new(Mutex::new(repository))
+    }
+
     #[test]
     fn queued_provider_turn_is_assigned_to_its_selected_task_after_release() {
         let mut resources = ResourceCoordinator::new();
         resources.set_capacity("llm:test", 1);
-        let admissions = ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources)));
         let root = RootSessionId::new();
         let first_task = TaskId::new();
         let second_task = TaskId::new();
+        let repository = test_repository(&root, &[first_task.clone(), second_task.clone()]);
+        let admissions =
+            ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources)), Arc::clone(&repository));
 
-        let first = admissions.acquire_now(
-            root.clone(),
-            first_task.clone(),
-            first_task.clone(),
-            "llm:test",
-        );
+        let first = admissions
+            .acquire_now(
+                root.clone(),
+                first_task.clone(),
+                first_task.clone(),
+                "llm:test",
+                AdmissionPriority::Normal,
+            )
+            .unwrap();
         assert!(first.is_some());
+        assert!(
+            repository
+                .lock()
+                .unwrap()
+                .has_active_lease_prefix(&first_task, "llm:")
+                .unwrap()
+        );
+        assert!(
+            repository
+                .lock()
+                .unwrap()
+                .admission_cursor("llm:test")
+                .unwrap()
+                .is_some()
+        );
         assert!(
             admissions
                 .acquire_now(
                     root.clone(),
                     second_task.clone(),
                     second_task.clone(),
-                    "llm:test"
+                    "llm:test",
+                    AdmissionPriority::Normal,
                 )
+                .unwrap()
                 .is_none()
         );
 
         drop(first);
+        assert!(
+            !repository
+                .lock()
+                .unwrap()
+                .has_active_lease_prefix(&first_task, "llm:")
+                .unwrap()
+        );
 
         assert!(
             admissions
-                .acquire_now(root, second_task.clone(), second_task, "llm:test")
+                .acquire_now(
+                    root,
+                    second_task.clone(),
+                    second_task,
+                    "llm:test",
+                    AdmissionPriority::Normal
+                )
+                .unwrap()
                 .is_some()
         );
     }
@@ -1336,19 +1452,32 @@ mod provider_turn_admission_tests {
     async fn waiting_provider_turn_gate_wakes_after_a_lease_releases() {
         let mut resources = ResourceCoordinator::new();
         resources.set_capacity("llm:test", 1);
-        let admissions = Arc::new(ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources))));
         let root = RootSessionId::new();
-        let first_task = TaskId::new();
+        let supervisor = Arc::new(AsyncMutex::new(AgentSupervisor::new(root.clone())));
+        let first_task = supervisor.lock().await.root_task_id().clone();
         let second_task = TaskId::new();
+        let repository = test_repository(&root, &[first_task.clone(), second_task.clone()]);
+        let admissions = Arc::new(ProviderTurnAdmissions::new(
+            Arc::new(Mutex::new(resources)),
+            repository,
+        ));
         let first = admissions
-            .acquire_now(root.clone(), first_task.clone(), first_task, "llm:test")
+            .acquire_now(
+                root.clone(),
+                first_task.clone(),
+                first_task,
+                "llm:test",
+                AdmissionPriority::Normal,
+            )
+            .unwrap()
             .unwrap();
         let gate = RuntimeProviderTurnGate {
             admissions,
             root_id: root,
             parent_id: second_task.clone(),
             task_id: second_task,
-            resource_key: "llm:test".into(),
+            profile_id: "test".into(),
+            supervisor,
         };
 
         let waiter = tokio::spawn(async move { gate.acquire().await });
@@ -1361,6 +1490,102 @@ mod provider_turn_admission_tests {
             .unwrap()
             .unwrap();
         drop(lease);
+    }
+
+    #[test]
+    fn coordination_provider_turn_admits_after_regular_pool_is_saturated() {
+        let mut resources = ResourceCoordinator::new();
+        resources.configure_provider_llm_capacity("test");
+        let root = RootSessionId::new();
+        let tasks = (0..8).map(|_| TaskId::new()).collect::<Vec<_>>();
+        let repository = test_repository(&root, &tasks);
+        let admissions = ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources)), repository);
+        let mut regular_leases = Vec::new();
+
+        for task in &tasks[..7] {
+            regular_leases.push(
+                admissions
+                    .acquire_now(
+                        root.clone(),
+                        task.clone(),
+                        task.clone(),
+                        "llm:test",
+                        AdmissionPriority::Normal,
+                    )
+                    .unwrap()
+                    .expect("regular pool has seven permits"),
+            );
+        }
+
+        let coordination = admissions
+            .acquire_now(
+                root,
+                tasks[7].clone(),
+                tasks[7].clone(),
+                "llm-coordination:test",
+                AdmissionPriority::High,
+            )
+            .unwrap();
+        assert!(
+            coordination.is_some(),
+            "parent coordination uses the reserve"
+        );
+        drop(coordination);
+        drop(regular_leases);
+    }
+
+    #[test]
+    fn startup_releases_provider_leases_and_restores_the_cursor() {
+        struct ProfileFactory;
+        impl AgentWorkerFactory for ProfileFactory {
+            fn provider_profile_id(&self) -> Option<String> {
+                Some("test".into())
+            }
+            fn start(
+                &self,
+                request: yi_agent_core::subagent::worker::WorkerStart,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<
+                    yi_agent_core::subagent::worker::WorkerHandle,
+                    yi_agent_core::subagent::worker::WorkerError,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(yi_agent_core::subagent::worker::WorkerHandle::new(
+                        request.cancellation,
+                    ))
+                })
+            }
+        }
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let root = RootSessionId::new();
+        let task = TaskId::new();
+        let mut repository = RuntimeRepository::open(&database).unwrap();
+        repository.create_task(&task, &root, "queued").unwrap();
+        repository
+            .save_provider_turn_grant("interrupted-turn", &task, "llm:test", &root, &task, 41)
+            .unwrap();
+        drop(repository);
+
+        let coordinator = RuntimeCoordinator::open(&database, Arc::new(ProfileFactory)).unwrap();
+        assert_eq!(
+            coordinator
+                .resource_coordinator
+                .lock()
+                .unwrap()
+                .admission_cursor("llm:test")
+                .sequence,
+            41
+        );
+        assert!(
+            !RuntimeRepository::open(&database)
+                .unwrap()
+                .has_active_lease_prefix(&task, "llm:")
+                .unwrap()
+        );
     }
 }
 

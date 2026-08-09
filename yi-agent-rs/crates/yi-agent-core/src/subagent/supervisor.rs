@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
+use super::scheduler::AdmissionPriority;
 use super::task::{
     AgentTask, BlockReason, CancelReason, PauseReason, RecoveryEvidence, RootSessionId, TaskEvent,
     TaskFailure, TaskId, TaskState,
@@ -231,6 +232,24 @@ impl AgentSupervisor {
 
     pub fn mailbox(&self, task_id: &TaskId) -> Option<&Mailbox> {
         self.mailboxes.get(task_id)
+    }
+
+    /// High-priority parent/root mailbox work must be able to consume the
+    /// provider coordination reserve on its next model turn.
+    pub fn provider_turn_admission_priority(&self, task_id: &TaskId) -> AdmissionPriority {
+        let is_root_or_parent =
+            task_id == &self.root_task_id || !self.children_of(task_id).is_empty();
+        if is_root_or_parent
+            && self.mailbox(task_id).is_some_and(|mailbox| {
+                mailbox.messages().iter().any(|message| {
+                    !message.consumed_by_worker && message.priority <= MessagePriority::High
+                })
+            })
+        {
+            AdmissionPriority::High
+        } else {
+            AdmissionPriority::Normal
+        }
     }
 
     pub fn has_worker(&self, task_id: &TaskId) -> bool {
@@ -1089,6 +1108,40 @@ impl Tool for WaitAgentTool {
 
 struct SendMessageTool {
     tools: SupervisorTools,
+}
+
+#[cfg(test)]
+mod provider_turn_priority_tests {
+    use super::*;
+    use crate::subagent::mailbox::ReworkInstruction;
+
+    #[test]
+    fn parent_routes_pending_high_priority_mail_to_the_coordination_reserve() {
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let root = supervisor.root_task_id().clone();
+        let child = supervisor.spawn(root.clone()).unwrap();
+
+        assert_eq!(
+            supervisor.provider_turn_admission_priority(&root),
+            AdmissionPriority::Normal
+        );
+        supervisor
+            .send_message(
+                &child,
+                MailboxMessageDraft::new(
+                    child.clone(),
+                    root.clone(),
+                    MessageKind::Rework(ReworkInstruction("review this result".into())),
+                    None,
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            supervisor.provider_turn_admission_priority(&root),
+            AdmissionPriority::High
+        );
+    }
 }
 
 #[async_trait]
