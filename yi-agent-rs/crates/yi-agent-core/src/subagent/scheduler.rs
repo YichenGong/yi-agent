@@ -254,6 +254,7 @@ fn select_fair_request(
 ) -> Option<usize> {
     let highest_score = queue
         .iter()
+        .filter(|entry| entry.request.units <= available)
         .map(|entry| admission_score(entry, now))
         .max()?;
     let roots =

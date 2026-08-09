@@ -165,30 +165,60 @@ fn high_priority_request_precedes_a_normal_request() {
 }
 
 #[test]
-fn aged_background_request_eventually_precedes_normal_work() {
+fn age_prevents_background_starvation_under_normal_contention() {
     let mut coordinator = ResourceCoordinator::new();
     coordinator.set_capacity("resident:global", 1);
     let background = TaskId::new();
-    let now = Utc::now();
+    let background_root = RootSessionId::new();
+    let normal_root = RootSessionId::new();
+    let start = Utc::now();
     coordinator.enqueue_with_priority_at(
-        RootSessionId::new(),
+        background_root,
         background.clone(),
         request("resident:global"),
         AdmissionPriority::Background,
-        now - Duration::minutes(10),
+        start,
     );
+
+    for elapsed_seconds in (0..=300).step_by(30) {
+        let now = start + Duration::seconds(elapsed_seconds);
+        coordinator.enqueue_with_priority_at(
+            normal_root.clone(),
+            TaskId::new(),
+            request("resident:global"),
+            AdmissionPriority::Normal,
+            now,
+        );
+
+        let lease = coordinator.grant_next_at("resident:global", now).unwrap();
+        if lease.task_id == background {
+            return;
+        }
+        coordinator.release(lease.lease_id).unwrap();
+    }
+
+    panic!("background work did not gain admission within eleven grants");
+}
+
+#[test]
+fn unrunnable_high_priority_request_does_not_block_a_runnable_request() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 1);
+    let runnable = TaskId::new();
     coordinator.enqueue_with_priority(
         RootSessionId::new(),
         TaskId::new(),
-        request("resident:global"),
-        AdmissionPriority::Normal,
+        shared_request("resident:global", 2),
+        AdmissionPriority::High,
+    );
+    coordinator.enqueue(
+        RootSessionId::new(),
+        runnable.clone(),
+        shared_request("resident:global", 1),
     );
 
     assert_eq!(
-        coordinator
-            .grant_next_at("resident:global", now)
-            .unwrap()
-            .task_id,
-        background
+        coordinator.grant_next("resident:global").unwrap().task_id,
+        runnable
     );
 }
