@@ -9,6 +9,8 @@ fn toml_policy_layers_can_only_narrow_the_user_ceiling() {
             max_queued_subagents = 64
             max_depth = 2
             max_direct_children_per_agent = 4
+            read_only = false
+            allow_coding = true
             [attempt_defaults]
             max_turns = 100
             max_wall_time_secs = 2700
@@ -21,6 +23,8 @@ fn toml_policy_layers_can_only_narrow_the_user_ceiling() {
             [runtime]
             max_resident_subagents = 8
             max_queued_subagents = 128
+            read_only = true
+            allow_coding = true
             [attempt_defaults]
             max_turns = 120
             max_wall_time_secs = 900
@@ -34,6 +38,8 @@ fn toml_policy_layers_can_only_narrow_the_user_ceiling() {
     assert_eq!(effective.max_turns, 100);
     assert_eq!(effective.max_wall_time_secs, 900);
     assert_eq!(effective.max_idle_time_secs, 300);
+    assert!(effective.read_only);
+    assert!(!effective.allow_coding);
 }
 
 #[test]

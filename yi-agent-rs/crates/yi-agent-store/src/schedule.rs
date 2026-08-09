@@ -18,6 +18,8 @@ struct RuntimeLimitsLayer {
     max_queued_subagents: Option<u16>,
     max_depth: Option<u8>,
     max_direct_children_per_agent: Option<u8>,
+    read_only: Option<bool>,
+    allow_coding: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -36,6 +38,8 @@ pub struct EffectiveRuntimePolicy {
     pub max_turns: u32,
     pub max_wall_time_secs: u64,
     pub max_idle_time_secs: u64,
+    pub read_only: bool,
+    pub allow_coding: bool,
 }
 
 impl RuntimePolicyLayer {
@@ -52,6 +56,8 @@ impl RuntimePolicyLayer {
             max_turns: 100,
             max_wall_time_secs: 2700,
             max_idle_time_secs: 300,
+            read_only: false,
+            allow_coding: true,
         };
         EffectiveRuntimePolicy {
             max_resident_subagents: narrow(
@@ -89,6 +95,15 @@ impl RuntimePolicyLayer {
                 self.attempt_defaults.max_idle_time_secs,
                 narrower.attempt_defaults.max_idle_time_secs,
             ),
+            read_only: self.runtime.read_only.unwrap_or(defaults.read_only)
+                || narrower.runtime.read_only.unwrap_or(false),
+            allow_coding: self.runtime.allow_coding.unwrap_or(defaults.allow_coding)
+                && narrower
+                    .runtime
+                    .allow_coding
+                    .unwrap_or(defaults.allow_coding)
+                && !(self.runtime.read_only.unwrap_or(defaults.read_only)
+                    || narrower.runtime.read_only.unwrap_or(false)),
         }
     }
 }
