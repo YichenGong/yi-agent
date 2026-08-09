@@ -14,7 +14,17 @@ use crate::openai::stream::OpenaiStream;
 use crate::openai::types::OpenaiRequest;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_TIMEOUT_SECS;
+
+    #[test]
+    fn default_stream_timeout_is_five_minutes() {
+        assert_eq!(DEFAULT_TIMEOUT_SECS, 300);
+    }
+}
 
 /// Configuration for constructing an [`OpenaiProvider`].
 ///
