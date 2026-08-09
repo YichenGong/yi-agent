@@ -277,6 +277,27 @@ async fn coordinator_starts_root_worker_and_cancels_its_tree() {
     assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
 }
 
+#[test]
+fn coordinator_creates_an_isolated_root_with_its_objective_snapshot() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator
+        .create_session_with_objective("Produce the scheduled report.".into())
+        .unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    let detail = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_detail(&root)
+        .unwrap();
+    assert_eq!(detail.session_id, session.to_string());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&detail.delivery_json).unwrap()["objective"],
+        "Produce the scheduled report."
+    );
+}
+
 #[tokio::test]
 async fn runtime_passes_an_llm_gate_to_a_profile_aware_worker_factory() {
     let directory = TempDir::new().unwrap();

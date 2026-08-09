@@ -268,9 +268,18 @@ impl RuntimeCoordinator {
     }
 
     pub fn create_session(&self) -> Result<RootSessionId, RuntimeCoordinatorError> {
+        self.create_session_with_objective("Root session objective not specified.".into())
+    }
+
+    /// Creates an isolated root session with an immutable initial objective.
+    /// Scheduled fires use this rather than inheriting any interactive session.
+    pub fn create_session_with_objective(
+        &self,
+        objective: String,
+    ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
-        let supervisor = AgentSupervisor::new(session_id.clone());
+        let supervisor = AgentSupervisor::new_with_objective(session_id.clone(), objective.clone());
         let root_id = supervisor.root_task_id().clone();
         let root_attempt = supervisor
             .task(&root_id)
@@ -280,12 +289,13 @@ impl RuntimeCoordinator {
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .create_task_with_attempt(
+            .create_task_with_attempt_and_objective(
                 &root_id,
                 &session_id,
                 &root_attempt.id,
                 root_attempt.number,
                 "queued",
+                &objective,
             )?;
         self.supervisors
             .lock()

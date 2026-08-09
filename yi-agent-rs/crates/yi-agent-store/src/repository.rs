@@ -451,15 +451,35 @@ impl RuntimeRepository {
         attempt_number: u32,
         state: &str,
     ) -> Result<(), RepositoryError> {
+        self.create_task_with_attempt_and_objective(
+            task,
+            root,
+            attempt,
+            attempt_number,
+            state,
+            "Root session objective not specified.",
+        )
+    }
+
+    pub fn create_task_with_attempt_and_objective(
+        &mut self,
+        task: &TaskId,
+        root: &RootSessionId,
+        attempt: &AttemptId,
+        attempt_number: u32,
+        state: &str,
+        objective: &str,
+    ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
+        let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
             "INSERT INTO sessions (id, project_root, state, config_json) VALUES (?1, '', 'active', '{}') ON CONFLICT(id) DO NOTHING",
             params![root.to_string()],
         )?;
         transaction.execute(
             "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
-             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, '{}')",
-            params![task.to_string(), root.to_string(), state, attempt.to_string()],
+             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5)",
+            params![task.to_string(), root.to_string(), state, attempt.to_string(), delivery_json],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
         transaction.commit()?;

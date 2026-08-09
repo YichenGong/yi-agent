@@ -77,6 +77,13 @@ pub struct AgentSupervisor {
 
 impl AgentSupervisor {
     pub fn new(root_session_id: RootSessionId) -> Self {
+        Self::new_with_objective(
+            root_session_id,
+            "Root session objective not specified.".into(),
+        )
+    }
+
+    pub fn new_with_objective(root_session_id: RootSessionId, objective: String) -> Self {
         let root = AgentTask::new_root(root_session_id);
         let root_task_id = root.id.clone();
         let mut tasks = HashMap::new();
@@ -84,10 +91,7 @@ impl AgentSupervisor {
         let mut mailboxes = HashMap::new();
         mailboxes.insert(root_task_id.clone(), Mailbox::default());
         let mut objectives = HashMap::new();
-        objectives.insert(
-            root_task_id.clone(),
-            "Root session objective not specified.".into(),
-        );
+        objectives.insert(root_task_id.clone(), objective);
         let (updates, _) = watch::channel(0_u64);
         Self {
             root_task_id,
