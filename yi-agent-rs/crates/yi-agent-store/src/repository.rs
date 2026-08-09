@@ -724,6 +724,7 @@ impl RuntimeRepository {
         attempt: &AttemptId,
         turn_delta: u32,
         token_delta: u64,
+        provider_retry_delta: u16,
         meaningful: bool,
         now: DateTime<Utc>,
     ) -> Result<(), RepositoryError> {
@@ -749,6 +750,7 @@ impl RuntimeRepository {
         })?;
         usage.turns = usage.turns.saturating_add(turn_delta);
         usage.tokens = usage.tokens.saturating_add(token_delta);
+        usage.provider_retries = usage.provider_retries.saturating_add(provider_retry_delta);
         let progress_event_id = meaningful
             .then(|| append_event(&transaction, task, RuntimeEvent::TaskProgress))
             .transpose()?;

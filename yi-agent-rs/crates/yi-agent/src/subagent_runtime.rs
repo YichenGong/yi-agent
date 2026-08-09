@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -12,8 +13,12 @@ use yi_agent_core::subagent::worker::{
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
 };
 use yi_agent_core::{
-    Agent, AgentConfig, AgentEvent, Provider, ProviderTurnGate, Tool, ToolRegistry, ToolResult,
+    Agent, AgentConfig, AgentError, AgentEvent, Provider, ProviderError, ProviderTurnGate, Tool,
+    ToolRegistry, ToolResult,
 };
+use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
+
+const DEFAULT_PROVIDER_RETRY_LIMIT: u16 = 3;
 
 /// Reuses the selected provider, tool registry, and system prompt for each
 /// delegated worker while the supervisor supplies its narrow objective.
@@ -63,6 +68,24 @@ impl DaemonAgentWorkerFactory {
         names.dedup();
         names
     }
+}
+
+fn provider_retry_failure(error: &AgentError) -> Option<RetryFailure> {
+    match error {
+        AgentError::Provider(ProviderError::Network(_)) => Some(RetryFailure::ProviderNetwork),
+        AgentError::Provider(ProviderError::RateLimited) => Some(RetryFailure::ProviderRateLimited),
+        AgentError::Provider(ProviderError::Server(_)) => Some(RetryFailure::ProviderServer),
+        AgentError::Provider(ProviderError::Stream(_)) => Some(RetryFailure::ProviderStream),
+        AgentError::Provider(ProviderError::Auth(_) | ProviderError::InvalidRequest(_))
+        | AgentError::ProviderTurnAdmission(_) => None,
+    }
+}
+
+fn retry_jitter_millis() -> u16 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.subsec_millis() % 250) as u16)
+        .unwrap_or(0)
 }
 
 impl AgentWorkerFactory for DaemonAgentWorkerFactory {
@@ -167,8 +190,14 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                             agent = agent.with_provider_turn_gate(gate);
                         }
                         let mut prompt = objective;
+                        let mut provider_retries = 0;
+                        let mut retrying_provider = false;
                         'run: loop {
-                            let stream = match agent.run(prompt).await {
+                            let stream = match if retrying_provider {
+                                agent.retry_current_session().await
+                            } else {
+                                agent.run(prompt.clone()).await
+                            } {
                                 Ok(stream) => stream,
                                 Err(error) => {
                                     reporter.report_failure(error.to_string());
@@ -225,6 +254,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             }
                                             if let Some(next_prompt) = message_prompt.take() {
                                                 prompt = next_prompt;
+                                                retrying_provider = false;
                                                 continue 'run;
                                             }
                                             reporter.report_completed_without_delivery();
@@ -237,12 +267,40 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             }
                                             if let Some(next_prompt) = message_prompt.take() {
                                                 prompt = next_prompt;
+                                                retrying_provider = false;
                                                 continue 'run;
                                             }
                                             reporter.report_cancelled();
                                             break 'run;
                                         }
                                         Some(AgentEvent::Error(error)) => {
+                                            let retry = provider_retry_failure(&error).and_then(|failure| {
+                                                match evaluate_retry(
+                                                    failure,
+                                                    provider_retries,
+                                                    DEFAULT_PROVIDER_RETRY_LIMIT,
+                                                    retry_jitter_millis(),
+                                                ) {
+                                                    RetryDecision::RetryAfter(delay) => Some(delay),
+                                                    RetryDecision::Blocked | RetryDecision::Failed => None,
+                                                }
+                                            });
+                                            if let Some(delay) = retry {
+                                                provider_retries += 1;
+                                                retrying_provider = true;
+                                                reporter.report_provider_retry();
+                                                tokio::select! {
+                                                    _ = tokio::time::sleep(delay) => continue 'run,
+                                                    _ = cancellation.cancelled() => {
+                                                        reporter.report_cancelled();
+                                                        break 'run;
+                                                    }
+                                                    _ = pause.requested() => {
+                                                        reporter.report_paused();
+                                                        break 'run;
+                                                    }
+                                                }
+                                            }
                                             reporter.report_failure(error.to_string());
                                             break 'run;
                                         }
@@ -606,6 +664,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct OneTransientFailureProvider {
+        calls: Mutex<u8>,
+        message_counts: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for OneTransientFailureProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.message_counts
+                .lock()
+                .unwrap()
+                .push(request.messages.len());
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                return Err(ProviderError::Network("temporary disconnect".into()));
+            }
+            Ok(futures::stream::iter([ProviderEvent::Stop {
+                reason: yi_agent_core::StopReason::EndTurn,
+            }])
+            .boxed())
+        }
+    }
+
     #[async_trait]
     impl Provider for RecordingHangingProvider {
         async fn call_stream(
@@ -849,6 +935,44 @@ mod tests {
                 output_tokens: 5,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_retries_a_transient_provider_failure() {
+        let directory = TempDir::new().unwrap();
+        let provider = Arc::new(OneTransientFailureProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+        let handle = factory
+            .start(
+                WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+                    .with_objective("Complete the delegated task."),
+            )
+            .await
+            .unwrap();
+
+        let saw_retry = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut saw_retry = false;
+            loop {
+                let events = handle.take_watchdog_events();
+                saw_retry |= events
+                    .iter()
+                    .any(|event| matches!(event, WorkerWatchdogEvent::ProviderRetry));
+                if saw_retry && *provider.calls.lock().unwrap() == 2 {
+                    return saw_retry;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should retry a transient provider failure");
+        assert!(saw_retry);
+        assert_eq!(*provider.calls.lock().unwrap(), 2);
+        assert_eq!(*provider.message_counts.lock().unwrap(), vec![1, 1]);
     }
 
     #[tokio::test]

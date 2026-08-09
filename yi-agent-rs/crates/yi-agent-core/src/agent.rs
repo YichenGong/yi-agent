@@ -294,15 +294,32 @@ impl Agent {
         &mut self,
         user_prompt: String,
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        self.start_run(Some(user_prompt)).await
+    }
+
+    /// Restarts execution from the current session after a transient provider
+    /// failure without duplicating the user prompt already in that session.
+    pub async fn retry_current_session(
+        &mut self,
+    ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        self.start_run(None).await
+    }
+
+    async fn start_run(
+        &mut self,
+        user_prompt: Option<String>,
+    ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
         // 每次运行使用新的 cancel token,避免上一次 cancel 留下的状态
         // 卡死后续运行(inline 模式的 Interrupt/ctrl_c/新 prompt 只 cancel
         // 不重建 agent,如果不重置,后续 run() 会在 run_loop 开头立刻返回
         // Cancelled)。
         self.cancel_token = CancellationToken::new();
-        self.session
-            .lock()
-            .unwrap()
-            .push(Message::user(user_prompt));
+        if let Some(user_prompt) = user_prompt {
+            self.session
+                .lock()
+                .unwrap()
+                .push(Message::user(user_prompt));
+        }
 
         let provider = self.provider.clone();
         let tools = self.tools.clone();

@@ -178,6 +178,7 @@ pub enum WorkerWatchdogEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    ProviderRetry,
     MeaningfulProgress,
 }
 
@@ -244,6 +245,11 @@ impl WorkerHandle {
             input_tokens,
             output_tokens,
         });
+    }
+
+    /// Records an automatic retry after a classified transient provider failure.
+    pub fn report_provider_retry(&self) {
+        self.report_watchdog(WorkerWatchdogEvent::ProviderRetry);
     }
 
     /// Records a durable progress point such as a successful tool result.
