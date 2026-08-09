@@ -1536,6 +1536,73 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
 }
 
 #[test]
+fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated {
+        root_task_id,
+        session_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: other_task,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id,
+            parent_task_id: root_task_id.clone(),
+            objective: "Unrelated task".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child");
+    };
+
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let cursor = repository.latest_event_id().unwrap();
+    repository
+        .append_event(&root_task_id.parse().unwrap(), RuntimeEvent::TaskStarted)
+        .unwrap();
+    repository
+        .append_event(&other_task.parse().unwrap(), RuntimeEvent::TaskQueued)
+        .unwrap();
+    repository
+        .append_event(&root_task_id.parse().unwrap(), RuntimeEvent::TaskProgress)
+        .unwrap();
+    drop(repository);
+
+    let IpcResponse::TaskEvents { events } = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskEvents {
+            task_id: root_task_id.clone(),
+            after_event_id: Some(cursor),
+        },
+    )
+    .unwrap() else {
+        panic!("expected task events");
+    };
+
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].event_id < pair[1].event_id)
+    );
+    assert!(events.iter().all(|event| event.task_id == root_task_id));
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["task_started", "task_progress"]
+    );
+}
+
+#[test]
 fn daemon_retries_a_terminal_task_through_its_control_api() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

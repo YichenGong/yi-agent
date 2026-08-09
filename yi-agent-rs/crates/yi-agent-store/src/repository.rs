@@ -2105,6 +2105,44 @@ impl RuntimeRepository {
             })
             .collect()
     }
+
+    /// Returns the append-only audit history for one task after the supplied cursor.
+    pub fn event_records_for_task_after(
+        &self,
+        task: &TaskId,
+        cursor: i64,
+    ) -> Result<Vec<PersistedEvent>, RepositoryError> {
+        self.task_detail(task)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, kind, payload_json
+             FROM events
+             WHERE task_id = ?1 AND id > ?2
+             ORDER BY id",
+        )?;
+        statement
+            .query_map(params![task.to_string(), cursor], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, task_id, kind, payload_json) = row?;
+                Ok(PersistedEvent {
+                    id,
+                    task_id: task_id
+                        .parse()
+                        .map_err(|_| RepositoryError::UnknownEventKind {
+                            kind: format!("invalid task ID in store: {task_id}"),
+                        })?,
+                    event: RuntimeEvent::parse(kind)?,
+                    payload_json,
+                })
+            })
+            .collect()
+    }
 }
 
 fn append_event(

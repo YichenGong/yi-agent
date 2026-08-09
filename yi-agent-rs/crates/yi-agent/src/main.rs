@@ -79,6 +79,15 @@ fn control_agent(action: AgentAction) -> Result<()> {
     let socket = runtime_directory()?.join("runtime.sock");
     let request = match action {
         AgentAction::Show { task_id } => yi_agent_store::ipc::IpcRequest::InspectTask { task_id },
+        AgentAction::Events { task_id, follow } => {
+            if follow {
+                anyhow::bail!("following task events is not yet supported by this daemon version")
+            }
+            yi_agent_store::ipc::IpcRequest::ReadTaskEvents {
+                task_id,
+                after_event_id: None,
+            }
+        }
         AgentAction::Message { task_id, text, .. } => {
             yi_agent_store::ipc::IpcRequest::SendUserMessage {
                 task_id,
@@ -130,6 +139,12 @@ fn control_agent(action: AgentAction) -> Result<()> {
     })? {
         yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => {
             println!("{} {}", detail.task_id, detail.state);
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::TaskEvents { events } => {
+            for event in events {
+                println!("{} {} {}", event.event_id, event.kind, event.payload_json);
+            }
             Ok(())
         }
         yi_agent_store::ipc::IpcResponse::TaskCancelled

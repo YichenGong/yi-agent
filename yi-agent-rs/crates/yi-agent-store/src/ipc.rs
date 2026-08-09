@@ -128,6 +128,11 @@ pub enum IpcRequest {
     InspectTask {
         task_id: String,
     },
+    ReadTaskEvents {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_event_id: Option<i64>,
+    },
     SubscribeEvents {
         after_event_id: i64,
         #[serde(default)]
@@ -182,6 +187,9 @@ pub enum IpcResponse {
         children: Vec<String>,
     },
     TaskDetail(IpcTaskDetail),
+    TaskEvents {
+        events: Vec<IpcEvent>,
+    },
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
     ResyncRequired,
@@ -1740,6 +1748,18 @@ fn respond(
                 state: detail.state,
                 delivery_json: detail.delivery_json,
             }))
+        }
+        IpcRequest::ReadTaskEvents {
+            task_id,
+            after_event_id,
+        } => {
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let events = repository
+                .event_records_for_task_after(&task_id, after_event_id.unwrap_or(0))?
+                .into_iter()
+                .map(ipc_event)
+                .collect();
+            Ok(IpcResponse::TaskEvents { events })
         }
         IpcRequest::SubscribeEvents {
             after_event_id,
