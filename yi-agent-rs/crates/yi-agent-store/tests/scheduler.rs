@@ -1,4 +1,40 @@
-use yi_agent_store::schedule::{OverlapPolicy, RuntimePolicy, SchedulePolicy};
+use yi_agent_store::schedule::{OverlapPolicy, RuntimePolicy, RuntimePolicyLayer, SchedulePolicy};
+
+#[test]
+fn toml_policy_layers_can_only_narrow_the_user_ceiling() {
+    let user = RuntimePolicyLayer::from_toml(
+        r#"
+            [runtime]
+            max_resident_subagents = 16
+            max_queued_subagents = 64
+            max_depth = 2
+            max_direct_children_per_agent = 4
+            [attempt_defaults]
+            max_turns = 100
+            max_wall_time_secs = 2700
+            max_idle_time_secs = 300
+        "#,
+    )
+    .unwrap();
+    let project = RuntimePolicyLayer::from_toml(
+        r#"
+            [runtime]
+            max_resident_subagents = 8
+            max_queued_subagents = 128
+            [attempt_defaults]
+            max_turns = 120
+            max_wall_time_secs = 900
+        "#,
+    )
+    .unwrap();
+
+    let effective = user.effective_with(&project);
+    assert_eq!(effective.max_resident_subagents, 8);
+    assert_eq!(effective.max_queued_subagents, 64);
+    assert_eq!(effective.max_turns, 100);
+    assert_eq!(effective.max_wall_time_secs, 900);
+    assert_eq!(effective.max_idle_time_secs, 300);
+}
 
 #[test]
 fn effective_policy_only_narrows_numeric_limits_and_capabilities() {
