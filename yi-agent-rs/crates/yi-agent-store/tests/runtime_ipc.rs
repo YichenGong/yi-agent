@@ -1180,6 +1180,11 @@ fn local_daemon_stop_announces_draining_before_requesting_worker_checkpoints() {
     )
     .unwrap();
 
+    let reporter = factory.handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        reporter.lock().unwrap().as_ref().unwrap().report_paused();
+    });
     daemon.stop().unwrap();
 
     let events = RuntimeRepository::open(&database)

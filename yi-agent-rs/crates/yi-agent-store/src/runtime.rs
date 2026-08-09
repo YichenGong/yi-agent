@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
@@ -28,6 +29,25 @@ pub enum RuntimeCoordinatorError {
     ResidentCapacityExhausted,
     #[error("runtime is draining and rejects new admissions")]
     Draining,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeStopOptions {
+    pub grace: Duration,
+}
+
+impl Default for RuntimeStopOptions {
+    fn default() -> Self {
+        Self {
+            grace: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStopSummary {
+    pub paused: usize,
+    pub recovery_required: usize,
 }
 
 /// Owns all supervisor instances and their worker handles for one daemon.
@@ -513,6 +533,102 @@ impl RuntimeCoordinator {
             repository.append_event(&task, RuntimeEvent::TaskPauseRequested)?;
         }
         Ok(())
+    }
+
+    /// Forces the recovery boundary after the daemon's grace period. Only
+    /// workers still held by supervisors are included: acknowledged pauses
+    /// have already relinquished their handles and resident permits.
+    pub async fn interrupt_unacknowledged_workers(&self) -> Result<(), RuntimeCoordinatorError> {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut interrupted = Vec::new();
+        for supervisor in supervisors {
+            interrupted.extend(
+                supervisor
+                    .lock()
+                    .await
+                    .interrupt_unacknowledged_workers()
+                    .map_err(RuntimeCoordinatorError::Supervisor)?,
+            );
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        for task in interrupted {
+            repository.transition_task(
+                &task,
+                "recovery_required",
+                RuntimeEvent::TaskRecoveryRequired,
+            )?;
+            self.resident_tasks
+                .lock()
+                .expect("runtime resident task mutex poisoned")
+                .remove(&task);
+        }
+        Ok(())
+    }
+
+    /// Applies the graceful-stop worker lifecycle. Admission closes and the
+    /// draining event is durable before a worker receives its pause signal;
+    /// any worker that misses the configured deadline crosses a recovery
+    /// boundary rather than being treated as a user cancellation.
+    pub async fn graceful_stop(
+        &self,
+        options: RuntimeStopOptions,
+    ) -> Result<RuntimeStopSummary, RuntimeCoordinatorError> {
+        let draining_tasks = self.active_worker_task_ids().await;
+        self.begin_draining().await?;
+        self.request_safe_checkpoints().await?;
+
+        let deadline = Instant::now() + options.grace;
+        while !self.active_worker_task_ids().await.is_empty() && Instant::now() < deadline {
+            self.reconcile_worker_events().await?;
+            if !self.active_worker_task_ids().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        self.reconcile_worker_events().await?;
+        if !self.active_worker_task_ids().await.is_empty() {
+            self.interrupt_unacknowledged_workers().await?;
+        }
+
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        let mut summary = RuntimeStopSummary {
+            paused: 0,
+            recovery_required: 0,
+        };
+        for task in draining_tasks {
+            match repository.task_state(&task)?.as_str() {
+                "paused" => summary.paused += 1,
+                "recovery_required" => summary.recovery_required += 1,
+                _ => {}
+            }
+        }
+        Ok(summary)
+    }
+
+    async fn active_worker_task_ids(&self) -> Vec<TaskId> {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for supervisor in supervisors {
+            tasks.extend(supervisor.lock().await.worker_task_ids().cloned());
+        }
+        tasks
     }
 
     fn ensure_admitting(&self) -> Result<(), RuntimeCoordinatorError> {

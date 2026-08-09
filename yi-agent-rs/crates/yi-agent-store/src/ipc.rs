@@ -18,7 +18,7 @@ use yi_agent_core::subagent::task::{RootSessionId, TaskId};
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 
 use crate::repository::RuntimeRepository;
-use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError};
+use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -634,8 +634,9 @@ fn prepare_coordinator_for_stop(coordinator: &RuntimeCoordinator) -> Result<(), 
         .build()
         .map_err(IpcError::Io)?;
     runtime.block_on(async {
-        coordinator.begin_draining().await?;
-        coordinator.request_safe_checkpoints().await
+        coordinator
+            .graceful_stop(RuntimeStopOptions::default())
+            .await
     })?;
     Ok(())
 }
@@ -1241,6 +1242,14 @@ mod subscription_queue_tests {
         );
     }
 
+    #[test]
+    fn draining_admission_error_is_a_typed_invalid_state_response() {
+        assert_eq!(
+            ipc_error_code(&IpcError::Runtime(RuntimeCoordinatorError::Draining)),
+            IpcErrorCode::InvalidState
+        );
+    }
+
     fn set_send_buffer(stream: &UnixStream, bytes: libc::c_int) {
         // SAFETY: the file descriptor and option pointer are valid for this call.
         let result = unsafe {
@@ -1350,6 +1359,7 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Runtime(RuntimeCoordinatorError::ResidentCapacityExhausted) => {
             IpcErrorCode::RateLimited
         }
+        IpcError::Runtime(RuntimeCoordinatorError::Draining) => IpcErrorCode::InvalidState,
         IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             IpcErrorCode::Validation
         }

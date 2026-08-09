@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{
-    AgentTask, CancelReason, PauseReason, RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState,
+    AgentTask, CancelReason, PauseReason, RecoveryEvidence, RootSessionId, TaskEvent, TaskFailure,
+    TaskId, TaskState,
 };
 use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
@@ -145,6 +146,39 @@ impl AgentSupervisor {
         let task_ids = self.workers.keys().cloned().collect::<Vec<_>>();
         for task_id in &task_ids {
             self.pause_task(task_id, PauseReason("daemon is draining".into()))?;
+        }
+        Ok(task_ids)
+    }
+
+    /// Records a recovery boundary for workers that missed the daemon's safe
+    /// checkpoint deadline. The handles are removed so no provider/tool work
+    /// can be replayed by this process after shutdown begins.
+    pub fn interrupt_unacknowledged_workers(&mut self) -> Result<Vec<TaskId>, String> {
+        let task_ids = self.workers.keys().cloned().collect::<Vec<_>>();
+        for task_id in &task_ids {
+            let worker = self
+                .workers
+                .get(task_id)
+                .expect("worker key was collected from this map");
+            worker.cancel();
+            let task = self
+                .tasks
+                .get_mut(task_id)
+                .expect("worker task is retained by its supervisor");
+            let attempt_id = task.active_attempt_id().clone();
+            task.reduce(
+                TaskEvent::RuntimeInterrupted {
+                    attempt_id,
+                    evidence: RecoveryEvidence("safe checkpoint grace deadline elapsed".into()),
+                },
+                chrono::Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+            self.workers.remove(task_id);
+            self.worker_message_capabilities.remove(task_id);
+        }
+        if !task_ids.is_empty() {
+            self.notify_update();
         }
         Ok(task_ids)
     }

@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_store::repository::{RuntimeEvent, RuntimeRepository};
-use yi_agent_store::runtime::RuntimeCoordinator;
+use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
 
 #[derive(Default)]
 struct RecordingFactory;
@@ -186,6 +187,65 @@ async fn draining_is_persisted_before_safe_checkpoint_requests() {
 
     factory.handles.lock().unwrap()[0].report_paused();
     coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(coordinator.task_state(&root).unwrap(), "paused");
+}
+
+#[tokio::test]
+async fn draining_interrupts_unacknowledged_workers_after_the_grace_deadline() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let cancellation = coordinator
+        .worker_cancellation(&session, &root)
+        .await
+        .unwrap();
+
+    coordinator.begin_draining().await.unwrap();
+    coordinator.request_safe_checkpoints().await.unwrap();
+    coordinator
+        .interrupt_unacknowledged_workers()
+        .await
+        .unwrap();
+
+    assert!(cancellation.is_cancelled());
+    assert_eq!(coordinator.task_state(&root).unwrap(), "recovery_required");
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .event_records_after(0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == RuntimeEvent::TaskRecoveryRequired)
+    );
+}
+
+#[tokio::test]
+async fn graceful_stop_waits_for_a_cooperative_safe_checkpoint() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(PauseRecordingFactory::default());
+    let coordinator = Arc::new(RuntimeCoordinator::open(&database, factory.clone()).unwrap());
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let reporter = factory.handles.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        reporter.lock().unwrap()[0].report_paused();
+    });
+    let summary = coordinator
+        .graceful_stop(RuntimeStopOptions {
+            grace: Duration::from_millis(100),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(summary.paused, 1);
+    assert_eq!(summary.recovery_required, 0);
     assert_eq!(coordinator.task_state(&root).unwrap(), "paused");
 }
 
