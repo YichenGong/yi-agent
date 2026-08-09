@@ -159,6 +159,7 @@ impl AgentSupervisor {
         supervisor
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_recovered_child(
         &mut self,
         task_id: TaskId,
