@@ -949,7 +949,8 @@ impl RuntimeRepository {
              WHERE task_id = ?1 AND state = 'active'",
             params![task.to_string()],
         )?;
-        let event_id = append_event(&transaction, task, terminal.event())?;
+        let event_id =
+            append_event_with_payload(&transaction, task, terminal.event(), &terminal_json)?;
         transaction.commit()?;
         Ok(Some(event_id))
     }

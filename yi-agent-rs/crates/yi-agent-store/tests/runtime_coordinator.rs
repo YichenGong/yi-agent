@@ -1187,15 +1187,14 @@ fn watchdog_terminal_is_durable_once_and_releases_every_lease() {
             .unwrap(),
         None
     );
-    assert_eq!(
-        repository
-            .event_records_after(0)
-            .unwrap()
-            .into_iter()
-            .filter(|event| event.event == RuntimeEvent::TaskStalled)
-            .count(),
-        1
-    );
+    let stalled_events = repository
+        .event_records_after(0)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event == RuntimeEvent::TaskStalled)
+        .collect::<Vec<_>>();
+    assert_eq!(stalled_events.len(), 1);
+    assert_eq!(stalled_events[0].payload_json, terminal.to_string());
 }
 
 #[tokio::test]
