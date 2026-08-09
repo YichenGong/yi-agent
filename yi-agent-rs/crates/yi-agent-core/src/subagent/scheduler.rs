@@ -60,6 +60,12 @@ pub enum ReleaseError {
     UnknownLease,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AdmissionError {
+    #[error("queued subagent capacity is exhausted")]
+    QueueCapacityExceeded,
+}
+
 #[derive(Debug)]
 pub struct ResourceCoordinator {
     capacities: HashMap<String, u16>,
@@ -67,6 +73,7 @@ pub struct ResourceCoordinator {
     queues: HashMap<String, VecDeque<QueuedRequest>>,
     active: HashMap<LeaseId, GrantedLease>,
     last_grant_root: HashMap<String, RootSessionId>,
+    queue_capacity: usize,
 }
 
 impl Default for ResourceCoordinator {
@@ -84,6 +91,7 @@ impl Default for ResourceCoordinator {
             queues: HashMap::new(),
             active: HashMap::new(),
             last_grant_root: HashMap::new(),
+            queue_capacity: 64,
         }
     }
 }
@@ -99,6 +107,27 @@ impl ResourceCoordinator {
 
     pub fn set_capacity(&mut self, key: impl Into<String>, units: u16) {
         self.capacities.insert(key.into(), units);
+    }
+
+    pub fn set_queue_capacity(&mut self, capacity: usize) {
+        self.queue_capacity = capacity;
+    }
+
+    pub fn queued_request_count(&self) -> usize {
+        self.queues.values().map(VecDeque::len).sum()
+    }
+
+    pub fn try_enqueue(
+        &mut self,
+        root_id: RootSessionId,
+        task_id: TaskId,
+        request: ResourceRequest,
+    ) -> Result<(), AdmissionError> {
+        if self.queued_request_count() >= self.queue_capacity {
+            return Err(AdmissionError::QueueCapacityExceeded);
+        }
+        self.enqueue(root_id, task_id, request);
+        Ok(())
     }
 
     /// Configure the regular and coordination-reserved LLM pools for a

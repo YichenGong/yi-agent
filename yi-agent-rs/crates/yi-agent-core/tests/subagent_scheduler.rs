@@ -1,5 +1,5 @@
 use yi_agent_core::subagent::scheduler::{
-    LeaseMode, ResourceCoordinator, ResourceRequest, ResourceScope,
+    AdmissionError, LeaseMode, ResourceCoordinator, ResourceRequest, ResourceScope,
 };
 
 #[test]
@@ -110,4 +110,20 @@ fn releasing_the_same_lease_twice_is_idempotent() {
 
     coordinator.release(lease.lease_id.clone()).unwrap();
     coordinator.release(lease.lease_id).unwrap();
+}
+
+#[test]
+fn queue_capacity_rejects_without_allocating_a_hidden_request() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_queue_capacity(1);
+    let root = RootSessionId::new();
+    coordinator
+        .try_enqueue(root.clone(), TaskId::new(), request("resident:global"))
+        .unwrap();
+
+    assert!(matches!(
+        coordinator.try_enqueue(root, TaskId::new(), request("resident:global")),
+        Err(AdmissionError::QueueCapacityExceeded)
+    ));
+    assert_eq!(coordinator.queued_request_count(), 1);
 }
