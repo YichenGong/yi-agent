@@ -11,7 +11,9 @@ use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
 };
-use yi_agent_core::{Agent, AgentConfig, AgentEvent, Provider, Tool, ToolRegistry, ToolResult};
+use yi_agent_core::{
+    Agent, AgentConfig, AgentEvent, Provider, ProviderTurnGate, Tool, ToolRegistry, ToolResult,
+};
 
 /// Reuses the selected provider, tool registry, and system prompt for each
 /// delegated worker while the supervisor supplies its narrow objective.
@@ -101,6 +103,14 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         &self,
         request: WorkerStart,
     ) -> futures::future::BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        self.start_with_provider_turn_gate(request, None)
+    }
+
+    fn start_with_provider_turn_gate(
+        &self,
+        request: WorkerStart,
+        provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> futures::future::BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
         let config = self.config.clone();
@@ -147,6 +157,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                     };
                     runtime.block_on(async move {
                         let mut agent = Agent::new(provider, worker_tools, config);
+                        if let Some(gate) = provider_turn_gate {
+                            agent = agent.with_provider_turn_gate(gate);
+                        }
                         let mut prompt = objective;
                         'run: loop {
                             let stream = match agent.run(prompt).await {

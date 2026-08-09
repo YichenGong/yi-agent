@@ -14,6 +14,7 @@ use super::task::{
     TaskFailure, TaskId, TaskState,
 };
 use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart};
+use crate::agent::ProviderTurnGate;
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
@@ -298,6 +299,17 @@ impl AgentSupervisor {
         factory: &dyn AgentWorkerFactory,
         task_id: &TaskId,
     ) -> Result<(), String> {
+        self.start_worker_with_provider_turn_gate(factory, task_id, None)
+            .await
+    }
+
+    /// Creates a worker with runtime-owned provider-turn admission attached.
+    pub async fn start_worker_with_provider_turn_gate(
+        &mut self,
+        factory: &dyn AgentWorkerFactory,
+        task_id: &TaskId,
+        provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> Result<(), String> {
         if self.workers.contains_key(task_id) {
             return Err("task already owns a worker".into());
         }
@@ -333,7 +345,10 @@ impl AgentSupervisor {
         // Admission is visible before the application factory can create any
         // side effects. A factory failure is reduced to a terminal task state.
         self.start_task(task_id)?;
-        let handle = match factory.start(start).await {
+        let handle = match factory
+            .start_with_provider_turn_gate(start, provider_turn_gate)
+            .await
+        {
             Ok(handle) => handle,
             Err(error) => {
                 self.fail_task(task_id, error.to_string())?;

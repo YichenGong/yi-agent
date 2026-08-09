@@ -8,6 +8,8 @@ use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::ProviderTurnGate;
+
 use super::task::{AttemptId, MessageId, RootSessionId, TaskId};
 
 #[derive(Debug, Clone)]
@@ -297,4 +299,14 @@ pub trait AgentWorkerFactory: Send + Sync {
     }
 
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>>;
+
+    /// Lets the runtime attach per-provider-turn admission without making
+    /// ordinary factories or core task ownership depend on a store type.
+    fn start_with_provider_turn_gate(
+        &self,
+        request: WorkerStart,
+        _gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        self.start(request)
+    }
 }

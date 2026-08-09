@@ -12,7 +12,7 @@ use yi_agent_core::subagent::task::{
     PauseReason, PermissionRequestId, RootSessionId, TaskDepth, TaskState,
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
-use yi_agent_core::{ContentBlock, ToolRegistry};
+use yi_agent_core::{ContentBlock, ProviderTurnGate, ProviderTurnLease, ToolRegistry};
 
 #[test]
 fn spawn_enforces_depth_two_and_four_direct_children() {
@@ -127,6 +127,36 @@ struct CapabilityWorkerFactory {
     start: Arc<Mutex<Option<WorkerStart>>>,
 }
 
+#[derive(Default)]
+struct GateObservingWorkerFactory {
+    received_gate: Arc<Mutex<bool>>,
+}
+
+struct NoopTurnLease;
+
+struct NoopTurnGate;
+
+impl ProviderTurnGate for NoopTurnGate {
+    fn acquire(&self) -> BoxFuture<'static, Result<Box<dyn ProviderTurnLease>, String>> {
+        Box::pin(async { Ok(Box::new(NoopTurnLease) as Box<dyn ProviderTurnLease>) })
+    }
+}
+
+impl AgentWorkerFactory for GateObservingWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+
+    fn start_with_provider_turn_gate(
+        &self,
+        request: WorkerStart,
+        gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        *self.received_gate.lock().unwrap() = gate.is_some();
+        self.start(request)
+    }
+}
+
 impl AgentWorkerFactory for CapabilityWorkerFactory {
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let handle = WorkerHandle::new(request.cancellation.clone());
@@ -160,6 +190,20 @@ async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let cancellation = supervisor.worker_cancellation(&child).unwrap();
     supervisor.cancel_worker(&child).unwrap();
     assert!(cancellation.is_cancelled());
+}
+
+#[tokio::test]
+async fn supervisor_passes_a_provider_turn_gate_to_the_factory() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+    let factory = GateObservingWorkerFactory::default();
+
+    supervisor
+        .start_worker_with_provider_turn_gate(&factory, &child, Some(Arc::new(NoopTurnGate)))
+        .await
+        .unwrap();
+
+    assert!(*factory.received_gate.lock().unwrap());
 }
 
 #[tokio::test]
