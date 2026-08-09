@@ -717,6 +717,55 @@ async fn global_resident_capacity_leaves_excess_child_queued() {
 }
 
 #[tokio::test]
+async fn fair_resident_grant_is_retained_for_the_selected_queued_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let mut children = Vec::new();
+    for _ in 0..17 {
+        let session = coordinator.create_session().unwrap();
+        let root = coordinator.root_task_id(&session).unwrap();
+        let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        children.push((session, child));
+    }
+    for (session, child) in children.iter().take(16) {
+        coordinator.start_worker(session, child).await.unwrap();
+    }
+    let (waiting_session, waiting_child) = &children[16];
+    assert!(
+        coordinator
+            .start_worker(waiting_session, waiting_child)
+            .await
+            .is_err()
+    );
+
+    let (released_session, released_child) = &children[0];
+    coordinator
+        .cancel_task(released_session, released_child, false)
+        .await
+        .unwrap();
+    let later_session = coordinator.create_session().unwrap();
+    let later_root = coordinator.root_task_id(&later_session).unwrap();
+    let later_child = coordinator
+        .spawn_child(&later_session, &later_root)
+        .await
+        .unwrap();
+
+    assert!(
+        coordinator
+            .start_worker(&later_session, &later_child)
+            .await
+            .is_err()
+    );
+    coordinator
+        .start_worker(waiting_session, waiting_child)
+        .await
+        .unwrap();
+    assert_eq!(coordinator.task_state(waiting_child).unwrap(), "running");
+    assert_eq!(coordinator.task_state(&later_child).unwrap(), "queued");
+}
+
+#[tokio::test]
 async fn queued_capacity_rejects_without_persisting_a_child_task() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

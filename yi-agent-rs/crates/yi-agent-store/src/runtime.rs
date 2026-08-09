@@ -421,28 +421,26 @@ impl RuntimeCoordinator {
                 let Some(lease) = coordinator.grant_next("resident:global") else {
                     return Err(RuntimeCoordinatorError::ResidentCapacityExhausted);
                 };
-                if lease.task_id != *task {
-                    coordinator
-                        .release(lease.lease_id)
-                        .expect("lease release is idempotent");
-                    return Err(RuntimeCoordinatorError::ResidentCapacityExhausted);
-                }
+                let admitted_task = lease.task_id.clone();
                 self.resident_waiting
                     .lock()
                     .expect("runtime resident wait mutex poisoned")
-                    .remove(task);
+                    .remove(&admitted_task);
                 self.resident_leases
                     .lock()
                     .expect("runtime resident lease mutex poisoned")
-                    .insert(task.clone(), lease.lease_id);
+                    .insert(admitted_task.clone(), lease.lease_id);
                 self.resident_tasks
                     .lock()
                     .expect("runtime resident task mutex poisoned")
-                    .insert(task.clone());
+                    .insert(admitted_task.clone());
                 drop(coordinator);
                 if let Err(error) = self.persist_resident_cursor() {
-                    self.release_resident_lease(task);
+                    self.release_resident_lease(&admitted_task);
                     return Err(error);
+                }
+                if admitted_task != *task {
+                    return Err(RuntimeCoordinatorError::ResidentCapacityExhausted);
                 }
             }
         }
