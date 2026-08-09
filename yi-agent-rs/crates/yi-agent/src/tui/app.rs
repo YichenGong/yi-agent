@@ -1454,7 +1454,10 @@ fn build_popup<'a>(popup: &'a CommandPopup) -> Paragraph<'a> {
         .enumerate()
         .map(|(i, cmd)| {
             let name = format!("/{}", cmd.name());
-            let desc = cmd.description();
+            let desc = match cmd.argument_usage() {
+                Some(usage) => format!("{} {usage}", cmd.description()),
+                None => cmd.description().to_owned(),
+            };
             let is_selected = i == popup.selected_index();
             let style = if is_selected {
                 Style::new().bg(Color::Blue).fg(Color::White)

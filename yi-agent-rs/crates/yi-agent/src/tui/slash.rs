@@ -80,10 +80,20 @@ impl SlashCommand {
         }
     }
 
-    /// Whether the command requires an argument (e.g. `/model gpt-4`).
-    #[allow(dead_code)]
+    /// Required positional arguments, rendered consistently in help and completion.
+    pub fn argument_usage(&self) -> Option<&'static str> {
+        match self {
+            SlashCommand::Model => Some("<model-name>"),
+            SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => {
+                Some("<session-id> <task-id>")
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the command requires an argument.
     pub fn needs_arg(&self) -> bool {
-        matches!(self, SlashCommand::Model)
+        self.argument_usage().is_some()
     }
 
     /// All available commands, in popup display order.
@@ -128,15 +138,28 @@ pub fn help_text(target: Option<&str>) -> String {
         .filter(|name| !name.is_empty())
     {
         Some(name) => match SlashCommand::from_name(name) {
-            Some(command) => format!("/{}\n{}", command.name(), command.description()),
+            Some(command) => format!(
+                "/{}{}\n{}",
+                command.name(),
+                command
+                    .argument_usage()
+                    .map(|usage| format!(" {usage}"))
+                    .unwrap_or_default(),
+                command.description()
+            ),
             None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
         },
         None => {
             let mut text = String::from("可用命令:\n");
             for command in SlashCommand::all() {
+                let usage = command
+                    .argument_usage()
+                    .map(|usage| format!(" {usage}"))
+                    .unwrap_or_default();
                 text.push_str(&format!(
-                    "  /{:<10} {}\n",
+                    "  /{}{} {}\n",
                     command.name(),
+                    usage,
                     command.description()
                 ));
             }
@@ -311,9 +334,25 @@ mod tests {
     }
 
     #[test]
-    fn needs_arg_only_for_model() {
+    fn task_controls_publish_usage_in_help_and_metadata() {
+        for command in [
+            SlashCommand::Pause,
+            SlashCommand::Resume,
+            SlashCommand::Retry,
+        ] {
+            assert_eq!(command.argument_usage(), Some("<session-id> <task-id>"));
+            assert!(command.needs_arg());
+            assert!(
+                help_text(Some(command.name()))
+                    .contains(&format!("/{} <session-id> <task-id>", command.name()))
+            );
+        }
+    }
+
+    #[test]
+    fn needs_arg_includes_commands_with_usage_metadata() {
         for cmd in SlashCommand::all() {
-            assert_eq!(cmd.needs_arg(), *cmd == SlashCommand::Model);
+            assert_eq!(cmd.needs_arg(), cmd.argument_usage().is_some());
         }
     }
 
