@@ -37,6 +37,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] 输入排队 — `tui/queued.rs::QueuedInput` 在 agent 运行期间缓存输入 — [设计](../plans/2026-07-25-tui-queued-input-design.md)
 - [x] 状态栏 — `tui/statusbar.rs` 显示实时 token + 模型名 + 运行中任务 — [设计](../plans/2026-07-25-task-perception-design.md)
 - [x] Bash 全屏弹窗 — `tui/bash_popup.rs` Ctrl+P 打开，显示实时输出 + exit code — [设计](../plans/2026-07-25-task-perception-design.md)
+- [x] Bash 详情内容换行 — `tui/bash_popup.rs` 按终端显示宽度折行 Ctrl+P 详情中的命令、stdout 和 stderr，完整内容可通过上下滚动查看；验证：`cargo test -p yi-agent --bin yi-agent tui::bash_popup::tests`
 - [x] `/cost` 命令 — `tui/cost.rs::CostTracker` 按模型累计 token + 调用次数 — [设计](../plans/2026-07-26-tui-cost-command-design.md)
 - [x] `/yolo` `/model` `/compact` `/clear` `/help` `/exit` slash 命令 — `tui/slash.rs` + `tui/app.rs` 路由
 - [x] 压缩状态闭环 — `/compact` 的 pending 行由 `ManualCompacted` / `ManualCompactFailed` 原地更新，`AutoCompacting` 追加完成行；验证：`cargo test -p yi-agent --bin yi-agent tui::history::tests::manual_compaction_` 和 `cargo test -p yi-agent --bin yi-agent tui::history::tests::auto_compaction_appends_completed_status`

@@ -342,7 +342,7 @@ fn run_loop<B: Backend, E: EventSource>(
                         let detail_area = chunks[0];
                         f.render_widget(Clear, detail_area);
                         f.render_widget(
-                            super::bash_popup::render_detail_popup(p, task),
+                            super::bash_popup::render_detail_popup(p, task, detail_area),
                             detail_area,
                         );
                     }
@@ -354,7 +354,7 @@ fn run_loop<B: Backend, E: EventSource>(
                         f.render_widget(Clear, detail_area);
                         let detail = DetailPopup::new(ck.task_id.clone());
                         f.render_widget(
-                            super::bash_popup::render_detail_popup(&detail, task),
+                            super::bash_popup::render_detail_popup(&detail, task, detail_area),
                             detail_area,
                         );
                     }
@@ -405,7 +405,12 @@ fn run_loop<B: Backend, E: EventSource>(
                 }
                 // Route keys to the bash popup when active.
                 if !matches!(bash_popup, BashPopup::None) {
-                    handle_bash_popup_key(key, &mut bash_popup, &task_registry);
+                    handle_bash_popup_key(
+                        key,
+                        &mut bash_popup,
+                        &task_registry,
+                        layout.chunks[0].width,
+                    );
                     continue;
                 }
                 let history_area = layout.chunks[0];
@@ -470,6 +475,7 @@ fn handle_bash_popup_key(
     key: KeyEvent,
     bash_popup: &mut BashPopup,
     task_registry: &RunningTaskRegistry,
+    detail_width: u16,
 ) {
     match bash_popup {
         BashPopup::List(p) => match key.code {
@@ -511,14 +517,9 @@ fn handle_bash_popup_key(
                 d.scroll_up(1);
             }
             KeyCode::Down => {
-                // Approximate max scroll by stdout+stderr line count.
                 let lines = task_registry
                     .get(&d.task_id)
-                    .map(|t| {
-                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
-                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
-                        so + se + 6 // header + labels
-                    })
+                    .map(|t| super::bash_popup::detail_line_count(t, detail_width))
                     .unwrap_or(0);
                 d.scroll_down(1, lines);
             }
@@ -588,11 +589,7 @@ fn handle_mouse(
             if is_scroll_down {
                 let lines = task_registry
                     .get(&d.task_id)
-                    .map(|t| {
-                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
-                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
-                        so + se + 6 // header + labels
-                    })
+                    .map(|t| super::bash_popup::detail_line_count(t, history_area.width))
                     .unwrap_or(0);
                 d.scroll_down(delta, lines);
             } else {
