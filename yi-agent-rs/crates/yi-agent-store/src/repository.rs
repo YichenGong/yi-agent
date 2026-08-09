@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
@@ -6,7 +7,7 @@ use yi_agent_core::subagent::task::MessageId;
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -22,6 +23,8 @@ pub enum RepositoryError {
     MailboxMessageNotFound { message_id: String },
     #[error("worker recovery context is not durable: {reason}")]
     InvalidWorkerRecoveryContext { reason: String },
+    #[error("admission cursor is invalid for {key}: {reason}")]
+    InvalidAdmissionCursor { key: String, reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +95,13 @@ pub struct PersistedEvent {
 pub struct PersistedTask {
     pub task_id: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedAdmissionCursor {
+    pub root_id: Option<RootSessionId>,
+    pub parent_id: Option<TaskId>,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +176,85 @@ impl RuntimeRepository {
             )
             .optional()?
             .is_some())
+    }
+
+    pub fn save_admission_cursor(
+        &mut self,
+        resource_key: &str,
+        root_id: Option<&RootSessionId>,
+        parent_id: Option<&TaskId>,
+        sequence: u64,
+    ) -> Result<(), RepositoryError> {
+        let sequence =
+            i64::try_from(sequence).map_err(|_| RepositoryError::InvalidAdmissionCursor {
+                key: resource_key.into(),
+                reason: "sequence exceeds SQLite integer range".into(),
+            })?;
+        self.connection.execute(
+            "INSERT INTO resource_admission_cursors
+             (resource_key, root_session_id, parent_task_id, sequence)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(resource_key) DO UPDATE SET
+                 root_session_id = excluded.root_session_id,
+                 parent_task_id = excluded.parent_task_id,
+                 sequence = excluded.sequence,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![
+                resource_key,
+                root_id.map(ToString::to_string),
+                parent_id.map(ToString::to_string),
+                sequence,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn admission_cursor(
+        &self,
+        resource_key: &str,
+    ) -> Result<Option<PersistedAdmissionCursor>, RepositoryError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT root_session_id, parent_task_id, sequence
+                 FROM resource_admission_cursors WHERE resource_key = ?1",
+                [resource_key],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((root_id, parent_id, sequence)) = row else {
+            return Ok(None);
+        };
+        let root_id = root_id
+            .map(|value| RootSessionId::from_str(&value))
+            .transpose()
+            .map_err(|error| RepositoryError::InvalidAdmissionCursor {
+                key: resource_key.into(),
+                reason: format!("invalid root session ID: {error}"),
+            })?;
+        let parent_id = parent_id
+            .map(|value| TaskId::from_str(&value))
+            .transpose()
+            .map_err(|error| RepositoryError::InvalidAdmissionCursor {
+                key: resource_key.into(),
+                reason: format!("invalid parent task ID: {error}"),
+            })?;
+        let sequence =
+            u64::try_from(sequence).map_err(|_| RepositoryError::InvalidAdmissionCursor {
+                key: resource_key.into(),
+                reason: "sequence is negative".into(),
+            })?;
+        Ok(Some(PersistedAdmissionCursor {
+            root_id,
+            parent_id,
+            sequence,
+        }))
     }
 
     pub fn create_task(
@@ -1358,6 +1447,22 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             INSERT INTO runtime_metadata (key, value) VALUES ('event_replay_floor', 1);",
         )?;
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])?;
+        transaction.commit()?;
+    }
+    if current_version < 3 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE resource_admission_cursors (
+                resource_key TEXT PRIMARY KEY,
+                root_session_id TEXT,
+                parent_task_id TEXT,
+                sequence INTEGER NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX admission_cursor_root_idx
+                ON resource_admission_cursors(root_session_id);",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])?;
         transaction.commit()?;
     }
     Ok(())

@@ -1438,6 +1438,7 @@ fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcError
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
+        | crate::repository::RepositoryError::InvalidAdmissionCursor { .. }
         | crate::repository::RepositoryError::UnknownEventKind { .. } => IpcErrorCode::Internal,
     }
 }

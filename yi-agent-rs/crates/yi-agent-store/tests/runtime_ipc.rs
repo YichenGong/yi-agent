@@ -100,7 +100,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 2);
+    assert_eq!(repository.schema_version().unwrap(), 3);
     for table in [
         "sessions",
         "tasks",
@@ -115,6 +115,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
         "schedules",
         "events",
         "runtime_metadata",
+        "resource_admission_cursors",
     ] {
         assert!(repository.has_table(table).unwrap(), "missing {table}");
     }
@@ -182,7 +183,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 2);
+    assert_eq!(repository.schema_version().unwrap(), 3);
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
         repository
