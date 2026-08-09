@@ -222,3 +222,30 @@ fn unrunnable_high_priority_request_does_not_block_a_runnable_request() {
         runnable
     );
 }
+
+#[test]
+fn incompatible_high_priority_request_does_not_block_a_compatible_request() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 2);
+    let root = RootSessionId::new();
+    coordinator.enqueue(
+        root.clone(),
+        TaskId::new(),
+        shared_request("resident:global", 1),
+    );
+    let held_lease = coordinator.grant_next("resident:global").unwrap();
+    let runnable = TaskId::new();
+    coordinator.enqueue_with_priority(
+        root.clone(),
+        TaskId::new(),
+        request("resident:global"),
+        AdmissionPriority::High,
+    );
+    coordinator.enqueue(root, runnable.clone(), shared_request("resident:global", 1));
+
+    assert_eq!(
+        coordinator.grant_next("resident:global").unwrap().task_id,
+        runnable
+    );
+    coordinator.release(held_lease.lease_id).unwrap();
+}

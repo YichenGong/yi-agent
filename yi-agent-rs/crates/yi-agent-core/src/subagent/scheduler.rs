@@ -202,25 +202,28 @@ impl ResourceCoordinator {
     pub fn grant_next_at(&mut self, key: &str, now: DateTime<Utc>) -> Option<GrantedLease> {
         let capacity = *self.capacities.get(key).unwrap_or(&0);
         let used = *self.in_use.get(key).unwrap_or(&0);
+        let has_active_lease = self.active.values().any(|lease| lease.request.key == key);
+        let has_exclusive_lease = self
+            .active
+            .values()
+            .any(|lease| lease.request.key == key && lease.request.mode == LeaseMode::Exclusive);
         let queue = self.queues.get_mut(key)?;
         queue.retain(|entry| entry.request.deadline.is_none_or(|deadline| deadline > now));
         if used >= capacity {
             return None;
         }
         let last_root = self.last_grant_root.get(key).cloned();
-        let selected_index = select_fair_request(queue, last_root.as_ref(), capacity - used, now)?;
+        let selected_index = select_fair_request(
+            queue,
+            last_root.as_ref(),
+            capacity - used,
+            now,
+            has_active_lease,
+            has_exclusive_lease,
+        )?;
         let queued = queue
             .remove(selected_index)
             .expect("selected queue entry exists");
-        let incompatible_lease = self.active.values().any(|lease| {
-            lease.request.key == queued.request.key
-                && (lease.request.mode == LeaseMode::Exclusive
-                    || queued.request.mode == LeaseMode::Exclusive)
-        });
-        if incompatible_lease {
-            queue.insert(selected_index, queued);
-            return None;
-        }
         let lease = GrantedLease {
             lease_id: LeaseId::new(),
             task_id: queued.task_id,
@@ -251,10 +254,15 @@ fn select_fair_request(
     last_root: Option<&RootSessionId>,
     available: u16,
     now: DateTime<Utc>,
+    has_active_lease: bool,
+    has_exclusive_lease: bool,
 ) -> Option<usize> {
     let highest_score = queue
         .iter()
-        .filter(|entry| entry.request.units <= available)
+        .filter(|entry| {
+            entry.request.units <= available
+                && request_is_compatible(entry, has_active_lease, has_exclusive_lease)
+        })
         .map(|entry| admission_score(entry, now))
         .max()?;
     let roots =
@@ -281,11 +289,20 @@ fn select_fair_request(
             &entry.root_id == root
                 && admission_score(entry, now) == highest_score
                 && entry.request.units <= available
+                && request_is_compatible(entry, has_active_lease, has_exclusive_lease)
         }) {
             return Some(index);
         }
     }
     None
+}
+
+fn request_is_compatible(
+    entry: &QueuedRequest,
+    has_active_lease: bool,
+    has_exclusive_lease: bool,
+) -> bool {
+    !has_exclusive_lease && !(has_active_lease && entry.request.mode == LeaseMode::Exclusive)
 }
 
 fn admission_score(entry: &QueuedRequest, now: DateTime<Utc>) -> i64 {
