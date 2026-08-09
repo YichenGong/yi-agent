@@ -456,7 +456,13 @@ async fn run_loop(
         // A permit covers only the provider request and response stream. Tool,
         // permission, and child-wait time deliberately run without one.
         let _provider_turn_lease = match &provider_turn_gate {
-            Some(gate) => match gate.acquire().await {
+            Some(gate) => match tokio::select! {
+                lease = gate.acquire() => lease,
+                _ = cancel_token.cancelled() => {
+                    let _ = tx.send(AgentEvent::Cancelled).await;
+                    return;
+                }
+            } {
                 Ok(lease) => Some(lease),
                 Err(error) => {
                     let _ = tx
@@ -1045,6 +1051,14 @@ mod tests {
         }
     }
 
+    struct BlockingTurnGate;
+
+    impl ProviderTurnGate for BlockingTurnGate {
+        fn acquire(&self) -> BoxFuture<'static, Result<Box<dyn ProviderTurnLease>, String>> {
+            Box::pin(futures::future::pending())
+        }
+    }
+
     impl ScriptedProvider {
         fn new(scripts: Vec<Vec<ProviderEvent>>) -> Self {
             Self {
@@ -1213,6 +1227,38 @@ mod tests {
         assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
         assert_eq!(gate.acquired.load(Ordering::SeqCst), 2);
         assert_eq!(gate.released.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_while_waiting_for_a_provider_turn_gate_exits_promptly() {
+        let provider = ScriptedProvider::new(vec![vec![ProviderEvent::Stop {
+            reason: StopReason::EndTurn,
+        }]]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        )
+        .with_provider_turn_gate(Arc::new(BlockingTurnGate));
+
+        let stream = agent.run("continue".into()).await.unwrap();
+        let cancellation = agent.cancel_token();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancellation.cancel();
+        });
+        let events = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            stream.collect::<Vec<_>>(),
+        )
+        .await
+        .expect("cancellation must interrupt permit admission");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
