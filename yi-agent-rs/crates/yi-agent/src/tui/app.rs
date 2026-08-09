@@ -1453,11 +1453,14 @@ fn build_popup<'a>(popup: &'a CommandPopup) -> Paragraph<'a> {
         .iter()
         .enumerate()
         .map(|(i, cmd)| {
-            let name = format!("/{}", cmd.name());
-            let desc = match cmd.argument_usage() {
-                Some(usage) => format!("{} {usage}", cmd.description()),
-                None => cmd.description().to_owned(),
-            };
+            let name = format!(
+                "/{}{}",
+                cmd.name(),
+                cmd.argument_usage()
+                    .map(|usage| format!(" {usage}"))
+                    .unwrap_or_default()
+            );
+            let desc = cmd.description();
             let is_selected = i == popup.selected_index();
             let style = if is_selected {
                 Style::new().bg(Color::Blue).fg(Color::White)
@@ -1922,10 +1925,14 @@ mod tests {
         .unwrap();
 
         let paused = daemon_pause_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+        let paused_detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
         let resumed = daemon_resume_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+        let resumed_detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
 
         assert!(paused.contains("已请求暂停"));
+        assert!(paused_detail.contains("state: paused"));
         assert!(resumed.contains("已请求恢复"));
+        assert!(resumed_detail.contains("state: running"));
     }
 
     #[test]

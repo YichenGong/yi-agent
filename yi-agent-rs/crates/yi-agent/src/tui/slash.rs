@@ -84,6 +84,9 @@ impl SlashCommand {
     pub fn argument_usage(&self) -> Option<&'static str> {
         match self {
             SlashCommand::Model => Some("<model-name>"),
+            SlashCommand::Agent => Some("<task-id>"),
+            SlashCommand::Message => Some("<task-id> <text>"),
+            SlashCommand::Cancel => Some("<session-id> <task-id> [recursive]"),
             SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => {
                 Some("<session-id> <task-id>")
             }
@@ -345,6 +348,22 @@ mod tests {
             assert!(
                 help_text(Some(command.name()))
                     .contains(&format!("/{} <session-id> <task-id>", command.name()))
+            );
+        }
+    }
+
+    #[test]
+    fn executable_commands_publish_their_argument_signatures() {
+        for (command, usage) in [
+            (SlashCommand::Agent, "<task-id>"),
+            (SlashCommand::Message, "<task-id> <text>"),
+            (SlashCommand::Cancel, "<session-id> <task-id> [recursive]"),
+            (SlashCommand::Model, "<model-name>"),
+        ] {
+            assert_eq!(command.argument_usage(), Some(usage));
+            assert!(command.needs_arg());
+            assert!(
+                help_text(Some(command.name())).contains(&format!("/{} {usage}", command.name()))
             );
         }
     }
