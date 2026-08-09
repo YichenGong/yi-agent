@@ -693,6 +693,32 @@ async fn global_resident_capacity_leaves_excess_child_queued() {
 }
 
 #[tokio::test]
+async fn queued_capacity_rejects_without_persisting_a_child_task() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    for _ in 0..RuntimeCoordinator::DEFAULT_GLOBAL_QUEUED_SUBAGENTS {
+        let session = coordinator.create_session().unwrap();
+        let root = coordinator.root_task_id(&session).unwrap();
+        coordinator.spawn_child(&session, &root).await.unwrap();
+    }
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    assert!(matches!(
+        coordinator.spawn_child(&session, &root).await,
+        Err(yi_agent_store::runtime::RuntimeCoordinatorError::QueueCapacityExceeded)
+    ));
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .queued_task_count()
+            .unwrap(),
+        64
+    );
+}
+
+#[tokio::test]
 async fn coordinator_retries_a_terminal_task_as_a_new_running_attempt() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

@@ -30,6 +30,8 @@ pub enum RuntimeCoordinatorError {
     Spawn(#[from] SpawnError),
     #[error("global resident subagent capacity is exhausted")]
     ResidentCapacityExhausted,
+    #[error("global queued subagent capacity is exhausted")]
+    QueueCapacityExceeded,
     #[error("runtime is draining and rejects new admissions")]
     Draining,
 }
@@ -67,6 +69,7 @@ pub struct RuntimeCoordinator {
 }
 
 impl RuntimeCoordinator {
+    pub const DEFAULT_GLOBAL_QUEUED_SUBAGENTS: usize = 64;
     pub fn open(
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
@@ -202,6 +205,15 @@ impl RuntimeCoordinator {
         objective: String,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
+        if self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .queued_task_count()?
+            >= Self::DEFAULT_GLOBAL_QUEUED_SUBAGENTS
+        {
+            return Err(RuntimeCoordinatorError::QueueCapacityExceeded);
+        }
         let supervisor = self.supervisor(session)?;
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;

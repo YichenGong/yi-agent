@@ -930,6 +930,14 @@ impl RuntimeRepository {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn queued_task_count(&self) -> Result<usize, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE state_json = 'queued' AND parent_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn recovered_tasks(&self) -> Result<Vec<PersistedRecoveredTask>, RepositoryError> {
         let mut statement = self.connection.prepare(
             "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth, attempts.id, attempts.number,
