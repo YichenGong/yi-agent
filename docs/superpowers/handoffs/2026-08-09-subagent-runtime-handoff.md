@@ -1,10 +1,15 @@
 # Subagent Runtime Development Handoff
 
-**Date:** 2026-08-09  
-**Repository:** `/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent`  
-**Active worktree:** `/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.worktrees/feat-subagent-core`  
-**Branch:** `feat/subagent-core`  
-**Implementation HEAD before this handoff:** `7e9950b`  
+**Date:** 2026-08-09
+
+**Repository:** `/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent`
+
+**Active worktree:** `/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.worktrees/feat-subagent-core`
+
+**Branch:** `feat/subagent-core`
+
+**Implementation HEAD before this handoff:** `7e9950b`
+
 **Status:** implementation in progress; do not merge to `main`
 
 ## 1. Objective
