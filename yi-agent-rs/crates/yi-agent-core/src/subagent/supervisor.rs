@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::task::{
-    AgentTask, CancelReason, PauseReason, RecoveryEvidence, RootSessionId, TaskEvent, TaskFailure,
-    TaskId, TaskState,
+    AgentTask, BlockReason, CancelReason, PauseReason, RecoveryEvidence, RootSessionId, TaskEvent,
+    TaskFailure, TaskId, TaskState,
 };
 use super::worker::{AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart};
 use crate::tool::{Tool, ToolRegistry, ToolResult};
@@ -99,6 +99,79 @@ impl AgentSupervisor {
             events: Vec::new(),
             updates,
         }
+    }
+
+    pub fn from_recovered_root(
+        root_session_id: RootSessionId,
+        root_task_id: TaskId,
+        attempt_id: super::task::AttemptId,
+        attempt_number: u32,
+    ) -> Self {
+        let root = AgentTask::recovered_root(
+            root_session_id,
+            root_task_id.clone(),
+            attempt_id,
+            attempt_number,
+        );
+        let mut tasks = HashMap::new();
+        tasks.insert(root_task_id.clone(), root);
+        let mut mailboxes = HashMap::new();
+        mailboxes.insert(root_task_id.clone(), Mailbox::default());
+        let mut objectives = HashMap::new();
+        objectives.insert(
+            root_task_id.clone(),
+            "Recover safely: inspect the recorded worktree before changes.".into(),
+        );
+        let (updates, _) = watch::channel(0_u64);
+        Self {
+            root_task_id,
+            tasks,
+            objectives,
+            children: HashMap::new(),
+            mailboxes,
+            workers: HashMap::new(),
+            worker_message_capabilities: HashMap::new(),
+            recovery_instructions: HashMap::new(),
+            pending_user_override_acks: Vec::new(),
+            events: Vec::new(),
+            updates,
+        }
+    }
+
+    pub fn insert_recovered_child(
+        &mut self,
+        task_id: TaskId,
+        parent_id: TaskId,
+        depth: super::task::TaskDepth,
+        attempt_id: super::task::AttemptId,
+        attempt_number: u32,
+    ) -> Result<(), String> {
+        if !self.tasks.contains_key(&parent_id) {
+            return Err("recovered child parent is missing".into());
+        }
+        if matches!(depth, super::task::TaskDepth::Root) {
+            return Err("recovered child has root depth".into());
+        }
+        let task = AgentTask::recovered_child(
+            self.tasks
+                .get(&parent_id)
+                .expect("recovered parent was checked")
+                .root_session_id
+                .clone(),
+            task_id.clone(),
+            parent_id.clone(),
+            depth,
+            attempt_id,
+            attempt_number,
+        );
+        self.tasks.insert(task_id.clone(), task);
+        self.mailboxes.insert(task_id.clone(), Mailbox::default());
+        self.objectives.insert(
+            task_id.clone(),
+            "Recover safely: inspect the recorded worktree before changes.".into(),
+        );
+        self.children.entry(parent_id).or_default().push(task_id);
+        Ok(())
     }
 
     pub fn root_task_id(&self) -> &TaskId {
@@ -309,6 +382,21 @@ impl AgentSupervisor {
                     .map_err(|error| error.to_string())?;
                 }
                 WorkerEvent::Failed(message) => self.fail_task(&task_id, message)?,
+                WorkerEvent::RecoveryConflict(message) => {
+                    let task = self
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("worker task was checked above");
+                    let attempt_id = task.active_attempt_id().clone();
+                    task.reduce(
+                        TaskEvent::RecoveryConflict {
+                            attempt_id,
+                            reason: BlockReason(format!("recovery_conflict: {message}")),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
                 WorkerEvent::Cancelled => {
                     self.cancel_task_tree(&task_id, false)?;
                 }

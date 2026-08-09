@@ -67,10 +67,54 @@ impl RuntimeCoordinator {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, RuntimeCoordinatorError> {
+        let repository = RuntimeRepository::open(database_path)?;
+        let recovered_tasks = repository.recovered_tasks()?;
+        let mut supervisors = HashMap::new();
+        for task in recovered_tasks {
+            if task.parent_id.is_none() {
+                supervisors.insert(
+                    task.session_id.clone(),
+                    Arc::new(AsyncMutex::new(AgentSupervisor::from_recovered_root(
+                        task.session_id,
+                        task.task_id,
+                        task.attempt_id,
+                        task.attempt_number,
+                    ))),
+                );
+            } else {
+                let depth = match task.depth {
+                    1 => yi_agent_core::TaskDepth::Child,
+                    2 => yi_agent_core::TaskDepth::Leaf,
+                    _ => {
+                        return Err(RuntimeCoordinatorError::Supervisor(
+                            "persisted recovered child has an invalid depth".into(),
+                        ));
+                    }
+                };
+                let supervisor = supervisors.get(&task.session_id).ok_or_else(|| {
+                    RuntimeCoordinatorError::Supervisor(
+                        "persisted recovered child has no recovered root".into(),
+                    )
+                })?;
+                supervisor
+                    .try_lock()
+                    .map_err(|_| {
+                        RuntimeCoordinatorError::Supervisor("recovery hydration is busy".into())
+                    })?
+                    .insert_recovered_child(
+                        task.task_id,
+                        task.parent_id.expect("child parent was checked"),
+                        depth,
+                        task.attempt_id,
+                        task.attempt_number,
+                    )
+                    .map_err(RuntimeCoordinatorError::Supervisor)?;
+            }
+        }
         Ok(Self {
-            repository: Mutex::new(RuntimeRepository::open(database_path)?),
+            repository: Mutex::new(repository),
             factory,
-            supervisors: Mutex::new(HashMap::new()),
+            supervisors: Mutex::new(supervisors),
             resident_tasks: Mutex::new(HashSet::new()),
             draining: AtomicBool::new(false),
         })
@@ -485,6 +529,7 @@ impl RuntimeCoordinator {
                     .clone();
                 let (state, event) = match state {
                     yi_agent_core::TaskState::Paused(_) => ("paused", RuntimeEvent::TaskPaused),
+                    yi_agent_core::TaskState::Blocked(_) => ("blocked", RuntimeEvent::TaskBlocked),
                     yi_agent_core::TaskState::Cancelled(_) => {
                         ("cancelled", RuntimeEvent::TaskCancelled)
                     }

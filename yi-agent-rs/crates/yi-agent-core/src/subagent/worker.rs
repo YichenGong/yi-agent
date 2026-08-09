@@ -132,6 +132,7 @@ pub enum WorkerEvent {
     Paused,
     Cancelled,
     Failed(String),
+    RecoveryConflict(String),
 }
 
 impl WorkerHandle {
@@ -183,6 +184,10 @@ impl WorkerHandle {
 
     pub fn report_failure(&self, message: impl Into<String>) {
         self.report(WorkerEvent::Failed(message.into()));
+    }
+
+    pub fn report_recovery_conflict(&self, message: impl Into<String>) {
+        self.report(WorkerEvent::RecoveryConflict(message.into()));
     }
 
     pub fn take_events(&self) -> Vec<WorkerEvent> {

@@ -426,6 +426,62 @@ impl AgentTask {
         }
     }
 
+    /// Reconstructs the minimum controller state required to explicitly
+    /// resume a recovered root task. The prior attempt stays durable in the
+    /// runtime store; this in-memory view begins at its recovery boundary.
+    pub fn recovered_root(
+        root_session_id: RootSessionId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+    ) -> Self {
+        let attempt = TaskAttempt {
+            id: attempt_id.clone(),
+            task_id: task_id.clone(),
+            number: attempt_number,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            checkpoint: None,
+            delivery: None,
+            budget: EffectiveBudget::default(),
+            usage: AttemptUsage::default(),
+            terminal_reason: Some(TerminalReason::RecoveryRequired(RecoveryEvidence(
+                "recovered after runtime restart".into(),
+            ))),
+        };
+        Self {
+            id: task_id,
+            root_session_id,
+            parent_id: None,
+            depth: TaskDepth::Root,
+            created_at: Utc::now(),
+            current_contract: ContractVersion::initial(),
+            authority_id: AuthorityId::new(),
+            active_attempt: attempt_id,
+            state: TaskState::RecoveryRequired(RecoveryEvidence(
+                "recovered after runtime restart".into(),
+            )),
+            pause_request: None,
+            delivery: DeliveryState::None,
+            workspace: None,
+            attempts: vec![attempt],
+        }
+    }
+
+    pub fn recovered_child(
+        root_session_id: RootSessionId,
+        task_id: TaskId,
+        parent_id: TaskId,
+        depth: TaskDepth,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+    ) -> Self {
+        let mut task = Self::recovered_root(root_session_id, task_id, attempt_id, attempt_number);
+        task.parent_id = Some(parent_id);
+        task.depth = depth;
+        task
+    }
+
     pub fn new_child(root_session_id: RootSessionId, parent_id: TaskId) -> Self {
         let mut task = Self::new_root(root_session_id);
         task.parent_id = Some(parent_id);
@@ -603,6 +659,10 @@ pub enum TaskEvent {
         attempt_id: AttemptId,
         evidence: RecoveryEvidence,
     },
+    RecoveryConflict {
+        attempt_id: AttemptId,
+        reason: BlockReason,
+    },
     RetryRequested {
         attempt_id: AttemptId,
     },
@@ -626,6 +686,7 @@ impl TaskEvent {
             | Self::PauseAcknowledged { attempt_id }
             | Self::ResumeRequested { attempt_id }
             | Self::RuntimeInterrupted { attempt_id, .. }
+            | Self::RecoveryConflict { attempt_id, .. }
             | Self::RetryRequested { attempt_id } => attempt_id,
         }
     }
@@ -835,6 +896,9 @@ pub fn reduce(
         }
         TaskEvent::RuntimeInterrupted { evidence, .. } => {
             transition(task, TaskState::RecoveryRequired(evidence), now)?
+        }
+        TaskEvent::RecoveryConflict { reason, .. } => {
+            transition(task, TaskState::Blocked(reason), now)?
         }
         TaskEvent::RetryRequested { .. } => {
             if !task.state().is_terminal() {

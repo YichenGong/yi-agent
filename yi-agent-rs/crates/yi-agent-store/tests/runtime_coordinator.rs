@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
+use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_store::repository::{RuntimeEvent, RuntimeRepository};
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
@@ -118,6 +119,94 @@ async fn runtime_persists_initial_attempts_for_root_and_child_workers() {
     let repository = RuntimeRepository::open(&database).unwrap();
     assert_eq!(repository.attempt_state(&root_attempt).unwrap(), "running");
     assert_eq!(repository.attempt_state(&child_attempt).unwrap(), "running");
+}
+
+#[tokio::test]
+async fn recovered_root_resumes_in_a_fresh_attempt_after_runtime_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    assert_eq!(coordinator.root_task_id(&session).unwrap(), task);
+
+    coordinator.resume_task(&session, &task).await.unwrap();
+    let starts = factory.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_ne!(starts[0].attempt_id, attempt);
+    assert!(
+        starts[0]
+            .recovery_instruction
+            .as_deref()
+            .unwrap()
+            .contains("git status")
+    );
+}
+
+#[tokio::test]
+async fn recovered_child_resumes_after_runtime_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let root = yi_agent_core::TaskId::new();
+    let root_attempt = yi_agent_core::AttemptId::new();
+    let child = yi_agent_core::TaskId::new();
+    let child_attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&root, &session, &root_attempt, 1, "running")
+        .unwrap();
+    repository
+        .create_child_task_with_attempt(&child, &session, &root, 1, &child_attempt, 1, "running")
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    coordinator.resume_task(&session, &child).await.unwrap();
+    assert_eq!(factory.starts.lock().unwrap()[0].task_id, child);
+}
+
+#[tokio::test]
+async fn unsafe_recovery_inspection_blocks_the_task_with_recovery_conflict() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let task = yi_agent_core::TaskId::new();
+    let attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    coordinator.resume_task(&session, &task).await.unwrap();
+    factory.handles.lock().unwrap()[0]
+        .report_recovery_conflict("dirty worktree cannot prove a safe base");
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert_eq!(coordinator.task_state(&task).unwrap(), "blocked");
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .event_records_after(0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == RuntimeEvent::TaskBlocked)
+    );
 }
 
 #[tokio::test]

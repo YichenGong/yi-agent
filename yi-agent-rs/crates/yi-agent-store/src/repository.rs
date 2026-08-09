@@ -30,6 +30,7 @@ pub enum RuntimeEvent {
     TaskCancelled,
     TaskPauseRequested,
     TaskPaused,
+    TaskBlocked,
     TaskFailed,
     TaskRecoveryRequired,
     MailboxMessageQueued,
@@ -46,6 +47,7 @@ impl RuntimeEvent {
             Self::TaskCancelled => "task_cancelled",
             Self::TaskPauseRequested => "task_pause_requested",
             Self::TaskPaused => "task_paused",
+            Self::TaskBlocked => "task_blocked",
             Self::TaskFailed => "task_failed",
             Self::TaskRecoveryRequired => "task_recovery_required",
             Self::MailboxMessageQueued => "mailbox_message_queued",
@@ -62,6 +64,7 @@ impl RuntimeEvent {
             "task_cancelled" => Ok(Self::TaskCancelled),
             "task_pause_requested" => Ok(Self::TaskPauseRequested),
             "task_paused" => Ok(Self::TaskPaused),
+            "task_blocked" => Ok(Self::TaskBlocked),
             "task_failed" => Ok(Self::TaskFailed),
             "task_recovery_required" => Ok(Self::TaskRecoveryRequired),
             "mailbox_message_queued" => Ok(Self::MailboxMessageQueued),
@@ -92,6 +95,16 @@ pub struct PersistedTaskDetail {
     pub depth: u8,
     pub state: String,
     pub delivery_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedRecoveredTask {
+    pub session_id: RootSessionId,
+    pub task_id: TaskId,
+    pub parent_id: Option<TaskId>,
+    pub depth: u8,
+    pub attempt_id: AttemptId,
+    pub attempt_number: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,6 +574,58 @@ impl RuntimeRepository {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn recovered_tasks(&self) -> Result<Vec<PersistedRecoveredTask>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth, attempts.id, attempts.number
+             FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
+             WHERE tasks.state_json = 'recovery_required'
+             ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, u8>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u32>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (session_id, task_id, parent_id, depth, attempt_id, attempt_number) = row?;
+                Ok(PersistedRecoveredTask {
+                    session_id: session_id.parse().map_err(|_| {
+                        RepositoryError::UnknownEventKind {
+                            kind: format!("invalid session ID in store: {session_id}"),
+                        }
+                    })?,
+                    task_id: task_id
+                        .parse()
+                        .map_err(|_| RepositoryError::UnknownEventKind {
+                            kind: format!("invalid task ID in store: {task_id}"),
+                        })?,
+                    parent_id: parent_id
+                        .map(|parent_id| {
+                            parent_id
+                                .parse()
+                                .map_err(|_| RepositoryError::UnknownEventKind {
+                                    kind: format!("invalid parent task ID in store: {parent_id}"),
+                                })
+                        })
+                        .transpose()?,
+                    depth,
+                    attempt_id: attempt_id.parse().map_err(|_| {
+                        RepositoryError::UnknownEventKind {
+                            kind: format!("invalid attempt ID in store: {attempt_id}"),
+                        }
+                    })?,
+                    attempt_number,
+                })
+            })
+            .collect()
     }
 
     pub fn task_detail(&self, task: &TaskId) -> Result<PersistedTaskDetail, RepositoryError> {
