@@ -1,9 +1,9 @@
 use chrono::{Duration, Utc};
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_store::schedule::{
-    MissedRunPolicy, OverlapPolicy, RuntimePolicy, RuntimePolicyLayer, SchedulePolicy,
-    SchedulePriority, WatchdogLimits, WatchdogObservation, WatchdogOutcome, WatchdogUsage,
-    evaluate_watchdog,
+    MissedRunPolicy, OverlapPolicy, RetryDecision, RetryFailure, RuntimePolicy, RuntimePolicyLayer,
+    SchedulePolicy, SchedulePriority, WatchdogLimits, WatchdogObservation, WatchdogOutcome,
+    WatchdogUsage, evaluate_retry, evaluate_watchdog,
 };
 
 #[test]
@@ -155,6 +155,58 @@ fn scheduled_policy_defaults_to_read_only_background_without_overlap_or_catch_up
     assert_eq!(policy.overlap_policy, OverlapPolicy::Skip);
     assert_eq!(policy.priority, SchedulePriority::Background);
     assert_eq!(policy.missed_run_policy, MissedRunPolicy::Skip);
+}
+
+#[test]
+fn retry_policy_only_retries_explicit_transient_failures_with_bounded_backoff() {
+    assert_eq!(
+        evaluate_retry(RetryFailure::ProviderNetwork, 0, 3, 137),
+        RetryDecision::RetryAfter(std::time::Duration::from_millis(1_137))
+    );
+    assert_eq!(
+        evaluate_retry(RetryFailure::ProviderRateLimited, 2, 3, 999),
+        RetryDecision::RetryAfter(std::time::Duration::from_millis(4_999))
+    );
+    assert_eq!(
+        evaluate_retry(RetryFailure::ProviderServer, 3, 3, 1),
+        RetryDecision::Failed
+    );
+    assert_eq!(
+        evaluate_retry(
+            RetryFailure::Tool {
+                explicitly_retryable: true,
+            },
+            1,
+            2,
+            0,
+        ),
+        RetryDecision::RetryAfter(std::time::Duration::from_secs(2))
+    );
+    assert_eq!(
+        evaluate_retry(
+            RetryFailure::Tool {
+                explicitly_retryable: false,
+            },
+            0,
+            2,
+            0,
+        ),
+        RetryDecision::Failed
+    );
+    for failure in [RetryFailure::GitConflict, RetryFailure::TestFailure] {
+        assert_eq!(evaluate_retry(failure, 0, 3, 0), RetryDecision::Failed);
+    }
+    for failure in [
+        RetryFailure::PermissionDenied,
+        RetryFailure::AuthorityDenied,
+        RetryFailure::ScopeAmbiguity,
+    ] {
+        assert_eq!(evaluate_retry(failure, 0, 3, 0), RetryDecision::Blocked);
+    }
+    assert_eq!(
+        evaluate_retry(RetryFailure::ProviderStream, 10, 20, 500),
+        RetryDecision::RetryAfter(std::time::Duration::from_secs(30))
+    );
 }
 
 #[test]

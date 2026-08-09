@@ -4,6 +4,63 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 
+/// A classified failure reaching the runtime retry boundary. Tool callers must
+/// explicitly mark a failure retryable; error text is never used as policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryFailure {
+    ProviderNetwork,
+    ProviderRateLimited,
+    ProviderServer,
+    ProviderStream,
+    Tool { explicitly_retryable: bool },
+    PermissionDenied,
+    GitConflict,
+    TestFailure,
+    AuthorityDenied,
+    ScopeAmbiguity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryDecision {
+    RetryAfter(std::time::Duration),
+    Blocked,
+    Failed,
+}
+
+/// Returns a deterministic bounded retry decision. `retries_used` counts
+/// prior automatic retries, while `jitter_millis` is supplied by the caller's
+/// random source so this policy remains testable and restart-safe.
+pub fn evaluate_retry(
+    failure: RetryFailure,
+    retries_used: u16,
+    retry_limit: u16,
+    jitter_millis: u16,
+) -> RetryDecision {
+    match failure {
+        RetryFailure::PermissionDenied
+        | RetryFailure::AuthorityDenied
+        | RetryFailure::ScopeAmbiguity => RetryDecision::Blocked,
+        RetryFailure::GitConflict | RetryFailure::TestFailure => RetryDecision::Failed,
+        RetryFailure::Tool {
+            explicitly_retryable: false,
+        } => RetryDecision::Failed,
+        RetryFailure::ProviderNetwork
+        | RetryFailure::ProviderRateLimited
+        | RetryFailure::ProviderServer
+        | RetryFailure::ProviderStream
+        | RetryFailure::Tool {
+            explicitly_retryable: true,
+        } if retries_used < retry_limit => {
+            let base_millis = 1_000_u64.saturating_mul(1_u64 << retries_used.min(5));
+            let capped_base_millis = base_millis.min(30_000);
+            let delay_millis = capped_base_millis
+                .saturating_add(u64::from(jitter_millis).min(30_000 - capped_base_millis));
+            RetryDecision::RetryAfter(std::time::Duration::from_millis(delay_millis))
+        }
+        _ => RetryDecision::Failed,
+    }
+}
+
 /// Immutable limits applied by the daemon to one attempt. Optional ceilings
 /// remain unbounded until configured by the user or a narrower project policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
