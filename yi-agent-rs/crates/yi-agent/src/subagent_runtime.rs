@@ -242,6 +242,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 u64::from(usage.output_tokens),
                                             );
                                         }
+                                        Some(AgentEvent::ToolRetry { .. }) => {
+                                            reporter.report_tool_retry();
+                                        }
                                         Some(AgentEvent::ToolResult { result, .. }) if !result.is_error => {
                                             // A successful tool result is external, durable progress;
                                             // generated text and streamed stdout are intentionally excluded.
@@ -862,7 +865,7 @@ mod tests {
             [yi_agent_core::ContentBlock::Text(text)] => text,
             content => panic!("expected a text-only resumed prompt, got {content:?}"),
         };
-        assert!(resumed_prompt.contains("Recover safely"));
+        assert!(resumed_prompt.contains("Root session objective not specified."));
         assert!(!resumed_prompt.contains("RECOVERY_CONTROLLER"));
     }
 

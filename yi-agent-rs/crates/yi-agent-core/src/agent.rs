@@ -166,6 +166,10 @@ pub enum AgentEvent {
         id: String,
         result: ToolResult,
     },
+    /// An explicitly retryable tool failed and is being retried internally.
+    ToolRetry {
+        id: String,
+    },
     ToolOutputDelta {
         id: String,
         stream: crate::tool::OutputStream,
@@ -224,6 +228,7 @@ const CONTINUE_AFTER_TRUNCATION: &str =
     "Continue the interrupted task from where you stopped. Do not repeat completed work.";
 const COMPLETION_AUDIT_PROMPT: &str =
     "Before you finish, verify the changed result using an appropriate read, diff, build, or test.";
+const DEFAULT_TOOL_RETRY_LIMIT: u16 = 2;
 
 #[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum AgentError {
@@ -818,7 +823,24 @@ async fn run_loop(
                         }
                     });
 
-                    let result = tool.call_stream(input.clone(), event_tx).await;
+                    let mut retries = 0;
+                    let result = loop {
+                        let result = tool.call_stream(input.clone(), event_tx.clone()).await;
+                        if !result.is_error
+                            || !tool.retryable()
+                            || retries >= DEFAULT_TOOL_RETRY_LIMIT
+                        {
+                            break result;
+                        }
+                        retries += 1;
+                        if tx
+                            .send(AgentEvent::ToolRetry { id: id.clone() })
+                            .await
+                            .is_err()
+                        {
+                            return (id.clone(), None);
+                        }
+                    };
 
                     info!(is_error = result.is_error, "tool call done");
 
@@ -1166,6 +1188,37 @@ mod tests {
         }
     }
 
+    struct FlakyRetryableTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for FlakyRetryableTool {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn description(&self) -> &str {
+            "Fails once before succeeding"
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> ToolResult {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ToolResult::error("temporary tool failure")
+            } else {
+                ToolResult::text("recovered")
+            }
+        }
+
+        fn retryable(&self) -> bool {
+            true
+        }
+    }
+
     fn collect_events(stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
         futures::executor::block_on_stream(stream).collect()
     }
@@ -1371,6 +1424,49 @@ mod tests {
             Some(AgentEvent::Done {
                 reason: DoneReason::EndTurn
             })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_retries_only_an_explicitly_retryable_tool_failure() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "flaky".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            }],
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(FlakyRetryableTool {
+            calls: Arc::clone(&calls),
+        }));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let events = collect_events(agent.run("run flaky tool".into()).await.unwrap());
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolRetry { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolResult { result, .. } if !result.is_error)
         ));
     }
 

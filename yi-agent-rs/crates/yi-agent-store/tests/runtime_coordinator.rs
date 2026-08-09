@@ -1529,6 +1529,7 @@ async fn coordinator_persists_worker_usage_and_meaningful_progress() {
 
     factory.handles.lock().unwrap()[0].report_provider_usage(11, 5);
     factory.handles.lock().unwrap()[0].report_provider_retry();
+    factory.handles.lock().unwrap()[0].report_tool_retry();
     factory.handles.lock().unwrap()[0].report_meaningful_progress();
     coordinator.reconcile_worker_events().await.unwrap();
 
@@ -1550,6 +1551,7 @@ async fn coordinator_persists_worker_usage_and_meaningful_progress() {
     assert_eq!(snapshot.observation.usage.turns, 1);
     assert_eq!(snapshot.observation.usage.tokens, 16);
     assert_eq!(snapshot.observation.usage.provider_retries, 1);
+    assert_eq!(snapshot.observation.usage.tool_retries, 1);
     assert!(snapshot.last_meaningful_event_id.is_some());
     assert!(
         RuntimeRepository::open(&database)

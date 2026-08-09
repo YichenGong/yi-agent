@@ -314,6 +314,9 @@ async fn drain_stream_human<W: std::io::Write, E: std::io::Write>(
                     result.is_error, result.content
                 );
             }
+            yi_agent_core::AgentEvent::ToolRetry { id } => {
+                let _ = writeln!(err, "[tool-retry:{id}]");
+            }
             yi_agent_core::AgentEvent::Done { reason } => match reason {
                 // Normal completion is already signaled by exit code 0; the
                 // [done:EndTurn] line is noise on stderr and is suppressed

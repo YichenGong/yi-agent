@@ -658,6 +658,7 @@ fn route_event(
         AgentEvent::ToolResult { id, result } => {
             registry.on_result(id, result.is_error);
         }
+        AgentEvent::ToolRetry { .. } => {}
         // Turn-end events finalize any still-running tasks. This is a
         // defense-in-depth cleanup: in the happy path each ToolCall gets a
         // matching ToolExit before Done arrives. But ToolExit can be missed

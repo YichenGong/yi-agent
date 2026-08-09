@@ -31,3 +31,4 @@
 - [ ] 手动启动的本地 daemon、SQLite 状态与 IPC 重连 — 验证：`cargo test -p yi-agent-store runtime::tests`
 - [ ] 定时任务与保守默认策略 — 验证：`cargo test -p yi-agent-store scheduler::tests`
 - [ ] CLI/TUI/Slash-command 任务树观察、帮助和人工干预 — 验证：`cargo test -p yi-agent --bin yi-agent subagent_`
+- [x] Worker retry watchdog 记账 — `WorkerWatchdogEvent::ToolRetry` 经 `RuntimeCoordinator::reconcile_worker_events` 持久化至 `WatchdogUsage::tool_retries`；验证：`cargo test -p yi-agent-store --test runtime_coordinator coordinator_persists_worker_usage_and_meaningful_progress`

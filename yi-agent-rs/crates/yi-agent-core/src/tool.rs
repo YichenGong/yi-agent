@@ -106,6 +106,12 @@ pub trait Tool: Send + Sync {
         ToolMetadata::default()
     }
 
+    /// Automatic retries are opt-in per tool. Runtime policy never infers
+    /// retryability from an error string or tool name.
+    fn retryable(&self) -> bool {
+        false
+    }
+
     /// Streaming variant. Default implementation just calls `call` with no stream events.
     /// Tools that produce incremental output should override this.
     async fn call_stream(

@@ -1023,20 +1023,23 @@ impl RuntimeCoordinator {
                 .lock()
                 .expect("runtime repository mutex poisoned");
             let attempt = repository.active_attempt_id(&task_id)?;
-            let (turn_delta, token_delta, provider_retry_delta, meaningful) = match update {
-                WorkerWatchdogEvent::ProviderUsage {
-                    input_tokens,
-                    output_tokens,
-                } => (1, input_tokens.saturating_add(output_tokens), 0, false),
-                WorkerWatchdogEvent::ProviderRetry => (0, 0, 1, false),
-                WorkerWatchdogEvent::MeaningfulProgress => (0, 0, 0, true),
-            };
+            let (turn_delta, token_delta, provider_retry_delta, tool_retry_delta, meaningful) =
+                match update {
+                    WorkerWatchdogEvent::ProviderUsage {
+                        input_tokens,
+                        output_tokens,
+                    } => (1, input_tokens.saturating_add(output_tokens), 0, 0, false),
+                    WorkerWatchdogEvent::ProviderRetry => (0, 0, 1, 0, false),
+                    WorkerWatchdogEvent::ToolRetry => (0, 0, 0, 1, false),
+                    WorkerWatchdogEvent::MeaningfulProgress => (0, 0, 0, 0, true),
+                };
             repository.record_watchdog_progress(
                 &task_id,
                 &attempt,
                 turn_delta,
                 token_delta,
                 provider_retry_delta,
+                tool_retry_delta,
                 meaningful,
                 Utc::now(),
             )?;

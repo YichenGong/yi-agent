@@ -30,5 +30,6 @@ yi-agent 的核心库，定义消息模型、工具系统、Provider 抽象和 A
 - [x] LLM 消息 tracing — `--debug` 时 `agent.rs` 打印 `think: request delta` / `think: response` debug 日志 — [设计](../plans/2026-07-25-trace-llm-content-design.md)
 - [x] auto-compact — `agent.rs::run_loop` 每轮 THINK 前用上次 `Usage.input_tokens` 检测,超 `compact_threshold` 调 `compact::compact_session` 压缩 session 并发 `AgentEvent::AutoCompacting` — [设计](../plans/2026-07-26-auto-compact-design.md) · 测试 `auto_compact_triggers_when_threshold_exceeded` 等 7 个
 - [x] Agent 完成语义与变更审计 — `agent.rs::DoneReason` 区分正常完成、截断和异常中断；`run_loop` 在变更型工具后要求一次 read/diff/build/test 审计；验证：`cargo test -p yi-agent-core --lib agent_`
+- [x] 显式可重试工具失败 — `tool.rs::Tool::retryable()` 默认关闭；`agent.rs` 仅对明确 opt-in 的工具最多重试两次并发出 `ToolRetry`；验证：`cargo test -p yi-agent-core --lib agent_retries_only_an_explicitly_retryable_tool_failure`
 - [ ] 图片工具（`ContentBlock::Image` 已留类型，无对应 Tool 实现）
 - [ ] 插件系统（`ToolSource::Plugin` 枚举已留，无加载机制）
