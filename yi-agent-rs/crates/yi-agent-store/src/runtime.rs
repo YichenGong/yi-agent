@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use yi_agent_core::subagent::scheduler::ResourceCoordinator;
 use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError, WaitMode, WaitOutcome};
-use yi_agent_core::subagent::task::{RootSessionId, TaskId};
+use yi_agent_core::subagent::task::{PauseReason, RootSessionId, TaskId};
 use yi_agent_core::subagent::worker::AgentWorkerFactory;
 
 use crate::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
@@ -237,6 +237,45 @@ impl RuntimeCoordinator {
                 .lock()
                 .expect("runtime resident task mutex poisoned")
                 .remove(&task);
+        }
+        Ok(())
+    }
+
+    pub async fn pause_task(
+        &self,
+        session: &RootSessionId,
+        task: &TaskId,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        supervisor
+            .lock()
+            .await
+            .pause_task(task, PauseReason("paused by user".into()))
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .transition_task(task, "paused", RuntimeEvent::TaskPaused)?;
+        Ok(())
+    }
+
+    pub async fn resume_task(
+        &self,
+        session: &RootSessionId,
+        task: &TaskId,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        supervisor
+            .lock()
+            .await
+            .resume_task(task)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .transition_task(task, "queued", RuntimeEvent::TaskQueued)?;
+        if self.factory.is_available() {
+            self.start_worker(session, task).await?;
         }
         Ok(())
     }
