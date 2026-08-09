@@ -8,7 +8,9 @@ use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
-use yi_agent_core::subagent::task::{PermissionRequestId, RootSessionId, TaskDepth, TaskState};
+use yi_agent_core::subagent::task::{
+    PauseReason, PermissionRequestId, RootSessionId, TaskDepth, TaskState,
+};
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{ContentBlock, ToolRegistry};
 
@@ -141,6 +143,30 @@ async fn supervisor_admission_starts_and_cancels_a_owned_worker() {
     let cancellation = supervisor.worker_cancellation(&child).unwrap();
     supervisor.cancel_worker(&child).unwrap();
     assert!(cancellation.is_cancelled());
+}
+
+#[tokio::test]
+async fn supervisor_pause_keeps_worker_alive_until_resume_releases_ownership() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let child = supervisor.spawn(supervisor.root_task_id().clone()).unwrap();
+    supervisor
+        .start_worker(&ImmediateWorkerFactory, &child)
+        .await
+        .unwrap();
+    let cancellation = supervisor.worker_cancellation(&child).unwrap();
+
+    supervisor
+        .pause_task(&child, PauseReason("user requested pause".into()))
+        .unwrap();
+    assert!(matches!(
+        supervisor.task(&child).unwrap().state(),
+        TaskState::Paused(_)
+    ));
+    assert!(!cancellation.is_cancelled());
+
+    supervisor.resume_task(&child).unwrap();
+    assert_eq!(supervisor.task(&child).unwrap().state(), &TaskState::Queued);
+    assert!(!supervisor.has_worker(&child));
 }
 
 #[tokio::test]
