@@ -23,6 +23,14 @@ pub enum LeaseMode {
     Exclusive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AdmissionPriority {
+    Background,
+    Normal,
+    High,
+    Critical,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRequest {
     pub scope: ResourceScope,
@@ -55,6 +63,7 @@ struct QueuedRequest {
     root_id: RootSessionId,
     task_id: TaskId,
     request: ResourceRequest,
+    priority: AdmissionPriority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -152,6 +161,16 @@ impl ResourceCoordinator {
     }
 
     pub fn enqueue(&mut self, root_id: RootSessionId, task_id: TaskId, request: ResourceRequest) {
+        self.enqueue_with_priority(root_id, task_id, request, AdmissionPriority::Normal);
+    }
+
+    pub fn enqueue_with_priority(
+        &mut self,
+        root_id: RootSessionId,
+        task_id: TaskId,
+        request: ResourceRequest,
+        priority: AdmissionPriority,
+    ) {
         self.queues
             .entry(request.key.clone())
             .or_default()
@@ -159,6 +178,7 @@ impl ResourceCoordinator {
                 root_id,
                 task_id,
                 request,
+                priority,
             });
     }
 
@@ -215,6 +235,7 @@ fn select_fair_request(
     last_root: Option<&RootSessionId>,
     available: u16,
 ) -> Option<usize> {
+    let highest_priority = queue.iter().map(|entry| entry.priority).max()?;
     let roots =
         queue
             .iter()
@@ -235,11 +256,11 @@ fn select_fair_request(
         .unwrap_or(0);
     for offset in 0..roots.len() {
         let root = &roots[(start + offset) % roots.len()];
-        if let Some((index, _)) = queue
-            .iter()
-            .enumerate()
-            .find(|(_, entry)| &entry.root_id == root && entry.request.units <= available)
-        {
+        if let Some((index, _)) = queue.iter().enumerate().find(|(_, entry)| {
+            &entry.root_id == root
+                && entry.priority == highest_priority
+                && entry.request.units <= available
+        }) {
             return Some(index);
         }
     }

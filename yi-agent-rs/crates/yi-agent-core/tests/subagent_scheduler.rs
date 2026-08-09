@@ -1,6 +1,7 @@
 use chrono::{Duration, Utc};
 use yi_agent_core::subagent::scheduler::{
-    AdmissionError, LeaseMode, ResourceCoordinator, ResourceRequest, ResourceScope,
+    AdmissionError, AdmissionPriority, LeaseMode, ResourceCoordinator, ResourceRequest,
+    ResourceScope,
 };
 
 #[test]
@@ -141,4 +142,24 @@ fn expired_resource_request_is_removed_before_grant() {
 
     assert!(coordinator.grant_next("resident:global").is_none());
     assert_eq!(coordinator.queued_request_count(), 0);
+}
+
+#[test]
+fn high_priority_request_precedes_a_normal_request() {
+    let mut coordinator = ResourceCoordinator::new();
+    coordinator.set_capacity("resident:global", 1);
+    let normal = TaskId::new();
+    let high = TaskId::new();
+    coordinator.enqueue(RootSessionId::new(), normal, request("resident:global"));
+    coordinator.enqueue_with_priority(
+        RootSessionId::new(),
+        high.clone(),
+        request("resident:global"),
+        AdmissionPriority::High,
+    );
+
+    assert_eq!(
+        coordinator.grant_next("resident:global").unwrap().task_id,
+        high
+    );
 }
