@@ -1,5 +1,7 @@
-use chrono::{Duration, Utc};
+use chrono::{Duration, Local, Utc};
+use tempfile::TempDir;
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
+use yi_agent_store::repository::RuntimeRepository;
 use yi_agent_store::schedule::{
     MissedRunPolicy, OverlapPolicy, RetryDecision, RetryFailure, RuntimePolicy, RuntimePolicyLayer,
     ScheduleDefinition, SchedulePolicy, SchedulePriority, WatchdogLimits, WatchdogObservation,
@@ -30,6 +32,37 @@ fn schedule_definition_embeds_conservative_defaults() {
     assert_eq!(definition.policy.priority, SchedulePriority::Background);
     assert_eq!(definition.policy.overlap_policy, OverlapPolicy::Skip);
     assert_eq!(definition.policy.missed_run_policy, MissedRunPolicy::Skip);
+}
+
+#[test]
+fn schedule_occurrence_claim_is_durable_and_idempotent() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let definition = ScheduleDefinition::new("0 9 * * 1-5", "inspect project tasks").unwrap();
+    let due_at = Local::now() + Duration::minutes(5);
+
+    let schedule = RuntimeRepository::open(&database)
+        .unwrap()
+        .create_schedule(&definition, due_at)
+        .unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .claim_schedule_occurrence(&schedule.id, due_at)
+            .unwrap()
+    );
+    assert!(
+        !RuntimeRepository::open(&database)
+            .unwrap()
+            .claim_schedule_occurrence(&schedule.id, due_at)
+            .unwrap()
+    );
+
+    let schedules = RuntimeRepository::open(&database)
+        .unwrap()
+        .schedules()
+        .unwrap();
+    assert_eq!(schedules, vec![schedule]);
 }
 
 #[test]

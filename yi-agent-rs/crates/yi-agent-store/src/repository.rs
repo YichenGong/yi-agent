@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,9 +10,9 @@ use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
-use crate::schedule::{WatchdogLimits, WatchdogObservation, WatchdogUsage};
+use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -133,6 +133,15 @@ pub struct PersistedWatchdogTask {
     pub task_id: TaskId,
     pub attempt_id: AttemptId,
     pub snapshot: PersistedAttemptWatchdog,
+}
+
+/// One validated schedule and its next locally evaluated occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSchedule {
+    pub id: String,
+    pub definition: ScheduleDefinition,
+    pub state: String,
+    pub next_run_at: DateTime<Local>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +268,79 @@ impl RuntimeRepository {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// Persists a validated schedule without coupling it to an interactive
+    /// session. Each later fire receives a new isolated root session.
+    pub fn create_schedule(
+        &mut self,
+        definition: &ScheduleDefinition,
+        next_run_at: DateTime<Local>,
+    ) -> Result<PersistedSchedule, RepositoryError> {
+        let schedule = PersistedSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            definition: definition.clone(),
+            state: "active".into(),
+            next_run_at,
+        };
+        self.connection.execute(
+            "INSERT INTO schedules (id, definition_json, state, next_run_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                schedule.id,
+                serde_json::to_string(&schedule.definition)?,
+                schedule.state,
+                schedule.next_run_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(schedule)
+    }
+
+    pub fn schedules(&self) -> Result<Vec<PersistedSchedule>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, definition_json, state, next_run_at
+             FROM schedules ORDER BY created_at, id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, definition_json, state, next_run_at) = row?;
+                let definition = serde_json::from_str(&definition_json)?;
+                let next_run_at = DateTime::parse_from_rfc3339(&next_run_at)
+                    .map_err(|error| RepositoryError::UnknownEventKind {
+                        kind: format!("invalid schedule next-run timestamp: {error}"),
+                    })?
+                    .with_timezone(&Local);
+                Ok(PersistedSchedule {
+                    id,
+                    definition,
+                    state,
+                    next_run_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Claims a due occurrence exactly once. A duplicate tick returns false.
+    pub fn claim_schedule_occurrence(
+        &mut self,
+        schedule_id: &str,
+        due_at: DateTime<Local>,
+    ) -> Result<bool, RepositoryError> {
+        let changed = self.connection.execute(
+            "INSERT INTO schedule_occurrences (schedule_id, due_at, outcome)
+             VALUES (?1, ?2, 'claimed')
+             ON CONFLICT(schedule_id, due_at) DO NOTHING",
+            params![schedule_id, due_at.to_rfc3339()],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn has_table(&self, table: &str) -> Result<bool, RepositoryError> {
@@ -2036,6 +2118,35 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             CREATE INDEX attempt_watchdogs_task_idx ON attempt_watchdogs(task_id);",
         )?;
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (4)", [])?;
+        transaction.commit()?;
+    }
+    if current_version < 5 {
+        let transaction = connection.unchecked_transaction()?;
+        // Schedules formerly referenced one session, but each fire now owns a
+        // new root. Rebuild the unused early table without that false link.
+        transaction.execute_batch(
+            "ALTER TABLE schedules RENAME TO schedules_legacy;
+             CREATE TABLE schedules (
+                id TEXT PRIMARY KEY,
+                definition_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                next_run_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             INSERT INTO schedules (id, definition_json, state, next_run_at, created_at)
+             SELECT id, definition_json, state, COALESCE(next_run_at, CURRENT_TIMESTAMP), created_at
+             FROM schedules_legacy;
+             DROP TABLE schedules_legacy;
+             CREATE TABLE schedule_occurrences (
+                schedule_id TEXT NOT NULL REFERENCES schedules(id),
+                due_at TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(schedule_id, due_at)
+             );
+             CREATE INDEX schedule_next_run_idx ON schedules(state, next_run_at);",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (5)", [])?;
         transaction.commit()?;
     }
     Ok(())

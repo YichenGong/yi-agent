@@ -3746,6 +3746,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "uuid",
  "yi-agent-core",
 ]
 
