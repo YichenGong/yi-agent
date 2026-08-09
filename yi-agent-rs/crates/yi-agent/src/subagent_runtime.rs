@@ -57,6 +57,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             }
             let reporter = handle.clone();
             let mut mailbox = handle.subscribe_messages();
+            let mut pause = handle.subscribe_pause();
             let mut worker_tools = (*tools).clone();
             worker_tools.register(Arc::new(DaemonSpawnAgentTool {
                 runtime_socket: runtime_socket.clone(),
@@ -96,6 +97,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                             let agent_cancellation = agent.cancel_token();
                             let mut stream = Box::pin(stream);
                             let mut cancellation_forwarded = false;
+                            let mut pause_forwarded = false;
                             let mut message_prompt = None;
                             loop {
                                 tokio::select! {
@@ -116,8 +118,16 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                         agent_cancellation.cancel();
                                         cancellation_forwarded = true;
                                     },
+                                    _ = pause.requested(), if !pause_forwarded => {
+                                        agent_cancellation.cancel();
+                                        pause_forwarded = true;
+                                    },
                                     event = stream.next() => match event {
                                         Some(AgentEvent::Done { .. }) | None => {
+                                            if pause_forwarded {
+                                                reporter.report_paused();
+                                                break 'run;
+                                            }
                                             if let Some(next_prompt) = message_prompt.take() {
                                                 prompt = next_prompt;
                                                 continue 'run;
@@ -126,6 +136,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             break 'run;
                                         }
                                         Some(AgentEvent::Cancelled) => {
+                                            if pause_forwarded {
+                                                reporter.report_paused();
+                                                break 'run;
+                                            }
                                             if let Some(next_prompt) = message_prompt.take() {
                                                 prompt = next_prompt;
                                                 continue 'run;
