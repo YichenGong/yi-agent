@@ -79,23 +79,47 @@ fn control_agent(action: AgentAction) -> Result<()> {
     let socket = runtime_directory()?.join("runtime.sock");
     let request = match action {
         AgentAction::Show { task_id } => yi_agent_store::ipc::IpcRequest::InspectTask { task_id },
-        AgentAction::Message { task_id, text, .. } => yi_agent_store::ipc::IpcRequest::SendUserMessage { task_id, message: text },
-        AgentAction::Cancel { task_id, recursive, yes } => {
-            if !yes { anyhow::bail!("cancel preview: task {task_id}; rerun with --yes to confirm") }
+        AgentAction::Message { task_id, text, .. } => {
+            yi_agent_store::ipc::IpcRequest::SendUserMessage {
+                task_id,
+                message: text,
+            }
+        }
+        AgentAction::Cancel {
+            task_id,
+            recursive,
+            yes,
+        } => {
+            if !yes {
+                anyhow::bail!("cancel preview: task {task_id}; rerun with --yes to confirm")
+            }
             let session_id = inspect_session(&socket, &task_id)?;
-            yi_agent_store::ipc::IpcRequest::CancelTask { session_id, task_id, recursive }
+            yi_agent_store::ipc::IpcRequest::CancelTask {
+                session_id,
+                task_id,
+                recursive,
+            }
         }
         AgentAction::Pause { task_id } => {
             let session_id = inspect_session(&socket, &task_id)?;
-            yi_agent_store::ipc::IpcRequest::PauseTask { session_id, task_id }
+            yi_agent_store::ipc::IpcRequest::PauseTask {
+                session_id,
+                task_id,
+            }
         }
         AgentAction::Resume { task_id } => {
             let session_id = inspect_session(&socket, &task_id)?;
-            yi_agent_store::ipc::IpcRequest::ResumeTask { session_id, task_id }
+            yi_agent_store::ipc::IpcRequest::ResumeTask {
+                session_id,
+                task_id,
+            }
         }
         AgentAction::Retry { task_id } => {
             let session_id = inspect_session(&socket, &task_id)?;
-            yi_agent_store::ipc::IpcRequest::RetryTask { session_id, task_id }
+            yi_agent_store::ipc::IpcRequest::RetryTask {
+                session_id,
+                task_id,
+            }
         }
         other => {
             anyhow::bail!("agent control `{other:?}` is not yet supported by this daemon version")
@@ -121,9 +145,16 @@ fn control_agent(action: AgentAction) -> Result<()> {
 }
 
 fn inspect_session(socket: &std::path::Path, task_id: &str) -> Result<String> {
-    match yi_agent_store::ipc::send_request(socket, yi_agent_store::ipc::IpcRequest::InspectTask { task_id: task_id.into() })? {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::InspectTask {
+            task_id: task_id.into(),
+        },
+    )? {
         yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => Ok(detail.session_id),
-        yi_agent_store::ipc::IpcResponse::Error { code } => anyhow::bail!("runtime daemon rejected request: {code}"),
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            anyhow::bail!("runtime daemon rejected request: {code}")
+        }
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
     }
 }
