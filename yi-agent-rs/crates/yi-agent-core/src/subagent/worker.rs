@@ -10,13 +10,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::ProviderTurnGate;
 
-use super::task::{AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId};
+use super::task::{AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId, WorkspaceLeaseId};
 
 #[derive(Debug, Clone)]
 pub struct WorkerStart {
     pub task_id: TaskId,
     pub attempt_id: AttemptId,
     pub root_session_id: RootSessionId,
+    /// Runtime-owned workspace identity required in a coding delivery report.
+    pub workspace_lease_id: Option<WorkspaceLeaseId>,
     pub cancellation: CancellationToken,
     /// Opaque daemon-issued capability required for worker IPC mutations.
     pub message_capability: String,
@@ -74,6 +76,7 @@ impl WorkerStart {
             task_id,
             attempt_id,
             root_session_id,
+            workspace_lease_id: None,
             cancellation: CancellationToken::new(),
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
@@ -86,6 +89,11 @@ impl WorkerStart {
         self
     }
 
+    pub fn with_workspace_lease(mut self, workspace_lease_id: WorkspaceLeaseId) -> Self {
+        self.workspace_lease_id = Some(workspace_lease_id);
+        self
+    }
+
     pub fn with_message_capability(mut self, capability: impl Into<String>) -> Self {
         self.message_capability = capability.into();
         self
@@ -94,6 +102,20 @@ impl WorkerStart {
     pub fn with_initial_user_messages(mut self, messages: Vec<WorkerMessage>) -> Self {
         self.initial_user_messages = messages;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subagent::task::WorkspaceLeaseId;
+
+    #[test]
+    fn worker_start_retains_the_task_workspace_lease() {
+        let workspace = WorkspaceLeaseId::new();
+        let start = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_workspace_lease(workspace.clone());
+        assert_eq!(start.workspace_lease_id, Some(workspace));
     }
 }
 

@@ -367,6 +367,11 @@ impl AgentSupervisor {
                 })
                 .collect(),
         );
+        let start = if let Some(workspace) = task.workspace.clone() {
+            start.with_workspace_lease(workspace)
+        } else {
+            start
+        };
         let message_capability = start.message_capability.clone();
         // Admission is visible before the application factory can create any
         // side effects. A factory failure is reduced to a terminal task state.
