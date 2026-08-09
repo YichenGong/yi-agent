@@ -155,7 +155,7 @@ fn scheduled_policy_defaults_to_read_only_background_without_overlap_or_catch_up
 }
 
 #[test]
-fn schedule_defaults_parse_and_only_narrow_user_selection_and_global_limits() {
+fn explicit_schedule_selection_is_only_narrowed_by_project_and_global_limits() {
     let user = RuntimePolicyLayer::from_toml(
         r#"
             [runtime]
@@ -201,6 +201,34 @@ fn schedule_defaults_parse_and_only_narrow_user_selection_and_global_limits() {
     assert_eq!(effective.runtime.max_resident_subagents, 5);
     assert_eq!(effective.runtime.max_turns, 32);
     assert_eq!(effective.runtime.max_wall_time_secs, 450);
+    assert!(!effective.runtime.read_only);
+    assert!(effective.runtime.allow_coding);
+    assert_eq!(effective.priority, SchedulePriority::Normal);
+    assert_eq!(effective.overlap_policy, OverlapPolicy::QueueOne);
+    assert_eq!(effective.missed_run_policy, MissedRunPolicy::CatchUpOnce);
+}
+
+#[test]
+fn schedule_defaults_seed_a_conservative_policy_without_an_explicit_selection() {
+    let user = RuntimePolicyLayer::from_toml(
+        r#"
+            [schedule_defaults]
+            max_resident_subagents = 3
+            max_turns = 20
+            max_wall_time_secs = 600
+            priority = "background"
+            read_only = true
+            overlap_policy = "skip"
+            missed_run_policy = "skip"
+        "#,
+    )
+    .unwrap();
+
+    let effective = user.default_schedule_policy_with(&RuntimePolicyLayer::default());
+
+    assert_eq!(effective.runtime.max_resident_subagents, 3);
+    assert_eq!(effective.runtime.max_turns, 20);
+    assert_eq!(effective.runtime.max_wall_time_secs, 600);
     assert!(effective.runtime.read_only);
     assert!(!effective.runtime.allow_coding);
     assert_eq!(effective.priority, SchedulePriority::Background);
@@ -249,4 +277,86 @@ fn schedule_policy_is_clamped_to_effective_global_runtime_limits() {
     assert_eq!(effective.runtime.max_resident_subagents, 8);
     assert_eq!(effective.runtime.max_turns, 40);
     assert_eq!(effective.runtime.max_wall_time_secs, 600);
+}
+
+#[test]
+fn explicit_user_schedule_selection_can_exceed_user_schedule_defaults() {
+    let user = RuntimePolicyLayer::from_toml(
+        r#"
+            [runtime]
+            max_resident_subagents = 8
+            [attempt_defaults]
+            max_turns = 100
+            max_wall_time_secs = 3600
+            [schedule_defaults]
+            max_resident_subagents = 4
+            max_turns = 30
+            max_wall_time_secs = 900
+        "#,
+    )
+    .unwrap();
+    let project = RuntimePolicyLayer::default();
+    let selection = SchedulePolicy {
+        runtime: RuntimePolicy {
+            max_resident_subagents: 6,
+            max_turns: 40,
+            max_wall_time_secs: 1200,
+            read_only: false,
+            allow_coding: true,
+        },
+        priority: SchedulePriority::Normal,
+        overlap_policy: OverlapPolicy::QueueOne,
+        missed_run_policy: MissedRunPolicy::CatchUpOnce,
+    };
+
+    let effective = user.effective_schedule_with(&project, &selection);
+
+    assert_eq!(effective.runtime.max_resident_subagents, 6);
+    assert_eq!(effective.runtime.max_turns, 40);
+    assert_eq!(effective.runtime.max_wall_time_secs, 1200);
+}
+
+#[test]
+fn schedule_selection_intersects_global_project_capabilities() {
+    let user = RuntimePolicyLayer::from_toml(
+        r#"
+            [runtime]
+            allow_coding = true
+        "#,
+    )
+    .unwrap();
+    let read_only_project = RuntimePolicyLayer::from_toml(
+        r#"
+            [runtime]
+            read_only = true
+        "#,
+    )
+    .unwrap();
+    let no_coding_project = RuntimePolicyLayer::from_toml(
+        r#"
+            [runtime]
+            allow_coding = false
+        "#,
+    )
+    .unwrap();
+    let selection = SchedulePolicy {
+        runtime: RuntimePolicy {
+            max_resident_subagents: 1,
+            max_turns: 1,
+            max_wall_time_secs: 1,
+            read_only: false,
+            allow_coding: true,
+        },
+        priority: SchedulePriority::Normal,
+        overlap_policy: OverlapPolicy::QueueOne,
+        missed_run_policy: MissedRunPolicy::CatchUpOnce,
+    };
+
+    let read_only = user.effective_schedule_with(&read_only_project, &selection);
+    assert!(read_only.runtime.read_only);
+    assert!(!read_only.runtime.allow_coding);
+
+    let no_coding = user.effective_schedule_with(&no_coding_project, &selection);
+    assert!(!no_coding.runtime.read_only);
+    assert!(!no_coding.runtime.allow_coding);
 }

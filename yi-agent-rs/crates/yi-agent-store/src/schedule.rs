@@ -192,11 +192,9 @@ impl RuntimePolicyLayer {
         selection: &SchedulePolicy,
     ) -> SchedulePolicy {
         let global = self.effective_with(project);
-        let user = &self.schedule_defaults;
         let project = &project.schedule_defaults;
-        let read_only = selection.runtime.read_only
-            || user.read_only.unwrap_or(false)
-            || project.read_only.unwrap_or(false);
+        let read_only =
+            global.read_only || selection.runtime.read_only || project.read_only.unwrap_or(false);
 
         SchedulePolicy {
             runtime: RuntimePolicy {
@@ -204,43 +202,65 @@ impl RuntimePolicyLayer {
                     .runtime
                     .max_resident_subagents
                     .min(global.max_resident_subagents)
-                    .min(user.max_resident_subagents.unwrap_or(u16::MAX))
                     .min(project.max_resident_subagents.unwrap_or(u16::MAX)),
                 max_turns: selection
                     .runtime
                     .max_turns
                     .min(global.max_turns)
-                    .min(user.max_turns.unwrap_or(u32::MAX))
                     .min(project.max_turns.unwrap_or(u32::MAX)),
                 max_wall_time_secs: selection
                     .runtime
                     .max_wall_time_secs
                     .min(global.max_wall_time_secs)
-                    .min(user.max_wall_time_secs.unwrap_or(u64::MAX))
                     .min(project.max_wall_time_secs.unwrap_or(u64::MAX)),
                 read_only,
-                allow_coding: selection.runtime.allow_coding && !read_only,
+                allow_coding: global.allow_coding && selection.runtime.allow_coding && !read_only,
             },
             priority: selection
                 .priority
-                .min(user.priority.unwrap_or(SchedulePriority::Critical))
                 .min(project.priority.unwrap_or(SchedulePriority::Critical)),
             overlap_policy: selection
                 .overlap_policy
-                .min(user.overlap_policy.unwrap_or(OverlapPolicy::QueueOne))
                 .min(project.overlap_policy.unwrap_or(OverlapPolicy::QueueOne)),
-            missed_run_policy: selection
-                .missed_run_policy
-                .min(
-                    user.missed_run_policy
-                        .unwrap_or(MissedRunPolicy::CatchUpOnce),
-                )
-                .min(
-                    project
-                        .missed_run_policy
-                        .unwrap_or(MissedRunPolicy::CatchUpOnce),
-                ),
+            missed_run_policy: selection.missed_run_policy.min(
+                project
+                    .missed_run_policy
+                    .unwrap_or(MissedRunPolicy::CatchUpOnce),
+            ),
         }
+    }
+
+    /// Builds the policy for a schedule without an explicit root selection.
+    /// User schedule defaults seed that selection; project settings then only
+    /// narrow it through the normal effective-policy path.
+    pub fn default_schedule_policy_with(&self, project: &Self) -> SchedulePolicy {
+        let defaults = &self.schedule_defaults;
+        let mut policy = SchedulePolicy::default();
+        if let Some(value) = defaults.max_resident_subagents {
+            policy.runtime.max_resident_subagents = value;
+        }
+        if let Some(value) = defaults.max_turns {
+            policy.runtime.max_turns = value;
+        }
+        if let Some(value) = defaults.max_wall_time_secs {
+            policy.runtime.max_wall_time_secs = value;
+        }
+        if let Some(value) = defaults.priority {
+            policy.priority = value;
+        }
+        if let Some(value) = defaults.read_only {
+            policy.runtime.read_only = value;
+            if value {
+                policy.runtime.allow_coding = false;
+            }
+        }
+        if let Some(value) = defaults.overlap_policy {
+            policy.overlap_policy = value;
+        }
+        if let Some(value) = defaults.missed_run_policy {
+            policy.missed_run_policy = value;
+        }
+        self.effective_schedule_with(project, &policy)
     }
 }
 
