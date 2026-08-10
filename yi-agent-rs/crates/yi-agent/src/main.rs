@@ -563,38 +563,31 @@ fn detach_tui_runtime_root(
     }
 }
 
+fn load_permission_checker_for_workdir(
+    workdir: std::path::PathBuf,
+    config: &config::Config,
+) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let permissions = rt
+        .block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
+        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?;
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
+    Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
+        permissions,
+        config.yolo,
+        workdir,
+        blocklist_fn,
+    )))
+}
+
 fn run_agent(cli: Cli) -> Result<()> {
     let config = config::load(&cli)?;
 
-    let tui_runtime = attach_tui_runtime(&cli, &config)?;
-    if tui_runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.embedded_daemon.is_some())
-    {
-        tracing::info!("embedded subagent runtime started for TUI");
-    }
-    let agent_workdir = tui_runtime
-        .as_ref()
-        .map(|runtime| runtime.attached_root.workspace.path.clone())
-        .unwrap_or_else(|| config.workdir.clone());
+    let agent_workdir = config.workdir.clone();
 
-    // Load permissions and construct checker for the actual tool workspace.
-    let yolo = config.yolo;
-    let permissions = {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(yi_agent_core::permission::PermissionChecker::load(
-            &agent_workdir,
-        ))
-        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
-    };
-    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
-        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
-    let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
-        permissions,
-        yolo,
-        agent_workdir.clone(),
-        blocklist_fn,
-    ));
+    // Load permissions and construct checker for the initial project workspace.
+    let checker = load_permission_checker_for_workdir(agent_workdir.clone(), &config)?;
     let (decision_tx, decision_rx) =
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
 
@@ -636,29 +629,13 @@ fn run_agent(cli: Cli) -> Result<()> {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
-    let registry = if let Some(runtime) = &tui_runtime {
-        build_tui_root_tools(
-            &registry,
-            &config,
-            runtime.socket_path.clone(),
-            &runtime.attached_root,
-        )
-    } else {
-        let mut registry = registry;
-        yi_agent_tools::register_builtin_tools_with_sandbox(
-            &mut registry,
-            config.workdir.clone(),
-            config.sandbox,
-            config.sandbox_writable_roots.clone(),
-        );
-        registry
-    };
-    let runtime_socket = tui_runtime
-        .as_ref()
-        .map(|runtime| runtime.socket_path.clone());
-    let attached_root = tui_runtime
-        .as_ref()
-        .map(|runtime| runtime.attached_root.clone());
+    let base_registry = registry.clone();
+    yi_agent_tools::register_builtin_tools_with_sandbox(
+        &mut registry,
+        config.workdir.clone(),
+        config.sandbox,
+        config.sandbox_writable_roots.clone(),
+    );
 
     let tools = Arc::new(registry);
 
@@ -679,8 +656,9 @@ fn run_agent(cli: Cli) -> Result<()> {
         checker,
         decision_tx,
         decision_rx,
-        runtime_socket,
-        attached_root,
+        cli,
+        config,
+        base_registry,
     )
 }
 
@@ -954,8 +932,9 @@ fn run_tui_agent(
     checker: Arc<yi_agent_core::permission::PermissionChecker>,
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     decision_rx: tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
-    runtime_socket: Option<std::path::PathBuf>,
-    attached_root: Option<crate::tui::subagents::AttachedRoot>,
+    cli: Cli,
+    config: config::Config,
+    base_registry: yi_agent_core::ToolRegistry,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -968,52 +947,64 @@ fn run_tui_agent(
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(8);
+        let (runtime_choice_tx, mut runtime_choice_rx) =
+            mpsc::channel::<crate::tui::subagents::RuntimeStartupChoice>(1);
+        let runtime_detach = Arc::new(std::sync::Mutex::new(None::<(
+            std::path::PathBuf,
+            crate::tui::subagents::AttachedRoot,
+        )>));
         let is_running = Arc::new(AtomicBool::new(false));
+
+        enum DriverInput {
+            Prompt(Option<String>),
+            Control(Option<ControlCommand>),
+            RuntimeChoice(Option<crate::tui::subagents::RuntimeStartupChoice>),
+        }
 
         // Spawn agent driver task (stays on the async runtime)
         let provider_clone = Arc::clone(&provider);
-        let tools_clone = Arc::clone(&tools);
+        let mut current_tools = Arc::clone(&tools);
+        let mut current_checker = Arc::clone(&checker);
         let config_clone = agent_config.clone();
         let is_running_clone = Arc::clone(&is_running);
-        let checker_clone = Arc::clone(&checker);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
-        // Keep extra clones for agent rebuild on /clear and /compact.
         let rebuild_provider = Arc::clone(&provider);
-        let rebuild_tools = Arc::clone(&tools);
         let rebuild_config = agent_config.clone();
-        let rebuild_checker = Arc::clone(&checker);
         let rebuild_decision_rx = Arc::clone(&decision_rx);
-        let runtime_socket_for_driver = runtime_socket.clone();
-        let attached_root_for_driver = attached_root.clone();
+        let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
-            let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone)
-                .with_permission(checker_clone, decision_rx);
+            let mut current_runtime: Option<TuiRuntimeSession> = None;
+            let mut agent = yi_agent_core::Agent::new(
+                Arc::clone(&provider_clone),
+                Arc::clone(&current_tools),
+                config_clone,
+            )
+            .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx));
             let _ = workdir; // workdir already passed to tools registration
 
             loop {
-                // Wait for user input or a control command. Control commands
-                // take priority (biased) so /clear and /compact are handled
-                // even if a prompt is also pending.
-                let (prompt_text, control_cmd) = tokio::select! {
+                // Wait for user input, runtime startup choice, or a control command.
+                let input = tokio::select! {
                     biased;
-                    cmd = control_rx.recv() => (None, cmd),
-                    text = input_rx.recv() => (text, None),
+                    cmd = control_rx.recv() => DriverInput::Control(cmd),
+                    choice = runtime_choice_rx.recv() => DriverInput::RuntimeChoice(choice),
+                    text = input_rx.recv() => DriverInput::Prompt(text),
                 };
 
                 // Handle control commands first (rebuild agent, no prompt run).
-                if let Some(cmd) = control_cmd {
+                if let DriverInput::Control(Some(cmd)) = input {
                     match cmd {
                         ControlCommand::Clear => {
                             // Rebuild agent with empty session.
                             agent = yi_agent_core::Agent::new(
                                 Arc::clone(&rebuild_provider),
-                                Arc::clone(&rebuild_tools),
+                                Arc::clone(&current_tools),
                                 rebuild_config.clone(),
                             )
                             .with_session(yi_agent_core::Session::new())
                             .with_permission(
-                                Arc::clone(&rebuild_checker),
+                                Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                             );
                             tracing::info!("agent session cleared via /clear");
@@ -1032,12 +1023,12 @@ fn run_tui_agent(
                                 Ok(new_session) => {
                                     agent = yi_agent_core::Agent::new(
                                         Arc::clone(&rebuild_provider),
-                                        Arc::clone(&rebuild_tools),
+                                        Arc::clone(&current_tools),
                                         rebuild_config.clone(),
                                     )
                                     .with_session(new_session)
                                     .with_permission(
-                                        Arc::clone(&rebuild_checker),
+                                        Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                     );
                                     tracing::info!("agent session compacted via /compact");
@@ -1053,8 +1044,80 @@ fn run_tui_agent(
                     continue;
                 }
 
-                // Otherwise, a prompt arrived (or both channels closed).
-                let Some(text) = prompt_text else {
+                if let DriverInput::RuntimeChoice(choice) = input {
+                    match choice {
+                        Some(crate::tui::subagents::RuntimeStartupChoice::Start) => {
+                            match attach_tui_runtime(&cli, &config) {
+                                Ok(Some(runtime)) => {
+                                    if runtime.embedded_daemon.is_some() {
+                                        tracing::info!("embedded subagent runtime started for TUI");
+                                    }
+                                    let runtime_workdir = runtime.attached_root.workspace.path.clone();
+                                    let next_tools = Arc::new(build_tui_root_tools(
+                                        &base_registry,
+                                        &config,
+                                        runtime.socket_path.clone(),
+                                        &runtime.attached_root,
+                                    ));
+                                    match load_permission_checker_for_workdir(runtime_workdir, &config) {
+                                        Ok(next_checker) => {
+                                            let session = agent.session();
+                                            current_tools = next_tools;
+                                            current_checker = next_checker;
+                                            agent = yi_agent_core::Agent::new(
+                                                Arc::clone(&rebuild_provider),
+                                                Arc::clone(&current_tools),
+                                                rebuild_config.clone(),
+                                            )
+                                            .with_session(session)
+                                            .with_permission(
+                                                Arc::clone(&current_checker),
+                                                Arc::clone(&rebuild_decision_rx),
+                                            );
+                                            *runtime_detach_for_driver
+                                                .lock()
+                                                .expect("runtime detach mutex poisoned") = Some((
+                                                runtime.socket_path.clone(),
+                                                runtime.attached_root.clone(),
+                                            ));
+                                            current_runtime = Some(runtime);
+                                            root_activated = false;
+                                        }
+                                        Err(error) => {
+                                            let _ = agent_tx
+                                                .send(yi_agent_core::AgentEvent::Error(
+                                                    yi_agent_core::AgentError::ProviderTurnAdmission(
+                                                        error.to_string(),
+                                                    ),
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::warn!("subagent runtime unavailable; continuing without delegation");
+                                }
+                                Err(error) => {
+                                    let _ = agent_tx
+                                        .send(yi_agent_core::AgentEvent::Error(
+                                            yi_agent_core::AgentError::ProviderTurnAdmission(
+                                                error.to_string(),
+                                            ),
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                        Some(crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation) => {
+                            tracing::info!("TUI subagent runtime disabled by user choice");
+                        }
+                        None => break,
+                    }
+                    continue;
+                }
+
+                // Otherwise, a prompt arrived (or all channels closed).
+                let DriverInput::Prompt(Some(text)) = input else {
                     break;
                 };
 
@@ -1062,11 +1125,12 @@ fn run_tui_agent(
                 let _ = interrupt_rx.try_recv();
 
                 if !root_activated {
-                    if let (Some(socket), Some(root)) = (
-                        runtime_socket_for_driver.as_ref(),
-                        attached_root_for_driver.as_ref(),
-                    ) {
-                        if let Err(error) = activate_tui_runtime_root(socket, root, &text) {
+                    if let Some(runtime) = current_runtime.as_ref() {
+                        if let Err(error) = activate_tui_runtime_root(
+                            &runtime.socket_path,
+                            &runtime.attached_root,
+                            &text,
+                        ) {
                             let _ = agent_tx
                                 .send(yi_agent_core::AgentEvent::Error(
                                     yi_agent_core::AgentError::ProviderTurnAdmission(
@@ -1116,6 +1180,15 @@ fn run_tui_agent(
                 }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
             }
+            if current_runtime.is_some() {
+                if let Some((socket, root)) = runtime_detach_for_driver
+                    .lock()
+                    .expect("runtime detach mutex poisoned")
+                    .take()
+                {
+                    detach_tui_runtime_root(&socket, &root);
+                }
+            }
         });
 
         // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)
@@ -1128,6 +1201,11 @@ fn run_tui_agent(
                 decision_tx,
                 is_running,
                 agent_config.model.clone(),
+                Some(crate::tui::subagents::RuntimeStartPrompt {
+                    title: "启动本地 Agent Runtime?".into(),
+                    body: "启动后可以直接用自然语言创建和管理子 Agent。按 y 启动，按 n 跳过。".into(),
+                }),
+                Some(runtime_choice_tx),
             )
         });
 
@@ -1137,8 +1215,12 @@ fn run_tui_agent(
             Err(e) => Err(anyhow::Error::from(e)),
         };
 
-        if let (Some(socket), Some(root)) = (runtime_socket.as_ref(), attached_root.as_ref()) {
-            detach_tui_runtime_root(socket, root);
+        if let Some((socket, root)) = runtime_detach
+            .lock()
+            .expect("runtime detach mutex poisoned")
+            .take()
+        {
+            detach_tui_runtime_root(&socket, &root);
         }
 
         // TUI exited; abort the driver task to clean up

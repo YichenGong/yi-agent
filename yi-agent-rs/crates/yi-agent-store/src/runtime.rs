@@ -113,6 +113,7 @@ pub struct RuntimeCoordinator {
     provider_turn_admissions: Option<Arc<ProviderTurnAdmissions>>,
     provider_profile_id: Option<String>,
     recovery_contexts: Mutex<HashMap<TaskId, RecoveryContext>>,
+    application_root_attach_lock: Mutex<()>,
     draining: AtomicBool,
 }
 
@@ -519,6 +520,7 @@ impl RuntimeCoordinator {
             provider_turn_admissions,
             provider_profile_id,
             recovery_contexts: Mutex::new(recovery_contexts),
+            application_root_attach_lock: Mutex::new(()),
             draining: AtomicBool::new(false),
         })
     }
@@ -564,6 +566,10 @@ impl RuntimeCoordinator {
         &self,
         idempotency_key: &str,
     ) -> Result<AttachedApplicationRoot, RuntimeCoordinatorError> {
+        let _attach_guard = self
+            .application_root_attach_lock
+            .lock()
+            .expect("runtime application root attach mutex poisoned");
         self.ensure_admitting()?;
         if idempotency_key.trim().is_empty() {
             return Err(RuntimeCoordinatorError::Supervisor(
@@ -579,6 +585,13 @@ impl RuntimeCoordinator {
                 .application_root_attachment(idempotency_key)?
         };
         if let Some(existing) = existing {
+            if existing.state == "detached" {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .reattach_application_root(idempotency_key)?;
+            }
+            self.ensure_application_root_supervisor(&existing)?;
             let workspace = {
                 self.repository
                     .lock()
@@ -627,6 +640,71 @@ impl RuntimeCoordinator {
         })
     }
 
+    fn ensure_application_root_supervisor(
+        &self,
+        attachment: &crate::repository::ApplicationRootAttachment,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .contains_key(&attachment.root_session_id)
+        {
+            return Ok(());
+        }
+        let tasks = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .application_root_hydration_tasks(&attachment.root_session_id)?;
+        if tasks.is_empty() {
+            return Err(RuntimeCoordinatorError::SessionNotFound(
+                attachment.root_session_id.clone(),
+            ));
+        }
+        let mut hydrated_supervisor = None;
+        for task in tasks {
+            let depth = persisted_depth(task.depth)?;
+            let (state, delivery, objective) =
+                hydrated_application_root_state(&task.state, &task.delivery_json)?;
+            let hydrated = AgentTask::hydrated_review_task(
+                task.session_id.clone(),
+                task.task_id.clone(),
+                task.parent_id.clone(),
+                depth,
+                task.attempt_id.clone(),
+                task.attempt_number,
+                state,
+                delivery,
+            );
+            if task.parent_id.is_none() {
+                hydrated_supervisor = Some(AgentSupervisor::from_hydrated_review_root(
+                    hydrated, objective,
+                ));
+            } else {
+                let supervisor = hydrated_supervisor.as_mut().ok_or_else(|| {
+                    RuntimeCoordinatorError::Supervisor(
+                        "application root child has no hydrated root".into(),
+                    )
+                })?;
+                supervisor
+                    .insert_hydrated_review_child(hydrated, objective)
+                    .map_err(RuntimeCoordinatorError::Supervisor)?;
+            }
+        }
+        let supervisor = hydrated_supervisor.ok_or_else(|| {
+            RuntimeCoordinatorError::Supervisor("application root hydration found no root".into())
+        })?;
+        self.supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .insert(
+                attachment.root_session_id.clone(),
+                Arc::new(AsyncMutex::new(supervisor)),
+            );
+        Ok(())
+    }
+
     fn authorize_application_root(
         &self,
         session: &RootSessionId,
@@ -655,6 +733,14 @@ impl RuntimeCoordinator {
         objective: String,
     ) -> Result<(), RuntimeCoordinatorError> {
         self.authorize_application_root(session, root_task, capability)?;
+        let current_state = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_state(root_task)?;
+        if current_state == "running" {
+            return Ok(());
+        }
         {
             let supervisor = self.supervisor(session)?;
             let mut supervisor = supervisor.lock().await;
@@ -1901,6 +1987,34 @@ impl RuntimeCoordinator {
         Ok((session, parent, delivery))
     }
 
+    pub async fn send_application_message(
+        &self,
+        session: &RootSessionId,
+        sender: &TaskId,
+        capability: &str,
+        recipient: TaskId,
+        message: String,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if message.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "message must be non-empty".into(),
+            ));
+        }
+        self.authorize_application_root(session, sender, capability)?;
+        let supervisor = self.supervisor(session)?;
+        let mut supervisor = supervisor.lock().await;
+        // Reuse supervisor adjacency and terminal-state checks without requiring
+        // the daemon-worker-only message capability map.
+        supervisor
+            .send_user_message(sender, recipient.clone(), message.clone())
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_user_message(sender, &recipient, &message)?;
+        Ok(())
+    }
+
     /// Routes external task messages through the owning supervisor before
     /// recording an auditable mailbox row and runtime event.
     pub async fn send_message(
@@ -2375,6 +2489,77 @@ fn persisted_depth(depth: u8) -> Result<yi_agent_core::TaskDepth, RuntimeCoordin
             "persisted review task has an invalid depth".into(),
         )),
     }
+}
+
+fn hydrated_application_root_state(
+    state: &str,
+    delivery_json: &str,
+) -> Result<(TaskState, Option<DeliveryReport>, String), RuntimeCoordinatorError> {
+    let payload =
+        serde_json::from_str::<serde_json::Value>(delivery_json).map_err(RepositoryError::from)?;
+    let objective = payload
+        .get("objective")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Continue the foreground TUI root safely.")
+        .to_owned();
+    let (state, delivery) = match state {
+        "queued"
+        | "running"
+        | "waiting_for_resource"
+        | "waiting_for_permission"
+        | "waiting_for_children" => (TaskState::Queued, None),
+        "paused" => (
+            TaskState::Paused(PauseReason("persisted application root pause".into())),
+            None,
+        ),
+        "awaiting_parent_review" => {
+            let delivery: DeliveryReport =
+                serde_json::from_value(payload).map_err(RepositoryError::from)?;
+            (
+                TaskState::AwaitingParentReview(delivery.id.clone()),
+                Some(delivery),
+            )
+        }
+        "completed" => (TaskState::Completed, None),
+        "completed_no_changes" => (TaskState::CompletedNoChanges, None),
+        "blocked" => (
+            TaskState::Blocked(BlockReason("persisted application root block".into())),
+            None,
+        ),
+        "stalled" => (
+            TaskState::Stalled(CoreWatchdogEvidence {
+                last_meaningful_event_id: None,
+                last_meaningful_at: Utc::now(),
+                elapsed_secs: 0,
+                current_wait: None,
+            }),
+            None,
+        ),
+        "timed_out" => (TaskState::TimedOut(TimeoutKind::WallClock), None),
+        "budget_exhausted" => (TaskState::BudgetExhausted(BudgetKind::WallTime), None),
+        "failed" => (
+            TaskState::Failed(TaskFailure::new("persisted application root failure")),
+            None,
+        ),
+        "cancelled" => (
+            TaskState::Cancelled(CancelReason(
+                "persisted application root cancellation".into(),
+            )),
+            None,
+        ),
+        "recovery_required" | "recovery_gated" | "recovery_attested" => (
+            TaskState::RecoveryRequired(RecoveryEvidence(
+                "persisted application root requires recovery".into(),
+            )),
+            None,
+        ),
+        other => {
+            return Err(RuntimeCoordinatorError::Supervisor(format!(
+                "persisted application root has unsupported state: {other}"
+            )));
+        }
+    };
+    Ok((state, delivery, objective))
 }
 
 fn hydrated_review_state(

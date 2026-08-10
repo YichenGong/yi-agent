@@ -2888,6 +2888,24 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    pub fn reattach_application_root(
+        &mut self,
+        idempotency_key: &str,
+    ) -> Result<(), RepositoryError> {
+        let changed = self.connection.execute(
+            "UPDATE application_root_attachments
+             SET state = 'attached', detached_at = NULL
+             WHERE idempotency_key = ?1 AND state = 'detached'",
+            params![idempotency_key],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: idempotency_key.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn detach_application_root(
         &mut self,
         root_session_id: &RootSessionId,
@@ -3406,6 +3424,74 @@ impl RuntimeRepository {
                         .parse()
                         .map_err(|_| RepositoryError::UnknownEventKind {
                             kind: format!("invalid review attempt ID in store: {attempt}"),
+                        })?,
+                    attempt_number: number,
+                    state,
+                    delivery_json,
+                })
+            })
+            .collect()
+    }
+
+    pub fn application_root_hydration_tasks(
+        &self,
+        root_session_id: &RootSessionId,
+    ) -> Result<Vec<PersistedReviewHydrationTask>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth,
+                    tasks.active_attempt_id, attempts.number, tasks.state_json,
+                    tasks.delivery_json
+             FROM tasks
+             JOIN attempts ON attempts.id = tasks.active_attempt_id
+             WHERE tasks.root_session_id = ?1
+             ORDER BY tasks.depth, tasks.created_at, tasks.id",
+        )?;
+        statement
+            .query_map(params![root_session_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, u8>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u32>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (session, task, parent, depth, attempt, number, state, delivery_json) = row?;
+                Ok(PersistedReviewHydrationTask {
+                    session_id: session
+                        .parse()
+                        .map_err(|_| RepositoryError::UnknownEventKind {
+                            kind: format!(
+                                "invalid application root session ID in store: {session}"
+                            ),
+                        })?,
+                    task_id: task
+                        .parse()
+                        .map_err(|_| RepositoryError::UnknownEventKind {
+                            kind: format!("invalid application root task ID in store: {task}"),
+                        })?,
+                    parent_id: parent
+                        .map(|value| {
+                            value
+                                .parse()
+                                .map_err(|_| RepositoryError::UnknownEventKind {
+                                    kind: format!(
+                                        "invalid application root parent ID in store: {value}"
+                                    ),
+                                })
+                        })
+                        .transpose()?,
+                    depth,
+                    attempt_id: attempt
+                        .parse()
+                        .map_err(|_| RepositoryError::UnknownEventKind {
+                            kind: format!(
+                                "invalid application root attempt ID in store: {attempt}"
+                            ),
                         })?,
                     attempt_number: number,
                     state,

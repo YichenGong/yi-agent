@@ -621,11 +621,69 @@ fn validate_recovery_context(
     })
 }
 
+struct DaemonApplicationSendMessageTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    application_capability: String,
+}
+
 struct DaemonSendMessageTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
     worker_capability: String,
+}
+
+#[async_trait]
+impl Tool for DaemonApplicationSendMessageTool {
+    fn name(&self) -> &str {
+        "send_message"
+    }
+
+    fn description(&self) -> &str {
+        "Send a direct message to an adjacent agent."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": { "type": "string", "description": "Recipient task ID." },
+                "message": { "type": "string", "description": "Message body." }
+            },
+            "required": ["recipient", "message"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(recipient) = args.get("recipient").and_then(Value::as_str) else {
+            return ToolResult::error("recipient is required");
+        };
+        let Some(message) = args.get("message").and_then(Value::as_str) else {
+            return ToolResult::error("message is required");
+        };
+        if message.trim().is_empty() {
+            return ToolResult::error("message must be non-empty");
+        }
+        match yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
+                session_id: self.session_id.clone(),
+                sender_task_id: self.caller_task_id.clone(),
+                capability: self.application_capability.clone(),
+                recipient_task_id: recipient.to_owned(),
+                message: message.to_owned(),
+            },
+        ) {
+            Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
+                ToolResult::text("message queued")
+            }
+            Ok(other) => ToolResult::error(format!("daemon rejected message: {other:?}")),
+            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+        }
+    }
 }
 
 #[async_trait]
@@ -693,13 +751,13 @@ pub fn register_application_subagent_tools(
         runtime_socket: runtime_socket.clone(),
         session_id: session_id.clone(),
         caller_task_id: caller_task_id.clone(),
-        application_capability,
+        application_capability: application_capability.clone(),
     }));
-    registry.register(Arc::new(DaemonSendMessageTool {
+    registry.register(Arc::new(DaemonApplicationSendMessageTool {
         runtime_socket: runtime_socket.clone(),
         session_id: session_id.clone(),
         caller_task_id: caller_task_id.clone(),
-        worker_capability: String::new(),
+        application_capability: application_capability.clone(),
     }));
     registry.register(Arc::new(DaemonWaitAgentTool {
         runtime_socket,

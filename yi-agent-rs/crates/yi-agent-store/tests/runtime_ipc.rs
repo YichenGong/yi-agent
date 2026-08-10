@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use futures::{FutureExt, future::BoxFuture};
 use rusqlite::{Connection, params};
@@ -380,6 +380,69 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
 }
 
 #[test]
+fn concurrent_application_root_attach_reuses_one_durable_root() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let socket = daemon.socket_path().to_path_buf();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let socket = socket.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                send_request(
+                    &socket,
+                    IpcRequest::AttachApplicationRoot {
+                        idempotency_key: "tui-concurrent".into(),
+                    },
+                )
+                .unwrap()
+            })
+        })
+        .collect();
+    let responses: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+
+    let mut attached = Vec::new();
+    for response in responses {
+        let IpcResponse::ApplicationRootAttached {
+            session_id,
+            root_task_id,
+            workspace,
+            ..
+        } = response
+        else {
+            panic!("expected application root attachment");
+        };
+        attached.push((session_id, root_task_id, workspace.path));
+    }
+    assert_eq!(attached[0], attached[1]);
+
+    let connection = Connection::open(&database).unwrap();
+    let attachment_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM application_root_attachments WHERE idempotency_key = 'tui-concurrent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let root_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE parent_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attachment_count, 1);
+    assert_eq!(root_count, 1);
+}
+
+#[test]
 fn application_root_activate_marks_the_foreground_root_running_without_starting_a_worker() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -421,6 +484,63 @@ fn application_root_activate_marks_the_foreground_root_running_without_starting_
     let detail = repository.task_detail(&task_id).unwrap();
     let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap();
     assert_eq!(delivery["objective"], "build the TUI MVP");
+}
+
+#[test]
+fn application_root_activation_keeps_the_first_objective() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-first-objective".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected application root attachment");
+    };
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: "first objective".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id,
+                root_task_id: root_task_id.clone(),
+                capability: message_capability,
+                objective: "second objective".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+
+    let task_id: TaskId = root_task_id.parse().unwrap();
+    let detail = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_detail(&task_id)
+        .unwrap();
+    let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap();
+    assert_eq!(delivery["objective"], "first objective");
 }
 
 #[test]
@@ -482,6 +602,198 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
             .state,
         "detached"
     );
+}
+
+#[test]
+fn application_root_can_spawn_and_send_message_to_its_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-send".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    let IpcResponse::TaskSpawned { task_id: child } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "child task".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected child spawn");
+    };
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::SendApplicationMessage {
+                session_id,
+                sender_task_id: root_task_id.clone(),
+                capability: message_capability,
+                recipient_task_id: child.clone(),
+                message: "please continue".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::MessageQueued
+    );
+
+    let child_id: TaskId = child.parse().unwrap();
+    let messages = RuntimeRepository::open(&database)
+        .unwrap()
+        .mailbox_messages_for_task(&child_id)
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].sender_task_id,
+        Some(root_task_id.parse().unwrap())
+    );
+}
+
+#[test]
+fn detached_application_root_can_be_reattached_with_the_same_key() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-reattach".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    );
+
+    let IpcResponse::ApplicationRootAttached {
+        session_id: reattached_session,
+        root_task_id: reattached_root,
+        message_capability: reattached_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-reattach".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected reattachment");
+    };
+
+    assert_eq!(reattached_session, session_id);
+    assert_eq!(reattached_root, root_task_id);
+    assert_eq!(reattached_capability, message_capability);
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id,
+                parent_task_id: root_task_id,
+                capability: reattached_capability,
+                objective: "after reattach".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::TaskSpawned { .. }
+    ));
+}
+
+#[test]
+fn attached_application_root_can_be_reused_after_daemon_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let runtime = directory.path().join("runtime");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    {
+        let daemon = Daemon::start_with_factory(
+            &runtime,
+            &database,
+            Arc::new(ApplicationRootFactory {
+                workspace_service: Arc::new(StaticWorkspaceService),
+                starts: Arc::clone(&starts),
+            }),
+        )
+        .unwrap();
+        let _ = send_request(
+            daemon.socket_path(),
+            IpcRequest::AttachApplicationRoot {
+                idempotency_key: "tui-restart".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let daemon = Daemon::start_with_factory(
+        &runtime,
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts,
+        }),
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-restart".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected restarted attachment");
+    };
+
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id,
+                parent_task_id: root_task_id,
+                capability: message_capability,
+                objective: "after restart".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::TaskSpawned { .. }
+    ));
 }
 
 #[test]

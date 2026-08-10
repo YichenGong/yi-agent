@@ -44,6 +44,10 @@ pub fn run_tui(
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     model: String,
+    runtime_start_prompt: Option<crate::tui::subagents::RuntimeStartPrompt>,
+    runtime_choice_tx: Option<
+        tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
+    >,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -66,6 +70,8 @@ pub fn run_tui(
         &is_running,
         &CrosstermEventSource,
         &model,
+        runtime_start_prompt,
+        runtime_choice_tx,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -133,6 +139,8 @@ pub fn run_tui_with_backend<B: Backend>(
         is_running,
         &CrosstermEventSource,
         "test-model",
+        None,
+        None,
     )
 }
 
@@ -163,6 +171,8 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         is_running,
         events,
         "test-model",
+        None,
+        None,
     )
 }
 
@@ -179,6 +189,10 @@ fn run_loop<B: Backend, E: EventSource>(
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
     model: &str,
+    runtime_start_prompt: Option<crate::tui::subagents::RuntimeStartPrompt>,
+    runtime_choice_tx: Option<
+        tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
+    >,
 ) -> std::io::Result<()> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
@@ -187,6 +201,7 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
     let mut bash_popup: BashPopup = BashPopup::None;
+    let mut runtime_start_prompt = runtime_start_prompt;
     // Keep the rendered viewport location so geometry that changes between
     // frames (such as a resize or newly queued preview) has an old-width anchor.
     let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
@@ -318,6 +333,33 @@ fn run_loop<B: Backend, E: EventSource>(
             let input_line = build_input_line(input, pending_quit, chunks[5].width);
             f.render_widget(input_line, chunks[5]);
 
+            if let Some(prompt) = &runtime_start_prompt {
+                let box_w = 58u16.min(chunks[0].width.saturating_sub(4));
+                let box_h = 6u16.min(chunks[0].height.max(1));
+                let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
+                let box_y = chunks[0].y + (chunks[0].height.saturating_sub(box_h)) / 3;
+                let box_area = ratatui::layout::Rect {
+                    x: box_x,
+                    y: box_y,
+                    width: box_w,
+                    height: box_h,
+                };
+                f.render_widget(Clear, box_area);
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new(vec![
+                        ratatui::text::Line::raw(prompt.body.clone()),
+                        ratatui::text::Line::raw(""),
+                        ratatui::text::Line::raw("[y] 启动并启用子 Agent   [n/Esc] 暂不启用"),
+                    ])
+                    .block(
+                        ratatui::widgets::Block::default()
+                            .borders(ratatui::widgets::Borders::ALL)
+                            .title(prompt.title.clone()),
+                    ),
+                    box_area,
+                );
+            }
+
             // Bash popup (covers the full screen above the input area).
             match &bash_popup {
                 BashPopup::List(p) => {
@@ -405,6 +447,28 @@ fn run_loop<B: Backend, E: EventSource>(
                 // Route keys to the bash popup when active.
                 if !matches!(bash_popup, BashPopup::None) {
                     handle_bash_popup_key(key, &mut bash_popup, &task_registry);
+                    continue;
+                }
+                if runtime_start_prompt.is_some() {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            if let Some(tx) = &runtime_choice_tx {
+                                let _ = tx.blocking_send(
+                                    crate::tui::subagents::RuntimeStartupChoice::Start,
+                                );
+                            }
+                            runtime_start_prompt = None;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            if let Some(tx) = &runtime_choice_tx {
+                                let _ = tx.blocking_send(
+                                    crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
+                                );
+                            }
+                            runtime_start_prompt = None;
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
                 let history_area = layout.chunks[0];
@@ -2710,6 +2774,8 @@ mod tests {
             &is_running,
             &source,
             "test-model",
+            None,
+            None,
         )
         .unwrap();
 
@@ -2789,6 +2855,8 @@ mod tests {
             &is_running,
             &source,
             "test-model",
+            None,
+            None,
         )
         .unwrap();
 
@@ -2851,6 +2919,8 @@ mod tests {
             &is_running,
             &source,
             "test-model",
+            None,
+            None,
         )
         .unwrap();
 
@@ -2930,6 +3000,104 @@ mod tests {
             handle.await.unwrap();
             assert_eq!(input_rx.recv().await.unwrap(), "hello");
         });
+    }
+
+    #[test]
+    fn runtime_start_prompt_sends_start_choice_before_accepting_chat_input() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (runtime_choice_tx, mut runtime_choice_rx) = tokio::sync::mpsc::channel(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            ])),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            Some(crate::tui::subagents::RuntimeStartPrompt {
+                title: "启动本地 Agent Runtime?".into(),
+                body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
+            }),
+            Some(runtime_choice_tx),
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime_choice_rx.try_recv().unwrap(),
+            crate::tui::subagents::RuntimeStartupChoice::Start
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "startup choice must not be sent as chat input"
+        );
+    }
+
+    #[test]
+    fn runtime_start_prompt_can_continue_without_delegation() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (runtime_choice_tx, mut runtime_choice_rx) = tokio::sync::mpsc::channel(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            ])),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            Some(crate::tui::subagents::RuntimeStartPrompt {
+                title: "启动本地 Agent Runtime?".into(),
+                body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
+            }),
+            Some(runtime_choice_tx),
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime_choice_rx.try_recv().unwrap(),
+            crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "skip choice must not be sent as chat input"
+        );
     }
 
     /// Test that first Ctrl+C does NOT quit but shows a confirm prompt,

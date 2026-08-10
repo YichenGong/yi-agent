@@ -214,6 +214,13 @@ pub enum IpcRequest {
         recipient_task_id: String,
         message: String,
     },
+    SendApplicationMessage {
+        session_id: String,
+        sender_task_id: String,
+        capability: String,
+        recipient_task_id: String,
+        message: String,
+    },
     SendUserMessage {
         task_id: String,
         message: String,
@@ -2107,6 +2114,28 @@ fn respond(
                 &session_id,
                 &sender_task_id,
                 &worker_capability,
+                recipient_task_id,
+                message,
+            ))?;
+            Ok(IpcResponse::MessageQueued)
+        }
+        IpcRequest::SendApplicationMessage {
+            session_id,
+            sender_task_id,
+            capability,
+            recipient_task_id,
+            message,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let sender_task_id = parse_id::<TaskId>(&sender_task_id)?;
+            let recipient_task_id = parse_id::<TaskId>(&recipient_task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.send_application_message(
+                &session_id,
+                &sender_task_id,
+                &capability,
                 recipient_task_id,
                 message,
             ))?;
