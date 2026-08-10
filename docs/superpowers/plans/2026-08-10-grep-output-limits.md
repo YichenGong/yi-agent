@@ -36,4 +36,4 @@
 - Modify: `docs/project-management/yi-agent-tools.md`
 
 - [x] Update the FS tool completion criterion with the grep output-limit verification command.
-- [ ] Run formatting and final verification, commit, and merge the branch.
+- [x] Run formatting and final verification, commit, and merge the branch.
