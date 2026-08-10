@@ -535,6 +535,55 @@ impl AgentTask {
         task
     }
 
+    /// Reconstructs reducer state needed to route durable review mail after a
+    /// process restart. Historical rows remain authoritative in SQLite.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hydrated_review_task(
+        root_session_id: RootSessionId,
+        task_id: TaskId,
+        parent_id: Option<TaskId>,
+        depth: TaskDepth,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+        state: TaskState,
+        delivery: Option<DeliveryReport>,
+    ) -> Self {
+        let ended_at = state.is_terminal().then(Utc::now);
+        let attempt = TaskAttempt {
+            id: attempt_id.clone(),
+            task_id: task_id.clone(),
+            number: attempt_number,
+            started_at: Utc::now(),
+            ended_at,
+            checkpoint: None,
+            delivery: delivery.clone(),
+            budget: EffectiveBudget::default(),
+            usage: AttemptUsage::default(),
+            terminal_reason: None,
+        };
+        let delivery = match (&state, delivery) {
+            (TaskState::AwaitingParentReview(_), Some(report)) => {
+                DeliveryState::ReadyForReview(report.id)
+            }
+            _ => DeliveryState::None,
+        };
+        Self {
+            id: task_id,
+            root_session_id,
+            parent_id,
+            depth,
+            created_at: Utc::now(),
+            current_contract: ContractVersion::initial(),
+            authority_id: AuthorityId::new(),
+            active_attempt: attempt_id,
+            state,
+            pause_request: None,
+            delivery,
+            workspace: None,
+            attempts: vec![attempt],
+        }
+    }
+
     pub fn new_child(root_session_id: RootSessionId, parent_id: TaskId) -> Self {
         let mut task = Self::new_root(root_session_id);
         task.parent_id = Some(parent_id);

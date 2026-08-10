@@ -8,7 +8,8 @@ use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
-    BudgetKind, IntegrationValidation, PermissionDecision, PermissionRequestId, TimeoutKind,
+    AttemptId, BudgetKind, IntegrationValidation, MessageId, PermissionDecision,
+    PermissionRequestId, TimeoutKind,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
@@ -381,7 +382,7 @@ async fn coordinator_persists_worker_delivery_and_notifies_direct_parent() {
 }
 
 #[tokio::test]
-async fn coordinator_accepts_delivery_as_its_direct_parent_with_integration_evidence() {
+async fn trusted_parent_integration_requires_passed_validation_to_complete_review() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let factory = Arc::new(MessageRecordingFactory::default());
@@ -403,6 +404,23 @@ async fn coordinator_accepts_delivery_as_its_direct_parent_with_integration_evid
     factory.handles.lock().unwrap()[0].report_delivery(delivery.clone());
     coordinator.reconcile_worker_events().await.unwrap();
 
+    assert!(
+        coordinator
+            .accept_review(
+                &child,
+                IntegrationValidation::failed("parent integration tests failed"),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+
     coordinator
         .accept_review(
             &child,
@@ -423,10 +441,9 @@ async fn coordinator_accepts_delivery_as_its_direct_parent_with_integration_evid
         .unwrap();
     let review_actor: serde_json::Value = serde_json::from_str(&review_actor).unwrap();
     assert_eq!(review_actor["task_id"], parent.to_string());
-    assert_eq!(review_actor["initiated_by"]["kind"], "local_user");
+    assert_eq!(review_actor["initiated_by"]["kind"], "parent_integration");
     let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
-    assert_eq!(parent_mailbox.len(), 2);
-    assert!(parent_mailbox[1].payload_json.contains("accepted"));
+    assert_eq!(parent_mailbox.len(), 1);
 }
 
 #[tokio::test]
@@ -543,6 +560,200 @@ async fn coordinator_rejects_delivery_with_a_durable_reason() {
     let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
     assert_eq!(parent_mailbox.len(), 2);
     assert!(parent_mailbox[1].payload_json.contains("rejected"));
+}
+
+#[tokio::test]
+async fn restart_hydrates_a_committed_user_review_notification() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, session, parent, child, delivery) =
+        delivered_child_coordinator(&database, factory).await;
+    let actor_json = local_user_review_actor(&parent);
+    let notification_id = MessageId::new();
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .approve_delivery_review(&child, &delivery.id, &parent, &actor_json, &notification_id)
+        .unwrap();
+    drop(coordinator);
+    let restart_factory = Arc::new(MessageRecordingFactory::default());
+    let reopened = RuntimeCoordinator::open(&database, restart_factory.clone()).unwrap();
+
+    reopened.start_worker(&session, &parent).await.unwrap();
+
+    let starts = restart_factory.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].initial_user_messages.len(), 1);
+    assert_eq!(starts[0].initial_user_messages[0].id, notification_id);
+    assert!(starts[0].initial_user_messages[0].body.contains("approved"));
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+}
+
+#[tokio::test]
+async fn restart_hydrates_review_mail_when_the_session_contains_a_failed_task() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, session, parent, child, delivery) =
+        delivered_child_coordinator(&database, factory).await;
+    let notification_id = MessageId::new();
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .approve_delivery_review(
+            &child,
+            &delivery.id,
+            &parent,
+            &local_user_review_actor(&parent),
+            &notification_id,
+        )
+        .unwrap();
+    let parent_attempt = RuntimeRepository::open(&database)
+        .unwrap()
+        .active_attempt_id(&parent)
+        .unwrap();
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE tasks SET state_json = 'failed' WHERE id = '{parent}';
+             UPDATE attempts SET state = 'failed' WHERE id = '{parent_attempt}';"
+        ))
+        .unwrap();
+    drop(coordinator);
+
+    let reopened = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let mailbox = reopened.mailbox_snapshot(&session, &parent).await.unwrap();
+
+    assert_eq!(mailbox.len(), 1);
+    assert_eq!(mailbox[0].id, notification_id);
+}
+
+#[tokio::test]
+async fn restart_hydrates_rework_once_with_its_durable_message_id() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, session, parent, child, delivery) =
+        delivered_child_coordinator(&database, factory).await;
+    let prior_attempt = RuntimeRepository::open(&database)
+        .unwrap()
+        .active_attempt_id(&child)
+        .unwrap();
+    let successor = AttemptId::new();
+    let feedback_id = MessageId::new();
+    let actor_json = local_user_review_actor(&parent);
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .rework_delivery_review(
+            &child,
+            &delivery.id,
+            &parent,
+            "rerun the parser regression suite",
+            &feedback_id,
+            &successor,
+            2,
+            &actor_json,
+            &MessageId::new(),
+        )
+        .unwrap();
+    drop(coordinator);
+    let first_factory = Arc::new(MessageRecordingFactory::default());
+    let first_restart = RuntimeCoordinator::open(&database, first_factory.clone()).unwrap();
+
+    first_restart.start_worker(&session, &child).await.unwrap();
+
+    let first_starts = first_factory.starts.lock().unwrap();
+    assert_eq!(first_starts.len(), 1);
+    assert_eq!(first_starts[0].attempt_id, successor);
+    assert_eq!(first_starts[0].initial_user_messages.len(), 1);
+    assert_eq!(first_starts[0].initial_user_messages[0].id, feedback_id);
+    drop(first_starts);
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .mailbox_message_delivered_at(&feedback_id)
+            .unwrap()
+            .is_some()
+    );
+    drop(first_restart);
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE tasks SET state_json = 'queued' WHERE id = '{child}';
+             UPDATE attempts SET state = 'queued' WHERE id = '{successor}';"
+        ))
+        .unwrap();
+    let second_factory = Arc::new(MessageRecordingFactory::default());
+    let second_restart = RuntimeCoordinator::open(&database, second_factory.clone()).unwrap();
+
+    second_restart.start_worker(&session, &child).await.unwrap();
+
+    assert!(
+        second_factory.starts.lock().unwrap()[0]
+            .initial_user_messages
+            .is_empty()
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .attempt_state(&prior_attempt)
+            .unwrap(),
+        "rework_requested"
+    );
+}
+
+#[tokio::test]
+async fn restart_hydrates_rejection_evidence_with_the_durable_message_id() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, session, parent, child, delivery) =
+        delivered_child_coordinator(&database, factory).await;
+    let reason_id = MessageId::new();
+    let actor_json = local_user_review_actor(&parent);
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .reject_delivery_review(
+            &child,
+            &delivery.id,
+            &parent,
+            "missing regression evidence",
+            &reason_id,
+            &actor_json,
+            &MessageId::new(),
+        )
+        .unwrap();
+    drop(coordinator);
+
+    let reopened = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let mailbox = reopened.mailbox_snapshot(&session, &child).await.unwrap();
+
+    assert_eq!(mailbox.len(), 1);
+    assert_eq!(mailbox[0].id, reason_id);
+    assert!(matches!(
+        mailbox[0].kind,
+        yi_agent_core::subagent::mailbox::MessageKind::ReviewRejected(ref id) if id == &reason_id
+    ));
+    let durable = RuntimeRepository::open(&database)
+        .unwrap()
+        .mailbox_messages_for_task(&child)
+        .unwrap();
+    assert_eq!(durable[0].message_id, reason_id.to_string());
+}
+
+fn local_user_review_actor(parent: &yi_agent_core::TaskId) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "kind": "task",
+        "task_id": parent,
+        "source": "daemon",
+        "initiated_by": { "kind": "local_user", "source": "daemon" },
+    }))
+    .unwrap()
 }
 
 async fn delivered_child_coordinator(
@@ -1034,6 +1245,51 @@ async fn resident_lease_is_released_after_child_startup_failure() {
         !repository
             .has_active_lease_prefix(&child, "resident:")
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn admission_persistence_failure_leaves_child_queued_and_retryable() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_all_admission_updates
+             BEFORE UPDATE OF state_json ON tasks
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected repeated sqlite failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(coordinator.start_worker(&session, &child).await.is_err());
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "queued"
+    );
+    assert!(factory.starts.lock().unwrap().is_empty());
+
+    connection
+        .execute_batch("DROP TRIGGER fail_all_admission_updates;")
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    assert_eq!(factory.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "running"
     );
 }
 

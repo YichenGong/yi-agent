@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use yi_agent_core::subagent::task::{
-    IntegrationValidation, PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
+    PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 
@@ -129,6 +129,7 @@ pub struct ResponseEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[serde(deny_unknown_fields)]
 pub enum IpcRequest {
     Status,
     Stop,
@@ -271,7 +272,7 @@ pub enum IpcResponse {
     TaskPaused,
     TaskResumed,
     PermissionResolved,
-    ReviewAccepted,
+    ReviewApproved,
     ReviewReworkRequested,
     ReviewRejected,
     MessageQueued,
@@ -337,8 +338,9 @@ impl From<IpcPermissionDecision> for PermissionDecision {
 /// delivery, and the direct-parent actor from its canonical runtime state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum IpcReviewDecision {
-    Accept { integration_evidence: String },
+    Accept {},
     Rework { feedback: String },
     Reject { reason: String },
 }
@@ -1814,6 +1816,7 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::MailboxMessageConsumed => "mailbox_message_consumed",
         crate::repository::RuntimeEvent::PermissionRequested => "permission_requested",
         crate::repository::RuntimeEvent::PermissionResolved => "permission_resolved",
+        crate::repository::RuntimeEvent::ReviewApproved => "review_approved",
         crate::repository::RuntimeEvent::ReviewAccepted => "review_accepted",
         crate::repository::RuntimeEvent::ReviewRework => "review_rework",
         crate::repository::RuntimeEvent::ReviewRejected => "review_rejected",
@@ -1969,14 +1972,9 @@ fn respond(
                 .enable_all()
                 .build()?;
             match decision {
-                IpcReviewDecision::Accept {
-                    integration_evidence,
-                } => {
-                    runtime.block_on(coordinator.accept_review(
-                        &task_id,
-                        IntegrationValidation::passed(integration_evidence),
-                    ))?;
-                    Ok(IpcResponse::ReviewAccepted)
+                IpcReviewDecision::Accept {} => {
+                    runtime.block_on(coordinator.approve_review(&task_id))?;
+                    Ok(IpcResponse::ReviewApproved)
                 }
                 IpcReviewDecision::Rework { feedback } => {
                     runtime.block_on(coordinator.rework_review(&task_id, &feedback))?;

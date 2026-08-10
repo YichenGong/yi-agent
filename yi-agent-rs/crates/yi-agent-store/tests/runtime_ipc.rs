@@ -1926,7 +1926,7 @@ fn resolve_permission_ipc_uses_only_the_daemon_owned_request_identity() {
 }
 
 #[test]
-fn review_ipc_accepts_without_caller_supplied_actor_or_delivery_identity() {
+fn review_ipc_accept_records_user_approval_without_completing_integration() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let factory = Arc::new(ReviewReportingFactory::default());
@@ -1946,7 +1946,7 @@ fn review_ipc_accepts_without_caller_supplied_actor_or_delivery_identity() {
         daemon.socket_path(),
         IpcRequest::SpawnChild {
             session_id: session_id.clone(),
-            parent_task_id: root_task_id,
+            parent_task_id: root_task_id.clone(),
             objective: "Implement the parser".into(),
         },
     )
@@ -1993,23 +1993,20 @@ fn review_ipc_accepts_without_caller_supplied_actor_or_delivery_identity() {
         "awaiting_parent_review"
     );
 
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::Review {
-            task_id: child_task_id.clone(),
-            decision: IpcReviewDecision::Accept {
-                integration_evidence: "cargo test -p parent".into(),
-            },
-        },
-    )
-    .unwrap();
+    let accept_request: IpcRequest = serde_json::from_value(serde_json::json!({
+        "type": "Review",
+        "task_id": child_task_id,
+        "decision": { "type": "accept" }
+    }))
+    .expect("accept has no caller-supplied integration evidence");
+    let response = send_request(daemon.socket_path(), accept_request).unwrap();
 
     let review_detail = RuntimeRepository::open(&database)
         .unwrap()
         .task_detail(&child_task_id.parse().unwrap())
         .unwrap();
     assert!(
-        matches!(response, IpcResponse::ReviewAccepted),
+        serde_json::to_value(&response).unwrap()["type"] == "ReviewApproved",
         "unexpected review response: {response:?}; state={}; delivery={}",
         review_detail.state,
         review_detail.delivery_json
@@ -2019,8 +2016,27 @@ fn review_ipc_accepts_without_caller_supplied_actor_or_delivery_identity() {
             .unwrap()
             .task_state(&child)
             .unwrap(),
-        "completed"
+        "awaiting_parent_review"
     );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let (decision, actor_json): (String, String) = connection
+        .query_row(
+            "SELECT decision, actor_json FROM reviews ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(decision, "approved");
+    let actor: serde_json::Value = serde_json::from_str(&actor_json).unwrap();
+    assert_eq!(actor["task_id"], root_task_id);
+    assert_eq!(actor["initiated_by"]["kind"], "local_user");
+    let parent: TaskId = root_task_id.parse().unwrap();
+    let parent_mailbox = RuntimeRepository::open(&database)
+        .unwrap()
+        .mailbox_messages_for_task(&parent)
+        .unwrap();
+    assert_eq!(parent_mailbox.len(), 2);
+    assert!(parent_mailbox[1].payload_json.contains("approved"));
     let encoded = serde_json::to_value(IpcRequest::Review {
         task_id: child_task_id,
         decision: IpcReviewDecision::Reject {
@@ -2032,6 +2048,30 @@ fn review_ipc_accepts_without_caller_supplied_actor_or_delivery_identity() {
     assert!(encoded.get("actor").is_none());
     assert!(encoded.get("session_id").is_none());
     assert!(encoded.get("delivery_id").is_none());
+}
+
+#[test]
+fn review_ipc_accept_rejects_forged_integration_evidence() {
+    let forged = serde_json::from_value::<IpcReviewDecision>(serde_json::json!({
+        "type": "accept",
+        "integration_evidence": "caller claims merge and tests passed"
+    }));
+
+    assert!(forged.is_err());
+}
+
+#[test]
+fn review_ipc_rejects_caller_supplied_routing_or_actor_identity() {
+    for forged_field in ["actor", "session_id", "delivery_id"] {
+        let mut command = serde_json::json!({
+            "type": "Review",
+            "task_id": TaskId::new().to_string(),
+            "decision": { "type": "accept" }
+        });
+        command[forged_field] = serde_json::json!("caller-controlled");
+
+        assert!(serde_json::from_value::<IpcRequest>(command).is_err());
+    }
 }
 
 #[test]
@@ -2116,9 +2156,6 @@ fn review_ipc_rejects_empty_rework_and_rejection_text() {
     let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
 
     for decision in [
-        IpcReviewDecision::Accept {
-            integration_evidence: "  ".into(),
-        },
         IpcReviewDecision::Rework {
             feedback: " ".into(),
         },

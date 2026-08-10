@@ -73,6 +73,7 @@ pub struct AgentSupervisor {
     workers: HashMap<TaskId, WorkerHandle>,
     worker_message_capabilities: HashMap<TaskId, String>,
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
+    pending_rework_delivery_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
 }
@@ -110,6 +111,7 @@ impl AgentSupervisor {
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
+            pending_rework_delivery_acks: Vec::new(),
             events: Vec::new(),
             updates,
         }
@@ -144,6 +146,7 @@ impl AgentSupervisor {
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
+            pending_rework_delivery_acks: Vec::new(),
             events: Vec::new(),
             updates,
         }
@@ -173,6 +176,50 @@ impl AgentSupervisor {
             ),
         );
         supervisor
+    }
+
+    pub fn from_hydrated_review_root(task: AgentTask, objective: String) -> Self {
+        let root_task_id = task.id.clone();
+        let mut tasks = HashMap::new();
+        tasks.insert(root_task_id.clone(), task);
+        let mut mailboxes = HashMap::new();
+        mailboxes.insert(root_task_id.clone(), Mailbox::default());
+        let mut objectives = HashMap::new();
+        objectives.insert(root_task_id.clone(), objective);
+        let (updates, _) = watch::channel(0_u64);
+        Self {
+            root_task_id,
+            tasks,
+            objectives,
+            children: HashMap::new(),
+            mailboxes,
+            workers: HashMap::new(),
+            worker_message_capabilities: HashMap::new(),
+            pending_user_override_acks: Vec::new(),
+            pending_rework_delivery_acks: Vec::new(),
+            events: Vec::new(),
+            updates,
+        }
+    }
+
+    pub fn insert_hydrated_review_child(
+        &mut self,
+        task: AgentTask,
+        objective: String,
+    ) -> Result<(), String> {
+        let parent_id = task
+            .parent_id
+            .clone()
+            .ok_or_else(|| "hydrated child has no parent".to_string())?;
+        if !self.tasks.contains_key(&parent_id) {
+            return Err("hydrated child parent is missing".into());
+        }
+        let task_id = task.id.clone();
+        self.tasks.insert(task_id.clone(), task);
+        self.mailboxes.insert(task_id.clone(), Mailbox::default());
+        self.objectives.insert(task_id.clone(), objective);
+        self.children.entry(parent_id).or_default().push(task_id);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -396,10 +443,15 @@ impl AgentSupervisor {
         self.worker_message_capabilities
             .insert(task_id.clone(), message_capability);
         for (id, _) in initial_user_messages {
-            self.mailboxes
+            let mailbox = self
+                .mailboxes
                 .get_mut(task_id)
-                .expect("task mailbox is created with task")
-                .mark_delivered_to_worker(&id);
+                .expect("task mailbox is created with task");
+            if mailbox.is_rework(&id) {
+                self.pending_rework_delivery_acks
+                    .push((task_id.clone(), id.clone()));
+            }
+            mailbox.mark_delivered_to_worker(&id);
         }
         self.workers.insert(task_id.clone(), handle);
         Ok(())
@@ -576,6 +628,19 @@ impl AgentSupervisor {
             self.pending_user_override_acks
                 .retain(|ack| ack != &(task_id.clone(), message_id.clone()));
         }
+    }
+
+    pub fn pending_rework_delivery_acks(&self) -> &[(TaskId, super::task::MessageId)] {
+        &self.pending_rework_delivery_acks
+    }
+
+    pub fn confirm_rework_delivered(
+        &mut self,
+        task_id: &TaskId,
+        message_id: &super::task::MessageId,
+    ) {
+        self.pending_rework_delivery_acks
+            .retain(|ack| ack != &(task_id.clone(), message_id.clone()));
     }
 
     /// Cancels a task and, when requested, every descendant owned by this
@@ -790,6 +855,22 @@ impl AgentSupervisor {
             });
         }
         self.notify_update();
+        Ok(())
+    }
+
+    /// Restores or stages an already-authorized durable mailbox fact. This is
+    /// reserved for runtime hydration/review transactions and deliberately
+    /// does not weaken ordinary live sender, adjacency, or terminal checks.
+    pub fn stage_persisted_message(
+        &mut self,
+        draft: MailboxMessageDraft,
+    ) -> Result<(), MessageDeliveryError> {
+        let recipient = draft.recipient().clone();
+        let mailbox = self
+            .mailboxes
+            .get_mut(&recipient)
+            .ok_or(MessageDeliveryError::RecipientNotFound)?;
+        mailbox.push(draft);
         Ok(())
     }
 
@@ -1091,33 +1172,34 @@ impl AgentSupervisor {
         Ok(successor)
     }
 
-    /// Rolls back reducer state if the matching durable transaction fails.
-    /// The supervisor lock prevents observers from seeing the staged state.
-    pub fn rework_review_with_persistence<T, E>(
+    /// Stages reducer/mailbox changes while the caller holds the supervisor
+    /// lock, then commits the matching repository transaction. Failed staging
+    /// or persistence restores both in-memory snapshots before returning.
+    pub fn stage_review_with_persistence<S, T, E>(
         &mut self,
-        task_id: &TaskId,
-        actor: &TaskId,
-        delivery_id: DeliveryId,
-        feedback: MessageId,
-        persist: impl FnOnce(&TaskAttempt) -> Result<T, E>,
-    ) -> Result<(TaskAttempt, T), ReviewPersistenceError<E>> {
-        let original = self
-            .tasks
-            .get(task_id)
-            .cloned()
-            .ok_or_else(|| ReviewPersistenceError::Supervisor("task does not exist".into()))?;
-        let successor = self
-            .reduce_rework_review(task_id, actor, delivery_id, feedback)
-            .map_err(ReviewPersistenceError::Supervisor)?;
-        let persisted = match persist(&successor) {
+        stage: impl FnOnce(&mut Self) -> Result<S, String>,
+        persist: impl FnOnce(&S) -> Result<T, E>,
+    ) -> Result<(S, T), ReviewPersistenceError<E>> {
+        let original_tasks = self.tasks.clone();
+        let original_mailboxes = self.mailboxes.clone();
+        let staged = match stage(self) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.tasks = original_tasks;
+                self.mailboxes = original_mailboxes;
+                return Err(ReviewPersistenceError::Supervisor(error));
+            }
+        };
+        let persisted = match persist(&staged) {
             Ok(persisted) => persisted,
             Err(error) => {
-                self.tasks.insert(task_id.clone(), original);
+                self.tasks = original_tasks;
+                self.mailboxes = original_mailboxes;
                 return Err(ReviewPersistenceError::Persistence(error));
             }
         };
         self.notify_update();
-        Ok((successor, persisted))
+        Ok((staged, persisted))
     }
 
     fn reduce_rework_review(
@@ -1181,10 +1263,18 @@ impl AgentSupervisor {
             TaskEvent::ReviewRejected {
                 attempt_id: attempt_id.clone(),
                 delivery_id,
-                reason,
+                reason: reason.clone(),
             },
             chrono::Utc::now(),
         )
+        .map_err(|error| error.to_string())?;
+        self.stage_persisted_message(MailboxMessageDraft::new_with_id(
+            reason.clone(),
+            actor.clone(),
+            task_id.clone(),
+            MessageKind::ReviewRejected(reason),
+            Some(attempt_id.clone()),
+        ))
         .map_err(|error| error.to_string())?;
         self.notify_update();
         Ok(attempt_id)
@@ -1540,15 +1630,17 @@ mod provider_turn_priority_tests {
     #[test]
     fn direct_parent_reject_blocks_the_reviewed_child() {
         let (mut supervisor, parent, child, delivery) = delivered_child();
+        let reason = MessageId::new();
 
         supervisor
-            .reject_review(&child, &parent, delivery.id, MessageId::new())
+            .reject_review(&child, &parent, delivery.id, reason.clone())
             .unwrap();
 
         assert!(matches!(
             supervisor.task(&child).unwrap().state(),
             TaskState::Blocked(_)
         ));
+        assert_eq!(supervisor.mailbox(&child).unwrap().messages()[0].id, reason);
     }
 
     #[test]
@@ -1579,6 +1671,44 @@ mod provider_turn_priority_tests {
             supervisor.task(&child).unwrap().state(),
             TaskState::AwaitingParentReview(_)
         ));
+    }
+
+    #[test]
+    fn failed_review_persistence_rolls_back_staged_state_and_mailboxes() {
+        let (mut supervisor, parent, child, delivery) = delivered_child();
+        let before_child = supervisor.task(&child).unwrap().clone();
+        let before_parent_mailbox = supervisor.mailbox(&parent).unwrap().messages().to_vec();
+        let notification = MessageId::new();
+
+        let result = supervisor.stage_review_with_persistence(
+            |supervisor| {
+                supervisor.accept_review(
+                    &child,
+                    &parent,
+                    delivery.id.clone(),
+                    IntegrationValidation::passed("trusted integration passed"),
+                )?;
+                supervisor
+                    .stage_persisted_message(MailboxMessageDraft::user_override_with_id(
+                        notification,
+                        parent.clone(),
+                        "review accepted",
+                    ))
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            },
+            |_| Err::<(), _>("injected repository failure"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ReviewPersistenceError::Persistence(_))
+        ));
+        assert_eq!(supervisor.task(&child).unwrap(), &before_child);
+        assert_eq!(
+            supervisor.mailbox(&parent).unwrap().messages(),
+            before_parent_mailbox
+        );
     }
 
     fn delivered_child() -> (AgentSupervisor, TaskId, TaskId, DeliveryReport) {

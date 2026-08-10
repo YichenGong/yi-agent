@@ -152,26 +152,10 @@ fn accepted_review_is_an_atomic_audited_task_transition() {
         integration
     );
     assert_eq!(persisted_actor, actor_json);
-    let parent_event_actor: String = connection
-        .query_row(
-            "SELECT actor_json FROM events
-             WHERE task_id = ?1 AND kind = 'mailbox_message_queued'
-             ORDER BY id DESC LIMIT 1",
-            [parent.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(parent_event_actor, actor_json);
-    let parent_notification_kind: String = connection
-        .query_row(
-            "SELECT kind FROM mailbox_messages
-             WHERE recipient_task_id = ?1 AND sender_task_id IS NULL
-             ORDER BY created_at DESC LIMIT 1",
-            [parent.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(parent_notification_kind, "user_override");
+    assert_eq!(
+        repository.mailbox_messages_for_task(&parent).unwrap().len(),
+        1
+    );
     let events = repository.event_records_for_task_after(&child, 0).unwrap();
     assert_eq!(events.last().unwrap().event, RuntimeEvent::ReviewAccepted);
     assert!(
@@ -347,6 +331,7 @@ fn rework_review_atomically_creates_a_successor_attempt_and_feedback() {
             &successor_attempt,
             2,
             r#"{"kind":"task","source":"daemon"}"#,
+            &MessageId::new(),
         )
         .unwrap();
 
@@ -404,6 +389,7 @@ fn rework_review_requires_non_empty_feedback() {
             &AttemptId::new(),
             2,
             r#"{"kind":"task","source":"daemon"}"#,
+            &MessageId::new(),
         )
         .unwrap_err();
 
@@ -428,6 +414,7 @@ fn rework_review_rejects_an_actor_other_than_the_direct_parent() {
             &AttemptId::new(),
             2,
             r#"{"kind":"task","source":"daemon"}"#,
+            &MessageId::new(),
         )
         .unwrap_err();
 
@@ -459,6 +446,7 @@ fn rework_review_rejects_a_non_reviewing_attempt_without_advancing_the_task() {
             &AttemptId::new(),
             2,
             r#"{"kind":"task","source":"daemon"}"#,
+            &MessageId::new(),
         )
         .unwrap_err();
 
@@ -486,6 +474,7 @@ fn rejected_review_is_an_atomic_audited_terminal_transition() {
             "verification evidence does not cover the regression",
             &reason_message,
             r#"{"kind":"task","source":"daemon"}"#,
+            &MessageId::new(),
         )
         .unwrap();
 
@@ -531,6 +520,7 @@ fn rejected_review_requires_a_non_empty_reason() {
             "\t",
             &MessageId::new(),
             r#"{"kind":"task","source":"daemon"}"#,
+            &MessageId::new(),
         )
         .unwrap_err();
 
@@ -553,6 +543,7 @@ fn rejected_review_rejects_an_actor_other_than_the_direct_parent() {
             "verification is incomplete",
             &MessageId::new(),
             r#"{"kind":"task","source":"daemon"}"#,
+            &MessageId::new(),
         )
         .unwrap_err();
 

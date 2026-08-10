@@ -34,6 +34,7 @@ pub enum MessageKind {
     PermissionRequest(PermissionRequestId),
     ScopeChange(ScopeChangeDraft),
     Rework(ReworkInstruction),
+    ReviewRejected(MessageId),
     UserInstruction(UserInstruction),
 }
 
@@ -45,7 +46,8 @@ impl MessageKind {
             | Self::Blocked(_)
             | Self::Failed(_)
             | Self::ScopeChange(_)
-            | Self::Rework(_) => MessagePriority::High,
+            | Self::Rework(_)
+            | Self::ReviewRejected(_) => MessagePriority::High,
             Self::Progress(_) | Self::UserInstruction(_) => MessagePriority::Normal,
         }
     }
@@ -171,7 +173,7 @@ pub struct DeliveryReceipt {
     pub coalesced: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Mailbox {
     messages: Vec<MailboxMessage>,
 }
@@ -221,6 +223,12 @@ impl Mailbox {
 
     pub fn messages(&self) -> &[MailboxMessage] {
         &self.messages
+    }
+
+    pub fn is_rework(&self, id: &MessageId) -> bool {
+        self.messages
+            .iter()
+            .any(|message| &message.id == id && matches!(message.kind, MessageKind::Rework(_)))
     }
 
     /// External user overrides are durable pending input. A worker that starts
