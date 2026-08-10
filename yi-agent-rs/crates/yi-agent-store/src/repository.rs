@@ -2000,25 +2000,6 @@ impl RuntimeRepository {
             .flatten())
     }
 
-    pub fn mark_rework_message_delivered(
-        &mut self,
-        task: &TaskId,
-        message_id: &MessageId,
-    ) -> Result<(), RepositoryError> {
-        let changed = self.connection.execute(
-            "UPDATE mailbox_messages SET delivered_at = CURRENT_TIMESTAMP
-             WHERE id = ?1 AND recipient_task_id = ?2 AND kind = 'rework'
-               AND delivered_at IS NULL",
-            params![message_id.to_string(), task.to_string()],
-        )?;
-        if changed == 0 && self.mailbox_message_delivered_at(message_id)?.is_none() {
-            return Err(RepositoryError::MailboxMessageNotFound {
-                message_id: message_id.to_string(),
-            });
-        }
-        Ok(())
-    }
-
     /// Returns a task's durable mailbox in enqueue order without acknowledging it.
     pub fn mailbox_messages_for_task(
         &self,
@@ -2174,6 +2155,31 @@ impl RuntimeRepository {
         context: &WorkerRecoveryContext,
         resident_resource_key: Option<&str>,
     ) -> Result<i64, RepositoryError> {
+        self.transition_task_and_attempt_with_admission(
+            task,
+            attempt,
+            state,
+            event,
+            context,
+            resident_resource_key,
+            &[],
+        )
+    }
+
+    /// Claims rework inputs in the same transaction that admits their target
+    /// attempt. Once committed, recovery owns that attempt and must not replay
+    /// the input into a second factory start.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transition_task_and_attempt_with_admission(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        state: &str,
+        event: RuntimeEvent,
+        context: &WorkerRecoveryContext,
+        resident_resource_key: Option<&str>,
+        rework_messages: &[MessageId],
+    ) -> Result<i64, RepositoryError> {
         validate_recovery_context(context)?;
         let transaction = self
             .connection
@@ -2243,6 +2249,23 @@ impl RuntimeRepository {
                     resource_key,
                 ],
             )?;
+        }
+        for message_id in rework_messages {
+            let changed = transaction.execute(
+                "UPDATE mailbox_messages SET delivered_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND recipient_task_id = ?2 AND kind = 'rework'
+                   AND correlation_id = ?3 AND delivered_at IS NULL",
+                params![
+                    message_id.to_string(),
+                    task.to_string(),
+                    attempt.to_string()
+                ],
+            )?;
+            if changed != 1 {
+                return Err(RepositoryError::MailboxMessageNotFound {
+                    message_id: message_id.to_string(),
+                });
+            }
         }
         let event_id = append_event(&transaction, task, event)?;
         transaction.commit()?;

@@ -782,17 +782,19 @@ impl RuntimeCoordinator {
         {
             recovery_context.workspace_lease_id = Some(format!("workspace:{workspace}"));
         }
+        let rework_messages = supervisor.pending_rework_message_ids(task);
         let admission = {
             self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
-                .transition_task_and_attempt_with_recovery_context_and_resident_lease(
+                .transition_task_and_attempt_with_admission(
                     task,
                     &attempt,
                     "running",
                     RuntimeEvent::TaskStarted,
                     &recovery_context,
                     is_subagent.then_some("resident:global"),
+                    &rework_messages,
                 )
         };
         if let Err(error) = admission {
@@ -843,14 +845,6 @@ impl RuntimeCoordinator {
                 self.release_resident_lease(task);
             }
             return Err(RuntimeCoordinatorError::Supervisor(error));
-        }
-        let rework_acks = supervisor.pending_rework_delivery_acks().to_vec();
-        for (task_id, message_id) in rework_acks {
-            self.repository
-                .lock()
-                .expect("runtime repository mutex poisoned")
-                .mark_rework_message_delivered(&task_id, &message_id)?;
-            supervisor.confirm_rework_delivered(&task_id, &message_id);
         }
         Ok(())
     }
@@ -1290,6 +1284,9 @@ impl RuntimeCoordinator {
                 },
             )
             .map_err(review_persistence_error)?;
+        supervisor
+            .deliver_committed_user_instruction(&parent, &parent_notification)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
         Ok(())
     }
 
@@ -1365,6 +1362,9 @@ impl RuntimeCoordinator {
                 },
             )
             .map_err(review_persistence_error)?;
+        supervisor
+            .deliver_committed_user_instruction(&parent, &parent_notification)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
         drop(supervisor);
         if self.factory.is_available() {
             self.start_worker(&session, task).await?;
@@ -1432,6 +1432,9 @@ impl RuntimeCoordinator {
                 },
             )
             .map_err(review_persistence_error)?;
+        supervisor
+            .deliver_committed_user_instruction(&parent, &parent_notification)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
         drop(supervisor);
         self.release_resident_lease(task);
         Ok(())

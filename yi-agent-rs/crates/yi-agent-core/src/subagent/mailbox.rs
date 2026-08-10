@@ -231,6 +231,16 @@ impl Mailbox {
             .any(|message| &message.id == id && matches!(message.kind, MessageKind::Rework(_)))
     }
 
+    pub fn user_instruction(&self, id: &MessageId) -> Option<String> {
+        self.messages
+            .iter()
+            .find(|message| &message.id == id)
+            .and_then(|message| match &message.kind {
+                MessageKind::UserInstruction(UserInstruction(body)) => Some(body.clone()),
+                _ => None,
+            })
+    }
+
     /// External user overrides are durable pending input. A worker that starts
     /// after the user action must receive them before it can make progress.
     pub fn pending_user_overrides(&self) -> Vec<(MessageId, String)> {

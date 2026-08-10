@@ -73,7 +73,6 @@ pub struct AgentSupervisor {
     workers: HashMap<TaskId, WorkerHandle>,
     worker_message_capabilities: HashMap<TaskId, String>,
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
-    pending_rework_delivery_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
 }
@@ -111,7 +110,6 @@ impl AgentSupervisor {
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
-            pending_rework_delivery_acks: Vec::new(),
             events: Vec::new(),
             updates,
         }
@@ -146,7 +144,6 @@ impl AgentSupervisor {
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
-            pending_rework_delivery_acks: Vec::new(),
             events: Vec::new(),
             updates,
         }
@@ -196,7 +193,6 @@ impl AgentSupervisor {
             workers: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
-            pending_rework_delivery_acks: Vec::new(),
             events: Vec::new(),
             updates,
         }
@@ -447,10 +443,6 @@ impl AgentSupervisor {
                 .mailboxes
                 .get_mut(task_id)
                 .expect("task mailbox is created with task");
-            if mailbox.is_rework(&id) {
-                self.pending_rework_delivery_acks
-                    .push((task_id.clone(), id.clone()));
-            }
             mailbox.mark_delivered_to_worker(&id);
         }
         self.workers.insert(task_id.clone(), handle);
@@ -628,19 +620,6 @@ impl AgentSupervisor {
             self.pending_user_override_acks
                 .retain(|ack| ack != &(task_id.clone(), message_id.clone()));
         }
-    }
-
-    pub fn pending_rework_delivery_acks(&self) -> &[(TaskId, super::task::MessageId)] {
-        &self.pending_rework_delivery_acks
-    }
-
-    pub fn confirm_rework_delivered(
-        &mut self,
-        task_id: &TaskId,
-        message_id: &super::task::MessageId,
-    ) {
-        self.pending_rework_delivery_acks
-            .retain(|ack| ack != &(task_id.clone(), message_id.clone()));
     }
 
     /// Cancels a task and, when requested, every descendant owned by this
@@ -872,6 +851,46 @@ impl AgentSupervisor {
             .ok_or(MessageDeliveryError::RecipientNotFound)?;
         mailbox.push(draft);
         Ok(())
+    }
+
+    /// Bridges a committed external mailbox fact to an already-running worker.
+    /// Callers must not invoke this until the matching repository transaction
+    /// commits because a `WorkerHandle` delivery cannot be rolled back.
+    pub fn deliver_committed_user_instruction(
+        &mut self,
+        recipient: &TaskId,
+        message_id: &super::task::MessageId,
+    ) -> Result<(), String> {
+        let body = self
+            .mailboxes
+            .get(recipient)
+            .ok_or_else(|| "recipient task does not exist".to_string())?
+            .user_instruction(message_id)
+            .ok_or_else(|| "committed user instruction does not exist".to_string())?;
+        if let Some(worker) = self.workers.get(recipient) {
+            worker.deliver_worker_message(WorkerMessage {
+                id: message_id.clone(),
+                body,
+            });
+            self.mailboxes
+                .get_mut(recipient)
+                .expect("recipient mailbox was checked")
+                .mark_delivered_to_worker(message_id);
+        }
+        self.notify_update();
+        Ok(())
+    }
+
+    pub fn pending_rework_message_ids(&self, task_id: &TaskId) -> Vec<super::task::MessageId> {
+        let Some(mailbox) = self.mailboxes.get(task_id) else {
+            return Vec::new();
+        };
+        mailbox
+            .pending_worker_inputs()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| mailbox.is_rework(id))
+            .collect()
     }
 
     /// Delivers the daemon's text-only control message through the same

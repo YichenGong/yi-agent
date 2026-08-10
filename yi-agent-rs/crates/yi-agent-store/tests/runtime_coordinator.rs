@@ -562,6 +562,135 @@ async fn coordinator_rejects_delivery_with_a_durable_reason() {
     assert!(parent_mailbox[1].payload_json.contains("rejected"));
 }
 
+#[derive(Clone, Copy)]
+enum ReviewDecision {
+    Approve,
+    Rework,
+    Reject,
+}
+
+#[tokio::test]
+async fn committed_review_decisions_reach_the_live_parent_with_the_durable_message_id() {
+    for decision in [
+        ReviewDecision::Approve,
+        ReviewDecision::Rework,
+        ReviewDecision::Reject,
+    ] {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let factory = Arc::new(MessageRecordingFactory::default());
+        let (coordinator, session, parent, child, _delivery) =
+            delivered_child_coordinator(&database, factory.clone()).await;
+        coordinator.start_worker(&session, &parent).await.unwrap();
+        let parent_handle = factory.handles.lock().unwrap()[1].clone();
+        let mut parent_mailbox = parent_handle.subscribe_messages();
+
+        match decision {
+            ReviewDecision::Approve => coordinator.approve_review(&child).await.unwrap(),
+            ReviewDecision::Rework => coordinator
+                .rework_review(&child, "rerun the parser regression suite")
+                .await
+                .unwrap(),
+            ReviewDecision::Reject => coordinator
+                .reject_review(&child, "missing parser regression evidence")
+                .await
+                .unwrap(),
+        }
+
+        let durable = RuntimeRepository::open(&database)
+            .unwrap()
+            .mailbox_messages_for_task(&parent)
+            .unwrap()
+            .pop()
+            .expect("review transaction persists a parent notification");
+        let delivered = tokio::time::timeout(Duration::from_millis(100), parent_mailbox.recv())
+            .await
+            .expect("committed notification wakes the live parent")
+            .expect("live parent mailbox remains open");
+        assert_eq!(delivered.id.to_string(), durable.message_id);
+        let payload: serde_json::Value = serde_json::from_str(&durable.payload_json).unwrap();
+        assert_eq!(delivered.body, payload["message"].as_str().unwrap());
+
+        parent_handle.report_message_consumed(delivered.id.clone());
+        coordinator.reconcile_worker_events().await.unwrap();
+        assert!(
+            RuntimeRepository::open(&database)
+                .unwrap()
+                .mailbox_message_delivered_at(&delivered.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn rework_acknowledgement_failure_prevents_factory_start_and_safe_retry_replays_once() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_rework_delivery_ack
+             BEFORE UPDATE OF delivered_at ON mailbox_messages
+             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(
+        coordinator
+            .rework_review(&child, "rerun the parser regression suite")
+            .await
+            .is_err()
+    );
+    assert_eq!(factory.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "queued"
+    );
+    let feedback_id: MessageId = RuntimeRepository::open(&database)
+        .unwrap()
+        .mailbox_messages_for_task(&child)
+        .unwrap()[0]
+        .message_id
+        .parse()
+        .unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .mailbox_message_delivered_at(&feedback_id)
+            .unwrap()
+            .is_none()
+    );
+
+    drop(coordinator);
+    connection
+        .execute_batch("DROP TRIGGER fail_rework_delivery_ack;")
+        .unwrap();
+    let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    reopened.start_worker(&session, &child).await.unwrap();
+    let starts = factory.starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].initial_user_messages.len(), 1);
+    assert_eq!(starts[1].initial_user_messages[0].id, feedback_id);
+    drop(starts);
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .mailbox_message_delivered_at(&feedback_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn restart_hydrates_a_committed_user_review_notification() {
     let directory = TempDir::new().unwrap();
