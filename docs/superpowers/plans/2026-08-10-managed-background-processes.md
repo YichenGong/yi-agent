@@ -674,7 +674,10 @@ Add this code to `manager.rs`:
 
 ```rust
 impl ProcessManager {
-    pub async fn start(self: &Arc<Self>, opts: ProcessStartOptions) -> Result<ProcessStartResult, String> {
+    pub async fn start(
+        self: &Arc<Self>,
+        opts: ProcessStartOptions,
+    ) -> Result<ProcessStartResult, String> {
         if opts.command.trim().is_empty() {
             return Err("command must not be empty".into());
         }
@@ -744,7 +747,10 @@ impl ProcessManager {
         self.spawn_reader(process_id.clone(), yi_agent_core::OutputStream::Stdout, stdout);
         self.spawn_reader(process_id.clone(), yi_agent_core::OutputStream::Stderr, stderr);
         self.spawn_waiter(process_id.clone(), child);
-        self.emit(ProcessEvent::Started { process_id: process_id.clone() }).await;
+        self.emit(ProcessEvent::Started {
+            process_id: process_id.clone(),
+        })
+        .await;
 
         let mut start_warning = None;
         if let Some(pattern) = &opts.ready_pattern {
@@ -754,7 +760,9 @@ impl ProcessManager {
                 let mut processes = self.processes.lock().await;
                 if let Some(process) = processes.get_mut(&process_id) {
                     process.ready = true;
-                    process.status = ProcessStatus::Ready;
+                    if !matches!(process.status, ProcessStatus::Exited { .. } | ProcessStatus::Killed) {
+                        process.status = ProcessStatus::Ready;
+                    }
                 }
                 self.emit(ProcessEvent::Ready { process_id: process_id.clone() }).await;
             } else {
@@ -888,6 +896,16 @@ impl ProcessManager {
         });
     }
 
+    async fn mark_killed(&self, process_id: &str) {
+        let mut processes = self.processes.lock().await;
+        if let Some(process) = processes.get_mut(process_id) {
+            process.status = ProcessStatus::Killed;
+            process.ready = false;
+            process.end_time = Some(Instant::now());
+            process.child = None;
+        }
+    }
+
     fn spawn_waiter(self: &Arc<Self>, process_id: String, child: Arc<Mutex<Child>>) {
         let manager = self.clone();
         tokio::spawn(async move {
@@ -904,10 +922,18 @@ impl ProcessManager {
                     process.status = ProcessStatus::Exited { code };
                     process.ready = false;
                 }
+            }
                 process.child = None;
             }
+            let was_killed = processes
+                .get(&process_id)
+                .is_some_and(|process| matches!(process.status, ProcessStatus::Killed));
             drop(processes);
-            manager.emit(ProcessEvent::Exited { process_id }).await;
+            if was_killed {
+                manager.emit(ProcessEvent::Killed { process_id }).await;
+            } else {
+                manager.emit(ProcessEvent::Exited { process_id }).await;
+            }
         });
     }
 
