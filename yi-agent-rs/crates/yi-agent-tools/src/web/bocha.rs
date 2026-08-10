@@ -37,6 +37,20 @@ impl BochaSearchProvider {
         }
     }
 
+    #[cfg(test)]
+    fn with_base_url_for_test(api_key: String, base_url: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("failed to build reqwest client");
+        Self {
+            client,
+            api_key,
+            base_url,
+        }
+    }
+
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var("BOCHA_API_KEY").ok()?;
         Some(Self::new(api_key))
@@ -207,7 +221,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = BochaSearchProvider::with_base_url("test-key".to_string(), server.uri());
+        let provider =
+            BochaSearchProvider::with_base_url_for_test("test-key".to_string(), server.uri());
         let results = provider.search("test query", 5).await.unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "Result One");
@@ -237,7 +252,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = BochaSearchProvider::with_base_url("test-key".to_string(), server.uri());
+        let provider =
+            BochaSearchProvider::with_base_url_for_test("test-key".to_string(), server.uri());
         let results = provider.search("nothing", 5).await.unwrap();
         assert!(results.is_empty());
     }
@@ -251,7 +267,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = BochaSearchProvider::with_base_url("bad-key".to_string(), server.uri());
+        let provider =
+            BochaSearchProvider::with_base_url_for_test("bad-key".to_string(), server.uri());
         let result = provider.search("test", 5).await;
         assert!(matches!(result, Err(ToolsError::SearchEngine(_))));
     }
@@ -265,7 +282,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = BochaSearchProvider::with_base_url("test-key".to_string(), server.uri());
+        let provider =
+            BochaSearchProvider::with_base_url_for_test("test-key".to_string(), server.uri());
         let result = provider.search("test", 5).await;
         assert!(matches!(result, Err(ToolsError::SearchEngine(_))));
     }
@@ -298,7 +316,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = BochaSearchProvider::with_base_url("test-key".to_string(), server.uri());
+        let provider =
+            BochaSearchProvider::with_base_url_for_test("test-key".to_string(), server.uri());
         let results = provider.search("test", 1).await.unwrap();
         assert_eq!(results[0].snippet, "LONG SUMMARY");
     }
