@@ -901,21 +901,6 @@ impl RuntimeCoordinator {
                     "rework delivery acknowledgement was not durable",
                 )
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
-            let recovery = serde_json::to_string(&serde_json::json!({
-                "reason": "ambiguous_rework_delivery",
-                "message_ids": rework_messages,
-            }))
-            .expect("recovery evidence is serializable");
-            self.repository
-                .lock()
-                .expect("runtime repository mutex poisoned")
-                .transition_task_and_attempt_with_terminal(
-                    task,
-                    &attempt,
-                    "recovery_required",
-                    RuntimeEvent::TaskRecoveryRequired,
-                    &recovery,
-                )?;
             self.recovery_contexts
                 .lock()
                 .expect("runtime recovery context mutex poisoned")
@@ -933,6 +918,21 @@ impl RuntimeCoordinator {
             if is_subagent {
                 self.release_resident_lease(task);
             }
+            let recovery = serde_json::to_string(&serde_json::json!({
+                "reason": "ambiguous_rework_delivery",
+                "message_ids": rework_messages,
+            }))
+            .expect("recovery evidence is serializable");
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .transition_task_and_attempt_with_terminal(
+                    task,
+                    &attempt,
+                    "recovery_required",
+                    RuntimeEvent::TaskRecoveryRequired,
+                    &recovery,
+                )?;
             return Err(RuntimeCoordinatorError::Repository(error));
         }
         Ok(())

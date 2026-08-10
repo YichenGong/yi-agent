@@ -84,6 +84,7 @@ impl AgentWorkerFactory for FailingFactory {
 struct MessageRecordingFactory {
     starts: Arc<Mutex<Vec<WorkerStart>>>,
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
+    recovery_preflights: Arc<Mutex<Vec<WorkerRecoveryPreflight>>>,
 }
 
 impl AgentWorkerFactory for MessageRecordingFactory {
@@ -93,8 +94,9 @@ impl AgentWorkerFactory for MessageRecordingFactory {
 
     fn preflight_recovery(
         &self,
-        _request: WorkerRecoveryPreflight,
+        request: WorkerRecoveryPreflight,
     ) -> WorkerRecoveryPreflightResult {
+        self.recovery_preflights.lock().unwrap().push(request);
         WorkerRecoveryPreflightResult::Attested(durable_attestation())
     }
 
@@ -693,6 +695,71 @@ async fn rework_acknowledgement_failure_enters_controlled_recovery_before_replay
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn failed_recovery_persistence_retains_the_admission_context_for_explicit_resume() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_rework_delivery_ack
+             BEFORE UPDATE OF delivered_at ON mailbox_messages
+             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
+             END;
+             CREATE TRIGGER fail_recovery_transition
+             BEFORE UPDATE OF state_json ON tasks
+             WHEN NEW.state_json = 'recovery_required'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected recovery transition failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(
+        coordinator
+            .rework_review(&child, "rerun the parser regression suite")
+            .await
+            .is_err()
+    );
+    assert!(
+        factory.handles.lock().unwrap()[1]
+            .cancellation_token()
+            .is_cancelled()
+    );
+    let expected: (Option<String>, Option<String>, String) = connection
+        .query_row(
+            "SELECT tasks.workspace_lease_id, attempts.checkpoint_json, attempts.usage_json
+             FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
+             WHERE tasks.id = ?1",
+            [child.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    connection
+        .execute_batch(
+            "DROP TRIGGER fail_rework_delivery_ack;
+             DROP TRIGGER fail_recovery_transition;",
+        )
+        .unwrap();
+    coordinator.resume_task(&session, &child).await.unwrap();
+
+    let preflights = factory.recovery_preflights.lock().unwrap();
+    let context = &preflights
+        .last()
+        .expect("resume must pass the recovery gate")
+        .context;
+    assert_eq!(context.workspace_lease_id, expected.0);
+    assert_eq!(context.worktree_lease, durable_context().worktree_lease);
+    assert_eq!(context.checkpoint_json, expected.1.clone().unwrap());
+    assert_eq!(context.tool_state_json, expected.2);
 }
 
 #[tokio::test]
