@@ -1,5 +1,8 @@
 pub mod manager;
+pub mod tools;
 
 pub use manager::{
-    ManagedProcessSnapshot, OnExitPolicy, ProcessManager, ProcessReadResult, ProcessStatus,
+    ManagedProcessSnapshot, OnExitPolicy, ProcessEvent, ProcessManager, ProcessReadResult,
+    ProcessSelector, ProcessStartOptions, ProcessStartResult, ProcessStatus,
 };
+pub use tools::{ProcessKillTool, ProcessListTool, ProcessReadTool, ProcessStartTool};
