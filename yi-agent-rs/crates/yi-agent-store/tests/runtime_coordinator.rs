@@ -164,8 +164,12 @@ struct WorkspaceObservingFactory {
 }
 
 impl AgentWorkerFactory for WorkspaceObservingFactory {
-    fn recovery_context(&self) -> WorkerRecoveryContext {
-        durable_context()
+    fn recovery_context_for(&self, request: &WorkerStart) -> WorkerRecoveryContext {
+        request
+            .workspace
+            .as_ref()
+            .map(workspace_recovery_context)
+            .unwrap_or_else(durable_context)
     }
 
     fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
@@ -185,6 +189,55 @@ impl AgentWorkerFactory for WorkspaceObservingFactory {
         assert_eq!(request.workspace_lease_id, Some(persisted.lease_id.clone()));
         self.starts.lock().unwrap().push(request.clone());
         Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+fn workspace_recovery_context(workspace: &WorkerWorkspace) -> WorkerRecoveryContext {
+    WorkerRecoveryContext {
+        workspace_lease_id: Some(format!("workspace:{}", workspace.path.display())),
+        worktree_lease: Some(format!("worktree:{}", workspace.repository_root.display())),
+        checkpoint_json: r#"{"state":"workspace-test"}"#.into(),
+        tool_state_json: r#"{"state":"workspace-test"}"#.into(),
+    }
+}
+
+#[derive(Clone)]
+struct DerivedWorkspaceService {
+    repository_root: std::path::PathBuf,
+}
+
+impl AgentWorkspaceService for DerivedWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path: self.repository_root.join(format!("root-{task_id}")),
+            branch: format!("feat/root-{task_id}"),
+            parent_branch: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        })
+    }
+
+    fn prepare_child(
+        &self,
+        parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: parent.repository_root.clone(),
+            path: parent.repository_root.join(format!("child-{task_id}")),
+            branch: format!("feat/child-{task_id}"),
+            parent_branch: parent.branch.clone(),
+            base_commit: parent.base_commit.clone(),
+        })
     }
 }
 
@@ -374,6 +427,42 @@ async fn worker_receives_its_persisted_workspace_before_provider_start() {
             .as_ref()
             .map(|workspace| &workspace.path),
         Some(&persisted.path)
+    );
+}
+
+#[tokio::test]
+async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(WorkspaceObservingFactory {
+        database: database.clone(),
+        starts: Arc::clone(&starts),
+        workspace_service: Arc::new(DerivedWorkspaceService {
+            repository_root: directory.path().join("repo"),
+        }),
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    let workspace = repository.task_workspace(&child).unwrap();
+    let persisted_lease: Option<String> = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT workspace_lease_id FROM tasks WHERE id = ?1",
+            [child.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted_lease,
+        Some(format!("workspace:{}", workspace.path.display()))
     );
 }
 

@@ -902,11 +902,12 @@ impl RuntimeCoordinator {
             recovery_request = recovery_request.with_workspace(workspace);
         }
         let mut recovery_context = self.factory.recovery_context_for(&recovery_request);
-        if let Some(workspace) = supervisor
-            .task(task)
-            .expect("worker task exists")
-            .workspace
-            .as_ref()
+        if workspace_assignment.is_none()
+            && let Some(workspace) = supervisor
+                .task(task)
+                .expect("worker task exists")
+                .workspace
+                .as_ref()
         {
             recovery_context.workspace_lease_id = Some(format!("workspace:{workspace}"));
         }
