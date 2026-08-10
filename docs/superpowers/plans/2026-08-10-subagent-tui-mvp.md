@@ -390,7 +390,7 @@ Expected: user checkout HEAD/status 在测试前后不变；随后完成两阶�
 - Test: `yi-agent-rs/crates/yi-agent-store/tests/runtime_ipc.rs`
 - Test: `yi-agent-rs/crates/yi-agent/src/tui/subagents.rs`
 
-- [ ] **Step 1：写 attach 幂等、capability 与显式启动 RED**
+- [x] **Step 1：写 attach 幂等、capability 与显式启动 RED**
 
 ```rust
 #[test]
@@ -415,7 +415,7 @@ fn delegation_tool_rejects_a_capability_from_another_attached_root() {
 
 TUI unit test证明 disconnected 状态只产生 `RuntimeStartPrompt`，用户确认前 launcher 调用数为 0。
 
-- [ ] **Step 2：运行 RED**
+- [x] **Step 2：运行 RED**
 
 ```bash
 cargo test -p yi-agent-store --test runtime_ipc application_root_attach_is_idempotent_and_returns_the_same_workspace -- --exact
@@ -424,7 +424,7 @@ cargo test -p yi-agent --bin yi-agent tui::subagents::tests -- --nocapture
 
 Expected: attach IPC 和 TUI runtime model 尚不存在。
 
-- [ ] **Step 3：增加外部根任务 typed IPC**
+- [x] **Step 3：增加外部根任务 typed IPC**
 
 ```rust
 IpcRequest::AttachApplicationRoot { idempotency_key: String },
@@ -454,7 +454,7 @@ IpcResponse::ApplicationRootDetached,
 
 repository 使用 `sha2 = "0.10"` 只保存 capability SHA-256 digest。重复 idempotency key 返回同一记录；`Activate` 原子记录首轮 objective 并把 queued root 变为 running；`Detach` 进入 pause/recovery 边界，不得记录 completed。
 
-- [ ] **Step 4：实现 TUI runtime bootstrap 与工具注册**
+- [x] **Step 4：实现 TUI runtime bootstrap 与工具注册**
 
 ```rust
 pub enum RuntimeStartupChoice { Start, ContinueWithoutDelegation }
@@ -474,7 +474,7 @@ pub enum TuiRuntimeMode {
 
 用户选择后再返回 mode。`main.rs` 使用 attachment workspace 重建 PermissionChecker 和 builtin tool registry，并调用 `register_application_subagent_tools` 注册三个 daemon proxy tools。第一条输入送给 Agent 前先 `Activate`，退出时 `Detach`。
 
-- [ ] **Step 5：验证自然语言 Agent 可见工具且无 `/delegate`**
+- [x] **Step 5：验证自然语言 Agent 可见工具且无 `/delegate`**
 
 ```rust
 #[test]
@@ -491,7 +491,7 @@ fn attached_tui_root_exposes_subagent_tools_without_a_delegate_command() {
 }
 ```
 
-- [ ] **Step 6：运行 GREEN、格式化并提交**
+- [x] **Step 6：运行 GREEN、格式化并提交**
 
 ```bash
 cargo test -p yi-agent-core --lib subagent::supervisor
@@ -505,6 +505,19 @@ git commit -m "feat: attach TUI sessions to the subagent runtime"
 ```
 
 Expected: attach/bootstrap 测试通过；随后完成两阶段 review 和父 Agent 复验。
+
+**Completion evidence (2026-08-11):**
+
+- Commits: `e5096c1`, `db90804`, `47f22c7`, `efb2035`, `4240e8d`, `2de830a`, `d497408`.
+- Verified commands:
+  - `cargo test -p yi-agent-core --lib subagent::supervisor` → 9 passed.
+  - `cargo test -p yi-agent-store --test runtime_ipc` → 70 passed.
+  - `cargo test -p yi-agent --bin yi-agent tui::subagents::tests -- --nocapture` → 3 passed.
+  - `cargo test -p yi-agent --bin yi-agent runtime_start_prompt -- --nocapture` → 2 passed.
+  - `cargo test -p yi-agent --bin yi-agent tests::build_tui_root_tools_registers_subagent_tools_for_attached_runtime -- --exact --nocapture` → 1 passed.
+  - `cargo test -p yi-agent --bin yi-agent subagent_runtime::tests::worker_wait_proxy_rejects_unbound_capability -- --exact --nocapture` → 1 passed.
+  - `cargo fmt --all && just fmt-check && git diff --check` passed.
+- Fresh final rereview result: no Critical / Important / Minor findings; ready to proceed to Task 5.
 
 ### Task 5：产生真实 commit delivery 并执行受信任的直接父集成
 
