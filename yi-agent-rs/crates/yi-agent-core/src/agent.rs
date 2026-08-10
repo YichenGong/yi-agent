@@ -122,7 +122,15 @@ Task execution:
 - When information is missing, make a reasonable assumption, state it
   briefly, and continue. Do not stop to ask unless the assumption would
   be risky or irreversible.
-- Do not substitute a narrower or easier task for the one requested."#
+- Do not substitute a narrower or easier task for the one requested.
+
+File discovery:
+- Avoid unbounded recursive glob calls at repository roots, such as
+  glob({"path":".","pattern":"**/*"}). Prefer `rg --files`, targeted
+  subdirectories, file-type constrained patterns, or search-first workflows.
+- Avoid scanning generated or heavy directories such as `.git/`, `target/`,
+  `node_modules/`, `.worktrees/`, caches, and build outputs unless explicitly
+  required."#
             .to_string()
     }
 }
@@ -2039,6 +2047,15 @@ mod tests {
         assert!(prompt.contains("minimizing round-trips"));
         assert!(prompt.contains("MULTIPLE tool calls"));
         assert!(prompt.contains("&&"));
+    }
+
+    #[test]
+    fn default_system_prompt_discourages_unbounded_glob() {
+        let prompt = AgentConfig::default_system_prompt();
+        assert!(prompt.contains("glob({\"path\":\".\",\"pattern\":\"**/*\"})"));
+        assert!(prompt.contains("rg --files"));
+        assert!(prompt.contains("target/"));
+        assert!(prompt.contains(".worktrees/"));
     }
 
     #[test]
