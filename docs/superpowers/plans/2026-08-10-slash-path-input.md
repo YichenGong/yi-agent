@@ -22,7 +22,7 @@
 - Modify: `yi-agent-rs/crates/yi-agent/src/tui/app.rs: around the handle_key Submit routing tests`
 - Test: `yi-agent-rs/crates/yi-agent/src/tui/app.rs`
 
-- [ ] **Step 1: Add the failing multi-segment path submission test**
+- [x] **Step 1: Add the failing multi-segment path submission test**
 
   Add this test beside the existing `handle_key Submit` tests. It calls the production routing path directly and asserts both the returned outcome and channel payload.
 
@@ -58,7 +58,7 @@
   }
   ```
 
-- [ ] **Step 2: Run the new test and verify it fails for the expected reason**
+- [x] **Step 2: Run the new test and verify it fails for the expected reason**
 
   Run:
 
@@ -68,7 +68,7 @@
 
   Expected: FAIL because the current routing produces `KeyOutcome::None` and does not send the path to `input_tx`.
 
-- [ ] **Step 3: Add the single-segment path regression test**
+- [x] **Step 3: Add the single-segment path regression test**
 
   Add this test using the same channel and `handle_key` setup. It defines the boundary requested in the design.
 
@@ -106,7 +106,7 @@
   }
   ```
 
-- [ ] **Step 4: Run both focused tests and verify only the new path test fails**
+- [x] **Step 4: Run both focused tests and verify only the new path test fails**
 
   Run:
 
@@ -123,7 +123,7 @@
 - Modify: `yi-agent-rs/crates/yi-agent/src/tui/app.rs: InputAction::Submit branch`
 - Test: `yi-agent-rs/crates/yi-agent/src/tui/app.rs`
 
-- [ ] **Step 1: Add a pure classifier for path-like leading tokens**
+- [x] **Step 1: Add a pure classifier for path-like leading tokens**
 
   Insert this helper above `handle_key`:
 
@@ -137,7 +137,7 @@
 
   This intentionally inspects only the leading token and does not access the filesystem.
 
-- [ ] **Step 2: Guard the existing local-command branch**
+- [x] **Step 2: Guard the existing local-command branch**
 
   Change the current submit condition from:
 
@@ -153,7 +153,7 @@
 
   Leave the command name, argument extraction, local execution, and unknown-command separator unchanged. A classified path then falls through to the existing `UserMessage` history insertion and `input_tx.blocking_send` code.
 
-- [ ] **Step 3: Run the focused tests and verify they pass**
+- [x] **Step 3: Run the focused tests and verify they pass**
 
   Run:
 
@@ -163,7 +163,7 @@
 
   Expected: all matching tests pass, including the two regression tests.
 
-- [ ] **Step 4: Run the existing unknown-command UI regression**
+- [x] **Step 4: Run the existing unknown-command UI regression**
 
   Run:
 
@@ -173,7 +173,7 @@
 
   Expected: PASS; `/foo` remains a local unknown-command error.
 
-- [ ] **Step 5: Commit the tested implementation**
+- [x] **Step 5: Commit the tested implementation**
 
   ```bash
   git add yi-agent-rs/crates/yi-agent/src/tui/app.rs
@@ -186,7 +186,7 @@
 - Modify: `docs/project-management/yi-agent-tui.md`
 - Modify: `docs/project-management/README.md`
 
-- [ ] **Step 1: Record the completed behavior in the TUI module document**
+- [x] **Step 1: Record the completed behavior in the TUI module document**
 
   Add this completed feature entry before the remaining unchecked InlineRenderer item:
 
@@ -194,11 +194,11 @@
   - [x] 多层绝对路径输入转发 — `tui/app.rs` 在首个空白符前的 token 含至少两个 `/` 时将完整输入发送给 agent；单层 `/tmp` 仍显示 `未知命令`；验证：`cargo test -p yi-agent --bin yi-agent tui::app::tests::submit_` 和 `cargo test -p yi-agent --bin yi-agent tui::app::tests::unknown_slash_command_shows_error`
   ```
 
-- [ ] **Step 2: Update the module index count**
+- [x] **Step 2: Update the module index count**
 
   In `docs/project-management/README.md`, change the `yi-agent-tui` table value from `18 / 19` to `19 / 20`.
 
-- [ ] **Step 3: Format and run final verification**
+- [x] **Step 3: Format and run final verification**
 
   First ensure no other Cargo process is active:
 
@@ -216,7 +216,7 @@
 
   Expected: formatting succeeds and every focused test passes. Do not run workspace-wide tests for this focused TUI routing change.
 
-- [ ] **Step 4: Review the final diff**
+- [x] **Step 4: Review the final diff**
 
   Run:
 
@@ -227,14 +227,14 @@
 
   Expected: no whitespace errors; only the two project-management files remain uncommitted.
 
-- [ ] **Step 5: Commit the tracking documentation**
+- [x] **Step 5: Commit the tracking documentation**
 
   ```bash
   git add docs/project-management/yi-agent-tui.md docs/project-management/README.md
   git commit -m "docs: track slash path input routing"
   ```
 
-- [ ] **Step 6: Verify the branch history and working tree**
+- [x] **Step 6: Verify the branch history and working tree**
 
   Run:
 
