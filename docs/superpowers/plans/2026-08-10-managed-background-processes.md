@@ -922,7 +922,6 @@ impl ProcessManager {
                     process.status = ProcessStatus::Exited { code };
                     process.ready = false;
                 }
-            }
                 process.child = None;
             }
             let was_killed = processes
