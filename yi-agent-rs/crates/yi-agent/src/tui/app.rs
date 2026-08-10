@@ -421,6 +421,9 @@ fn run_loop<B: Backend, E: EventSource>(
                 sync_popup(&mut popup, &input.buffer);
             }
             Some(Event::Paste(text)) => {
+                if runtime_popup.blocks_text_input() {
+                    continue;
+                }
                 handle_paste(
                     text,
                     input,
@@ -464,6 +467,10 @@ impl RuntimePopup {
             Self::Bash(popup) => Some(popup),
             _ => None,
         }
+    }
+
+    fn blocks_text_input(&self) -> bool {
+        !matches!(self, Self::None)
     }
 
     fn switch_tab(&mut self, process_ids: Vec<String>) {
@@ -1717,6 +1724,13 @@ mod tests {
             popup,
             RuntimePopup::Processes(ProcessPopup::List(_))
         ));
+    }
+
+    #[test]
+    fn process_runtime_popup_blocks_text_input() {
+        let popup = RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
+
+        assert!(popup.blocks_text_input());
     }
 
     #[test]
