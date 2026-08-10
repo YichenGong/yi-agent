@@ -282,7 +282,7 @@ Expected: 三组测试通过；随后完成两阶段 review 和父 Agent 复验�
 - Test: `yi-agent-rs/crates/yi-agent-store/tests/runtime_coordinator.rs`
 - Test: `yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs`
 
-- [ ] **Step 1：写 root/child provisioning RED**
+- [x] **Step 1：写 root/child provisioning RED**
 
 ```rust
 #[test]
@@ -304,7 +304,7 @@ fn root_and_child_worktrees_are_distinct_and_begin_at_the_recorded_parent_head()
 
 coordinator 测试还要断言 factory start 前 workspace 已持久化，且 `WorkerStart.workspace.path` 与 repository 完全一致。
 
-- [ ] **Step 2：运行 RED**
+- [x] **Step 2：运行 RED**
 
 ```bash
 cargo test -p yi-agent-tools --test subagent_worktree root_and_child_worktrees_are_distinct_and_begin_at_the_recorded_parent_head -- --exact
@@ -313,7 +313,7 @@ cargo test -p yi-agent-store --test runtime_coordinator worker_receives_its_pers
 
 Expected: `create_root` 和 workspace service injection 尚不存在。
 
-- [ ] **Step 3：定义 workspace service 边界**
+- [x] **Step 3：定义 workspace service 边界**
 
 ```rust
 pub trait AgentWorkspaceService: Send + Sync {
@@ -336,7 +336,7 @@ pub trait AgentWorkspaceService: Send + Sync {
 
 提供 `UnavailableWorkspaceService`，只允许非 coding mock 测试显式使用；它返回 `WorkerError::Startup("coding workspace service is unavailable")`，不得回退到当前目录。
 
-- [ ] **Step 4：实现 Git service 并接入 coordinator**
+- [x] **Step 4：实现 Git service 并接入 coordinator**
 
 `WorktreeService::create_root` 复用 parent-base 验证。`DaemonWorkspaceService` 使用稳定命名：
 
@@ -356,11 +356,11 @@ fn short(value: &str) -> String {
 
 root/child task 先以 queued 持久化，再 provision 并记录 assignment，最后才 admit worker。provisioning 失败在 provider 之前持久化为 failed，并保留 Git evidence。
 
-- [ ] **Step 5：让 worker tools/recovery 使用 assignment.path**
+- [x] **Step 5：让 worker tools/recovery 使用 assignment.path**
 
 `DaemonAgentWorkerFactory::start_with_provider_turn_gate` 必须读取 `request.workspace`，并为其 path 重建 builtin tool registry。`recovery_context` 改为接收对应 `WorkerStart`；删除全局 workspace 复用。
 
-- [ ] **Step 6：运行 GREEN、格式化并提交**
+- [x] **Step 6：运行 GREEN、格式化并提交**
 
 ```bash
 cargo test -p yi-agent-tools --test subagent_worktree
