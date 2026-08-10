@@ -2830,7 +2830,95 @@ impl RuntimeRepository {
         workspace: &WorkerWorkspace,
     ) -> Result<(), RepositoryError> {
         validate_task_workspace(task, workspace)?;
+        let repository_root =
+            workspace_path_str(task, "repository_root", &workspace.repository_root)?;
+        let path = workspace_path_str(task, "path", &workspace.path)?;
         let transaction = self.connection.transaction()?;
+        let active_attempt_matches = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM tasks
+                JOIN attempts ON attempts.id = ?2 AND attempts.task_id = tasks.id
+                WHERE tasks.id = ?1 AND tasks.active_attempt_id = ?2
+             )",
+            params![task.to_string(), attempt.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !active_attempt_matches {
+            return Err(RepositoryError::InvalidTaskWorkspace {
+                task: task.to_string(),
+                reason: "workspace attempt is not the task's active attempt".into(),
+            });
+        }
+
+        let existing = transaction
+            .query_row(
+                "SELECT attempt_id, lease_id, repository_root, path, branch, parent_branch, base_commit
+                 FROM task_workspaces WHERE task_id = ?1",
+                params![task.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((
+            existing_attempt,
+            lease_id,
+            repository_root,
+            path,
+            branch,
+            parent_branch,
+            base_commit,
+        )) = existing
+        {
+            let existing_workspace = persisted_task_workspace(
+                task,
+                lease_id,
+                repository_root,
+                path,
+                branch,
+                parent_branch,
+                base_commit,
+            )?;
+            if existing_attempt == attempt.to_string() && existing_workspace == *workspace {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(RepositoryError::InvalidTaskWorkspace {
+                task: task.to_string(),
+                reason: "workspace assignment conflicts with an existing task workspace".into(),
+            });
+        }
+
+        let conflicting_task = transaction
+            .query_row(
+                "SELECT task_id FROM task_workspaces
+                 WHERE lease_id = ?1 OR path = ?2 OR (repository_root = ?3 AND branch = ?4)
+                 LIMIT 1",
+                params![
+                    workspace.lease_id.to_string(),
+                    path,
+                    repository_root,
+                    workspace.branch.as_str(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(conflicting_task) = conflicting_task {
+            return Err(RepositoryError::InvalidTaskWorkspace {
+                task: task.to_string(),
+                reason: format!("workspace assignment conflicts with task {conflicting_task}"),
+            });
+        }
+
         transaction.execute(
             "INSERT INTO task_workspaces (
                 task_id, attempt_id, lease_id, repository_root, path,
@@ -2840,20 +2928,26 @@ impl RuntimeRepository {
                 task.to_string(),
                 attempt.to_string(),
                 workspace.lease_id.to_string(),
-                workspace.repository_root.to_string_lossy(),
-                workspace.path.to_string_lossy(),
+                repository_root,
+                path,
                 workspace.branch.as_str(),
                 workspace.parent_branch.as_str(),
                 workspace.base_commit.as_str(),
             ],
         )?;
         let updated = transaction.execute(
-            "UPDATE tasks SET workspace_lease_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-            params![workspace.lease_id.to_string(), task.to_string()],
+            "UPDATE tasks SET workspace_lease_id = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3",
+            params![
+                workspace.lease_id.to_string(),
+                task.to_string(),
+                attempt.to_string(),
+            ],
         )?;
         if updated == 0 {
-            return Err(RepositoryError::TaskNotFound {
+            return Err(RepositoryError::InvalidTaskWorkspace {
                 task: task.to_string(),
+                reason: "workspace attempt is no longer active".into(),
             });
         }
         transaction.commit()?;
@@ -3681,18 +3775,8 @@ fn validate_task_workspace(
     task: &TaskId,
     workspace: &WorkerWorkspace,
 ) -> Result<(), RepositoryError> {
-    if workspace.repository_root.as_os_str().is_empty() {
-        return Err(RepositoryError::InvalidTaskWorkspace {
-            task: task.to_string(),
-            reason: "repository_root is empty".into(),
-        });
-    }
-    if workspace.path.as_os_str().is_empty() {
-        return Err(RepositoryError::InvalidTaskWorkspace {
-            task: task.to_string(),
-            reason: "path is empty".into(),
-        });
-    }
+    workspace_path_str(task, "repository_root", &workspace.repository_root)?;
+    workspace_path_str(task, "path", &workspace.path)?;
     for (field, value) in [
         ("branch", workspace.branch.as_str()),
         ("parent_branch", workspace.parent_branch.as_str()),
@@ -3706,6 +3790,26 @@ fn validate_task_workspace(
         }
     }
     Ok(())
+}
+
+fn workspace_path_str<'a>(
+    task: &TaskId,
+    field: &str,
+    path: &'a Path,
+) -> Result<&'a str, RepositoryError> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| RepositoryError::InvalidTaskWorkspace {
+            task: task.to_string(),
+            reason: format!("{field} is not valid UTF-8"),
+        })?;
+    if value.is_empty() {
+        return Err(RepositoryError::InvalidTaskWorkspace {
+            task: task.to_string(),
+            reason: format!("{field} is empty"),
+        });
+    }
+    Ok(value)
 }
 
 fn persisted_task_workspace(
@@ -3982,10 +4086,11 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
                 lease_id TEXT NOT NULL UNIQUE,
                 repository_root TEXT NOT NULL,
                 path TEXT NOT NULL UNIQUE,
-                branch TEXT NOT NULL UNIQUE,
+                branch TEXT NOT NULL,
                 parent_branch TEXT NOT NULL,
                 base_commit TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(repository_root, branch)
              );
              CREATE TABLE application_root_attachments (
                 idempotency_key TEXT PRIMARY KEY,

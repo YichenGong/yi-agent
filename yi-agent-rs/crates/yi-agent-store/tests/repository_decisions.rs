@@ -28,6 +28,13 @@ fn test_workspace(session: &RootSessionId, task: &TaskId) -> WorkerWorkspace {
     }
 }
 
+fn assert_invalid_workspace(error: RepositoryError) {
+    assert!(matches!(
+        error,
+        RepositoryError::InvalidTaskWorkspace { .. }
+    ));
+}
+
 #[test]
 fn task_workspace_round_trips_every_git_identity_field() {
     let directory = TempDir::new().unwrap();
@@ -41,6 +48,169 @@ fn task_workspace_round_trips_every_git_identity_field() {
         .unwrap();
 
     assert_eq!(repository.task_workspace(&task).unwrap(), workspace);
+}
+
+#[test]
+fn task_workspace_rejects_attempt_from_another_task() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, task, _attempt) = persisted_root(&mut repository);
+    let (_other_session, _other_task, other_attempt) = persisted_root(&mut repository);
+    let workspace = test_workspace(&session, &task);
+
+    let error = repository
+        .record_task_workspace(&task, &other_attempt, &workspace)
+        .unwrap_err();
+
+    assert_invalid_workspace(error);
+    assert_eq!(repository.task_workspace_optional(&task).unwrap(), None);
+}
+
+#[test]
+fn task_workspace_rejects_stale_non_active_attempt() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, task, stale_attempt) = persisted_root(&mut repository);
+    let active_attempt = AttemptId::new();
+    repository
+        .activate_successor_attempt(
+            &task,
+            &active_attempt,
+            2,
+            "queued",
+            RuntimeEvent::TaskQueued,
+        )
+        .unwrap();
+    let workspace = test_workspace(&session, &task);
+
+    let error = repository
+        .record_task_workspace(&task, &stale_attempt, &workspace)
+        .unwrap_err();
+
+    assert_invalid_workspace(error);
+    assert_eq!(repository.task_workspace_optional(&task).unwrap(), None);
+}
+
+#[test]
+fn task_workspace_recording_is_idempotent_for_identical_retry() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, task, attempt) = persisted_root(&mut repository);
+    let workspace = test_workspace(&session, &task);
+
+    repository
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap();
+    repository
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap();
+
+    assert_eq!(repository.task_workspace(&task).unwrap(), workspace);
+}
+
+#[test]
+fn task_workspace_rejects_conflicting_duplicate_assignment() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, task, attempt) = persisted_root(&mut repository);
+    let workspace = test_workspace(&session, &task);
+    repository
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap();
+    let active_attempt = AttemptId::new();
+    repository
+        .activate_successor_attempt(
+            &task,
+            &active_attempt,
+            2,
+            "queued",
+            RuntimeEvent::TaskQueued,
+        )
+        .unwrap();
+    let conflicting = WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: workspace.repository_root.clone(),
+        path: workspace.path.with_file_name("different-task"),
+        branch: format!("{}-conflict", workspace.branch),
+        parent_branch: workspace.parent_branch.clone(),
+        base_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+    };
+
+    let error = repository
+        .record_task_workspace(&task, &active_attempt, &conflicting)
+        .unwrap_err();
+
+    assert_invalid_workspace(error);
+    assert_eq!(repository.task_workspace(&task).unwrap(), workspace);
+}
+
+#[test]
+fn task_workspace_branch_names_are_unique_only_within_a_repository() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, first_task, first_attempt) = persisted_root(&mut repository);
+    let (_second_session, second_task, second_attempt) = persisted_root(&mut repository);
+    let first_workspace = test_workspace(&session, &first_task);
+    let second_workspace = WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: "/tmp/other-repository".into(),
+        path: format!("/tmp/other-repository/.worktrees/{second_task}").into(),
+        branch: first_workspace.branch.clone(),
+        parent_branch: first_workspace.parent_branch.clone(),
+        base_commit: first_workspace.base_commit.clone(),
+    };
+
+    repository
+        .record_task_workspace(&first_task, &first_attempt, &first_workspace)
+        .unwrap();
+    repository
+        .record_task_workspace(&second_task, &second_attempt, &second_workspace)
+        .unwrap();
+
+    assert_eq!(
+        repository.task_workspace(&first_task).unwrap(),
+        first_workspace
+    );
+    assert_eq!(
+        repository.task_workspace(&second_task).unwrap(),
+        second_workspace
+    );
+}
+
+#[test]
+fn task_workspace_rejects_duplicate_branch_in_the_same_repository() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, first_task, first_attempt) = persisted_root(&mut repository);
+    let (_second_session, second_task, second_attempt) = persisted_root(&mut repository);
+    let first_workspace = test_workspace(&session, &first_task);
+    let conflicting_workspace = WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: first_workspace.repository_root.clone(),
+        path: first_workspace.path.with_file_name("second-task"),
+        branch: first_workspace.branch.clone(),
+        parent_branch: first_workspace.parent_branch.clone(),
+        base_commit: first_workspace.base_commit.clone(),
+    };
+
+    repository
+        .record_task_workspace(&first_task, &first_attempt, &first_workspace)
+        .unwrap();
+    let error = repository
+        .record_task_workspace(&second_task, &second_attempt, &conflicting_workspace)
+        .unwrap_err();
+
+    assert_invalid_workspace(error);
+    assert_eq!(
+        repository.task_workspace_optional(&second_task).unwrap(),
+        None
+    );
 }
 
 #[test]
