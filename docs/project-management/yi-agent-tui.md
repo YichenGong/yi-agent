@@ -13,7 +13,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - 输入行编辑器（自实现，不依赖 reedline）
 - 多行自动换行（unicode-width + CJK 宽度感知）
 - Slash 命令弹窗（自动补全 + 中文描述 + Up/Down/Tab/Enter 导航）
-- 两步退出确认（Ctrl+C / Esc 两次退出）
+- 两步退出确认（仅 Ctrl+C 两次退出）
 - 输入排队（agent 运行期间粘贴的输入进队列，结束后回放）
 - 状态栏（实时 token 计数 + 模型名 + 运行中任务指示）
 - Bash 全屏弹窗（Ctrl+P 查看运行中/已完成 bash 实时输出 + exit code）
@@ -31,7 +31,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] Markdown 渲染 — `tui/markdown.rs` 用 pulldown-cmark + 表格 Unicode box drawing — [设计](../plans/2026-07-25-tui-history-redesign.md)
 - [x] LaTeX 终端渲染 — `tui/markdown.rs` 支持 `$...$`、`$$...$$`、`\\(...\\)`、`\\[...\\]` 并按终端宽度换行；验证：`cargo test -p yi-agent tui::markdown::tests -- --nocapture`
 - [x] 输入框多行自动换行 — `tui/input.rs` 实现 CJK 宽度感知换行
-- [x] 两步退出确认 — `tui/app.rs` Ctrl+C / Esc 两次才退出 — [设计](../plans/2026-07-24-yi-agent-tui-features-design.md)
+- [x] 两步退出确认 — `tui/app.rs` Ctrl+C 两次才退出；Esc 只打断运行中的 agent 或命令，不退出进程；验证：`cargo test -p yi-agent --bin yi-agent tui::app::tests::repeated_esc_does_not_quit` — [设计](../plans/2026-07-24-yi-agent-tui-features-design.md)
 - [x] Slash 命令弹窗 — `tui/slash.rs` 实现自动补全 + 中文描述 — [设计](../plans/2026-07-25-tui-slash-commands-design.md)
 - [x] 输入框光标可见 — `tui/input.rs` 反色显示（白底黑字）
 - [x] 输入排队 — `tui/queued.rs::QueuedInput` 在 agent 运行期间缓存输入 — [设计](../plans/2026-07-25-tui-queued-input-design.md)
