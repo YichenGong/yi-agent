@@ -17,3 +17,4 @@
 - [ ] 当遇到一系列的待确认项的时候，最好有进度条。
 - [ ] 两次ESC不应该直接退出Agent的进程。ESC可以打断命令执行，可以打断对话，但是不应该退出整体进程。
 - [x] `--yolo` 条件下，`/dev/null` 受 sandbox 限制阻断 — `crates/yi-agent/src/config.rs` 在未显式指定 `--sandbox` 或 `YI_AGENT_SANDBOX` 时选择 `danger-full-access`，从而不经 sandbox wrapper 执行；验证：`cargo test -p yi-agent --bin yi-agent config::tests::load_yolo_from_cli_flag`。
+- [ ] 自动压缩后，Prefill的数字好像不会自动更新了。
