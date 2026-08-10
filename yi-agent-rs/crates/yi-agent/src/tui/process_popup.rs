@@ -163,9 +163,10 @@ pub fn render_process_detail_popup(
     output: Option<&ProcessReadResult>,
     area: Rect,
 ) -> Paragraph<'static> {
+    let scroll = process_detail_scroll(popup, process, output, area);
     Paragraph::new(process_detail_lines(process, output, area.width))
         .alignment(Alignment::Left)
-        .scroll((popup.scroll as u16, 0))
+        .scroll((scroll as u16, 0))
 }
 
 pub fn process_detail_line_count(
@@ -174,6 +175,19 @@ pub fn process_detail_line_count(
     width: u16,
 ) -> usize {
     process_detail_lines(process, output, width).len()
+}
+
+pub fn process_detail_scroll(
+    popup: &ProcessDetailPopup,
+    process: &ManagedProcessSnapshot,
+    output: Option<&ProcessReadResult>,
+    area: Rect,
+) -> usize {
+    if popup.scroll_locked {
+        process_detail_line_count(process, output, area.width).saturating_sub(area.height as usize)
+    } else {
+        popup.scroll
+    }
 }
 
 pub fn process_detail_lines(
@@ -185,12 +199,14 @@ pub fn process_detail_lines(
     let name = process.name.as_deref().unwrap_or("-");
     lines.push(Line::styled(
         format!(
-            " process {} name={} pid={:?} status={} ready={}",
+            " process {} name={} pid={:?} status={} ready={} elapsed={:.1}s exit_code={:?}",
             process.process_id,
             name,
             process.pid,
             status_word(&process.status),
-            process.ready
+            process.ready,
+            process.elapsed_sec,
+            process.exit_code
         ),
         Style::new().fg(status_color(&process.status)),
     ));
@@ -284,5 +300,27 @@ mod tests {
         assert!(text.contains("listening"));
         assert!(text.contains("warn"));
         assert!(text.contains("proc_1"));
+        assert!(text.contains("elapsed=1.2s"));
+        assert!(text.contains("exit_code=None"));
+    }
+
+    #[test]
+    fn detail_render_scroll_locked_follows_bottom() {
+        let process = snapshot("proc_1", Some("dev"), ProcessStatus::Ready);
+        let output = ProcessReadResult {
+            process_id: "proc_1".into(),
+            name: Some("dev".into()),
+            stdout: (0..20).map(|i| format!("line-{i}\n")).collect(),
+            stderr: String::new(),
+            next_cursor: 10,
+            truncated: false,
+            status: ProcessStatus::Ready,
+            ready: true,
+        };
+
+        let popup = ProcessDetailPopup::new("proc_1".into());
+        let scroll = process_detail_scroll(&popup, &process, Some(&output), Rect::new(0, 0, 80, 5));
+
+        assert!(scroll > 0, "locked detail popup should render at bottom");
     }
 }

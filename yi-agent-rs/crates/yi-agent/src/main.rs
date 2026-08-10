@@ -413,12 +413,7 @@ fn run_headless(
             match process_manager.shutdown().await {
                 Ok(retained) => {
                     for process in retained {
-                        eprintln!(
-                            "retained process: id={} name={} pid={:?}",
-                            process.process_id,
-                            process.name.unwrap_or_else(|| "-".into()),
-                            process.pid
-                        );
+                        eprintln!("{}", retained_process_message(&process));
                     }
                 }
                 Err(error) => eprintln!("process shutdown error: {error}"),
@@ -454,6 +449,7 @@ fn run_tui_agent(
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(8);
         let is_running = Arc::new(AtomicBool::new(false));
+        let tui_process_manager = process_manager.clone();
 
         // Spawn agent driver task (stays on the async runtime)
         let provider_clone = Arc::clone(&provider);
@@ -604,7 +600,7 @@ fn run_tui_agent(
                 decision_tx,
                 is_running,
                 agent_config.model.clone(),
-                process_manager,
+                tui_process_manager,
             )
         });
 
@@ -617,6 +613,14 @@ fn run_tui_agent(
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
+        match process_manager.shutdown().await {
+            Ok(retained) => {
+                for process in retained {
+                    eprintln!("{}", retained_process_message(&process));
+                }
+            }
+            Err(error) => eprintln!("process shutdown error: {error}"),
+        }
 
         result
     });
@@ -635,6 +639,15 @@ pub(crate) enum ControlCommand {
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
+}
+
+fn retained_process_message(process: &yi_agent_tools::ManagedProcessSnapshot) -> String {
+    format!(
+        "retained process: id={} name={} pid={:?}",
+        process.process_id,
+        process.name.as_deref().unwrap_or("-"),
+        process.pid
+    )
 }
 
 fn manual_compaction_outcome_event(
@@ -1026,6 +1039,28 @@ mod tests {
         assert!(read.metadata().read_only);
         assert!(kill.metadata().requires_confirmation);
         assert!(!kill.metadata().read_only);
+    }
+
+    #[test]
+    fn retained_process_message_includes_id_name_and_pid() {
+        let snapshot = yi_agent_tools::ManagedProcessSnapshot {
+            process_id: "proc_1".into(),
+            name: Some("dev".into()),
+            pid: Some(1234),
+            command: "sleep 30".into(),
+            cwd: "/tmp".into(),
+            status: yi_agent_tools::ProcessStatus::Running,
+            ready: true,
+            on_exit: yi_agent_tools::OnExitPolicy::Keep,
+            exit_code: None,
+            elapsed_sec: 1.0,
+        };
+
+        let line = retained_process_message(&snapshot);
+
+        assert!(line.contains("proc_1"));
+        assert!(line.contains("dev"));
+        assert!(line.contains("1234"));
     }
 
     #[test]
