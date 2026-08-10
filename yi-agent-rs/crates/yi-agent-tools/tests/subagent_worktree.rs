@@ -58,6 +58,22 @@ fn root_and_child_worktrees_are_distinct_and_begin_at_the_recorded_parent_head()
 }
 
 #[test]
+fn root_creation_requires_a_clean_committed_parent_base() {
+    let (repo, _head) = repository();
+    let service = WorktreeService::new();
+    std::fs::write(repo.path().join("README.md"), "dirty root\n").unwrap();
+
+    assert!(matches!(
+        service.create_root(
+            repo.path(),
+            "feat/yi-root-dirty",
+            &repo.path().join(".worktrees/yi-root-dirty")
+        ),
+        Err(WorktreeError::DirtyParent { .. })
+    ));
+}
+
+#[test]
 fn child_creation_requires_a_clean_committed_parent_base() {
     let (repo, head) = repository();
     let service = WorktreeService::new();

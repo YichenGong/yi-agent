@@ -62,6 +62,7 @@ impl WorktreeService {
                 path: root_path.to_path_buf(),
             });
         }
+        self.validate_parent_base(repository_root, "HEAD")?;
         let parent_branch = current_branch(repository_root)?;
         let base_commit = self.resolve_parent_base(repository_root, "HEAD")?;
         ensure_worktree_parent_is_ignored(repository_root, root_path)?;
