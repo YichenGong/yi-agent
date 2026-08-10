@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -228,6 +228,7 @@ pub struct ProcessManager {
     root: PathBuf,
     sandbox: SandboxPolicy,
     next_id: AtomicU64,
+    shutting_down: AtomicBool,
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     events: broadcast::Sender<ProcessEvent>,
 }
@@ -244,6 +245,7 @@ impl ProcessManager {
             root,
             sandbox,
             next_id: AtomicU64::new(1),
+            shutting_down: AtomicBool::new(false),
             processes: Arc::new(Mutex::new(HashMap::new())),
             events,
         })
@@ -260,6 +262,9 @@ impl ProcessManager {
         let command = opts.command.trim();
         if command.is_empty() {
             return Err("process command cannot be empty".into());
+        }
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err("process manager is shutting down".into());
         }
         if let Some(reason) = blocklist::is_blocked(command) {
             return Err(format!("blocked command: {reason}"));
@@ -278,6 +283,9 @@ impl ProcessManager {
         let on_exit = opts.on_exit;
         {
             let mut processes = self.lock_processes();
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err("process manager is shutting down".into());
+            }
             if processes.len() >= 16 {
                 return Err("maximum managed process count reached".into());
             }
@@ -333,6 +341,12 @@ impl ProcessManager {
 
         {
             let mut processes = self.lock_processes();
+            if self.shutting_down.load(Ordering::SeqCst) {
+                processes.remove(&process_id);
+                drop(processes);
+                terminate_child(child, pid);
+                return Err("process manager is shutting down".into());
+            }
             let process = processes
                 .get_mut(&process_id)
                 .ok_or_else(|| format!("process reservation missing: {process_id}"))?;
@@ -434,6 +448,7 @@ impl ProcessManager {
     }
 
     pub async fn shutdown(&self) -> Result<Vec<ManagedProcessSnapshot>, String> {
+        self.shutting_down.store(true, Ordering::SeqCst);
         let ids = {
             let processes = self.lock_processes();
             processes
@@ -757,6 +772,13 @@ fn process_id_sort_key(process_id: &str) -> (u64, String) {
     (numeric, process_id.to_owned())
 }
 
+fn terminate_child(mut child: Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        kill_process_group(pid);
+    }
+    let _ = child.start_kill();
+}
+
 #[cfg(unix)]
 fn configure_process_group(cmd: &mut Command) {
     unsafe {
@@ -910,6 +932,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keep.status, ProcessStatus::Killed);
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_prevents_late_start_leak() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+
+        manager.shutdown().await.unwrap();
+        let err = manager
+            .start(start_options("sleep 30", "late"))
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("process manager is shutting down"));
+        assert!(manager.list().is_empty());
     }
 
     #[tokio::test]

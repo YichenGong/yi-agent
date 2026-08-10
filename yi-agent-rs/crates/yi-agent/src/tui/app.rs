@@ -376,7 +376,9 @@ fn run_loop<B: Backend, E: EventSource>(
                         &mut runtime_popup,
                         &task_registry,
                         &process_snapshots,
+                        &process_outputs,
                         layout.chunks[0].width,
+                        layout.chunks[0].height,
                     );
                     if let Some(process_id) = process_to_kill {
                         let _ = tokio::runtime::Handle::current().block_on(
@@ -440,6 +442,8 @@ fn run_loop<B: Backend, E: EventSource>(
                     &mut runtime_popup,
                     history,
                     &task_registry,
+                    &process_snapshots,
+                    &process_outputs,
                     &mut pending_quit,
                 );
             }
@@ -680,7 +684,8 @@ fn handle_runtime_popup_key_for_test(
         return;
     }
     let registry = RunningTaskRegistry::new();
-    let _ = handle_runtime_popup_key(key, runtime_popup, &registry, processes, 80);
+    let outputs = std::collections::HashMap::new();
+    let _ = handle_runtime_popup_key(key, runtime_popup, &registry, processes, &outputs, 80, 24);
 }
 
 fn handle_runtime_popup_key(
@@ -688,7 +693,9 @@ fn handle_runtime_popup_key(
     runtime_popup: &mut RuntimePopup,
     task_registry: &RunningTaskRegistry,
     processes: &[yi_agent_tools::ManagedProcessSnapshot],
+    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
     detail_width: u16,
+    detail_height: u16,
 ) -> Option<String> {
     match runtime_popup {
         RuntimePopup::None => {}
@@ -732,8 +739,26 @@ fn handle_runtime_popup_key(
                 *runtime_popup =
                     RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
             }
-            KeyCode::Up => d.scroll_up(1),
-            KeyCode::Down => d.scroll_down(1, 1000),
+            KeyCode::Up => {
+                let max = process_detail_max_scroll(
+                    d,
+                    processes,
+                    process_outputs,
+                    detail_width,
+                    detail_height,
+                );
+                d.scroll_up_from_bottom(1, max);
+            }
+            KeyCode::Down => {
+                let max = process_detail_max_scroll(
+                    d,
+                    processes,
+                    process_outputs,
+                    detail_width,
+                    detail_height,
+                );
+                d.scroll_down(1, max);
+            }
             KeyCode::Char('f') => d.scroll_to_bottom(),
             _ => {}
         },
@@ -753,6 +778,27 @@ fn handle_runtime_popup_key(
         },
     }
     None
+}
+
+fn process_detail_max_scroll(
+    detail: &ProcessDetailPopup,
+    processes: &[yi_agent_tools::ManagedProcessSnapshot],
+    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
+    width: u16,
+    height: u16,
+) -> usize {
+    processes
+        .iter()
+        .find(|process| process.process_id == detail.process_id)
+        .map(|process| {
+            super::process_popup::process_detail_line_count(
+                process,
+                process_outputs.get(&detail.process_id),
+                width,
+            )
+            .saturating_sub(height as usize)
+        })
+        .unwrap_or(0)
 }
 
 /// Handle a key event for the bash popup state machine.
@@ -844,12 +890,15 @@ fn handle_bash_popup_key(
 /// 2. Otherwise, if the mouse is over the history region, scroll history.
 /// 3. If the mouse is over the input region, do nothing — the input widget
 ///    handles its own scrolling internally.
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     mouse: MouseEvent,
     layout: &LayoutInfo,
     runtime_popup: &mut RuntimePopup,
     history: &mut HistoryState,
     task_registry: &RunningTaskRegistry,
+    processes: &[yi_agent_tools::ManagedProcessSnapshot],
+    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
     pending_quit: &mut bool,
 ) {
     // Only react to scroll-wheel events.
@@ -881,6 +930,29 @@ fn handle_mouse(
                 d.scroll_down(delta, lines);
             } else {
                 d.scroll_up(delta);
+            }
+        }
+        return;
+    }
+
+    if matches!(
+        runtime_popup,
+        RuntimePopup::Processes(ProcessPopup::Detail(_))
+            | RuntimePopup::Processes(ProcessPopup::ConfirmKill(_))
+    ) && history_area.contains(pos)
+    {
+        if let RuntimePopup::Processes(ProcessPopup::Detail(d)) = runtime_popup {
+            let max = process_detail_max_scroll(
+                d,
+                processes,
+                process_outputs,
+                history_area.width,
+                history_area.height,
+            );
+            if is_scroll_down {
+                d.scroll_down(delta, max);
+            } else {
+                d.scroll_up_from_bottom(delta, max);
             }
         }
         return;
@@ -4728,6 +4800,8 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -4742,6 +4816,8 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(hist.scroll_offset, 6, "second ScrollUp should accumulate");
@@ -4777,6 +4853,8 @@ mod tests {
                 &mut bash_popup,
                 &mut hist,
                 &registry,
+                &[],
+                &std::collections::HashMap::new(),
                 &mut pending_quit,
             );
         }
@@ -4811,6 +4889,8 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -4826,6 +4906,8 @@ mod tests {
                 &mut bash_popup,
                 &mut hist,
                 &registry,
+                &[],
+                &std::collections::HashMap::new(),
                 &mut pending_quit,
             );
         }
@@ -4856,6 +4938,8 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -4891,6 +4975,8 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(hist.scroll_offset, 0, "click should not scroll");
@@ -4912,6 +4998,8 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert!(!pending_quit, "scrolling history should clear pending_quit");

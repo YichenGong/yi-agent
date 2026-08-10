@@ -85,6 +85,13 @@ impl ProcessDetailPopup {
         self.scroll_locked = false;
     }
 
+    pub fn scroll_up_from_bottom(&mut self, n: usize, max: usize) {
+        if self.scroll_locked {
+            self.scroll = max;
+        }
+        self.scroll_up(n);
+    }
+
     pub fn scroll_down(&mut self, n: usize, max: usize) {
         self.scroll = (self.scroll + n).min(max);
         if self.scroll >= max {
@@ -322,5 +329,32 @@ mod tests {
         let scroll = process_detail_scroll(&popup, &process, Some(&output), Rect::new(0, 0, 80, 5));
 
         assert!(scroll > 0, "locked detail popup should render at bottom");
+    }
+
+    #[test]
+    fn detail_scroll_up_from_follow_moves_one_line_above_bottom() {
+        let process = snapshot("proc_1", Some("dev"), ProcessStatus::Ready);
+        let output = ProcessReadResult {
+            process_id: "proc_1".into(),
+            name: Some("dev".into()),
+            stdout: (0..20).map(|i| format!("line-{i}\n")).collect(),
+            stderr: String::new(),
+            next_cursor: 10,
+            truncated: false,
+            status: ProcessStatus::Ready,
+            ready: true,
+        };
+        let max_scroll = process_detail_scroll(
+            &ProcessDetailPopup::new("proc_1".into()),
+            &process,
+            Some(&output),
+            Rect::new(0, 0, 80, 5),
+        );
+        let mut popup = ProcessDetailPopup::new("proc_1".into());
+
+        popup.scroll_up_from_bottom(1, max_scroll);
+
+        assert!(!popup.scroll_locked);
+        assert_eq!(popup.scroll, max_scroll.saturating_sub(1));
     }
 }
