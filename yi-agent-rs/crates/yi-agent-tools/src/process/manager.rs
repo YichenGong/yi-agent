@@ -77,16 +77,27 @@ impl StreamRingBuffer {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         let start = self.next_cursor;
-        self.next_cursor = self.next_cursor.saturating_add(bytes.len() as u64);
+        self.push_at(start, bytes);
+    }
+
+    fn push_at(&mut self, start: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.next_cursor = self
+            .next_cursor
+            .max(start.saturating_add(bytes.len() as u64));
         self.chunks.push((start, bytes.to_vec()));
         self.trim_to_cap();
     }
 
+    #[cfg(test)]
     fn next_cursor(&self) -> u64 {
         self.next_cursor
     }
@@ -207,6 +218,7 @@ struct ManagedProcess {
     exit_code: Option<i32>,
     start_time: Instant,
     end_time: Option<Instant>,
+    output_cursor: u64,
     stdout: StreamRingBuffer,
     stderr: StreamRingBuffer,
     child: Option<Child>,
@@ -257,12 +269,19 @@ impl ProcessManager {
         }
 
         let cwd = self.resolve_cwd(opts.cwd.as_ref())?;
+        let (program, args) = self
+            .sandbox
+            .command(command, &cwd)
+            .map_err(|err| err.to_string())?;
+        let process_id = self.next_process_id();
+        let name = opts.name.clone();
+        let on_exit = opts.on_exit;
         {
-            let processes = self.lock_processes();
+            let mut processes = self.lock_processes();
             if processes.len() >= 16 {
                 return Err("maximum managed process count reached".into());
             }
-            if let Some(name) = &opts.name {
+            if let Some(name) = &name {
                 if processes
                     .values()
                     .any(|process| process.name.as_ref() == Some(name))
@@ -270,12 +289,28 @@ impl ProcessManager {
                     return Err("process name already exists".into());
                 }
             }
+            processes.insert(
+                process_id.clone(),
+                ManagedProcess {
+                    process_id: process_id.clone(),
+                    name: name.clone(),
+                    pid: None,
+                    command: opts.command.clone(),
+                    cwd: cwd.clone(),
+                    status: ProcessStatus::Starting,
+                    ready: false,
+                    on_exit,
+                    exit_code: None,
+                    start_time: Instant::now(),
+                    end_time: None,
+                    output_cursor: 0,
+                    stdout: StreamRingBuffer::new(DEFAULT_STREAM_CAP_BYTES),
+                    stderr: StreamRingBuffer::new(DEFAULT_STREAM_CAP_BYTES),
+                    child: None,
+                },
+            );
         }
 
-        let (program, args) = self
-            .sandbox
-            .command(command, &cwd)
-            .map_err(|err| err.to_string())?;
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(&cwd)
@@ -288,35 +323,22 @@ impl ProcessManager {
 
         let mut child = cmd
             .spawn()
+            .inspect_err(|_| {
+                self.lock_processes().remove(&process_id);
+            })
             .map_err(|err| format!("failed to start process: {err}"))?;
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let process_id = self.next_process_id();
-        let name = opts.name.clone();
-        let on_exit = opts.on_exit;
 
         {
             let mut processes = self.lock_processes();
-            processes.insert(
-                process_id.clone(),
-                ManagedProcess {
-                    process_id: process_id.clone(),
-                    name: name.clone(),
-                    pid,
-                    command: opts.command,
-                    cwd,
-                    status: ProcessStatus::Running,
-                    ready: false,
-                    on_exit,
-                    exit_code: None,
-                    start_time: Instant::now(),
-                    end_time: None,
-                    stdout: StreamRingBuffer::new(DEFAULT_STREAM_CAP_BYTES),
-                    stderr: StreamRingBuffer::new(DEFAULT_STREAM_CAP_BYTES),
-                    child: Some(child),
-                },
-            );
+            let process = processes
+                .get_mut(&process_id)
+                .ok_or_else(|| format!("process reservation missing: {process_id}"))?;
+            process.pid = pid;
+            process.status = ProcessStatus::Running;
+            process.child = Some(child);
         }
 
         self.spawn_reader(process_id.clone(), StreamKind::Stdout, stdout);
@@ -343,7 +365,7 @@ impl ProcessManager {
             pid: snapshot.pid,
             status: snapshot.status,
             ready: snapshot.ready,
-            next_cursor: self.max_cursor(&process_id).unwrap_or(0),
+            next_cursor: self.next_output_cursor(&process_id).unwrap_or(0),
             start_warning,
         })
     }
@@ -369,14 +391,14 @@ impl ProcessManager {
         let process = processes
             .get(&process_id)
             .ok_or_else(|| format!("process not found: {process_id}"))?;
-        let (stdout, stdout_cursor, stdout_truncated) = process.stdout.read(cursor, max_bytes);
-        let (stderr, stderr_cursor, stderr_truncated) = process.stderr.read(cursor, max_bytes);
+        let (stdout, _, stdout_truncated) = process.stdout.read(cursor, max_bytes);
+        let (stderr, _, stderr_truncated) = process.stderr.read(cursor, max_bytes);
         Ok(ProcessReadResult {
             process_id: process.process_id.clone(),
             name: process.name.clone(),
             stdout,
             stderr,
-            next_cursor: stdout_cursor.max(stderr_cursor),
+            next_cursor: process.output_cursor,
             truncated: stdout_truncated || stderr_truncated,
             status: process.status.clone(),
             ready: process.ready,
@@ -385,26 +407,29 @@ impl ProcessManager {
 
     pub async fn kill(&self, selector: ProcessSelector) -> Result<(), String> {
         let process_id = self.selector_to_id(&selector)?;
-        let pid = {
+        let (pid, killed) = {
             let mut processes = self.lock_processes();
             let process = processes
                 .get_mut(&process_id)
                 .ok_or_else(|| format!("process not found: {process_id}"))?;
-            let pid = process.pid;
-            if !matches!(process.status, ProcessStatus::Killed) {
-                process.status = ProcessStatus::Killed;
-                process.ready = false;
-                process.end_time = Some(Instant::now());
+            if is_terminal(&process.status) {
+                return Ok(());
             }
+            let pid = process.child.as_ref().and(process.pid);
+            process.status = ProcessStatus::Killed;
+            process.ready = false;
+            process.end_time = Some(Instant::now());
             if let Some(child) = process.child.as_mut() {
                 let _ = child.start_kill();
             }
-            pid
+            (pid, true)
         };
         if let Some(pid) = pid {
             kill_process_group(pid);
         }
-        self.emit(ProcessEvent::Killed { process_id });
+        if killed {
+            self.emit(ProcessEvent::Killed { process_id });
+        }
         Ok(())
     }
 
@@ -413,7 +438,9 @@ impl ProcessManager {
             let processes = self.lock_processes();
             processes
                 .values()
-                .filter(|process| process.on_exit == OnExitPolicy::Kill)
+                .filter(|process| {
+                    process.on_exit == OnExitPolicy::Kill && !is_terminal(&process.status)
+                })
                 .map(|process| process.process_id.clone())
                 .collect::<Vec<_>>()
         };
@@ -527,9 +554,11 @@ impl ProcessManager {
             let Some(process) = processes.get_mut(process_id) else {
                 return;
             };
+            let start = process.output_cursor;
+            process.output_cursor = process.output_cursor.saturating_add(bytes.len() as u64);
             match stream {
-                StreamKind::Stdout => process.stdout.push(bytes),
-                StreamKind::Stderr => process.stderr.push(bytes),
+                StreamKind::Stdout => process.stdout.push_at(start, bytes),
+                StreamKind::Stderr => process.stderr.push_at(start, bytes),
             }
         }
         self.emit(ProcessEvent::Output {
@@ -603,11 +632,11 @@ impl ProcessManager {
     }
 
     async fn wait_for_ready(&self, process_id: &str, pattern: &str, timeout: Duration) -> bool {
+        let mut events = self.subscribe();
         if self.output_contains(process_id, pattern) {
             return true;
         }
         let deadline = time::Instant::now() + timeout;
-        let mut events = self.subscribe();
         loop {
             let now = time::Instant::now();
             if now >= deadline {
@@ -695,14 +724,11 @@ impl ProcessManager {
         })
     }
 
-    fn max_cursor(&self, process_id: &str) -> Option<u64> {
+    fn next_output_cursor(&self, process_id: &str) -> Option<u64> {
         let processes = self.lock_processes();
-        processes.get(process_id).map(|process| {
-            process
-                .stdout
-                .next_cursor()
-                .max(process.stderr.next_cursor())
-        })
+        processes
+            .get(process_id)
+            .map(|process| process.output_cursor)
     }
 
     fn lock_processes(&self) -> std::sync::MutexGuard<'_, HashMap<String, ManagedProcess>> {
@@ -759,6 +785,7 @@ fn kill_process_group(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{Duration, sleep};
 
     fn start_options(command: &str, name: &str) -> ProcessStartOptions {
         ProcessStartOptions {
@@ -770,6 +797,19 @@ mod tests {
             ready_pattern: None,
             ready_timeout_sec: None,
         }
+    }
+
+    async fn wait_until<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..50 {
+            if predicate() {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(predicate());
     }
 
     #[tokio::test]
@@ -870,6 +910,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keep.status, ProcessStatus::Killed);
+    }
+
+    #[tokio::test]
+    async fn manager_read_cursor_does_not_skip_slower_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        let mut opts = start_options("printf out; sleep 1; printf err >&2; sleep 30", "mixed");
+        opts.ready_pattern = Some("out".into());
+        opts.ready_timeout_sec = Some(2);
+        manager.start(opts).await.unwrap();
+
+        let first = manager
+            .read(ProcessSelector::Name("mixed".into()), None, 1024)
+            .await
+            .unwrap();
+        assert!(first.stdout.contains("out"));
+        assert!(first.stderr.is_empty());
+
+        wait_until(|| {
+            let output = futures::executor::block_on(manager.read(
+                ProcessSelector::Name("mixed".into()),
+                Some(first.next_cursor),
+                1024,
+            ))
+            .unwrap();
+            output.stderr.contains("err")
+        })
+        .await;
+        let second = manager
+            .read(
+                ProcessSelector::Name("mixed".into()),
+                Some(first.next_cursor),
+                1024,
+            )
+            .await
+            .unwrap();
+        assert!(second.stdout.is_empty());
+        assert!(second.stderr.contains("err"));
+
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_leaves_exited_kill_policy_process_exited() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        manager
+            .start(start_options("printf done", "short"))
+            .await
+            .unwrap();
+
+        wait_until(|| {
+            manager
+                .list()
+                .iter()
+                .any(|process| matches!(process.status, ProcessStatus::Exited { code: Some(0) }))
+        })
+        .await;
+
+        let kept = manager.shutdown().await.unwrap();
+
+        assert!(kept.is_empty());
+        let processes = manager.list();
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].status, ProcessStatus::Exited { code: Some(0) });
     }
 
     #[test]
