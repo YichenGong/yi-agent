@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::{MessageId, PermissionRequestId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
-    WorkerWorkspace,
+    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
+    WorkerStart, WorkerWorkspace,
 };
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
@@ -149,6 +149,66 @@ impl AgentWorkerFactory for ReportingWorkerFactory {
     }
 }
 
+#[derive(Clone, Default)]
+struct StaticWorkspaceService;
+
+impl AgentWorkspaceService for StaticWorkspaceService {
+    fn prepare_root(
+        &self,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(test_workspace_for_ipc(
+            &root_session_id.to_string(),
+            &task_id.to_string(),
+        ))
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(test_workspace_for_ipc(
+            &root_session_id.to_string(),
+            &task_id.to_string(),
+        ))
+    }
+}
+
+#[derive(Clone)]
+struct ApplicationRootFactory {
+    workspace_service: Arc<StaticWorkspaceService>,
+}
+
+impl AgentWorkerFactory for ApplicationRootFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+        Some(self.workspace_service.clone())
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+fn application_root_daemon(directory: &TempDir, database: &std::path::Path) -> Daemon {
+    Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+        }),
+    )
+    .unwrap()
+}
+
 #[test]
 fn task_snapshot_and_event_log_replay_from_cursor() {
     let directory = TempDir::new().unwrap();
@@ -209,6 +269,104 @@ fn v6_database_migrates_to_workspace_and_attachment_tables() {
         repository
             .has_table("application_root_attachments")
             .unwrap()
+    );
+}
+
+#[test]
+fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = application_root_daemon(&directory, &database);
+
+    let first = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-start-1".into(),
+        },
+    )
+    .unwrap();
+    let second = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-start-1".into(),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::ApplicationRootAttached {
+        session_id: first_session,
+        root_task_id: first_root,
+        message_capability: first_capability,
+        workspace: first_workspace,
+    } = first
+    else {
+        panic!("expected application root attachment");
+    };
+    let IpcResponse::ApplicationRootAttached {
+        session_id: second_session,
+        root_task_id: second_root,
+        message_capability: second_capability,
+        workspace: second_workspace,
+    } = second
+    else {
+        panic!("expected idempotent application root attachment");
+    };
+
+    assert_eq!(first_session, second_session);
+    assert_eq!(first_root, second_root);
+    assert_eq!(first_capability, second_capability);
+    assert_eq!(first_workspace, second_workspace);
+    assert!(!first_capability.is_empty());
+}
+
+#[test]
+fn application_root_delegation_rejects_a_capability_from_another_attached_root() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = application_root_daemon(&directory, &database);
+
+    let IpcResponse::ApplicationRootAttached {
+        session_id: first_session,
+        root_task_id: first_root,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-a".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected first attachment");
+    };
+    let IpcResponse::ApplicationRootAttached {
+        message_capability: second_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-b".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected second attachment");
+    };
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id: first_session,
+                parent_task_id: first_root,
+                capability: second_capability,
+                objective: "inspect the parser".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+        }
     );
 }
 

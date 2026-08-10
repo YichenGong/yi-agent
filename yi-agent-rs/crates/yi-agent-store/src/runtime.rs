@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use yi_agent_core::ProviderTurnGate;
@@ -57,6 +58,8 @@ pub enum RuntimeCoordinatorError {
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
     Supervisor(String),
+    #[error("authority denied: {0}")]
+    AuthorityDenied(String),
     #[error(transparent)]
     Spawn(#[from] SpawnError),
     #[error("global resident subagent capacity is exhausted")]
@@ -84,6 +87,14 @@ impl Default for RuntimeStopOptions {
 pub struct RuntimeStopSummary {
     pub paused: usize,
     pub recovery_required: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedApplicationRoot {
+    pub session_id: RootSessionId,
+    pub root_task_id: TaskId,
+    pub message_capability: String,
+    pub workspace: WorkerWorkspace,
 }
 
 /// Owns all supervisor instances and their worker handles for one daemon.
@@ -150,6 +161,18 @@ impl AgentWorkerFactory for WorkspaceAssignedFactory<'_> {
         self.inner
             .start_with_provider_turn_gate(request.with_workspace(self.workspace.clone()), gate)
     }
+}
+
+fn application_root_capability(idempotency_key: &str) -> String {
+    format!(
+        "app-root-{}",
+        digest_hex(&format!("application-root:{idempotency_key}"))
+    )
+}
+
+fn digest_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl RuntimeCoordinator {
@@ -535,6 +558,94 @@ impl RuntimeCoordinator {
             .expect("runtime supervisor mutex poisoned")
             .insert(session_id.clone(), Arc::new(AsyncMutex::new(supervisor)));
         Ok(session_id)
+    }
+
+    pub async fn attach_application_root(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<AttachedApplicationRoot, RuntimeCoordinatorError> {
+        self.ensure_admitting()?;
+        if idempotency_key.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "application root idempotency key is required".into(),
+            ));
+        }
+        let capability = application_root_capability(idempotency_key);
+        let capability_digest = digest_hex(&capability);
+        let existing = {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .application_root_attachment(idempotency_key)?
+        };
+        if let Some(existing) = existing {
+            let workspace = {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_workspace(&existing.root_task_id)?
+            };
+            return Ok(AttachedApplicationRoot {
+                session_id: existing.root_session_id,
+                root_task_id: existing.root_task_id,
+                message_capability: capability,
+                workspace,
+            });
+        }
+
+        let session_id =
+            self.create_session_with_objective("TUI application root pending activation.".into())?;
+        let supervisor_handle = self.supervisor(&session_id)?;
+        let mut supervisor = supervisor_handle.lock().await;
+        let root_task_id = supervisor.root_task_id().clone();
+        let attempt = supervisor
+            .task(&root_task_id)
+            .expect("root task exists")
+            .active_attempt_id()
+            .clone();
+        let workspace = self
+            .prepare_task_workspace(&mut supervisor, &session_id, &root_task_id, &attempt)?
+            .ok_or_else(|| {
+                RuntimeCoordinatorError::Supervisor(
+                    "application root workspace service is unavailable".into(),
+                )
+            })?;
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_application_root_attachment(
+                idempotency_key,
+                &session_id,
+                &root_task_id,
+                &capability_digest,
+            )?;
+        Ok(AttachedApplicationRoot {
+            session_id,
+            root_task_id,
+            message_capability: capability,
+            workspace,
+        })
+    }
+
+    pub async fn spawn_application_child(
+        &self,
+        session: &RootSessionId,
+        parent: &TaskId,
+        capability: &str,
+        objective: String,
+    ) -> Result<TaskId, RuntimeCoordinatorError> {
+        let capability_digest = digest_hex(capability);
+        let authorized = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .application_root_capability_matches(session, parent, &capability_digest)?;
+        if !authorized {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "application root capability is invalid".into(),
+            ));
+        }
+        self.spawn_child_and_admit(session, parent, objective).await
     }
 
     pub fn root_task_id(&self, session: &RootSessionId) -> Result<TaskId, RuntimeCoordinatorError> {

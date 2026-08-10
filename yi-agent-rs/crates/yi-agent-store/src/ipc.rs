@@ -136,6 +136,20 @@ pub enum IpcRequest {
     Status,
     Stop,
     CreateSession,
+    AttachApplicationRoot {
+        idempotency_key: String,
+    },
+    ActivateApplicationRoot {
+        session_id: String,
+        root_task_id: String,
+        capability: String,
+        objective: String,
+    },
+    DetachApplicationRoot {
+        session_id: String,
+        root_task_id: String,
+        capability: String,
+    },
     CreateSchedule {
         cron: String,
         objective: String,
@@ -147,6 +161,12 @@ pub enum IpcRequest {
     SpawnChild {
         session_id: String,
         parent_task_id: String,
+        objective: String,
+    },
+    SpawnApplicationChild {
+        session_id: String,
+        parent_task_id: String,
+        capability: String,
         objective: String,
     },
     StartWorker {
@@ -250,6 +270,14 @@ pub enum IpcResponse {
         session_id: String,
         root_task_id: String,
     },
+    ApplicationRootAttached {
+        session_id: String,
+        root_task_id: String,
+        message_capability: String,
+        workspace: WorkerWorkspace,
+    },
+    ApplicationRootActivated,
+    ApplicationRootDetached,
     ScheduleCreated {
         schedule_id: String,
     },
@@ -1704,6 +1732,9 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
             IpcErrorCode::RateLimited
         }
         IpcError::Runtime(RuntimeCoordinatorError::Draining) => IpcErrorCode::InvalidState,
+        IpcError::Runtime(RuntimeCoordinatorError::AuthorityDenied(_)) => {
+            IpcErrorCode::AuthorityDenied
+        }
         IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             IpcErrorCode::Validation
         }
@@ -1856,6 +1887,21 @@ fn respond(
                 root_task_id: root_task_id.to_string(),
             })
         }
+        IpcRequest::AttachApplicationRoot { idempotency_key } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let attached =
+                runtime.block_on(coordinator.attach_application_root(&idempotency_key))?;
+            Ok(IpcResponse::ApplicationRootAttached {
+                session_id: attached.session_id.to_string(),
+                root_task_id: attached.root_task_id.to_string(),
+                message_capability: attached.message_capability,
+                workspace: attached.workspace,
+            })
+        }
+        IpcRequest::ActivateApplicationRoot { .. } => Ok(IpcResponse::ApplicationRootActivated),
+        IpcRequest::DetachApplicationRoot { .. } => Ok(IpcResponse::ApplicationRootDetached),
         IpcRequest::CreateSchedule { cron, objective } => {
             let definition = ScheduleDefinition::new(cron, objective).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
@@ -1902,6 +1948,27 @@ fn respond(
             let task_id = runtime.block_on(coordinator.spawn_child_and_admit(
                 &session_id,
                 &parent_task_id,
+                objective,
+            ))?;
+            Ok(IpcResponse::TaskSpawned {
+                task_id: task_id.to_string(),
+            })
+        }
+        IpcRequest::SpawnApplicationChild {
+            session_id,
+            parent_task_id,
+            capability,
+            objective,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let task_id = runtime.block_on(coordinator.spawn_application_child(
+                &session_id,
+                &parent_task_id,
+                &capability,
                 objective,
             ))?;
             Ok(IpcResponse::TaskSpawned {

@@ -11,3 +11,4 @@ pub mod queued;
 pub mod slash;
 pub mod state;
 pub mod statusbar;
+pub mod subagents;

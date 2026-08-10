@@ -682,16 +682,94 @@ impl Tool for DaemonSendMessageTool {
     }
 }
 
+pub fn register_application_subagent_tools(
+    registry: &mut ToolRegistry,
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    application_capability: String,
+) {
+    registry.register(Arc::new(DaemonApplicationSpawnAgentTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        application_capability,
+    }));
+    registry.register(Arc::new(DaemonSendMessageTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        worker_capability: String::new(),
+    }));
+    registry.register(Arc::new(DaemonWaitAgentTool {
+        runtime_socket,
+        session_id,
+        caller_task_id,
+    }));
+}
+
 struct DaemonSpawnAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
 }
 
+struct DaemonApplicationSpawnAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    application_capability: String,
+}
+
 struct DaemonWaitAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
+}
+
+#[async_trait]
+impl Tool for DaemonApplicationSpawnAgentTool {
+    fn name(&self) -> &str {
+        "spawn_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Create an asynchronously scheduled direct child agent."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "task": { "type": "string", "description": "Delegated objective." } },
+            "required": ["task"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task) = args.get("task").and_then(Value::as_str) else {
+            return ToolResult::error("task is required");
+        };
+        if task.trim().is_empty() {
+            return ToolResult::error("task must not be empty");
+        }
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: self.session_id.clone(),
+                parent_task_id: self.caller_task_id.clone(),
+                capability: self.application_capability.clone(),
+                objective: task.to_string(),
+            },
+        );
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
+                json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
+            ),
+            Ok(other) => ToolResult::error(format!("daemon rejected spawn request: {other:?}")),
+            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+        }
+    }
 }
 
 #[async_trait]

@@ -177,6 +177,15 @@ pub struct WatchdogEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationRootAttachment {
+    pub idempotency_key: String,
+    pub root_session_id: RootSessionId,
+    pub root_task_id: TaskId,
+    pub capability_digest: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedAttemptWatchdog {
     pub limits: WatchdogLimits,
     pub observation: WatchdogObservation,
@@ -2821,6 +2830,87 @@ impl RuntimeRepository {
                 attempt: value,
                 reason: "task has an invalid active attempt ID".into(),
             })
+    }
+
+    pub fn application_root_attachment(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<ApplicationRootAttachment>, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT idempotency_key, root_session_id, root_task_id, capability_digest, state
+                 FROM application_root_attachments WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |row| {
+                    Ok(ApplicationRootAttachment {
+                        idempotency_key: row.get(0)?,
+                        root_session_id: row.get::<_, String>(1)?.parse().map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                1,
+                                "root_session_id".into(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?,
+                        root_task_id: row.get::<_, String>(2)?.parse().map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                2,
+                                "root_task_id".into(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?,
+                        capability_digest: row.get(3)?,
+                        state: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(RepositoryError::from)
+    }
+
+    pub fn record_application_root_attachment(
+        &mut self,
+        idempotency_key: &str,
+        root_session_id: &RootSessionId,
+        root_task_id: &TaskId,
+        capability_digest: &str,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "INSERT INTO application_root_attachments
+                (idempotency_key, root_session_id, root_task_id, capability_digest, state)
+             VALUES (?1, ?2, ?3, ?4, 'attached')",
+            params![
+                idempotency_key,
+                root_session_id.to_string(),
+                root_task_id.to_string(),
+                capability_digest
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn application_root_capability_matches(
+        &self,
+        root_session_id: &RootSessionId,
+        root_task_id: &TaskId,
+        capability_digest: &str,
+    ) -> Result<bool, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM application_root_attachments
+                    WHERE root_session_id = ?1
+                      AND root_task_id = ?2
+                      AND capability_digest = ?3
+                      AND state = 'attached'
+                 )",
+                params![
+                    root_session_id.to_string(),
+                    root_task_id.to_string(),
+                    capability_digest
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(RepositoryError::from)
     }
 
     pub fn record_task_workspace(

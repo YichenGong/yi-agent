@@ -21,6 +21,7 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 futures = { workspace = true }
 toml = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
