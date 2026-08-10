@@ -2888,6 +2888,43 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    pub fn detach_application_root(
+        &mut self,
+        root_session_id: &RootSessionId,
+        root_task_id: &TaskId,
+    ) -> Result<(), RepositoryError> {
+        let changed = self.connection.execute(
+            "UPDATE application_root_attachments
+             SET state = 'detached', detached_at = CURRENT_TIMESTAMP
+             WHERE root_session_id = ?1 AND root_task_id = ?2 AND state = 'attached'",
+            params![root_session_id.to_string(), root_task_id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: root_task_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn update_task_objective(
+        &mut self,
+        task: &TaskId,
+        objective: &str,
+    ) -> Result<(), RepositoryError> {
+        let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
+        let changed = self.connection.execute(
+            "UPDATE tasks SET delivery_json = ?1 WHERE id = ?2",
+            params![delivery_json, task.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn application_root_capability_matches(
         &self,
         root_session_id: &RootSessionId,

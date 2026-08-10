@@ -279,6 +279,18 @@ impl AgentSupervisor {
         self.objectives.get(task_id).map(String::as_str)
     }
 
+    pub fn set_objective(&mut self, task_id: &TaskId, objective: String) -> Result<(), String> {
+        if objective.trim().is_empty() {
+            return Err("task objective must be non-empty".into());
+        }
+        if !self.tasks.contains_key(task_id) {
+            return Err("task does not exist".into());
+        }
+        self.objectives.insert(task_id.clone(), objective);
+        self.notify_update();
+        Ok(())
+    }
+
     pub fn children_of(&self, task_id: &TaskId) -> &[TaskId] {
         self.children.get(task_id).map(Vec::as_slice).unwrap_or(&[])
     }

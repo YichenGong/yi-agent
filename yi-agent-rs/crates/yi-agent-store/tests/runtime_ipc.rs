@@ -182,6 +182,7 @@ impl AgentWorkspaceService for StaticWorkspaceService {
 #[derive(Clone)]
 struct ApplicationRootFactory {
     workspace_service: Arc<StaticWorkspaceService>,
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
 }
 
 impl AgentWorkerFactory for ApplicationRootFactory {
@@ -194,19 +195,27 @@ impl AgentWorkerFactory for ApplicationRootFactory {
     }
 
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+        let handle = WorkerHandle::new(request.cancellation.clone());
+        self.starts.lock().unwrap().push(request);
+        Box::pin(async move { Ok(handle) })
     }
 }
 
-fn application_root_daemon(directory: &TempDir, database: &std::path::Path) -> Daemon {
-    Daemon::start_with_factory(
+fn application_root_daemon(
+    directory: &TempDir,
+    database: &std::path::Path,
+) -> (Daemon, Arc<Mutex<Vec<WorkerStart>>>) {
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let daemon = Daemon::start_with_factory(
         directory.path().join("runtime"),
         database,
         Arc::new(ApplicationRootFactory {
             workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::clone(&starts),
         }),
     )
-    .unwrap()
+    .unwrap();
+    (daemon, starts)
 }
 
 #[test]
@@ -276,7 +285,7 @@ fn v6_database_migrates_to_workspace_and_attachment_tables() {
 fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
-    let daemon = application_root_daemon(&directory, &database);
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
 
     let first = send_request(
         daemon.socket_path(),
@@ -323,7 +332,7 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
 fn application_root_delegation_rejects_a_capability_from_another_attached_root() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
-    let daemon = application_root_daemon(&directory, &database);
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
 
     let IpcResponse::ApplicationRootAttached {
         session_id: first_session,
@@ -367,6 +376,108 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
         }
+    );
+}
+
+#[test]
+fn application_root_activate_starts_the_attached_root_with_the_user_objective() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-activate".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected application root attachment");
+    };
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id,
+                root_task_id,
+                capability: message_capability,
+                objective: "build the TUI MVP".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+
+    let starts = starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].objective, "build the TUI MVP");
+    assert!(starts[0].workspace.is_some());
+}
+
+#[test]
+fn application_root_detach_requires_capability_and_does_not_complete_root() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-detach".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected application root attachment");
+    };
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: "wrong".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+        }
+    );
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    );
+
+    let task_id: TaskId = root_task_id.parse().unwrap();
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_ne!(repository.task_state(&task_id).unwrap(), "completed");
+    assert_eq!(
+        repository
+            .application_root_attachment("tui-detach")
+            .unwrap()
+            .unwrap()
+            .state,
+        "detached"
     );
 }
 

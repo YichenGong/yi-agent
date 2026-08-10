@@ -1900,8 +1900,35 @@ fn respond(
                 workspace: attached.workspace,
             })
         }
-        IpcRequest::ActivateApplicationRoot { .. } => Ok(IpcResponse::ApplicationRootActivated),
-        IpcRequest::DetachApplicationRoot { .. } => Ok(IpcResponse::ApplicationRootDetached),
+        IpcRequest::ActivateApplicationRoot {
+            session_id,
+            root_task_id,
+            capability,
+            objective,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let root_task_id = parse_id::<TaskId>(&root_task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.activate_application_root(
+                &session_id,
+                &root_task_id,
+                &capability,
+                objective,
+            ))?;
+            Ok(IpcResponse::ApplicationRootActivated)
+        }
+        IpcRequest::DetachApplicationRoot {
+            session_id,
+            root_task_id,
+            capability,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let root_task_id = parse_id::<TaskId>(&root_task_id)?;
+            coordinator.detach_application_root(&session_id, &root_task_id, &capability)?;
+            Ok(IpcResponse::ApplicationRootDetached)
+        }
         IpcRequest::CreateSchedule { cron, objective } => {
             let definition = ScheduleDefinition::new(cron, objective).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))

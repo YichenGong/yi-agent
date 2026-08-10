@@ -627,6 +627,62 @@ impl RuntimeCoordinator {
         })
     }
 
+    fn authorize_application_root(
+        &self,
+        session: &RootSessionId,
+        root_task: &TaskId,
+        capability: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let capability_digest = digest_hex(capability);
+        let authorized = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .application_root_capability_matches(session, root_task, &capability_digest)?;
+        if !authorized {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "application root capability is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn activate_application_root(
+        &self,
+        session: &RootSessionId,
+        root_task: &TaskId,
+        capability: &str,
+        objective: String,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.authorize_application_root(session, root_task, capability)?;
+        {
+            let supervisor = self.supervisor(session)?;
+            let mut supervisor = supervisor.lock().await;
+            supervisor
+                .set_objective(root_task, objective.clone())
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+        }
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .update_task_objective(root_task, &objective)?;
+        self.start_worker(session, root_task).await
+    }
+
+    pub fn detach_application_root(
+        &self,
+        session: &RootSessionId,
+        root_task: &TaskId,
+        capability: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.authorize_application_root(session, root_task, capability)?;
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .detach_application_root(session, root_task)?;
+        Ok(())
+    }
+
     pub async fn spawn_application_child(
         &self,
         session: &RootSessionId,
@@ -634,17 +690,7 @@ impl RuntimeCoordinator {
         capability: &str,
         objective: String,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
-        let capability_digest = digest_hex(capability);
-        let authorized = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .application_root_capability_matches(session, parent, &capability_digest)?;
-        if !authorized {
-            return Err(RuntimeCoordinatorError::AuthorityDenied(
-                "application root capability is invalid".into(),
-            ));
-        }
+        self.authorize_application_root(session, parent, capability)?;
         self.spawn_child_and_admit(session, parent, objective).await
     }
 
