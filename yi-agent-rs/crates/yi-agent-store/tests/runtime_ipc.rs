@@ -1683,6 +1683,36 @@ fn inspect_task_omits_workspace_for_unassigned_old_tasks() {
 }
 
 #[test]
+fn subscription_snapshot_omits_workspace_for_unassigned_old_tasks() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    let IpcResponse::Subscription(snapshot) = send_request(
+        daemon.socket_path(),
+        IpcRequest::SubscribeEvents {
+            after_event_id: 0,
+            filters: SubscriptionFilters::default(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected subscription snapshot");
+    };
+
+    let task = snapshot
+        .tasks
+        .iter()
+        .find(|task| task.task_id == root_task_id)
+        .expect("snapshot contains the unassigned root task");
+    assert_eq!(task.workspace, None);
+}
+
+#[test]
 fn subscription_snapshot_includes_recorded_task_workspace() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
