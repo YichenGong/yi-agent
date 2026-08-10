@@ -756,28 +756,43 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime repository mutex poisoned")
             .activate_application_root_once(root_task, &attempt, &objective)?;
-        if !activated {
-            let current_state = self
-                .repository
-                .lock()
-                .expect("runtime repository mutex poisoned")
-                .task_state(root_task)?;
-            if current_state == "running" {
-                return Ok(());
-            }
-            return Err(RuntimeCoordinatorError::Supervisor(format!(
-                "application root cannot be activated from state {current_state}"
-            )));
-        }
         let supervisor = self.supervisor(session)?;
         let mut supervisor = supervisor.lock().await;
-        supervisor
-            .set_objective(root_task, objective)
-            .map_err(RuntimeCoordinatorError::Supervisor)?;
-        supervisor
-            .start_task(root_task)
-            .map_err(RuntimeCoordinatorError::Supervisor)?;
-        Ok(())
+        if activated {
+            supervisor
+                .set_objective(root_task, objective)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            sync_foreground_root_running(&mut supervisor, root_task)?;
+            return Ok(());
+        }
+
+        let current_state = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_state(root_task)?;
+        match current_state.as_str() {
+            "running" => {
+                sync_foreground_root_running(&mut supervisor, root_task)?;
+                Ok(())
+            }
+            "paused" => {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .transition_task_and_attempt(
+                        root_task,
+                        &attempt,
+                        "running",
+                        RuntimeEvent::TaskStarted,
+                    )?;
+                sync_foreground_root_running(&mut supervisor, root_task)?;
+                Ok(())
+            }
+            _ => Err(RuntimeCoordinatorError::Supervisor(format!(
+                "application root cannot be activated from state {current_state}"
+            ))),
+        }
     }
 
     pub async fn detach_application_root(
@@ -2542,6 +2557,35 @@ fn persisted_depth(depth: u8) -> Result<yi_agent_core::TaskDepth, RuntimeCoordin
         _ => Err(RuntimeCoordinatorError::Supervisor(
             "persisted review task has an invalid depth".into(),
         )),
+    }
+}
+
+fn sync_foreground_root_running(
+    supervisor: &mut AgentSupervisor,
+    root_task: &TaskId,
+) -> Result<(), RuntimeCoordinatorError> {
+    let state = supervisor
+        .task(root_task)
+        .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
+        .state()
+        .clone();
+    match state {
+        TaskState::Running => Ok(()),
+        TaskState::Queued => supervisor
+            .start_task(root_task)
+            .map_err(RuntimeCoordinatorError::Supervisor),
+        TaskState::Paused(_) => {
+            supervisor
+                .resume_task(root_task)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            supervisor
+                .start_task(root_task)
+                .map_err(RuntimeCoordinatorError::Supervisor)
+        }
+        other if other.is_terminal() => Err(RuntimeCoordinatorError::Supervisor(
+            "terminal application root cannot be activated".into(),
+        )),
+        _ => Ok(()),
     }
 }
 

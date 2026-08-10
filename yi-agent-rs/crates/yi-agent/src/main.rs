@@ -494,7 +494,12 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
             return Ok(None);
         }
     };
-    let idempotency_key = format!("tui:{}:{}", std::process::id(), config.workdir.display());
+    let idempotency_key = format!(
+        "tui:{}:{}:{}",
+        std::process::id(),
+        config.workdir.display(),
+        uuid::Uuid::new_v4()
+    );
     let response = match yi_agent_store::ipc::send_request(
         &socket_path,
         yi_agent_store::ipc::IpcRequest::AttachApplicationRoot { idempotency_key },

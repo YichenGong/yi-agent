@@ -773,6 +773,105 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
 }
 
 #[test]
+fn detached_paused_application_root_can_reattach_activate_and_spawn() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-paused-reattach".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: "first prompt".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    );
+    let IpcResponse::ApplicationRootAttached {
+        session_id: reattached_session,
+        root_task_id: reattached_root,
+        message_capability: reattached_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-paused-reattach".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected reattachment");
+    };
+
+    assert_eq!(reattached_session, session_id);
+    assert_eq!(reattached_root, root_task_id);
+    assert_eq!(reattached_capability, message_capability);
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id: reattached_session.clone(),
+                root_task_id: reattached_root.clone(),
+                capability: reattached_capability.clone(),
+                objective: "second prompt should not be dropped".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id: reattached_session,
+                parent_task_id: reattached_root.clone(),
+                capability: reattached_capability,
+                objective: "after paused reattach".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::TaskSpawned { .. }
+    ));
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&reattached_root.parse().unwrap())
+            .unwrap(),
+        "running"
+    );
+}
+
+#[test]
 fn detached_application_root_can_be_reattached_with_the_same_key() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
