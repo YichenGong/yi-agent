@@ -1,300 +1,258 @@
-# Subagent TUI MVP Design
+# 子 Agent TUI MVP 设计
 
-**Date:** 2026-08-10
+**日期：** 2026-08-10
 
-**Status:** approved for written specification review
+**状态：** 等待书面规格确认
 
-## Objective
+## 目标
 
-Deliver the first user-runnable vertical slice of the durable subagent runtime
-inside the existing TUI. The user describes work in ordinary conversation, the
-foreground application Agent may delegate it to one child, and the TUI shows
-live child progress and an inline accept/rework/reject review card. The child
-works in an isolated Git worktree and delivers a real commit for direct-parent
-integration.
+在现有 TUI 中交付第一个用户真正可运行的持久化子 Agent 垂直闭环。用户只需像
+平时一样在对话中描述工作，前台应用 Agent 可以把任务委派给一个子 Agent，TUI
+实时展示子任务进度，并提供内嵌的接受、返工和拒绝审核卡片。子 Agent 必须在隔离
+的 Git worktree 中工作，并以真实 commit 向直接父任务交付。
 
-The normal development workflow must not require CLI control commands or a
-`/delegate` command. CLI and Slash controls remain secondary diagnostics and
-recovery affordances. This MVP changes implementation order, not final scope:
-the full task tree, schedules, two-level delegation, and all remaining runtime
-acceptance criteria still follow after the vertical slice works.
+日常开发流程不得要求用户使用 CLI 控制命令，也不要求记忆 `/delegate` 命令。
+CLI 和 Slash 命令保留为辅助诊断和恢复手段。本 MVP 只调整实现顺序，不缩减最终
+范围：完整任务树、定时调度、两级委派，以及其余 runtime 验收标准仍须在垂直闭环
+跑通后继续完成。
 
-## Primary User Workflow
+## 主要用户流程
 
-1. The user starts `yi-agent` and enters the existing TUI.
-2. If the local runtime is unavailable, the TUI displays an explicit start
-   confirmation. Confirming starts it without leaving the TUI; declining keeps
-   the current conversation usable without delegation.
-3. The user writes a normal request, for example: "Implement the login flow;
-   delegate a focused part if useful."
-4. The foreground root Agent decides whether to call `spawn_agent`. The user
-   does not need to learn a delegation command.
-5. A compact child-task card appears in the conversation and updates from
-   daemon events while the user continues chatting.
-6. When the child produces a valid commit delivery, the card becomes a review
-   card with diff and verification evidence.
-7. The user accepts, requests rework in natural language, or rejects from that
-   card. A confirmed acceptance integrates only into the root integration
-   worktree, never into the user checkout or `main`.
+1. 用户启动 `yi-agent`，进入现有 TUI。
+2. 如果本地 runtime 不可用，TUI 显示明确的启动确认。用户确认后，无需离开 TUI
+   即可启动 runtime；用户拒绝后，当前对话仍可作为不带委派能力的普通单 Agent
+   对话使用。
+3. 用户输入正常请求，例如：“实现登录流程，如果合适就把其中一个明确部分交给子
+   Agent。”
+4. 前台根 Agent 自行决定是否调用 `spawn_agent`，用户不需要学习委派命令。
+5. 对话中出现简洁的子任务卡片；用户继续聊天时，卡片根据 daemon 事件实时更新。
+6. 子 Agent 产出有效 commit delivery 后，卡片转为审核卡片，展示 diff 和验证
+   证据。
+7. 用户直接在卡片上接受、用自然语言要求返工，或拒绝交付。确认接受后，只集成到
+   根 Agent 的 integration worktree，绝不写入用户 checkout 或 `main`。
 
-`/agents`, `/agent`, `/events`, `/diff`, `/review`, `/accept`, `/rework`, and
-`/reject` remain available for advanced inspection and recovery, but they are
-not the primary workflow.
+`/agents`、`/agent`、`/events`、`/diff`、`/review`、`/accept`、
+`/rework` 和 `/reject` 继续用于高级检查和恢复，但不是主要使用路径。
 
-## Interaction Model
+## 交互模型
 
-### Conversation-Native Delegation
+### 对话原生委派
 
-The existing foreground application Agent remains responsible for the visible
-conversation and provider stream. At TUI session initialization it attaches to
-a durable daemon root task and receives task-scoped `spawn_agent`,
-`send_message`, and `wait_agent` proxy tools. Those tools use the daemon's typed
-IPC and cannot invent a caller task, session, or capability identity.
+现有前台应用 Agent 继续负责可见对话和 provider 流式输出。TUI 会话初始化时，
+它挂接到 daemon 中的一个持久化根任务，并获得任务级 `spawn_agent`、
+`send_message` 和 `wait_agent` 代理工具。这些工具通过 typed IPC 调用 daemon，
+不能自行伪造调用方任务、会话或 capability 身份。
 
-The Agent decides to delegate from the user's natural-language request and its
-system instructions. The TUI does not run a second intent-classification LLM
-call and does not reinterpret arbitrary user text itself. This preserves the
-normal tool-selection model and avoids a second source of truth for delegation.
+Agent 根据用户的自然语言请求和系统指令自行判断是否委派。TUI 不额外调用一次
+LLM 做意图分类，也不自行解释任意用户文本。这样可以沿用正常的工具选择机制，并
+避免出现第二套委派事实来源。
 
-If root attachment fails, the TUI reports the concrete runtime error and keeps
-ordinary single-Agent chat available. It must not pretend delegation succeeded
-or silently create an untracked child.
+如果根任务挂接失败，TUI 显示具体 runtime 错误，同时保留普通单 Agent 对话能力。
+它不得假装委派成功，也不得创建未被 runtime 跟踪的子任务。
 
-### Inline Task Cards
+### 内嵌任务卡片
 
-Runtime task state is rendered as structured history cells rather than plain
-text injected into the Agent conversation. A compact running card contains:
+runtime 任务状态以结构化 history cell 展示，而不是以普通文本注入 Agent 对话。
+运行中的简洁卡片包含：
 
-- stable short task ID and parent relationship;
-- concise objective;
-- state and attempt number;
-- elapsed time and current wait/resource;
-- latest meaningful progress or error;
-- a hint to expand details.
+- 稳定的任务短 ID 和父任务关系；
+- 简短目标；
+- 状态和 attempt 编号；
+- 已运行时间和当前等待的资源；
+- 最近一次有效进度或错误；
+- 展开详情的提示。
 
-The card updates in place by task ID; each progress event must not append a new
-chat message. Expanding it shows worktree/branch, contract, mailbox summary,
-recent events, budget, and permission state. Runtime cells are visible audit
-information but are not appended to the root LLM conversation context.
+卡片以任务 ID 为键原地更新；每个进度事件不得追加一条新的聊天消息。展开后显示
+worktree/branch、contract、mailbox 摘要、最近事件、预算和权限状态。runtime
+cell 是用户可见的审计信息，但不会追加到根 LLM 的对话上下文中。
 
-The first MVP uses conversation cells and an optional expanded card, not a
-dedicated side panel or dashboard. This fits the current TUI history/cell model
-and remains usable in narrow terminals.
+第一版 MVP 使用对话 cell 和可选的展开卡片，不做独立侧边栏或管理页面。这样可以
+复用当前 TUI 的 history/cell 模型，并兼容较窄的终端宽度。
 
-### Review Cards
+### 审核卡片
 
-When a child enters `AwaitingParentReview`, its card shows:
+子任务进入 `AwaitingParentReview` 后，卡片展示：
 
-- pinned delivery ID, base commit, and head commit;
-- branch and worktree identity;
-- changed-file summary and diff access;
-- verification evidence and known limitations;
-- `A Accept`, `R Rework`, `X Reject`, and `D Diff` actions.
+- 固定的 delivery ID、base commit 和 head commit；
+- branch 和 worktree 身份；
+- 变更文件摘要及 diff 入口；
+- 验证证据和已知限制；
+- `A 接受`、`R 返工`、`X 拒绝` 和 `D Diff` 操作。
 
-`A`, `R`, `X`, and `D` apply only while the review card has focus, so normal
-text entry is unaffected. Accept first shows the exact commit, target parent
-branch, worktrees, and action scope. Rework opens the normal input editor in a
-review-feedback mode; reject similarly requires a non-empty reason. Escape
-cancels either mode without mutation.
+只有审核卡片获得焦点时，`A`、`R`、`X` 和 `D` 才会生效，因此不会干扰普通文本
+输入。接受前先展示准确 commit、目标父 branch、相关 worktree 和操作范围。返工
+会让普通输入框进入审核反馈模式；拒绝同样要求输入非空原因。按 Escape 可退出这些
+模式且不产生任何状态变更。
 
-The confirmation token is bound to the current task, delivery, parent target,
-and action and expires. If task state or reviewed HEAD changes, the daemon
-rejects it and the TUI refreshes the card.
+确认 token 必须绑定当前任务、delivery、父集成目标和具体操作，并且会过期。任务
+状态或已审核 HEAD 发生变化后，daemon 必须拒绝旧 token，TUI 随即刷新卡片。
 
-### Runtime Connection State
+### Runtime 连接状态
 
-The status area displays `runtime: connected`, `starting`, `disconnected`, or
-`resyncing`, plus resident/queued counts when connected. Starting the runtime
-from the TUI is always an explicit user action. The TUI never silently starts a
-daemon merely because an Agent attempted delegation.
+状态区展示 `runtime: connected`、`starting`、`disconnected` 或
+`resyncing`，连接成功时同时显示 resident 和 queued 数量。在 TUI 内启动 runtime
+始终是用户明确确认的动作。不能仅因为 Agent 尝试委派，就静默启动 daemon。
 
-The TUI holds a versioned event subscription with its last durable cursor.
-Events update a local read-only projection. On reconnect or `ResyncRequired`,
-the TUI discards that projection and replaces it with a fresh daemon snapshot;
-it never infers task transitions locally. Subscription work runs outside the
-render/input loop so a slow or unavailable daemon cannot freeze typing or Agent
-stream rendering.
+TUI 持有带版本号的事件订阅，并保存最近的持久化 cursor。事件只更新本地只读
+projection。重连或收到 `ResyncRequired` 时，TUI 丢弃本地 projection，并用
+daemon 最新 snapshot 完整替换；不得在本地推断任务状态变化。订阅任务必须运行在
+渲染/输入循环之外，避免缓慢或不可用的 daemon 阻塞键盘输入和 Agent 流式渲染。
 
-## Runtime And Application Boundaries
+## Runtime 与应用边界
 
-### Root Attachment
+### 根任务挂接
 
-One typed attach/start request creates the root task, records the natural
-language objective when the first turn begins, and returns an opaque
-task-scoped capability bundle for the foreground Agent tools. It is correlated
-with a TUI-generated idempotency key so retrying a failed transport does not
-create a duplicate root session.
+一次 typed attach/start 请求负责创建根任务，在第一轮开始时记录自然语言目标，并
+返回不透明的任务级 capability 集合，供前台 Agent 工具使用。请求携带由 TUI 生成
+的幂等键，传输失败后重试不得创建重复的根会话。
 
-The application-side root adapter reports lifecycle, usage, permission waits,
-safe checkpoints, child waits, and completion to the daemon. SQLite and the
-daemon supervisor remain authoritative for task state; the TUI history model is
-only a projection. Closing or disconnecting the TUI triggers the existing
-pause/drain protocol rather than marking an active root successfully complete.
+应用侧 root adapter 向 daemon 报告生命周期、用量、权限等待、安全检查点、子任务
+等待和完成状态。SQLite 与 daemon supervisor 始终是任务状态的权威来源；TUI
+history model 只是 projection。关闭 TUI 或连接断开时，必须触发现有 pause/drain
+协议，不能把仍在活动的根任务标成成功完成。
 
-### Permission Channel
+### 权限通道
 
-The foreground root continues using the existing TUI permission UX.
-Daemon-owned children send permission requests through typed IPC to the same visible
-interaction queue. Each card includes task lineage and requested tool/input so
-the user can distinguish root and child requests.
+前台根任务继续使用现有 TUI 权限交互。daemon 托管的子任务通过 typed IPC 把权限
+请求发送到同一个可见交互队列。每张卡片都包含任务 lineage 和请求的 tool/input，
+让用户能够区分根任务与子任务请求。
 
-The TUI sends decisions through `ResolvePermission`; the daemon persists the
-decision before waking the waiting worker. Security-reserved actions cannot be
-approved by a parent Agent. `--yolo` retains its current explicit semantics and
-is never inferred from a detached daemon or child task.
+TUI 通过 `ResolvePermission` 发送决定；daemon 先持久化决定，再唤醒等待中的
+worker。安全保留操作不得由父 Agent 代替用户批准。`--yolo` 保持现有的显式语义，
+不能因为 daemon 或子任务在后台运行就自动启用。
 
-## Git Worktree Ownership
+## Git Worktree 所有权
 
-The user checkout is a read-only source of the selected committed base. A
-coding session requires a clean Git checkout. The runtime creates:
+用户 checkout 只作为已选定 commit base 的只读来源。coding session 要求 Git
+checkout 干净。runtime 创建以下结构：
 
 ```text
-user checkout (never written by the runtime)
-  root integration worktree and branch
-    child delivery worktree and branch
+用户 checkout（runtime 永不写入）
+  根任务 integration worktree 与 branch
+    子任务 delivery worktree 与 branch
 ```
 
-The root worktree is created from the user checkout's recorded HEAD. A child
-worktree is created from the direct parent's recorded clean HEAD. Branch names
-and paths derive only from daemon-generated session/task IDs, never from raw
-objectives. The daemon persists repository root, worktree path, branch, direct
-parent branch, and base commit before starting the corresponding worker.
+根 worktree 从用户 checkout 记录的 HEAD 创建。子 worktree 从直接父任务记录的
+干净 HEAD 创建。branch 名称和路径只能由 daemon 生成的 session/task ID 派生，
+不能使用原始目标文本。daemon 必须先持久化 repository root、worktree path、
+branch、直接父 branch 和 base commit，再启动相应 worker。
 
-Every Agent receives its own persisted workspace path. Built-in filesystem and
-shell tools, recovery inspection, Git evidence collection, and nested
-delegation all use that path. The global daemon configuration directory must
-not be reused as every worker's workspace.
+每个 Agent 使用自己持久化的 workspace path。内置文件系统和 shell 工具、恢复
+检查、Git 证据收集和嵌套委派都必须使用同一路径。不得把 daemon 的全局配置目录
+复用为所有 worker 的 workspace。
 
-Dirty or non-Git source checkouts disable coding delegation with an actionable
-TUI explanation before worker/provider side effects. Ordinary read-only chat
-remains usable. The runtime never stashes, copies, resets, force-removes, or
-writes the user checkout.
+如果源 checkout 不干净或不是 Git repository，TUI 在任何 worker/provider 副作用
+发生前禁用 coding delegation，并给出可操作的说明；普通只读聊天仍可使用。
+runtime 不得 stash、复制、reset、强制移除或写入用户 checkout。
 
 ## Commit Delivery
 
-When a non-root coding worker finishes a successful Agent turn, the worker
-factory inspects its assigned worktree through the trusted worktree service. A
-valid delivery requires:
+非根 coding worker 成功结束 Agent turn 后，worker factory 通过受信任的 worktree
+service 检查其专属 worktree。有效 delivery 必须满足：
 
-- a clean worktree;
-- the expected child branch;
-- a HEAD different from the recorded base;
-- the recorded base to be an ancestor of HEAD;
-- a commit still reachable at the exact inspected HEAD;
-- non-empty verification evidence collected from the task contract/runtime.
+- worktree 干净；
+- 当前 branch 与预期子 branch 一致；
+- HEAD 与记录的 base 不同；
+- 记录的 base 是 HEAD 的 ancestor；
+- commit 在检查时仍可从精确 HEAD 到达；
+- task contract/runtime 收集了非空验证证据。
 
-The factory reports a real `DeliveryReport` containing the pinned commit, base,
-workspace lease, and evidence. It must not report
-`CompletedWithoutDelivery` for a coding child expected to deliver a commit. A
-dirty tree, missing commit, branch mismatch, or invalid ancestry is a durable
-task failure with retained worktree evidence, not a successful empty delivery.
+factory 随后报告真实 `DeliveryReport`，其中包含固定 commit、base、workspace
+lease 和验证证据。对于要求 commit 的 coding child，不得报告
+`CompletedWithoutDelivery`。worktree 脏、缺少 commit、branch 不匹配或 ancestry
+无效时，任务必须以包含 worktree 证据的持久化失败结束，不能伪装成成功的空交付。
 
-Root completion is different: its integration branch is the session result and
-is not automatically merged into the user checkout. The TUI displays its
-branch/worktree for later explicit user validation.
+根任务完成的语义不同：它的 integration branch 是 session 结果，不会自动合并到
+用户 checkout。TUI 显示该 branch/worktree，供用户后续明确验证。
 
-## Review And Integration
+## 审核与集成
 
-TUI card actions and Slash fallbacks encode the same typed `Review` IPC
-requests. They operate only on the delivery currently named by
-`AwaitingParentReview`; a stale delivery or changed child HEAD is rejected.
+TUI 卡片操作和 Slash 兜底命令编码为相同的 typed `Review` IPC 请求。它们只能作用
+于 `AwaitingParentReview` 当前指向的 delivery；过期 delivery 或发生变化的 child
+HEAD 必须被拒绝。
 
-Acceptance has two distinct durable facts:
+接受包含两个不同的持久化事实：
 
-1. the local user approves the pinned delivery;
-2. the trusted daemon integration service merges that exact commit with
-   `merge --no-ff` into the direct parent's worktree and records successful
-   validation evidence.
+1. 本地用户批准固定的 delivery；
+2. 受信任的 daemon integration service 使用 `merge --no-ff` 把该精确 commit
+   合并到直接父任务 worktree，并记录成功的验证证据。
 
-The task becomes accepted only after both facts succeed. Approval alone wakes
-or notifies the direct parent but cannot claim integration. Immediately before
-merging, the integration service verifies parent ownership, recorded base,
-parent cleanliness, child cleanliness, and pinned child HEAD. It then runs the
-contract's MVP validation command, at minimum `git diff --check`.
+只有两者都成功后，任务才能进入 accepted。单纯批准只能唤醒或通知直接父任务，
+不能宣称已经集成。合并前一刻，integration service 必须重新验证父任务所有权、
+记录的 base、父 worktree 干净状态、子 worktree 干净状态，以及固定的 child HEAD。
+随后运行 contract 定义的 MVP 验证命令，至少包含 `git diff --check`。
 
-A merge or validation failure is recorded with Git evidence and leaves the
-relevant worktrees intact. It never silently resets a successful merge. Rework
-persists feedback, starts a successor attempt through the controlled admission
-path, and delivers the durable feedback exactly once after admission becomes
-unambiguous. If the parent HEAD moved, the successor uses a fresh worktree from
-the new parent base and retains old history. Reject records the reason and
-retains the unmerged child worktree.
+合并或验证失败时，必须记录 Git 证据并保留相关 worktree。成功产生的 merge 不能被
+静默 reset。返工先持久化反馈，再通过受控 admission 路径启动 successor attempt；
+只有 admission 结果不再含糊后，才恰好一次地交付持久化反馈。如果父 HEAD 已变化，
+successor 从新的父 base 创建全新 worktree，并保留旧历史。拒绝会记录原因，并保留
+未合并的子 worktree。
 
-No review action merges the feature branch or a runtime integration branch
-into `main`.
+任何审核操作都不得把当前 feature branch 或 runtime integration branch 合并到
+`main`。
 
-## Recovery And Failure Semantics
+## 恢复与失败语义
 
-The existing controlled recovery gate remains authoritative. On daemon restart,
-workspace identity, worktree identity, checkpoint state, registered tools, and
-Git HEAD/status must attest before a recovered worker receives tools or invokes
-the provider.
+现有受控恢复 gate 仍是权威路径。daemon 重启后，workspace 身份、worktree 身份、
+checkpoint 状态、已注册工具及 Git HEAD/status 必须完成 attestation，恢复的 worker
+才能获得工具或调用 provider。
 
-Before building the vertical slice, the current review checkpoint must close
-two known correctness gaps:
+在实现垂直闭环之前，当前 review checkpoint 必须关闭两个已知正确性缺口：
 
-- ambiguous rework fallback must release or durably invalidate the SQLite
-  `resident:*` lease even when persisting `RecoveryRequired` also fails;
-- a post-admission worker factory failure must retain the concrete factory
-  error in terminal evidence while closing the attempt as failed.
+- 即使持久化 `RecoveryRequired` 也失败，含糊的 rework fallback 仍必须释放或以
+  持久化方式作废 SQLite 中的 `resident:*` lease；
+- admission 后的 worker factory 启动失败必须在关闭 attempt 为 failed 的同时，把
+  具体 factory error 保留在终止证据中。
 
-These fixes are prerequisites because the MVP exercises the same admission,
-rework, and restart paths.
+MVP 会直接经过相同的 admission、rework 和 restart 路径，因此这两项是实现前置。
 
-## Secondary Controls
+## 辅助控制面
 
-Slash commands mirror every MVP control and remain useful when a card is no
-longer visible. Existing CLI commands remain supported for automation,
-diagnostics, and tests, but the user does not need them for ordinary TUI
-development. Generated help describes both card shortcuts and Slash fallbacks
-from the same command metadata.
+Slash 命令覆盖所有 MVP 操作，并在卡片已经不可见时提供恢复入口。现有 CLI 命令
+继续服务于自动化、诊断和测试，但普通 TUI 开发不依赖 CLI。生成式帮助从同一份
+command metadata 同时说明卡片快捷键和 Slash 兜底命令。
 
-## End-To-End Verification
+## 端到端验证
 
-The deterministic MVP test uses a temporary Git repository, scripted providers,
-the real daemon/IPC stack, and the TUI application reducer; it never calls a
-real LLM API. It proves this sequence:
+确定性的 MVP 测试使用临时 Git repository、脚本化 mock provider、真实
+daemon/IPC stack 和 TUI application reducer；绝不调用真实 LLM API。测试必须证明
+以下流程：
 
-1. initialize and commit a clean user checkout;
-2. open the TUI and explicitly start/attach the local runtime;
-3. submit a normal natural-language coding request;
-4. the root provider selects `spawn_agent` and then waits;
-5. an inline child card appears and updates without polluting LLM context;
-6. the child writes only its assigned worktree, commits, and completes;
-7. the card becomes a review card with a real pinned delivery;
-8. accepting the focused card merges that exact commit into the root
-   integration worktree with a merge commit;
-9. the user checkout and its branch/HEAD remain unchanged;
-10. SQLite records approval, integration evidence, terminal state, and released
-    resident ownership;
-11. restarting and reattaching replaces the TUI projection from durable state
-    without replaying the accepted delivery.
+1. 初始化并 commit 一个干净的用户 checkout；
+2. 打开 TUI，并在其中明确启动/挂接本地 runtime；
+3. 提交普通自然语言 coding 请求；
+4. root provider 选择 `spawn_agent`，随后等待；
+5. 对话中出现内嵌子任务卡片，并在不污染 LLM 上下文的情况下持续更新；
+6. child 只写自己的 worktree，完成 commit 后结束；
+7. 卡片转为包含真实固定 delivery 的审核卡片；
+8. 接受当前聚焦卡片后，该精确 commit 通过 merge commit 集成到根任务
+   integration worktree；
+9. 用户 checkout 及其 branch/HEAD 保持不变；
+10. SQLite 记录批准、集成证据、终止状态和已释放的 resident 所有权；
+11. daemon 重启并重新挂接后，TUI 从持久化状态替换 projection，且不会重放已经
+    接受的 delivery。
 
-Separate deterministic paths prove natural-language rework reaches the
-successor attempt and reject retains an unmerged worktree. Failure tests cover
-runtime-start refusal, daemon disconnect/resync, dirty source checkout, missing
-child commit, changed reviewed HEAD, merge conflict, validation failure,
-permission denial, and recovery conflict. Rendering tests cover narrow and
-normal terminal widths, focused review actions, and input isolation.
+独立的确定性路径还要证明：自然语言返工意见会到达 successor attempt，拒绝后未
+合并 worktree 会被保留。失败测试覆盖：用户拒绝启动 runtime、daemon 断线/重同步、
+源 checkout 脏、child 没有 commit、已审核 HEAD 变化、merge conflict、验证失败、
+权限拒绝和 recovery conflict。渲染测试覆盖窄终端与常规终端宽度、审核卡片焦点
+操作以及输入隔离。
 
-## MVP Completion Boundary
+## MVP 完成边界
 
-The MVP is complete only when the normal TUI conversation workflow runs against
-the real daemon and real Git operations, the deterministic end-to-end tests
-pass, and focused core/store/tools/application suites pass serially. Unit tests
-that invoke the coordinator directly or Slash-only workflows are supporting
-evidence but cannot substitute for the TUI-to-Agent-to-daemon-to-child-to-Git
-end-to-end test.
+只有正常 TUI 对话流程真正经过 real daemon 和真实 Git 操作、确定性端到端测试
+通过，并且 core/store/tools/application 的聚焦测试套件串行通过，才能宣称 MVP
+完成。直接调用 coordinator 的单元测试或只覆盖 Slash 命令的流程只能作为辅助
+证据，不能替代 TUI→Agent→daemon→child→Git 的端到端测试。
 
-The following remain required for the full subagent-runtime milestone but do
-not block this first runnable slice:
+以下内容仍属于完整子 Agent runtime milestone，但不阻塞第一个可运行垂直闭环：
 
-- a dedicated full task-tree side panel and richer navigation;
-- root-to-child-to-leaf end-to-end delegation and direct-parent integration;
-- natural-language schedules executing the same worker pipeline;
-- all remaining checkpoints 1-20 audit items;
-- strict Clippy and project-management updates;
-- final user validation and an explicitly authorized merge decision.
+- 独立的完整任务树侧边栏和更丰富的导航；
+- root→child→leaf 两级端到端委派与直接父任务集成；
+- 使用同一 worker pipeline 执行的自然语言定时任务；
+- checkpoints 1–20 的其余审计项；
+- strict Clippy 和项目管理文档更新；
+- 最终用户验证及明确授权的 merge 决策。
 
-No MVP operation merges the current feature branch or any runtime integration
-branch into `main`.
+任何 MVP 操作都不得把当前 feature branch 或 runtime integration branch 合并到
+`main`。
