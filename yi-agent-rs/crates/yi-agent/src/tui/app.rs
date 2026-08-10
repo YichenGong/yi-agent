@@ -714,6 +714,12 @@ enum KeyOutcome {
     Submit(String),
 }
 
+fn starts_with_multi_segment_absolute_path(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|token| token.starts_with('/') && token.matches('/').count() >= 2)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
@@ -931,7 +937,7 @@ fn handle_key(
         InputAction::Submit => {
             let text = input.take_submitted();
             // Check if this is a slash command
-            if text.starts_with('/') {
+            if text.starts_with('/') && !starts_with_multi_segment_absolute_path(&text) {
                 let name = text
                     .trim_start_matches('/')
                     .split_whitespace()
@@ -4022,6 +4028,93 @@ mod tests {
     }
 
     // ----- handle_key Submit 分流 tests -----
+
+    #[test]
+    fn submit_multi_segment_absolute_path_sends_to_agent() {
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+        let path = "/Users/name/project explain this";
+
+        input.buffer = path.to_string();
+        input.cursor = input.buffer.len();
+
+        let result = handle_key(
+            make_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            1000,
+            80,
+            24,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+
+        assert_eq!(result, KeyOutcome::Submit(path.to_string()));
+        assert_eq!(input_rx.try_recv().unwrap(), path);
+        assert!(matches!(
+            history.cells.as_slice(),
+            [HistoryCell::UserMessage { text }] if text == path
+        ));
+    }
+
+    #[test]
+    fn submit_single_segment_absolute_path_shows_unknown_command() {
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        input.buffer = "/tmp".to_string();
+        input.cursor = input.buffer.len();
+
+        let result = handle_key(
+            make_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            1000,
+            80,
+            24,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+
+        assert_eq!(result, KeyOutcome::None);
+        assert!(input_rx.try_recv().is_err());
+        assert!(matches!(
+            history.cells.as_slice(),
+            [HistoryCell::Separator { label: Some(label) }] if label == "未知命令: /tmp"
+        ));
+    }
 
     #[test]
     fn submit_while_running_goes_to_queue_not_history() {
