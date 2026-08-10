@@ -127,7 +127,7 @@ impl StreamRingBuffer {
             let Some((start, bytes)) = self.chunks.first_mut() else {
                 break;
             };
-            if excess >= bytes.len() {
+            if excess > bytes.len() {
                 total -= bytes.len();
                 self.chunks.remove(0);
             } else {
@@ -177,6 +177,18 @@ mod tests {
         let mut buf = StreamRingBuffer::new(6);
         buf.push(b"abcdef");
         buf.push(b"ghij");
+
+        let (text, next_cursor, truncated) = buf.read(Some(0), 64);
+
+        assert_eq!(text, "efghij");
+        assert_eq!(next_cursor, 10);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn stream_ring_buffer_retains_tail_when_single_chunk_exceeds_cap() {
+        let mut buf = StreamRingBuffer::new(6);
+        buf.push(b"abcdefghij");
 
         let (text, next_cursor, truncated) = buf.read(Some(0), 64);
 
