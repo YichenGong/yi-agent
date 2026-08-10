@@ -5,7 +5,7 @@ mod llm_prefix;
 mod tracing_init;
 mod tui;
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
@@ -99,6 +99,7 @@ fn run_agent(cli: Cli) -> Result<()> {
 
     let system_prompt = resolve_system_prompt_with_skills(
         config.system_prompt.clone(),
+        &config.workdir,
         &skills_service,
         config.skills_catalog_budget,
         config.skills_catalog_budget_explicit,
@@ -270,6 +271,7 @@ fn build_headless_setup(config: &config::Config, naked: bool) -> Result<Headless
     let skills_service = setup_skills(config)?;
     let system_prompt = resolve_system_prompt_with_skills(
         config.system_prompt.clone(),
+        &config.workdir,
         &skills_service,
         config.skills_catalog_budget,
         config.skills_catalog_budget_explicit,
@@ -610,11 +612,27 @@ fn manual_compaction_outcome_event(
 /// when the user did not provide one. The current local date is appended to
 /// the end so the model knows today's date; placed at the tail to avoid
 /// disrupting the cached prefix of the prompt.
-fn resolve_system_prompt(user: Option<String>) -> Option<String> {
+fn load_project_instructions(workdir: &Path) -> Option<String> {
+    let path = workdir.join("AGENTS.md");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), "failed to read project instructions: {error}");
+            None
+        }
+    }
+}
+
+fn resolve_system_prompt(user: Option<String>, workdir: &Path) -> Option<String> {
     let mut base = yi_agent_core::AgentConfig::default_system_prompt();
     if let Some(user) = user {
         base.push_str("\n\nUser-provided instructions:\n");
         base.push_str(&user);
+    }
+    if let Some(instructions) = load_project_instructions(workdir) {
+        base.push_str("\n\nProject instructions (AGENTS.md):\n");
+        base.push_str(&instructions);
     }
     let today = chrono::Local::now().format("%Y-%m-%d");
     Some(format!("{base}\n\nCurrent date: {today}"))
@@ -665,11 +683,12 @@ fn setup_skills(config: &config::Config) -> Result<Option<Arc<yi_agent_skills::S
 /// Resolve the effective system prompt, appending the skills catalog if available.
 fn resolve_system_prompt_with_skills(
     user: Option<String>,
+    workdir: &Path,
     service: &Option<Arc<yi_agent_skills::SkillsService>>,
     budget: usize,
     budget_explicit: bool,
 ) -> Option<String> {
-    let base = resolve_system_prompt(user);
+    let base = resolve_system_prompt(user, workdir);
     let Some(svc) = service else {
         return base;
     };
@@ -739,7 +758,8 @@ mod tests {
 
     #[test]
     fn resolve_system_prompt_none_uses_default() {
-        let resolved = resolve_system_prompt(None);
+        let resolved =
+            resolve_system_prompt(None, Path::new("/definitely-missing-yi-agent-test-root"));
         let default = yi_agent_core::AgentConfig::default_system_prompt();
         // The resolved prompt should start with the default prompt and have
         // the current date appended at the end.
@@ -756,7 +776,10 @@ mod tests {
 
     #[test]
     fn resolve_system_prompt_custom_keeps_base_instructions() {
-        let resolved = resolve_system_prompt(Some("custom".into()));
+        let resolved = resolve_system_prompt(
+            Some("custom".into()),
+            Path::new("/definitely-missing-yi-agent-test-root"),
+        );
         let default = yi_agent_core::AgentConfig::default_system_prompt();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(
@@ -765,6 +788,39 @@ mod tests {
                 && r.ends_with(&today)),
             "resolved should retain base instructions, append custom prompt, and end with date: {resolved:?}"
         );
+    }
+
+    #[test]
+    fn resolve_system_prompt_appends_root_agents_md_after_custom_instructions() {
+        let project = tempfile::tempdir().expect("create project root");
+        std::fs::write(
+            project.path().join("AGENTS.md"),
+            "Always run focused tests.",
+        )
+        .expect("write AGENTS.md");
+
+        let resolved = resolve_system_prompt(Some("Use concise output.".into()), project.path());
+        let prompt = resolved.expect("normal mode should have a system prompt");
+
+        assert!(prompt.contains("User-provided instructions:\nUse concise output."));
+        assert!(prompt.contains("Project instructions (AGENTS.md):\nAlways run focused tests."));
+        assert!(
+            prompt.find("User-provided instructions:").unwrap()
+                < prompt.find("Project instructions (AGENTS.md):").unwrap()
+        );
+        assert!(
+            prompt.find("Project instructions (AGENTS.md):").unwrap()
+                < prompt.find("Current date:").unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_system_prompt_ignores_missing_root_agents_md() {
+        let project = tempfile::tempdir().expect("create project root");
+        let prompt = resolve_system_prompt(None, project.path())
+            .expect("normal mode should have a system prompt");
+
+        assert!(!prompt.contains("Project instructions (AGENTS.md):"));
     }
 
     #[test]
@@ -794,8 +850,9 @@ mod tests {
     fn resolve_system_prompt_with_skills_no_service_returns_base() {
         // When service is None, should fall back to base via resolve_system_prompt
         // (which appends the current date).
-        let resolved = resolve_system_prompt_with_skills(None, &None, 8192, false);
-        let expected = resolve_system_prompt(None);
+        let workdir = Path::new("/definitely-missing-yi-agent-test-root");
+        let resolved = resolve_system_prompt_with_skills(None, workdir, &None, 8192, false);
+        let expected = resolve_system_prompt(None, workdir);
         assert_eq!(resolved, expected);
     }
 
@@ -804,8 +861,9 @@ mod tests {
         // When service is Some but catalog is empty (no skills discovered),
         // should return the base prompt unchanged (with current date appended).
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
-        let expected = resolve_system_prompt(None);
-        let resolved = resolve_system_prompt_with_skills(None, &Some(svc), 8192, false);
+        let workdir = Path::new("/definitely-missing-yi-agent-test-root");
+        let expected = resolve_system_prompt(None, workdir);
+        let resolved = resolve_system_prompt_with_skills(None, workdir, &Some(svc), 8192, false);
         assert_eq!(resolved, expected);
     }
 
