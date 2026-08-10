@@ -51,6 +51,29 @@ impl WorktreeService {
         Self
     }
 
+    pub fn create_root(
+        &self,
+        repository_root: &Path,
+        branch: &str,
+        root_path: &Path,
+    ) -> Result<ChildWorktree, WorktreeError> {
+        if same_path(repository_root, root_path) {
+            return Err(WorktreeError::ParentPathReuse {
+                path: root_path.to_path_buf(),
+            });
+        }
+        let parent_branch = current_branch(repository_root)?;
+        let base_commit = self.resolve_parent_base(repository_root, "HEAD")?;
+        ensure_worktree_parent_is_ignored(repository_root, root_path)?;
+        add_worktree(repository_root, root_path, branch, &base_commit)?;
+        Ok(ChildWorktree {
+            path: root_path.to_path_buf(),
+            branch: branch.to_owned(),
+            parent_branch,
+            base_commit,
+        })
+    }
+
     /// Reject uncommitted parent state before a child branch can be derived.
     pub fn validate_parent_base(
         &self,
@@ -82,20 +105,8 @@ impl WorktreeService {
         self.validate_parent_base(parent_worktree, base)?;
         let base_commit = self.resolve_parent_base(parent_worktree, base)?;
         let parent_branch = current_branch(parent_worktree)?;
-        let output = Command::new("git")
-            .args(["worktree", "add"])
-            .arg(child_path)
-            .args(["-b", branch, &base_commit])
-            .current_dir(parent_worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
+        ensure_worktree_parent_is_ignored(parent_worktree, child_path)?;
+        add_worktree(parent_worktree, child_path, branch, &base_commit)?;
         Ok(ChildWorktree {
             path: child_path.to_path_buf(),
             branch: branch.to_owned(),
@@ -337,6 +348,77 @@ fn current_branch(workdir: &Path) -> Result<String, WorktreeError> {
     Ok(git(workdir, &["branch", "--show-current"])?
         .trim()
         .to_owned())
+}
+
+fn add_worktree(
+    owner_worktree: &Path,
+    path: &Path,
+    branch: &str,
+    base_commit: &str,
+) -> Result<(), WorktreeError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| WorktreeError::Git {
+            message: error.to_string(),
+        })?;
+    }
+    let output = Command::new("git")
+        .args(["worktree", "add"])
+        .arg(path)
+        .args(["-b", branch, base_commit])
+        .current_dir(owner_worktree)
+        .output()
+        .map_err(|error| WorktreeError::Git {
+            message: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(WorktreeError::Git {
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_worktree_parent_is_ignored(
+    owner_worktree: &Path,
+    worktree_path: &Path,
+) -> Result<(), WorktreeError> {
+    let Ok(relative) = worktree_path.strip_prefix(owner_worktree) else {
+        return Ok(());
+    };
+    if relative
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        != Some(".worktrees")
+    {
+        return Ok(());
+    }
+    let git_dir = git(owner_worktree, &["rev-parse", "--git-dir"])?
+        .trim()
+        .to_owned();
+    let git_dir = PathBuf::from(git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        owner_worktree.join(git_dir)
+    };
+    let info_dir = git_dir.join("info");
+    std::fs::create_dir_all(&info_dir).map_err(|error| WorktreeError::Git {
+        message: error.to_string(),
+    })?;
+    let exclude_path = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == "/.worktrees/") {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("/.worktrees/\n");
+    std::fs::write(exclude_path, updated).map_err(|error| WorktreeError::Git {
+        message: error.to_string(),
+    })
 }
 
 fn git(workdir: &Path, args: &[&str]) -> Result<String, WorktreeError> {

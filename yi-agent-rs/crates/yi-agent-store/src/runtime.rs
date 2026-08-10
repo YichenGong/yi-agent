@@ -21,14 +21,14 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, ReviewPersistenceError, SpawnError, WaitMode, WaitOutcome,
 };
 use yi_agent_core::subagent::task::{
-    AgentTask, BlockReason, BudgetKind, CancelReason, DeliveryReport, IntegrationValidation,
-    MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
-    RootSessionId, TaskFailure, TaskId, TaskState, TimeoutKind,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryReport,
+    IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
+    RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState, TimeoutKind,
     WatchdogEvidence as CoreWatchdogEvidence,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult, WorkerWatchdogEvent,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
+    WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
 };
 
 use crate::repository::{
@@ -89,6 +89,7 @@ pub struct RuntimeStopSummary {
 pub struct RuntimeCoordinator {
     repository: Arc<Mutex<RuntimeRepository>>,
     factory: Arc<dyn AgentWorkerFactory>,
+    workspace_service: Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>>,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
     resident_tasks: Mutex<HashSet<TaskId>>,
     resident_leases: Mutex<HashMap<TaskId, LeaseId>>,
@@ -98,6 +99,53 @@ pub struct RuntimeCoordinator {
     provider_profile_id: Option<String>,
     recovery_contexts: Mutex<HashMap<TaskId, RecoveryContext>>,
     draining: AtomicBool,
+}
+
+struct WorkspaceAssignedFactory<'a> {
+    inner: &'a dyn AgentWorkerFactory,
+    workspace: WorkerWorkspace,
+}
+
+impl AgentWorkerFactory for WorkspaceAssignedFactory<'_> {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn provider_profile_id(&self) -> Option<String> {
+        self.inner.provider_profile_id()
+    }
+
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        self.inner.recovery_context()
+    }
+
+    fn recovery_context_for(&self, request: &WorkerStart) -> WorkerRecoveryContext {
+        self.inner.recovery_context_for(request)
+    }
+
+    fn preflight_recovery(
+        &self,
+        request: WorkerRecoveryPreflight,
+    ) -> WorkerRecoveryPreflightResult {
+        self.inner.preflight_recovery(request)
+    }
+
+    fn start(
+        &self,
+        request: WorkerStart,
+    ) -> futures::future::BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        self.inner
+            .start(request.with_workspace(self.workspace.clone()))
+    }
+
+    fn start_with_provider_turn_gate(
+        &self,
+        request: WorkerStart,
+        gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> futures::future::BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        self.inner
+            .start_with_provider_turn_gate(request.with_workspace(self.workspace.clone()), gate)
+    }
 }
 
 impl RuntimeCoordinator {
@@ -405,6 +453,7 @@ impl RuntimeCoordinator {
             }
         }
         let provider_profile_id = factory.provider_profile_id();
+        let workspace_service = factory.workspace_service();
         if let Some(profile_id) = &provider_profile_id {
             resource_coordinator.configure_provider_llm_capacity(profile_id);
             for resource_key in [
@@ -434,6 +483,7 @@ impl RuntimeCoordinator {
         Ok(Self {
             repository,
             factory,
+            workspace_service,
             supervisors: Mutex::new(supervisors),
             resident_tasks: Mutex::new(HashSet::new()),
             resident_leases: Mutex::new(HashMap::new()),
@@ -701,6 +751,34 @@ impl RuntimeCoordinator {
                 .depth,
             yi_agent_core::TaskDepth::Root
         );
+        let attempt = supervisor
+            .task(task)
+            .expect("worker task exists")
+            .active_attempt_id()
+            .clone();
+        let workspace_assignment =
+            match self.prepare_task_workspace(&supervisor, session, task, &attempt) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    let evidence = serde_json::to_string(&serde_json::json!({
+                        "reason": "workspace_provision_failed",
+                        "error": error.to_string(),
+                    }))
+                    .expect("workspace failure evidence is serializable");
+                    self.repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned")
+                        .transition_task_and_attempt_with_terminal(
+                            task,
+                            &attempt,
+                            "failed",
+                            RuntimeEvent::TaskFailed,
+                            &evidence,
+                        )?;
+                    let _ = supervisor.fail_task(task, error.to_string());
+                    return Err(RuntimeCoordinatorError::Supervisor(error.to_string()));
+                }
+            };
         if is_subagent {
             let parent_id = supervisor
                 .task(task)
@@ -769,11 +847,6 @@ impl RuntimeCoordinator {
                 }
             }
         }
-        let attempt = supervisor
-            .task(task)
-            .expect("worker task exists")
-            .active_attempt_id()
-            .clone();
         let gate = recovery_boundary
             .as_ref()
             .filter(|context| context.recovery_gated)
@@ -824,7 +897,11 @@ impl RuntimeCoordinator {
                 }
             }
         }
-        let mut recovery_context = self.factory.recovery_context();
+        let mut recovery_request = WorkerStart::new(task.clone(), attempt.clone(), session.clone());
+        if let Some(workspace) = workspace_assignment.clone() {
+            recovery_request = recovery_request.with_workspace(workspace);
+        }
+        let mut recovery_context = self.factory.recovery_context_for(&recovery_request);
         if let Some(workspace) = supervisor
             .task(task)
             .expect("worker task exists")
@@ -877,8 +954,19 @@ impl RuntimeCoordinator {
                     }) as Arc<dyn ProviderTurnGate>
                 })
             });
+        let workspace_factory =
+            workspace_assignment
+                .clone()
+                .map(|workspace| WorkspaceAssignedFactory {
+                    inner: self.factory.as_ref(),
+                    workspace,
+                });
+        let worker_factory: &dyn AgentWorkerFactory = workspace_factory
+            .as_ref()
+            .map(|factory| factory as &dyn AgentWorkerFactory)
+            .unwrap_or_else(|| self.factory.as_ref());
         if let Err(error) = supervisor
-            .start_worker_with_provider_turn_gate(self.factory.as_ref(), task, provider_turn_gate)
+            .start_worker_with_provider_turn_gate(worker_factory, task, provider_turn_gate)
             .await
         {
             let terminal = serde_json::to_string(&serde_json::json!({
@@ -954,6 +1042,48 @@ impl RuntimeCoordinator {
             return Err(RuntimeCoordinatorError::Repository(error));
         }
         Ok(())
+    }
+
+    fn prepare_task_workspace(
+        &self,
+        supervisor: &AgentSupervisor,
+        session: &RootSessionId,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) -> Result<Option<WorkerWorkspace>, RuntimeCoordinatorError> {
+        let existing = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_workspace_optional(task)?;
+        if existing.is_some() {
+            return Ok(existing);
+        }
+        let Some(service) = self.workspace_service.as_ref() else {
+            return Ok(None);
+        };
+        let task_snapshot = supervisor
+            .task(task)
+            .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?;
+        let workspace = if let Some(parent_id) = task_snapshot.parent_id.as_ref() {
+            let parent = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .task_workspace(parent_id)?;
+            service
+                .prepare_child(&parent, session, task, attempt)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
+        } else {
+            service
+                .prepare_root(session, task, attempt)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
+        };
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_task_workspace(task, attempt, &workspace)?;
+        Ok(Some(workspace))
     }
 
     pub async fn retry_task(

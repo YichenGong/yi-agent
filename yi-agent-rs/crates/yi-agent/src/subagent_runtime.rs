@@ -8,9 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use yi_agent_core::subagent::task::{AttemptId, RootSessionId, TaskId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
-    WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
+    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
+    WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerRecoveryPreflight,
+    WorkerRecoveryPreflightResult, WorkerStart, WorkerWorkspace,
 };
 use yi_agent_core::{
     Agent, AgentConfig, AgentError, AgentEvent, Provider, ProviderError, ProviderTurnGate, Tool,
@@ -27,7 +29,10 @@ pub struct DaemonAgentWorkerFactory {
     tools: Arc<ToolRegistry>,
     config: AgentConfig,
     runtime_socket: PathBuf,
-    workspace: PathBuf,
+    sandbox: yi_agent_tools::SandboxMode,
+    sandbox_writable_roots: Vec<PathBuf>,
+    workspace_service: Option<Arc<DaemonWorkspaceService>>,
+    recovery_workspace: Option<PathBuf>,
 }
 
 impl DaemonAgentWorkerFactory {
@@ -42,19 +47,44 @@ impl DaemonAgentWorkerFactory {
             tools,
             config,
             runtime_socket,
-            workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
+            sandbox_writable_roots: Vec::new(),
+            workspace_service: None,
+            recovery_workspace: None,
         }
     }
 
-    /// Must match the directory passed to builtin filesystem and shell tools.
-    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
-        self.workspace = workspace;
+    pub fn with_sandbox(
+        mut self,
+        sandbox: yi_agent_tools::SandboxMode,
+        writable_roots: Vec<PathBuf>,
+    ) -> Self {
+        self.sandbox = sandbox;
+        self.sandbox_writable_roots = writable_roots;
         self
     }
 
-    fn worker_tool_names(&self) -> Vec<String> {
+    /// Configures the Git repository from which task worktrees are created.
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.recovery_workspace = Some(workspace.clone());
+        self.workspace_service = Some(Arc::new(DaemonWorkspaceService::new(workspace)));
+        self
+    }
+
+    fn tool_registry_for_workspace(&self, workspace: PathBuf) -> ToolRegistry {
+        let mut tools = (*self.tools).clone();
+        yi_agent_tools::register_builtin_tools_with_sandbox(
+            &mut tools,
+            workspace,
+            self.sandbox,
+            self.sandbox_writable_roots.clone(),
+        );
+        tools
+    }
+
+    fn worker_tool_names_for_workspace(&self, workspace: PathBuf) -> Vec<String> {
         let mut names = self
-            .tools
+            .tool_registry_for_workspace(workspace)
             .schemas()
             .into_iter()
             .map(|schema| schema.name)
@@ -68,6 +98,143 @@ impl DaemonAgentWorkerFactory {
         names.dedup();
         names
     }
+
+    fn worker_tool_names(&self) -> Vec<String> {
+        self.recovery_workspace
+            .clone()
+            .map(|workspace| self.worker_tool_names_for_workspace(workspace))
+            .unwrap_or_else(|| {
+                let mut names = self
+                    .tools
+                    .schemas()
+                    .into_iter()
+                    .map(|schema| schema.name)
+                    .collect::<Vec<_>>();
+                names.extend([
+                    "spawn_agent".to_string(),
+                    "send_message".to_string(),
+                    "wait_agent".to_string(),
+                ]);
+                names.sort();
+                names.dedup();
+                names
+            })
+    }
+
+    fn recovery_context_for_workspace(&self, workspace: PathBuf) -> WorkerRecoveryContext {
+        let git_root = git_output(&workspace, &["rev-parse", "--show-toplevel"]);
+        let git_head = git_output(&workspace, &["rev-parse", "HEAD"]);
+        let git_status = git_command_output(&workspace, &["status", "--porcelain"]).ok();
+        let tool_names = self.worker_tool_names_for_workspace(workspace.clone());
+        WorkerRecoveryContext {
+            workspace_lease_id: Some(format!("workspace:{}", workspace.display())),
+            worktree_lease: git_root.map(|directory| format!("worktree:{directory}")),
+            checkpoint_json: json!({
+                "kind": "worker_admission",
+                "git_head": git_head,
+                "git_status": git_status,
+            })
+            .to_string(),
+            tool_state_json: json!({
+                "state": "available",
+                "registered_tools": tool_names,
+            })
+            .to_string(),
+        }
+    }
+}
+
+pub struct DaemonWorkspaceService {
+    repository_root: PathBuf,
+    worktree_root: PathBuf,
+    service: yi_agent_tools::worktree::WorktreeService,
+}
+
+impl DaemonWorkspaceService {
+    pub fn new(workspace: PathBuf) -> Self {
+        let repository_root = git_output(&workspace, &["rev-parse", "--show-toplevel"])
+            .map(PathBuf::from)
+            .unwrap_or(workspace);
+        let worktree_root = repository_root.join(".worktrees");
+        Self {
+            repository_root,
+            worktree_root,
+            service: yi_agent_tools::worktree::WorktreeService::new(),
+        }
+    }
+}
+
+impl AgentWorkspaceService for DaemonWorkspaceService {
+    fn prepare_root(
+        &self,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let branch = branch_name(root_session_id, task_id, true);
+        let path = self.worktree_root.join(format!(
+            "yi-agent-{}-root",
+            short(&root_session_id.to_string())
+        ));
+        let root = self
+            .service
+            .create_root(&self.repository_root, &branch, &path)
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path: root.path,
+            branch: root.branch,
+            parent_branch: root.parent_branch,
+            base_commit: root.base_commit,
+        })
+    }
+
+    fn prepare_child(
+        &self,
+        parent: &WorkerWorkspace,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let branch = branch_name(root_session_id, task_id, false);
+        let path = self.worktree_root.join(format!(
+            "yi-agent-{}-{}",
+            short(&root_session_id.to_string()),
+            short(&task_id.to_string())
+        ));
+        let base = git_output(&parent.path, &["rev-parse", "HEAD"]).ok_or_else(|| {
+            WorkerError::Startup("Git workspace error: parent HEAD is unavailable".into())
+        })?;
+        let child = self
+            .service
+            .create_child(&parent.path, &base, &branch, &path)
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: parent.repository_root.clone(),
+            path: child.path,
+            branch: child.branch,
+            parent_branch: child.parent_branch,
+            base_commit: child.base_commit,
+        })
+    }
+}
+
+fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {
+    if root {
+        format!("feat/yi-agent-{}-root", short(&session.to_string()))
+    } else {
+        format!(
+            "feat/yi-agent-{}-{}",
+            short(&session.to_string()),
+            short(&task.to_string())
+        )
+    }
+}
+
+fn short(value: &str) -> String {
+    value.chars().filter(|ch| *ch != '-').take(8).collect()
 }
 
 fn provider_retry_failure(error: &AgentError) -> Option<RetryFailure> {
@@ -95,34 +262,35 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         Some("daemon-default".into())
     }
 
+    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+        self.workspace_service
+            .as_ref()
+            .map(|service| Arc::clone(service) as Arc<dyn AgentWorkspaceService>)
+    }
+
     fn recovery_context(&self) -> WorkerRecoveryContext {
-        let workspace = &self.workspace;
-        let git_root = git_output(workspace, &["rev-parse", "--show-toplevel"]);
-        let git_head = git_output(workspace, &["rev-parse", "HEAD"]);
-        let git_status = git_command_output(workspace, &["status", "--porcelain"]).ok();
-        let tool_names = self.worker_tool_names();
-        WorkerRecoveryContext {
-            workspace_lease_id: Some(format!("workspace:{}", workspace.display())),
-            worktree_lease: git_root.map(|directory| format!("worktree:{directory}")),
-            checkpoint_json: json!({
-                "kind": "worker_admission",
-                "git_head": git_head,
-                "git_status": git_status,
-            })
-            .to_string(),
-            tool_state_json: json!({
-                "state": "available",
-                "registered_tools": tool_names,
-            })
-            .to_string(),
-        }
+        self.recovery_workspace
+            .clone()
+            .map(|workspace| self.recovery_context_for_workspace(workspace))
+            .unwrap_or_else(WorkerRecoveryContext::default)
+    }
+
+    fn recovery_context_for(&self, request: &WorkerStart) -> WorkerRecoveryContext {
+        request
+            .workspace
+            .as_ref()
+            .map(|workspace| self.recovery_context_for_workspace(workspace.path.clone()))
+            .unwrap_or_else(|| self.recovery_context())
     }
 
     fn preflight_recovery(
         &self,
         request: WorkerRecoveryPreflight,
     ) -> WorkerRecoveryPreflightResult {
-        match validate_recovery_context(&request.context, self.worker_tool_names()) {
+        let actual_tools = recovery_workspace_path(&request.context)
+            .map(|workspace| self.worker_tool_names_for_workspace(workspace))
+            .unwrap_or_else(|| self.worker_tool_names());
+        match validate_recovery_context(&request.context, actual_tools) {
             Ok(attestation) => WorkerRecoveryPreflightResult::Attested(attestation),
             Err(reason) => WorkerRecoveryPreflightResult::Conflict(reason),
         }
@@ -141,7 +309,14 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
     ) -> futures::future::BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         let provider = Arc::clone(&self.provider);
-        let tools = Arc::clone(&self.tools);
+        let Some(workspace) = request.workspace.clone() else {
+            return Box::pin(async {
+                Err(WorkerError::Startup(
+                    "worker workspace assignment is required".into(),
+                ))
+            });
+        };
+        let worker_tools = Arc::new(self.tool_registry_for_workspace(workspace.path));
         let config = self.config.clone();
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
@@ -159,7 +334,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             let reporter = handle.clone();
             let mut mailbox = handle.subscribe_messages();
             let mut pause = handle.subscribe_pause();
-            let mut worker_tools = (*tools).clone();
+            let mut worker_tools = (*worker_tools).clone();
             worker_tools.register(Arc::new(DaemonSpawnAgentTool {
                 runtime_socket: runtime_socket.clone(),
                 session_id: request.root_session_id.to_string(),
@@ -339,6 +514,14 @@ fn git_command_output(directory: &std::path::Path, args: &[&str]) -> Result<Stri
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .ok_or(())
+}
+
+fn recovery_workspace_path(context: &WorkerRecoveryContext) -> Option<PathBuf> {
+    context
+        .workspace_lease_id
+        .as_deref()
+        .and_then(|value| value.strip_prefix("workspace:"))
+        .map(PathBuf::from)
 }
 
 /// Performs the recovery gate before an Agent or ordinary worker tool exists.
@@ -741,6 +924,17 @@ mod tests {
         git_output(directory, &["rev-parse", "HEAD"]).unwrap()
     }
 
+    fn worker_workspace(directory: &std::path::Path) -> WorkerWorkspace {
+        WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.to_path_buf(),
+            path: directory.to_path_buf(),
+            branch: "feat/yi-agent-test-root".into(),
+            parent_branch: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        }
+    }
+
     #[test]
     fn recovery_gate_attests_matching_git_and_tool_state_without_provider_action() {
         let directory = TempDir::new().unwrap();
@@ -881,6 +1075,7 @@ mod tests {
         );
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Continue the delegated task.")
+            .with_workspace(worker_workspace(directory.path()))
             .with_initial_user_messages(vec![WorkerMessage {
                 id: message_id.clone(),
                 body: "continue with the fix".into(),
@@ -917,7 +1112,8 @@ mod tests {
             directory.path().join("runtime.sock"),
         );
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
-            .with_objective("Complete the delegated task.");
+            .with_objective("Complete the delegated task.")
+            .with_workspace(worker_workspace(directory.path()));
         let handle = factory.start(request).await.unwrap();
 
         let events = tokio::time::timeout(Duration::from_secs(1), async {
@@ -953,7 +1149,8 @@ mod tests {
         let handle = factory
             .start(
                 WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
-                    .with_objective("Complete the delegated task."),
+                    .with_objective("Complete the delegated task.")
+                    .with_workspace(worker_workspace(directory.path())),
             )
             .await
             .unwrap();
@@ -1053,12 +1250,25 @@ mod tests {
         else {
             panic!("expected child");
         };
+        let IpcResponse::CancelPreview {
+            confirmation_token, ..
+        } = send_request(
+            daemon.socket_path(),
+            IpcRequest::PreviewCancel {
+                task_id: child_task_id.clone(),
+                recursive: false,
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected cancel preview");
+        };
         send_request(
             daemon.socket_path(),
-            IpcRequest::CancelTask {
-                session_id: session_id.clone(),
-                task_id: child_task_id,
+            IpcRequest::ConfirmCancel {
+                task_id: child_task_id.clone(),
                 recursive: false,
+                confirmation_token,
             },
         )
         .unwrap();

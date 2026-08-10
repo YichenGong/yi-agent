@@ -1455,6 +1455,7 @@ fn daemon_cancel_at(
             confirmation_token,
             task_ids,
             expires_in_secs,
+            ..
         } => Ok(format!(
             "取消预览（{} 个任务）: {}；使用 /cancel {task_id}{} --confirm {confirmation_token} 在 {expires_in_secs}s 内确认",
             task_ids.len(),

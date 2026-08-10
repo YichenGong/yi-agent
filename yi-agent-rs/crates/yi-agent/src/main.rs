@@ -196,6 +196,7 @@ fn show_cancel_preview(socket: &std::path::Path, task_id: String, recursive: boo
             confirmation_token,
             task_ids,
             expires_in_secs,
+            ..
         } => {
             println!("affected tasks: {}", task_ids.join(", "));
             println!(
@@ -381,14 +382,8 @@ fn build_daemon_worker_factory(
         other => anyhow::bail!("unknown provider '{other}': expected 'anthropic' or 'openai'"),
     };
 
-    let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_tools::register_builtin_tools_with_sandbox(
-        &mut registry,
-        config.workdir.clone(),
-        config.sandbox,
-        config.sandbox_writable_roots.clone(),
-    );
     let skills = setup_skills(&config)?;
+    let mut registry = yi_agent_core::ToolRegistry::new();
     if let Some(skills) = &skills {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
     }
@@ -413,6 +408,7 @@ fn build_daemon_worker_factory(
             runtime_socket,
         )
         // Recovery must inspect the same worktree ordinary builtin tools use.
+        .with_sandbox(config.sandbox, config.sandbox_writable_roots)
         .with_workspace(config.workdir),
     ))
 }

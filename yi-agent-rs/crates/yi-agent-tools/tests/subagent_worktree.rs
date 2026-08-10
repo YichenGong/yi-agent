@@ -31,6 +31,33 @@ fn repository() -> (TempDir, String) {
 }
 
 #[test]
+fn root_and_child_worktrees_are_distinct_and_begin_at_the_recorded_parent_head() {
+    let (repo, _head) = repository();
+    let service = WorktreeService::new();
+    let root_path = repo.path().join(".worktrees/yi-root");
+    let child_path = repo.path().join(".worktrees/yi-child");
+    let original_head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let original_status = git(repo.path(), &["status", "--porcelain"]);
+
+    let root = service
+        .create_root(repo.path(), "feat/yi-root", &root_path)
+        .unwrap();
+    let child = service
+        .create_child(&root.path, &root.base_commit, "feat/yi-child", &child_path)
+        .unwrap();
+
+    assert_ne!(root.path, child.path);
+    assert_eq!(child.parent_branch, root.branch);
+    assert_eq!(child.base_commit, git(&root.path, &["rev-parse", "HEAD"]));
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), root.base_commit);
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), original_head);
+    assert_eq!(
+        git(repo.path(), &["status", "--porcelain"]),
+        original_status
+    );
+}
+
+#[test]
 fn child_creation_requires_a_clean_committed_parent_base() {
     let (repo, head) = repository();
     let service = WorktreeService::new();

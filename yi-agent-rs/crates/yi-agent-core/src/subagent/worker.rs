@@ -393,6 +393,51 @@ pub enum WorkerError {
     Startup(String),
 }
 
+pub trait AgentWorkspaceService: Send + Sync {
+    fn prepare_root(
+        &self,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError>;
+
+    fn prepare_child(
+        &self,
+        parent: &WorkerWorkspace,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError>;
+}
+
+#[derive(Debug, Default)]
+pub struct UnavailableWorkspaceService;
+
+impl AgentWorkspaceService for UnavailableWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup(
+            "coding workspace service is unavailable".into(),
+        ))
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup(
+            "coding workspace service is unavailable".into(),
+        ))
+    }
+}
+
 /// Constructs an application-specific `Agent` worker without making core
 /// depend on the CLI, provider bootstrap, or tool registry construction.
 pub trait AgentWorkerFactory: Send + Sync {
@@ -408,12 +453,20 @@ pub trait AgentWorkerFactory: Send + Sync {
         None
     }
 
+    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+        None
+    }
+
     /// Supplies the facts that must survive an interrupted worker attempt.
     /// Factories without a workspace deliberately return explicit absence,
     /// which turns a later recovery attempt into a conflict instead of a
     /// replay from an unknown base.
     fn recovery_context(&self) -> WorkerRecoveryContext {
         WorkerRecoveryContext::default()
+    }
+
+    fn recovery_context_for(&self, _request: &WorkerStart) -> WorkerRecoveryContext {
+        self.recovery_context()
     }
 
     /// Inspects durable recovery evidence without constructing an Agent,

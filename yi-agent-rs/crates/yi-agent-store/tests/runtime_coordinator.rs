@@ -9,11 +9,12 @@ use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
     AttemptId, BudgetKind, IntegrationValidation, MessageId, PermissionDecision,
-    PermissionRequestId, TimeoutKind,
+    PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
-    WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
+    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
+    WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerRecoveryPreflight,
+    WorkerRecoveryPreflightResult, WorkerStart, WorkerWorkspace,
 };
 use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
@@ -128,6 +129,88 @@ struct ConflictReportingFactory {
 }
 
 struct StartupErrorFactory;
+
+#[derive(Clone)]
+struct StaticWorkspaceService {
+    workspace: WorkerWorkspace,
+}
+
+impl AgentWorkspaceService for StaticWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.workspace.clone())
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.workspace.clone())
+    }
+}
+
+#[derive(Clone)]
+struct WorkspaceObservingFactory {
+    database: std::path::PathBuf,
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
+    workspace_service: Arc<dyn AgentWorkspaceService>,
+}
+
+impl AgentWorkerFactory for WorkspaceObservingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+        Some(Arc::clone(&self.workspace_service))
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let persisted = RuntimeRepository::open(&self.database)
+            .unwrap()
+            .task_workspace(&request.task_id)
+            .unwrap();
+        let assigned = request
+            .workspace
+            .as_ref()
+            .expect("worker start includes workspace assignment");
+        assert_eq!(&persisted, assigned);
+        assert_eq!(request.workspace_lease_id, Some(persisted.lease_id.clone()));
+        self.starts.lock().unwrap().push(request.clone());
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
+#[derive(Clone, Default)]
+struct FailingWorkspaceService;
+
+impl AgentWorkspaceService for FailingWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup("Git workspace error: boom".into()))
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup("Git workspace error: boom".into()))
+    }
+}
 
 fn durable_context() -> WorkerRecoveryContext {
     WorkerRecoveryContext {
@@ -250,6 +333,75 @@ impl AgentWorkerFactory for PauseRecordingFactory {
         self.handles.lock().unwrap().push(handle.clone());
         Box::pin(async move { Ok(handle) })
     }
+}
+
+#[tokio::test]
+async fn worker_receives_its_persisted_workspace_before_provider_start() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let workspace = WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: directory.path().join("repo"),
+        path: directory.path().join("repo/.worktrees/worker"),
+        branch: "feat/yi-agent-test-root".into(),
+        parent_branch: "main".into(),
+        base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+    };
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(WorkspaceObservingFactory {
+        database: database.clone(),
+        starts: Arc::clone(&starts),
+        workspace_service: Arc::new(StaticWorkspaceService {
+            workspace: workspace.clone(),
+        }),
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+
+    coordinator.start_worker(&session, &task).await.unwrap();
+
+    let persisted = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_workspace(&task)
+        .unwrap();
+    assert_eq!(persisted, workspace);
+    let starts = starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0]
+            .workspace
+            .as_ref()
+            .map(|workspace| &workspace.path),
+        Some(&persisted.path)
+    );
+}
+
+#[tokio::test]
+async fn workspace_provisioning_failure_is_terminal_before_provider_start() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(WorkspaceObservingFactory {
+        database: database.clone(),
+        starts: Arc::clone(&starts),
+        workspace_service: Arc::new(FailingWorkspaceService),
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+
+    assert!(coordinator.start_worker(&session, &task).await.is_err());
+
+    assert!(starts.lock().unwrap().is_empty());
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&task).unwrap(), "failed");
+    let terminal = repository
+        .attempt_terminal_json_for_task(&task)
+        .unwrap()
+        .expect("workspace failure is terminal evidence");
+    assert!(terminal.contains("workspace_provision_failed"));
+    assert!(terminal.contains("Git workspace error"));
 }
 
 #[tokio::test]
