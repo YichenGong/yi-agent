@@ -212,6 +212,9 @@ impl Tool for ProcessReadTool {
             Err(err) => return ToolResult::error(err),
         };
         let max_bytes = args.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
+        if max_bytes == 0 {
+            return ToolResult::error("max_bytes must be greater than 0");
+        }
 
         match self.manager.read(selector, args.cursor, max_bytes).await {
             Ok(result) => json_result(&result),
@@ -361,7 +364,7 @@ mod tests {
 
         let started = start
             .call(serde_json::json!({
-                "command": "printf ready; sleep 30",
+                "command": "printf ready; sleep 2",
                 "name": "dev-server",
                 "ready_pattern": "ready",
                 "ready_timeout_sec": 2
@@ -384,6 +387,23 @@ mod tests {
             .await;
         assert!(!killed.is_error, "{}", text(&killed));
         assert_eq!(text(&killed), "killed");
+    }
+
+    #[tokio::test]
+    async fn process_read_rejects_zero_max_bytes() {
+        let temp = TempDir::new().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        let read = ProcessReadTool::new(manager);
+
+        let result = read
+            .call(serde_json::json!({
+                "process_id": "proc_1",
+                "max_bytes": 0
+            }))
+            .await;
+
+        assert!(result.is_error);
+        assert!(text(&result).contains("max_bytes must be greater than 0"));
     }
 
     #[test]
