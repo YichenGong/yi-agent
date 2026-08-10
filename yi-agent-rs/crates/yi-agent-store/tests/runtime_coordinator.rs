@@ -662,6 +662,23 @@ async fn rework_acknowledgement_failure_enters_controlled_recovery_before_replay
             .unwrap(),
         "recovery_required"
     );
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        !repository
+            .has_active_lease_prefix(&child, "resident:")
+            .unwrap()
+    );
+    assert!(
+        repository
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap()
+    );
+    assert!(
+        repository
+            .has_active_lease_prefix(&child, "worktree:")
+            .unwrap()
+    );
+    drop(repository);
     let feedback_id: MessageId = RuntimeRepository::open(&database)
         .unwrap()
         .mailbox_messages_for_task(&child)
@@ -862,6 +879,57 @@ async fn failed_recovery_transition_still_releases_the_durable_resident_lease() 
     assert_eq!(context.worktree_lease, durable_context().worktree_lease);
     assert_eq!(context.checkpoint_json, expected.1.unwrap());
     assert_eq!(context.tool_state_json, expected.2);
+}
+
+#[tokio::test]
+async fn failed_rework_fallback_reports_ack_cleanup_and_recovery_failures() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory).await;
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_rework_delivery_ack
+             BEFORE UPDATE OF delivered_at ON mailbox_messages
+             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
+             END;
+             CREATE TRIGGER fail_process_lease_cleanup
+             BEFORE UPDATE OF state ON resource_leases
+             WHEN OLD.resource_key LIKE 'resident:%' AND NEW.state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected process lease cleanup failure');
+             END;
+             CREATE TRIGGER fail_recovery_transition
+             BEFORE UPDATE OF state_json ON tasks
+             WHEN NEW.state_json = 'recovery_required'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected recovery transition failure');
+             END;",
+        )
+        .unwrap();
+
+    let error = coordinator
+        .rework_review(&child, "rerun the parser regression suite")
+        .await
+        .expect_err("the injected fallback failures must surface");
+    let evidence = format!("{error:?}\n{error}");
+
+    assert!(
+        evidence.contains("injected rework acknowledgement failure"),
+        "missing acknowledgement evidence: {evidence}"
+    );
+    assert!(
+        evidence.contains("injected process lease cleanup failure"),
+        "missing cleanup evidence: {evidence}"
+    );
+    assert!(
+        evidence.contains("injected recovery transition failure"),
+        "missing recovery evidence: {evidence}"
+    );
 }
 
 #[tokio::test]

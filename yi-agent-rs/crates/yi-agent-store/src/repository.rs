@@ -2305,6 +2305,37 @@ impl RuntimeRepository {
         Ok(event_id)
     }
 
+    pub fn transition_task_and_attempt_with_terminal_retaining_leases(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        state: &str,
+        event: RuntimeEvent,
+        terminal_json: &str,
+    ) -> Result<i64, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3",
+            params![state, task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = ?1, ended_at = CURRENT_TIMESTAMP, terminal_json = ?2
+             WHERE id = ?3 AND task_id = ?4",
+            params![state, terminal_json, attempt.to_string(), task.to_string()],
+        )?;
+        let event_id = append_event(&transaction, task, event)?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
     /// Commits a watchdog outcome exactly once for an active attempt. A later
     /// scan sees the terminal task state and becomes a no-op rather than
     /// duplicating the terminal audit event or lease release.

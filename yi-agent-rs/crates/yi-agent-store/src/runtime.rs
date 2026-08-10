@@ -41,6 +41,14 @@ use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 pub enum RuntimeCoordinatorError {
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+    #[error(
+        "controlled recovery persistence failed after acknowledgement error: acknowledgement={acknowledgement}; cleanup={cleanup:?}; recovery={recovery:?}"
+    )]
+    ControlledRecoveryPersistence {
+        acknowledgement: String,
+        cleanup: Option<String>,
+        recovery: Option<String>,
+    },
     #[error("session does not exist: {0}")]
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
@@ -928,21 +936,36 @@ impl RuntimeCoordinator {
                 "message_ids": rework_messages,
             }))
             .expect("recovery evidence is serializable");
+            let cleanup_result = if is_subagent {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .release_process_leases_for_task(task)
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
             let mut repository = self
                 .repository
                 .lock()
                 .expect("runtime repository mutex poisoned");
-            let recovery_result = repository.transition_task_and_attempt_with_terminal(
-                task,
-                &attempt,
-                "recovery_required",
-                RuntimeEvent::TaskRecoveryRequired,
-                &recovery,
-            );
-            if is_subagent {
-                let _ = repository.release_process_leases_for_task(task);
+            let recovery_result = repository
+                .transition_task_and_attempt_with_terminal_retaining_leases(
+                    task,
+                    &attempt,
+                    "recovery_required",
+                    RuntimeEvent::TaskRecoveryRequired,
+                    &recovery,
+                );
+            let cleanup = cleanup_result.err().map(|error| error.to_string());
+            let recovery = recovery_result.err().map(|error| error.to_string());
+            if cleanup.is_some() || recovery.is_some() {
+                return Err(RuntimeCoordinatorError::ControlledRecoveryPersistence {
+                    acknowledgement: error.to_string(),
+                    cleanup,
+                    recovery,
+                });
             }
-            recovery_result?;
             return Err(RuntimeCoordinatorError::Repository(error));
         }
         Ok(())
