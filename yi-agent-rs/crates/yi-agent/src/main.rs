@@ -581,6 +581,23 @@ fn load_permission_checker_for_workdir(
     )))
 }
 
+async fn load_permission_checker_for_workdir_async(
+    workdir: std::path::PathBuf,
+    config: &config::Config,
+) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
+    let permissions = yi_agent_core::permission::PermissionChecker::load(&workdir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?;
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
+    Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
+        permissions,
+        config.yolo,
+        workdir,
+        blocklist_fn,
+    )))
+}
+
 fn run_agent(cli: Cli) -> Result<()> {
     let config = config::load(&cli)?;
 
@@ -1059,7 +1076,7 @@ fn run_tui_agent(
                                         runtime.socket_path.clone(),
                                         &runtime.attached_root,
                                     ));
-                                    match load_permission_checker_for_workdir(runtime_workdir, &config) {
+                                    match load_permission_checker_for_workdir_async(runtime_workdir, &config).await {
                                         Ok(next_checker) => {
                                             let session = agent.session();
                                             current_tools = next_tools;
