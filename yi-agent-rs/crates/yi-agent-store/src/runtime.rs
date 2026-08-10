@@ -194,6 +194,49 @@ impl RuntimeCoordinator {
                         ));
                     }
                 };
+                for ancestor in review_tasks.iter().filter(|candidate| {
+                    candidate.session_id == task.session_id && candidate.depth < task.depth
+                }) {
+                    let ancestor_depth = persisted_depth(ancestor.depth)?;
+                    let (state, delivery, objective) =
+                        hydrated_review_state(&ancestor.state, &ancestor.delivery_json)?;
+                    let hydrated = AgentTask::hydrated_review_task(
+                        ancestor.session_id.clone(),
+                        ancestor.task_id.clone(),
+                        ancestor.parent_id.clone(),
+                        ancestor_depth,
+                        ancestor.attempt_id.clone(),
+                        ancestor.attempt_number,
+                        state,
+                        delivery,
+                    );
+                    if ancestor.parent_id.is_none() {
+                        if !supervisors.contains_key(&ancestor.session_id) {
+                            supervisors.insert(
+                                ancestor.session_id.clone(),
+                                Arc::new(AsyncMutex::new(
+                                    AgentSupervisor::from_hydrated_review_root(hydrated, objective),
+                                )),
+                            );
+                        }
+                        continue;
+                    }
+                    let supervisor = supervisors.get(&ancestor.session_id).ok_or_else(|| {
+                        RuntimeCoordinatorError::Supervisor(
+                            "persisted recovery ancestor has no root".into(),
+                        )
+                    })?;
+                    let mut supervisor = supervisor.try_lock().map_err(|_| {
+                        RuntimeCoordinatorError::Supervisor(
+                            "recovery ancestor hydration is busy".into(),
+                        )
+                    })?;
+                    if supervisor.task(&ancestor.task_id).is_none() {
+                        supervisor
+                            .insert_hydrated_review_child(hydrated, objective)
+                            .map_err(RuntimeCoordinatorError::Supervisor)?;
+                    }
+                }
                 let supervisor = supervisors.get(&task.session_id).ok_or_else(|| {
                     RuntimeCoordinatorError::Supervisor(
                         "persisted recovered child has no recovered root".into(),
@@ -787,14 +830,13 @@ impl RuntimeCoordinator {
             self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
-                .transition_task_and_attempt_with_admission(
+                .transition_task_and_attempt_with_recovery_context_and_resident_lease(
                     task,
                     &attempt,
                     "running",
                     RuntimeEvent::TaskStarted,
                     &recovery_context,
                     is_subagent.then_some("resident:global"),
-                    &rework_messages,
                 )
         };
         if let Err(error) = admission {
@@ -845,6 +887,53 @@ impl RuntimeCoordinator {
                 self.release_resident_lease(task);
             }
             return Err(RuntimeCoordinatorError::Supervisor(error));
+        }
+        let acknowledgement = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .mark_rework_messages_delivered(task, &rework_messages);
+        if let Err(error) = acknowledgement {
+            supervisor
+                .interrupt_worker_for_recovery(
+                    task,
+                    &rework_messages,
+                    "rework delivery acknowledgement was not durable",
+                )
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            let recovery = serde_json::to_string(&serde_json::json!({
+                "reason": "ambiguous_rework_delivery",
+                "message_ids": rework_messages,
+            }))
+            .expect("recovery evidence is serializable");
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .transition_task_and_attempt_with_terminal(
+                    task,
+                    &attempt,
+                    "recovery_required",
+                    RuntimeEvent::TaskRecoveryRequired,
+                    &recovery,
+                )?;
+            self.recovery_contexts
+                .lock()
+                .expect("runtime recovery context mutex poisoned")
+                .insert(
+                    task.clone(),
+                    RecoveryContext {
+                        workspace_lease_id: recovery_context.workspace_lease_id.clone(),
+                        worktree_lease: recovery_context.worktree_lease.clone(),
+                        checkpoint_json: Some(recovery_context.checkpoint_json.clone()),
+                        tool_state_json: recovery_context.tool_state_json.clone(),
+                        recovery_gated: false,
+                        recovery_attested: false,
+                    },
+                );
+            if is_subagent {
+                self.release_resident_lease(task);
+            }
+            return Err(RuntimeCoordinatorError::Repository(error));
         }
         Ok(())
     }

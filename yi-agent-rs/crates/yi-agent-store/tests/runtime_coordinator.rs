@@ -624,7 +624,7 @@ async fn committed_review_decisions_reach_the_live_parent_with_the_durable_messa
 }
 
 #[tokio::test]
-async fn rework_acknowledgement_failure_prevents_factory_start_and_safe_retry_replays_once() {
+async fn rework_acknowledgement_failure_enters_controlled_recovery_before_replay() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let factory = Arc::new(MessageRecordingFactory::default());
@@ -648,13 +648,17 @@ async fn rework_acknowledgement_failure_prevents_factory_start_and_safe_retry_re
             .await
             .is_err()
     );
-    assert_eq!(factory.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        factory.starts.lock().unwrap().len(),
+        2,
+        "the ambiguous worker start is never hidden as an unattempted delivery"
+    );
     assert_eq!(
         RuntimeRepository::open(&database)
             .unwrap()
             .task_state(&child)
             .unwrap(),
-        "queued"
+        "recovery_required"
     );
     let feedback_id: MessageId = RuntimeRepository::open(&database)
         .unwrap()
@@ -671,16 +675,16 @@ async fn rework_acknowledgement_failure_prevents_factory_start_and_safe_retry_re
             .is_none()
     );
 
-    drop(coordinator);
     connection
         .execute_batch("DROP TRIGGER fail_rework_delivery_ack;")
         .unwrap();
+    drop(coordinator);
     let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
-    reopened.start_worker(&session, &child).await.unwrap();
+    reopened.resume_task(&session, &child).await.unwrap();
     let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 2);
-    assert_eq!(starts[1].initial_user_messages.len(), 1);
-    assert_eq!(starts[1].initial_user_messages[0].id, feedback_id);
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2].initial_user_messages.len(), 1);
+    assert_eq!(starts[2].initial_user_messages[0].id, feedback_id);
     drop(starts);
     assert!(
         RuntimeRepository::open(&database)

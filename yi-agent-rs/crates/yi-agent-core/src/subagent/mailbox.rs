@@ -284,6 +284,12 @@ impl Mailbox {
         }
     }
 
+    pub fn mark_pending_for_worker(&mut self, id: &MessageId) {
+        if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
+            message.delivered_to_worker = false;
+        }
+    }
+
     /// Only external user overrides participate in the durable consumption
     /// protocol. Agent-to-agent mail must not be mistaken for user input.
     pub fn mark_user_override_consumed(&mut self, id: &MessageId) -> bool {

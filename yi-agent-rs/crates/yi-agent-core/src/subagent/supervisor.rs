@@ -369,6 +369,44 @@ impl AgentSupervisor {
         Ok(task_ids)
     }
 
+    /// Quarantines one worker at an ambiguous durable-delivery boundary. The
+    /// message may be offered again only through the explicit recovery gate.
+    pub fn interrupt_worker_for_recovery(
+        &mut self,
+        task_id: &TaskId,
+        message_ids: &[super::task::MessageId],
+        evidence: impl Into<String>,
+    ) -> Result<(), String> {
+        self.workers
+            .get(task_id)
+            .ok_or_else(|| "worker does not exist".to_string())?
+            .cancel();
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::RuntimeInterrupted {
+                attempt_id,
+                evidence: RecoveryEvidence(evidence.into()),
+            },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mailbox = self
+            .mailboxes
+            .get_mut(task_id)
+            .expect("task mailbox is created with task");
+        for message_id in message_ids {
+            mailbox.mark_pending_for_worker(message_id);
+        }
+        self.workers.remove(task_id);
+        self.worker_message_capabilities.remove(task_id);
+        self.notify_update();
+        Ok(())
+    }
+
     /// Creates a worker only after the task has passed supervised admission.
     pub async fn start_worker(
         &mut self,
