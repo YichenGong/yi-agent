@@ -22,7 +22,7 @@ yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统
 
 ## Features
 
-- [x] FS 工具：Read/Write/Edit/Glob/Grep — `crates/yi-agent-tools/src/fs/` 五个 tool 文件 + 单一 root 校验 — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
+- [x] FS 工具：Read/Write/Edit/Glob/Grep — `crates/yi-agent-tools/src/fs/` 五个 tool 文件 + 单一 root 校验；`grep.rs` 对所有输出模式限制为 200 条渲染记录或 32 KiB 并返回截断提示；验证：`cargo test -p yi-agent-tools grep_` — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
 - [x] Shell 工具：Bash — `crates/yi-agent-tools/src/shell/bash.rs` 实现 sh -c + 黑名单 + timeout + 输出截断 + 流式增量 — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
 - [x] 工具注册 API — `crates/yi-agent-tools/src/lib.rs::register_builtin_tools()` 注册全部内置工具 — [设计](../plans/2026-07-19-yi-agent-tools-design.md)
 - [x] Web 工具：WebFetch + WebSearch — `crates/yi-agent-tools/src/web/` 目录，WebSearch 在有 `BOCHA_API_KEY` 时注册 — [设计](../plans/2026-07-19-yi-agent-web-tools-design.md)

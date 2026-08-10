@@ -7,6 +7,11 @@ use std::sync::Arc;
 use walkdir::WalkDir;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
+const MAX_OUTPUT_ENTRIES: usize = 200;
+const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+const TRUNCATION_NOTICE: &str =
+    "[truncated: narrow path, glob, or pattern; use files_with_matches or count]\n";
+
 pub struct GrepTool {
     ctx: Arc<ToolsContext>,
 }
@@ -132,6 +137,18 @@ fn is_binary(path: &std::path::Path) -> bool {
     buf[..n].contains(&0)
 }
 
+/// Appends one rendered result line only when both context-safety budgets allow it.
+fn append_entry(output: &mut String, entry_count: &mut usize, entry: String) -> bool {
+    let content_budget = MAX_OUTPUT_BYTES - TRUNCATION_NOTICE.len();
+    if *entry_count >= MAX_OUTPUT_ENTRIES || output.len() + entry.len() > content_budget {
+        return false;
+    }
+
+    output.push_str(&entry);
+    *entry_count += 1;
+    true
+}
+
 fn grep_search(
     base: &std::path::Path,
     re: &regex::Regex,
@@ -142,8 +159,10 @@ fn grep_search(
 ) -> Result<String, ToolsError> {
     let mut output = String::new();
     let mut found_any = false;
+    let mut entry_count = 0;
+    let mut truncated = false;
 
-    for entry in WalkDir::new(base).into_iter().filter_map(|e| e.ok()) {
+    'walk: for entry in WalkDir::new(base).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -185,30 +204,57 @@ fn grep_search(
         match mode {
             OutputMode::Content => {
                 for (i, line) in &file_matches {
-                    output.push_str(&format!("{}:{}:{}\n", rel.display(), i + 1, line));
+                    if !append_entry(
+                        &mut output,
+                        &mut entry_count,
+                        format!("{}:{}:{}\n", rel.display(), i + 1, line),
+                    ) {
+                        truncated = true;
+                        break 'walk;
+                    }
                     if context > 0 {
                         let start = i.saturating_sub(context);
                         let end = (i + context + 1).min(lines.len());
                         for (j, context_line) in lines.iter().enumerate().take(end).skip(start) {
                             if j != *i {
-                                output.push_str(&format!(
-                                    "{}-{}:{}\n",
-                                    rel.display(),
-                                    j + 1,
-                                    context_line
-                                ));
+                                if !append_entry(
+                                    &mut output,
+                                    &mut entry_count,
+                                    format!("{}-{}:{}\n", rel.display(), j + 1, context_line),
+                                ) {
+                                    truncated = true;
+                                    break 'walk;
+                                }
                             }
                         }
                     }
                 }
             }
             OutputMode::FilesWithMatches => {
-                output.push_str(&format!("{}\n", rel.display()));
+                if !append_entry(
+                    &mut output,
+                    &mut entry_count,
+                    format!("{}\n", rel.display()),
+                ) {
+                    truncated = true;
+                    break;
+                }
             }
             OutputMode::Count => {
-                output.push_str(&format!("{}:{}\n", rel.display(), file_matches.len()));
+                if !append_entry(
+                    &mut output,
+                    &mut entry_count,
+                    format!("{}:{}\n", rel.display(), file_matches.len()),
+                ) {
+                    truncated = true;
+                    break;
+                }
             }
         }
+    }
+
+    if truncated {
+        output.push_str(TRUNCATION_NOTICE);
     }
 
     if !found_any {
@@ -233,6 +279,13 @@ mod tests {
         fs::write(tmp.path().join("src/a.rs"), "fn foo() {}\nfn bar() {}\n").unwrap();
         fs::write(tmp.path().join("src/b.rs"), "fn foo() {}\nfn baz() {}\n").unwrap();
         fs::write(tmp.path().join("README.md"), "# foo\nhello\n").unwrap();
+    }
+
+    fn text_result(result: &ToolResult) -> &str {
+        match &result.content[0] {
+            yi_agent_core::ContentBlock::Text(text) => text,
+            _ => panic!("expected a text result"),
+        }
     }
 
     #[tokio::test]
@@ -317,5 +370,44 @@ mod tests {
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
             assert_eq!(s, "no matches");
         }
+    }
+
+    #[tokio::test]
+    async fn grep_files_mode_truncates_many_matching_files() {
+        let tmp = TempDir::new().unwrap();
+        for index in 0..201 {
+            fs::write(tmp.path().join(format!("match-{index}.txt")), "needle\n").unwrap();
+        }
+        let tool = make_tool(&tmp);
+
+        let result = tool
+            .call(serde_json::json!({
+                "pattern": "needle",
+                "glob": "*.txt",
+                "output_mode": "files_with_matches"
+            }))
+            .await;
+
+        let text = text_result(&result);
+        assert!(text.contains("[truncated:"));
+        assert!(text.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn grep_content_mode_truncates_large_matching_output() {
+        let tmp = TempDir::new().unwrap();
+        let large_line = format!("needle {}", "x".repeat(20_000));
+        fs::write(
+            tmp.path().join("large.txt"),
+            format!("{large_line}\n{large_line}\n"),
+        )
+        .unwrap();
+        let tool = make_tool(&tmp);
+
+        let result = tool.call(serde_json::json!({"pattern": "needle"})).await;
+
+        let text = text_result(&result);
+        assert!(text.contains("[truncated:"));
+        assert!(text.len() <= MAX_OUTPUT_BYTES);
     }
 }
