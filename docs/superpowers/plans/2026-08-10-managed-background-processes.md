@@ -88,17 +88,12 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_STREAM_CAP_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnExitPolicy {
+    #[default]
     Kill,
     Keep,
-}
-
-impl Default for OnExitPolicy {
-    fn default() -> Self {
-        Self::Kill
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -138,6 +133,7 @@ pub struct ProcessReadResult {
     pub ready: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct StreamRingBuffer {
     cap: usize,
@@ -145,6 +141,7 @@ struct StreamRingBuffer {
     next_cursor: u64,
 }
 
+#[allow(dead_code)]
 impl StreamRingBuffer {
     fn new(cap: usize) -> Self {
         Self {
