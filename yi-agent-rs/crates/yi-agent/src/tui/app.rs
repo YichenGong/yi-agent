@@ -633,16 +633,14 @@ fn route_event(
             // counter so it doesn't linger at the previous turn's value
             // throughout the entire tool execution phase.
             statusbar.on_tool_call_phase();
-            let cmd = input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let exp = input
-                .get("expected_timeout_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(120) as u32;
-            registry.on_tool_call(id, name, &cmd, exp);
+            if name == "bash" {
+                let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let exp = input
+                    .get("expected_timeout_sec")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(120) as u32;
+                registry.on_tool_call(id, name, cmd, exp);
+            }
         }
         AgentEvent::ToolOutputDelta { id, stream, text } => {
             registry.on_output_delta(id, *stream, text);
@@ -1415,6 +1413,38 @@ mod tests {
     }
 
     #[test]
+    fn test_route_event_tracks_only_bash_tool_calls() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut statusbar = StatusBarState::default();
+        let mut cost = CostTracker::default();
+
+        route_event(
+            &mut registry,
+            &mut statusbar,
+            &mut cost,
+            &AgentEvent::ToolCall {
+                id: "grep".into(),
+                name: "grep".into(),
+                input: serde_json::json!({"pattern": "TODO"}),
+            },
+        );
+        assert!(registry.list().is_empty());
+
+        route_event(
+            &mut registry,
+            &mut statusbar,
+            &mut cost,
+            &AgentEvent::ToolCall {
+                id: "bash".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "echo hi", "expected_timeout_sec": 30}),
+            },
+        );
+        assert_eq!(registry.list().len(), 1);
+        assert_eq!(registry.get("bash").unwrap().command, "echo hi");
+    }
+
+    #[test]
     fn test_route_event_tool_timeout() {
         let mut registry = RunningTaskRegistry::new();
         let mut sb = StatusBarState::default();
@@ -1437,11 +1467,10 @@ mod tests {
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
     }
 
-    /// A normal (non-streaming) tool such as web_search returns ToolResult
-    /// without ToolExit. Its timer must stop when that result arrives rather
-    /// than continuing through the next LLM think phase until Done.
+    /// Non-Bash tools do not create Ctrl+P tasks, and their results are safe
+    /// to ignore in the Bash-task registry.
     #[test]
-    fn test_route_event_tool_result_finalizes_non_streaming_tool() {
+    fn test_route_event_ignores_non_bash_tool_results() {
         let mut registry = RunningTaskRegistry::new();
         let mut sb = StatusBarState::default();
         let mut cost = CostTracker::default();
@@ -1465,10 +1494,8 @@ mod tests {
             },
         );
 
-        let elapsed = registry.get("search").unwrap().elapsed();
-        assert_eq!(registry.get("search").unwrap().status, TaskStatus::Done);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        assert_eq!(registry.get("search").unwrap().elapsed(), elapsed);
+        assert!(registry.get("search").is_none());
+        assert!(registry.list().is_empty());
     }
 
     /// Regression: a ToolCall that never receives a ToolExit (e.g. bash tool
