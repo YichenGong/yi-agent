@@ -2833,7 +2833,9 @@ impl RuntimeRepository {
         let repository_root =
             workspace_path_str(task, "repository_root", &workspace.repository_root)?;
         let path = workspace_path_str(task, "path", &workspace.path)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let active_attempt_matches = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1
@@ -2919,22 +2921,24 @@ impl RuntimeRepository {
             });
         }
 
-        transaction.execute(
-            "INSERT INTO task_workspaces (
+        transaction
+            .execute(
+                "INSERT INTO task_workspaces (
                 task_id, attempt_id, lease_id, repository_root, path,
                 branch, parent_branch, base_commit
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                task.to_string(),
-                attempt.to_string(),
-                workspace.lease_id.to_string(),
-                repository_root,
-                path,
-                workspace.branch.as_str(),
-                workspace.parent_branch.as_str(),
-                workspace.base_commit.as_str(),
-            ],
-        )?;
+                params![
+                    task.to_string(),
+                    attempt.to_string(),
+                    workspace.lease_id.to_string(),
+                    repository_root,
+                    path,
+                    workspace.branch.as_str(),
+                    workspace.parent_branch.as_str(),
+                    workspace.base_commit.as_str(),
+                ],
+            )
+            .map_err(|error| task_workspace_insert_error(task, error))?;
         let updated = transaction.execute(
             "UPDATE tasks SET workspace_lease_id = ?1, updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2 AND active_attempt_id = ?3",
@@ -3883,6 +3887,20 @@ fn optional_persisted_task_workspace(
             task: task.to_string(),
             reason: "workspace row is partially persisted".into(),
         }),
+    }
+}
+
+fn task_workspace_insert_error(task: &TaskId, error: rusqlite::Error) -> RepositoryError {
+    match &error {
+        rusqlite::Error::SqliteFailure(sqlite_error, _)
+            if sqlite_error.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            RepositoryError::InvalidTaskWorkspace {
+                task: task.to_string(),
+                reason: "workspace assignment conflicts with persisted workspace state".into(),
+            }
+        }
+        _ => RepositoryError::Sql(error),
     }
 }
 

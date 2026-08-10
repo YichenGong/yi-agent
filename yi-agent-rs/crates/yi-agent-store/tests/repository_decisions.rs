@@ -214,6 +214,49 @@ fn task_workspace_rejects_duplicate_branch_in_the_same_repository() {
 }
 
 #[test]
+fn task_workspace_maps_insert_constraint_race_to_domain_error() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, task, attempt) = persisted_root(&mut repository);
+    let (_other_session, other_task, other_attempt) = persisted_root(&mut repository);
+    let workspace = test_workspace(&session, &task);
+    drop(repository);
+    let injected_lease = WorkspaceLeaseId::new();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER inject_workspace_path_conflict
+             BEFORE INSERT ON task_workspaces
+             WHEN NEW.task_id = '{task}'
+             BEGIN
+                INSERT INTO task_workspaces (
+                    task_id, attempt_id, lease_id, repository_root, path,
+                    branch, parent_branch, base_commit
+                ) VALUES (
+                    '{other_task}', '{other_attempt}', '{injected_lease}',
+                    '/tmp/injected-repository', NEW.path, 'feat/injected',
+                    'main', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                );
+             END;"
+        ))
+        .unwrap();
+    drop(connection);
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    let error = repository
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap_err();
+
+    assert_invalid_workspace(error);
+    assert_eq!(repository.task_workspace_optional(&task).unwrap(), None);
+    assert_eq!(
+        repository.task_workspace_optional(&other_task).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn task_workspace_rejects_empty_persisted_git_identity_fields() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
