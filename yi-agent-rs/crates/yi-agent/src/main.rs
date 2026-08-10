@@ -451,23 +451,148 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
     Ok(())
 }
 
+fn build_tui_root_tools(
+    base_registry: &yi_agent_core::ToolRegistry,
+    config: &config::Config,
+    runtime_socket: std::path::PathBuf,
+    attached_root: &crate::tui::subagents::AttachedRoot,
+) -> yi_agent_core::ToolRegistry {
+    let mut registry = base_registry.clone();
+    yi_agent_tools::register_builtin_tools_with_sandbox(
+        &mut registry,
+        attached_root.workspace.path.clone(),
+        config.sandbox,
+        config.sandbox_writable_roots.clone(),
+    );
+    crate::tui::subagents::register_attached_root_tools(
+        &mut registry,
+        runtime_socket,
+        attached_root,
+    );
+    registry
+}
+
+struct TuiRuntimeSession {
+    socket_path: std::path::PathBuf,
+    attached_root: crate::tui::subagents::AttachedRoot,
+    embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
+}
+
+fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
+    let runtime_dir = runtime_directory()?;
+    let database = runtime_dir.join("runtime.sqlite");
+    let socket_path = runtime_dir.join("runtime.sock");
+    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
+        &runtime_dir,
+        &database,
+        build_daemon_worker_factory(cli, socket_path.clone())?,
+    ) {
+        Ok(daemon) => Some(daemon),
+        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+        Err(error) => {
+            tracing::warn!(error = %error, "subagent runtime unavailable; continuing without delegation");
+            return Ok(None);
+        }
+    };
+    let idempotency_key = format!("tui:{}:{}", std::process::id(), config.workdir.display());
+    let response = match yi_agent_store::ipc::send_request(
+        &socket_path,
+        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot { idempotency_key },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not attach TUI to subagent runtime");
+            return Ok(None);
+        }
+    };
+    let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace,
+    } = response
+    else {
+        tracing::warn!(response = ?response, "daemon rejected TUI runtime attachment");
+        return Ok(None);
+    };
+    Ok(Some(TuiRuntimeSession {
+        socket_path,
+        attached_root: crate::tui::subagents::AttachedRoot {
+            session_id,
+            task_id: root_task_id,
+            capability: message_capability,
+            workspace,
+        },
+        embedded_daemon,
+    }))
+}
+
+fn activate_tui_runtime_root(
+    socket_path: &std::path::Path,
+    root: &crate::tui::subagents::AttachedRoot,
+    objective: &str,
+) -> Result<()> {
+    match yi_agent_store::ipc::send_request(
+        socket_path,
+        yi_agent_store::ipc::IpcRequest::ActivateApplicationRoot {
+            session_id: root.session_id.clone(),
+            root_task_id: root.task_id.clone(),
+            capability: root.capability.clone(),
+            objective: objective.to_owned(),
+        },
+    )? {
+        yi_agent_store::ipc::IpcResponse::ApplicationRootActivated => Ok(()),
+        other => anyhow::bail!("daemon rejected TUI runtime activation: {other:?}"),
+    }
+}
+
+fn detach_tui_runtime_root(
+    socket_path: &std::path::Path,
+    root: &crate::tui::subagents::AttachedRoot,
+) {
+    let response = yi_agent_store::ipc::send_request(
+        socket_path,
+        yi_agent_store::ipc::IpcRequest::DetachApplicationRoot {
+            session_id: root.session_id.clone(),
+            root_task_id: root.task_id.clone(),
+            capability: root.capability.clone(),
+        },
+    );
+    if let Err(error) = response {
+        tracing::warn!(error = %error, "could not detach TUI runtime root");
+    }
+}
+
 fn run_agent(cli: Cli) -> Result<()> {
     let config = config::load(&cli)?;
 
-    // Load permissions and construct checker
-    let workdir = config.workdir.clone();
+    let tui_runtime = attach_tui_runtime(&cli, &config)?;
+    if tui_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.embedded_daemon.is_some())
+    {
+        tracing::info!("embedded subagent runtime started for TUI");
+    }
+    let agent_workdir = tui_runtime
+        .as_ref()
+        .map(|runtime| runtime.attached_root.workspace.path.clone())
+        .unwrap_or_else(|| config.workdir.clone());
+
+    // Load permissions and construct checker for the actual tool workspace.
     let yolo = config.yolo;
     let permissions = {
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
-            .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
+        rt.block_on(yi_agent_core::permission::PermissionChecker::load(
+            &agent_workdir,
+        ))
+        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
     };
     let blocklist_fn: yi_agent_core::permission::BlocklistFn =
         Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
     let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
         permissions,
         yolo,
-        workdir,
+        agent_workdir.clone(),
         blocklist_fn,
     ));
     let (decision_tx, decision_rx) =
@@ -495,12 +620,6 @@ fn run_agent(cli: Cli) -> Result<()> {
     };
 
     let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_tools::register_builtin_tools_with_sandbox(
-        &mut registry,
-        config.workdir.clone(),
-        config.sandbox,
-        config.sandbox_writable_roots.clone(),
-    );
 
     // --- Skills system setup ---
     let skills_service = setup_skills(&config)?;
@@ -517,6 +636,30 @@ fn run_agent(cli: Cli) -> Result<()> {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
+    let registry = if let Some(runtime) = &tui_runtime {
+        build_tui_root_tools(
+            &registry,
+            &config,
+            runtime.socket_path.clone(),
+            &runtime.attached_root,
+        )
+    } else {
+        let mut registry = registry;
+        yi_agent_tools::register_builtin_tools_with_sandbox(
+            &mut registry,
+            config.workdir.clone(),
+            config.sandbox,
+            config.sandbox_writable_roots.clone(),
+        );
+        registry
+    };
+    let runtime_socket = tui_runtime
+        .as_ref()
+        .map(|runtime| runtime.socket_path.clone());
+    let attached_root = tui_runtime
+        .as_ref()
+        .map(|runtime| runtime.attached_root.clone());
+
     let tools = Arc::new(registry);
 
     let agent_config = yi_agent_core::AgentConfig {
@@ -532,10 +675,12 @@ fn run_agent(cli: Cli) -> Result<()> {
         provider,
         tools,
         agent_config,
-        config.workdir.clone(),
+        agent_workdir,
         checker,
         decision_tx,
         decision_rx,
+        runtime_socket,
+        attached_root,
     )
 }
 
@@ -809,6 +954,8 @@ fn run_tui_agent(
     checker: Arc<yi_agent_core::permission::PermissionChecker>,
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     decision_rx: tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
+    runtime_socket: Option<std::path::PathBuf>,
+    attached_root: Option<crate::tui::subagents::AttachedRoot>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -836,7 +983,10 @@ fn run_tui_agent(
         let rebuild_config = agent_config.clone();
         let rebuild_checker = Arc::clone(&checker);
         let rebuild_decision_rx = Arc::clone(&decision_rx);
+        let runtime_socket_for_driver = runtime_socket.clone();
+        let attached_root_for_driver = attached_root.clone();
         let driver = tokio::spawn(async move {
+            let mut root_activated = false;
             let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone)
                 .with_permission(checker_clone, decision_rx);
             let _ = workdir; // workdir already passed to tools registration
@@ -911,6 +1061,25 @@ fn run_tui_agent(
                 // Clear any stale interrupt signal
                 let _ = interrupt_rx.try_recv();
 
+                if !root_activated {
+                    if let (Some(socket), Some(root)) = (
+                        runtime_socket_for_driver.as_ref(),
+                        attached_root_for_driver.as_ref(),
+                    ) {
+                        if let Err(error) = activate_tui_runtime_root(socket, root, &text) {
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::Error(
+                                    yi_agent_core::AgentError::ProviderTurnAdmission(
+                                        error.to_string(),
+                                    ),
+                                ))
+                                .await;
+                            continue;
+                        }
+                    }
+                    root_activated = true;
+                }
+
                 // Run agent
                 is_running_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 match agent.run(text).await {
@@ -967,6 +1136,10 @@ fn run_tui_agent(
             Ok(Err(e)) => Err(anyhow::Error::from(e)),
             Err(e) => Err(anyhow::Error::from(e)),
         };
+
+        if let (Some(socket), Some(root)) = (runtime_socket.as_ref(), attached_root.as_ref()) {
+            detach_tui_runtime_root(socket, root);
+        }
 
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
@@ -1209,6 +1382,44 @@ mod tests {
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
         }
+    }
+
+    fn attached_root_for_main_tests() -> crate::tui::subagents::AttachedRoot {
+        crate::tui::subagents::AttachedRoot {
+            session_id: "session-1".into(),
+            task_id: "task-1".into(),
+            capability: "capability-1".into(),
+            workspace: yi_agent_core::subagent::worker::WorkerWorkspace {
+                lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+                repository_root: "/tmp/repo".into(),
+                path: "/tmp/repo/.worktrees/root".into(),
+                branch: "feat/root".into(),
+                parent_branch: "main".into(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn build_tui_root_tools_registers_subagent_tools_for_attached_runtime() {
+        let config = test_config();
+        let root = attached_root_for_main_tests();
+        let registry = build_tui_root_tools(
+            &yi_agent_core::ToolRegistry::new(),
+            &config,
+            "/tmp/runtime.sock".into(),
+            &root,
+        );
+        let names = registry
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"send_message".to_string()));
+        assert!(names.contains(&"wait_agent".to_string()));
+        assert!(names.contains(&"bash".to_string()));
     }
 
     #[test]

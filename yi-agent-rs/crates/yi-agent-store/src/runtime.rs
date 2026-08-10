@@ -662,11 +662,27 @@ impl RuntimeCoordinator {
                 .set_objective(root_task, objective.clone())
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
         }
-        self.repository
+        let attempt = {
+            let supervisor = self.supervisor(session)?;
+            let supervisor = supervisor.lock().await;
+            supervisor
+                .task(root_task)
+                .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
+                .active_attempt_id()
+                .clone()
+        };
+        let mut repository = self
+            .repository
             .lock()
-            .expect("runtime repository mutex poisoned")
-            .update_task_objective(root_task, &objective)?;
-        self.start_worker(session, root_task).await
+            .expect("runtime repository mutex poisoned");
+        repository.update_task_objective(root_task, &objective)?;
+        repository.transition_task_and_attempt(
+            root_task,
+            &attempt,
+            "running",
+            RuntimeEvent::TaskStarted,
+        )?;
+        Ok(())
     }
 
     pub fn detach_application_root(

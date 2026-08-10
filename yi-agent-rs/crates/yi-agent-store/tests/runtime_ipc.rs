@@ -380,7 +380,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
 }
 
 #[test]
-fn application_root_activate_starts_the_attached_root_with_the_user_objective() {
+fn application_root_activate_marks_the_foreground_root_running_without_starting_a_worker() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let (daemon, starts) = application_root_daemon(&directory, &database);
@@ -405,7 +405,7 @@ fn application_root_activate_starts_the_attached_root_with_the_user_objective() 
             daemon.socket_path(),
             IpcRequest::ActivateApplicationRoot {
                 session_id,
-                root_task_id,
+                root_task_id: root_task_id.clone(),
                 capability: message_capability,
                 objective: "build the TUI MVP".into(),
             },
@@ -414,10 +414,13 @@ fn application_root_activate_starts_the_attached_root_with_the_user_objective() 
         IpcResponse::ApplicationRootActivated
     );
 
-    let starts = starts.lock().unwrap();
-    assert_eq!(starts.len(), 1);
-    assert_eq!(starts[0].objective, "build the TUI MVP");
-    assert!(starts[0].workspace.is_some());
+    assert!(starts.lock().unwrap().is_empty());
+    let task_id: TaskId = root_task_id.parse().unwrap();
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&task_id).unwrap(), "running");
+    let detail = repository.task_detail(&task_id).unwrap();
+    let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap();
+    assert_eq!(delivery["objective"], "build the TUI MVP");
 }
 
 #[test]
