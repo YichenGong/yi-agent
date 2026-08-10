@@ -763,6 +763,108 @@ async fn failed_recovery_persistence_retains_the_admission_context_for_explicit_
 }
 
 #[tokio::test]
+async fn failed_recovery_transition_still_releases_the_durable_resident_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_rework_delivery_ack
+             BEFORE UPDATE OF delivered_at ON mailbox_messages
+             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
+             END;
+             CREATE TRIGGER fail_recovery_transition
+             BEFORE UPDATE OF state_json ON tasks
+             WHEN NEW.state_json = 'recovery_required'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected recovery transition failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(
+        coordinator
+            .rework_review(&child, "rerun the parser regression suite")
+            .await
+            .is_err()
+    );
+    assert!(
+        factory.handles.lock().unwrap()[1]
+            .cancellation_token()
+            .is_cancelled()
+    );
+    let expected: (Option<String>, Option<String>, String) = connection
+        .query_row(
+            "SELECT tasks.workspace_lease_id, attempts.checkpoint_json, attempts.usage_json
+             FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
+             WHERE tasks.id = ?1",
+            [child.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let feedback_id: MessageId = RuntimeRepository::open(&database)
+        .unwrap()
+        .mailbox_messages_for_task(&child)
+        .unwrap()[0]
+        .message_id
+        .parse()
+        .unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        !repository
+            .has_active_lease_prefix(&child, "resident:")
+            .unwrap()
+    );
+    assert!(
+        repository
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap()
+    );
+    assert!(
+        repository
+            .has_active_lease_prefix(&child, "worktree:")
+            .unwrap()
+    );
+    drop(repository);
+
+    connection
+        .execute_batch(
+            "DROP TRIGGER fail_rework_delivery_ack;
+             DROP TRIGGER fail_recovery_transition;",
+        )
+        .unwrap();
+    drop(connection);
+    drop(coordinator);
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .recover_inflight_tasks()
+        .unwrap();
+    let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    reopened.resume_task(&session, &child).await.unwrap();
+
+    let starts = factory.starts.lock().unwrap();
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2].initial_user_messages.len(), 1);
+    assert_eq!(starts[2].initial_user_messages[0].id, feedback_id);
+    drop(starts);
+    let preflights = factory.recovery_preflights.lock().unwrap();
+    let context = &preflights
+        .last()
+        .expect("resume must pass the recovery gate")
+        .context;
+    assert_eq!(context.workspace_lease_id, expected.0);
+    assert_eq!(context.worktree_lease, durable_context().worktree_lease);
+    assert_eq!(context.checkpoint_json, expected.1.unwrap());
+    assert_eq!(context.tool_state_json, expected.2);
+}
+
+#[tokio::test]
 async fn restart_hydrates_a_committed_user_review_notification() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -1402,6 +1504,43 @@ async fn recovery_required_task_rejects_direct_start_without_factory_action() {
 
     assert!(factory.starts.lock().unwrap().is_empty());
     assert_eq!(coordinator.task_state(&task).unwrap(), "recovery_required");
+}
+
+#[tokio::test]
+async fn startup_failure_retains_the_concrete_factory_error() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(StartupErrorFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+
+    assert!(coordinator.start_worker(&session, &task).await.is_err());
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&task).unwrap(), "failed");
+    let terminal = repository
+        .attempt_terminal_json_for_task(&task)
+        .unwrap()
+        .unwrap();
+    let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+    assert_eq!(terminal["reason"], "worker_start_failed");
+    let error = terminal
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    assert!(
+        error.contains("provider bootstrap failed"),
+        "terminal evidence should include concrete startup error: {terminal}"
+    );
+    let attempt_state: String = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT state FROM attempts WHERE task_id = ?1 ORDER BY number DESC LIMIT 1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_state, "failed");
 }
 
 #[tokio::test]

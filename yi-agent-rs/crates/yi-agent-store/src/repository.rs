@@ -795,6 +795,20 @@ impl RuntimeRepository {
         )?)
     }
 
+    pub fn release_process_leases_for_task(
+        &mut self,
+        task: &TaskId,
+    ) -> Result<usize, RepositoryError> {
+        Ok(self.connection.execute(
+            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE task_id = ?1
+               AND state = 'active'
+               AND resource_key NOT LIKE 'workspace:%'
+               AND resource_key NOT LIKE 'worktree:%'",
+            params![task.to_string()],
+        )?)
+    }
+
     pub fn create_task(
         &mut self,
         task: &TaskId,

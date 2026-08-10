@@ -873,6 +873,11 @@ impl RuntimeCoordinator {
             .start_worker_with_provider_turn_gate(self.factory.as_ref(), task, provider_turn_gate)
             .await
         {
+            let terminal = serde_json::to_string(&serde_json::json!({
+                "reason": "worker_start_failed",
+                "error": error.as_str(),
+            }))
+            .expect("worker start failure payload is serializable");
             self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
@@ -881,7 +886,7 @@ impl RuntimeCoordinator {
                     &attempt,
                     "failed",
                     RuntimeEvent::TaskFailed,
-                    r#"{"reason":"worker_start_failed"}"#,
+                    &terminal,
                 )?;
             if is_subagent {
                 self.release_resident_lease(task);
@@ -923,16 +928,21 @@ impl RuntimeCoordinator {
                 "message_ids": rework_messages,
             }))
             .expect("recovery evidence is serializable");
-            self.repository
+            let mut repository = self
+                .repository
                 .lock()
-                .expect("runtime repository mutex poisoned")
-                .transition_task_and_attempt_with_terminal(
-                    task,
-                    &attempt,
-                    "recovery_required",
-                    RuntimeEvent::TaskRecoveryRequired,
-                    &recovery,
-                )?;
+                .expect("runtime repository mutex poisoned");
+            let recovery_result = repository.transition_task_and_attempt_with_terminal(
+                task,
+                &attempt,
+                "recovery_required",
+                RuntimeEvent::TaskRecoveryRequired,
+                &recovery,
+            );
+            if is_subagent {
+                let _ = repository.release_process_leases_for_task(task);
+            }
+            recovery_result?;
             return Err(RuntimeCoordinatorError::Repository(error));
         }
         Ok(())
