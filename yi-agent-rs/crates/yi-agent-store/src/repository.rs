@@ -55,6 +55,13 @@ pub enum RepositoryError {
     InvalidWatchdogSnapshot { attempt: String, reason: String },
 }
 
+#[derive(Debug, Error)]
+#[error("controlled recovery transition failed: cleanup={cleanup:?}; recovery={recovery:?}")]
+pub struct ControlledRecoveryTransitionError {
+    pub cleanup: Option<RepositoryError>,
+    pub recovery: Option<RepositoryError>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeEvent {
     RuntimeDraining,
@@ -2305,34 +2312,76 @@ impl RuntimeRepository {
         Ok(event_id)
     }
 
-    pub fn transition_task_and_attempt_with_terminal_retaining_leases(
+    /// Enters controlled recovery while releasing process-local leases and
+    /// retaining workspace/worktree leases needed for explicit resume.
+    pub fn transition_task_to_recovery_required_releasing_process_leases(
         &mut self,
         task: &TaskId,
         attempt: &AttemptId,
-        state: &str,
-        event: RuntimeEvent,
         terminal_json: &str,
-    ) -> Result<i64, RepositoryError> {
+    ) -> Result<i64, ControlledRecoveryTransitionError> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?2 AND active_attempt_id = ?3",
-            params![state, task.to_string(), attempt.to_string()],
-        )?;
-        if changed == 0 {
-            return Err(RepositoryError::TaskNotFound {
-                task: task.to_string(),
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| ControlledRecoveryTransitionError {
+                cleanup: None,
+                recovery: Some(error.into()),
+            })?;
+        let cleanup_result = transaction
+            .execute(
+                "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1
+                   AND state = 'active'
+                   AND resource_key NOT LIKE 'workspace:%'
+                   AND resource_key NOT LIKE 'worktree:%'",
+                params![task.to_string()],
+            )
+            .map(|_| ())
+            .map_err(RepositoryError::from);
+        let recovery_result = (|| -> Result<i64, RepositoryError> {
+            let changed = transaction.execute(
+                "UPDATE tasks SET state_json = 'recovery_required', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND active_attempt_id = ?2",
+                params![task.to_string(), attempt.to_string()],
+            )?;
+            if changed == 0 {
+                return Err(RepositoryError::TaskNotFound {
+                    task: task.to_string(),
+                });
+            }
+            transaction.execute(
+                "UPDATE attempts SET state = 'recovery_required',
+                     ended_at = CURRENT_TIMESTAMP, terminal_json = ?1
+                 WHERE id = ?2 AND task_id = ?3",
+                params![terminal_json, attempt.to_string(), task.to_string()],
+            )?;
+            append_event(&transaction, task, RuntimeEvent::TaskRecoveryRequired)
+        })();
+        let cleanup_error = cleanup_result.err();
+        let (event_id, recovery_error) = match recovery_result {
+            Ok(event_id) => (Some(event_id), None),
+            Err(error) => (None, Some(error)),
+        };
+        if cleanup_error.is_some() || recovery_error.is_some() {
+            drop(transaction);
+            let cleanup_error = if cleanup_error.is_none() && recovery_error.is_some() {
+                self.release_process_leases_for_task(task).err()
+            } else {
+                cleanup_error
+            };
+            return Err(ControlledRecoveryTransitionError {
+                cleanup: cleanup_error,
+                recovery: recovery_error,
             });
         }
-        transaction.execute(
-            "UPDATE attempts SET state = ?1, ended_at = CURRENT_TIMESTAMP, terminal_json = ?2
-             WHERE id = ?3 AND task_id = ?4",
-            params![state, terminal_json, attempt.to_string(), task.to_string()],
-        )?;
-        let event_id = append_event(&transaction, task, event)?;
-        transaction.commit()?;
+        let event_id = event_id.expect("recovery result checked above");
+        if let Err(error) = transaction.commit() {
+            let cleanup = self.release_process_leases_for_task(task).err();
+            return Err(ControlledRecoveryTransitionError {
+                cleanup,
+                recovery: Some(error.into()),
+            });
+        }
         Ok(event_id)
     }
 

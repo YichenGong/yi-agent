@@ -18,7 +18,7 @@ use yi_agent_core::subagent::worker::{
 use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
 };
-use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
+use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
 use yi_agent_store::schedule::{
     MissedRunPolicy, ScheduleDefinition, WatchdogLimits, WatchdogUsage,
 };
@@ -916,19 +916,67 @@ async fn failed_rework_fallback_reports_ack_cleanup_and_recovery_failures() {
         .rework_review(&child, "rerun the parser regression suite")
         .await
         .expect_err("the injected fallback failures must surface");
-    let evidence = format!("{error:?}\n{error}");
+    let RuntimeCoordinatorError::ControlledRecoveryPersistence {
+        acknowledgement,
+        cleanup: Some(cleanup),
+        recovery: Some(recovery),
+    } = error
+    else {
+        panic!("expected combined controlled recovery evidence, got {error:?}");
+    };
+    assert!(acknowledgement.contains("injected rework acknowledgement failure"));
+    assert!(cleanup.contains("injected process lease cleanup failure"));
+    assert!(recovery.contains("injected recovery transition failure"));
+}
 
+#[tokio::test]
+async fn cleanup_failure_rolls_back_controlled_recovery_transition() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory).await;
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_rework_delivery_ack
+             BEFORE UPDATE OF delivered_at ON mailbox_messages
+             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
+             END;
+             CREATE TRIGGER fail_process_lease_cleanup
+             BEFORE UPDATE OF state ON resource_leases
+             WHEN OLD.resource_key LIKE 'resident:%' AND NEW.state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected process lease cleanup failure');
+             END;",
+        )
+        .unwrap();
+
+    let error = coordinator
+        .rework_review(&child, "rerun the parser regression suite")
+        .await
+        .expect_err("the injected cleanup failure must surface");
+    let RuntimeCoordinatorError::ControlledRecoveryPersistence {
+        acknowledgement,
+        cleanup: Some(cleanup),
+        recovery: None,
+    } = error
+    else {
+        panic!("expected acknowledgement plus cleanup evidence, got {error:?}");
+    };
+    assert!(acknowledgement.contains("injected rework acknowledgement failure"));
+    assert!(cleanup.contains("injected process lease cleanup failure"));
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    let task_state = repository.task_state(&child).unwrap();
+    let resident_active = repository
+        .has_active_lease_prefix(&child, "resident:")
+        .unwrap();
     assert!(
-        evidence.contains("injected rework acknowledgement failure"),
-        "missing acknowledgement evidence: {evidence}"
-    );
-    assert!(
-        evidence.contains("injected process lease cleanup failure"),
-        "missing cleanup evidence: {evidence}"
-    );
-    assert!(
-        evidence.contains("injected recovery transition failure"),
-        "missing recovery evidence: {evidence}"
+        !(task_state == "recovery_required" && resident_active),
+        "cleanup failure must not leave recovery_required with an active resident lease"
     );
 }
 

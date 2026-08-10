@@ -936,34 +936,19 @@ impl RuntimeCoordinator {
                 "message_ids": rework_messages,
             }))
             .expect("recovery evidence is serializable");
-            let cleanup_result = if is_subagent {
-                self.repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned")
-                    .release_process_leases_for_task(task)
-                    .map(|_| ())
-            } else {
-                Ok(())
-            };
             let mut repository = self
                 .repository
                 .lock()
                 .expect("runtime repository mutex poisoned");
-            let recovery_result = repository
-                .transition_task_and_attempt_with_terminal_retaining_leases(
-                    task,
-                    &attempt,
-                    "recovery_required",
-                    RuntimeEvent::TaskRecoveryRequired,
-                    &recovery,
-                );
-            let cleanup = cleanup_result.err().map(|error| error.to_string());
-            let recovery = recovery_result.err().map(|error| error.to_string());
-            if cleanup.is_some() || recovery.is_some() {
+            if let Err(transition_error) = repository
+                .transition_task_to_recovery_required_releasing_process_leases(
+                    task, &attempt, &recovery,
+                )
+            {
                 return Err(RuntimeCoordinatorError::ControlledRecoveryPersistence {
                     acknowledgement: error.to_string(),
-                    cleanup,
-                    recovery,
+                    cleanup: transition_error.cleanup.map(|error| error.to_string()),
+                    recovery: transition_error.recovery.map(|error| error.to_string()),
                 });
             }
             return Err(RuntimeCoordinatorError::Repository(error));
