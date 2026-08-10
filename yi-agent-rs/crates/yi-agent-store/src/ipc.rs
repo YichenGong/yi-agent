@@ -228,6 +228,7 @@ pub enum IpcRequest {
     WaitAgent {
         session_id: String,
         caller_task_id: String,
+        capability: String,
         mode: String,
     },
     InspectTask {
@@ -1933,7 +1934,14 @@ fn respond(
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let root_task_id = parse_id::<TaskId>(&root_task_id)?;
-            coordinator.detach_application_root(&session_id, &root_task_id, &capability)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.detach_application_root(
+                &session_id,
+                &root_task_id,
+                &capability,
+            ))?;
             Ok(IpcResponse::ApplicationRootDetached)
         }
         IpcRequest::CreateSchedule { cron, objective } => {
@@ -2152,6 +2160,7 @@ fn respond(
         IpcRequest::WaitAgent {
             session_id,
             caller_task_id,
+            capability,
             mode,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
@@ -2169,9 +2178,10 @@ fn respond(
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let outcome = runtime.block_on(coordinator.wait_for_children(
+            let outcome = runtime.block_on(coordinator.wait_for_children_authorized(
                 &session_id,
                 &caller_task_id,
+                &capability,
                 mode,
             ))?;
             let (status, children) = match outcome {

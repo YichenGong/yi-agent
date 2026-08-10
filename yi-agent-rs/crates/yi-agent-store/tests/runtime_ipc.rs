@@ -73,14 +73,14 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 7);
+    assert_eq!(repository.schema_version().unwrap(), 8);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
             "DROP TABLE task_workspaces;
              DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version = 7;",
+             DELETE FROM schema_migrations WHERE version IN (7, 8);",
         )
         .unwrap();
     database
@@ -138,6 +138,10 @@ impl AgentWorkerFactory for ReviewReportingFactory {
 }
 
 impl AgentWorkerFactory for ReportingWorkerFactory {
+    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+        Some(Arc::new(StaticWorkspaceService))
+    }
+
     fn recovery_context(&self) -> WorkerRecoveryContext {
         durable_context()
     }
@@ -243,7 +247,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 7);
+    assert_eq!(repository.schema_version().unwrap(), 8);
     for table in [
         "sessions",
         "tasks",
@@ -272,7 +276,7 @@ fn v6_database_migrates_to_workspace_and_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 7);
+    assert_eq!(repository.schema_version().unwrap(), 8);
     assert!(repository.has_table("task_workspaces").unwrap());
     assert!(
         repository
@@ -380,6 +384,37 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
 }
 
 #[test]
+fn application_root_capability_is_not_derived_from_idempotency_key() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        message_capability, ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-random-capability".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected application root attachment");
+    };
+    let deterministic = format!(
+        "app-root-{}",
+        sha256_hex("application-root:tui-random-capability")
+    );
+    assert_ne!(message_capability, deterministic);
+}
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
 fn concurrent_application_root_attach_reuses_one_durable_root() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -484,6 +519,79 @@ fn application_root_activate_marks_the_foreground_root_running_without_starting_
     let detail = repository.task_detail(&task_id).unwrap();
     let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap();
     assert_eq!(delivery["objective"], "build the TUI MVP");
+}
+
+#[test]
+fn concurrent_application_root_activation_records_one_first_objective() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-concurrent-activate".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    let socket = daemon.socket_path().to_path_buf();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = ["first objective", "second objective"]
+        .into_iter()
+        .map(|objective| {
+            let socket = socket.clone();
+            let barrier = Arc::clone(&barrier);
+            let session_id = session_id.clone();
+            let root_task_id = root_task_id.clone();
+            let message_capability = message_capability.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                send_request(
+                    &socket,
+                    IpcRequest::ActivateApplicationRoot {
+                        session_id,
+                        root_task_id,
+                        capability: message_capability,
+                        objective: objective.into(),
+                    },
+                )
+                .unwrap()
+            })
+        })
+        .collect();
+    for handle in handles {
+        assert_eq!(
+            handle.join().unwrap(),
+            IpcResponse::ApplicationRootActivated
+        );
+    }
+
+    let connection = Connection::open(&database).unwrap();
+    let started_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE task_id = ?1 AND kind = 'task_started'",
+            [root_task_id.clone()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(started_events, 1);
+
+    let detail = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_detail(&root_task_id.parse().unwrap())
+        .unwrap();
+    let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap();
+    assert!(matches!(
+        delivery["objective"].as_str(),
+        Some("first objective" | "second objective")
+    ));
 }
 
 #[test]
@@ -904,7 +1012,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 7);
+    assert_eq!(repository.schema_version().unwrap(), 8);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -1900,21 +2008,30 @@ fn daemon_rejects_messages_to_unrelated_tasks_without_persisting_them() {
 fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated {
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
         session_id,
         root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-wait".into(),
+        },
+    )
+    .unwrap()
     else {
-        panic!("expected a created session");
+        panic!("expected an attached root");
     };
     let IpcResponse::TaskSpawned {
         task_id: child_task_id,
     } = send_request(
         daemon.socket_path(),
-        IpcRequest::SpawnChild {
+        IpcRequest::SpawnApplicationChild {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
             objective: "Inspect child behavior".into(),
         },
     )
@@ -1925,11 +2042,28 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
     let response = confirm_cancel(daemon.socket_path(), child_task_id.clone(), false);
     assert!(matches!(response, IpcResponse::TaskCancelled));
 
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::WaitAgent {
+                session_id: session_id.clone(),
+                caller_task_id: root_task_id.clone(),
+                capability: "wrong".into(),
+                mode: "all".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+        }
+    );
+
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::WaitAgent {
             session_id,
             caller_task_id: root_task_id,
+            capability: message_capability,
             mode: "all".into(),
         },
     )
@@ -1955,20 +2089,29 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
         Arc::new(factory.clone()),
     )
     .unwrap();
-    let IpcResponse::SessionCreated {
+    let IpcResponse::ApplicationRootAttached {
         session_id,
         root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-worker-wait".into(),
+        },
+    )
+    .unwrap()
     else {
-        panic!("expected a created session");
+        panic!("expected an attached root");
     };
     let IpcResponse::TaskSpawned {
         task_id: child_task_id,
     } = send_request(
         daemon.socket_path(),
-        IpcRequest::SpawnChild {
+        IpcRequest::SpawnApplicationChild {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
             objective: "Inspect child behavior".into(),
         },
     )
@@ -1993,6 +2136,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
             IpcRequest::WaitAgent {
                 session_id,
                 caller_task_id: root_task_id,
+                capability: message_capability,
                 mode: "all".into(),
             },
         );

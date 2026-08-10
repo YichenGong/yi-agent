@@ -1069,6 +1069,12 @@ fn run_tui_agent(
                                     if runtime.embedded_daemon.is_some() {
                                         tracing::info!("embedded subagent runtime started for TUI");
                                     }
+                                    *runtime_detach_for_driver
+                                        .lock()
+                                        .expect("runtime detach mutex poisoned") = Some((
+                                        runtime.socket_path.clone(),
+                                        runtime.attached_root.clone(),
+                                    ));
                                     let runtime_workdir = runtime.attached_root.workspace.path.clone();
                                     let next_tools = Arc::new(build_tui_root_tools(
                                         &base_registry,
@@ -1091,16 +1097,17 @@ fn run_tui_agent(
                                                 Arc::clone(&current_checker),
                                                 Arc::clone(&rebuild_decision_rx),
                                             );
-                                            *runtime_detach_for_driver
-                                                .lock()
-                                                .expect("runtime detach mutex poisoned") = Some((
-                                                runtime.socket_path.clone(),
-                                                runtime.attached_root.clone(),
-                                            ));
                                             current_runtime = Some(runtime);
                                             root_activated = false;
                                         }
                                         Err(error) => {
+                                            if let Some((socket, root)) = runtime_detach_for_driver
+                                                .lock()
+                                                .expect("runtime detach mutex poisoned")
+                                                .take()
+                                            {
+                                                detach_tui_runtime_root(&socket, &root);
+                                            }
                                             let _ = agent_tx
                                                 .send(yi_agent_core::AgentEvent::Error(
                                                     yi_agent_core::AgentError::ProviderTurnAdmission(

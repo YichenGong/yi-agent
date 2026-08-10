@@ -164,11 +164,15 @@ impl AgentWorkerFactory for WorkspaceAssignedFactory<'_> {
     }
 }
 
-fn application_root_capability(idempotency_key: &str) -> String {
+fn legacy_application_root_capability(idempotency_key: &str) -> String {
     format!(
         "app-root-{}",
         digest_hex(&format!("application-root:{idempotency_key}"))
     )
+}
+
+fn new_application_root_capability() -> String {
+    format!("app-root-{}", uuid::Uuid::new_v4())
 }
 
 fn digest_hex(value: &str) -> String {
@@ -576,8 +580,6 @@ impl RuntimeCoordinator {
                 "application root idempotency key is required".into(),
             ));
         }
-        let capability = application_root_capability(idempotency_key);
-        let capability_digest = digest_hex(&capability);
         let existing = {
             self.repository
                 .lock()
@@ -598,6 +600,10 @@ impl RuntimeCoordinator {
                     .expect("runtime repository mutex poisoned")
                     .task_workspace(&existing.root_task_id)?
             };
+            let capability = existing
+                .capability_secret
+                .clone()
+                .unwrap_or_else(|| legacy_application_root_capability(idempotency_key));
             return Ok(AttachedApplicationRoot {
                 session_id: existing.root_session_id,
                 root_task_id: existing.root_task_id,
@@ -606,6 +612,8 @@ impl RuntimeCoordinator {
             });
         }
 
+        let capability = new_application_root_capability();
+        let capability_digest = digest_hex(&capability);
         let session_id =
             self.create_session_with_objective("TUI application root pending activation.".into())?;
         let supervisor_handle = self.supervisor(&session_id)?;
@@ -631,6 +639,7 @@ impl RuntimeCoordinator {
                 &session_id,
                 &root_task_id,
                 &capability_digest,
+                &capability,
             )?;
         Ok(AttachedApplicationRoot {
             session_id,
@@ -733,21 +742,6 @@ impl RuntimeCoordinator {
         objective: String,
     ) -> Result<(), RuntimeCoordinatorError> {
         self.authorize_application_root(session, root_task, capability)?;
-        let current_state = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .task_state(root_task)?;
-        if current_state == "running" {
-            return Ok(());
-        }
-        {
-            let supervisor = self.supervisor(session)?;
-            let mut supervisor = supervisor.lock().await;
-            supervisor
-                .set_objective(root_task, objective.clone())
-                .map_err(RuntimeCoordinatorError::Supervisor)?;
-        }
         let attempt = {
             let supervisor = self.supervisor(session)?;
             let supervisor = supervisor.lock().await;
@@ -757,31 +751,66 @@ impl RuntimeCoordinator {
                 .active_attempt_id()
                 .clone()
         };
-        let mut repository = self
+        let activated = self
             .repository
             .lock()
-            .expect("runtime repository mutex poisoned");
-        repository.update_task_objective(root_task, &objective)?;
-        repository.transition_task_and_attempt(
-            root_task,
-            &attempt,
-            "running",
-            RuntimeEvent::TaskStarted,
-        )?;
+            .expect("runtime repository mutex poisoned")
+            .activate_application_root_once(root_task, &attempt, &objective)?;
+        if !activated {
+            let current_state = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .task_state(root_task)?;
+            if current_state == "running" {
+                return Ok(());
+            }
+            return Err(RuntimeCoordinatorError::Supervisor(format!(
+                "application root cannot be activated from state {current_state}"
+            )));
+        }
+        let supervisor = self.supervisor(session)?;
+        let mut supervisor = supervisor.lock().await;
+        supervisor
+            .set_objective(root_task, objective)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        supervisor
+            .start_task(root_task)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
         Ok(())
     }
 
-    pub fn detach_application_root(
+    pub async fn detach_application_root(
         &self,
         session: &RootSessionId,
         root_task: &TaskId,
         capability: &str,
     ) -> Result<(), RuntimeCoordinatorError> {
         self.authorize_application_root(session, root_task, capability)?;
-        self.repository
+        let attempt = {
+            let supervisor = self.supervisor(session)?;
+            let mut supervisor = supervisor.lock().await;
+            let attempt = supervisor
+                .task(root_task)
+                .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
+                .active_attempt_id()
+                .clone();
+            supervisor
+                .pause_foreground_task(root_task, PauseReason("foreground TUI detached".into()))
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            attempt
+        };
+        let mut repository = self
+            .repository
             .lock()
-            .expect("runtime repository mutex poisoned")
-            .detach_application_root(session, root_task)?;
+            .expect("runtime repository mutex poisoned");
+        repository.transition_task_and_attempt(
+            root_task,
+            &attempt,
+            "paused",
+            RuntimeEvent::TaskPaused,
+        )?;
+        repository.detach_application_root(session, root_task)?;
         Ok(())
     }
 
@@ -2100,6 +2129,31 @@ impl RuntimeCoordinator {
                 RuntimeCoordinatorError::Supervisor("supervisor is no longer available".into())
             })?;
         }
+    }
+
+    pub async fn wait_for_children_authorized(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        mode: WaitMode,
+    ) -> Result<WaitOutcome, RuntimeCoordinatorError> {
+        if self
+            .authorize_application_root(session, caller, capability)
+            .is_err()
+        {
+            let supervisor = self.supervisor(session)?;
+            supervisor
+                .lock()
+                .await
+                .can_use_worker_capability(caller, capability)
+                .map_err(|_| {
+                    RuntimeCoordinatorError::AuthorityDenied(
+                        "wait_agent capability is invalid".into(),
+                    )
+                })?;
+        }
+        self.wait_for_children(session, caller, mode).await
     }
 
     /// Drains facts emitted by application workers and persists their reducer

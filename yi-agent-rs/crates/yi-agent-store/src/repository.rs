@@ -19,7 +19,7 @@ use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const LATEST_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -182,6 +182,7 @@ pub struct ApplicationRootAttachment {
     pub root_session_id: RootSessionId,
     pub root_task_id: TaskId,
     pub capability_digest: String,
+    pub capability_secret: Option<String>,
     pub state: String,
 }
 
@@ -2838,7 +2839,8 @@ impl RuntimeRepository {
     ) -> Result<Option<ApplicationRootAttachment>, RepositoryError> {
         self.connection
             .query_row(
-                "SELECT idempotency_key, root_session_id, root_task_id, capability_digest, state
+                "SELECT idempotency_key, root_session_id, root_task_id, capability_digest,
+                        capability_secret, state
                  FROM application_root_attachments WHERE idempotency_key = ?1",
                 params![idempotency_key],
                 |row| {
@@ -2859,7 +2861,8 @@ impl RuntimeRepository {
                             )
                         })?,
                         capability_digest: row.get(3)?,
-                        state: row.get(4)?,
+                        capability_secret: row.get(4)?,
+                        state: row.get(5)?,
                     })
                 },
             )
@@ -2873,16 +2876,19 @@ impl RuntimeRepository {
         root_session_id: &RootSessionId,
         root_task_id: &TaskId,
         capability_digest: &str,
+        capability_secret: &str,
     ) -> Result<(), RepositoryError> {
         self.connection.execute(
             "INSERT INTO application_root_attachments
-                (idempotency_key, root_session_id, root_task_id, capability_digest, state)
-             VALUES (?1, ?2, ?3, ?4, 'attached')",
+                (idempotency_key, root_session_id, root_task_id, capability_digest,
+                 capability_secret, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'attached')",
             params![
                 idempotency_key,
                 root_session_id.to_string(),
                 root_task_id.to_string(),
-                capability_digest
+                capability_digest,
+                capability_secret
             ],
         )?;
         Ok(())
@@ -2923,6 +2929,45 @@ impl RuntimeRepository {
             });
         }
         Ok(())
+    }
+
+    pub fn activate_application_root_once(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        objective: &str,
+    ) -> Result<bool, RepositoryError> {
+        let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tasks
+             SET state_json = 'running', delivery_json = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3 AND state_json = 'queued'",
+            params![delivery_json, task.to_string(), attempt.to_string()],
+        )?;
+        if changed == 0 {
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND active_attempt_id = ?2)",
+                params![task.to_string(), attempt.to_string()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(RepositoryError::TaskNotFound {
+                    task: task.to_string(),
+                });
+            }
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE attempts SET state = 'running' WHERE id = ?1 AND task_id = ?2",
+            params![attempt.to_string(), task.to_string()],
+        )?;
+        append_event(&transaction, task, RuntimeEvent::TaskStarted)?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn update_task_objective(
@@ -4334,6 +4379,25 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
              );",
         )?;
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (7)", [])?;
+        transaction.commit()?;
+    }
+
+    if current_version < 8 {
+        let transaction = connection.unchecked_transaction()?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('application_root_attachments')
+                WHERE name = 'capability_secret'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            transaction.execute_batch(
+                "ALTER TABLE application_root_attachments ADD COLUMN capability_secret TEXT;",
+            )?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (8)", [])?;
         transaction.commit()?;
     }
     Ok(())

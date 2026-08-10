@@ -978,6 +978,53 @@ impl AgentSupervisor {
 
     /// Authenticates daemon-worker IPC before applying the ordinary adjacency
     /// rules. UI clients never receive this random per-worker capability.
+
+    pub fn can_use_worker_capability(
+        &self,
+        task: &TaskId,
+        capability: &str,
+    ) -> Result<(), MessageDeliveryError> {
+        if self
+            .worker_message_capabilities
+            .get(task)
+            .is_none_or(|expected| expected != capability)
+        {
+            return Err(MessageDeliveryError::SenderNotFound);
+        }
+        let task = self
+            .tasks
+            .get(task)
+            .ok_or(MessageDeliveryError::SenderNotFound)?;
+        if task.state().is_terminal() {
+            return Err(MessageDeliveryError::SenderTerminal);
+        }
+        Ok(())
+    }
+
+    pub fn pause_foreground_task(
+        &mut self,
+        task_id: &TaskId,
+        reason: PauseReason,
+    ) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        if matches!(task.state(), TaskState::Paused(_)) {
+            return Ok(());
+        }
+        if task.state().is_terminal() {
+            return Err("terminal task cannot be paused".into());
+        }
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::PauseRequested { attempt_id, reason },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(())
+    }
     pub fn send_worker_message(
         &mut self,
         sender: &TaskId,
@@ -995,20 +1042,11 @@ impl AgentSupervisor {
         capability: &str,
         recipient: &TaskId,
     ) -> Result<(), MessageDeliveryError> {
-        if self
-            .worker_message_capabilities
-            .get(sender)
-            .is_none_or(|expected| expected != capability)
-        {
-            return Err(MessageDeliveryError::SenderNotFound);
-        }
+        self.can_use_worker_capability(sender, capability)?;
         let sender_task = self
             .tasks
             .get(sender)
             .ok_or(MessageDeliveryError::SenderNotFound)?;
-        if sender_task.state().is_terminal() {
-            return Err(MessageDeliveryError::SenderTerminal);
-        }
         let recipient_task = self
             .tasks
             .get(recipient)

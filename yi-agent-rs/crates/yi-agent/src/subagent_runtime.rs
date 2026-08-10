@@ -360,6 +360,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 runtime_socket,
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
+                caller_capability: request.message_capability.clone(),
             }));
             let worker_tools = Arc::new(worker_tools);
             std::thread::Builder::new()
@@ -763,6 +764,7 @@ pub fn register_application_subagent_tools(
         runtime_socket,
         session_id,
         caller_task_id,
+        caller_capability: application_capability,
     }));
 }
 
@@ -783,6 +785,7 @@ struct DaemonWaitAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
+    caller_capability: String,
 }
 
 #[async_trait]
@@ -861,6 +864,7 @@ impl Tool for DaemonWaitAgentTool {
             yi_agent_store::ipc::IpcRequest::WaitAgent {
                 session_id: self.session_id.clone(),
                 caller_task_id: self.caller_task_id.clone(),
+                capability: self.caller_capability.clone(),
                 mode: mode.to_owned(),
             },
         );
@@ -1409,7 +1413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_wait_proxy_routes_through_the_daemon() {
+    async fn worker_wait_proxy_rejects_unbound_capability() {
         let directory = TempDir::new().unwrap();
         let daemon = Daemon::start(
             directory.path().join("runtime"),
@@ -1464,13 +1468,14 @@ mod tests {
             runtime_socket: daemon.socket_path().to_path_buf(),
             session_id,
             caller_task_id: root_task_id,
+            caller_capability: "forged".into(),
         };
         let result = tool.call(json!({ "mode": "all" })).await;
 
-        assert!(!result.is_error);
+        assert!(result.is_error);
         assert!(matches!(
             result.content.as_slice(),
-            [yi_agent_core::ContentBlock::Text(text)] if text.contains("completed")
+            [yi_agent_core::ContentBlock::Text(text)] if text.contains("rejected") || text.contains("unavailable")
         ));
     }
 }
