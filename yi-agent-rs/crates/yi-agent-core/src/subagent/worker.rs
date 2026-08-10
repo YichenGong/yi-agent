@@ -408,6 +408,10 @@ pub trait AgentWorkspaceService: Send + Sync {
         task_id: &TaskId,
         attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError>;
+
+    fn cleanup_prepared(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]

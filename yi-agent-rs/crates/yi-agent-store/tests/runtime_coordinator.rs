@@ -8,7 +8,7 @@ use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
-    AttemptId, BudgetKind, IntegrationValidation, MessageId, PermissionDecision,
+    AttemptId, BudgetKind, DeliveryReport, IntegrationValidation, MessageId, PermissionDecision,
     PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
@@ -160,6 +160,7 @@ impl AgentWorkspaceService for StaticWorkspaceService {
 struct WorkspaceObservingFactory {
     database: std::path::PathBuf,
     starts: Arc<Mutex<Vec<WorkerStart>>>,
+    handles: Arc<Mutex<Vec<WorkerHandle>>>,
     workspace_service: Arc<dyn AgentWorkspaceService>,
 }
 
@@ -187,8 +188,10 @@ impl AgentWorkerFactory for WorkspaceObservingFactory {
             .expect("worker start includes workspace assignment");
         assert_eq!(&persisted, assigned);
         assert_eq!(request.workspace_lease_id, Some(persisted.lease_id.clone()));
+        let handle = WorkerHandle::new(request.cancellation.clone());
         self.starts.lock().unwrap().push(request.clone());
-        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+        self.handles.lock().unwrap().push(handle.clone());
+        Box::pin(async move { Ok(handle) })
     }
 }
 
@@ -238,6 +241,38 @@ impl AgentWorkspaceService for DerivedWorkspaceService {
             parent_branch: parent.branch.clone(),
             base_commit: parent.base_commit.clone(),
         })
+    }
+}
+
+#[derive(Clone)]
+struct CleanupRecordingWorkspaceService {
+    workspace: WorkerWorkspace,
+    cleaned: Arc<Mutex<Vec<WorkerWorkspace>>>,
+}
+
+impl AgentWorkspaceService for CleanupRecordingWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.workspace.clone())
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.workspace.clone())
+    }
+
+    fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        self.cleaned.lock().unwrap().push(workspace.clone());
+        Ok(())
     }
 }
 
@@ -401,9 +436,11 @@ async fn worker_receives_its_persisted_workspace_before_provider_start() {
         base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
     };
     let starts = Arc::new(Mutex::new(Vec::new()));
+    let handles = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(WorkspaceObservingFactory {
         database: database.clone(),
         starts: Arc::clone(&starts),
+        handles,
         workspace_service: Arc::new(StaticWorkspaceService {
             workspace: workspace.clone(),
         }),
@@ -435,9 +472,11 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let starts = Arc::new(Mutex::new(Vec::new()));
+    let handles = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(WorkspaceObservingFactory {
         database: database.clone(),
         starts: Arc::clone(&starts),
+        handles: Arc::clone(&handles),
         workspace_service: Arc::new(DerivedWorkspaceService {
             repository_root: directory.path().join("repo"),
         }),
@@ -467,13 +506,57 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
 }
 
 #[tokio::test]
+async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let handles = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(WorkspaceObservingFactory {
+        database: database.clone(),
+        starts: Arc::clone(&starts),
+        handles: Arc::clone(&handles),
+        workspace_service: Arc::new(DerivedWorkspaceService {
+            repository_root: directory.path().join("repo"),
+        }),
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    let workspace = starts.lock().unwrap()[1]
+        .workspace_lease_id
+        .clone()
+        .expect("child start carries assigned workspace lease");
+
+    handles.lock().unwrap()[1].report_delivery(DeliveryReport::coding(
+        "deadbeef",
+        "main",
+        workspace,
+        "cargo test",
+    ));
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+}
+
+#[tokio::test]
 async fn workspace_provisioning_failure_is_terminal_before_provider_start() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let starts = Arc::new(Mutex::new(Vec::new()));
+    let handles = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(WorkspaceObservingFactory {
         database: database.clone(),
         starts: Arc::clone(&starts),
+        handles,
         workspace_service: Arc::new(FailingWorkspaceService),
     });
     let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
@@ -491,6 +574,47 @@ async fn workspace_provisioning_failure_is_terminal_before_provider_start() {
         .expect("workspace failure is terminal evidence");
     assert!(terminal.contains("workspace_provision_failed"));
     assert!(terminal.contains("Git workspace error"));
+}
+
+#[tokio::test]
+async fn workspace_record_failure_cleans_up_prepared_assignment_before_provider_start() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let handles = Arc::new(Mutex::new(Vec::new()));
+    let cleaned = Arc::new(Mutex::new(Vec::new()));
+    let workspace = WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: directory.path().join("repo"),
+        path: directory.path().join("repo/.worktrees/bad"),
+        branch: "feat/yi-agent-bad".into(),
+        parent_branch: "main".into(),
+        base_commit: "".into(),
+    };
+    let factory = Arc::new(WorkspaceObservingFactory {
+        database: database.clone(),
+        starts: Arc::clone(&starts),
+        handles,
+        workspace_service: Arc::new(CleanupRecordingWorkspaceService {
+            workspace: workspace.clone(),
+            cleaned: Arc::clone(&cleaned),
+        }),
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+
+    assert!(coordinator.start_worker(&session, &task).await.is_err());
+
+    assert!(starts.lock().unwrap().is_empty());
+    assert_eq!(cleaned.lock().unwrap().as_slice(), [workspace]);
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&task)
+            .unwrap(),
+        "failed"
+    );
 }
 
 #[tokio::test]

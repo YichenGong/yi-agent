@@ -219,6 +219,16 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
             base_commit: child.base_commit,
         })
     }
+
+    fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        self.service
+            .remove_created(
+                &workspace.repository_root,
+                &workspace.path,
+                &workspace.branch,
+            )
+            .map_err(|error| WorkerError::Startup(format!("Git workspace cleanup error: {error}")))
+    }
 }
 
 fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {
@@ -1006,6 +1016,47 @@ mod tests {
             WorkerRecoveryPreflightResult::Conflict(reason) if reason.contains("tool state")
         ));
         assert!(provider.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemon_workspace_cleanup_removes_prepared_root_worktree_and_branch() {
+        let directory = TempDir::new().unwrap();
+        initialize_git_repository(directory.path());
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let workspace = service
+            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .unwrap();
+        assert!(workspace.path.exists());
+        assert!(
+            Command::new("git")
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", workspace.branch)
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        service.cleanup_prepared(&workspace).unwrap();
+
+        assert!(!workspace.path.exists());
+        assert!(
+            !Command::new("git")
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", workspace.branch)
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[tokio::test]

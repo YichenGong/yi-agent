@@ -495,6 +495,20 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    pub fn assign_workspace(
+        &mut self,
+        task_id: &TaskId,
+        workspace: WorkspaceLeaseId,
+    ) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        task.workspace = Some(workspace);
+        self.notify_update();
+        Ok(())
+    }
+
     /// Applies worker facts through the task reducer and discards handles for
     /// terminal tasks. A normal model completion without a structured delivery
     /// is intentionally a failure: coding completion requires review evidence.

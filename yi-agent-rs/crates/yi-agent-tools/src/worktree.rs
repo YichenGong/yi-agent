@@ -7,8 +7,14 @@ use thiserror::Error;
 pub enum WorktreeError {
     #[error("parent worktree is dirty: {path}")]
     DirtyParent { path: PathBuf },
+    #[error("parent worktree is detached: {path}")]
+    DetachedParent { path: PathBuf },
     #[error("child worktree path reuses its parent: {path}")]
     ParentPathReuse { path: PathBuf },
+    #[error("worktree path already exists: {path}")]
+    ExistingWorktreePath { path: PathBuf },
+    #[error("worktree branch already exists: {branch}")]
+    ExistingBranch { branch: String },
     #[error("child worktree is dirty: {path}")]
     DirtyChild { path: PathBuf },
     #[error("child delivery has no commits beyond its recorded base {base}")]
@@ -65,6 +71,7 @@ impl WorktreeService {
         self.validate_parent_base(repository_root, "HEAD")?;
         let parent_branch = current_branch(repository_root)?;
         let base_commit = self.resolve_parent_base(repository_root, "HEAD")?;
+        ensure_worktree_target_available(repository_root, root_path, branch)?;
         ensure_worktree_parent_is_ignored(repository_root, root_path)?;
         add_worktree(repository_root, root_path, branch, &base_commit)?;
         Ok(ChildWorktree {
@@ -106,6 +113,7 @@ impl WorktreeService {
         self.validate_parent_base(parent_worktree, base)?;
         let base_commit = self.resolve_parent_base(parent_worktree, base)?;
         let parent_branch = current_branch(parent_worktree)?;
+        ensure_worktree_target_available(parent_worktree, child_path, branch)?;
         ensure_worktree_parent_is_ignored(parent_worktree, child_path)?;
         add_worktree(parent_worktree, child_path, branch, &base_commit)?;
         Ok(ChildWorktree {
@@ -311,6 +319,40 @@ impl WorktreeService {
         Ok(())
     }
 
+    pub fn remove_created(
+        &self,
+        owner_worktree: &Path,
+        child_path: &Path,
+        branch: &str,
+    ) -> Result<(), WorktreeError> {
+        let output = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(child_path)
+            .current_dir(owner_worktree)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let output = Command::new("git")
+            .args(["branch", "-D", branch])
+            .current_dir(owner_worktree)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn resolve_parent_base(
         &self,
         parent_worktree: &Path,
@@ -346,9 +388,43 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn current_branch(workdir: &Path) -> Result<String, WorktreeError> {
-    Ok(git(workdir, &["branch", "--show-current"])?
+    let branch = git(workdir, &["branch", "--show-current"])?
         .trim()
-        .to_owned())
+        .to_owned();
+    if branch.is_empty() {
+        return Err(WorktreeError::DetachedParent {
+            path: workdir.to_path_buf(),
+        });
+    }
+    Ok(branch)
+}
+
+fn ensure_worktree_target_available(
+    owner_worktree: &Path,
+    path: &Path,
+    branch: &str,
+) -> Result<(), WorktreeError> {
+    if path.try_exists().map_err(|error| WorktreeError::Git {
+        message: error.to_string(),
+    })? {
+        return Err(WorktreeError::ExistingWorktreePath {
+            path: path.to_path_buf(),
+        });
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let status = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &branch_ref])
+        .current_dir(owner_worktree)
+        .status()
+        .map_err(|error| WorktreeError::Git {
+            message: error.to_string(),
+        })?;
+    if status.success() {
+        return Err(WorktreeError::ExistingBranch {
+            branch: branch.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn add_worktree(

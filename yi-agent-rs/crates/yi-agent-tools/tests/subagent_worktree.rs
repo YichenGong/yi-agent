@@ -87,6 +87,34 @@ fn child_creation_requires_a_clean_committed_parent_base() {
 }
 
 #[test]
+fn root_creation_rejects_a_detached_parent_before_creating_worktree() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    git(repo.path(), &["checkout", "--detach", &head]);
+    let root_path = repo.path().join(".worktrees/detached-root");
+
+    assert!(matches!(
+        service.create_root(repo.path(), "feat/detached-root", &root_path),
+        Err(WorktreeError::DetachedParent { .. })
+    ));
+    assert!(!root_path.exists());
+}
+
+#[test]
+fn child_creation_rejects_a_detached_parent_before_creating_worktree() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    git(repo.path(), &["checkout", "--detach", &head]);
+    let child_path = repo.path().join(".worktrees/detached-child");
+
+    assert!(matches!(
+        service.create_child(repo.path(), &head, "feat/detached-child", &child_path),
+        Err(WorktreeError::DetachedParent { .. })
+    ));
+    assert!(!child_path.exists());
+}
+
+#[test]
 fn child_creation_rejects_reusing_the_parent_worktree_path() {
     let (repo, head) = repository();
     let service = WorktreeService::new();
@@ -95,6 +123,75 @@ fn child_creation_rejects_reusing_the_parent_worktree_path() {
         service.create_child(repo.path(), &head, "child/reused-path", repo.path()),
         Err(WorktreeError::ParentPathReuse { .. })
     ));
+}
+
+#[test]
+fn creation_rejects_an_existing_child_path_before_creating_branch() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    let child_path = repo.path().join(".worktrees/stale-path");
+    std::fs::create_dir_all(&child_path).unwrap();
+
+    assert!(matches!(
+        service.create_child(repo.path(), &head, "feat/stale-path", &child_path),
+        Err(WorktreeError::ExistingWorktreePath { .. })
+    ));
+    assert!(
+        !Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feat/stale-path"
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn creation_rejects_an_existing_branch_before_creating_worktree() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    git(repo.path(), &["branch", "feat/existing-branch"]);
+    let child_path = repo.path().join(".worktrees/existing-branch");
+
+    assert!(matches!(
+        service.create_child(repo.path(), &head, "feat/existing-branch", &child_path),
+        Err(WorktreeError::ExistingBranch { .. })
+    ));
+    assert!(!child_path.exists());
+}
+
+#[test]
+fn remove_created_deletes_unmerged_worktree_and_branch() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    let child_path = repo.path().join(".worktrees/orphaned-child");
+    service
+        .create_child(repo.path(), &head, "feat/orphaned-child", &child_path)
+        .unwrap();
+
+    service
+        .remove_created(repo.path(), &child_path, "feat/orphaned-child")
+        .unwrap();
+
+    assert!(!child_path.exists());
+    assert!(
+        !Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feat/orphaned-child"
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]

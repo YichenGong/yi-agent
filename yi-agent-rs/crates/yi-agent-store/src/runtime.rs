@@ -757,7 +757,7 @@ impl RuntimeCoordinator {
             .active_attempt_id()
             .clone();
         let workspace_assignment =
-            match self.prepare_task_workspace(&supervisor, session, task, &attempt) {
+            match self.prepare_task_workspace(&mut supervisor, session, task, &attempt) {
                 Ok(workspace) => workspace,
                 Err(error) => {
                     let evidence = serde_json::to_string(&serde_json::json!({
@@ -1047,7 +1047,7 @@ impl RuntimeCoordinator {
 
     fn prepare_task_workspace(
         &self,
-        supervisor: &AgentSupervisor,
+        supervisor: &mut AgentSupervisor,
         session: &RootSessionId,
         task: &TaskId,
         attempt: &AttemptId,
@@ -1057,8 +1057,11 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime repository mutex poisoned")
             .task_workspace_optional(task)?;
-        if existing.is_some() {
-            return Ok(existing);
+        if let Some(existing) = existing {
+            supervisor
+                .assign_workspace(task, existing.lease_id.clone())
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            return Ok(Some(existing));
         }
         let Some(service) = self.workspace_service.as_ref() else {
             return Ok(None);
@@ -1080,10 +1083,18 @@ impl RuntimeCoordinator {
                 .prepare_root(session, task, attempt)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
         };
-        self.repository
+        let record_result = self
+            .repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .record_task_workspace(task, attempt, &workspace)?;
+            .record_task_workspace(task, attempt, &workspace);
+        if let Err(error) = record_result {
+            let _ = service.cleanup_prepared(&workspace);
+            return Err(RuntimeCoordinatorError::Repository(error));
+        }
+        supervisor
+            .assign_workspace(task, workspace.lease_id.clone())
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
         Ok(Some(workspace))
     }
 
