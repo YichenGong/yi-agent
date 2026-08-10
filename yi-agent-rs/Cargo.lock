@@ -3552,6 +3552,7 @@ dependencies = [
  "futures",
  "glob",
  "html2md",
+ "libc",
  "regex 1.13.1",
  "reqwest",
  "rstest",

@@ -6,6 +6,7 @@
 mod context;
 mod error;
 mod fs;
+mod process;
 mod sandbox;
 mod shell;
 mod skill_tool;
@@ -19,6 +20,9 @@ use yi_agent_core::ToolRegistry;
 pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+pub use process::{
+    ManagedProcessSnapshot, OnExitPolicy, ProcessManager, ProcessReadResult, ProcessStatus,
+};
 pub use sandbox::{SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
