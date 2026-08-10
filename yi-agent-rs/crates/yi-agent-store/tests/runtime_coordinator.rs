@@ -248,6 +248,7 @@ impl AgentWorkspaceService for DerivedWorkspaceService {
 struct CleanupRecordingWorkspaceService {
     workspace: WorkerWorkspace,
     cleaned: Arc<Mutex<Vec<WorkerWorkspace>>>,
+    cleanup_error: Option<&'static str>,
 }
 
 impl AgentWorkspaceService for CleanupRecordingWorkspaceService {
@@ -272,6 +273,9 @@ impl AgentWorkspaceService for CleanupRecordingWorkspaceService {
 
     fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
         self.cleaned.lock().unwrap().push(workspace.clone());
+        if let Some(error) = self.cleanup_error {
+            return Err(WorkerError::Startup(error.into()));
+        }
         Ok(())
     }
 }
@@ -598,6 +602,7 @@ async fn workspace_record_failure_cleans_up_prepared_assignment_before_provider_
         workspace_service: Arc::new(CleanupRecordingWorkspaceService {
             workspace: workspace.clone(),
             cleaned: Arc::clone(&cleaned),
+            cleanup_error: None,
         }),
     });
     let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
@@ -615,6 +620,57 @@ async fn workspace_record_failure_cleans_up_prepared_assignment_before_provider_
             .unwrap(),
         "failed"
     );
+}
+
+#[tokio::test]
+async fn workspace_record_failure_surfaces_cleanup_failure_in_terminal_evidence() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let handles = Arc::new(Mutex::new(Vec::new()));
+    let cleaned = Arc::new(Mutex::new(Vec::new()));
+    let workspace = WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: directory.path().join("repo"),
+        path: directory.path().join("repo/.worktrees/bad-cleanup"),
+        branch: "feat/yi-agent-bad-cleanup".into(),
+        parent_branch: "main".into(),
+        base_commit: "".into(),
+    };
+    let factory = Arc::new(WorkspaceObservingFactory {
+        database: database.clone(),
+        starts: Arc::clone(&starts),
+        handles,
+        workspace_service: Arc::new(CleanupRecordingWorkspaceService {
+            workspace: workspace.clone(),
+            cleaned: Arc::clone(&cleaned),
+            cleanup_error: Some("injected workspace cleanup failure"),
+        }),
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let task = coordinator.root_task_id(&session).unwrap();
+
+    let error = coordinator
+        .start_worker(&session, &task)
+        .await
+        .expect_err("record and cleanup failures must surface together");
+
+    assert!(error.to_string().contains("record_task_workspace"));
+    assert!(
+        error
+            .to_string()
+            .contains("injected workspace cleanup failure")
+    );
+    assert!(starts.lock().unwrap().is_empty());
+    assert_eq!(cleaned.lock().unwrap().as_slice(), [workspace]);
+    let terminal = RuntimeRepository::open(&database)
+        .unwrap()
+        .attempt_terminal_json_for_task(&task)
+        .unwrap()
+        .expect("workspace failure is terminal evidence");
+    assert!(terminal.contains("workspace_provision_failed"));
+    assert!(terminal.contains("injected workspace cleanup failure"));
 }
 
 #[tokio::test]

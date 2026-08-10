@@ -49,6 +49,10 @@ pub enum RuntimeCoordinatorError {
         cleanup: Option<String>,
         recovery: Option<String>,
     },
+    #[error(
+        "record_task_workspace failed and cleanup_prepared failed: record={record}; cleanup={cleanup}"
+    )]
+    WorkspaceRecordingCleanup { record: String, cleanup: String },
     #[error("session does not exist: {0}")]
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
@@ -1089,7 +1093,12 @@ impl RuntimeCoordinator {
             .expect("runtime repository mutex poisoned")
             .record_task_workspace(task, attempt, &workspace);
         if let Err(error) = record_result {
-            let _ = service.cleanup_prepared(&workspace);
+            if let Err(cleanup) = service.cleanup_prepared(&workspace) {
+                return Err(RuntimeCoordinatorError::WorkspaceRecordingCleanup {
+                    record: error.to_string(),
+                    cleanup: cleanup.to_string(),
+                });
+            }
             return Err(RuntimeCoordinatorError::Repository(error));
         }
         supervisor
