@@ -1,9 +1,11 @@
 //! Application-owned worker construction boundary for the runtime daemon.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +14,16 @@ use crate::agent::ProviderTurnGate;
 
 use super::task::{AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId, WorkspaceLeaseId};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerWorkspace {
+    pub lease_id: WorkspaceLeaseId,
+    pub repository_root: PathBuf,
+    pub path: PathBuf,
+    pub branch: String,
+    pub parent_branch: String,
+    pub base_commit: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerStart {
     pub task_id: TaskId,
@@ -19,6 +31,8 @@ pub struct WorkerStart {
     pub root_session_id: RootSessionId,
     /// Runtime-owned workspace identity required in a coding delivery report.
     pub workspace_lease_id: Option<WorkspaceLeaseId>,
+    /// Full application-owned workspace assignment for this task, when known.
+    pub workspace: Option<WorkerWorkspace>,
     pub cancellation: CancellationToken,
     /// Opaque daemon-issued capability required for worker IPC mutations.
     pub message_capability: String,
@@ -77,6 +91,7 @@ impl WorkerStart {
             attempt_id,
             root_session_id,
             workspace_lease_id: None,
+            workspace: None,
             cancellation: CancellationToken::new(),
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
@@ -91,6 +106,12 @@ impl WorkerStart {
 
     pub fn with_workspace_lease(mut self, workspace_lease_id: WorkspaceLeaseId) -> Self {
         self.workspace_lease_id = Some(workspace_lease_id);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: WorkerWorkspace) -> Self {
+        self.workspace_lease_id = Some(workspace.lease_id.clone());
+        self.workspace = Some(workspace);
         self
     }
 
@@ -116,6 +137,25 @@ mod tests {
         let start = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_workspace_lease(workspace.clone());
         assert_eq!(start.workspace_lease_id, Some(workspace));
+    }
+
+    #[test]
+    fn worker_start_workspace_assignment_keeps_legacy_lease_coherent() {
+        let lease = WorkspaceLeaseId::new();
+        let workspace = WorkerWorkspace {
+            lease_id: lease.clone(),
+            repository_root: "/repo".into(),
+            path: "/repo/.worktrees/task".into(),
+            branch: "feat/task".into(),
+            parent_branch: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        };
+
+        let start = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_workspace(workspace.clone());
+
+        assert_eq!(start.workspace_lease_id, Some(lease));
+        assert_eq!(start.workspace, Some(workspace));
     }
 }
 

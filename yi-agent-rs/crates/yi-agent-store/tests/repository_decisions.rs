@@ -4,7 +4,74 @@ use yi_agent_core::subagent::task::{
     AttemptId, DeliveryReport, IntegrationValidation, MessageId, PermissionDecision,
     PermissionRequestId, RootSessionId, TaskId, WorkspaceLeaseId,
 };
+use yi_agent_core::subagent::worker::WorkerWorkspace;
 use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
+
+fn persisted_root(repository: &mut RuntimeRepository) -> (RootSessionId, TaskId, AttemptId) {
+    let session = RootSessionId::new();
+    let task = TaskId::new();
+    let attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    (session, task, attempt)
+}
+
+fn test_workspace(session: &RootSessionId, task: &TaskId) -> WorkerWorkspace {
+    WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: format!("/tmp/repositories/{session}").into(),
+        path: format!("/tmp/repositories/{session}/.worktrees/{task}").into(),
+        branch: format!("feat/task-{task}"),
+        parent_branch: "main".into(),
+        base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+    }
+}
+
+#[test]
+fn task_workspace_round_trips_every_git_identity_field() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, task, attempt) = persisted_root(&mut repository);
+    let workspace = test_workspace(&session, &task);
+
+    repository
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap();
+
+    assert_eq!(repository.task_workspace(&task).unwrap(), workspace);
+}
+
+#[test]
+fn task_workspace_rejects_empty_persisted_git_identity_fields() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (_session, task, attempt) = persisted_root(&mut repository);
+    drop(repository);
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO task_workspaces (
+                task_id, attempt_id, lease_id, repository_root, path,
+                branch, parent_branch, base_commit
+             ) VALUES (?1, ?2, ?3, '', '', '', '', '')",
+            rusqlite::params![
+                task.to_string(),
+                attempt.to_string(),
+                WorkspaceLeaseId::new().to_string(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let repository = RuntimeRepository::open(&database).unwrap();
+
+    assert!(matches!(
+        repository.task_workspace_optional(&task),
+        Err(RepositoryError::InvalidTaskWorkspace { .. })
+    ));
+}
 
 #[test]
 fn permission_resolution_is_an_atomic_audited_task_transition() {

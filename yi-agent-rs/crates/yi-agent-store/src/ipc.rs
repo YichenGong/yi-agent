@@ -19,7 +19,9 @@ use uuid::Uuid;
 use yi_agent_core::subagent::task::{
     PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
 };
-use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
+use yi_agent_core::subagent::worker::{
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart, WorkerWorkspace,
+};
 
 use crate::repository::RuntimeRepository;
 use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
@@ -389,6 +391,8 @@ pub struct SubscriptionSnapshot {
 pub struct IpcTask {
     pub task_id: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +411,8 @@ pub struct IpcTaskDetail {
     pub depth: u8,
     pub state: String,
     pub delivery_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1000,6 +1006,7 @@ fn stream_subscription(
                 .map(|task| IpcTask {
                     task_id: task.task_id,
                     state: task.state,
+                    workspace: task.workspace,
                 })
                 .collect(),
             events: snapshot
@@ -1562,6 +1569,7 @@ mod subscription_queue_tests {
                 depth: 0,
                 state: "queued".into(),
                 delivery_json: "x".repeat(MAX_FRAME_BYTES),
+                workspace: None,
             }),
         );
 
@@ -1743,6 +1751,7 @@ fn read_incoming_frame<R: BufRead>(reader: &mut R) -> Result<Option<IncomingFram
 fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcErrorCode {
     match error {
         crate::repository::RepositoryError::TaskNotFound { .. }
+        | crate::repository::RepositoryError::TaskWorkspaceNotFound { .. }
         | crate::repository::RepositoryError::MailboxMessageNotFound { .. }
         | crate::repository::RepositoryError::PermissionRequestNotFound { .. } => {
             IpcErrorCode::NotFound
@@ -1765,6 +1774,7 @@ fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcError
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
         | crate::repository::RepositoryError::InvalidAdmissionCursor { .. }
+        | crate::repository::RepositoryError::InvalidTaskWorkspace { .. }
         | crate::repository::RepositoryError::InvalidWatchdogSnapshot { .. }
         | crate::repository::RepositoryError::UnknownEventKind { .. } => IpcErrorCode::Internal,
     }
@@ -2065,6 +2075,7 @@ fn respond(
                 depth: detail.depth,
                 state: detail.state,
                 delivery_json: detail.delivery_json,
+                workspace: detail.workspace,
             }))
         }
         IpcRequest::ReadTaskEvents {
@@ -2116,6 +2127,7 @@ fn respond(
                 .map(|task| IpcTask {
                     task_id: task.task_id,
                     state: task.state,
+                    workspace: task.workspace,
                 })
                 .collect();
             let events = snapshot

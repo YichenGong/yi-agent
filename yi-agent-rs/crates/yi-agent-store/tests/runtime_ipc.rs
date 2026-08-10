@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -8,9 +9,10 @@ use futures::{FutureExt, future::BoxFuture};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use yi_agent_core::subagent::task::{MessageId, PermissionRequestId};
+use yi_agent_core::subagent::task::{MessageId, PermissionRequestId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+    WorkerWorkspace,
 };
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
@@ -65,6 +67,34 @@ fn confirm_cancel(socket: &std::path::Path, task_id: String, recursive: bool) ->
         },
     )
     .unwrap()
+}
+
+fn legacy_v6_database() -> PathBuf {
+    let directory = TempDir::new().unwrap();
+    let database = directory.keep().join("runtime.sqlite");
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 7);
+    drop(repository);
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE task_workspaces;
+             DROP TABLE application_root_attachments;
+             DELETE FROM schema_migrations WHERE version = 7;",
+        )
+        .unwrap();
+    database
+}
+
+fn test_workspace_for_ipc(session: &str, task: &str) -> WorkerWorkspace {
+    WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: format!("/tmp/repositories/{session}").into(),
+        path: format!("/tmp/repositories/{session}/.worktrees/{task}").into(),
+        branch: format!("feat/task-{task}"),
+        parent_branch: "main".into(),
+        base_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -144,7 +174,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 6);
+    assert_eq!(repository.schema_version().unwrap(), 7);
     for table in [
         "sessions",
         "tasks",
@@ -161,9 +191,25 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
         "events",
         "runtime_metadata",
         "resource_admission_cursors",
+        "task_workspaces",
+        "application_root_attachments",
     ] {
         assert!(repository.has_table(table).unwrap(), "missing {table}");
     }
+}
+
+#[test]
+fn v6_database_migrates_to_workspace_and_attachment_tables() {
+    let database = legacy_v6_database();
+    let repository = RuntimeRepository::open(&database).unwrap();
+
+    assert_eq!(repository.schema_version().unwrap(), 7);
+    assert!(repository.has_table("task_workspaces").unwrap());
+    assert!(
+        repository
+            .has_table("application_root_attachments")
+            .unwrap()
+    );
 }
 
 #[test]
@@ -274,7 +320,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 6);
+    assert_eq!(repository.schema_version().unwrap(), 7);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -1562,6 +1608,131 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
     );
     assert_eq!(detail.depth, 1);
     assert_eq!(detail.state, "queued");
+}
+
+#[test]
+fn inspect_task_includes_the_authoritative_recorded_workspace() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id,
+            objective: "Inspect workspace assignment".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child");
+    };
+    let task: TaskId = task_id.parse().unwrap();
+    let attempt = RuntimeRepository::open(&database)
+        .unwrap()
+        .active_attempt_id(&task)
+        .unwrap();
+    let workspace = test_workspace_for_ipc(&session_id, &task_id);
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap();
+
+    let IpcResponse::TaskDetail(detail) = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectTask {
+            task_id: task_id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected task detail");
+    };
+
+    assert_eq!(detail.task_id, task_id);
+    assert_eq!(detail.workspace, Some(workspace));
+}
+
+#[test]
+fn inspect_task_omits_workspace_for_unassigned_old_tasks() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    let IpcResponse::TaskDetail(detail) = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectTask {
+            task_id: root_task_id,
+        },
+    )
+    .unwrap() else {
+        panic!("expected task detail");
+    };
+
+    assert_eq!(detail.workspace, None);
+}
+
+#[test]
+fn subscription_snapshot_includes_recorded_task_workspace() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id,
+            objective: "Publish workspace assignment".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child");
+    };
+    let task: TaskId = task_id.parse().unwrap();
+    let attempt = RuntimeRepository::open(&database)
+        .unwrap()
+        .active_attempt_id(&task)
+        .unwrap();
+    let workspace = test_workspace_for_ipc(&session_id, &task_id);
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap();
+
+    let IpcResponse::Subscription(snapshot) = send_request(
+        daemon.socket_path(),
+        IpcRequest::SubscribeEvents {
+            after_event_id: 0,
+            filters: SubscriptionFilters::default(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected subscription snapshot");
+    };
+
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.task_id == task_id && task.workspace == Some(workspace.clone()))
+    );
 }
 
 #[test]

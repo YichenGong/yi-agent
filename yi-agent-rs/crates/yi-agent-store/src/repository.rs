@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chrono::{DateTime, Local, Utc};
@@ -9,13 +9,17 @@ use uuid::Uuid;
 use yi_agent_core::subagent::task::{
     BudgetKind, DeliveryId, DeliveryReport, IntegrationValidation, TimeoutKind,
 };
-use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionRequestId};
-use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
+use yi_agent_core::subagent::task::{
+    MessageId, PermissionDecision, PermissionRequestId, WorkspaceLeaseId,
+};
+use yi_agent_core::subagent::worker::{
+    WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerWorkspace,
+};
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 6;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -53,6 +57,10 @@ pub enum RepositoryError {
     InvalidAdmissionCursor { key: String, reason: String },
     #[error("watchdog snapshot is invalid for {attempt}: {reason}")]
     InvalidWatchdogSnapshot { attempt: String, reason: String },
+    #[error("task workspace does not exist: {task}")]
+    TaskWorkspaceNotFound { task: String },
+    #[error("task workspace is invalid for {task}: {reason}")]
+    InvalidTaskWorkspace { task: String, reason: String },
 }
 
 #[derive(Debug, Error)]
@@ -269,6 +277,7 @@ pub struct PersistedMailboxMessage {
 pub struct PersistedTask {
     pub task_id: String,
     pub state: String,
+    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +295,7 @@ pub struct PersistedTaskDetail {
     pub depth: u8,
     pub state: String,
     pub delivery_json: String,
+    pub workspace: Option<WorkerWorkspace>,
 }
 
 /// Active resource ownership which a destructive-control preview must expose.
@@ -2813,6 +2823,97 @@ impl RuntimeRepository {
             })
     }
 
+    pub fn record_task_workspace(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        workspace: &WorkerWorkspace,
+    ) -> Result<(), RepositoryError> {
+        validate_task_workspace(task, workspace)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO task_workspaces (
+                task_id, attempt_id, lease_id, repository_root, path,
+                branch, parent_branch, base_commit
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task.to_string(),
+                attempt.to_string(),
+                workspace.lease_id.to_string(),
+                workspace.repository_root.to_string_lossy(),
+                workspace.path.to_string_lossy(),
+                workspace.branch.as_str(),
+                workspace.parent_branch.as_str(),
+                workspace.base_commit.as_str(),
+            ],
+        )?;
+        let updated = transaction.execute(
+            "UPDATE tasks SET workspace_lease_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![workspace.lease_id.to_string(), task.to_string()],
+        )?;
+        if updated == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn task_workspace(&self, task: &TaskId) -> Result<WorkerWorkspace, RepositoryError> {
+        self.task_workspace_optional(task)?
+            .ok_or_else(|| RepositoryError::TaskWorkspaceNotFound {
+                task: task.to_string(),
+            })
+    }
+
+    pub fn task_workspace_optional(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<WorkerWorkspace>, RepositoryError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT lease_id, repository_root, path, branch, parent_branch, base_commit
+                 FROM task_workspaces WHERE task_id = ?1",
+                params![task.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((lease_id, repository_root, path, branch, parent_branch, base_commit)) = row {
+            return persisted_task_workspace(
+                task,
+                lease_id,
+                repository_root,
+                path,
+                branch,
+                parent_branch,
+                base_commit,
+            )
+            .map(Some);
+        }
+        if self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            params![task.to_string()],
+            |row| row.get::<_, bool>(0),
+        )? {
+            Ok(None)
+        } else {
+            Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            })
+        }
+    }
+
     pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT state FROM attempts WHERE id = ?1",
@@ -2870,17 +2971,52 @@ impl RuntimeRepository {
     }
 
     pub fn task_snapshots(&self) -> Result<Vec<PersistedTask>, RepositoryError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, state_json FROM tasks ORDER BY created_at, id")?;
-        Ok(statement
+        let mut statement = self.connection.prepare(
+            "SELECT tasks.id, tasks.state_json, task_workspaces.lease_id,
+                    task_workspaces.repository_root, task_workspaces.path,
+                    task_workspaces.branch, task_workspaces.parent_branch,
+                    task_workspaces.base_commit
+             FROM tasks
+             LEFT JOIN task_workspaces ON task_workspaces.task_id = tasks.id
+             ORDER BY tasks.created_at, tasks.id",
+        )?;
+        statement
             .query_map([], |row| {
-                Ok(PersistedTask {
-                    task_id: row.get(0)?,
-                    state: row.get(1)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
             })?
-            .collect::<Result<Vec<_>, _>>()?)
+            .map(|row| {
+                let (task_id, state, lease_id, root, path, branch, parent_branch, base_commit) =
+                    row?;
+                let task = task_id
+                    .parse()
+                    .map_err(|_| RepositoryError::InvalidTaskWorkspace {
+                        task: task_id.clone(),
+                        reason: "task ID in workspace snapshot is invalid".into(),
+                    })?;
+                Ok(PersistedTask {
+                    task_id,
+                    state,
+                    workspace: optional_persisted_task_workspace(
+                        &task,
+                        lease_id,
+                        root,
+                        path,
+                        branch,
+                        parent_branch,
+                        base_commit,
+                    )?,
+                })
+            })
+            .collect()
     }
 
     pub fn queued_task_count(&self) -> Result<usize, RepositoryError> {
@@ -3055,7 +3191,8 @@ impl RuntimeRepository {
     }
 
     pub fn task_detail(&self, task: &TaskId) -> Result<PersistedTaskDetail, RepositoryError> {
-        self.connection
+        let detail = self
+            .connection
             .query_row(
                 "SELECT id, root_session_id, parent_id, depth, state_json, delivery_json
                  FROM tasks WHERE id = ?1",
@@ -3068,6 +3205,7 @@ impl RuntimeRepository {
                         depth: row.get(3)?,
                         state: row.get(4)?,
                         delivery_json: row.get(5)?,
+                        workspace: None,
                     })
                 },
             )
@@ -3076,7 +3214,11 @@ impl RuntimeRepository {
                     task: task.to_string(),
                 },
                 error => RepositoryError::Sql(error),
-            })
+            })?;
+        Ok(PersistedTaskDetail {
+            workspace: self.task_workspace_optional(task)?,
+            ..detail
+        })
     }
 
     /// Returns a task and, when requested, all descendants in stable tree order.
@@ -3193,16 +3335,61 @@ impl RuntimeRepository {
             RuntimeCursorState::Replayable
         };
         let tasks = {
-            let mut statement =
-                transaction.prepare("SELECT id, state_json FROM tasks ORDER BY created_at, id")?;
+            let mut statement = transaction.prepare(
+                "SELECT tasks.id, tasks.state_json, task_workspaces.lease_id,
+                            task_workspaces.repository_root, task_workspaces.path,
+                            task_workspaces.branch, task_workspaces.parent_branch,
+                            task_workspaces.base_commit
+                     FROM tasks
+                     LEFT JOIN task_workspaces ON task_workspaces.task_id = tasks.id
+                     ORDER BY tasks.created_at, tasks.id",
+            )?;
             statement
                 .query_map([], |row| {
-                    Ok(PersistedTask {
-                        task_id: row.get(0)?,
-                        state: row.get(1)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
                 })?
-                .collect::<Result<Vec<_>, _>>()?
+                .map(|row| {
+                    let (
+                        task_id,
+                        state,
+                        lease_id,
+                        repository_root,
+                        path,
+                        branch,
+                        parent_branch,
+                        base_commit,
+                    ) = row?;
+                    let task =
+                        task_id
+                            .parse()
+                            .map_err(|_| RepositoryError::InvalidTaskWorkspace {
+                                task: task_id.clone(),
+                                reason: "task ID in workspace snapshot is invalid".into(),
+                            })?;
+                    Ok(PersistedTask {
+                        task_id,
+                        state,
+                        workspace: optional_persisted_task_workspace(
+                            &task,
+                            lease_id,
+                            repository_root,
+                            path,
+                            branch,
+                            parent_branch,
+                            base_commit,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RepositoryError>>()?
         };
         let events = if matches!(cursor_state, RuntimeCursorState::Replayable) {
             let mut statement = transaction.prepare(
@@ -3490,6 +3677,111 @@ fn validate_recovery_context(context: &WorkerRecoveryContext) -> Result<(), Repo
     Ok(())
 }
 
+fn validate_task_workspace(
+    task: &TaskId,
+    workspace: &WorkerWorkspace,
+) -> Result<(), RepositoryError> {
+    if workspace.repository_root.as_os_str().is_empty() {
+        return Err(RepositoryError::InvalidTaskWorkspace {
+            task: task.to_string(),
+            reason: "repository_root is empty".into(),
+        });
+    }
+    if workspace.path.as_os_str().is_empty() {
+        return Err(RepositoryError::InvalidTaskWorkspace {
+            task: task.to_string(),
+            reason: "path is empty".into(),
+        });
+    }
+    for (field, value) in [
+        ("branch", workspace.branch.as_str()),
+        ("parent_branch", workspace.parent_branch.as_str()),
+        ("base_commit", workspace.base_commit.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(RepositoryError::InvalidTaskWorkspace {
+                task: task.to_string(),
+                reason: format!("{field} is empty"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn persisted_task_workspace(
+    task: &TaskId,
+    lease_id: String,
+    repository_root: String,
+    path: String,
+    branch: String,
+    parent_branch: String,
+    base_commit: String,
+) -> Result<WorkerWorkspace, RepositoryError> {
+    if lease_id.trim().is_empty() {
+        return Err(RepositoryError::InvalidTaskWorkspace {
+            task: task.to_string(),
+            reason: "lease_id is empty".into(),
+        });
+    }
+    let workspace = WorkerWorkspace {
+        lease_id: lease_id.parse::<WorkspaceLeaseId>().map_err(|_| {
+            RepositoryError::InvalidTaskWorkspace {
+                task: task.to_string(),
+                reason: "lease_id is invalid".into(),
+            }
+        })?,
+        repository_root: PathBuf::from(repository_root),
+        path: PathBuf::from(path),
+        branch,
+        parent_branch,
+        base_commit,
+    };
+    validate_task_workspace(task, &workspace)?;
+    Ok(workspace)
+}
+
+fn optional_persisted_task_workspace(
+    task: &TaskId,
+    lease_id: Option<String>,
+    repository_root: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    parent_branch: Option<String>,
+    base_commit: Option<String>,
+) -> Result<Option<WorkerWorkspace>, RepositoryError> {
+    match (
+        lease_id,
+        repository_root,
+        path,
+        branch,
+        parent_branch,
+        base_commit,
+    ) {
+        (None, None, None, None, None, None) => Ok(None),
+        (
+            Some(lease_id),
+            Some(repository_root),
+            Some(path),
+            Some(branch),
+            Some(parent_branch),
+            Some(base_commit),
+        ) => persisted_task_workspace(
+            task,
+            lease_id,
+            repository_root,
+            path,
+            branch,
+            parent_branch,
+            base_commit,
+        )
+        .map(Some),
+        _ => Err(RepositoryError::InvalidTaskWorkspace {
+            task: task.to_string(),
+            reason: "workspace row is partially persisted".into(),
+        }),
+    }
+}
+
 fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
@@ -3679,6 +3971,33 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
              ADD COLUMN root_session_id TEXT REFERENCES sessions(id);",
         )?;
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (6)", [])?;
+        transaction.commit()?;
+    }
+    if current_version < 7 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE task_workspaces (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                attempt_id TEXT NOT NULL REFERENCES attempts(id),
+                lease_id TEXT NOT NULL UNIQUE,
+                repository_root TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                branch TEXT NOT NULL UNIQUE,
+                parent_branch TEXT NOT NULL,
+                base_commit TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE application_root_attachments (
+                idempotency_key TEXT PRIMARY KEY,
+                root_session_id TEXT NOT NULL,
+                root_task_id TEXT NOT NULL REFERENCES tasks(id),
+                capability_digest TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                detached_at TEXT
+             );",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (7)", [])?;
         transaction.commit()?;
     }
     Ok(())
