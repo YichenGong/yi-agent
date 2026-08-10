@@ -10,14 +10,18 @@ use chrono::{DateTime, Timelike, Utc};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use yi_agent_core::ProviderTurnGate;
+use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind, ReworkInstruction};
 use yi_agent_core::subagent::scheduler::{
     AdmissionCursor, AdmissionPriority, LeaseId, LeaseMode, ResourceCoordinator, ResourceRequest,
     ResourceScope,
 };
-use yi_agent_core::subagent::supervisor::{AgentSupervisor, SpawnError, WaitMode, WaitOutcome};
+use yi_agent_core::subagent::supervisor::{
+    AgentSupervisor, ReviewPersistenceError, SpawnError, WaitMode, WaitOutcome,
+};
 use yi_agent_core::subagent::task::{
-    MessageId, PauseReason, PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
-    TaskState, WatchdogEvidence as CoreWatchdogEvidence,
+    DeliveryReport, IntegrationValidation, MessageId, PauseReason, PermissionDecision,
+    PermissionRequestId, RootSessionId, TaskId, TaskState,
+    WatchdogEvidence as CoreWatchdogEvidence,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerRecoveryContext, WorkerRecoveryPreflight,
@@ -510,6 +514,11 @@ impl RuntimeCoordinator {
         {
             return Err(RuntimeCoordinatorError::Supervisor(
                 "recovery-required task must be explicitly resumed".into(),
+            ));
+        }
+        if supervisor.has_worker(task) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "task already owns a worker".into(),
             ));
         }
         let is_subagent = !matches!(
@@ -1071,6 +1080,210 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// Resolves task/session/actor from daemon-owned state and records an
+    /// accepted delivery only after successful parent integration evidence.
+    pub async fn accept_review(
+        &self,
+        task: &TaskId,
+        integration: IntegrationValidation,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let (session, parent, delivery) = self.review_context(task)?;
+        let actor_json = daemon_review_actor_json(&parent)?;
+        let supervisor = self.supervisor(&session)?;
+        let mut supervisor = supervisor.lock().await;
+        if !matches!(
+            supervisor.task(task).map(|task| task.state()),
+            Some(TaskState::AwaitingParentReview(expected)) if expected == &delivery.id
+        ) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "delivery does not match the active review".into(),
+            ));
+        }
+        supervisor
+            .can_accept_user_override(&parent)
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        let (_, parent_notification) = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .accept_delivery_review(task, &delivery.id, &parent, &integration, &actor_json)?;
+        supervisor
+            .accept_review(task, &parent, delivery.id.clone(), integration)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        supervisor
+            .send_user_override_with_id(
+                parent_notification,
+                parent.clone(),
+                review_parent_notification("accepted", task, &delivery.id),
+            )
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        drop(supervisor);
+        self.release_resident_lease(task);
+        Ok(())
+    }
+
+    /// Records direct-parent rework feedback, creates the reducer-owned
+    /// successor attempt, and starts it with the durable feedback message.
+    pub async fn rework_review(
+        &self,
+        task: &TaskId,
+        feedback: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if feedback.trim().is_empty() {
+            return Err(RepositoryError::ReviewFeedbackRequired.into());
+        }
+        let (session, parent, delivery) = self.review_context(task)?;
+        let actor_json = daemon_review_actor_json(&parent)?;
+        let supervisor = self.supervisor(&session)?;
+        let mut supervisor = supervisor.lock().await;
+        if !matches!(
+            supervisor.task(task).map(|task| task.state()),
+            Some(TaskState::AwaitingParentReview(expected)) if expected == &delivery.id
+        ) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "delivery does not match the active review".into(),
+            ));
+        }
+        supervisor
+            .can_accept_user_override(&parent)
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        let feedback_message = MessageId::new();
+        let (successor, (_, parent_notification)) = supervisor
+            .rework_review_with_persistence(
+                task,
+                &parent,
+                delivery.id.clone(),
+                feedback_message.clone(),
+                |successor| {
+                    self.repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned")
+                        .rework_delivery_review(
+                            task,
+                            &delivery.id,
+                            &parent,
+                            feedback,
+                            &feedback_message,
+                            &successor.id,
+                            successor.number,
+                            &actor_json,
+                        )
+                },
+            )
+            .map_err(|error| match error {
+                ReviewPersistenceError::Supervisor(error) => {
+                    RuntimeCoordinatorError::Supervisor(error)
+                }
+                ReviewPersistenceError::Persistence(error) => error.into(),
+            })?;
+        supervisor
+            .send_message(
+                &parent,
+                MailboxMessageDraft::new_with_id(
+                    feedback_message,
+                    parent.clone(),
+                    task.clone(),
+                    MessageKind::Rework(ReworkInstruction(feedback.to_owned())),
+                    Some(successor.id),
+                ),
+            )
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        supervisor
+            .send_user_override_with_id(
+                parent_notification,
+                parent.clone(),
+                review_parent_notification("rework", task, &delivery.id),
+            )
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        drop(supervisor);
+        if self.factory.is_available() {
+            self.start_worker(&session, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Records a direct-parent rejection with a non-empty durable reason.
+    pub async fn reject_review(
+        &self,
+        task: &TaskId,
+        reason: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if reason.trim().is_empty() {
+            return Err(RepositoryError::ReviewReasonRequired.into());
+        }
+        let (session, parent, delivery) = self.review_context(task)?;
+        let actor_json = daemon_review_actor_json(&parent)?;
+        let supervisor = self.supervisor(&session)?;
+        let mut supervisor = supervisor.lock().await;
+        if !matches!(
+            supervisor.task(task).map(|task| task.state()),
+            Some(TaskState::AwaitingParentReview(expected)) if expected == &delivery.id
+        ) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "delivery does not match the active review".into(),
+            ));
+        }
+        supervisor
+            .can_accept_user_override(&parent)
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        let reason_message = MessageId::new();
+        let (_, parent_notification) = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .reject_delivery_review(
+                task,
+                &delivery.id,
+                &parent,
+                reason,
+                &reason_message,
+                &actor_json,
+            )?;
+        supervisor
+            .reject_review(task, &parent, delivery.id.clone(), reason_message)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        supervisor
+            .send_user_override_with_id(
+                parent_notification,
+                parent.clone(),
+                review_parent_notification("rejected", task, &delivery.id),
+            )
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        drop(supervisor);
+        self.release_resident_lease(task);
+        Ok(())
+    }
+
+    fn review_context(
+        &self,
+        task: &TaskId,
+    ) -> Result<(RootSessionId, TaskId, DeliveryReport), RuntimeCoordinatorError> {
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        let detail = repository.task_detail(task)?;
+        let session = detail.session_id.parse().map_err(|_| {
+            RuntimeCoordinatorError::Supervisor("persisted task has an invalid session ID".into())
+        })?;
+        let parent = detail
+            .parent_task_id
+            .ok_or_else(|| {
+                RuntimeCoordinatorError::Supervisor(
+                    "root tasks cannot receive delivery reviews".into(),
+                )
+            })?
+            .parse()
+            .map_err(|_| {
+                RuntimeCoordinatorError::Supervisor(
+                    "persisted task has an invalid parent ID".into(),
+                )
+            })?;
+        let delivery = serde_json::from_str::<DeliveryReport>(&detail.delivery_json)
+            .map_err(RepositoryError::from)?;
+        Ok((session, parent, delivery))
+    }
+
     /// Routes external task messages through the owning supervisor before
     /// recording an auditable mailbox row and runtime event.
     pub async fn send_message(
@@ -1488,6 +1701,25 @@ struct ProviderTurnAdmissions {
     queued: Mutex<HashMap<TaskId, QueuedProviderTurn>>,
     assigned: Mutex<HashMap<TaskId, LeaseId>>,
     notify: Arc<Notify>,
+}
+
+fn daemon_review_actor_json(parent: &TaskId) -> Result<String, RuntimeCoordinatorError> {
+    serde_json::to_string(&serde_json::json!({
+        "kind": "task",
+        "task_id": parent,
+        "source": "daemon",
+        "initiated_by": { "kind": "local_user", "source": "daemon" },
+    }))
+    .map_err(RepositoryError::from)
+    .map_err(RuntimeCoordinatorError::from)
+}
+
+fn review_parent_notification(
+    decision: &str,
+    subject: &TaskId,
+    delivery: &yi_agent_core::subagent::task::DeliveryId,
+) -> String {
+    format!("Local user review {decision} delivery {delivery} for direct child {subject}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

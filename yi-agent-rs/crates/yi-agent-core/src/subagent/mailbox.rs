@@ -98,6 +98,23 @@ impl MailboxMessageDraft {
         }
     }
 
+    /// Reuses a durable mailbox identity allocated by the runtime repository.
+    pub fn new_with_id(
+        id: MessageId,
+        sender: TaskId,
+        recipient: TaskId,
+        kind: MessageKind,
+        correlation_id: Option<AttemptId>,
+    ) -> Self {
+        Self {
+            id: Some(id),
+            sender: Some(sender),
+            recipient,
+            kind,
+            correlation_id,
+        }
+    }
+
     /// User interventions are external inputs, not forged task messages.
     pub fn user_override(recipient: TaskId, message: impl Into<String>) -> Self {
         Self {
@@ -214,6 +231,27 @@ impl Mailbox {
             .filter_map(|message| match (&message.sender, &message.kind) {
                 (None, MessageKind::UserInstruction(UserInstruction(body)))
                     if !message.consumed_by_worker =>
+                {
+                    Some((message.id.clone(), body.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Controller inputs include external overrides and direct-parent rework
+    /// instructions, both of which must reach a newly started worker prompt.
+    pub fn pending_worker_inputs(&self) -> Vec<(MessageId, String)> {
+        self.messages
+            .iter()
+            .filter_map(|message| match (&message.sender, &message.kind) {
+                (None, MessageKind::UserInstruction(UserInstruction(body)))
+                    if !message.consumed_by_worker =>
+                {
+                    Some((message.id.clone(), body.clone()))
+                }
+                (Some(_), MessageKind::Rework(ReworkInstruction(body)))
+                    if !message.delivered_to_worker =>
                 {
                     Some((message.id.clone(), body.clone()))
                 }

@@ -11,9 +11,10 @@ use uuid::Uuid;
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::scheduler::AdmissionPriority;
 use super::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, PauseReason, PermissionDecision,
-    PermissionRequestId, RecoveryEvidence, RootSessionId, TaskEvent, TaskFailure, TaskId,
-    TaskState, TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, IntegrationValidation,
+    MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
+    RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind,
+    WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::worker::{
     AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
@@ -74,6 +75,12 @@ pub struct AgentSupervisor {
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
+}
+
+#[derive(Debug)]
+pub enum ReviewPersistenceError<E> {
+    Supervisor(String),
+    Persistence(E),
 }
 
 impl AgentSupervisor {
@@ -350,7 +357,7 @@ impl AgentSupervisor {
             .mailboxes
             .get(task_id)
             .expect("task mailbox is created with task")
-            .pending_user_overrides();
+            .pending_worker_inputs();
         let start = WorkerStart::new(
             task.id.clone(),
             task.active_attempt_id().clone(),
@@ -743,6 +750,7 @@ impl AgentSupervisor {
         let recipient = draft.recipient().clone();
         let worker_message = match draft.kind() {
             MessageKind::UserInstruction(UserInstruction(body)) => Some(body.clone()),
+            MessageKind::Rework(instruction) => Some(instruction.0.clone()),
             _ => None,
         };
         let sender_task = self
@@ -1041,6 +1049,147 @@ impl AgentSupervisor {
         Ok(attempt_id)
     }
 
+    /// Applies an accepted delivery through the task reducer. The reducer
+    /// verifies both direct-parent ownership and integration evidence.
+    pub fn accept_review(
+        &mut self,
+        task_id: &TaskId,
+        actor: &TaskId,
+        delivery_id: DeliveryId,
+        integration: IntegrationValidation,
+    ) -> Result<AttemptId, String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::ReviewAccepted {
+                attempt_id: attempt_id.clone(),
+                actor: actor.clone(),
+                delivery_id,
+                integration,
+            },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(attempt_id)
+    }
+
+    /// Requests rework of the exact reviewed delivery and returns the newly
+    /// created attempt for durable persistence by the runtime coordinator.
+    pub fn rework_review(
+        &mut self,
+        task_id: &TaskId,
+        actor: &TaskId,
+        delivery_id: DeliveryId,
+        feedback: MessageId,
+    ) -> Result<TaskAttempt, String> {
+        let successor = self.reduce_rework_review(task_id, actor, delivery_id, feedback)?;
+        self.notify_update();
+        Ok(successor)
+    }
+
+    /// Rolls back reducer state if the matching durable transaction fails.
+    /// The supervisor lock prevents observers from seeing the staged state.
+    pub fn rework_review_with_persistence<T, E>(
+        &mut self,
+        task_id: &TaskId,
+        actor: &TaskId,
+        delivery_id: DeliveryId,
+        feedback: MessageId,
+        persist: impl FnOnce(&TaskAttempt) -> Result<T, E>,
+    ) -> Result<(TaskAttempt, T), ReviewPersistenceError<E>> {
+        let original = self
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| ReviewPersistenceError::Supervisor("task does not exist".into()))?;
+        let successor = self
+            .reduce_rework_review(task_id, actor, delivery_id, feedback)
+            .map_err(ReviewPersistenceError::Supervisor)?;
+        let persisted = match persist(&successor) {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                self.tasks.insert(task_id.clone(), original);
+                return Err(ReviewPersistenceError::Persistence(error));
+            }
+        };
+        self.notify_update();
+        Ok((successor, persisted))
+    }
+
+    fn reduce_rework_review(
+        &mut self,
+        task_id: &TaskId,
+        actor: &TaskId,
+        delivery_id: DeliveryId,
+        feedback: MessageId,
+    ) -> Result<TaskAttempt, String> {
+        if self
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.parent_id.as_ref())
+            != Some(actor)
+        {
+            return Err("review actor does not match direct parent".into());
+        }
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        let transition = task
+            .reduce(
+                TaskEvent::ReviewRework {
+                    attempt_id,
+                    delivery_id,
+                    feedback,
+                },
+                chrono::Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        let successor = transition
+            .new_attempt
+            .ok_or_else(|| "rework did not create a successor attempt".to_string())?;
+        Ok(successor)
+    }
+
+    /// Rejects the exact reviewed delivery through reducer-owned state.
+    pub fn reject_review(
+        &mut self,
+        task_id: &TaskId,
+        actor: &TaskId,
+        delivery_id: DeliveryId,
+        reason: MessageId,
+    ) -> Result<AttemptId, String> {
+        if self
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.parent_id.as_ref())
+            != Some(actor)
+        {
+            return Err("review actor does not match direct parent".into());
+        }
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        let attempt_id = task.active_attempt_id().clone();
+        task.reduce(
+            TaskEvent::ReviewRejected {
+                attempt_id: attempt_id.clone(),
+                delivery_id,
+                reason,
+            },
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.notify_update();
+        Ok(attempt_id)
+    }
+
     pub fn record_recovery_conflict(
         &mut self,
         task_id: &TaskId,
@@ -1277,7 +1426,8 @@ mod provider_turn_priority_tests {
     use super::*;
     use crate::subagent::mailbox::ReworkInstruction;
     use crate::subagent::task::{
-        DeliveryReport, PermissionDecision, PermissionRequestId, WorkspaceLeaseId,
+        DeliveryReport, IntegrationValidation, MessageId, PermissionDecision, PermissionRequestId,
+        WorkspaceLeaseId,
     };
 
     #[test]
@@ -1348,6 +1498,102 @@ mod provider_turn_priority_tests {
             supervisor.task(&child).unwrap().state(),
             &TaskState::AwaitingParentReview(delivery.id)
         );
+    }
+
+    #[test]
+    fn direct_parent_accepts_a_validated_child_delivery() {
+        let (mut supervisor, parent, child, delivery) = delivered_child();
+
+        supervisor
+            .accept_review(
+                &child,
+                &parent,
+                delivery.id.clone(),
+                IntegrationValidation::passed("parent integration passed"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            supervisor.task(&child).unwrap().state(),
+            &TaskState::Completed
+        );
+    }
+
+    #[test]
+    fn direct_parent_rework_creates_a_successor_attempt() {
+        let (mut supervisor, parent, child, delivery) = delivered_child();
+        let previous_attempt = supervisor.task(&child).unwrap().active_attempt_id().clone();
+
+        let successor = supervisor
+            .rework_review(&child, &parent, delivery.id, MessageId::new())
+            .unwrap();
+
+        assert_ne!(successor.id, previous_attempt);
+        assert_eq!(successor.number, 2);
+        assert_eq!(supervisor.task(&child).unwrap().state(), &TaskState::Queued);
+        assert_eq!(
+            supervisor.task(&child).unwrap().active_attempt_id(),
+            &successor.id
+        );
+    }
+
+    #[test]
+    fn direct_parent_reject_blocks_the_reviewed_child() {
+        let (mut supervisor, parent, child, delivery) = delivered_child();
+
+        supervisor
+            .reject_review(&child, &parent, delivery.id, MessageId::new())
+            .unwrap();
+
+        assert!(matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn rework_rejects_an_actor_other_than_the_direct_parent() {
+        let (mut supervisor, _parent, child, delivery) = delivered_child();
+
+        let error = supervisor
+            .rework_review(&child, &TaskId::new(), delivery.id, MessageId::new())
+            .unwrap_err();
+
+        assert_eq!(error, "review actor does not match direct parent");
+        assert!(matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::AwaitingParentReview(_)
+        ));
+    }
+
+    #[test]
+    fn rejection_rejects_an_actor_other_than_the_direct_parent() {
+        let (mut supervisor, _parent, child, delivery) = delivered_child();
+
+        let error = supervisor
+            .reject_review(&child, &TaskId::new(), delivery.id, MessageId::new())
+            .unwrap_err();
+
+        assert_eq!(error, "review actor does not match direct parent");
+        assert!(matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::AwaitingParentReview(_)
+        ));
+    }
+
+    fn delivered_child() -> (AgentSupervisor, TaskId, TaskId, DeliveryReport) {
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let parent = supervisor.root_task_id().clone();
+        let child = supervisor.spawn(parent.clone()).unwrap();
+        let workspace = WorkspaceLeaseId::new();
+        supervisor.tasks.get_mut(&child).unwrap().workspace = Some(workspace.clone());
+        supervisor.start_task(&child).unwrap();
+        let handle = WorkerHandle::new(tokio_util::sync::CancellationToken::new());
+        supervisor.workers.insert(child.clone(), handle.clone());
+        let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "checks passed");
+        handle.report_delivery(delivery.clone());
+        supervisor.reconcile_worker_events().unwrap();
+        (supervisor, parent, child, delivery)
     }
 }
 

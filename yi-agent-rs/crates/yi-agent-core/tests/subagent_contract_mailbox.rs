@@ -4,9 +4,9 @@ use yi_agent_core::subagent::contract::{
     AuthorityDerivationError, DelegatedAuthority, EffectiveBudget, PathScope,
 };
 use yi_agent_core::subagent::mailbox::{
-    Mailbox, MailboxMessageDraft, MessageKind, MessagePriority,
+    Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, ReworkInstruction,
 };
-use yi_agent_core::subagent::task::{AttemptId, RootSessionId, TaskId};
+use yi_agent_core::subagent::task::{AttemptId, MessageId, RootSessionId, TaskId};
 
 fn authority(tools: &[&str], paths: &[&str]) -> DelegatedAuthority {
     authority_for_root(RootSessionId::new(), tools, paths)
@@ -110,4 +110,24 @@ fn completion_message_wakes_the_parent_and_is_not_coalesced() {
     assert!(!receipt.coalesced);
     assert_eq!(mailbox.messages().len(), 1);
     assert_eq!(mailbox.messages()[0].priority, MessagePriority::High);
+}
+
+#[test]
+fn delivered_rework_instruction_is_not_replayed_to_a_later_worker() {
+    let parent = TaskId::new();
+    let child = TaskId::new();
+    let message_id = MessageId::new();
+    let mut mailbox = Mailbox::default();
+    mailbox.push(MailboxMessageDraft::new_with_id(
+        message_id.clone(),
+        parent,
+        child,
+        MessageKind::Rework(ReworkInstruction("fix the parser".into())),
+        Some(AttemptId::new()),
+    ));
+
+    assert_eq!(mailbox.pending_worker_inputs().len(), 1);
+    mailbox.mark_delivered_to_worker(&message_id);
+
+    assert!(mailbox.pending_worker_inputs().is_empty());
 }

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use yi_agent_core::subagent::task::{
-    PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
+    IntegrationValidation, PermissionDecision, PermissionRequestId, RootSessionId, TaskId,
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 
@@ -180,6 +180,10 @@ pub enum IpcRequest {
         request_id: String,
         decision: IpcPermissionDecision,
     },
+    Review {
+        task_id: String,
+        decision: IpcReviewDecision,
+    },
     SendMessage {
         session_id: String,
         sender_task_id: String,
@@ -267,6 +271,9 @@ pub enum IpcResponse {
     TaskPaused,
     TaskResumed,
     PermissionResolved,
+    ReviewAccepted,
+    ReviewReworkRequested,
+    ReviewRejected,
     MessageQueued,
     WaitCompleted {
         status: String,
@@ -324,6 +331,16 @@ impl From<IpcPermissionDecision> for PermissionDecision {
             IpcPermissionDecision::Deny => Self::Deny,
         }
     }
+}
+
+/// Actor-free review decisions. The daemon resolves task lineage, current
+/// delivery, and the direct-parent actor from its canonical runtime state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IpcReviewDecision {
+    Accept { integration_evidence: String },
+    Rework { feedback: String },
+    Reject { reason: String },
 }
 
 /// Stable public error categories for IPC consumers. Error responses never
@@ -1732,9 +1749,16 @@ fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcError
             IpcErrorCode::InvalidState
         }
         crate::repository::RepositoryError::DeliveryRequiresParent { .. }
-        | crate::repository::RepositoryError::TaskNotReadyForDelivery { .. } => {
+        | crate::repository::RepositoryError::TaskNotReadyForDelivery { .. }
+        | crate::repository::RepositoryError::DeliveryNotAwaitingReview { .. } => {
             IpcErrorCode::InvalidState
         }
+        crate::repository::RepositoryError::ReviewActorMismatch { .. } => {
+            IpcErrorCode::AuthorityDenied
+        }
+        crate::repository::RepositoryError::IntegrationNotValidated
+        | crate::repository::RepositoryError::ReviewFeedbackRequired
+        | crate::repository::RepositoryError::ReviewReasonRequired => IpcErrorCode::Validation,
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
@@ -1790,6 +1814,9 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::MailboxMessageConsumed => "mailbox_message_consumed",
         crate::repository::RuntimeEvent::PermissionRequested => "permission_requested",
         crate::repository::RuntimeEvent::PermissionResolved => "permission_resolved",
+        crate::repository::RuntimeEvent::ReviewAccepted => "review_accepted",
+        crate::repository::RuntimeEvent::ReviewRework => "review_rework",
+        crate::repository::RuntimeEvent::ReviewRejected => "review_rejected",
     }
 }
 
@@ -1935,6 +1962,31 @@ fn respond(
                 .build()?;
             runtime.block_on(coordinator.resolve_permission(&request_id, decision.into()))?;
             Ok(IpcResponse::PermissionResolved)
+        }
+        IpcRequest::Review { task_id, decision } => {
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            match decision {
+                IpcReviewDecision::Accept {
+                    integration_evidence,
+                } => {
+                    runtime.block_on(coordinator.accept_review(
+                        &task_id,
+                        IntegrationValidation::passed(integration_evidence),
+                    ))?;
+                    Ok(IpcResponse::ReviewAccepted)
+                }
+                IpcReviewDecision::Rework { feedback } => {
+                    runtime.block_on(coordinator.rework_review(&task_id, &feedback))?;
+                    Ok(IpcResponse::ReviewReworkRequested)
+                }
+                IpcReviewDecision::Reject { reason } => {
+                    runtime.block_on(coordinator.reject_review(&task_id, &reason))?;
+                    Ok(IpcResponse::ReviewRejected)
+                }
+            }
         }
         IpcRequest::SendMessage {
             session_id,

@@ -14,8 +14,8 @@ use yi_agent_core::subagent::worker::{
 };
 use yi_agent_core::{AttemptId, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
-    Daemon, IpcRequest, IpcResponse, SubscriptionFilters, send_request, send_request_with_version,
-    subscribe, subscribe_with_filters,
+    Daemon, IpcRequest, IpcResponse, IpcReviewDecision, SubscriptionFilters, send_request,
+    send_request_with_version, subscribe, subscribe_with_filters,
 };
 use yi_agent_store::repository::{
     RepositoryError, RuntimeCursorState, RuntimeEvent, RuntimeRepository,
@@ -86,6 +86,25 @@ impl AgentWorkerFactory for StartCountingFactory {
 #[derive(Clone)]
 struct ReportingWorkerFactory {
     handle: Arc<Mutex<Option<WorkerHandle>>>,
+}
+
+#[derive(Clone, Default)]
+struct ReviewReportingFactory {
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
+    handles: Arc<Mutex<Vec<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for ReviewReportingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation.clone());
+        self.starts.lock().unwrap().push(request);
+        self.handles.lock().unwrap().push(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
 }
 
 impl AgentWorkerFactory for ReportingWorkerFactory {
@@ -1904,6 +1923,283 @@ fn resolve_permission_ipc_uses_only_the_daemon_owned_request_identity() {
             code: yi_agent_store::ipc::IpcErrorCode::NotFound
         }
     ));
+}
+
+#[test]
+fn review_ipc_accepts_without_caller_supplied_actor_or_delivery_identity() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ReviewReportingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id,
+            objective: "Implement the parser".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child");
+    };
+    let child: TaskId = child_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "running"
+    );
+    let workspace = factory.starts.lock().unwrap()[0]
+        .workspace_lease_id
+        .clone()
+        .unwrap();
+    factory.handles.lock().unwrap()[0].report_delivery(
+        yi_agent_core::subagent::task::DeliveryReport::coding(
+            "deadbeef",
+            "main",
+            workspace,
+            "cargo test -p child",
+        ),
+    );
+    for _ in 0..100 {
+        if RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap()
+            == "awaiting_parent_review"
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::Review {
+            task_id: child_task_id.clone(),
+            decision: IpcReviewDecision::Accept {
+                integration_evidence: "cargo test -p parent".into(),
+            },
+        },
+    )
+    .unwrap();
+
+    let review_detail = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_detail(&child_task_id.parse().unwrap())
+        .unwrap();
+    assert!(
+        matches!(response, IpcResponse::ReviewAccepted),
+        "unexpected review response: {response:?}; state={}; delivery={}",
+        review_detail.state,
+        review_detail.delivery_json
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "completed"
+    );
+    let encoded = serde_json::to_value(IpcRequest::Review {
+        task_id: child_task_id,
+        decision: IpcReviewDecision::Reject {
+            reason: "not acceptable".into(),
+        },
+    })
+    .unwrap();
+    assert_eq!(encoded["decision"]["type"], "reject");
+    assert!(encoded.get("actor").is_none());
+    assert!(encoded.get("session_id").is_none());
+    assert!(encoded.get("delivery_id").is_none());
+}
+
+#[test]
+fn review_ipc_routes_rework_feedback_into_the_successor_worker() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ReviewReportingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::Review {
+            task_id: child_task_id.clone(),
+            decision: IpcReviewDecision::Rework {
+                feedback: "rerun the parser regression suite".into(),
+            },
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(response, IpcResponse::ReviewReworkRequested));
+    let starts = factory.starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
+    assert!(
+        starts[1]
+            .initial_user_messages
+            .iter()
+            .any(|message| message.body.contains("parser regression"))
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child_task_id.parse().unwrap())
+            .unwrap(),
+        "running"
+    );
+}
+
+#[test]
+fn review_ipc_rejects_with_a_required_durable_reason() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ReviewReportingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::Review {
+            task_id: child_task_id.clone(),
+            decision: IpcReviewDecision::Reject {
+                reason: "missing regression evidence".into(),
+            },
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(response, IpcResponse::ReviewRejected));
+    let child: TaskId = child_task_id.parse().unwrap();
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&child).unwrap(), "blocked");
+    assert!(
+        repository.mailbox_messages_for_task(&child).unwrap()[0]
+            .payload_json
+            .contains("regression evidence")
+    );
+}
+
+#[test]
+fn review_ipc_rejects_empty_rework_and_rejection_text() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ReviewReportingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
+
+    for decision in [
+        IpcReviewDecision::Accept {
+            integration_evidence: "  ".into(),
+        },
+        IpcReviewDecision::Rework {
+            feedback: " ".into(),
+        },
+        IpcReviewDecision::Reject {
+            reason: "\n".into(),
+        },
+    ] {
+        assert!(matches!(
+            send_request(
+                daemon.socket_path(),
+                IpcRequest::Review {
+                    task_id: child_task_id.clone(),
+                    decision,
+                },
+            )
+            .unwrap(),
+            IpcResponse::Error {
+                code: yi_agent_store::ipc::IpcErrorCode::Validation
+            }
+        ));
+    }
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child_task_id.parse().unwrap())
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+}
+
+fn delivered_child_over_ipc(
+    daemon: &Daemon,
+    database: &std::path::Path,
+    factory: &ReviewReportingFactory,
+) -> String {
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id,
+            parent_task_id: root_task_id,
+            objective: "Implement the parser".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child");
+    };
+    let workspace = factory.starts.lock().unwrap()[0]
+        .workspace_lease_id
+        .clone()
+        .unwrap();
+    factory.handles.lock().unwrap()[0].report_delivery(
+        yi_agent_core::subagent::task::DeliveryReport::coding(
+            "deadbeef",
+            "main",
+            workspace,
+            "cargo test -p child",
+        ),
+    );
+    let child: TaskId = child_task_id.parse().unwrap();
+    for _ in 0..100 {
+        if RuntimeRepository::open(database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap()
+            == "awaiting_parent_review"
+        {
+            return child_task_id;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("delivery did not reach durable parent review");
 }
 
 #[test]
