@@ -30,6 +30,18 @@ impl WebFetchTool {
             .expect("failed to build reqwest client");
         Self { client }
     }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::default())
+            .user_agent("yi-agent/0.1.1")
+            .no_proxy()
+            .build()
+            .expect("failed to build reqwest client");
+        Self { client }
+    }
 }
 
 #[derive(Deserialize)]
@@ -255,7 +267,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": format!("{}/page", server.uri())
@@ -283,7 +295,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": format!("{}/text", server.uri())
@@ -310,7 +322,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": format!("{}/api", server.uri())
@@ -337,7 +349,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": format!("{}/img", server.uri())
@@ -360,7 +372,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": format!("{}/big", server.uri())
@@ -376,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_invalid_scheme() {
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": "ftp://example.com/file"
@@ -407,7 +419,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": format!("{}{}", server.uri(), redirect_path)
@@ -504,7 +516,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new_for_test();
         let result = tool
             .call(serde_json::json!({
                 "url": format!("{}/with_comments", server.uri())
