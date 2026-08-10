@@ -6,6 +6,7 @@
 mod context;
 mod error;
 mod fs;
+mod process;
 mod sandbox;
 mod shell;
 mod skill_tool;
@@ -19,11 +20,24 @@ use yi_agent_core::ToolRegistry;
 pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+pub use process::{
+    ManagedProcessSnapshot, OnExitPolicy, ProcessEvent, ProcessKillTool, ProcessListTool,
+    ProcessManager, ProcessReadResult, ProcessReadTool, ProcessSelector, ProcessStartOptions,
+    ProcessStartResult, ProcessStartTool, ProcessStatus,
+};
 pub use sandbox::{SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
 pub use skill_tool::SkillTool;
 pub use web::{BochaSearchProvider, SearchResult, WebFetchTool, WebSearchProvider, WebSearchTool};
+
+/// Register managed background process tools with a shared process manager.
+pub fn register_process_tools(registry: &mut ToolRegistry, manager: Arc<ProcessManager>) {
+    registry.register(Arc::new(ProcessStartTool::new(manager.clone())));
+    registry.register(Arc::new(ProcessListTool::new(manager.clone())));
+    registry.register(Arc::new(ProcessReadTool::new(manager.clone())));
+    registry.register(Arc::new(ProcessKillTool::new(manager)));
+}
 
 /// Register all builtin tools into the given registry.
 ///

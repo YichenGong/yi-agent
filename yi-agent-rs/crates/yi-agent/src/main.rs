@@ -93,6 +93,15 @@ fn run_agent(cli: Cli) -> Result<()> {
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
+    let process_manager = yi_agent_tools::ProcessManager::with_sandbox(
+        config.workdir.clone(),
+        yi_agent_tools::SandboxPolicy::new(
+            config.sandbox,
+            &config.workdir,
+            config.sandbox_writable_roots.clone(),
+        ),
+    );
+    yi_agent_tools::register_process_tools(&mut registry, process_manager.clone());
 
     // --- Skills system setup ---
     let skills_service = setup_skills(&config)?;
@@ -129,6 +138,7 @@ fn run_agent(cli: Cli) -> Result<()> {
         checker,
         decision_tx,
         decision_rx,
+        process_manager,
     )
 }
 
@@ -244,6 +254,7 @@ async fn drain_stream_json<W: std::io::Write>(
 struct HeadlessSetup {
     tools: Arc<yi_agent_core::ToolRegistry>,
     system_prompt: Option<String>,
+    process_manager: Option<Arc<yi_agent_tools::ProcessManager>>,
 }
 
 /// 根据 `naked` flag 构建 headless 模式用的工具集和 system prompt。
@@ -259,6 +270,7 @@ fn build_headless_setup(config: &config::Config, naked: bool) -> Result<Headless
         return Ok(HeadlessSetup {
             tools: Arc::new(registry),
             system_prompt: None,
+            process_manager: None,
         });
     }
 
@@ -268,6 +280,15 @@ fn build_headless_setup(config: &config::Config, naked: bool) -> Result<Headless
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
+    let process_manager = yi_agent_tools::ProcessManager::with_sandbox(
+        config.workdir.clone(),
+        yi_agent_tools::SandboxPolicy::new(
+            config.sandbox,
+            &config.workdir,
+            config.sandbox_writable_roots.clone(),
+        ),
+    );
+    yi_agent_tools::register_process_tools(&mut registry, process_manager.clone());
     let skills_service = setup_skills(config)?;
     let system_prompt = resolve_system_prompt_with_skills(
         config.system_prompt.clone(),
@@ -283,6 +304,7 @@ fn build_headless_setup(config: &config::Config, naked: bool) -> Result<Headless
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
         system_prompt,
+        process_manager: Some(process_manager),
     })
 }
 
@@ -355,6 +377,7 @@ fn run_headless(
 
     let setup = build_headless_setup(&config, naked)?;
     let tools = setup.tools;
+    let process_manager = setup.process_manager;
 
     let agent_config = yi_agent_core::AgentConfig {
         model: config.model.clone(),
@@ -381,17 +404,29 @@ fn run_headless(
         let stderr = std::io::stderr();
         let mut out = stdout.lock();
         let mut err = stderr.lock();
-        if json {
+        let exit_code = if json {
             drain_stream_json(stream, &mut out).await
         } else {
             drain_stream_human(stream, &mut out, &mut err).await
+        };
+        if let Some(process_manager) = process_manager {
+            match process_manager.shutdown().await {
+                Ok(retained) => {
+                    for process in retained {
+                        eprintln!("{}", retained_process_message(&process));
+                    }
+                }
+                Err(error) => eprintln!("process shutdown error: {error}"),
+            }
         }
+        exit_code
     });
 
     std::process::exit(exit_code);
 }
 
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
+#[allow(clippy::too_many_arguments)]
 fn run_tui_agent(
     provider: Arc<dyn Provider>,
     tools: Arc<yi_agent_core::ToolRegistry>,
@@ -400,6 +435,7 @@ fn run_tui_agent(
     checker: Arc<yi_agent_core::permission::PermissionChecker>,
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     decision_rx: tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -413,6 +449,7 @@ fn run_tui_agent(
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(8);
         let is_running = Arc::new(AtomicBool::new(false));
+        let tui_process_manager = process_manager.clone();
 
         // Spawn agent driver task (stays on the async runtime)
         let provider_clone = Arc::clone(&provider);
@@ -563,6 +600,7 @@ fn run_tui_agent(
                 decision_tx,
                 is_running,
                 agent_config.model.clone(),
+                tui_process_manager,
             )
         });
 
@@ -575,6 +613,14 @@ fn run_tui_agent(
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
+        match process_manager.shutdown().await {
+            Ok(retained) => {
+                for process in retained {
+                    eprintln!("{}", retained_process_message(&process));
+                }
+            }
+            Err(error) => eprintln!("process shutdown error: {error}"),
+        }
 
         result
     });
@@ -593,6 +639,15 @@ pub(crate) enum ControlCommand {
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
+}
+
+fn retained_process_message(process: &yi_agent_tools::ManagedProcessSnapshot) -> String {
+    format!(
+        "retained process: id={} name={} pid={:?}",
+        process.process_id,
+        process.name.as_deref().unwrap_or("-"),
+        process.pid
+    )
 }
 
 fn manual_compaction_outcome_event(
@@ -948,6 +1003,64 @@ mod tests {
             names.iter().any(|n| n == "bash"),
             "default mode should register 'bash' tool, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn default_mode_registers_process_tools_with_expected_permissions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        yi_agent_tools::register_builtin_tools_with_sandbox(
+            &mut registry,
+            tmp.path().to_path_buf(),
+            yi_agent_tools::SandboxMode::DangerFullAccess,
+            Vec::new(),
+        );
+        let manager = yi_agent_tools::ProcessManager::new(tmp.path().to_path_buf());
+        yi_agent_tools::register_process_tools(&mut registry, manager);
+
+        let start = registry
+            .get("process_start")
+            .expect("process_start registered");
+        let list = registry
+            .get("process_list")
+            .expect("process_list registered");
+        let read = registry
+            .get("process_read")
+            .expect("process_read registered");
+        let kill = registry
+            .get("process_kill")
+            .expect("process_kill registered");
+
+        assert!(start.metadata().requires_confirmation);
+        assert!(!start.metadata().read_only);
+        assert!(!list.metadata().requires_confirmation);
+        assert!(list.metadata().read_only);
+        assert!(!read.metadata().requires_confirmation);
+        assert!(read.metadata().read_only);
+        assert!(kill.metadata().requires_confirmation);
+        assert!(!kill.metadata().read_only);
+    }
+
+    #[test]
+    fn retained_process_message_includes_id_name_and_pid() {
+        let snapshot = yi_agent_tools::ManagedProcessSnapshot {
+            process_id: "proc_1".into(),
+            name: Some("dev".into()),
+            pid: Some(1234),
+            command: "sleep 30".into(),
+            cwd: "/tmp".into(),
+            status: yi_agent_tools::ProcessStatus::Running,
+            ready: true,
+            on_exit: yi_agent_tools::OnExitPolicy::Keep,
+            exit_code: None,
+            elapsed_sec: 1.0,
+        };
+
+        let line = retained_process_message(&snapshot);
+
+        assert!(line.contains("proc_1"));
+        assert!(line.contains("dev"));
+        assert!(line.contains("1234"));
     }
 
     #[test]
