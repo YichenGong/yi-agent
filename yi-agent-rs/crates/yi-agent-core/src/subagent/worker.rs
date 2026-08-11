@@ -409,6 +409,15 @@ pub trait AgentWorkspaceService: Send + Sync {
         attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError>;
 
+    fn inspect_delivery(
+        &self,
+        _workspace: &WorkerWorkspace,
+    ) -> Result<DeliveryReport, WorkerError> {
+        Err(WorkerError::Startup(
+            "coding workspace service does not support delivery inspection".into(),
+        ))
+    }
+
     fn cleanup_prepared(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
         Ok(())
     }

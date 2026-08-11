@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{path::Path, process::Command};
 
 use chrono::{DateTime, Duration as ChronoDuration, Local, Timelike, Utc};
 use futures::future::BoxFuture;
@@ -86,6 +87,7 @@ struct MessageRecordingFactory {
     starts: Arc<Mutex<Vec<WorkerStart>>>,
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
     recovery_preflights: Arc<Mutex<Vec<WorkerRecoveryPreflight>>>,
+    workspace_service: Option<Arc<dyn AgentWorkspaceService>>,
 }
 
 impl AgentWorkerFactory for MessageRecordingFactory {
@@ -106,6 +108,10 @@ impl AgentWorkerFactory for MessageRecordingFactory {
         self.starts.lock().unwrap().push(request);
         self.handles.lock().unwrap().push(handle.clone());
         Box::pin(async move { Ok(handle) })
+    }
+
+    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+        self.workspace_service.clone()
     }
 }
 
@@ -153,6 +159,138 @@ impl AgentWorkspaceService for StaticWorkspaceService {
         _attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(self.workspace.clone())
+    }
+}
+
+struct GitWorkspaceService {
+    repository_root: std::path::PathBuf,
+}
+
+impl GitWorkspaceService {
+    fn new(repository_root: std::path::PathBuf) -> Self {
+        Self { repository_root }
+    }
+}
+
+impl AgentWorkspaceService for GitWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let root_path = self
+            .repository_root
+            .join(".worktrees")
+            .join(format!("root-{task_id}"));
+        let base_commit = git_output(&self.repository_root, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        git_ok(
+            &self.repository_root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                root_path.to_str().unwrap(),
+                &base_commit,
+            ],
+        )?;
+        git_ok(
+            &root_path,
+            &[
+                "checkout",
+                "-b",
+                &format!("feat/root-{task_id}"),
+                &base_commit,
+            ],
+        )?;
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path: root_path,
+            branch: format!("feat/root-{task_id}"),
+            parent_branch: "main".into(),
+            base_commit,
+        })
+    }
+
+    fn prepare_child(
+        &self,
+        parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let child_path = self
+            .repository_root
+            .join(".worktrees")
+            .join(format!("child-{task_id}"));
+        let base = git_output(&parent.path, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        git_ok(
+            &self.repository_root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                child_path.to_str().unwrap(),
+                &base,
+            ],
+        )?;
+        git_ok(
+            &child_path,
+            &["checkout", "-b", &format!("feat/child-{task_id}"), &base],
+        )?;
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path: child_path,
+            branch: format!("feat/child-{task_id}"),
+            parent_branch: parent.branch.clone(),
+            base_commit: base,
+        })
+    }
+
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        let status = git_output(&workspace.path, &["status", "--porcelain"])?;
+        if !status.is_empty() {
+            return Err(WorkerError::Startup(
+                "Git workspace error: dirty child".into(),
+            ));
+        }
+        let head = git_output(&workspace.path, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        if head == workspace.base_commit {
+            return Err(WorkerError::Startup(
+                "Git workspace error: empty delivery".into(),
+            ));
+        }
+        Ok(DeliveryReport::coding(
+            head,
+            workspace.parent_branch.clone(),
+            workspace.lease_id.clone(),
+            "inspected delivery",
+        ))
+    }
+
+    fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        let _ = Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                workspace.path.to_str().unwrap(),
+            ])
+            .current_dir(&workspace.repository_root)
+            .status();
+        let _ = Command::new("git")
+            .args(["branch", "-D", &workspace.branch])
+            .current_dir(&workspace.repository_root)
+            .status();
+        Ok(())
     }
 }
 
@@ -776,7 +914,13 @@ async fn coordinator_persists_worker_delivery_and_notifies_direct_parent() {
         "cargo test -p child",
     );
 
-    factory.handles.lock().unwrap()[0].report_delivery(delivery.clone());
+    factory
+        .handles
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .report_delivery(delivery.clone());
     coordinator.reconcile_worker_events().await.unwrap();
 
     let repository = RuntimeRepository::open(&database).unwrap();
@@ -824,7 +968,13 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
         workspace,
         "cargo test -p child",
     );
-    factory.handles.lock().unwrap()[0].report_delivery(delivery.clone());
+    factory
+        .handles
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .report_delivery(delivery.clone());
     coordinator.reconcile_worker_events().await.unwrap();
 
     assert!(
@@ -867,6 +1017,92 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
     assert_eq!(review_actor["initiated_by"]["kind"], "parent_integration");
     let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
     assert_eq!(parent_mailbox.len(), 1);
+}
+
+#[tokio::test]
+async fn review_confirmation_rejects_a_delivery_head_change_between_preview_and_confirm() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    let preview = coordinator
+        .preview_review(&child, yi_agent_store::runtime::ReviewDecision::Approve)
+        .await
+        .unwrap();
+    let workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("worker received a workspace");
+    std::fs::write(workspace.path.join("review_change.txt"), "changed\n").unwrap();
+    Command::new("git")
+        .args(["add", "review_change.txt"])
+        .current_dir(&workspace.path)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "changed after preview"])
+        .current_dir(&workspace.path)
+        .status()
+        .unwrap();
+
+    assert!(
+        coordinator
+            .confirm_review(
+                &child,
+                yi_agent_store::runtime::ReviewDecision::Approve,
+                &preview.confirmation_token,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+}
+
+#[tokio::test]
+async fn review_preview_rejects_a_delivery_that_already_has_a_review_decision() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let preview = coordinator
+        .preview_review(&child, yi_agent_store::runtime::ReviewDecision::Approve)
+        .await
+        .unwrap();
+    coordinator
+        .confirm_review(
+            &child,
+            yi_agent_store::runtime::ReviewDecision::Approve,
+            &preview.confirmation_token,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        coordinator
+            .preview_review(&child, yi_agent_store::runtime::ReviewDecision::Approve)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1595,6 +1831,71 @@ fn local_user_review_actor(parent: &yi_agent_core::TaskId) -> String {
     .unwrap()
 }
 
+fn git_output(directory: &Path, args: &[&str]) -> Result<String, WorkerError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
+    if !output.status.success() {
+        return Err(WorkerError::Startup(format!(
+            "Git workspace error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8(output.stdout)
+        .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?)
+}
+
+fn git_ok(directory: &Path, args: &[&str]) -> Result<(), WorkerError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
+    if !output.status.success() {
+        return Err(WorkerError::Startup(format!(
+            "Git workspace error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn initialize_git_repository(directory: &Path) {
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "tests@example.com"],
+        vec!["config", "user.name", "Runtime Tests"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(directory.join("README.md"), "base\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(directory)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(directory)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 async fn delivered_child_coordinator(
     database: &std::path::Path,
     factory: Arc<MessageRecordingFactory>,
@@ -1608,19 +1909,37 @@ async fn delivered_child_coordinator(
     let coordinator = RuntimeCoordinator::open(database, factory.clone()).unwrap();
     let session = coordinator.create_session().unwrap();
     let parent = coordinator.root_task_id(&session).unwrap();
+    if factory.workspace_service.is_some() {
+        coordinator.start_worker(&session, &parent).await.unwrap();
+    }
     let child = coordinator.spawn_child(&session, &parent).await.unwrap();
     coordinator.start_worker(&session, &child).await.unwrap();
-    let workspace = factory.starts.lock().unwrap()[0]
-        .workspace_lease_id
-        .clone()
-        .unwrap();
+    let child_start = factory.starts.lock().unwrap().last().unwrap().clone();
+    let workspace = child_start.workspace_lease_id.clone().unwrap();
+    let commit = if let Some(worker_workspace) = child_start.workspace.as_ref() {
+        std::fs::write(worker_workspace.path.join("delivery.txt"), "ready\n").unwrap();
+        git_ok(&worker_workspace.path, &["add", "delivery.txt"]).unwrap();
+        git_ok(&worker_workspace.path, &["commit", "-m", "child delivery"]).unwrap();
+        git_output(&worker_workspace.path, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned()
+    } else {
+        "deadbeef".into()
+    };
     let delivery = yi_agent_core::subagent::task::DeliveryReport::coding(
-        "deadbeef",
+        commit,
         "main",
         workspace,
         "cargo test -p child",
     );
-    factory.handles.lock().unwrap()[0].report_delivery(delivery.clone());
+    factory
+        .handles
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .report_delivery(delivery.clone());
     coordinator.reconcile_worker_events().await.unwrap();
     (coordinator, session, parent, child, delivery)
 }

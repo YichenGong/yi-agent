@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use yi_agent_core::subagent::task::DeliveryReport;
 use yi_agent_core::subagent::task::{AttemptId, RootSessionId, TaskId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
@@ -162,6 +163,35 @@ impl DaemonWorkspaceService {
             service: yi_agent_tools::worktree::WorktreeService::new(),
         }
     }
+
+    fn inspect_delivery_report(
+        &self,
+        workspace: &WorkerWorkspace,
+    ) -> Result<DeliveryReport, WorkerError> {
+        let delivery = self
+            .service
+            .inspect_delivery(&yi_agent_tools::worktree::ChildWorktree {
+                path: workspace.path.clone(),
+                branch: workspace.branch.clone(),
+                parent_branch: workspace.parent_branch.clone(),
+                base_commit: workspace.base_commit.clone(),
+            })
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
+        let head_commit = delivery.head_commit.clone();
+        Ok(DeliveryReport::coding(
+            head_commit,
+            workspace.parent_branch.clone(),
+            workspace.lease_id.clone(),
+            serde_json::json!({
+                "kind": "clean_delivery",
+                "branch": delivery.branch,
+                "base_commit": delivery.base_commit,
+                "head_commit": delivery.head_commit,
+                "clean": delivery.clean,
+            })
+            .to_string(),
+        ))
+    }
 }
 
 impl AgentWorkspaceService for DaemonWorkspaceService {
@@ -218,6 +248,10 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
             parent_branch: child.parent_branch,
             base_commit: child.base_commit,
         })
+    }
+
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        self.inspect_delivery_report(workspace)
     }
 
     fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
@@ -326,12 +360,15 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 ))
             });
         };
-        let worker_tools = Arc::new(self.tool_registry_for_workspace(workspace.path));
+        let workspace_path = workspace.path.clone();
+        let worker_tools = Arc::new(self.tool_registry_for_workspace(workspace_path));
         let config = self.config.clone();
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
         let objective = request.objective;
         let initial_user_messages = request.initial_user_messages;
+        let workspace_service = self.workspace_service.clone();
+        let workspace_for_delivery = workspace.clone();
 
         Box::pin(async move {
             if objective.trim().is_empty() {
@@ -446,7 +483,16 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 retrying_provider = false;
                                                 continue 'run;
                                             }
-                                            reporter.report_completed_without_delivery();
+                                            if let Some(service) = workspace_service.as_ref() {
+                                                match service.inspect_delivery(&workspace_for_delivery) {
+                                                    Ok(delivery) => reporter.report_delivery(delivery),
+                                                    Err(error) => {
+                                                        reporter.report_failure(error.to_string())
+                                                    }
+                                                }
+                                            } else {
+                                                reporter.report_completed_without_delivery();
+                                            }
                                             break 'run;
                                         }
                                         Some(AgentEvent::Cancelled) => {
@@ -939,6 +985,7 @@ mod tests {
     use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
     use yi_agent_store::repository::RuntimeRepository;
     use yi_agent_store::runtime::RuntimeCoordinator;
+    use yi_agent_tools::worktree::WorktreeService;
 
     use super::*;
 
@@ -1291,6 +1338,69 @@ mod tests {
             |event| matches!(event, WorkerEvent::MessageConsumed { message_id: id } if id == &message_id)
         ));
         handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_reports_a_structured_delivery_when_it_completes_cleanly() {
+        let directory = TempDir::new().unwrap();
+        let base_head = initialize_git_repository(directory.path());
+        let root_path = directory.path().join(".worktrees/yi-root");
+        let root = WorktreeService::new()
+            .create_root(directory.path(), "feat/yi-agent-test-root", &root_path)
+            .unwrap();
+        std::fs::write(root.path.join("delivery.txt"), "ready\n").unwrap();
+        Command::new("git")
+            .args(["add", "delivery.txt"])
+            .current_dir(&root.path)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "prepared delivery"])
+            .current_dir(&root.path)
+            .status()
+            .unwrap();
+        let head = git_output(&root.path, &["rev-parse", "HEAD"]).unwrap();
+        let workspace = WorkerWorkspace {
+            lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: root.path.clone(),
+            branch: root.branch.clone(),
+            parent_branch: root.parent_branch.clone(),
+            base_commit: base_head,
+        };
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Return immediately after one clean provider turn.")
+            .with_workspace(workspace.clone());
+        let handle = factory.start(request).await.unwrap();
+
+        let delivery = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let events = handle.take_events();
+                if let Some(delivery) = events.into_iter().find_map(|event| match event {
+                    WorkerEvent::Delivered(delivery) => Some(delivery),
+                    WorkerEvent::CompletedWithoutDelivery => {
+                        panic!("worker completed without a structured delivery report")
+                    }
+                    _ => None,
+                }) {
+                    return delivery;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should complete and report a delivery");
+
+        assert_eq!(delivery.commit, head);
+        assert_eq!(delivery.base_ref, workspace.parent_branch);
+        assert_eq!(delivery.workspace, workspace.lease_id);
     }
 
     #[tokio::test]

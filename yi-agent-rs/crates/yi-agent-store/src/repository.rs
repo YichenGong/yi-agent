@@ -1703,6 +1703,18 @@ impl RuntimeRepository {
         Ok(event_id)
     }
 
+    pub fn delivery_has_review(&self, delivery: &DeliveryId) -> Result<bool, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM reviews WHERE delivery_id = ?1 LIMIT 1",
+                params![delivery.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Persists a rework decision, preserves the reviewed attempt, and starts
     /// its durable successor with the same feedback mailbox identity.
     #[allow(clippy::too_many_arguments)]

@@ -10,6 +10,7 @@ use chrono::{DateTime, Timelike, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use uuid::Uuid;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::subagent::mailbox::{
     MailboxMessage, MailboxMessageDraft, MessageKind, ReworkInstruction,
@@ -22,7 +23,7 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, ReviewPersistenceError, SpawnError, WaitMode, WaitOutcome,
 };
 use yi_agent_core::subagent::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryReport,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, DeliveryReport,
     IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
     RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState, TimeoutKind,
     WatchdogEvidence as CoreWatchdogEvidence,
@@ -37,6 +38,8 @@ use crate::repository::{
     WatchdogTerminal,
 };
 use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
+
+const REVIEW_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
@@ -97,6 +100,32 @@ pub struct AttachedApplicationRoot {
     pub workspace: WorkerWorkspace,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approve,
+    Rework { feedback: String },
+    Reject { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPreview {
+    pub task_id: TaskId,
+    pub delivery_id: DeliveryId,
+    pub confirmation_token: String,
+    pub expires_in_secs: u64,
+    pub decision: ReviewDecision,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReviewConfirmation {
+    task_id: TaskId,
+    decision: ReviewDecision,
+    delivery_id: DeliveryId,
+    delivery_commit: String,
+    workspace: Option<WorkerWorkspace>,
+    expires_at: Instant,
+}
+
 /// Owns all supervisor instances and their worker handles for one daemon.
 ///
 /// The coordinator deliberately receives a factory instead of constructing an
@@ -113,6 +142,7 @@ pub struct RuntimeCoordinator {
     provider_turn_admissions: Option<Arc<ProviderTurnAdmissions>>,
     provider_profile_id: Option<String>,
     recovery_contexts: Mutex<HashMap<TaskId, RecoveryContext>>,
+    review_confirmations: Mutex<HashMap<String, PendingReviewConfirmation>>,
     application_root_attach_lock: Mutex<()>,
     draining: AtomicBool,
 }
@@ -524,6 +554,7 @@ impl RuntimeCoordinator {
             provider_turn_admissions,
             provider_profile_id,
             recovery_contexts: Mutex::new(recovery_contexts),
+            review_confirmations: Mutex::new(HashMap::new()),
             application_root_attach_lock: Mutex::new(()),
             draining: AtomicBool::new(false),
         })
@@ -1801,6 +1832,105 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// Captures the current review target and issues a short-lived confirmation
+    /// token before any review-side mutation happens.
+    pub async fn preview_review(
+        &self,
+        task: &TaskId,
+        decision: ReviewDecision,
+    ) -> Result<ReviewPreview, RuntimeCoordinatorError> {
+        match &decision {
+            ReviewDecision::Rework { feedback } if feedback.trim().is_empty() => {
+                return Err(RepositoryError::ReviewFeedbackRequired.into());
+            }
+            ReviewDecision::Reject { reason } if reason.trim().is_empty() => {
+                return Err(RepositoryError::ReviewReasonRequired.into());
+            }
+            _ => {}
+        }
+        let (session, _parent, delivery) = self.review_context(task)?;
+        let workspace = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            if repository.delivery_has_review(&delivery.id)? {
+                return Err(RuntimeCoordinatorError::Supervisor(
+                    "delivery already has a review decision".into(),
+                ));
+            }
+            repository.task_workspace_optional(task)?
+        };
+        let supervisor = self.supervisor(&session)?;
+        let supervisor = supervisor.lock().await;
+        if !matches!(
+            supervisor.task(task).map(|task| task.state()),
+            Some(TaskState::AwaitingParentReview(expected)) if expected == &delivery.id
+        ) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "delivery does not match the active review".into(),
+            ));
+        }
+        let confirmation_token =
+            self.issue_review_confirmation(task, &decision, &delivery, workspace);
+        Ok(ReviewPreview {
+            task_id: task.clone(),
+            delivery_id: delivery.id,
+            confirmation_token,
+            expires_in_secs: REVIEW_CONFIRMATION_TTL.as_secs(),
+            decision,
+        })
+    }
+
+    /// Consumes a preview token and performs the requested review mutation.
+    pub async fn confirm_review(
+        &self,
+        task: &TaskId,
+        decision: ReviewDecision,
+        confirmation_token: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let (_session, _parent, delivery) = self.review_context(task)?;
+        let preview_workspace = self
+            .review_confirmations
+            .lock()
+            .expect("runtime review confirmations mutex poisoned")
+            .get(confirmation_token)
+            .map(|pending| pending.workspace.clone())
+            .ok_or_else(|| {
+                RuntimeCoordinatorError::Supervisor(
+                    "review confirmation token is invalid or stale".into(),
+                )
+            })?;
+        let inspected_commit = if let Some(workspace) = preview_workspace.as_ref() {
+            if let Some(service) = self.workspace_service.as_ref() {
+                service
+                    .inspect_delivery(workspace)
+                    .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
+                    .commit
+            } else {
+                delivery.commit.clone()
+            }
+        } else {
+            delivery.commit.clone()
+        };
+        if !self.consume_review_confirmation(
+            task,
+            &decision,
+            &delivery,
+            &inspected_commit,
+            confirmation_token,
+        ) {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "review confirmation token is invalid or stale".into(),
+            ));
+        }
+        match decision {
+            ReviewDecision::Approve => self.approve_review(task).await,
+            ReviewDecision::Rework { feedback } => self.rework_review(task, &feedback).await,
+            ReviewDecision::Reject { reason } => self.reject_review(task, &reason).await,
+        }
+    }
+
     /// Records local-user approval and wakes the direct parent. Integration is
     /// intentionally left to the trusted parent path in `accept_review`.
     pub async fn approve_review(&self, task: &TaskId) -> Result<(), RuntimeCoordinatorError> {
@@ -1849,6 +1979,55 @@ impl RuntimeCoordinator {
             .deliver_committed_user_instruction(&parent, &parent_notification)
             .map_err(RuntimeCoordinatorError::Supervisor)?;
         Ok(())
+    }
+
+    fn issue_review_confirmation(
+        &self,
+        task: &TaskId,
+        decision: &ReviewDecision,
+        delivery: &DeliveryReport,
+        workspace: Option<WorkerWorkspace>,
+    ) -> String {
+        let token = Uuid::new_v4().to_string();
+        self.review_confirmations
+            .lock()
+            .expect("runtime review confirmations mutex poisoned")
+            .insert(
+                token.clone(),
+                PendingReviewConfirmation {
+                    task_id: task.clone(),
+                    decision: decision.clone(),
+                    delivery_id: delivery.id.clone(),
+                    delivery_commit: delivery.commit.clone(),
+                    workspace,
+                    expires_at: Instant::now() + REVIEW_CONFIRMATION_TTL,
+                },
+            );
+        token
+    }
+
+    fn consume_review_confirmation(
+        &self,
+        task: &TaskId,
+        decision: &ReviewDecision,
+        delivery: &DeliveryReport,
+        inspected_commit: &str,
+        token: &str,
+    ) -> bool {
+        let Some(pending) = self
+            .review_confirmations
+            .lock()
+            .expect("runtime review confirmations mutex poisoned")
+            .remove(token)
+        else {
+            return false;
+        };
+        pending.expires_at > Instant::now()
+            && pending.task_id == *task
+            && pending.decision == *decision
+            && pending.delivery_id == delivery.id
+            && pending.delivery_commit == inspected_commit
+            && pending.delivery_commit == delivery.commit
     }
 
     /// Records direct-parent rework feedback, creates the reducer-owned

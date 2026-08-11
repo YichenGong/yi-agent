@@ -30,5 +30,6 @@
 - [ ] Git worktree 基线、提交交付和逐层集成 — 验证：`cargo test -p yi-agent-tools subagent_worktree`
 - [ ] 手动启动的本地 daemon、SQLite 状态与 IPC 重连 — 验证：`cargo test -p yi-agent-store runtime::tests`
 - [x] 定时任务与保守默认策略 — 五字段 Cron、原子发生记录、离线 skip/catch-up-once、重叠 skip、daemon 分钟 tick 与 IPC 位于 `yi-agent-store`；自然语言仅生成需 `--confirm` 的本地预览，验证：`cargo test -p yi-agent-store --test scheduler && cargo test -p yi-agent-store --test runtime_coordinator && cargo test -p yi-agent-store --test runtime_ipc && cargo test -p yi-agent --bin yi-agent schedule_intent`
+- [x] TUI-first delivery 审查 MVP — `/review` 读取 daemon delivery JSON，`/accept`、`/rework`、`/reject` 走预览 token 后确认的受控审查路径，代码：`yi-agent-rs/crates/yi-agent/src/tui/app.rs`，验证：`cargo test -p yi-agent --bin yi-agent review_control && cargo test -p yi-agent --bin yi-agent control_previews_then_confirms_review_from_tui`
 - [ ] CLI/TUI/Slash-command 任务树观察、帮助和人工干预 — 验证：`cargo test -p yi-agent --bin yi-agent subagent_`
 - [x] Worker retry watchdog 记账 — `WorkerWatchdogEvent::ToolRetry` 经 `RuntimeCoordinator::reconcile_worker_events` 持久化至 `WatchdogUsage::tool_retries`；验证：`cargo test -p yi-agent-store --test runtime_coordinator coordinator_persists_worker_usage_and_meaningful_progress`

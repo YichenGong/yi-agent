@@ -266,6 +266,10 @@ pub struct DeliveryReport {
     pub base_ref: String,
     pub workspace: WorkspaceLeaseId,
     pub evidence: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_limitations: Vec<String>,
 }
 
 impl DeliveryReport {
@@ -281,7 +285,19 @@ impl DeliveryReport {
             base_ref: base_ref.into(),
             workspace,
             evidence: evidence.into(),
+            changed_files: Vec::new(),
+            known_limitations: Vec::new(),
         }
+    }
+
+    pub fn with_changed_files(mut self, changed_files: Vec<String>) -> Self {
+        self.changed_files = changed_files;
+        self
+    }
+
+    pub fn with_known_limitations(mut self, known_limitations: Vec<String>) -> Self {
+        self.known_limitations = known_limitations;
+        self
     }
 
     fn validate_for(&self, task: &AgentTask) -> Result<(), &'static str> {
@@ -1103,6 +1119,22 @@ mod tests {
 
     fn coding_delivery(workspace: WorkspaceLeaseId) -> DeliveryReport {
         DeliveryReport::coding("abc123", "main", workspace, "validated commit")
+    }
+
+    #[test]
+    fn legacy_delivery_json_still_deserializes_without_optional_fields() {
+        let workspace = WorkspaceLeaseId::new();
+        let delivery = serde_json::from_value::<DeliveryReport>(serde_json::json!({
+            "id": DeliveryId::new(),
+            "commit": "abc123",
+            "base_ref": "main",
+            "workspace": workspace,
+            "evidence": "validated commit",
+        }))
+        .unwrap();
+
+        assert!(delivery.changed_files.is_empty());
+        assert!(delivery.known_limitations.is_empty());
     }
 
     #[test]

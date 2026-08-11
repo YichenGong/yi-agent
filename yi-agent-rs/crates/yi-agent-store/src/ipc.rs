@@ -24,7 +24,9 @@ use yi_agent_core::subagent::worker::{
 };
 
 use crate::repository::RuntimeRepository;
-use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
+use crate::runtime::{
+    ReviewDecision, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions,
+};
 use crate::schedule::ScheduleDefinition;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -207,6 +209,15 @@ pub enum IpcRequest {
         task_id: String,
         decision: IpcReviewDecision,
     },
+    PreviewReview {
+        task_id: String,
+        decision: IpcReviewDecision,
+    },
+    ConfirmReview {
+        task_id: String,
+        decision: IpcReviewDecision,
+        confirmation_token: String,
+    },
     SendMessage {
         session_id: String,
         sender_task_id: String,
@@ -310,6 +321,13 @@ pub enum IpcResponse {
     TaskPaused,
     TaskResumed,
     PermissionResolved,
+    ReviewPreview {
+        task_id: String,
+        delivery_id: String,
+        decision: IpcReviewDecision,
+        confirmation_token: String,
+        expires_in_secs: u64,
+    },
     ReviewApproved,
     ReviewReworkRequested,
     ReviewRejected,
@@ -368,6 +386,16 @@ impl From<IpcPermissionDecision> for PermissionDecision {
         match decision {
             IpcPermissionDecision::Allow => Self::Allow,
             IpcPermissionDecision::Deny => Self::Deny,
+        }
+    }
+}
+
+impl From<IpcReviewDecision> for ReviewDecision {
+    fn from(decision: IpcReviewDecision) -> Self {
+        match decision {
+            IpcReviewDecision::Accept {} => Self::Approve,
+            IpcReviewDecision::Rework { feedback } => Self::Rework { feedback },
+            IpcReviewDecision::Reject { reason } => Self::Reject { reason },
         }
     }
 }
@@ -945,6 +973,47 @@ fn preview_cancel(
         unmerged_deliveries: scope.unmerged_deliveries,
         expires_in_secs: CONFIRMATION_TTL.as_secs(),
     })
+}
+
+fn preview_review(
+    coordinator: &RuntimeCoordinator,
+    task_id: String,
+    decision: IpcReviewDecision,
+) -> Result<IpcResponse, IpcError> {
+    let task = parse_id::<TaskId>(&task_id)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let preview = runtime.block_on(coordinator.preview_review(&task, decision.clone().into()))?;
+    Ok(IpcResponse::ReviewPreview {
+        task_id,
+        delivery_id: preview.delivery_id.to_string(),
+        decision,
+        confirmation_token: preview.confirmation_token,
+        expires_in_secs: preview.expires_in_secs,
+    })
+}
+
+fn confirm_review(
+    coordinator: &RuntimeCoordinator,
+    task_id: String,
+    decision: IpcReviewDecision,
+    confirmation_token: String,
+) -> Result<IpcResponse, IpcError> {
+    let task = parse_id::<TaskId>(&task_id)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(coordinator.confirm_review(
+        &task,
+        decision.clone().into(),
+        &confirmation_token,
+    ))?;
+    match decision {
+        IpcReviewDecision::Accept {} => Ok(IpcResponse::ReviewApproved),
+        IpcReviewDecision::Rework { .. } => Ok(IpcResponse::ReviewReworkRequested),
+        IpcReviewDecision::Reject { .. } => Ok(IpcResponse::ReviewRejected),
+    }
 }
 
 fn cancellation_scope(
@@ -2085,26 +2154,17 @@ fn respond(
             runtime.block_on(coordinator.resolve_permission(&request_id, decision.into()))?;
             Ok(IpcResponse::PermissionResolved)
         }
-        IpcRequest::Review { task_id, decision } => {
-            let task_id = parse_id::<TaskId>(&task_id)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            match decision {
-                IpcReviewDecision::Accept {} => {
-                    runtime.block_on(coordinator.approve_review(&task_id))?;
-                    Ok(IpcResponse::ReviewApproved)
-                }
-                IpcReviewDecision::Rework { feedback } => {
-                    runtime.block_on(coordinator.rework_review(&task_id, &feedback))?;
-                    Ok(IpcResponse::ReviewReworkRequested)
-                }
-                IpcReviewDecision::Reject { reason } => {
-                    runtime.block_on(coordinator.reject_review(&task_id, &reason))?;
-                    Ok(IpcResponse::ReviewRejected)
-                }
-            }
+        IpcRequest::Review { .. } => Ok(IpcResponse::Error {
+            code: IpcErrorCode::ConfirmationRequired,
+        }),
+        IpcRequest::PreviewReview { task_id, decision } => {
+            preview_review(coordinator, task_id, decision)
         }
+        IpcRequest::ConfirmReview {
+            task_id,
+            decision,
+            confirmation_token,
+        } => confirm_review(coordinator, task_id, decision, confirmation_token),
         IpcRequest::SendMessage {
             session_id,
             sender_task_id,

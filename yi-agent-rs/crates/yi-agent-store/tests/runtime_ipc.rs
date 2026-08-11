@@ -3021,13 +3021,28 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
         "awaiting_parent_review"
     );
 
-    let accept_request: IpcRequest = serde_json::from_value(serde_json::json!({
-        "type": "Review",
+    let accept_preview: IpcRequest = serde_json::from_value(serde_json::json!({
+        "type": "PreviewReview",
         "task_id": child_task_id,
         "decision": { "type": "accept" }
     }))
     .expect("accept has no caller-supplied integration evidence");
-    let response = send_request(daemon.socket_path(), accept_request).unwrap();
+    let response = send_request(daemon.socket_path(), accept_preview).unwrap();
+    let IpcResponse::ReviewPreview {
+        confirmation_token, ..
+    } = response
+    else {
+        panic!("expected a review preview");
+    };
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmReview {
+            task_id: child_task_id.clone(),
+            decision: IpcReviewDecision::Accept {},
+            confirmation_token,
+        },
+    )
+    .unwrap();
 
     let review_detail = RuntimeRepository::open(&database)
         .unwrap()
@@ -3065,7 +3080,7 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
         .unwrap();
     assert_eq!(parent_mailbox.len(), 2);
     assert!(parent_mailbox[1].payload_json.contains("approved"));
-    let encoded = serde_json::to_value(IpcRequest::Review {
+    let encoded = serde_json::to_value(IpcRequest::PreviewReview {
         task_id: child_task_id,
         decision: IpcReviewDecision::Reject {
             reason: "not acceptable".into(),
@@ -3079,6 +3094,33 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
 }
 
 #[test]
+fn legacy_review_request_fails_instead_of_silently_previewing() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ReviewReportingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::Review {
+            task_id: child_task_id,
+            decision: IpcReviewDecision::Accept {},
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        response,
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+        }
+    ));
+}
+
+#[test]
 fn review_ipc_accept_rejects_forged_integration_evidence() {
     let forged = serde_json::from_value::<IpcReviewDecision>(serde_json::json!({
         "type": "accept",
@@ -3089,10 +3131,23 @@ fn review_ipc_accept_rejects_forged_integration_evidence() {
 }
 
 #[test]
+fn review_ipc_requires_a_confirmation_token_before_integrating_a_delivery() {
+    let command = serde_json::json!({
+        "type": "ConfirmReview",
+        "task_id": TaskId::new().to_string(),
+        "decision": { "type": "accept" },
+        "confirmation_token": "not-a-token"
+    });
+
+    let request = serde_json::from_value::<IpcRequest>(command).unwrap();
+    assert!(matches!(request, IpcRequest::ConfirmReview { .. }));
+}
+
+#[test]
 fn review_ipc_rejects_caller_supplied_routing_or_actor_identity() {
     for forged_field in ["actor", "session_id", "delivery_id"] {
         let mut command = serde_json::json!({
-            "type": "Review",
+            "type": "PreviewReview",
             "task_id": TaskId::new().to_string(),
             "decision": { "type": "accept" }
         });
@@ -3114,11 +3169,29 @@ fn review_ipc_routes_rework_feedback_into_the_successor_worker() {
 
     let response = send_request(
         daemon.socket_path(),
-        IpcRequest::Review {
+        IpcRequest::PreviewReview {
             task_id: child_task_id.clone(),
             decision: IpcReviewDecision::Rework {
                 feedback: "rerun the parser regression suite".into(),
             },
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::ReviewPreview {
+        confirmation_token, ..
+    } = response
+    else {
+        panic!("expected a review preview");
+    };
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmReview {
+            task_id: child_task_id.clone(),
+            decision: IpcReviewDecision::Rework {
+                feedback: "rerun the parser regression suite".into(),
+            },
+            confirmation_token,
         },
     )
     .unwrap();
@@ -3153,11 +3226,29 @@ fn review_ipc_rejects_with_a_required_durable_reason() {
 
     let response = send_request(
         daemon.socket_path(),
-        IpcRequest::Review {
+        IpcRequest::PreviewReview {
             task_id: child_task_id.clone(),
             decision: IpcReviewDecision::Reject {
                 reason: "missing regression evidence".into(),
             },
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::ReviewPreview {
+        confirmation_token, ..
+    } = response
+    else {
+        panic!("expected a review preview");
+    };
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmReview {
+            task_id: child_task_id.clone(),
+            decision: IpcReviewDecision::Reject {
+                reason: "missing regression evidence".into(),
+            },
+            confirmation_token,
         },
     )
     .unwrap();
@@ -3194,7 +3285,7 @@ fn review_ipc_rejects_empty_rework_and_rejection_text() {
         assert!(matches!(
             send_request(
                 daemon.socket_path(),
-                IpcRequest::Review {
+                IpcRequest::PreviewReview {
                     task_id: child_task_id.clone(),
                     decision,
                 },

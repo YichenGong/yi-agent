@@ -145,15 +145,15 @@ impl SlashCommand {
             SlashCommand::Agent => Some("<task-id>"),
             SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
             SlashCommand::Message => Some("<task-id> <text>"),
-            SlashCommand::Cancel => Some("<session-id> <task-id> [recursive]"),
-            SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => {
-                Some("<session-id> <task-id>")
-            }
+            SlashCommand::Cancel => Some("<task-id> [--recursive] [--confirm <token>]"),
+            SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => Some("<task-id>"),
             SlashCommand::Priority => Some("<task-id> <level>"),
             SlashCommand::Approve => Some("<request-id> [once|task]"),
             SlashCommand::Deny => Some("<request-id>"),
-            SlashCommand::Rework => Some("<task-id> <feedback>"),
-            SlashCommand::Reject => Some("<task-id> <reason>"),
+            SlashCommand::Review => Some("<task-id>"),
+            SlashCommand::Accept => Some("<task-id> [--confirm <token>]"),
+            SlashCommand::Rework => Some("<task-id> <feedback> [--confirm <token>]"),
+            SlashCommand::Reject => Some("<task-id> <reason> [--confirm <token>]"),
             _ => None,
         }
     }

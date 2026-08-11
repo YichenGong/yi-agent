@@ -224,18 +224,27 @@ pub enum AgentAction {
         task_id: String,
         #[arg(long)]
         yes: bool,
+        /// Single-use token returned by the preceding review preview.
+        #[arg(long)]
+        confirmation: Option<String>,
     },
     Rework {
         task_id: String,
         feedback: String,
         #[arg(long)]
         yes: bool,
+        /// Single-use token returned by the preceding review preview.
+        #[arg(long)]
+        confirmation: Option<String>,
     },
     Reject {
         task_id: String,
         reason: String,
         #[arg(long)]
         yes: bool,
+        /// Single-use token returned by the preceding review preview.
+        #[arg(long)]
+        confirmation: Option<String>,
     },
 }
 

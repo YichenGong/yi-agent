@@ -139,6 +139,68 @@ fn control_agent(action: AgentAction) -> Result<()> {
                 task_id,
             }
         }
+        AgentAction::Accept {
+            task_id,
+            yes,
+            confirmation,
+        } => {
+            let decision = yi_agent_store::ipc::IpcReviewDecision::Accept {};
+            if !yes {
+                return show_review_preview(&socket, task_id, decision, "accept");
+            }
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmReview {
+                task_id,
+                decision,
+                confirmation_token,
+            }
+        }
+        AgentAction::Rework {
+            task_id,
+            feedback,
+            yes,
+            confirmation,
+        } => {
+            let decision = yi_agent_store::ipc::IpcReviewDecision::Rework { feedback };
+            if !yes {
+                return show_review_preview(&socket, task_id, decision, "rework");
+            }
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmReview {
+                task_id,
+                decision,
+                confirmation_token,
+            }
+        }
+        AgentAction::Reject {
+            task_id,
+            reason,
+            yes,
+            confirmation,
+        } => {
+            let decision = yi_agent_store::ipc::IpcReviewDecision::Reject { reason };
+            if !yes {
+                return show_review_preview(&socket, task_id, decision, "reject");
+            }
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmReview {
+                task_id,
+                decision,
+                confirmation_token,
+            }
+        }
         other => {
             anyhow::bail!("agent control `{other:?}` is not yet supported by this daemon version")
         }
@@ -176,11 +238,48 @@ fn control_agent(action: AgentAction) -> Result<()> {
         | yi_agent_store::ipc::IpcResponse::TaskPaused
         | yi_agent_store::ipc::IpcResponse::TaskResumed
         | yi_agent_store::ipc::IpcResponse::TaskRetried
-        | yi_agent_store::ipc::IpcResponse::MessageQueued => Ok(()),
+        | yi_agent_store::ipc::IpcResponse::MessageQueued
+        | yi_agent_store::ipc::IpcResponse::ReviewApproved
+        | yi_agent_store::ipc::IpcResponse::ReviewReworkRequested
+        | yi_agent_store::ipc::IpcResponse::ReviewRejected => Ok(()),
         yi_agent_store::ipc::IpcResponse::Error { code } => {
             anyhow::bail!("runtime daemon rejected request: {code}")
         }
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+}
+
+fn show_review_preview(
+    socket: &std::path::Path,
+    task_id: String,
+    decision: yi_agent_store::ipc::IpcReviewDecision,
+    action: &str,
+) -> Result<()> {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::PreviewReview { task_id, decision },
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })? {
+        yi_agent_store::ipc::IpcResponse::ReviewPreview {
+            task_id,
+            delivery_id,
+            confirmation_token,
+            expires_in_secs,
+            ..
+        } => {
+            println!("task: {task_id}");
+            println!("delivery: {delivery_id}");
+            println!(
+                "rerun agent {action} with --yes --confirmation {confirmation_token} within {expires_in_secs}s"
+            );
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            anyhow::bail!("runtime daemon rejected review preview: {code}")
+        }
+        other => anyhow::bail!("unexpected runtime review preview response: {other:?}"),
     }
 }
 
