@@ -49,4 +49,5 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] 语义化对话留白 — `tui/history.rs` 在用户输入后、工具结果后的首段模型回复前各保留一行空白，工具调用/结果连续显示；验证：`cargo test -p yi-agent --bin yi-agent tui::history::tests`
 - [x] 多层绝对路径输入转发 — `tui/app.rs` 在首个空白符前的 token 含至少两个 `/` 时将完整输入发送给 agent；单层 `/tmp` 仍显示 `未知命令`；验证：`cargo test -p yi-agent --bin yi-agent tui::app::tests::submit_` 和 `cargo test -p yi-agent --bin yi-agent tui::app::tests::unknown_slash_command_shows_error`
 - [x] 项目 AGENTS.md 提示词加载 — `main.rs::load_project_instructions()` 读取 `<workdir>/AGENTS.md` 并由 `resolve_system_prompt_with_skills()` 注入正常 TUI/run 会话；`--naked` 保持不加载；验证：`cargo test -p yi-agent --bin yi-agent resolve_system_prompt_`
+- [x] 启动不污染项目目录 — `config.rs::load()` 只读取已存在的 `<workdir>/.yi-agent/.env`，不在 fallback 启动时创建 `<workdir>/.yi-agent`；验证：`cargo test -p yi-agent --bin yi-agent config::tests::load_does_not_create_local_yi_agent_dir_in_fallback_mode`
 - [ ] InlineRenderer 退役 — `tui/` 仍保留 deprecated 的 InlineRenderer 代码，待删除
