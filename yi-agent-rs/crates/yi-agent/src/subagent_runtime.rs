@@ -23,7 +23,7 @@ use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
 
 const DEFAULT_PROVIDER_RETRY_LIMIT: u16 = 3;
 #[cfg(not(test))]
-const TUI_WAIT_AGENT_TIMEOUT_MS: u64 = 30_000;
+const TUI_WAIT_AGENT_TIMEOUT_MS: u64 = 120_000;
 #[cfg(test)]
 const TUI_WAIT_AGENT_TIMEOUT_MS: u64 = 10;
 
