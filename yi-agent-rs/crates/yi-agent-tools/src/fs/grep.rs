@@ -216,15 +216,15 @@ fn grep_search(
                         let start = i.saturating_sub(context);
                         let end = (i + context + 1).min(lines.len());
                         for (j, context_line) in lines.iter().enumerate().take(end).skip(start) {
-                            if j != *i {
-                                if !append_entry(
+                            if j != *i
+                                && !append_entry(
                                     &mut output,
                                     &mut entry_count,
                                     format!("{}-{}:{}\n", rel.display(), j + 1, context_line),
-                                ) {
-                                    truncated = true;
-                                    break 'walk;
-                                }
+                                )
+                            {
+                                truncated = true;
+                                break 'walk;
                             }
                         }
                     }
