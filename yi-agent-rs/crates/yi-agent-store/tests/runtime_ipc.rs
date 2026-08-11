@@ -796,6 +796,171 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
 }
 
 #[test]
+fn application_root_can_spawn_multiple_direct_children() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-multiple-spawn".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    let first = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "fast child".into(),
+        },
+    )
+    .unwrap();
+    let second = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "slow child".into(),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(first, IpcResponse::TaskSpawned { .. }));
+    assert!(matches!(second, IpcResponse::TaskSpawned { .. }));
+}
+
+#[test]
+fn application_root_can_spawn_second_child_while_first_is_running() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-second-spawn-while-running".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    let IpcResponse::TaskSpawned {
+        task_id: first_child,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "fast child".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected first child spawn");
+    };
+    assert_eq!(starts.lock().unwrap().len(), 1);
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "slow child".into(),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::TaskSpawned {
+        task_id: second_child,
+    } = response
+    else {
+        panic!("second spawn should be queued instead of rejected, got {response:?}");
+    };
+    assert_ne!(first_child, second_child);
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&second_child.parse().unwrap())
+            .unwrap(),
+        "running"
+    );
+}
+
+#[test]
+fn application_root_rejects_more_than_four_direct_children() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-direct-child-limit".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    for index in 0..4 {
+        assert!(matches!(
+            send_request(
+                daemon.socket_path(),
+                IpcRequest::SpawnApplicationChild {
+                    session_id: session_id.clone(),
+                    parent_task_id: root_task_id.clone(),
+                    capability: message_capability.clone(),
+                    objective: format!("child {index}"),
+                },
+            )
+            .unwrap(),
+            IpcResponse::TaskSpawned { .. }
+        ));
+    }
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id,
+                parent_task_id: root_task_id,
+                capability: message_capability,
+                objective: "fifth child".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::InvalidState,
+        }
+    );
+}
+
+#[test]
 fn detached_paused_application_root_can_reattach_activate_and_spawn() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
