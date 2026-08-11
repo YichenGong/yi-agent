@@ -319,11 +319,7 @@ fn process_selector_schema(extra_properties: Value) -> Value {
 
     serde_json::json!({
         "type": "object",
-        "properties": properties,
-        "oneOf": [
-            { "required": ["process_id"] },
-            { "required": ["name"] }
-        ]
+        "properties": properties
     })
 }
 
@@ -404,6 +400,28 @@ mod tests {
 
         assert!(result.is_error);
         assert!(text(&result).contains("max_bytes must be greater than 0"));
+    }
+
+    #[test]
+    fn process_selector_schemas_are_openai_compatible() {
+        let temp = TempDir::new().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ProcessReadTool::new(manager.clone())),
+            Box::new(ProcessKillTool::new(manager)),
+        ];
+
+        for tool in tools {
+            let schema = tool.schema();
+            assert_eq!(schema["type"], "object", "{}", tool.name());
+            for keyword in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
+                assert!(
+                    schema.get(keyword).is_none(),
+                    "{} contains {keyword}",
+                    tool.name()
+                );
+            }
+        }
     }
 
     #[test]
