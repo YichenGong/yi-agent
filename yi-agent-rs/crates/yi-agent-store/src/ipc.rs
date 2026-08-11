@@ -360,6 +360,8 @@ pub enum IpcResponse {
     },
     Error {
         code: IpcErrorCode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 }
 
@@ -885,6 +887,7 @@ fn handle_client(
                 None,
                 &IpcResponse::Error {
                     code: IpcErrorCode::Validation,
+                    message: None,
                 },
             );
         }
@@ -925,6 +928,7 @@ fn handle_client(
                         None,
                         &IpcResponse::Error {
                             code: IpcErrorCode::Internal,
+                            message: None,
                         },
                     ),
                 };
@@ -957,6 +961,7 @@ fn handle_client(
         },
         Err(_) => IpcResponse::Error {
             code: IpcErrorCode::Validation,
+            message: None,
         },
     };
     write_response_frame(&mut stream, &request_id, None, &response)
@@ -1076,6 +1081,7 @@ fn confirm_cancel(
     if !confirmations.consume(&confirmation_token, &task_id, recursive, &scope) {
         return Ok(IpcResponse::Error {
             code: IpcErrorCode::ConfirmationRequired,
+            message: None,
         });
     }
     let session = parse_id::<RootSessionId>(&detail.session_id)?;
@@ -1424,6 +1430,7 @@ fn write_envelope_frame(
             None,
             IpcResponse::Error {
                 code: IpcErrorCode::Internal,
+                message: None,
             },
         ))?,
         Err(error) => return Err(error),
@@ -1699,6 +1706,7 @@ mod subscription_queue_tests {
             response.result,
             IpcResponse::Error {
                 code: IpcErrorCode::Internal,
+                message: None,
             }
         );
     }
@@ -1802,6 +1810,16 @@ fn json_string_field(frame: &[u8], key: &[u8]) -> Option<String> {
 fn error_response(error: &IpcError) -> IpcResponse {
     IpcResponse::Error {
         code: ipc_error_code(error),
+        message: ipc_error_message(error),
+    }
+}
+
+fn ipc_error_message(error: &IpcError) -> Option<String> {
+    match error {
+        IpcError::Runtime(RuntimeCoordinatorError::Spawn(
+            yi_agent_core::subagent::supervisor::SpawnError::DirectChildLimitReached,
+        )) => Some("an agent may have at most four direct children".into()),
+        _ => None,
     }
 }
 
@@ -2113,6 +2131,7 @@ fn respond(
         }
         IpcRequest::CancelTask { .. } => Ok(IpcResponse::Error {
             code: IpcErrorCode::ConfirmationRequired,
+            message: None,
         }),
         IpcRequest::PreviewCancel { .. } | IpcRequest::ConfirmCancel { .. } => {
             Err(IpcError::Io(std::io::Error::new(
@@ -2169,6 +2188,7 @@ fn respond(
         }
         IpcRequest::Review { .. } => Ok(IpcResponse::Error {
             code: IpcErrorCode::ConfirmationRequired,
+            message: None,
         }),
         IpcRequest::PreviewReview { task_id, decision } => {
             preview_review(coordinator, task_id, decision)

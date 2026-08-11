@@ -747,7 +747,7 @@ impl Tool for DaemonApplicationSendMessageTool {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
-            Ok(other) => ToolResult::error(format!("daemon rejected message: {other:?}")),
+            Ok(other) => ToolResult::error(format_ipc_rejection("message", &other)),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
     }
@@ -801,7 +801,7 @@ impl Tool for DaemonSendMessageTool {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
-            Ok(other) => ToolResult::error(format!("daemon rejected message: {other:?}")),
+            Ok(other) => ToolResult::error(format_ipc_rejection("message", &other)),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
     }
@@ -832,6 +832,20 @@ pub fn register_application_subagent_tools(
         caller_task_id,
         caller_capability: application_capability,
     }));
+}
+
+fn format_ipc_rejection(action: &str, response: &yi_agent_store::ipc::IpcResponse) -> String {
+    match response {
+        yi_agent_store::ipc::IpcResponse::Error {
+            code,
+            message: Some(message),
+        } => format!("daemon rejected {action}: {code}: {message}"),
+        yi_agent_store::ipc::IpcResponse::Error {
+            code,
+            message: None,
+        } => format!("daemon rejected {action}: {code}"),
+        other => format!("daemon rejected {action}: {other:?}"),
+    }
 }
 
 struct DaemonSpawnAgentTool {
@@ -893,7 +907,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
             ),
-            Ok(other) => ToolResult::error(format!("daemon rejected spawn request: {other:?}")),
+            Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
     }
@@ -943,7 +957,7 @@ impl Tool for DaemonWaitAgentTool {
             }) => ToolResult::text(
                 json!({ "status": status, "children": children, "reports": reports }).to_string(),
             ),
-            Ok(other) => ToolResult::error(format!("daemon rejected wait request: {other:?}")),
+            Ok(other) => ToolResult::error(format_ipc_rejection("wait request", &other)),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
     }
@@ -987,7 +1001,7 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
             ),
-            Ok(other) => ToolResult::error(format!("daemon rejected spawn request: {other:?}")),
+            Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
     }
@@ -1024,6 +1038,19 @@ mod tests {
         ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
             Ok(futures::stream::pending().boxed())
         }
+    }
+
+    #[test]
+    fn ipc_rejection_formatter_includes_error_message() {
+        let response = IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::InvalidState,
+            message: Some("an agent may have at most four direct children".into()),
+        };
+
+        assert_eq!(
+            format_ipc_rejection("spawn request", &response),
+            "daemon rejected spawn request: invalid_state: an agent may have at most four direct children"
+        );
     }
 
     #[derive(Default)]

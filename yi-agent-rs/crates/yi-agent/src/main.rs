@@ -19,6 +19,13 @@ use yi_agent_core::Provider;
 
 use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
 
+fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
+    match message {
+        Some(message) => format!("{code}: {message}"),
+        None => code.to_string(),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let _trace_guard = tracing_init::init(cli.debug);
@@ -242,9 +249,10 @@ fn control_agent(action: AgentAction) -> Result<()> {
         | yi_agent_store::ipc::IpcResponse::ReviewApproved
         | yi_agent_store::ipc::IpcResponse::ReviewReworkRequested
         | yi_agent_store::ipc::IpcResponse::ReviewRejected => Ok(()),
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            anyhow::bail!("runtime daemon rejected request: {code}")
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => anyhow::bail!(
+            "runtime daemon rejected request: {}",
+            format_ipc_error(code, message)
+        ),
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
     }
 }
@@ -276,9 +284,10 @@ fn show_review_preview(
             );
             Ok(())
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            anyhow::bail!("runtime daemon rejected review preview: {code}")
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => anyhow::bail!(
+            "runtime daemon rejected review preview: {}",
+            format_ipc_error(code, message)
+        ),
         other => anyhow::bail!("unexpected runtime review preview response: {other:?}"),
     }
 }
@@ -303,9 +312,10 @@ fn show_cancel_preview(socket: &std::path::Path, task_id: String, recursive: boo
             );
             Ok(())
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            anyhow::bail!("runtime daemon rejected cancel preview: {code}")
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => anyhow::bail!(
+            "runtime daemon rejected cancel preview: {}",
+            format_ipc_error(code, message)
+        ),
         other => anyhow::bail!("unexpected runtime cancel preview response: {other:?}"),
     }
 }
@@ -338,8 +348,11 @@ fn follow_task_events(socket: &std::path::Path, task_id: String) -> Result<()> {
                     "daemon event stream requires resync; rerun `yi-agent agent events --follow`"
                 )
             }
-            yi_agent_store::ipc::IpcResponse::Error { code } => {
-                anyhow::bail!("runtime daemon rejected event subscription: {code}")
+            yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+                anyhow::bail!(
+                    "runtime daemon rejected event subscription: {}",
+                    format_ipc_error(code, message)
+                )
             }
             other => anyhow::bail!("unexpected runtime event subscription response: {other:?}"),
         }
@@ -358,8 +371,11 @@ fn inspect_session(socket: &std::path::Path, task_id: &str) -> Result<String> {
         },
     )? {
         yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => Ok(detail.session_id),
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            anyhow::bail!("runtime daemon rejected request: {code}")
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected request: {}",
+                format_ipc_error(code, message)
+            )
         }
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
     }
@@ -407,8 +423,11 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
         yi_agent_store::ipc::IpcResponse::ScheduleCreated { schedule_id } => {
             println!("schedule created: {schedule_id}")
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            anyhow::bail!("runtime daemon rejected schedule: {code}")
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected schedule: {}",
+                format_ipc_error(code, message)
+            )
         }
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
     }
@@ -542,8 +561,11 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
         yi_agent_store::ipc::IpcResponse::UnsupportedProtocol { .. } => {
             anyhow::bail!("runtime daemon protocol is incompatible")
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            anyhow::bail!("runtime daemon rejected request: {code}")
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected request: {}",
+                format_ipc_error(code, message)
+            )
         }
         other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
     }

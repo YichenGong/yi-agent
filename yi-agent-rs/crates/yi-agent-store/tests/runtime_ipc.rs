@@ -402,6 +402,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         .unwrap(),
         IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            message: None,
         }
     );
 }
@@ -707,6 +708,7 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
         .unwrap(),
         IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            message: None,
         }
     );
     assert_eq!(
@@ -943,21 +945,22 @@ fn application_root_rejects_more_than_four_direct_children() {
         ));
     }
 
-    assert_eq!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::SpawnApplicationChild {
-                session_id,
-                parent_task_id: root_task_id,
-                capability: message_capability,
-                objective: "fifth child".into(),
-            },
-        )
-        .unwrap(),
-        IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::InvalidState,
-        }
-    );
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "fifth child".into(),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::Error { code, message } = response else {
+        panic!("expected direct child limit error, got {response:?}");
+    };
+    assert_eq!(code, yi_agent_store::ipc::IpcErrorCode::InvalidState);
+    assert!(message.unwrap().contains("at most four direct children"));
 }
 
 #[test]
@@ -1207,7 +1210,8 @@ fn schedule_ipc_validates_creates_lists_and_deletes() {
         )
         .unwrap(),
         IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::Validation
+            code: yi_agent_store::ipc::IpcErrorCode::Validation,
+            message: None,
         }
     ));
     let IpcResponse::ScheduleCreated { schedule_id } = send_request(
@@ -2343,6 +2347,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
         .unwrap(),
         IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            message: None,
         }
     );
 
@@ -2715,6 +2720,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
         response,
         IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            message: None,
         }
     );
 }
@@ -3605,7 +3611,8 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
     assert!(matches!(
         reused,
         IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired,
+            message: None,
         }
     ));
     let detail = RuntimeRepository::open(&database)
@@ -3720,7 +3727,8 @@ fn cancel_confirmation_rejects_a_preview_when_its_active_lease_scope_changes() {
         )
         .unwrap(),
         IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired,
+            message: None,
         }
     ));
 }
@@ -3742,7 +3750,8 @@ fn resolve_permission_ipc_uses_only_the_daemon_owned_request_identity() {
     assert!(matches!(
         response,
         IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::NotFound
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound,
+            message: None,
         }
     ));
 }
@@ -3909,7 +3918,8 @@ fn legacy_review_request_fails_instead_of_silently_previewing() {
     assert!(matches!(
         response,
         IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired,
+            message: None,
         }
     ));
 }
@@ -4086,7 +4096,8 @@ fn review_ipc_rejects_empty_rework_and_rejection_text() {
             )
             .unwrap(),
             IpcResponse::Error {
-                code: yi_agent_store::ipc::IpcErrorCode::Validation
+                code: yi_agent_store::ipc::IpcErrorCode::Validation,
+                message: None,
             }
         ));
     }
@@ -4178,7 +4189,8 @@ fn raw_cancel_request_cannot_bypass_confirmation() {
     assert!(matches!(
         response,
         IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired
+            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired,
+            message: None,
         }
     ));
 }

@@ -30,6 +30,13 @@ use super::statusbar::{StatusBarState, render_statusbar};
 
 const HISTORY_WHEEL_LINES: usize = 3;
 
+fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
+    match message {
+        Some(message) => format!("{code}: {message}"),
+        None => code.to_string(),
+    }
+}
+
 /// Run the ratatui TUI main loop with the real terminal.
 ///
 /// - `agent_rx`: receives agent events to display in history
@@ -1525,7 +1532,9 @@ fn daemon_task_session_at(socket: &std::path::Path, task_id: &str) -> Result<Str
     .map_err(|error| error.to_string())?
     {
         yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => Ok(detail.session_id),
-        yi_agent_store::ipc::IpcResponse::Error { code } => Err(code.to_string()),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            Err(format_ipc_error(code, message))
+        }
         _ => Err("daemon 返回了非任务详情响应".into()),
     }
 }
@@ -1666,9 +1675,10 @@ fn daemon_cancel_at(
         } else {
             format!("已取消任务: {task_id}")
         }),
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            Err(format!("daemon 拒绝取消请求: {code}"))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝取消请求: {}",
+            format_ipc_error(code, message)
+        )),
         _ => Err("daemon 返回了非取消响应".into()),
     }
 }
@@ -1693,9 +1703,10 @@ fn daemon_review_at(socket: &std::path::Path, task_id: &str) -> Result<String, S
         yi_agent_store::ipc::IpcResponse::TaskDiff { delivery_json, .. } => {
             Ok(format!("Delivery 审查 {task_id}\n{delivery_json}"))
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            Err(format!("daemon 拒绝审查请求: {code}"))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝审查请求: {}",
+            format_ipc_error(code, message)
+        )),
         _ => Err("daemon 返回了非审查响应".into()),
     }
 }
@@ -1731,9 +1742,10 @@ fn daemon_events_at(socket: &std::path::Path, task_id: &str) -> Result<String, S
             }
             Ok(output)
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            Err(format!("daemon 拒绝事件请求: {code}"))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝事件请求: {}",
+            format_ipc_error(code, message)
+        )),
         _ => Err("daemon 返回了非事件响应".into()),
     }
 }
@@ -1758,9 +1770,10 @@ fn daemon_diff_at(socket: &std::path::Path, task_id: &str) -> Result<String, Str
         yi_agent_store::ipc::IpcResponse::TaskDiff { delivery_json, .. } => {
             Ok(format!("Diff {task_id}\n{delivery_json}"))
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            Err(format!("daemon 拒绝 diff 请求: {code}"))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝 diff 请求: {}",
+            format_ipc_error(code, message)
+        )),
         _ => Err("daemon 返回了非 diff 响应".into()),
     }
 }
@@ -1795,9 +1808,10 @@ fn daemon_mailbox_at(socket: &std::path::Path, task_id: &str) -> Result<String, 
             }
             Ok(output)
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            Err(format!("daemon 拒绝 mailbox 请求: {code}"))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝 mailbox 请求: {}",
+            format_ipc_error(code, message)
+        )),
         _ => Err("daemon 返回了非 mailbox 响应".into()),
     }
 }
@@ -1930,9 +1944,10 @@ fn daemon_review_decision_at(
         yi_agent_store::ipc::IpcResponse::ReviewRejected => {
             Ok(format!("已拒绝 delivery: {task_id}"))
         }
-        yi_agent_store::ipc::IpcResponse::Error { code } => {
-            Err(format!("daemon 拒绝审查决策: {code}"))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝审查决策: {}",
+            format_ipc_error(code, message)
+        )),
         _ => Err("daemon 返回了非审查决策响应".into()),
     }
 }
