@@ -37,6 +37,22 @@ fn spawn_enforces_depth_two_and_four_direct_children() {
 }
 
 #[test]
+fn terminal_direct_children_do_not_block_future_spawns() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+
+    for index in 0..4 {
+        let child = supervisor.spawn(root.clone()).unwrap();
+        supervisor.start_task(&child).unwrap();
+        supervisor
+            .fail_task(&child, format!("historical child {index} finished"))
+            .unwrap();
+    }
+
+    assert!(supervisor.spawn(root).is_ok());
+}
+
+#[test]
 fn spawning_enqueues_child_and_emits_a_structured_event() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let root = supervisor.root_task_id().clone();

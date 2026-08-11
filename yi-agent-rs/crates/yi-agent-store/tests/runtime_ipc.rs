@@ -964,6 +964,76 @@ fn application_root_rejects_more_than_four_direct_children() {
 }
 
 #[test]
+fn application_root_reuses_direct_child_slots_after_terminal_reports() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-terminal-slot-reuse".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    for index in 0..4 {
+        assert!(matches!(
+            send_request(
+                daemon.socket_path(),
+                IpcRequest::SpawnApplicationChild {
+                    session_id: session_id.clone(),
+                    parent_task_id: root_task_id.clone(),
+                    capability: message_capability.clone(),
+                    objective: format!("historical child {index}"),
+                },
+            )
+            .unwrap(),
+            IpcResponse::TaskSpawned { .. }
+        ));
+        factory.handles.lock().unwrap()[index].report_completed(format!("done {index}"));
+    }
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::WaitAgent {
+                session_id: session_id.clone(),
+                caller_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                mode: "all".into(),
+                timeout_ms: Some(1_000),
+            },
+        )
+        .unwrap(),
+        IpcResponse::WaitCompleted { status, .. } if status == "completed"
+    ));
+
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id,
+                parent_task_id: root_task_id,
+                capability: message_capability,
+                objective: "new child after historical completions".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::TaskSpawned { .. }
+    ));
+}
+
+#[test]
 fn detached_paused_application_root_can_reattach_activate_and_spawn() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

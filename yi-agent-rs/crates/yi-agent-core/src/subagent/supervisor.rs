@@ -914,7 +914,15 @@ impl AgentSupervisor {
             .depth
             .can_spawn_child()
             .map_err(|_| SpawnError::MaximumDepthReached)?;
-        if self.children_of(&parent_id).len() >= MAX_DIRECT_CHILDREN {
+        let active_direct_children = self
+            .children_of(&parent_id)
+            .iter()
+            .filter(|child| {
+                self.task(child)
+                    .is_some_and(|task| !task.state().is_terminal())
+            })
+            .count();
+        if active_direct_children >= MAX_DIRECT_CHILDREN {
             return Err(SpawnError::DirectChildLimitReached);
         }
 
