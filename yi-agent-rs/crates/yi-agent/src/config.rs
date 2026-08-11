@@ -150,12 +150,6 @@ pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
         })
 }
 
-/// 确保目录存在,不存在则递归创建(类似 mkdir -p)。
-fn ensure_dir_exists(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("failed to create directory: {}", path.display()))
-}
-
 /// 加载 .env 文件到进程环境变量(不覆盖已存在的)。
 ///
 /// - `local_path`: 本地 .env 路径(必填,不存在则静默跳过)
@@ -204,23 +198,13 @@ pub fn is_workdir_explicit(cli: &Cli) -> bool {
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
 /// .env 加载:显式指定 workdir 时只加载指定目录,fallback 模式合并全局兜底。
-/// fallback 模式下自动创建 .yi-agent/ 目录(本地和全局)。
+/// fallback 模式下只读取已存在的 `.yi-agent/.env`,不主动创建目录。
 pub fn load(cli: &Cli) -> Result<Config> {
     let local_env_path = resolve_env_path(cli);
     let global_env_path = if is_workdir_explicit(cli) {
         None
     } else {
-        // fallback 模式:自动创建本地和全局 .yi-agent/ 目录
-        if let Some(parent) = local_env_path.parent() {
-            ensure_dir_exists(parent)?;
-        }
-        let global = resolve_global_env_path();
-        if let Some(ref g) = global {
-            if let Some(parent) = g.parent() {
-                ensure_dir_exists(parent)?;
-            }
-        }
-        global
+        resolve_global_env_path()
     };
     load_env_files(&local_env_path, global_env_path.as_deref());
 
@@ -945,35 +929,13 @@ mod tests {
     }
 
     #[test]
-    fn ensure_dir_exists_creates_missing_directory() {
-        let temp = std::env::temp_dir().join(".env_test_ensure_dir");
-        let target = temp.join("a/b/c");
-        assert!(!target.exists());
-
-        ensure_dir_exists(&target).unwrap();
-        assert!(target.is_dir());
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn ensure_dir_exists_noop_when_already_exists() {
-        let temp = std::env::temp_dir().join(".env_test_ensure_dir_exists");
-        std::fs::create_dir_all(&temp).unwrap();
-
-        ensure_dir_exists(&temp).unwrap();
-        assert!(temp.is_dir());
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_creates_local_yi_agent_dir_in_fallback_mode() {
+    fn load_does_not_create_local_yi_agent_dir_in_fallback_mode() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // fallback 模式下,当前目录的 .yi-agent/ 不存在时应自动创建
+        // fallback 模式只读取本地 .yi-agent/.env,不应污染启动目录。
         let temp = std::env::temp_dir().join(".env_test_auto_create_local");
+        std::fs::remove_dir_all(&temp).ok();
         std::fs::create_dir_all(&temp).unwrap();
         let yi_agent_dir = temp.join(".yi-agent");
         assert!(!yi_agent_dir.exists());
@@ -1008,8 +970,10 @@ mod tests {
         let result = load(&cli);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
 
-        // 验证 .yi-agent/ 目录已创建
-        assert!(yi_agent_dir.is_dir(), ".yi-agent/ should be auto-created");
+        assert!(
+            !yi_agent_dir.exists(),
+            ".yi-agent/ should not be created until yi-agent writes a project file"
+        );
         std::fs::remove_dir_all(&temp).ok();
     }
 
