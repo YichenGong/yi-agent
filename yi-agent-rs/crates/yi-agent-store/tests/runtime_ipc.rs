@@ -2199,6 +2199,106 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
 }
 
 #[test]
+fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let runtime_dir = directory.path().join("runtime");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon = Daemon::start_with_factory(&runtime_dir, &database, factory.clone()).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-wait-report-restart".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached root");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "Inspect child behavior".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child task");
+    };
+    factory.handles.lock().unwrap()[0].report_completed("sub-agent 正常完成，结果可读");
+
+    let IpcResponse::WaitCompleted { reports, .. } = send_request(
+        daemon.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id: session_id.clone(),
+            caller_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            mode: "all".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected initial wait completion");
+    };
+    assert_eq!(
+        reports[0].report.as_deref(),
+        Some("sub-agent 正常完成，结果可读")
+    );
+    drop(daemon);
+
+    let restarted = Daemon::start_with_factory(&runtime_dir, &database, factory).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        restarted.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-wait-report-restart".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected reattached root after restart");
+    };
+    let response = send_request(
+        restarted.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id,
+            caller_task_id: root_task_id,
+            capability: message_capability,
+            mode: "all".into(),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::WaitCompleted {
+        status,
+        children,
+        reports,
+    } = response
+    else {
+        panic!("expected wait completion after restart, got {response:?}");
+    };
+    assert_eq!(status, "completed");
+    assert_eq!(children, vec![task_id.clone()]);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].task_id, task_id);
+    assert_eq!(reports[0].state, "completed_no_changes");
+    assert_eq!(
+        reports[0].report.as_deref(),
+        Some("sub-agent 正常完成，结果可读")
+    );
+}
+
+#[test]
 fn daemon_wait_agent_returns_completed_child_reports() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

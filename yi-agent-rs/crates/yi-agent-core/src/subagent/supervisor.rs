@@ -232,6 +232,22 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    pub fn hydrate_completion_report(
+        &mut self,
+        task_id: TaskId,
+        report: String,
+    ) -> Result<(), String> {
+        if !self.tasks.contains_key(&task_id) {
+            return Err("hydrated completion report references a missing task".into());
+        }
+        self.completion_reports.insert(task_id, report);
+        Ok(())
+    }
+
+    pub fn completion_report(&self, task_id: &TaskId) -> Option<&str> {
+        self.completion_reports.get(task_id).map(String::as_str)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_recovered_child(
         &mut self,

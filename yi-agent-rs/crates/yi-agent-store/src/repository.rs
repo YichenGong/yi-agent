@@ -361,6 +361,7 @@ pub struct PersistedReviewHydrationTask {
     pub attempt_number: u32,
     pub state: String,
     pub delivery_json: String,
+    pub terminal_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3431,7 +3432,7 @@ impl RuntimeRepository {
         let mut statement = self.connection.prepare(
             "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth,
                     tasks.active_attempt_id, attempts.number, tasks.state_json,
-                    tasks.delivery_json
+                    tasks.delivery_json, attempts.terminal_json
              FROM tasks
              JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.root_session_id IN (
@@ -3455,10 +3456,21 @@ impl RuntimeRepository {
                     row.get::<_, u32>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })?
             .map(|row| {
-                let (session, task, parent, depth, attempt, number, state, delivery_json) = row?;
+                let (
+                    session,
+                    task,
+                    parent,
+                    depth,
+                    attempt,
+                    number,
+                    state,
+                    delivery_json,
+                    terminal_json,
+                ) = row?;
                 Ok(PersistedReviewHydrationTask {
                     session_id: session
                         .parse()
@@ -3488,6 +3500,7 @@ impl RuntimeRepository {
                     attempt_number: number,
                     state,
                     delivery_json,
+                    terminal_json,
                 })
             })
             .collect()
@@ -3500,7 +3513,7 @@ impl RuntimeRepository {
         let mut statement = self.connection.prepare(
             "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth,
                     tasks.active_attempt_id, attempts.number, tasks.state_json,
-                    tasks.delivery_json
+                    tasks.delivery_json, attempts.terminal_json
              FROM tasks
              JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.root_session_id = ?1
@@ -3517,10 +3530,21 @@ impl RuntimeRepository {
                     row.get::<_, u32>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })?
             .map(|row| {
-                let (session, task, parent, depth, attempt, number, state, delivery_json) = row?;
+                let (
+                    session,
+                    task,
+                    parent,
+                    depth,
+                    attempt,
+                    number,
+                    state,
+                    delivery_json,
+                    terminal_json,
+                ) = row?;
                 Ok(PersistedReviewHydrationTask {
                     session_id: session
                         .parse()
@@ -3556,6 +3580,7 @@ impl RuntimeRepository {
                     attempt_number: number,
                     state,
                     delivery_json,
+                    terminal_json,
                 })
             })
             .collect()

@@ -316,11 +316,15 @@ impl RuntimeCoordinator {
                     candidate.session_id == task.session_id && candidate.depth < task.depth
                 }) {
                     let ancestor_depth = persisted_depth(ancestor.depth)?;
-                    let (state, delivery, objective) =
-                        hydrated_review_state(&ancestor.state, &ancestor.delivery_json)?;
+                    let (state, delivery, objective, completion_report) = hydrated_review_state(
+                        &ancestor.state,
+                        &ancestor.delivery_json,
+                        ancestor.terminal_json.as_deref(),
+                    )?;
+                    let task_id = ancestor.task_id.clone();
                     let hydrated = AgentTask::hydrated_review_task(
                         ancestor.session_id.clone(),
-                        ancestor.task_id.clone(),
+                        task_id.clone(),
                         ancestor.parent_id.clone(),
                         ancestor_depth,
                         ancestor.attempt_id.clone(),
@@ -332,9 +336,17 @@ impl RuntimeCoordinator {
                         if !supervisors.contains_key(&ancestor.session_id) {
                             supervisors.insert(
                                 ancestor.session_id.clone(),
-                                Arc::new(AsyncMutex::new(
-                                    AgentSupervisor::from_hydrated_review_root(hydrated, objective),
-                                )),
+                                Arc::new(AsyncMutex::new({
+                                    let mut supervisor = AgentSupervisor::from_hydrated_review_root(
+                                        hydrated, objective,
+                                    );
+                                    hydrate_completion_report(
+                                        &mut supervisor,
+                                        task_id,
+                                        completion_report,
+                                    )?;
+                                    supervisor
+                                })),
                             );
                         }
                         continue;
@@ -353,6 +365,7 @@ impl RuntimeCoordinator {
                         supervisor
                             .insert_hydrated_review_child(hydrated, objective)
                             .map_err(RuntimeCoordinatorError::Supervisor)?;
+                        hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                     }
                 }
                 let supervisor = supervisors.get(&task.session_id).ok_or_else(|| {
@@ -405,11 +418,15 @@ impl RuntimeCoordinator {
                 continue;
             }
             let depth = persisted_depth(task.depth)?;
-            let (state, delivery, objective) =
-                hydrated_review_state(&task.state, &task.delivery_json)?;
+            let (state, delivery, objective, completion_report) = hydrated_review_state(
+                &task.state,
+                &task.delivery_json,
+                task.terminal_json.as_deref(),
+            )?;
+            let task_id = task.task_id.clone();
             let hydrated = AgentTask::hydrated_review_task(
                 task.session_id.clone(),
-                task.task_id.clone(),
+                task_id.clone(),
                 task.parent_id.clone(),
                 depth,
                 task.attempt_id.clone(),
@@ -420,12 +437,15 @@ impl RuntimeCoordinator {
             if task.parent_id.is_none() {
                 supervisors.insert(
                     task.session_id.clone(),
-                    Arc::new(AsyncMutex::new(AgentSupervisor::from_hydrated_review_root(
-                        hydrated, objective,
-                    ))),
+                    Arc::new(AsyncMutex::new({
+                        let mut supervisor =
+                            AgentSupervisor::from_hydrated_review_root(hydrated, objective);
+                        hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
+                        supervisor
+                    })),
                 );
             } else {
-                supervisors
+                let mut supervisor = supervisors
                     .get(&task.session_id)
                     .ok_or_else(|| {
                         RuntimeCoordinatorError::Supervisor(
@@ -435,9 +455,11 @@ impl RuntimeCoordinator {
                     .try_lock()
                     .map_err(|_| {
                         RuntimeCoordinatorError::Supervisor("review hydration is busy".into())
-                    })?
+                    })?;
+                supervisor
                     .insert_hydrated_review_child(hydrated, objective)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
+                hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
             }
         }
         for task in &review_tasks {
@@ -705,11 +727,15 @@ impl RuntimeCoordinator {
         let mut hydrated_supervisor = None;
         for task in tasks {
             let depth = persisted_depth(task.depth)?;
-            let (state, delivery, objective) =
-                hydrated_application_root_state(&task.state, &task.delivery_json)?;
+            let (state, delivery, objective, completion_report) = hydrated_application_root_state(
+                &task.state,
+                &task.delivery_json,
+                task.terminal_json.as_deref(),
+            )?;
+            let task_id = task.task_id.clone();
             let hydrated = AgentTask::hydrated_review_task(
                 task.session_id.clone(),
-                task.task_id.clone(),
+                task_id.clone(),
                 task.parent_id.clone(),
                 depth,
                 task.attempt_id.clone(),
@@ -718,9 +744,10 @@ impl RuntimeCoordinator {
                 delivery,
             );
             if task.parent_id.is_none() {
-                hydrated_supervisor = Some(AgentSupervisor::from_hydrated_review_root(
-                    hydrated, objective,
-                ));
+                let mut supervisor =
+                    AgentSupervisor::from_hydrated_review_root(hydrated, objective);
+                hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
+                hydrated_supervisor = Some(supervisor);
             } else {
                 let supervisor = hydrated_supervisor.as_mut().ok_or_else(|| {
                     RuntimeCoordinatorError::Supervisor(
@@ -730,6 +757,7 @@ impl RuntimeCoordinator {
                 supervisor
                     .insert_hydrated_review_child(hydrated, objective)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
+                hydrate_completion_report(supervisor, task_id, completion_report)?;
             }
         }
         let supervisor = hydrated_supervisor.ok_or_else(|| {
@@ -2387,16 +2415,20 @@ impl RuntimeCoordinator {
                     yi_agent_core::TaskState::Paused(_) => {
                         ("paused", RuntimeEvent::TaskPaused, None)
                     }
-                    yi_agent_core::TaskState::CompletedNoChanges => {
-                        ("completed_no_changes", RuntimeEvent::TaskCompleted, None)
-                    }
+                    yi_agent_core::TaskState::CompletedNoChanges => (
+                        "completed_no_changes",
+                        RuntimeEvent::TaskCompleted,
+                        Some(text_completion_terminal_json(
+                            supervisor.completion_report(&task_id),
+                        )?),
+                    ),
                     yi_agent_core::TaskState::Blocked(reason) => (
                         "blocked",
                         RuntimeEvent::TaskBlocked,
                         reason
                             .0
                             .strip_prefix("recovery_conflict:")
-                            .map(|_| r#"{"reason":"recovery_conflict"}"#),
+                            .map(|_| r#"{"reason":"recovery_conflict"}"#.to_string()),
                     ),
                     yi_agent_core::TaskState::Cancelled(_) => {
                         ("cancelled", RuntimeEvent::TaskCancelled, None)
@@ -2467,7 +2499,7 @@ impl RuntimeCoordinator {
                     &attempt,
                     state,
                     event,
-                    terminal_json,
+                    &terminal_json,
                 )?;
             } else {
                 repository.transition_task_and_attempt(&task_id, &attempt, state, event)?;
@@ -2698,6 +2730,36 @@ struct ProviderTurnAdmissions {
     notify: Arc<Notify>,
 }
 
+fn text_completion_terminal_json(report: Option<&str>) -> Result<String, RuntimeCoordinatorError> {
+    serde_json::to_string(&serde_json::json!({
+        "kind": "text_completion",
+        "report": report.unwrap_or(""),
+    }))
+    .map_err(RepositoryError::from)
+    .map_err(RuntimeCoordinatorError::from)
+}
+
+fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
+    let payload = serde_json::from_str::<serde_json::Value>(terminal_json?).ok()?;
+    (payload.get("kind").and_then(serde_json::Value::as_str) == Some("text_completion"))
+        .then(|| payload.get("report").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_owned)
+}
+
+fn hydrate_completion_report(
+    supervisor: &mut AgentSupervisor,
+    task_id: TaskId,
+    report: Option<String>,
+) -> Result<(), RuntimeCoordinatorError> {
+    if let Some(report) = report {
+        supervisor
+            .hydrate_completion_report(task_id, report)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+    }
+    Ok(())
+}
+
 fn daemon_review_actor_json(parent: &TaskId) -> Result<String, RuntimeCoordinatorError> {
     serde_json::to_string(&serde_json::json!({
         "kind": "task",
@@ -2774,7 +2836,8 @@ fn sync_foreground_root_running(
 fn hydrated_application_root_state(
     state: &str,
     delivery_json: &str,
-) -> Result<(TaskState, Option<DeliveryReport>, String), RuntimeCoordinatorError> {
+    terminal_json: Option<&str>,
+) -> Result<(TaskState, Option<DeliveryReport>, String, Option<String>), RuntimeCoordinatorError> {
     let payload =
         serde_json::from_str::<serde_json::Value>(delivery_json).map_err(RepositoryError::from)?;
     let objective = payload
@@ -2839,13 +2902,15 @@ fn hydrated_application_root_state(
             )));
         }
     };
-    Ok((state, delivery, objective))
+    let completion_report = text_completion_report(terminal_json);
+    Ok((state, delivery, objective, completion_report))
 }
 
 fn hydrated_review_state(
     state: &str,
     delivery_json: &str,
-) -> Result<(TaskState, Option<DeliveryReport>, String), RuntimeCoordinatorError> {
+    terminal_json: Option<&str>,
+) -> Result<(TaskState, Option<DeliveryReport>, String, Option<String>), RuntimeCoordinatorError> {
     let payload =
         serde_json::from_str::<serde_json::Value>(delivery_json).map_err(RepositoryError::from)?;
     let objective = payload
@@ -2910,7 +2975,8 @@ fn hydrated_review_state(
             )));
         }
     };
-    Ok((state, delivery, objective))
+    let completion_report = text_completion_report(terminal_json);
+    Ok((state, delivery, objective, completion_report))
 }
 
 fn review_parent_notification(
