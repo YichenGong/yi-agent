@@ -2427,6 +2427,79 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
 }
 
 #[test]
+fn daemon_wait_completed_report_wakes_before_timeout() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-wait-completed-wake".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached root");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "reply quickly".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected child task");
+    };
+
+    let socket = daemon.socket_path().to_path_buf();
+    let (wait_tx, wait_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let response = send_request(
+            &socket,
+            IpcRequest::WaitAgent {
+                session_id,
+                caller_task_id: root_task_id,
+                capability: message_capability,
+                mode: "all".into(),
+                timeout_ms: Some(1_000),
+            },
+        );
+        wait_tx.send(response).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    factory.handles.lock().unwrap()[0].report_completed("hello from subagent");
+
+    let response = wait_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("completed report should wake wait_agent before timeout")
+        .unwrap();
+    let IpcResponse::WaitCompleted {
+        status,
+        children,
+        reports,
+    } = response
+    else {
+        panic!("expected wait completion");
+    };
+    assert_eq!(status, "completed");
+    assert_eq!(children, vec![task_id.clone()]);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].task_id, task_id);
+    assert_eq!(reports[0].report.as_deref(), Some("hello from subagent"));
+}
+
+#[test]
 fn daemon_wait_timeout_does_not_bypass_application_capability() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

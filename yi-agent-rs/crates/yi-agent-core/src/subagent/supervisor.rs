@@ -682,6 +682,7 @@ impl AgentSupervisor {
                 self.workers.remove(&task_id);
                 self.worker_message_capabilities.remove(&task_id);
                 changed.push(task_id);
+                self.notify_update();
             }
         }
         Ok(changed)

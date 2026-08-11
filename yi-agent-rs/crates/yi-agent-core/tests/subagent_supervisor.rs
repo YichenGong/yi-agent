@@ -615,6 +615,39 @@ async fn wait_any_returns_only_terminal_child_reports() {
 }
 
 #[tokio::test]
+async fn completed_worker_report_wakes_wait_agent() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    let supervisor = Arc::new(Mutex::new(supervisor));
+    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
+
+    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "all" })).await });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    handle.report_completed("finished quickly");
+    supervisor
+        .lock()
+        .unwrap()
+        .reconcile_worker_events()
+        .unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+        .await
+        .expect("completed worker report should wake wait_agent")
+        .unwrap();
+    assert!(!result.is_error);
+    assert!(matches!(
+        &result.content[0],
+        ContentBlock::Text(text) if text.contains("finished quickly")
+    ));
+}
+
+#[tokio::test]
 async fn wait_agent_returns_completed_child_reports() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let root = supervisor.root_task_id().clone();
