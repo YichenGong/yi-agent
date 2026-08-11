@@ -1968,6 +1968,51 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
 }
 
 #[test]
+fn daemon_lists_compact_task_summaries() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    let other_root = RootSessionId::new();
+    let completed_task = TaskId::new();
+    repository
+        .create_task(&completed_task, &other_root, "completed_no_changes")
+        .unwrap();
+
+    let IpcResponse::TaskSummaries { tasks } = send_request(
+        daemon.socket_path(),
+        IpcRequest::ListTaskSummaries {
+            session_id: Some(root.to_string()),
+            active_only: false,
+        },
+    )
+    .unwrap() else {
+        panic!("expected task summaries");
+    };
+
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].task_id, task.to_string());
+    assert_eq!(tasks[0].state, "queued");
+    assert!(tasks[0].is_root);
+
+    let IpcResponse::TaskSummaries { tasks } = send_request(
+        daemon.socket_path(),
+        IpcRequest::ListTaskSummaries {
+            session_id: None,
+            active_only: true,
+        },
+    )
+    .unwrap() else {
+        panic!("expected active task summaries");
+    };
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].task_id, task.to_string());
+}
+
+#[test]
 fn slow_daemon_subscriber_gets_one_framed_resync_without_affecting_another_client() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

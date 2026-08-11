@@ -1201,6 +1201,9 @@ fn run_tui_agent(
                                         runtime.socket_path.clone(),
                                         runtime.attached_root.clone(),
                                     ));
+                                    crate::tui::subagents::set_current_attached_root(
+                                        runtime.attached_root.clone(),
+                                    );
                                     let runtime_workdir = runtime.attached_root.workspace.path.clone();
                                     let next_tools = Arc::new(build_tui_root_tools(
                                         &base_registry,

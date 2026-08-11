@@ -1165,11 +1165,11 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Agents => {
-            let label = match daemon_agents_summary() {
+            let text = match daemon_agents_summary(args.as_deref()) {
                 Ok(summary) => summary,
                 Err(error) => format!("无法读取本地 daemon runtime: {error}"),
             };
-            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            history.push(HistoryCell::Markdown { text }, width);
             KeyOutcome::None
         }
         SlashCommand::Agent => {
@@ -1340,12 +1340,12 @@ fn execute_slash_command(
     }
 }
 
-fn daemon_agents_summary() -> Result<String, String> {
+fn daemon_agents_summary(args: Option<&str>) -> Result<String, String> {
     let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
         .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_agents_summary_at(&runtime_dir.join("runtime.sock"))
+    daemon_agents_summary_at(&runtime_dir.join("runtime.sock"), args)
 }
 
 fn daemon_agent_detail(task_id: &str) -> Result<String, String> {
@@ -1952,26 +1952,70 @@ fn daemon_review_decision_at(
     }
 }
 
-fn daemon_agents_summary_at(socket: &std::path::Path) -> Result<String, String> {
+fn daemon_agents_summary_at(
+    socket: &std::path::Path,
+    args: Option<&str>,
+) -> Result<String, String> {
+    let (session_id, active_only, title, excluded_task_id, empty_label) =
+        match args.map(str::trim).filter(|args| !args.is_empty()) {
+            None => {
+                let root = crate::tui::subagents::current_attached_root().ok_or_else(|| {
+                    "当前 TUI 未接入 subagent runtime；使用 /agents --all 查看 daemon 全部任务"
+                        .to_string()
+                })?;
+                (
+                    Some(root.session_id),
+                    false,
+                    "Current session",
+                    Some(root.task_id),
+                    "暂无子任务",
+                )
+            }
+            Some("--all") => (None, false, "All agents", None, "暂无任务"),
+            Some("--active") => (None, true, "Active agents", None, "暂无任务"),
+            Some(_) => return Err("用法: /agents [--all|--active]".into()),
+        };
     let response = yi_agent_store::ipc::send_request(
         socket,
-        yi_agent_store::ipc::IpcRequest::SubscribeEvents {
-            after_event_id: 0,
-            filters: yi_agent_store::ipc::SubscriptionFilters::default(),
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id,
+            active_only,
         },
     )
     .map_err(|error| error.to_string())?;
-    let yi_agent_store::ipc::IpcResponse::Subscription(snapshot) = response else {
-        return Err("daemon 返回了非订阅快照响应".into());
+    let yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } = response else {
+        return Err("daemon 返回了非任务摘要响应".into());
     };
-    if snapshot.tasks.is_empty() {
-        return Ok("Agents: 暂无任务".into());
+    Ok(format_agents_summary(
+        title,
+        tasks,
+        excluded_task_id.as_deref(),
+        empty_label,
+    ))
+}
+
+fn format_agents_summary(
+    title: &str,
+    tasks: Vec<yi_agent_store::ipc::IpcTaskSummary>,
+    excluded_task_id: Option<&str>,
+    empty_label: &str,
+) -> String {
+    let tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|task| Some(task.task_id.as_str()) != excluded_task_id)
+        .collect();
+    if tasks.is_empty() {
+        return format!("**{title}**\n\n{empty_label}");
     }
-    let mut output = format!("Agents ({})", snapshot.tasks.len());
-    for task in snapshot.tasks {
-        output.push_str(&format!("\n{}  {}", task.task_id, task.state));
+    let mut output = format!("**{title} ({})**", tasks.len());
+    for task in tasks {
+        let root_label = task.is_root.then_some(" **root**").unwrap_or_default();
+        output.push_str(&format!(
+            "\n- `{}`: {}{}",
+            task.task_id, task.state, root_label
+        ));
     }
-    Ok(output)
+    output
 }
 
 /// Build the popup widget for rendering.
@@ -2436,10 +2480,53 @@ mod tests {
             .create_task(&task, &RootSessionId::new(), "queued")
             .unwrap();
 
-        let summary = daemon_agents_summary_at(daemon.socket_path()).unwrap();
+        let summary = daemon_agents_summary_at(daemon.socket_path(), Some("--all")).unwrap();
 
+        assert!(summary.starts_with("**All agents (1)**"));
+        assert!(summary.contains(&format!("- `{task}`: queued")));
         assert!(summary.contains(&task.to_string()));
         assert!(summary.contains("queued"));
+    }
+
+    #[test]
+    fn current_agents_summary_excludes_the_attached_root_task() {
+        let summary = format_agents_summary(
+            "Current session",
+            vec![
+                yi_agent_store::ipc::IpcTaskSummary {
+                    task_id: "root".into(),
+                    state: "queued".into(),
+                    is_root: true,
+                },
+                yi_agent_store::ipc::IpcTaskSummary {
+                    task_id: "child".into(),
+                    state: "running".into(),
+                    is_root: false,
+                },
+            ],
+            Some("root"),
+            "暂无子任务",
+        );
+
+        assert!(!summary.contains("root"));
+        assert!(summary.contains("Current session (1)"));
+        assert!(summary.contains("`child`: running"));
+    }
+
+    #[test]
+    fn all_agents_summary_marks_root_tasks() {
+        let summary = format_agents_summary(
+            "All agents",
+            vec![yi_agent_store::ipc::IpcTaskSummary {
+                task_id: "root".into(),
+                state: "running".into(),
+                is_root: true,
+            }],
+            None,
+            "暂无任务",
+        );
+
+        assert!(summary.contains("`root`: running **root**"));
     }
 
     #[test]

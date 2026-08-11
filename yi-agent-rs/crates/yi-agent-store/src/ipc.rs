@@ -247,6 +247,12 @@ pub enum IpcRequest {
     InspectTask {
         task_id: String,
     },
+    ListTaskSummaries {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default)]
+        active_only: bool,
+    },
     ReadTaskEvents {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,6 +347,9 @@ pub enum IpcResponse {
         reports: Vec<IpcCompletedChildReport>,
     },
     TaskDetail(IpcTaskDetail),
+    TaskSummaries {
+        tasks: Vec<IpcTaskSummary>,
+    },
     TaskEvents {
         events: Vec<IpcEvent>,
     },
@@ -463,6 +472,13 @@ pub struct IpcTask {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkerWorkspace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcTaskSummary {
+    pub task_id: String,
+    pub state: String,
+    pub is_root: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -912,7 +928,7 @@ fn handle_client(
                 after_event_id,
                 filters,
             } => {
-                return match stream_subscription(
+                let subscription = stream_subscription(
                     &mut stream,
                     database_path,
                     Arc::clone(stop),
@@ -920,18 +936,12 @@ fn handle_client(
                     after_event_id,
                     filters,
                     &envelope.request_id,
-                ) {
-                    Ok(()) => Ok(()),
-                    Err(_) => write_response_frame(
-                        &mut stream,
-                        &envelope.request_id,
-                        None,
-                        &IpcResponse::Error {
-                            code: IpcErrorCode::Internal,
-                            message: None,
-                        },
-                    ),
-                };
+                );
+                return respond_to_subscription_result(
+                    &mut stream,
+                    &envelope.request_id,
+                    subscription,
+                );
             }
             IpcRequest::PreviewCancel { task_id, recursive } => {
                 match preview_cancel(database_path, confirmations, task_id, recursive) {
@@ -965,6 +975,30 @@ fn handle_client(
         },
     };
     write_response_frame(&mut stream, &request_id, None, &response)
+}
+
+fn respond_to_subscription_result(
+    stream: &mut UnixStream,
+    request_id: &str,
+    result: Result<(), SubscriptionFailure>,
+) -> Result<(), IpcError> {
+    match result {
+        Ok(()) | Err(SubscriptionFailure::AfterInitialFrame) => Ok(()),
+        Err(SubscriptionFailure::BeforeInitialFrame) => write_response_frame(
+            stream,
+            request_id,
+            None,
+            &IpcResponse::Error {
+                code: IpcErrorCode::Internal,
+                message: None,
+            },
+        ),
+    }
+}
+
+enum SubscriptionFailure {
+    BeforeInitialFrame,
+    AfterInitialFrame,
 }
 
 fn preview_cancel(
@@ -1113,9 +1147,12 @@ fn stream_subscription(
     after_event_id: i64,
     filters: SubscriptionFilters,
     request_id: &str,
-) -> Result<(), IpcError> {
-    let mut repository = RuntimeRepository::open(database_path)?;
-    let snapshot = repository.subscription_snapshot(after_event_id)?;
+) -> Result<(), SubscriptionFailure> {
+    let mut repository = RuntimeRepository::open(database_path)
+        .map_err(|_| SubscriptionFailure::BeforeInitialFrame)?;
+    let snapshot = repository
+        .subscription_snapshot(after_event_id)
+        .map_err(|_| SubscriptionFailure::BeforeInitialFrame)?;
     let mut cursor = snapshot.high_water_event_id;
     write_response_frame(
         stream,
@@ -1139,7 +1176,8 @@ fn stream_subscription(
                 .filter(|event| filters.matches(event))
                 .collect(),
         }),
-    )?;
+    )
+    .map_err(|_| SubscriptionFailure::AfterInitialFrame)?;
 
     let pending = Arc::new(PendingSubscriptionFrames::new(
         request_id,
@@ -1179,12 +1217,11 @@ fn stream_subscription(
     let write_result = write_subscription_frames(stream, &pending, &stop);
     subscription_stop.store(true, Ordering::Release);
     pending.close();
-    let producer_result = producer.join().map_err(|_| {
-        IpcError::Io(std::io::Error::other(
-            "subscription producer thread panicked",
-        ))
-    })?;
-    write_result?;
+    let producer_result = producer
+        .join()
+        .map_err(|_| SubscriptionFailure::AfterInitialFrame)?
+        .map_err(|_| SubscriptionFailure::AfterInitialFrame);
+    write_result.map_err(|_| SubscriptionFailure::AfterInitialFrame)?;
     producer_result
 }
 
@@ -1709,6 +1746,24 @@ mod subscription_queue_tests {
                 message: None,
             }
         );
+    }
+
+    #[test]
+    fn subscription_failure_after_initial_frame_does_not_append_an_error_frame() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(br#"{"partial":"#).unwrap();
+
+        respond_to_subscription_result(
+            &mut writer,
+            "subscription-client",
+            Err(SubscriptionFailure::AfterInitialFrame),
+        )
+        .unwrap();
+        writer.shutdown(Shutdown::Write).unwrap();
+
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, br#"{"partial":"#);
     }
 
     #[test]
@@ -2355,6 +2410,25 @@ fn respond(
                 delivery_json: detail.delivery_json,
                 workspace: detail.workspace,
             }))
+        }
+        IpcRequest::ListTaskSummaries {
+            session_id,
+            active_only,
+        } => {
+            let session_id = session_id
+                .as_deref()
+                .map(parse_id::<RootSessionId>)
+                .transpose()?;
+            let tasks = repository
+                .task_summaries(session_id.as_ref(), active_only)?
+                .into_iter()
+                .map(|task| IpcTaskSummary {
+                    task_id: task.task_id,
+                    state: task.state,
+                    is_root: task.is_root,
+                })
+                .collect();
+            Ok(IpcResponse::TaskSummaries { tasks })
         }
         IpcRequest::ReadTaskEvents {
             task_id,

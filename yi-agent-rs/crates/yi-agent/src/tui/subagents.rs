@@ -1,6 +1,7 @@
 //! TUI-facing subagent runtime attachment model.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use yi_agent_core::ToolRegistry;
 use yi_agent_core::subagent::worker::WorkerWorkspace;
@@ -20,6 +21,23 @@ pub struct AttachedRoot {
     pub task_id: String,
     pub capability: String,
     pub workspace: WorkerWorkspace,
+}
+
+static CURRENT_ATTACHED_ROOT: OnceLock<Mutex<Option<AttachedRoot>>> = OnceLock::new();
+
+pub fn set_current_attached_root(root: AttachedRoot) {
+    *CURRENT_ATTACHED_ROOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("current attached root mutex poisoned") = Some(root);
+}
+
+pub fn current_attached_root() -> Option<AttachedRoot> {
+    CURRENT_ATTACHED_ROOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("current attached root mutex poisoned")
+        .clone()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

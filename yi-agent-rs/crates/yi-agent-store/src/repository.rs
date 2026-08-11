@@ -294,6 +294,13 @@ pub struct PersistedTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTaskSummary {
+    pub task_id: String,
+    pub state: String,
+    pub is_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedAdmissionCursor {
     pub root_id: Option<RootSessionId>,
     pub parent_id: Option<TaskId>,
@@ -3615,6 +3622,48 @@ impl RuntimeRepository {
             workspace: self.task_workspace_optional(task)?,
             ..detail
         })
+    }
+
+    pub fn task_summaries(
+        &self,
+        root_session_id: Option<&RootSessionId>,
+        active_only: bool,
+    ) -> Result<Vec<PersistedTaskSummary>, RepositoryError> {
+        let (sql, parameters): (&str, Vec<String>) = match (root_session_id, active_only) {
+            (Some(session), false) => (
+                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                 WHERE root_session_id = ?1 ORDER BY created_at, id",
+                vec![session.to_string()],
+            ),
+            (None, true) => (
+                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                 WHERE state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
+                 ORDER BY created_at, id",
+                Vec::new(),
+            ),
+            (None, false) => (
+                "SELECT id, state_json, parent_id IS NULL FROM tasks ORDER BY created_at, id",
+                Vec::new(),
+            ),
+            (Some(session), true) => (
+                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                 WHERE root_session_id = ?1
+                   AND state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
+                 ORDER BY created_at, id",
+                vec![session.to_string()],
+            ),
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok(PersistedTaskSummary {
+                    task_id: row.get(0)?,
+                    state: row.get(1)?,
+                    is_root: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RepositoryError::Sql)
     }
 
     /// Returns a task and, when requested, all descendants in stable tree order.

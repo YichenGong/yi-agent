@@ -113,7 +113,7 @@ impl SlashCommand {
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
             SlashCommand::Help => "显示帮助信息",
-            SlashCommand::Agents => "显示 agent 任务树",
+            SlashCommand::Agents => "显示当前 session 的 agent 任务树",
             SlashCommand::Agent => "显示单个 agent 详情 (需要任务 ID)",
             SlashCommand::Events => "查看任务事件 (需要任务 ID)",
             SlashCommand::Diff => "查看任务 diff (需要任务 ID)",
@@ -141,6 +141,7 @@ impl SlashCommand {
             return (!spec.usage.is_empty()).then_some(spec.usage);
         }
         match self {
+            SlashCommand::Agents => Some("[--all|--active]"),
             SlashCommand::Model => Some("<model-name>"),
             SlashCommand::Agent => Some("<task-id>"),
             SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
