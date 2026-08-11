@@ -2275,12 +2275,23 @@ fn respond(
             };
             let (status, children, reports) = match outcome {
                 Err(_) => {
-                    let children = coordinator
-                        .direct_children(&session_id, &caller_task_id)?
-                        .into_iter()
-                        .map(|child| child.to_string())
-                        .collect();
-                    ("timeout".into(), children, Vec::new())
+                    let (children, reports) =
+                        coordinator.child_completion_snapshot(&session_id, &caller_task_id)?;
+                    (
+                        "timeout".into(),
+                        children
+                            .into_iter()
+                            .map(|child| child.to_string())
+                            .collect(),
+                        reports
+                            .into_iter()
+                            .map(|report| IpcCompletedChildReport {
+                                task_id: report.task_id.to_string(),
+                                state: report.state,
+                                report: report.report,
+                            })
+                            .collect(),
+                    )
                 }
                 Ok(outcome) => match outcome? {
                     yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention => {

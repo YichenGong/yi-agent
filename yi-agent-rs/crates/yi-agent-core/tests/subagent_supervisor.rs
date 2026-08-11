@@ -585,6 +585,36 @@ async fn wait_any_returns_after_the_first_terminal_child() {
 }
 
 #[tokio::test]
+async fn wait_any_returns_only_terminal_child_reports() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let first = supervisor.spawn(root.clone()).unwrap();
+    let second = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &first).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    supervisor.start_task(&second).unwrap();
+    handle.report_completed("first result");
+    supervisor.reconcile_worker_events().unwrap();
+    let supervisor = Arc::new(Mutex::new(supervisor));
+    let wait_tool = SupervisorTools::new(supervisor, root).wait_agent();
+
+    let result = wait_tool.call(json!({ "mode": "any" })).await;
+
+    assert!(!result.is_error);
+    let text = match &result.content[0] {
+        ContentBlock::Text(text) => text,
+        other => panic!("expected text result, got {other:?}"),
+    };
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["children"], json!([first.to_string()]));
+    assert_eq!(value["reports"].as_array().unwrap().len(), 1);
+    assert_eq!(value["reports"][0]["task_id"], first.to_string());
+    assert_eq!(value["reports"][0]["report"], "first result");
+}
+
+#[tokio::test]
 async fn wait_agent_returns_completed_child_reports() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let root = supervisor.root_task_id().clone();

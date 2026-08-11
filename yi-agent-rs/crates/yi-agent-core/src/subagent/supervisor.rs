@@ -832,11 +832,20 @@ impl AgentSupervisor {
             return Some(WaitOutcome::NeedsAttention);
         }
         let children = self.children_of(caller);
-        let complete = match mode {
-            WaitMode::Any => children.iter().any(|child| {
+        let completed_children: Vec<TaskId> = children
+            .iter()
+            .filter(|child| {
                 self.task(child)
                     .is_some_and(|task| task.state().is_terminal())
-            }),
+            })
+            .cloned()
+            .collect();
+        let selected_children = match mode {
+            WaitMode::Any => completed_children,
+            WaitMode::All => children.to_vec(),
+        };
+        let complete = match mode {
+            WaitMode::Any => !selected_children.is_empty(),
             WaitMode::All => {
                 !children.is_empty()
                     && children.iter().all(|child| {
@@ -846,19 +855,40 @@ impl AgentSupervisor {
             }
         };
         complete.then(|| WaitOutcome::Completed {
-            children: children.to_vec(),
-            reports: children
-                .iter()
-                .filter_map(|child| {
-                    let task = self.task(child)?;
-                    Some(CompletedChildReport {
-                        task_id: child.clone(),
-                        state: task_state_label(task.state()).to_string(),
-                        report: self.completion_reports.get(child).cloned(),
-                    })
-                })
-                .collect(),
+            reports: self.completed_child_reports(&selected_children),
+            children: selected_children,
         })
+    }
+
+    pub fn child_completion_snapshot(
+        &self,
+        caller: &TaskId,
+    ) -> (Vec<TaskId>, Vec<CompletedChildReport>) {
+        let children = self.children_of(caller).to_vec();
+        let terminal_children = children
+            .iter()
+            .filter(|child| {
+                self.task(child)
+                    .is_some_and(|task| task.state().is_terminal())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let reports = self.completed_child_reports(&terminal_children);
+        (children, reports)
+    }
+
+    fn completed_child_reports(&self, children: &[TaskId]) -> Vec<CompletedChildReport> {
+        children
+            .iter()
+            .filter_map(|child| {
+                let task = self.task(child)?;
+                Some(CompletedChildReport {
+                    task_id: child.clone(),
+                    state: task_state_label(task.state()).to_string(),
+                    report: self.completion_reports.get(child).cloned(),
+                })
+            })
+            .collect()
     }
 
     fn notify_update(&self) {

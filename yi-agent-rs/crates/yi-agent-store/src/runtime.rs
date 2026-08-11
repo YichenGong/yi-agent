@@ -20,7 +20,8 @@ use yi_agent_core::subagent::scheduler::{
     ResourceScope,
 };
 use yi_agent_core::subagent::supervisor::{
-    AgentSupervisor, ReviewPersistenceError, SpawnError, WaitMode, WaitOutcome,
+    AgentSupervisor, CompletedChildReport, ReviewPersistenceError, SpawnError, WaitMode,
+    WaitOutcome,
 };
 use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, DeliveryReport,
@@ -2383,11 +2384,19 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         caller: &TaskId,
     ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
+        Ok(self.child_completion_snapshot(session, caller)?.0)
+    }
+
+    pub fn child_completion_snapshot(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+    ) -> Result<(Vec<TaskId>, Vec<CompletedChildReport>), RuntimeCoordinatorError> {
         let supervisor = self.supervisor(session)?;
         let supervisor = supervisor
             .try_lock()
             .map_err(|_| RuntimeCoordinatorError::Supervisor("supervisor is busy".into()))?;
-        Ok(supervisor.children_of(caller).to_vec())
+        Ok(supervisor.child_completion_snapshot(caller))
     }
 
     /// Drains facts emitted by application workers and persists their reducer
