@@ -167,6 +167,29 @@ async fn index_html_returns_html() {
 }
 
 #[tokio::test]
+async fn index_html_defaults_to_global_scope_before_local_scope() {
+    let tmp = TempDir::new().unwrap();
+    let app = test_app(tmp.path().join(".env"));
+
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    let global_button = html.find("id=\"scopeGlobal\"").unwrap();
+    let local_button = html.find("id=\"scopeLocal\"").unwrap();
+    assert!(global_button < local_button);
+    assert!(html.contains("let currentScope = 'global';"));
+    assert!(html.contains(
+        "} else {\n      currentScope = 'local';\n      document.getElementById('scopeLocal').classList.add('active');"
+    ));
+}
+
+#[tokio::test]
 async fn get_config_merges_global_and_local() {
     // global 有 MODEL_API_KEY, local 有 YI_AGENT_MODEL
     // GET 应返回两者合并, source 标注来源
