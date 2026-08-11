@@ -2378,6 +2378,18 @@ impl RuntimeCoordinator {
         self.wait_for_children(session, caller, mode).await
     }
 
+    pub fn direct_children(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+    ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        let supervisor = supervisor
+            .try_lock()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("supervisor is busy".into()))?;
+        Ok(supervisor.children_of(caller).to_vec())
+    }
+
     /// Drains facts emitted by application workers and persists their reducer
     /// outcomes. Workers themselves never write task snapshots or events.
     pub async fn reconcile_worker_events(&self) -> Result<(), RuntimeCoordinatorError> {

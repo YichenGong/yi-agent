@@ -241,6 +241,8 @@ pub enum IpcRequest {
         caller_task_id: String,
         capability: String,
         mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     InspectTask {
         task_id: String,
@@ -2233,6 +2235,7 @@ fn respond(
             caller_task_id,
             capability,
             mode,
+            timeout_ms,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
@@ -2249,34 +2252,59 @@ fn respond(
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let outcome = runtime.block_on(coordinator.wait_for_children_authorized(
-                &session_id,
-                &caller_task_id,
-                &capability,
-                mode,
-            ))?;
+            let outcome = if let Some(timeout_ms) = timeout_ms {
+                runtime.block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_millis(timeout_ms),
+                        coordinator.wait_for_children_authorized(
+                            &session_id,
+                            &caller_task_id,
+                            &capability,
+                            mode,
+                        ),
+                    )
+                    .await
+                })
+            } else {
+                Ok(runtime.block_on(coordinator.wait_for_children_authorized(
+                    &session_id,
+                    &caller_task_id,
+                    &capability,
+                    mode,
+                )))
+            };
             let (status, children, reports) = match outcome {
-                yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention => {
-                    ("needs_attention".into(), Vec::new(), Vec::new())
-                }
-                yi_agent_core::subagent::supervisor::WaitOutcome::Completed {
-                    children,
-                    reports,
-                } => (
-                    "completed".into(),
-                    children
+                Err(_) => {
+                    let children = coordinator
+                        .direct_children(&session_id, &caller_task_id)?
                         .into_iter()
                         .map(|child| child.to_string())
-                        .collect(),
-                    reports
-                        .into_iter()
-                        .map(|report| IpcCompletedChildReport {
-                            task_id: report.task_id.to_string(),
-                            state: report.state,
-                            report: report.report,
-                        })
-                        .collect(),
-                ),
+                        .collect();
+                    ("timeout".into(), children, Vec::new())
+                }
+                Ok(outcome) => match outcome? {
+                    yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention => {
+                        ("needs_attention".into(), Vec::new(), Vec::new())
+                    }
+                    yi_agent_core::subagent::supervisor::WaitOutcome::Completed {
+                        children,
+                        reports,
+                    } => (
+                        "completed".into(),
+                        children
+                            .into_iter()
+                            .map(|child| child.to_string())
+                            .collect(),
+                        reports
+                            .into_iter()
+                            .map(|report| IpcCompletedChildReport {
+                                task_id: report.task_id.to_string(),
+                                state: report.state,
+                                report: report.report,
+                            })
+                            .collect(),
+                    ),
+                },
             };
             Ok(IpcResponse::WaitCompleted {
                 status,

@@ -2172,6 +2172,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
                 caller_task_id: root_task_id.clone(),
                 capability: "wrong".into(),
                 mode: "all".into(),
+                timeout_ms: None,
             },
         )
         .unwrap(),
@@ -2187,6 +2188,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
             caller_task_id: root_task_id,
             capability: message_capability,
             mode: "all".into(),
+            timeout_ms: None,
         },
     )
     .unwrap();
@@ -2196,6 +2198,66 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
         IpcResponse::WaitCompleted { status, children, .. }
             if status == "completed" && children == vec![child_task_id]
     ));
+}
+
+#[test]
+fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-wait-timeout".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached root");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "Inspect child behavior slowly".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child task");
+    };
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id,
+            caller_task_id: root_task_id,
+            capability: message_capability,
+            mode: "all".into(),
+            timeout_ms: Some(10),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::WaitCompleted {
+        status,
+        children,
+        reports,
+    } = response
+    else {
+        panic!("expected bounded wait response");
+    };
+    assert_eq!(status, "timeout");
+    assert_eq!(children, vec![task_id]);
+    assert!(reports.is_empty());
 }
 
 #[test]
@@ -2241,6 +2303,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             caller_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             mode: "all".into(),
+            timeout_ms: None,
         },
     )
     .unwrap() else {
@@ -2275,6 +2338,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             caller_task_id: root_task_id,
             capability: message_capability,
             mode: "all".into(),
+            timeout_ms: None,
         },
     )
     .unwrap();
@@ -2342,6 +2406,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
             caller_task_id: root_task_id,
             capability: message_capability,
             mode: "all".into(),
+            timeout_ms: None,
         },
     )
     .unwrap();
@@ -2434,6 +2499,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
                 caller_task_id: root_task_id,
                 capability: message_capability,
                 mode: "all".into(),
+                timeout_ms: None,
             },
         );
         done_tx.send(response).unwrap();

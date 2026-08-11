@@ -22,6 +22,10 @@ use yi_agent_core::{
 use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
 
 const DEFAULT_PROVIDER_RETRY_LIMIT: u16 = 3;
+#[cfg(not(test))]
+const TUI_WAIT_AGENT_TIMEOUT_MS: u64 = 30_000;
+#[cfg(test)]
+const TUI_WAIT_AGENT_TIMEOUT_MS: u64 = 10;
 
 /// Reuses the selected provider, tool registry, and system prompt for each
 /// delegated worker while the supervisor supplies its narrow objective.
@@ -928,6 +932,7 @@ impl Tool for DaemonWaitAgentTool {
                 caller_task_id: self.caller_task_id.clone(),
                 capability: self.caller_capability.clone(),
                 mode: mode.to_owned(),
+                timeout_ms: Some(TUI_WAIT_AGENT_TIMEOUT_MS),
             },
         );
         match response {
