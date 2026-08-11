@@ -1180,9 +1180,6 @@ fn execute_slash_command(
         | SlashCommand::Deny
         | SlashCommand::Budget
         | SlashCommand::Priority
-        | SlashCommand::Events
-        | SlashCommand::Diff
-        | SlashCommand::Mailbox
         | SlashCommand::Daemon => {
             history.push(
                 HistoryCell::Separator {
@@ -1239,6 +1236,39 @@ fn execute_slash_command(
                     }
                 }
                 Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Events => {
+            let label = match parse_review_args(args.as_deref()) {
+                Ok(task_id) => match daemon_events(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法读取任务事件: {error}"),
+                },
+                Err(_) => "用法: /events <task-id>".into(),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Diff => {
+            let label = match parse_review_args(args.as_deref()) {
+                Ok(task_id) => match daemon_diff(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法读取任务 diff: {error}"),
+                },
+                Err(_) => "用法: /diff <task-id>".into(),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Mailbox => {
+            let label = match parse_review_args(args.as_deref()) {
+                Ok(task_id) => match daemon_mailbox(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法读取任务 mailbox: {error}"),
+                },
+                Err(_) => "用法: /mailbox <task-id>".into(),
             };
             history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
@@ -1667,6 +1697,108 @@ fn daemon_review_at(socket: &std::path::Path, task_id: &str) -> Result<String, S
             Err(format!("daemon 拒绝审查请求: {code}"))
         }
         _ => Err("daemon 返回了非审查响应".into()),
+    }
+}
+
+fn daemon_events(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_events_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_events_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ReadTaskEvents {
+            task_id: task_id.to_owned(),
+            after_event_id: None,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskEvents { events } if events.is_empty() => {
+            Ok(format!("Events {task_id}: 暂无事件"))
+        }
+        yi_agent_store::ipc::IpcResponse::TaskEvents { events } => {
+            let mut output = format!("Events {}（{} 条）", task_id, events.len());
+            for event in events {
+                output.push_str(&format!(
+                    "\n{} {} {}",
+                    event.event_id, event.kind, event.payload_json
+                ));
+            }
+            Ok(output)
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            Err(format!("daemon 拒绝事件请求: {code}"))
+        }
+        _ => Err("daemon 返回了非事件响应".into()),
+    }
+}
+
+fn daemon_diff(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_diff_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_diff_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskDiff { delivery_json, .. } => {
+            Ok(format!("Diff {task_id}\n{delivery_json}"))
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            Err(format!("daemon 拒绝 diff 请求: {code}"))
+        }
+        _ => Err("daemon 返回了非 diff 响应".into()),
+    }
+}
+
+fn daemon_mailbox(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_mailbox_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_mailbox_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ReadTaskMailbox {
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskMailbox { messages } if messages.is_empty() => {
+            Ok(format!("Mailbox {task_id}: 暂无消息"))
+        }
+        yi_agent_store::ipc::IpcResponse::TaskMailbox { messages } => {
+            let mut output = format!("Mailbox {}（{} 条）", task_id, messages.len());
+            for message in messages {
+                output.push_str(&format!(
+                    "\n{} {} priority={} {}",
+                    message.message_id, message.kind, message.priority, message.payload_json
+                ));
+            }
+            Ok(output)
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code } => {
+            Err(format!("daemon 拒绝 mailbox 请求: {code}"))
+        }
+        _ => Err("daemon 返回了非 mailbox 响应".into()),
     }
 }
 
@@ -2390,6 +2522,99 @@ mod tests {
         assert!(review.contains("Delivery 审查"));
         assert!(review.contains("deadbeef"));
         assert!(review.contains("cargo test -p child"));
+    }
+
+    #[test]
+    fn events_control_reads_task_events_from_daemon() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::repository::RuntimeRepository::open(&database)
+            .unwrap()
+            .append_event(
+                &root_task_id.parse().unwrap(),
+                yi_agent_store::repository::RuntimeEvent::TaskStarted,
+            )
+            .unwrap();
+
+        let events = daemon_events_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(events.contains("Events"));
+        assert!(events.contains("task_started"));
+    }
+
+    #[test]
+    fn mailbox_control_reads_messages_without_consuming_them() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::SendUserMessage {
+                task_id: root_task_id.clone(),
+                message: "请汇报进展".into(),
+            },
+        )
+        .unwrap();
+
+        let mailbox = daemon_mailbox_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(mailbox.contains("Mailbox"));
+        assert!(mailbox.contains("user_override"));
+        assert!(mailbox.contains("请汇报进展"));
+        assert_eq!(
+            yi_agent_store::repository::RuntimeRepository::open(&database)
+                .unwrap()
+                .mailbox_messages_for_task(&root_task_id.parse().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn diff_control_reads_delivery_evidence_from_daemon() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let diff = daemon_diff_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(diff.contains("Diff"));
+        assert!(diff.contains("Root session objective not specified."));
     }
 
     #[test]
