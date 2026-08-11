@@ -117,6 +117,19 @@ impl AgentWorkerFactory for ReportingWorkerFactory {
     }
 }
 
+#[derive(Clone, Default)]
+struct HandleCapturingWorkerFactory {
+    handle: Arc<Mutex<Option<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for HandleCapturingWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation);
+        *self.handle.lock().unwrap() = Some(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+}
+
 #[derive(Clone)]
 struct InboxWorkerFactory {
     handle: Arc<Mutex<Option<WorkerHandle>>>,
@@ -568,6 +581,36 @@ async fn wait_any_returns_after_the_first_terminal_child() {
             .state()
             .is_terminal(),
         false
+    );
+}
+
+#[tokio::test]
+async fn wait_agent_returns_completed_child_reports() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    handle.report_completed("sub-agent 正常完成，结果可读");
+    supervisor.reconcile_worker_events().unwrap();
+    let supervisor = Arc::new(Mutex::new(supervisor));
+    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
+
+    let result = wait_tool.call(json!({ "mode": "all" })).await;
+
+    assert!(!result.is_error);
+    let text = match &result.content[0] {
+        ContentBlock::Text(text) => text,
+        other => panic!("expected text result, got {other:?}"),
+    };
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["reports"][0]["task_id"], child.to_string());
+    assert_eq!(value["reports"][0]["state"], "completed_no_changes");
+    assert_eq!(
+        value["reports"][0]["report"],
+        "sub-agent 正常完成，结果可读"
     );
 }
 

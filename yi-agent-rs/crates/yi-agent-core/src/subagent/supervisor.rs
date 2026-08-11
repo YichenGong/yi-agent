@@ -61,7 +61,17 @@ pub enum WaitMode {
 
 pub enum WaitOutcome {
     NeedsAttention,
-    Completed(Vec<TaskId>),
+    Completed {
+        children: Vec<TaskId>,
+        reports: Vec<CompletedChildReport>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedChildReport {
+    pub task_id: TaskId,
+    pub state: String,
+    pub report: Option<String>,
 }
 
 pub struct AgentSupervisor {
@@ -71,6 +81,7 @@ pub struct AgentSupervisor {
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
+    completion_reports: HashMap<TaskId, String>,
     worker_message_capabilities: HashMap<TaskId, String>,
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
@@ -108,6 +119,7 @@ impl AgentSupervisor {
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
+            completion_reports: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
@@ -142,6 +154,7 @@ impl AgentSupervisor {
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
+            completion_reports: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
@@ -191,6 +204,7 @@ impl AgentSupervisor {
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
+            completion_reports: HashMap::new(),
             worker_message_capabilities: HashMap::new(),
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
@@ -591,6 +605,19 @@ impl AgentSupervisor {
                     )
                     .map_err(|error| error.to_string())?;
                 }
+                WorkerEvent::Completed { report } => {
+                    let task = self
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("worker task was checked above");
+                    let attempt_id = task.active_attempt_id().clone();
+                    task.reduce(
+                        TaskEvent::WorkerCompletedNoChanges { attempt_id },
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    self.completion_reports.insert(task_id.clone(), report);
+                }
                 WorkerEvent::Paused => {
                     let task = self
                         .tasks
@@ -802,7 +829,20 @@ impl AgentSupervisor {
                     })
             }
         };
-        complete.then(|| WaitOutcome::Completed(children.to_vec()))
+        complete.then(|| WaitOutcome::Completed {
+            children: children.to_vec(),
+            reports: children
+                .iter()
+                .filter_map(|child| {
+                    let task = self.task(child)?;
+                    Some(CompletedChildReport {
+                        task_id: child.clone(),
+                        state: task_state_label(task.state()).to_string(),
+                        report: self.completion_reports.get(child).cloned(),
+                    })
+                })
+                .collect(),
+        })
     }
 
     fn notify_update(&self) {
@@ -1473,6 +1513,27 @@ impl AgentSupervisor {
     }
 }
 
+fn task_state_label(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::WaitingForResource(_) => "waiting_for_resource",
+        TaskState::WaitingForPermission(_) => "waiting_for_permission",
+        TaskState::WaitingForChildren(_) => "waiting_for_children",
+        TaskState::Paused(_) => "paused",
+        TaskState::AwaitingParentReview(_) => "awaiting_parent_review",
+        TaskState::Completed => "completed",
+        TaskState::CompletedNoChanges => "completed_no_changes",
+        TaskState::Blocked(_) => "blocked",
+        TaskState::Stalled(_) => "stalled",
+        TaskState::TimedOut(_) => "timed_out",
+        TaskState::BudgetExhausted(_) => "budget_exhausted",
+        TaskState::Failed(_) => "failed",
+        TaskState::Cancelled(_) => "cancelled",
+        TaskState::RecoveryRequired(_) => "recovery_required",
+    }
+}
+
 /// The per-task built-in tool set. Tool calls delegate to the Supervisor; they
 /// never create worker state independently.
 #[derive(Clone)]
@@ -1604,19 +1665,30 @@ impl Tool for WaitAgentTool {
                 supervisor
                     .wait_outcome(&self.tools.caller, mode)
                     .map(|outcome| match outcome {
-                        WaitOutcome::NeedsAttention => ("needs_attention", Vec::new()),
-                        WaitOutcome::Completed(children) => (
+                        WaitOutcome::NeedsAttention => ("needs_attention", Vec::new(), Vec::new()),
+                        WaitOutcome::Completed { children, reports } => (
                             "completed",
                             children
                                 .into_iter()
                                 .map(|child| child.to_string())
                                 .collect(),
+                            reports
+                                .into_iter()
+                                .map(|report| {
+                                    json!({
+                                        "task_id": report.task_id.to_string(),
+                                        "state": report.state,
+                                        "report": report.report,
+                                    })
+                                })
+                                .collect(),
                         ),
                     })
             };
-            if let Some((status, children)) = status {
+            if let Some((status, children, reports)) = status {
                 return ToolResult::text(
-                    json!({ "status": status, "children": children }).to_string(),
+                    json!({ "status": status, "children": children, "reports": reports })
+                        .to_string(),
                 );
             }
             if updates.changed().await.is_err() {

@@ -227,6 +227,10 @@ pub enum WorkerEvent {
     },
     /// A validated coding result awaits inspection by the direct parent.
     Delivered(DeliveryReport),
+    /// A normal text-only task completed without a coding delivery.
+    Completed {
+        report: String,
+    },
     CompletedWithoutDelivery,
     Paused,
     Cancelled,
@@ -285,6 +289,12 @@ impl WorkerHandle {
 
     pub fn report_delivery(&self, delivery: DeliveryReport) {
         self.report(WorkerEvent::Delivered(delivery));
+    }
+
+    pub fn report_completed(&self, report: impl Into<String>) {
+        self.report(WorkerEvent::Completed {
+            report: report.into(),
+        });
     }
 
     pub fn report_message_consumed(&self, message_id: MessageId) {

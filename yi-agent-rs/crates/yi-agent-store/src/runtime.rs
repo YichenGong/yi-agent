@@ -2387,6 +2387,9 @@ impl RuntimeCoordinator {
                     yi_agent_core::TaskState::Paused(_) => {
                         ("paused", RuntimeEvent::TaskPaused, None)
                     }
+                    yi_agent_core::TaskState::CompletedNoChanges => {
+                        ("completed_no_changes", RuntimeEvent::TaskCompleted, None)
+                    }
                     yi_agent_core::TaskState::Blocked(reason) => (
                         "blocked",
                         RuntimeEvent::TaskBlocked,

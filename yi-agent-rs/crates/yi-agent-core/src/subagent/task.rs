@@ -180,6 +180,7 @@ impl TaskState {
                     | Self::WaitingForPermission(_)
                     | Self::WaitingForChildren(_)
                     | Self::Paused(_)
+                    | Self::CompletedNoChanges
                     | Self::AwaitingParentReview(_)
                     | Self::Blocked(_)
                     | Self::Stalled(_)
@@ -739,6 +740,9 @@ pub enum TaskEvent {
         attempt_id: AttemptId,
         delivery: DeliveryReport,
     },
+    WorkerCompletedNoChanges {
+        attempt_id: AttemptId,
+    },
     WorkerFailed {
         attempt_id: AttemptId,
         failure: TaskFailure,
@@ -807,6 +811,7 @@ impl TaskEvent {
             | Self::PermissionRequested { attempt_id, .. }
             | Self::PermissionResolved { attempt_id, .. }
             | Self::WorkerDelivered { attempt_id, .. }
+            | Self::WorkerCompletedNoChanges { attempt_id }
             | Self::WorkerFailed { attempt_id, .. }
             | Self::ReviewAccepted { attempt_id, .. }
             | Self::ReviewRework { attempt_id, .. }
@@ -942,6 +947,9 @@ pub fn reduce(
         }
         TaskEvent::WorkerFailed { failure, .. } => {
             transition(task, TaskState::Failed(failure), now)?
+        }
+        TaskEvent::WorkerCompletedNoChanges { .. } => {
+            transition(task, TaskState::CompletedNoChanges, now)?
         }
         TaskEvent::ReviewAccepted {
             delivery_id,

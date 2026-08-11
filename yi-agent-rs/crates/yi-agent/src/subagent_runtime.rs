@@ -432,6 +432,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                             let mut cancellation_forwarded = false;
                             let mut pause_forwarded = false;
                             let mut message_prompt = None;
+                            let mut assistant_report = String::new();
                             loop {
                                 tokio::select! {
                                     message = mailbox.recv(), if message_prompt.is_none() => {
@@ -465,6 +466,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 u64::from(usage.output_tokens),
                                             );
                                         }
+                                        Some(AgentEvent::AssistantText(text)) => {
+                                            assistant_report.push_str(&text);
+                                        }
                                         Some(AgentEvent::ToolRetry { .. }) => {
                                             reporter.report_tool_retry();
                                         }
@@ -481,17 +485,22 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             if let Some(next_prompt) = message_prompt.take() {
                                                 prompt = next_prompt;
                                                 retrying_provider = false;
+                                                assistant_report.clear();
                                                 continue 'run;
                                             }
                                             if let Some(service) = workspace_service.as_ref() {
                                                 match service.inspect_delivery(&workspace_for_delivery) {
                                                     Ok(delivery) => reporter.report_delivery(delivery),
-                                                    Err(error) => {
-                                                        reporter.report_failure(error.to_string())
+                                                    Err(error)
+                                                        if !assistant_report.trim().is_empty()
+                                                            && is_empty_delivery_error(&error) =>
+                                                    {
+                                                        reporter.report_completed(assistant_report.trim())
                                                     }
+                                                    Err(error) => reporter.report_failure(error.to_string()),
                                                 }
                                             } else {
-                                                reporter.report_completed_without_delivery();
+                                                reporter.report_completed(assistant_report.trim());
                                             }
                                             break 'run;
                                         }
@@ -503,6 +512,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             if let Some(next_prompt) = message_prompt.take() {
                                                 prompt = next_prompt;
                                                 retrying_provider = false;
+                                                assistant_report.clear();
                                                 continue 'run;
                                             }
                                             reporter.report_cancelled();
@@ -552,6 +562,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             Ok(handle)
         })
     }
+}
+
+fn is_empty_delivery_error(error: &WorkerError) -> bool {
+    error
+        .to_string()
+        .contains("child delivery has no commits beyond")
 }
 
 fn git_output(directory: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -915,9 +931,13 @@ impl Tool for DaemonWaitAgentTool {
             },
         );
         match response {
-            Ok(yi_agent_store::ipc::IpcResponse::WaitCompleted { status, children }) => {
-                ToolResult::text(json!({ "status": status, "children": children }).to_string())
-            }
+            Ok(yi_agent_store::ipc::IpcResponse::WaitCompleted {
+                status,
+                children,
+                reports,
+            }) => ToolResult::text(
+                json!({ "status": status, "children": children, "reports": reports }).to_string(),
+            ),
             Ok(other) => ToolResult::error(format!("daemon rejected wait request: {other:?}")),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
@@ -1026,6 +1046,24 @@ mod tests {
     }
 
     struct UsageReportingProvider;
+
+    struct TextAnswerProvider;
+
+    #[async_trait]
+    impl Provider for TextAnswerProvider {
+        async fn call_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            Ok(futures::stream::iter([
+                ProviderEvent::TextDelta("sub-agent 正常完成，结果可读".into()),
+                ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                },
+            ])
+            .boxed())
+        }
+    }
 
     #[async_trait]
     impl Provider for UsageReportingProvider {
@@ -1435,6 +1473,58 @@ mod tests {
                 output_tokens: 5,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_reports_text_completion_without_a_workspace_delivery() {
+        let directory = TempDir::new().unwrap();
+        let base_commit = initialize_git_repository(directory.path());
+        let branch = git_output(directory.path(), &["branch", "--show-current"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(TextAnswerProvider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: directory.path().to_path_buf(),
+            branch,
+            parent_branch: "main".into(),
+            base_commit,
+        };
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Report whether the sub-agent is healthy.")
+            .with_workspace(workspace);
+        let handle = factory.start(request).await.unwrap();
+
+        let report = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(report) = handle
+                    .take_events()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        WorkerEvent::Completed { report } => Some(report),
+                        WorkerEvent::CompletedWithoutDelivery => {
+                            panic!("text-only completion should carry a report")
+                        }
+                        _ => None,
+                    })
+                {
+                    return report;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should report text completion");
+
+        assert_eq!(report, "sub-agent 正常完成，结果可读");
     }
 
     #[tokio::test]

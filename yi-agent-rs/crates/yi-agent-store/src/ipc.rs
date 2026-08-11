@@ -335,6 +335,8 @@ pub enum IpcResponse {
     WaitCompleted {
         status: String,
         children: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reports: Vec<IpcCompletedChildReport>,
     },
     TaskDetail(IpcTaskDetail),
     TaskEvents {
@@ -497,6 +499,14 @@ pub struct IpcMailboxMessage {
     pub payload_json: String,
     pub delivered_at: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcCompletedChildReport {
+    pub task_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// The stable wire payload for a top-level subscription event frame.
@@ -1918,6 +1928,7 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::RuntimeRecovered => "runtime_recovered",
         crate::repository::RuntimeEvent::TaskQueued => "task_queued",
         crate::repository::RuntimeEvent::TaskStarted => "task_started",
+        crate::repository::RuntimeEvent::TaskCompleted => "task_completed",
         crate::repository::RuntimeEvent::TaskCancelled => "task_cancelled",
         crate::repository::RuntimeEvent::TaskPauseRequested => "task_pause_requested",
         crate::repository::RuntimeEvent::TaskPaused => "task_paused",
@@ -2244,19 +2255,34 @@ fn respond(
                 &capability,
                 mode,
             ))?;
-            let (status, children) = match outcome {
+            let (status, children, reports) = match outcome {
                 yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention => {
-                    ("needs_attention".into(), Vec::new())
+                    ("needs_attention".into(), Vec::new(), Vec::new())
                 }
-                yi_agent_core::subagent::supervisor::WaitOutcome::Completed(children) => (
+                yi_agent_core::subagent::supervisor::WaitOutcome::Completed {
+                    children,
+                    reports,
+                } => (
                     "completed".into(),
                     children
                         .into_iter()
                         .map(|child| child.to_string())
                         .collect(),
+                    reports
+                        .into_iter()
+                        .map(|report| IpcCompletedChildReport {
+                            task_id: report.task_id.to_string(),
+                            state: report.state,
+                            report: report.report,
+                        })
+                        .collect(),
                 ),
             };
-            Ok(IpcResponse::WaitCompleted { status, children })
+            Ok(IpcResponse::WaitCompleted {
+                status,
+                children,
+                reports,
+            })
         }
         IpcRequest::InspectTask { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;

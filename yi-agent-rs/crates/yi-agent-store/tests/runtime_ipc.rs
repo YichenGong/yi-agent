@@ -189,6 +189,29 @@ struct ApplicationRootFactory {
     starts: Arc<Mutex<Vec<WorkerStart>>>,
 }
 
+#[derive(Clone, Default)]
+struct TextCompletionFactory {
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
+    handles: Arc<Mutex<Vec<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for TextCompletionFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+        Some(Arc::new(StaticWorkspaceService))
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation.clone());
+        self.starts.lock().unwrap().push(request);
+        self.handles.lock().unwrap().push(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+}
+
 impl AgentWorkerFactory for ApplicationRootFactory {
     fn recovery_context(&self) -> WorkerRecoveryContext {
         durable_context()
@@ -2170,9 +2193,83 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
 
     assert!(matches!(
         response,
-        IpcResponse::WaitCompleted { status, children }
+        IpcResponse::WaitCompleted { status, children, .. }
             if status == "completed" && children == vec![child_task_id]
     ));
+}
+
+#[test]
+fn daemon_wait_agent_returns_completed_child_reports() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-wait-report".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached root");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "Inspect child behavior".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child task");
+    };
+    factory.handles.lock().unwrap()[0].report_completed("sub-agent 正常完成，结果可读");
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id,
+            caller_task_id: root_task_id,
+            capability: message_capability,
+            mode: "all".into(),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::WaitCompleted {
+        status,
+        children,
+        reports,
+    } = response
+    else {
+        panic!("expected wait completion");
+    };
+    assert_eq!(status, "completed");
+    assert_eq!(children, vec![task_id.clone()]);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].task_id, task_id);
+    assert_eq!(reports[0].state, "completed_no_changes");
+    assert_eq!(
+        reports[0].report.as_deref(),
+        Some("sub-agent 正常完成，结果可读")
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&reports[0].task_id.parse().unwrap())
+            .unwrap(),
+        "completed_no_changes"
+    );
 }
 
 #[test]
