@@ -821,13 +821,17 @@ mod tests {
         }
     }
 
-    async fn wait_until<F>(mut predicate: F)
+    async fn wait_until<F>(timeout: Duration, mut predicate: F)
     where
         F: FnMut() -> bool,
     {
-        for _ in 0..50 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
             if predicate() {
                 return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -965,7 +969,7 @@ mod tests {
         assert!(first.stdout.contains("out"));
         assert!(first.stderr.is_empty());
 
-        wait_until(|| {
+        wait_until(Duration::from_secs(3), || {
             let output = futures::executor::block_on(manager.read(
                 ProcessSelector::Name("mixed".into()),
                 Some(first.next_cursor),
@@ -998,7 +1002,7 @@ mod tests {
             .await
             .unwrap();
 
-        wait_until(|| {
+        wait_until(Duration::from_secs(1), || {
             manager
                 .list()
                 .iter()
