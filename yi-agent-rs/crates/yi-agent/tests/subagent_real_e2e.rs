@@ -116,12 +116,14 @@ fn temporary_repository() -> tempfile::TempDir {
 }
 
 struct RealAgentRun {
-    child: Child,
+    child: Option<Child>,
 }
 
 impl RealAgentRun {
-    fn wait(self) -> Output {
+    fn wait(mut self) -> Output {
         self.child
+            .take()
+            .expect("real subagent process remains available")
             .wait_with_output()
             .expect("collect real subagent output")
     }
@@ -145,7 +147,7 @@ fn start_real_subagent(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map(|child| RealAgentRun { child })
+        .map(|child| RealAgentRun { child: Some(child) })
         .expect("start real subagent")
 }
 
@@ -176,9 +178,81 @@ fn root_workspace(socket: &Path) -> PathBuf {
     detail.workspace.expect("application root workspace").path
 }
 
-fn await_direct_child(socket: &Path) -> String {
+fn task_snapshot(socket: &Path) -> String {
+    let IpcResponse::TaskSummaries { tasks } = send_request(
+        socket,
+        IpcRequest::ListTaskSummaries {
+            session_id: None,
+            active_only: false,
+        },
+    )
+    .expect("list runtime task summaries") else {
+        return "unexpected task-summary response".into();
+    };
+    tasks
+        .into_iter()
+        .map(|task| {
+            let detail = match send_request(
+                socket,
+                IpcRequest::InspectTask {
+                    task_id: task.task_id.clone(),
+                },
+            ) {
+                Ok(IpcResponse::TaskDetail(detail)) => detail,
+                Ok(other) => {
+                    return format!("{}: unexpected detail response {other:?}", task.task_id);
+                }
+                Err(error) => return format!("{}: detail request failed: {error}", task.task_id),
+            };
+            let events = match send_request(
+                socket,
+                IpcRequest::ReadTaskEvents {
+                    task_id: task.task_id.clone(),
+                    after_event_id: None,
+                },
+            ) {
+                Ok(IpcResponse::TaskEvents { events }) => events
+                    .into_iter()
+                    .map(|event| {
+                        format!("{}:{}:{}", event.event_id, event.kind, event.payload_json)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                Ok(other) => format!("unexpected events response {other:?}"),
+                Err(error) => format!("events request failed: {error}"),
+            };
+            format!(
+                "task={} root={} state={} terminal={:?} events=[{}]",
+                task.task_id, task.is_root, detail.state, detail.terminal_json, events
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn await_direct_child(socket: &Path, run: &mut RealAgentRun) -> String {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
+        if let Some(status) = run
+            .child
+            .as_mut()
+            .expect("real root process remains available")
+            .try_wait()
+            .expect("poll real root process")
+        {
+            let output = run
+                .child
+                .take()
+                .expect("take exited real root process")
+                .wait_with_output()
+                .expect("collect exited real root output");
+            panic!(
+                "real root exited before spawning a child with {status}; stdout: {}; stderr: {}; runtime snapshot:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                task_snapshot(socket),
+            );
+        }
         let response = send_request(
             socket,
             IpcRequest::ListTaskSummaries {
@@ -198,7 +272,8 @@ fn await_direct_child(socket: &Path) -> String {
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for one child task"
+            "timed out waiting for one child task; runtime snapshot:\n{}",
+            task_snapshot(socket)
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -350,13 +425,13 @@ fn real_subagent_accepts_delivery_into_parent_history() {
         return;
     };
     let fixture = start_real_runtime_fixture(Some(&config));
-    let run = start_real_subagent(
+    let mut run = start_real_subagent(
         &config,
         &fixture,
         "Use spawn_agent exactly once. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in its assigned worktree. The child must not delegate. Do not create that file yourself. Do not call wait_agent: a local human reviewer will accept the child delivery and you will then receive its completion report. Do not attempt review or acceptance.",
     );
     let socket = fixture.runtime_dir.join("runtime.sock");
-    let child_id = await_direct_child(&socket);
+    let child_id = await_direct_child(&socket, &mut run);
     let delivery = await_review(&socket, &child_id);
     let delivery_json: serde_json::Value =
         serde_json::from_str(&delivery.delivery_json).expect("child delivery JSON");
