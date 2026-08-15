@@ -74,8 +74,10 @@ pub struct AgentConfig {
     pub gen_params: GenParams,
     /// Token count threshold to trigger auto-compact.
     pub compact_threshold: Option<u32>,
-    /// Number of recent turns to keep during compact.
-    pub compact_keep_turns: Option<u32>,
+    /// Real user input token budget retained during compact.
+    pub compact_user_budget_tokens: usize,
+    /// Complete raw tool interaction token budget retained during compact.
+    pub compact_tool_budget_tokens: usize,
     /// Max idle time (no provider events) during THINK before the stream is
     /// considered stalled. When elapsed, the agent emits `Done { EndTurn }`
     /// with whatever content was accumulated so far. `None` disables the idle
@@ -91,7 +93,8 @@ impl Default for AgentConfig {
             max_turns: Some(100),
             gen_params: Default::default(),
             compact_threshold: Some(100_000),
-            compact_keep_turns: Some(4),
+            compact_user_budget_tokens: crate::compact::DEFAULT_COMPACT_USER_BUDGET_TOKENS,
+            compact_tool_budget_tokens: crate::compact::DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
             // Default idle timeout: 60s between provider events. This is
             // intentionally generous (LLMs can pause between deltas while
             // thinking) but bounded so a stalled connection eventually
@@ -1721,7 +1724,8 @@ mod tests {
     fn agent_config_has_compact_fields() {
         let config = AgentConfig::default();
         assert!(config.compact_threshold.is_some());
-        assert!(config.compact_keep_turns.is_some());
+        assert_eq!(config.compact_user_budget_tokens, 20_000);
+        assert_eq!(config.compact_tool_budget_tokens, 12_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2125,7 +2129,8 @@ mod tests {
                 ..Default::default()
             },
             compact_threshold: Some(50_000),
-            compact_keep_turns: Some(2),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             think_idle_timeout: None,
         };
         assert_eq!(config.model, "custom-model");
@@ -2520,7 +2525,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2589,7 +2595,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2654,7 +2661,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: None,
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2719,7 +2727,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(0),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2770,7 +2779,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), config);
@@ -2875,7 +2885,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2976,7 +2987,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();

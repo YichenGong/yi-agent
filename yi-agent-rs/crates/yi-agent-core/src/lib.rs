@@ -9,7 +9,10 @@ pub mod tool;
 
 // Re-export most-used types at crate root.
 pub use agent::{Agent, AgentConfig, AgentError, AgentEvent, DoneReason, Session};
-pub use compact::compact_session;
+pub use compact::{
+    CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
+    DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
+};
 pub use message::{ContentBlock, ImageSource, Message, Role};
 pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,

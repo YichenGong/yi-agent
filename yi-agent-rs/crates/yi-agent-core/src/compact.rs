@@ -427,8 +427,8 @@ pub async fn compact_session(
 ) -> Result<Option<Session>, AgentError> {
     let Some(plan) = plan_compaction(
         session.messages(),
-        DEFAULT_COMPACT_USER_BUDGET_TOKENS,
-        DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
+        config.compact_user_budget_tokens,
+        config.compact_tool_budget_tokens,
     ) else {
         tracing::info!(msg_count = session.len(), "compact: no safe reduction");
         return Ok(None);

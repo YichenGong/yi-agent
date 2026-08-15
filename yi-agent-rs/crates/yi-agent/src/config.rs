@@ -16,7 +16,8 @@ pub struct Config {
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
     pub compact_threshold: u32, // computed: context_length * ratio / 100
-    pub compact_keep_turns: u32,
+    pub compact_user_budget_tokens: usize,
+    pub compact_tool_budget_tokens: usize,
     pub yolo: bool,
     pub sandbox: yi_agent_tools::SandboxMode,
     pub sandbox_writable_roots: Vec<PathBuf>,
@@ -68,8 +69,16 @@ pub struct Cli {
     #[arg(long)]
     pub compact_ratio: Option<u32>,
 
-    /// Number of recent turns to keep during compact
+    /// Retained real user context budget during compact.
     #[arg(long)]
+    pub compact_user_budget_tokens: Option<usize>,
+
+    /// Retained complete tool context budget during compact; zero disables it.
+    #[arg(long)]
+    pub compact_tool_budget_tokens: Option<usize>,
+
+    /// Deprecated: ignored in favor of token budgets.
+    #[arg(long, hide = true)]
     pub compact_keep_turns: Option<u32>,
 
     /// Skip permission prompts (except blacklisted commands)
@@ -128,6 +137,12 @@ pub enum Command {
         #[arg(long, default_value = "7292")]
         port: u16,
     },
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
 /// 解析 .env 文件路径：优先 workdir CLI 参数，否则 YI_AGENT_WORKDIR 环境变量，否则当前目录。
@@ -293,14 +308,27 @@ pub fn load(cli: &Cli) -> Result<Config> {
     let effective_context_length = model_context_length.unwrap_or(200_000);
     let compact_threshold = effective_context_length * compact_ratio / 100;
 
-    let compact_keep_turns = cli
-        .compact_keep_turns
-        .or_else(|| {
-            std::env::var("YI_AGENT_COMPACT_KEEP_TURNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(4);
+    let deprecated_keep_turns = cli.compact_keep_turns.is_some()
+        || std::env::var("YI_AGENT_COMPACT_KEEP_TURNS")
+            .ok()
+            .is_some_and(|value| !value.is_empty());
+    if deprecated_keep_turns {
+        eprintln!(
+            "warning: YI_AGENT_COMPACT_KEEP_TURNS/--compact-keep-turns is deprecated and ignored; use compact token budgets instead"
+        );
+    }
+
+    let compact_user_budget_tokens = cli
+        .compact_user_budget_tokens
+        .or_else(|| env_usize("YI_AGENT_COMPACT_USER_BUDGET_TOKENS"))
+        .unwrap_or(20_000);
+    if compact_user_budget_tokens == 0 {
+        bail!("compact user budget tokens must be greater than zero");
+    }
+    let compact_tool_budget_tokens = cli
+        .compact_tool_budget_tokens
+        .or_else(|| env_usize("YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS"))
+        .unwrap_or(12_000);
 
     let yolo = cli.yolo
         || cli.skip_permissions
@@ -346,7 +374,8 @@ pub fn load(cli: &Cli) -> Result<Config> {
         workdir,
         system_prompt,
         compact_threshold,
-        compact_keep_turns,
+        compact_user_budget_tokens,
+        compact_tool_budget_tokens,
         yolo,
         sandbox,
         sandbox_writable_roots,
@@ -423,6 +452,8 @@ mod tests {
             "YI_AGENT_MODEL_CONTEXT_LENGTH",
             "YI_AGENT_COMPACT_RATIO",
             "YI_AGENT_COMPACT_KEEP_TURNS",
+            "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
+            "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
         ]);
         for key in [
@@ -438,6 +469,8 @@ mod tests {
             "YI_AGENT_MODEL_CONTEXT_LENGTH",
             "YI_AGENT_COMPACT_RATIO",
             "YI_AGENT_COMPACT_KEEP_TURNS",
+            "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
+            "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
         ] {
             env.remove(key);
@@ -506,6 +539,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -536,6 +571,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -569,6 +606,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -585,6 +624,10 @@ mod tests {
 
     #[test]
     fn load_includes_compact_defaults() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
         let cli = Cli {
             command: None,
             provider: None,
@@ -597,6 +640,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -606,7 +651,8 @@ mod tests {
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
-        assert_eq!(config.compact_keep_turns, 4);
+        assert_eq!(config.compact_user_budget_tokens, 20_000);
+        assert_eq!(config.compact_tool_budget_tokens, 12_000);
     }
 
     #[test]
@@ -623,6 +669,8 @@ mod tests {
             model_context_length: Some(100_000),
             compact_ratio: Some(50),
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -636,6 +684,10 @@ mod tests {
 
     #[test]
     fn load_falls_back_to_default_context_length() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
         let cli = Cli {
             command: None,
             provider: None,
@@ -648,6 +700,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: Some(80),
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -673,6 +727,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -702,6 +758,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -731,6 +789,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -770,6 +830,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -797,6 +859,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -827,6 +891,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -960,6 +1026,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -997,6 +1065,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -1162,6 +1232,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -1255,6 +1327,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),

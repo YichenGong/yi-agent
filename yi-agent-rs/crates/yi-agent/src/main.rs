@@ -126,7 +126,8 @@ fn run_agent(cli: Cli) -> Result<()> {
         system_prompt,
         max_turns: Some(config.max_turns),
         compact_threshold: Some(config.compact_threshold),
-        compact_keep_turns: Some(config.compact_keep_turns),
+        compact_user_budget_tokens: config.compact_user_budget_tokens,
+        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
         ..Default::default()
     };
 
@@ -383,6 +384,9 @@ fn run_headless(
         model: config.model.clone(),
         system_prompt: setup.system_prompt,
         max_turns: Some(config.max_turns),
+        compact_threshold: Some(config.compact_threshold),
+        compact_user_budget_tokens: config.compact_user_budget_tokens,
+        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
         ..Default::default()
     };
 
@@ -952,7 +956,8 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             system_prompt: None,
             compact_threshold: 160_000,
-            compact_keep_turns: 4,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             yolo: false,
             sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
             sandbox_writable_roots: Vec::new(),
