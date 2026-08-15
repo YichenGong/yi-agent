@@ -9,6 +9,14 @@ use std::path::PathBuf;
 use anyhow::Result;
 use axum::routing::{delete, get, post};
 
+fn user_real_test_env_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".yi-agent")
+        .join(".env")
+}
+
 /// 启动 Web 配置服务器。
 pub async fn serve(
     host: &str,
@@ -27,6 +35,7 @@ pub async fn serve(
 
     let state = api::AppState {
         env_path,
+        real_test_env_path: user_real_test_env_path(),
         global_env_path,
     };
     let app = axum::Router::new()

@@ -19,6 +19,7 @@ fn test_app(env_path: PathBuf) -> axum::Router {
 fn test_app_with_global(env_path: PathBuf, global_env_path: Option<PathBuf>) -> axum::Router {
     use axum::routing::get;
     let state = AppState {
+        real_test_env_path: env_path.clone(),
         env_path,
         global_env_path,
     };

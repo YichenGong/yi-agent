@@ -30,6 +30,8 @@ use crate::env_file;
 pub struct AppState {
     pub env_path: PathBuf,
     pub global_env_path: Option<PathBuf>,
+    /// User-scoped, dedicated real-regression credentials; never the project config path.
+    pub real_test_env_path: PathBuf,
 }
 
 /// GET / — 返回内嵌 HTML 页面
@@ -38,7 +40,7 @@ pub async fn index_html() -> Html<&'static str> {
 }
 
 pub async fn get_real_llm_test_config(State(state): State<AppState>) -> impl IntoResponse {
-    let values = env_file::read(&state.env_path).unwrap_or_default();
+    let values = env_file::read(&state.real_test_env_path).unwrap_or_default();
     (
         StatusCode::OK,
         Json(json!({
@@ -54,7 +56,7 @@ pub async fn put_real_llm_test_config(
     State(state): State<AppState>,
     Json(request): Json<RealLlmTestConfigRequest>,
 ) -> impl IntoResponse {
-    let mut values = match env_file::read(&state.env_path) {
+    let mut values = match env_file::read(&state.real_test_env_path) {
         Ok(values) => values,
         Err(_) => {
             return (
@@ -81,7 +83,7 @@ pub async fn put_real_llm_test_config(
     if !request.api_key.trim().is_empty() {
         values.insert("YI_AGENT_REAL_LLM_API_KEY".into(), request.api_key);
     }
-    match env_file::write_selected(&state.env_path, &values) {
+    match env_file::write_selected(&state.real_test_env_path, &values) {
         Ok(()) => (StatusCode::OK, Json(json!({"ok":true}))),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,7 +93,7 @@ pub async fn put_real_llm_test_config(
 }
 
 pub async fn validate_real_llm_test_config(State(state): State<AppState>) -> impl IntoResponse {
-    let values = match env_file::read(&state.env_path) {
+    let values = match env_file::read(&state.real_test_env_path) {
         Ok(values) => values,
         Err(_) => {
             return (
@@ -133,7 +135,7 @@ pub async fn clear_real_llm_test_key(
             Json(json!({"error":"clear confirmation is required"})),
         );
     }
-    let mut values = match env_file::read(&state.env_path) {
+    let mut values = match env_file::read(&state.real_test_env_path) {
         Ok(values) => values,
         Err(_) => {
             return (
@@ -143,7 +145,7 @@ pub async fn clear_real_llm_test_key(
         }
     };
     values.remove("YI_AGENT_REAL_LLM_API_KEY");
-    match env_file::write_selected(&state.env_path, &values) {
+    match env_file::write_selected(&state.real_test_env_path, &values) {
         Ok(()) => (StatusCode::OK, Json(json!({"ok":true}))),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
