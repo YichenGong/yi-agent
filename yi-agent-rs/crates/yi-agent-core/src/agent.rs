@@ -232,6 +232,8 @@ const COMPLETION_AUDIT_PROMPT: &str =
 pub enum AgentError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
+    #[error("compaction error: {0}")]
+    Compact(#[from] crate::compact::CompactError),
 }
 
 impl Agent {
@@ -371,17 +373,9 @@ async fn run_loop(
         ) {
             if tokens >= threshold && messages.len() > 4 {
                 let old_count = messages.len();
-                let keep_turns = config.compact_keep_turns.unwrap_or(4);
                 let session_snapshot = session.lock().unwrap().clone();
-                match crate::compact::compact_session(
-                    &provider,
-                    &config,
-                    &session_snapshot,
-                    keep_turns,
-                )
-                .await
-                {
-                    Ok(new_session) => {
+                match crate::compact::compact_session(&provider, &config, &session_snapshot).await {
+                    Ok(Some(new_session)) if new_session.len() < old_count => {
                         messages = new_session.messages().to_vec();
                         *session.lock().unwrap() = new_session;
                         // Reset logging cursor: compact replaced the entire
@@ -394,6 +388,7 @@ async fn run_loop(
                             })
                             .await;
                     }
+                    Ok(Some(_)) | Ok(None) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "auto-compact failed, will retry next turn");
                     }

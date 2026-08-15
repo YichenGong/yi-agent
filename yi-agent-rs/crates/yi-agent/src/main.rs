@@ -499,16 +499,14 @@ fn run_tui_agent(
                         ControlCommand::Compact => {
                             let session = agent.session();
                             let old_msg_count = session.messages().len();
-                            let keep_turns = rebuild_config.compact_keep_turns.unwrap_or(4);
                             match yi_agent_core::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
                                 &session,
-                                keep_turns,
                             )
                             .await
                             {
-                                Ok(new_session) => {
+                                Ok(Some(new_session)) => {
                                     let event = manual_compaction_outcome_event(
                                         old_msg_count,
                                         Ok(new_session.messages().len()),
@@ -528,6 +526,14 @@ fn run_tui_agent(
                                         "agent session compacted via /compact"
                                     );
                                     let _ = agent_tx.send(event).await;
+                                }
+                                Ok(None) => {
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Err("没有可压缩的历史".into()),
+                                        ))
+                                        .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
@@ -805,9 +811,9 @@ mod tests {
             }
         ));
         assert!(matches!(
-            manual_compaction_outcome_event(9, Err("request failed".into())),
+            manual_compaction_outcome_event(9, Err("没有可压缩的历史".into())),
             yi_agent_core::AgentEvent::ManualCompactFailed { message }
-                if message == "request failed"
+                if message == "没有可压缩的历史"
         ));
     }
 
