@@ -124,10 +124,11 @@ Use the existing `TuiApp` event/render pattern; do not add screenshot or termina
 Add a focused `#[ignore]` suite, using `RealLlmTestConfig` and `TempDir` isolated Git repositories. Tests use a 300-second deadline and structural assertions only.
 
 1. A parent delegates README inspection; terminal child report is non-empty and no repository file changes.
-2. A parent delegates creation of a deterministic file in a child worktree; child creates a commit and delivery; direct-parent accept makes the file visible on parent branch and records delivery ancestry.
-3. A low-cost rework flow directs a child to replace a known file marker; final accepted parent content contains only the corrected marker.
+2. A parent delegates creation of a uniquely marked file in a child worktree. After review and direct-parent acceptance, the file is visible on the parent branch and the accepted delivery commit is an ancestor of parent `HEAD`.
+3. A parent requests rework of a delivery that contains a known incorrect marker. The successor delivery must replace it with the correct marker; after acceptance, parent content contains the correct marker and excludes the incorrect marker.
+4. A parent delegates two independent uniquely marked files concurrently. Each child uses an isolated worktree and produces its own delivery evidence; after accepting both deliveries, both files and their distinct markers are visible on the parent branch without one overwriting the other.
 
-Real tests may accept either configured provider. They must not assert exact prose, print secret values, or run in normal `cargo test`/CI execution.
+The suite contains four independently named ignored tests, including the existing README smoke test. `just test-real-subagent` runs them serially with `--test-threads=1`; each uses an independent temporary Git repository and a 300-second deadline. Real tests may accept either configured provider. They must not assert exact prose, print secret values, or run in normal `cargo test`/CI execution.
 
 ## Recipes, documentation, and verification
 
