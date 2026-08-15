@@ -18,6 +18,19 @@ fn invoke(runtime: &std::path::Path, arguments: &[&str]) -> std::process::Output
 }
 
 #[test]
+fn run_help_advertises_explicit_subagent_opt_in() {
+    let output = Command::new(yi_agent_bin())
+        .args(["run", "--help"])
+        .output()
+        .expect("run yi-agent help");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("--subagents"),
+        "run help must document the delegation opt-in"
+    );
+}
+
+#[test]
 fn cli_task_observation_controls_render_daemon_owned_task_identity_without_secrets() {
     let directory = TempDir::new().unwrap();
     let runtime = directory.path().join("runtime");

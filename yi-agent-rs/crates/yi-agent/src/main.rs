@@ -573,6 +573,86 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
     Ok(())
 }
 
+fn build_headless_root_tools(
+    config: &config::Config,
+    runtime_socket: std::path::PathBuf,
+    attached_root: &crate::tui::subagents::AttachedRoot,
+) -> Result<HeadlessSetup> {
+    let setup =
+        build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
+    let mut registry = (*setup.tools).clone();
+    crate::tui::subagents::register_attached_root_tools(
+        &mut registry,
+        runtime_socket,
+        attached_root,
+    );
+    Ok(HeadlessSetup {
+        tools: Arc::new(registry),
+        system_prompt: setup.system_prompt,
+    })
+}
+
+struct HeadlessRuntimeSession {
+    socket_path: std::path::PathBuf,
+    attached_root: crate::tui::subagents::AttachedRoot,
+    embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
+}
+
+fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
+    let runtime_dir = runtime_directory()?;
+    let database = runtime_dir.join("runtime.sqlite");
+    let socket_path = runtime_dir.join("runtime.sock");
+    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
+        &runtime_dir,
+        &database,
+        build_daemon_worker_factory(cli, socket_path.clone())?,
+    ) {
+        Ok(daemon) => Some(daemon),
+        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+        Err(error) => anyhow::bail!("could not start subagent runtime: {error}"),
+    };
+    let response = yi_agent_store::ipc::send_request(
+        &socket_path,
+        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
+            idempotency_key: format!(
+                "headless:{}:{}:{}",
+                std::process::id(),
+                config.workdir.display(),
+                uuid::Uuid::new_v4()
+            ),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("could not attach headless subagent runtime: {error}"))?;
+    let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace,
+    } = response
+    else {
+        anyhow::bail!("daemon rejected headless runtime attachment: {response:?}");
+    };
+    Ok(HeadlessRuntimeSession {
+        socket_path,
+        attached_root: crate::tui::subagents::AttachedRoot {
+            session_id,
+            task_id: root_task_id,
+            capability: message_capability,
+            workspace,
+        },
+        embedded_daemon,
+    })
+}
+
+fn activate_headless_runtime_root(runtime: &HeadlessRuntimeSession, objective: &str) -> Result<()> {
+    activate_tui_runtime_root(&runtime.socket_path, &runtime.attached_root, objective)
+        .map_err(|error| anyhow::anyhow!("could not activate headless subagent runtime: {error}"))
+}
+
+fn detach_headless_runtime_root(runtime: &HeadlessRuntimeSession) {
+    detach_tui_runtime_root(&runtime.socket_path, &runtime.attached_root);
+}
+
 fn build_tui_root_tools(
     base_registry: &yi_agent_core::ToolRegistry,
     config: &config::Config,
@@ -930,6 +1010,14 @@ struct HeadlessSetup {
 /// 注册 SkillTool、用 `resolve_system_prompt_with_skills` 拼接默认 prompt +
 /// 当前日期 + skills catalog。
 fn build_headless_setup(config: &config::Config, naked: bool) -> Result<HeadlessSetup> {
+    build_headless_setup_for_workspace(config, naked, config.workdir.clone())
+}
+
+fn build_headless_setup_for_workspace(
+    config: &config::Config,
+    naked: bool,
+    workspace: std::path::PathBuf,
+) -> Result<HeadlessSetup> {
     let mut registry = yi_agent_core::ToolRegistry::new();
 
     if naked {
@@ -941,7 +1029,7 @@ fn build_headless_setup(config: &config::Config, naked: bool) -> Result<Headless
 
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
-        config.workdir.clone(),
+        workspace,
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
@@ -970,7 +1058,7 @@ fn run_headless(
     json: bool,
     from_stdin: bool,
     naked: bool,
-    _subagents: bool,
+    subagents: bool,
 ) -> Result<()> {
     let config = config::load(&cli)?;
 
@@ -987,7 +1075,21 @@ fn run_headless(
         anyhow::bail!("empty prompt");
     }
 
-    let workdir = config.workdir.clone();
+    if subagents && naked {
+        anyhow::bail!("--subagents cannot be combined with --naked");
+    }
+
+    let headless_runtime = if subagents {
+        let runtime = attach_headless_runtime(&cli, &config)?;
+        activate_headless_runtime_root(&runtime, &prompt_text)?;
+        Some(runtime)
+    } else {
+        None
+    };
+    let workdir = headless_runtime
+        .as_ref()
+        .map(|runtime| runtime.attached_root.workspace.path.clone())
+        .unwrap_or_else(|| config.workdir.clone());
     // Headless mode: auto-allow non-blacklisted tools (yolo behavior)
     let yolo = true;
     let permissions = {
@@ -1030,7 +1132,12 @@ fn run_headless(
         ),
     };
 
-    let setup = build_headless_setup(&config, naked)?;
+    let setup = match &headless_runtime {
+        Some(runtime) => {
+            build_headless_root_tools(&config, runtime.socket_path.clone(), &runtime.attached_root)?
+        }
+        None => build_headless_setup(&config, naked)?,
+    };
     let tools = setup.tools;
 
     let agent_config = yi_agent_core::AgentConfig {
@@ -1065,6 +1172,11 @@ fn run_headless(
         }
     });
 
+    if let Some(runtime) = &headless_runtime {
+        detach_headless_runtime_root(runtime);
+        let _embedded_daemon = runtime.embedded_daemon.as_ref();
+    }
+    drop(headless_runtime);
     std::process::exit(exit_code);
 }
 
@@ -1636,6 +1748,29 @@ mod tests {
                 base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
             },
         }
+    }
+
+    #[test]
+    fn headless_root_tools_include_delegation_only_when_attached() {
+        let config = test_config();
+        let ordinary = build_headless_setup(&config, false)
+            .expect("ordinary setup")
+            .tools;
+        assert!(ordinary.get("spawn_agent").is_none());
+
+        let root = attached_root_for_main_tests();
+        let registry = build_headless_root_tools(&config, "/tmp/runtime.sock".into(), &root)
+            .expect("attached headless setup");
+        let names = registry
+            .tools
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"send_message".to_string()));
+        assert!(names.contains(&"wait_agent".to_string()));
+        assert!(!names.contains(&"accept_review".to_string()));
     }
 
     #[test]

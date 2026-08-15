@@ -2315,11 +2315,10 @@ mod tests {
             request: WorkerStart,
         ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
             let handle = WorkerHandle::new(request.cancellation);
-            self.workspaces.lock().unwrap().push(
-                request
-                    .workspace_lease_id
-                    .unwrap_or_else(WorkspaceLeaseId::new),
-            );
+            self.workspaces
+                .lock()
+                .unwrap()
+                .push(request.workspace_lease_id.unwrap_or_default());
             self.handles.lock().unwrap().push(handle.clone());
             Box::pin(async move { Ok(handle) })
         }
