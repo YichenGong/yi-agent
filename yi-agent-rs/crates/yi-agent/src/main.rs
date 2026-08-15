@@ -516,7 +516,8 @@ fn build_daemon_worker_factory(
         ),
         max_turns: Some(config.max_turns),
         compact_threshold: Some(config.compact_threshold),
-        compact_keep_turns: Some(config.compact_keep_turns),
+        compact_user_budget_tokens: config.compact_user_budget_tokens,
+        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
         ..Default::default()
     };
     Ok(Arc::new(
@@ -868,7 +869,8 @@ fn run_agent(cli: Cli) -> Result<()> {
         system_prompt,
         max_turns: Some(config.max_turns),
         compact_threshold: Some(config.compact_threshold),
-        compact_keep_turns: Some(config.compact_keep_turns),
+        compact_user_budget_tokens: config.compact_user_budget_tokens,
+        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
         ..Default::default()
     };
 
@@ -1269,16 +1271,14 @@ fn run_tui_agent(
                         }
                         ControlCommand::Compact => {
                             let session = agent.session();
-                            let keep_turns = rebuild_config.compact_keep_turns.unwrap_or(4);
                             match yi_agent_core::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
                                 &session,
-                                keep_turns,
                             )
                             .await
                             {
-                                Ok(new_session) => {
+                                Ok(Some(new_session)) => {
                                     agent = yi_agent_core::Agent::new(
                                         Arc::clone(&rebuild_provider),
                                         Arc::clone(&current_tools),
@@ -1290,6 +1290,9 @@ fn run_tui_agent(
                                         Arc::clone(&rebuild_decision_rx),
                                     );
                                     tracing::info!("agent session compacted via /compact");
+                                }
+                                Ok(None) => {
+                                    tracing::info!("no compactable session history");
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
@@ -1725,7 +1728,8 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             system_prompt: None,
             compact_threshold: 160_000,
-            compact_keep_turns: 4,
+            compact_user_budget_tokens: 8192,
+            compact_tool_budget_tokens: 4096,
             yolo: false,
             sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
             sandbox_writable_roots: Vec::new(),

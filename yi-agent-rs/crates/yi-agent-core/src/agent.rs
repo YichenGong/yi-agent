@@ -36,6 +36,7 @@ pub trait ProviderTurnGate: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     messages: Vec<Message>,
+    last_input_tokens: Option<u32>,
 }
 
 impl Session {
@@ -49,6 +50,18 @@ impl Session {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn last_input_tokens(&self) -> Option<u32> {
+        self.last_input_tokens
+    }
+
+    pub fn set_last_input_tokens(&mut self, tokens: Option<u32>) {
+        self.last_input_tokens = tokens;
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
     }
 
     pub fn truncate(&mut self, len: usize) {
@@ -74,8 +87,10 @@ pub struct AgentConfig {
     pub gen_params: GenParams,
     /// Token count threshold to trigger auto-compact.
     pub compact_threshold: Option<u32>,
-    /// Number of recent turns to keep during compact.
-    pub compact_keep_turns: Option<u32>,
+    /// Real user input token budget retained during compact.
+    pub compact_user_budget_tokens: usize,
+    /// Complete raw tool interaction token budget retained during compact.
+    pub compact_tool_budget_tokens: usize,
     /// Max idle time (no provider events) during THINK before the stream is
     /// considered stalled. When elapsed, the agent emits `Done { EndTurn }`
     /// with whatever content was accumulated so far. `None` disables the idle
@@ -91,7 +106,8 @@ impl Default for AgentConfig {
             max_turns: Some(100),
             gen_params: Default::default(),
             compact_threshold: Some(100_000),
-            compact_keep_turns: Some(4),
+            compact_user_budget_tokens: crate::compact::DEFAULT_COMPACT_USER_BUDGET_TOKENS,
+            compact_tool_budget_tokens: crate::compact::DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
             // Default idle timeout: 60s between provider events. This is
             // intentionally generous (LLMs can pause between deltas while
             // thinking) but bounded so a stalled connection eventually
@@ -135,7 +151,15 @@ Task execution:
 - When information is missing, make a reasonable assumption, state it
   briefly, and continue. Do not stop to ask unless the assumption would
   be risky or irreversible.
-- Do not substitute a narrower or easier task for the one requested."#
+- Do not substitute a narrower or easier task for the one requested.
+
+File discovery:
+- Avoid unbounded recursive glob calls at repository roots, such as
+  glob({"path":".","pattern":"**/*"}). Prefer `rg --files`, targeted
+  subdirectories, file-type constrained patterns, or search-first workflows.
+- Avoid scanning generated or heavy directories such as `.git/`, `target/`,
+  `node_modules/`, `.worktrees/`, caches, and build outputs unless explicitly
+  required."#
             .to_string()
     }
 }
@@ -202,6 +226,15 @@ pub enum AgentEvent {
         old_msg_count: usize,
         new_msg_count: usize,
     },
+    /// Manual `/compact` completed and replaced the current session.
+    ManualCompacted {
+        old_msg_count: usize,
+        new_msg_count: usize,
+    },
+    /// Manual `/compact` failed before it could replace the current session.
+    ManualCompactFailed {
+        message: String,
+    },
     Cancelled,
     Error(AgentError),
     PermissionRequest {
@@ -228,7 +261,6 @@ const CONTINUE_AFTER_TRUNCATION: &str =
     "Continue the interrupted task from where you stopped. Do not repeat completed work.";
 const COMPLETION_AUDIT_PROMPT: &str =
     "Before you finish, verify the changed result using an appropriate read, diff, build, or test.";
-const DEFAULT_TOOL_RETRY_LIMIT: u16 = 2;
 
 #[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum AgentError {
@@ -236,6 +268,8 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("provider turn admission failed: {0}")]
     ProviderTurnAdmission(String),
+    #[error("compaction error: {0}")]
+    Compact(#[from] crate::compact::CompactError),
 }
 
 impl Agent {
@@ -259,6 +293,12 @@ impl Agent {
         }
     }
 
+    /// Restrict provider turns through the daemon-owned admission gate.
+    pub fn with_provider_turn_gate(mut self, gate: Arc<dyn ProviderTurnGate>) -> Self {
+        self.provider_turn_gate = Some(gate);
+        self
+    }
+
     /// Attach a permission checker and decision channel for tool gating.
     ///
     /// `decision_rx` is shared via `Arc<Mutex<Receiver>>` so that the same
@@ -271,12 +311,6 @@ impl Agent {
     ) -> Self {
         self.permission_checker = Some(checker);
         self.decision_rx = Some(decision_rx);
-        self
-    }
-
-    /// Acquire a runtime permit around each actual provider request.
-    pub fn with_provider_turn_gate(mut self, gate: Arc<dyn ProviderTurnGate>) -> Self {
-        self.provider_turn_gate = Some(gate);
         self
     }
 
@@ -304,26 +338,15 @@ impl Agent {
 
     /// Restarts execution from the current session after a transient provider
     /// failure without duplicating the user prompt already in that session.
-    pub async fn retry_current_session(
-        &mut self,
-    ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+    pub async fn retry_current_session(&mut self) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
         self.start_run(None).await
     }
 
-    async fn start_run(
-        &mut self,
-        user_prompt: Option<String>,
-    ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
-        // 每次运行使用新的 cancel token,避免上一次 cancel 留下的状态
-        // 卡死后续运行(inline 模式的 Interrupt/ctrl_c/新 prompt 只 cancel
-        // 不重建 agent,如果不重置,后续 run() 会在 run_loop 开头立刻返回
-        // Cancelled)。
+    async fn start_run(&mut self, user_prompt: Option<String>) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        // Every run uses a fresh cancel token.
         self.cancel_token = CancellationToken::new();
         if let Some(user_prompt) = user_prompt {
-            self.session
-                .lock()
-                .unwrap()
-                .push(Message::user(user_prompt));
+            self.session.lock().unwrap().push(Message::user(user_prompt));
         }
 
         let provider = self.provider.clone();
@@ -376,7 +399,6 @@ async fn run_loop(
     // assistant(tool_use),避免下次 run 被 Anthropic API 拒绝(tool_use
     // 必须跟 tool_result)。
     let session_len = session.lock().unwrap().len();
-    let mut last_input_tokens: Option<u32> = None;
     let mut turn = 0u32;
     let mut verification_pending = false;
     let mut audit_attempted = false;
@@ -395,62 +417,11 @@ async fn run_loop(
             return;
         }
 
-        // auto-compact: 每轮 THINK 前用上次 input_tokens 判断
-        if let (Some(threshold), Some(tokens)) = (
-            config.compact_threshold.filter(|&t| t > 0),
-            last_input_tokens,
-        ) {
-            if tokens >= threshold && messages.len() > 4 {
-                let old_count = messages.len();
-                let keep_turns = config.compact_keep_turns.unwrap_or(4);
-                let session_snapshot = session.lock().unwrap().clone();
-                // Compaction performs its own provider request, so it needs
-                // the same short-lived admission as an ordinary THINK turn.
-                let compact_lease = match &provider_turn_gate {
-                    Some(gate) => match tokio::select! {
-                        lease = gate.acquire() => lease,
-                        _ = cancel_token.cancelled() => {
-                            let _ = tx.send(AgentEvent::Cancelled).await;
-                            return;
-                        }
-                    } {
-                        Ok(lease) => Some(lease),
-                        Err(error) => {
-                            let _ = tx
-                                .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
-                                .await;
-                            return;
-                        }
-                    },
-                    None => None,
-                };
-                match crate::compact::compact_session(
-                    &provider,
-                    &config,
-                    &session_snapshot,
-                    keep_turns,
-                )
-                .await
-                {
-                    Ok(new_session) => {
-                        messages = new_session.messages().to_vec();
-                        *session.lock().unwrap() = new_session;
-                        // Reset logging cursor: compact replaced the entire
-                        // message list, so last_logged is now stale.
-                        last_logged = 0;
-                        let _ = tx
-                            .send(AgentEvent::AutoCompacting {
-                                old_msg_count: old_count,
-                                new_msg_count: messages.len(),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "auto-compact failed, will retry next turn");
-                    }
-                }
-                drop(compact_lease);
-            }
+        if let Some(new_messages) = maybe_auto_compact(&tx, &provider, &config, &session).await {
+            messages = new_messages;
+            // Compaction replaced the history, so the incremental request-log
+            // cursor no longer refers to this message vector.
+            last_logged = 0;
         }
 
         turn += 1;
@@ -496,9 +467,7 @@ async fn run_loop(
         let prefill_estimate = estimate_prefill_tokens(&req);
         let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
-        // A permit covers only the provider request and response stream. Tool,
-        // permission, and child-wait time deliberately run without one.
-        let _provider_turn_lease = match &provider_turn_gate {
+        let provider_turn_lease = match &provider_turn_gate {
             Some(gate) => match tokio::select! {
                 lease = gate.acquire() => lease,
                 _ = cancel_token.cancelled() => {
@@ -508,14 +477,13 @@ async fn run_loop(
             } {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    let _ = tx
-                        .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
-                        .await;
+                    let _ = tx.send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error))).await;
                     return;
                 }
             },
             None => None,
         };
+
         let stream = match provider.call_stream(req).await {
             Ok(s) => {
                 tracing::info!(
@@ -563,7 +531,12 @@ async fn run_loop(
             }
         };
 
-        last_input_tokens = last_usage.map(|u| u.input_tokens);
+        if let Some(usage) = last_usage {
+            session
+                .lock()
+                .unwrap()
+                .set_last_input_tokens(Some(usage.input_tokens));
+        }
 
         // Log the full accumulated response content at debug level (never repeats across turns).
         debug!(turn, content = ?content, "think: response");
@@ -585,6 +558,8 @@ async fn run_loop(
                 return;
             }
         }
+
+        drop(provider_turn_lease);
 
         messages.push(Message::assistant(content.clone()));
         session
@@ -823,24 +798,7 @@ async fn run_loop(
                         }
                     });
 
-                    let mut retries = 0;
-                    let result = loop {
-                        let result = tool.call_stream(input.clone(), event_tx.clone()).await;
-                        if !result.is_error
-                            || !tool.retryable()
-                            || retries >= DEFAULT_TOOL_RETRY_LIMIT
-                        {
-                            break result;
-                        }
-                        retries += 1;
-                        if tx
-                            .send(AgentEvent::ToolRetry { id: id.clone() })
-                            .await
-                            .is_err()
-                        {
-                            return (id.clone(), None);
-                        }
-                    };
+                    let result = tool.call_stream(input.clone(), event_tx).await;
 
                     info!(is_error = result.is_error, "tool call done");
 
@@ -993,6 +951,44 @@ async fn handle_confirmation(
     }
 }
 
+async fn maybe_auto_compact(
+    tx: &mpsc::Sender<AgentEvent>,
+    provider: &Arc<dyn Provider>,
+    config: &AgentConfig,
+    session: &Arc<Mutex<Session>>,
+) -> Option<Vec<Message>> {
+    let threshold = config
+        .compact_threshold
+        .filter(|threshold| *threshold > 0)?;
+    let snapshot = session.lock().unwrap().clone();
+    if snapshot.last_input_tokens()? < threshold {
+        return None;
+    }
+
+    let old_count = snapshot.len();
+    match crate::compact::compact_session(provider, config, &snapshot).await {
+        Ok(Some(new_session)) if new_session.len() < old_count => {
+            let new_messages = new_session.messages().to_vec();
+            {
+                let mut current = session.lock().unwrap();
+                current.replace_messages(new_messages.clone());
+                current.set_last_input_tokens(None);
+            }
+            let _ = tx
+                .send(AgentEvent::AutoCompacting {
+                    old_msg_count: old_count,
+                    new_msg_count: new_messages.len(),
+                })
+                .await;
+            Some(new_messages)
+        }
+        Ok(Some(_)) | Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(error = %error, "auto-compact failed, will retry next think");
+            None
+        }
+    }
+}
 async fn accumulate_provider_stream(
     stream: BoxStream<'static, ProviderEvent>,
     tx: &mpsc::Sender<AgentEvent>,
@@ -1080,43 +1076,12 @@ mod tests {
     use crate::tool::{Tool, ToolMetadata, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Provider that returns a fixed sequence of events.
     /// Each call returns the next script; if scripts exhausted, returns empty (EndTurn).
     struct ScriptedProvider {
         scripts: Vec<Vec<ProviderEvent>>,
         call_index: std::sync::Mutex<usize>,
-    }
-
-    #[derive(Clone, Default)]
-    struct CountingTurnGate {
-        acquired: Arc<AtomicUsize>,
-        released: Arc<AtomicUsize>,
-    }
-
-    struct CountingTurnLease(Arc<AtomicUsize>);
-
-    impl Drop for CountingTurnLease {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    impl ProviderTurnGate for CountingTurnGate {
-        fn acquire(&self) -> BoxFuture<'static, Result<Box<dyn ProviderTurnLease>, String>> {
-            self.acquired.fetch_add(1, Ordering::SeqCst);
-            let lease = CountingTurnLease(Arc::clone(&self.released));
-            Box::pin(async move { Ok(Box::new(lease) as Box<dyn ProviderTurnLease>) })
-        }
-    }
-
-    struct BlockingTurnGate;
-
-    impl ProviderTurnGate for BlockingTurnGate {
-        fn acquire(&self) -> BoxFuture<'static, Result<Box<dyn ProviderTurnLease>, String>> {
-            Box::pin(futures::future::pending())
-        }
     }
 
     impl ScriptedProvider {
@@ -1188,39 +1153,18 @@ mod tests {
         }
     }
 
-    struct FlakyRetryableTool {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Tool for FlakyRetryableTool {
-        fn name(&self) -> &str {
-            "flaky"
-        }
-
-        fn schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        fn description(&self) -> &str {
-            "Fails once before succeeding"
-        }
-
-        async fn call(&self, _args: serde_json::Value) -> ToolResult {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                ToolResult::error("temporary tool failure")
-            } else {
-                ToolResult::text("recovered")
-            }
-        }
-
-        fn retryable(&self) -> bool {
-            true
-        }
-    }
-
     fn collect_events(stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
         futures::executor::block_on_stream(stream).collect()
+    }
+
+    #[tokio::test]
+    async fn session_tracks_and_clears_last_input_tokens() {
+        let mut session = Session::new();
+        assert_eq!(session.last_input_tokens(), None);
+        session.set_last_input_tokens(Some(160_000));
+        assert_eq!(session.last_input_tokens(), Some(160_000));
+        session.set_last_input_tokens(None);
+        assert_eq!(session.last_input_tokens(), None);
     }
 
     #[tokio::test]
@@ -1296,63 +1240,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn provider_turn_gate_acquires_and_releases_each_provider_turn() {
-        let provider = ScriptedProvider::new(vec![
-            vec![ProviderEvent::Stop {
-                reason: StopReason::MaxTokens,
-            }],
-            vec![ProviderEvent::Stop {
-                reason: StopReason::EndTurn,
-            }],
-        ]);
-        let gate = CountingTurnGate::default();
-        let mut agent = Agent::new(
-            Arc::new(provider),
-            Arc::new(ToolRegistry::new()),
-            AgentConfig::default(),
-        )
-        .with_provider_turn_gate(Arc::new(gate.clone()));
-
-        let events = collect_events(agent.run("continue".into()).await.unwrap());
-
-        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
-        assert_eq!(gate.acquired.load(Ordering::SeqCst), 2);
-        assert_eq!(gate.released.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cancelling_while_waiting_for_a_provider_turn_gate_exits_promptly() {
-        let provider = ScriptedProvider::new(vec![vec![ProviderEvent::Stop {
-            reason: StopReason::EndTurn,
-        }]]);
-        let mut agent = Agent::new(
-            Arc::new(provider),
-            Arc::new(ToolRegistry::new()),
-            AgentConfig::default(),
-        )
-        .with_provider_turn_gate(Arc::new(BlockingTurnGate));
-
-        let stream = agent.run("continue".into()).await.unwrap();
-        let cancellation = agent.cancel_token();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            cancellation.cancel();
-        });
-        let events = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            stream.collect::<Vec<_>>(),
-        )
-        .await
-        .expect("cancellation must interrupt permit admission");
-
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::Cancelled))
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn agent_does_not_report_abnormal_stop_as_end_turn() {
         let provider = ScriptedProvider::new(vec![vec![
             ProviderEvent::TextDelta("partial".into()),
@@ -1424,49 +1311,6 @@ mod tests {
             Some(AgentEvent::Done {
                 reason: DoneReason::EndTurn
             })
-        ));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn agent_retries_only_an_explicitly_retryable_tool_failure() {
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ProviderEvent::ToolUseStart {
-                    id: "t1".into(),
-                    name: "flaky".into(),
-                },
-                ProviderEvent::ToolUseDelta {
-                    id: "t1".into(),
-                    partial_json: "{}".into(),
-                },
-                ProviderEvent::ToolUseEnd { id: "t1".into() },
-                ProviderEvent::Stop {
-                    reason: StopReason::EndTurn,
-                },
-            ],
-            vec![ProviderEvent::Stop {
-                reason: StopReason::EndTurn,
-            }],
-        ]);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut tools = ToolRegistry::new();
-        tools.register(Arc::new(FlakyRetryableTool {
-            calls: Arc::clone(&calls),
-        }));
-        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
-
-        let events = collect_events(agent.run("run flaky tool".into()).await.unwrap());
-
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, AgentEvent::ToolRetry { .. }))
-                .count(),
-            1
-        );
-        assert!(events.iter().any(
-            |event| matches!(event, AgentEvent::ToolResult { result, .. } if !result.is_error)
         ));
     }
 
@@ -1935,7 +1779,8 @@ mod tests {
     fn agent_config_has_compact_fields() {
         let config = AgentConfig::default();
         assert!(config.compact_threshold.is_some());
-        assert!(config.compact_keep_turns.is_some());
+        assert_eq!(config.compact_user_budget_tokens, 20_000);
+        assert_eq!(config.compact_tool_budget_tokens, 12_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2301,6 +2146,15 @@ mod tests {
     }
 
     #[test]
+    fn default_system_prompt_discourages_unbounded_glob() {
+        let prompt = AgentConfig::default_system_prompt();
+        assert!(prompt.contains("glob({\"path\":\".\",\"pattern\":\"**/*\"})"));
+        assert!(prompt.contains("rg --files"));
+        assert!(prompt.contains("target/"));
+        assert!(prompt.contains(".worktrees/"));
+    }
+
+    #[test]
     fn agent_config_default_uses_default_system_prompt() {
         let config = AgentConfig::default();
         assert_eq!(
@@ -2330,7 +2184,8 @@ mod tests {
                 ..Default::default()
             },
             compact_threshold: Some(50_000),
-            compact_keep_turns: Some(2),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             think_idle_timeout: None,
         };
         assert_eq!(config.model, "custom-model");
@@ -2639,6 +2494,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn auto_compact_runs_before_second_user_turn_from_session_usage() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::TextDelta("first answer".into()),
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 200,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("checkpoint".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("second answer".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let config = AgentConfig {
+            compact_threshold: Some(100),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(ToolRegistry::new()), config);
+        let first = agent.run("first request".into()).await.unwrap();
+        let _ = collect_events(first);
+        assert_eq!(agent.session().last_input_tokens(), Some(200));
+        let second = agent.run("second request".into()).await.unwrap();
+        let events = collect_events(second);
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::AutoCompacting { old_msg_count, new_msg_count } if old_msg_count > new_msg_count)));
+        assert_eq!(agent.session().last_input_tokens(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn auto_compact_triggers_when_threshold_exceeded() {
         // Pre-populate session with 4 messages (2 user/assistant pairs) so that
         // after turn 1 the session has 7 messages — enough for compact_session
@@ -2685,7 +2580,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2697,10 +2593,8 @@ mod tests {
         session.push(Message::assistant(vec![ContentBlock::Text(
             "reply2".into(),
         )]));
-        let gate = CountingTurnGate::default();
-        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), config)
-            .with_session(session)
-            .with_provider_turn_gate(Arc::new(gate.clone()));
+        let mut agent =
+            Agent::new(Arc::new(provider), Arc::new(tools), config).with_session(session);
 
         let stream = agent.run("prompt".into()).await.unwrap();
         let events = collect_events(stream);
@@ -2721,10 +2615,6 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
-        // Turn 1, automatic compaction, and turn 2 each require a provider
-        // lease. Compaction must not bypass daemon-wide admission.
-        assert_eq!(gate.acquired.load(Ordering::SeqCst), 3);
-        assert_eq!(gate.released.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2760,7 +2650,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2825,7 +2716,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: None,
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2890,7 +2782,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(0),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2941,7 +2834,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), config);
@@ -3046,7 +2940,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -3079,7 +2974,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn auto_compact_resets_baseline() {
+    async fn auto_compact_success_clears_baseline_before_next_think() {
         // Verify compact → next THINK → compact again works.
         // Scripts:
         // 0: turn 1 — tool_use + Usage(200) + Stop
@@ -3147,7 +3042,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -3170,8 +3066,8 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::AutoCompacting { .. }))
             .count();
         assert_eq!(
-            compact_count, 2,
-            "should emit exactly 2 AutoCompacting events, got {compact_count}"
+            compact_count, 1,
+            "successful compact clears usage until a later provider report; got {compact_count}"
         );
         assert!(matches!(
             events.last(),

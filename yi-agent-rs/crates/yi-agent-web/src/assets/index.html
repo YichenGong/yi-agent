@@ -254,8 +254,8 @@
 <div class="env-path" id="globalEnvPath" style="display:none;"></div>
 
 <div class="scope-toggle" id="scopeToggle">
-  <button id="scopeLocal" class="active">本地</button>
-  <button id="scopeGlobal">全局</button>
+  <button id="scopeGlobal" class="active">全局</button>
+  <button id="scopeLocal">本地</button>
 </div>
 
 <div class="layout">
@@ -276,7 +276,7 @@
   let currentValues = {};
   let activeTab = 'Model Provider';
   let collapsedSections = { 'Provider Credentials': true };
-  let currentScope = 'local'; // 'local' or 'global'
+  let currentScope = 'global'; // 'local' or 'global'
   let hasGlobal = false; // whether global path is available
 
   // 定义 sections：仅 Model Provider tab 使用
@@ -310,6 +310,9 @@
       globalEl.style.display = '';
       scopeToggle.style.display = '';
     } else {
+      currentScope = 'local';
+      document.getElementById('scopeLocal').classList.add('active');
+      document.getElementById('scopeGlobal').classList.remove('active');
       globalEl.style.display = 'none';
       scopeToggle.style.display = 'none';
     }

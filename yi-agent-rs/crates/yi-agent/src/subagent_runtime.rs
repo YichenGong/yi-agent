@@ -93,7 +93,7 @@ impl DaemonAgentWorkerFactory {
             &mut tools,
             workspace.path.clone(),
             self.sandbox,
-            vec![git_dir_for_worktree(&workspace.path)],
+            git_dir_for_worktree(&workspace.path).into_iter().collect(),
         );
         tools
     }
@@ -303,7 +303,8 @@ fn provider_retry_failure(error: &AgentError) -> Option<RetryFailure> {
         AgentError::Provider(ProviderError::Server(_)) => Some(RetryFailure::ProviderServer),
         AgentError::Provider(ProviderError::Stream(_)) => Some(RetryFailure::ProviderStream),
         AgentError::Provider(ProviderError::Auth(_) | ProviderError::InvalidRequest(_))
-        | AgentError::ProviderTurnAdmission(_) => None,
+        | AgentError::ProviderTurnAdmission(_)
+        | AgentError::Compact(_) => None,
     }
 }
 
@@ -584,14 +585,13 @@ fn is_empty_delivery_error(error: &WorkerError) -> bool {
         .contains("child delivery has no commits beyond")
 }
 
-fn git_dir_for_worktree(workspace: &std::path::Path) -> PathBuf {
-    let git_dir = git_output(workspace, &["rev-parse", "--git-dir"])
-        .expect("worker workspace must have a Git directory");
+fn git_dir_for_worktree(workspace: &std::path::Path) -> Option<PathBuf> {
+    let git_dir = git_output(workspace, &["rev-parse", "--git-dir"])?;
     let git_dir = PathBuf::from(git_dir);
     if git_dir.is_absolute() {
-        git_dir
+        Some(git_dir)
     } else {
-        workspace.join(git_dir)
+        Some(workspace.join(git_dir))
     }
 }
 

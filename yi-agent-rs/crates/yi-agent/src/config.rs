@@ -16,7 +16,8 @@ pub struct Config {
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
     pub compact_threshold: u32, // computed: context_length * ratio / 100
-    pub compact_keep_turns: u32,
+    pub compact_user_budget_tokens: usize,
+    pub compact_tool_budget_tokens: usize,
     pub yolo: bool,
     pub sandbox: yi_agent_tools::SandboxMode,
     pub sandbox_writable_roots: Vec<PathBuf>,
@@ -68,8 +69,16 @@ pub struct Cli {
     #[arg(long)]
     pub compact_ratio: Option<u32>,
 
-    /// Number of recent turns to keep during compact
+    /// Retained real user context budget during compact.
     #[arg(long)]
+    pub compact_user_budget_tokens: Option<usize>,
+
+    /// Retained complete tool context budget during compact; zero disables it.
+    #[arg(long)]
+    pub compact_tool_budget_tokens: Option<usize>,
+
+    /// Deprecated: ignored in favor of token budgets.
+    #[arg(long, hide = true)]
     pub compact_keep_turns: Option<u32>,
 
     /// Skip permission prompts (except blacklisted commands)
@@ -265,6 +274,12 @@ pub enum DaemonAction {
     Serve,
 }
 
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 /// 解析 .env 文件路径：优先 workdir CLI 参数，否则 YI_AGENT_WORKDIR 环境变量，否则当前目录。
 /// 所有路径均使用 `.yi-agent/.env` 子目录结构，避免与项目自身的 .env 冲突。
 pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
@@ -283,12 +298,6 @@ pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
                 .join(".yi-agent")
                 .join(".env")
         })
-}
-
-/// 确保目录存在,不存在则递归创建(类似 mkdir -p)。
-fn ensure_dir_exists(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("failed to create directory: {}", path.display()))
 }
 
 /// 加载 .env 文件到进程环境变量(不覆盖已存在的)。
@@ -339,23 +348,13 @@ pub fn is_workdir_explicit(cli: &Cli) -> bool {
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
 /// .env 加载:显式指定 workdir 时只加载指定目录,fallback 模式合并全局兜底。
-/// fallback 模式下自动创建 .yi-agent/ 目录(本地和全局)。
+/// fallback 模式下只读取已存在的 `.yi-agent/.env`,不主动创建目录。
 pub fn load(cli: &Cli) -> Result<Config> {
     let local_env_path = resolve_env_path(cli);
     let global_env_path = if is_workdir_explicit(cli) {
         None
     } else {
-        // fallback 模式:自动创建本地和全局 .yi-agent/ 目录
-        if let Some(parent) = local_env_path.parent() {
-            ensure_dir_exists(parent)?;
-        }
-        let global = resolve_global_env_path();
-        if let Some(ref g) = global {
-            if let Some(parent) = g.parent() {
-                ensure_dir_exists(parent)?;
-            }
-        }
-        global
+        resolve_global_env_path()
     };
     load_env_files(&local_env_path, global_env_path.as_deref());
 
@@ -444,14 +443,27 @@ pub fn load(cli: &Cli) -> Result<Config> {
     let effective_context_length = model_context_length.unwrap_or(200_000);
     let compact_threshold = effective_context_length * compact_ratio / 100;
 
-    let compact_keep_turns = cli
-        .compact_keep_turns
-        .or_else(|| {
-            std::env::var("YI_AGENT_COMPACT_KEEP_TURNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(4);
+    let deprecated_keep_turns = cli.compact_keep_turns.is_some()
+        || std::env::var("YI_AGENT_COMPACT_KEEP_TURNS")
+            .ok()
+            .is_some_and(|value| !value.is_empty());
+    if deprecated_keep_turns {
+        eprintln!(
+            "warning: YI_AGENT_COMPACT_KEEP_TURNS/--compact-keep-turns is deprecated and ignored; use compact token budgets instead"
+        );
+    }
+
+    let compact_user_budget_tokens = cli
+        .compact_user_budget_tokens
+        .or_else(|| env_usize("YI_AGENT_COMPACT_USER_BUDGET_TOKENS"))
+        .unwrap_or(20_000);
+    if compact_user_budget_tokens == 0 {
+        bail!("compact user budget tokens must be greater than zero");
+    }
+    let compact_tool_budget_tokens = cli
+        .compact_tool_budget_tokens
+        .or_else(|| env_usize("YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS"))
+        .unwrap_or(12_000);
 
     let yolo = cli.yolo
         || cli.skip_permissions
@@ -467,6 +479,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
                     "invalid YI_AGENT_SANDBOX: expected read-only, workspace-write, or danger-full-access"
                 )
             })?,
+            Err(_) if cli.yolo => yi_agent_tools::SandboxMode::DangerFullAccess,
             Err(_) => yi_agent_tools::SandboxMode::default(),
         },
     };
@@ -496,7 +509,8 @@ pub fn load(cli: &Cli) -> Result<Config> {
         workdir,
         system_prompt,
         compact_threshold,
-        compact_keep_turns,
+        compact_user_budget_tokens,
+        compact_tool_budget_tokens,
         yolo,
         sandbox,
         sandbox_writable_roots,
@@ -573,6 +587,8 @@ mod tests {
             "YI_AGENT_MODEL_CONTEXT_LENGTH",
             "YI_AGENT_COMPACT_RATIO",
             "YI_AGENT_COMPACT_KEEP_TURNS",
+            "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
+            "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
         ]);
         for key in [
@@ -588,6 +604,8 @@ mod tests {
             "YI_AGENT_MODEL_CONTEXT_LENGTH",
             "YI_AGENT_COMPACT_RATIO",
             "YI_AGENT_COMPACT_KEEP_TURNS",
+            "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
+            "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
         ] {
             env.remove(key);
@@ -656,6 +674,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -686,6 +706,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -719,6 +741,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -751,6 +775,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -760,7 +786,8 @@ mod tests {
         };
         let config = load(&cli).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
-        assert_eq!(config.compact_keep_turns, 4);
+        assert_eq!(config.compact_user_budget_tokens, 20_000);
+        assert_eq!(config.compact_tool_budget_tokens, 12_000);
     }
 
     #[test]
@@ -777,6 +804,8 @@ mod tests {
             model_context_length: Some(100_000),
             compact_ratio: Some(50),
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -806,6 +835,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: Some(80),
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -831,6 +862,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -860,6 +893,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -889,6 +924,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -928,6 +965,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -955,6 +994,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -985,6 +1026,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -1087,35 +1130,13 @@ mod tests {
     }
 
     #[test]
-    fn ensure_dir_exists_creates_missing_directory() {
-        let temp = std::env::temp_dir().join(".env_test_ensure_dir");
-        let target = temp.join("a/b/c");
-        assert!(!target.exists());
-
-        ensure_dir_exists(&target).unwrap();
-        assert!(target.is_dir());
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn ensure_dir_exists_noop_when_already_exists() {
-        let temp = std::env::temp_dir().join(".env_test_ensure_dir_exists");
-        std::fs::create_dir_all(&temp).unwrap();
-
-        ensure_dir_exists(&temp).unwrap();
-        assert!(temp.is_dir());
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_creates_local_yi_agent_dir_in_fallback_mode() {
+    fn load_does_not_create_local_yi_agent_dir_in_fallback_mode() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // fallback 模式下,当前目录的 .yi-agent/ 不存在时应自动创建
+        // fallback 模式只读取本地 .yi-agent/.env,不应污染启动目录。
         let temp = std::env::temp_dir().join(".env_test_auto_create_local");
+        std::fs::remove_dir_all(&temp).ok();
         std::fs::create_dir_all(&temp).unwrap();
         let yi_agent_dir = temp.join(".yi-agent");
         assert!(!yi_agent_dir.exists());
@@ -1140,6 +1161,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -1150,8 +1173,10 @@ mod tests {
         let result = load(&cli);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
 
-        // 验证 .yi-agent/ 目录已创建
-        assert!(yi_agent_dir.is_dir(), ".yi-agent/ should be auto-created");
+        assert!(
+            !yi_agent_dir.exists(),
+            ".yi-agent/ should not be created until yi-agent writes a project file"
+        );
         std::fs::remove_dir_all(&temp).ok();
     }
 
@@ -1175,6 +1200,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
@@ -1362,9 +1389,8 @@ mod tests {
         assert!(cli.skip_permissions);
     }
 
-    #[test]
-    fn load_yolo_from_cli_flag() {
-        let cli = Cli {
+    fn test_cli() -> Cli {
+        Cli {
             command: None,
             provider: None,
             api_url: None,
@@ -1376,40 +1402,85 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
-            yolo: true,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
+            yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),
             skip_permissions: false,
             skills_catalog_budget: None,
             debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert!(config.yolo);
+        }
     }
 
     #[test]
-    fn load_yolo_from_skip_permissions_flag() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: true,
-            skills_catalog_budget: None,
-            debug: false,
-        };
+    fn load_yolo_from_cli_flag() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
+        env.remove("YI_AGENT_SANDBOX");
+        let mut cli = test_cli();
+        cli.yolo = true;
         let config = load(&cli).unwrap();
         assert!(config.yolo);
+        assert_eq!(
+            config.sandbox,
+            yi_agent_tools::SandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn explicit_cli_sandbox_overrides_yolo() {
+        let mut cli = test_cli();
+        cli.yolo = true;
+        cli.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
+        assert_eq!(
+            load(&cli).unwrap().sandbox,
+            yi_agent_tools::SandboxMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn environment_sandbox_overrides_yolo() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
+        env.set("YI_AGENT_SANDBOX", "read-only");
+        let mut cli = test_cli();
+        cli.yolo = true;
+        assert_eq!(
+            load(&cli).unwrap().sandbox,
+            yi_agent_tools::SandboxMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn skip_permissions_keeps_default_sandbox() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
+        env.remove("YI_AGENT_SANDBOX");
+        let mut cli = test_cli();
+        cli.skip_permissions = true;
+        let config = load(&cli).unwrap();
+        assert!(config.yolo);
+        assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
+    }
+
+    #[test]
+    fn yolo_environment_variable_keeps_default_sandbox() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_YOLO", "YI_AGENT_SANDBOX"]);
+        env.set("YI_AGENT_YOLO", "true");
+        env.remove("YI_AGENT_SANDBOX");
+        let config = load(&test_cli()).unwrap();
+        assert!(config.yolo);
+        assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
     }
 
     #[test]
@@ -1426,6 +1497,8 @@ mod tests {
             model_context_length: None,
             compact_ratio: None,
             compact_keep_turns: None,
+            compact_user_budget_tokens: None,
+            compact_tool_budget_tokens: None,
             yolo: false,
             sandbox: None,
             sandbox_writable_roots: Vec::new(),

@@ -391,7 +391,7 @@ fn run_loop<B: Backend, E: EventSource>(
                         let detail_area = chunks[0];
                         f.render_widget(Clear, detail_area);
                         f.render_widget(
-                            super::bash_popup::render_detail_popup(p, task),
+                            super::bash_popup::render_detail_popup(p, task, detail_area),
                             detail_area,
                         );
                     }
@@ -403,7 +403,7 @@ fn run_loop<B: Backend, E: EventSource>(
                         f.render_widget(Clear, detail_area);
                         let detail = DetailPopup::new(ck.task_id.clone());
                         f.render_widget(
-                            super::bash_popup::render_detail_popup(&detail, task),
+                            super::bash_popup::render_detail_popup(&detail, task, detail_area),
                             detail_area,
                         );
                     }

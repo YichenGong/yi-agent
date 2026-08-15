@@ -13,15 +13,15 @@ pub use agent::{
     Agent, AgentConfig, AgentError, AgentEvent, DoneReason, ProviderTurnGate, ProviderTurnLease,
     Session,
 };
-pub use compact::compact_session;
+pub use compact::{
+    CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
+    DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
+};
 pub use message::{ContentBlock, ImageSource, Message, Role};
+pub use subagent::task::{AttemptId, RootSessionId, TaskDepth, TaskId, TaskState};
 pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
     StopReason, TokenUsage,
-};
-pub use subagent::task::{
-    AgentTask, AttemptId, RootSessionId, TaskAttempt, TaskDepth, TaskEvent, TaskId,
-    TaskReduceError, TaskState, TransitionResult, reduce,
 };
 pub use tool::{
     OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,

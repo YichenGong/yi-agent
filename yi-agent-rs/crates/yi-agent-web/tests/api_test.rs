@@ -189,12 +189,12 @@ async fn get_config_returns_all_groups() {
     let groups = json["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 3); // Model Provider, Agent, Tools
 
-    // 验证包含所有 15 个变量
+    // 验证包含所有 16 个变量
     let total_vars: usize = groups
         .iter()
         .map(|g| g["vars"].as_array().unwrap().len())
         .sum();
-    assert_eq!(total_vars, 15);
+    assert_eq!(total_vars, 16);
 }
 
 #[tokio::test]
@@ -303,6 +303,29 @@ async fn index_html_returns_html() {
         .unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("<html") || html.contains("<!DOCTYPE"));
+}
+
+#[tokio::test]
+async fn index_html_defaults_to_global_scope_before_local_scope() {
+    let tmp = TempDir::new().unwrap();
+    let app = test_app(tmp.path().join(".env"));
+
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    let global_button = html.find("id=\"scopeGlobal\"").unwrap();
+    let local_button = html.find("id=\"scopeLocal\"").unwrap();
+    assert!(global_button < local_button);
+    assert!(html.contains("let currentScope = 'global';"));
+    assert!(html.contains(
+        "} else {\n      currentScope = 'local';\n      document.getElementById('scopeLocal').classList.add('active');"
+    ));
 }
 
 #[tokio::test]

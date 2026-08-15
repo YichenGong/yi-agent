@@ -6,6 +6,9 @@ use serde_json::Value;
 use std::sync::Arc;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
+const UNBOUNDED_ROOT_GLOB_WARNING: &str = "[warning: unbounded recursive glob at repository root] \
+prefer rg --files, a targeted directory, or a file-type constrained pattern; avoid heavy directories such as .git/, target/, node_modules/, and .worktrees/.";
+
 pub struct GlobTool {
     ctx: Arc<ToolsContext>,
 }
@@ -50,6 +53,8 @@ impl Tool for GlobTool {
             Err(e) => return ToolsError::ArgsParse(e).into(),
         };
 
+        let warn_unbounded_root_glob =
+            is_unbounded_root_recursive_scan(args.path.as_deref(), &args.pattern);
         let base = match &args.path {
             Some(p) => self.ctx.root().join(p),
             None => self.ctx.root().to_path_buf(),
@@ -79,11 +84,18 @@ impl Tool for GlobTool {
             }
         }
 
-        if matches.is_empty() {
-            ToolResult::text("no matches")
-        } else {
-            ToolResult::text(matches.join("\n"))
+        let mut lines = Vec::new();
+        if warn_unbounded_root_glob {
+            lines.push(UNBOUNDED_ROOT_GLOB_WARNING.to_string());
         }
+
+        if matches.is_empty() {
+            lines.push("no matches".to_string());
+        } else {
+            lines.extend(matches);
+        }
+
+        ToolResult::text(lines.join("\n"))
     }
 
     fn metadata(&self) -> ToolMetadata {
@@ -94,6 +106,16 @@ impl Tool for GlobTool {
             version: None,
         }
     }
+}
+
+fn is_unbounded_root_recursive_scan(path: Option<&str>, pattern: &str) -> bool {
+    let root_path = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        None => true,
+        Some(".") | Some("./") => true,
+        Some(_) => false,
+    };
+
+    root_path && pattern.trim() == "**/*"
 }
 
 #[cfg(test)]
@@ -132,6 +154,24 @@ mod tests {
         assert!(!result.is_error);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
             assert_eq!(s, "no matches");
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_warns_on_unbounded_root_recursive_scan() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("README.md"), "#").unwrap();
+
+        let tool = make_tool(&tmp);
+        let result = tool
+            .call(serde_json::json!({"path": ".", "pattern": "**/*"}))
+            .await;
+
+        assert!(!result.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            assert!(s.contains("[warning: unbounded recursive glob at repository root]"));
+            assert!(s.contains("prefer rg --files"));
+            assert!(s.contains("README.md"));
         }
     }
 }

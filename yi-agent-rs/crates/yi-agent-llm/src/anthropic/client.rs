@@ -15,7 +15,17 @@ use crate::anthropic::types::AnthropicRequest;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_TIMEOUT_SECS;
+
+    #[test]
+    fn default_stream_timeout_is_five_minutes() {
+        assert_eq!(DEFAULT_TIMEOUT_SECS, 300);
+    }
+}
 
 /// Configuration for constructing an [`AnthropicProvider`].
 ///

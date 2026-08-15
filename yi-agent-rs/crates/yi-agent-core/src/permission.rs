@@ -17,6 +17,10 @@ pub struct ToolLevelConfig {
     #[serde(default)]
     pub bash: bool,
     #[serde(default)]
+    pub process_start: bool,
+    #[serde(default)]
+    pub process_kill: bool,
+    #[serde(default)]
     pub write: bool,
     #[serde(default)]
     pub edit: bool,
@@ -102,8 +106,11 @@ impl PermissionChecker {
     }
 
     pub fn check(&self, tool_name: &str, tool_input: &serde_json::Value) -> CheckResult {
-        // 只对 bash/write/edit 做权限检查,其他工具直接放行
-        if !matches!(tool_name, "bash" | "write" | "edit") {
+        // 只对会产生副作用的工具做权限检查,其他工具直接放行
+        if !matches!(
+            tool_name,
+            "bash" | "process_start" | "process_kill" | "write" | "edit"
+        ) {
             return CheckResult::Allow;
         }
 
@@ -131,8 +138,8 @@ impl PermissionChecker {
         tool_name: &str,
         tool_input: &serde_json::Value,
     ) -> CheckResult {
-        // 黑名单只对 bash 检查
-        if tool_name == "bash" {
+        // 黑名单对直接 shell 和后台进程启动命令都生效。
+        if matches!(tool_name, "bash" | "process_start") {
             if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
                 if let Some(reason) = (self.blocklist_fn)(cmd) {
                     let request = self.build_request(
@@ -150,6 +157,8 @@ impl PermissionChecker {
     fn tool_level_allows(config: &PermissionsConfig, tool_name: &str) -> bool {
         match tool_name {
             "bash" => config.tool_level.bash,
+            "process_start" => config.tool_level.process_start,
+            "process_kill" => config.tool_level.process_kill,
             "write" => config.tool_level.write,
             "edit" => config.tool_level.edit,
             _ => false,
@@ -163,7 +172,7 @@ impl PermissionChecker {
         workdir: &Path,
     ) -> bool {
         match tool_name {
-            "bash" => {
+            "bash" | "process_start" => {
                 let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) else {
                     return false;
                 };
@@ -202,7 +211,7 @@ impl PermissionChecker {
         tool_input: &serde_json::Value,
         kind: PermissionKind,
     ) -> PermissionRequest {
-        let prefix_suggestion = if tool_name == "bash" {
+        let prefix_suggestion = if matches!(tool_name, "bash" | "process_start") {
             tool_input
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -240,6 +249,8 @@ impl PermissionChecker {
                 let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 match tool_name {
                     "bash" => config.tool_level.bash = true,
+                    "process_start" => config.tool_level.process_start = true,
+                    "process_kill" => config.tool_level.process_kill = true,
                     "write" => config.tool_level.write = true,
                     "edit" => config.tool_level.edit = true,
                     _ => {}
@@ -249,7 +260,9 @@ impl PermissionChecker {
             Decision::AlwaysAllowPrefix(prefix) => {
                 let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 match tool_name {
-                    "bash" if !config.prefix_level.bash.prefixes.contains(prefix) => {
+                    "bash" | "process_start"
+                        if !config.prefix_level.bash.prefixes.contains(prefix) =>
+                    {
                         config.prefix_level.bash.prefixes.push(prefix.clone());
                     }
                     "write" if !config.prefix_level.write.paths.contains(prefix) => {
@@ -325,6 +338,8 @@ mod tests {
     fn default_config_is_all_false_and_empty() {
         let config = PermissionsConfig::default();
         assert!(!config.tool_level.bash);
+        assert!(!config.tool_level.process_start);
+        assert!(!config.tool_level.process_kill);
         assert!(!config.tool_level.write);
         assert!(!config.tool_level.edit);
         assert!(config.prefix_level.bash.prefixes.is_empty());
@@ -337,6 +352,8 @@ mod tests {
         let config = PermissionsConfig {
             tool_level: ToolLevelConfig {
                 bash: true,
+                process_start: true,
+                process_kill: false,
                 write: false,
                 edit: true,
             },
@@ -440,6 +457,46 @@ bash = true
         ));
         assert!(matches!(
             checker.check("bash", &bash_input("git status")),
+            CheckResult::NeedConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn check_process_start_uses_bash_prefix_permissions() {
+        let config = PermissionsConfig {
+            prefix_level: PrefixLevelConfig {
+                bash: BashPrefixConfig {
+                    prefixes: vec!["python -m http.server".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let checker = checker_with(config, false);
+        assert!(matches!(
+            checker.check("process_start", &bash_input("python -m http.server 8000")),
+            CheckResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("process_start", &bash_input("npm run dev")),
+            CheckResult::NeedConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn check_process_start_blacklist_overrides_yolo() {
+        let checker = checker_with(PermissionsConfig::default(), true);
+        assert!(matches!(
+            checker.check("process_start", &bash_input("rm -rf /")),
+            CheckResult::Blacklisted(_)
+        ));
+    }
+
+    #[test]
+    fn check_process_kill_needs_confirmation_without_yolo() {
+        let checker = checker_with(PermissionsConfig::default(), false);
+        assert!(matches!(
+            checker.check("process_kill", &serde_json::json!({"process_id": "proc_1"})),
             CheckResult::NeedConfirm(_)
         ));
     }

@@ -16,6 +16,7 @@ yi-agent-skills = { workspace = true }
 async-trait = "0.1"
 tokio = { version = "1", features = ["process", "time", "fs", "io-util"] }
 futures = "0.3"
+libc = "0.2"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
