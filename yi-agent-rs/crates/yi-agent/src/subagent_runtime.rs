@@ -1202,6 +1202,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn child_tool_registry_enforces_workspace_sandbox_boundaries() {
+        let parent = TempDir::new().unwrap();
+        let child = TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            parent.path().join("runtime.sock"),
+        )
+        .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
+        let registry = factory.tool_registry_for_workspace(child.path().to_path_buf());
+        let write = registry
+            .get("write")
+            .expect("workspace-write includes write");
+
+        assert!(
+            !write
+                .call(json!({"path":"inside.txt","content":"inside"}))
+                .await
+                .is_error
+        );
+        assert!(
+            write
+                .call(json!({"path":"../parent.txt","content":"escape"}))
+                .await
+                .is_error
+        );
+        assert!(
+            write
+                .call(json!({"path":parent.path().join("absolute.txt"),"content":"escape"}))
+                .await
+                .is_error
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.path().join("inside.txt")).unwrap(),
+            "inside"
+        );
+        assert!(!parent.path().join("parent.txt").exists());
+        assert!(!parent.path().join("absolute.txt").exists());
+
+        let read_only = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            parent.path().join("runtime.sock"),
+        )
+        .with_sandbox(yi_agent_tools::SandboxMode::ReadOnly, Vec::new())
+        .tool_registry_for_workspace(child.path().to_path_buf());
+        assert!(read_only.get("write").is_none());
+        assert!(read_only.get("edit").is_none());
+    }
+
     #[test]
     fn recovery_gate_attests_matching_git_and_tool_state_without_provider_action() {
         let directory = TempDir::new().unwrap();
