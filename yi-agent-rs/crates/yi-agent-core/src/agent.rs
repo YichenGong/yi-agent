@@ -338,15 +338,23 @@ impl Agent {
 
     /// Restarts execution from the current session after a transient provider
     /// failure without duplicating the user prompt already in that session.
-    pub async fn retry_current_session(&mut self) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+    pub async fn retry_current_session(
+        &mut self,
+    ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
         self.start_run(None).await
     }
 
-    async fn start_run(&mut self, user_prompt: Option<String>) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+    async fn start_run(
+        &mut self,
+        user_prompt: Option<String>,
+    ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
         // Every run uses a fresh cancel token.
         self.cancel_token = CancellationToken::new();
         if let Some(user_prompt) = user_prompt {
-            self.session.lock().unwrap().push(Message::user(user_prompt));
+            self.session
+                .lock()
+                .unwrap()
+                .push(Message::user(user_prompt));
         }
 
         let provider = self.provider.clone();
@@ -477,7 +485,9 @@ async fn run_loop(
             } {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    let _ = tx.send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error))).await;
+                    let _ = tx
+                        .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
+                        .await;
                     return;
                 }
             },
