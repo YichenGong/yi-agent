@@ -18,11 +18,11 @@ pub use compact::{
     DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
 };
 pub use message::{ContentBlock, ImageSource, Message, Role};
-pub use subagent::task::{AttemptId, RootSessionId, TaskDepth, TaskId, TaskState};
 pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
     StopReason, TokenUsage,
 };
+pub use subagent::task::{AttemptId, RootSessionId, TaskDepth, TaskId, TaskState};
 pub use tool::{
     OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,
 };
