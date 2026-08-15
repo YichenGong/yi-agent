@@ -402,3 +402,65 @@ fn inspected_delivery_rejects_a_dirty_child_before_merging() {
         Err(WorktreeError::DirtyChild { .. })
     ));
 }
+
+#[test]
+fn missing_child_worktree_cannot_be_inspected_or_merged() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    let child_path = repo.path().join(".worktrees/missing-child");
+    let child = service
+        .create_child(repo.path(), &head, "child/missing", &child_path)
+        .unwrap();
+    git(&child_path, &["config", "user.email", "test@example.com"]);
+    git(&child_path, &["config", "user.name", "Test"]);
+    std::fs::write(child_path.join("delivery.txt"), "delivered\n").unwrap();
+    git(&child_path, &["add", "delivery.txt"]);
+    git(&child_path, &["commit", "-m", "delivery"]);
+    let parent_head = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            child_path.to_str().unwrap(),
+        ],
+    );
+    assert!(service.inspect_delivery(&child).is_err());
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), parent_head);
+}
+
+#[test]
+fn accepted_delivery_cannot_be_merged_twice_and_dirty_cleanup_is_refused() {
+    let (repo, head) = repository();
+    let service = WorktreeService::new();
+    let child_path = repo.path().join(".worktrees/one-merge");
+    let child = service
+        .create_child(repo.path(), &head, "child/one-merge", &child_path)
+        .unwrap();
+    git(&child_path, &["config", "user.email", "test@example.com"]);
+    git(&child_path, &["config", "user.name", "Test"]);
+    std::fs::write(child_path.join("delivery.txt"), "delivered\n").unwrap();
+    git(&child_path, &["add", "delivery.txt"]);
+    git(&child_path, &["commit", "-m", "delivery"]);
+    let delivery = service.inspect_delivery(&child).unwrap();
+
+    service
+        .merge_inspected_delivery(repo.path(), &child, &delivery, "accept delivery")
+        .unwrap();
+    let parent_head = git(repo.path(), &["rev-parse", "HEAD"]);
+    assert!(
+        service
+            .merge_inspected_delivery(repo.path(), &child, &delivery, "accept delivery again")
+            .is_err()
+    );
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), parent_head);
+
+    std::fs::write(child_path.join("uncommitted.txt"), "retain me\n").unwrap();
+    assert!(matches!(
+        service.remove_accepted_clean(repo.path(), &child),
+        Err(WorktreeError::DirtyChild { .. })
+    ));
+    assert!(child_path.exists());
+}
