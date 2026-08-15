@@ -498,6 +498,8 @@ pub struct IpcTaskDetail {
     pub state: String,
     pub delivery_json: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkerWorkspace>,
 }
 
@@ -1730,6 +1732,7 @@ mod subscription_queue_tests {
                 depth: 0,
                 state: "queued".into(),
                 delivery_json: "x".repeat(MAX_FRAME_BYTES),
+                terminal_json: None,
                 workspace: None,
             }),
         );
@@ -1871,6 +1874,7 @@ fn error_response(error: &IpcError) -> IpcResponse {
 
 fn ipc_error_message(error: &IpcError) -> Option<String> {
     match error {
+        IpcError::Runtime(RuntimeCoordinatorError::Supervisor(message)) => Some(message.clone()),
         IpcError::Runtime(RuntimeCoordinatorError::Spawn(
             yi_agent_core::subagent::supervisor::SpawnError::DirectChildLimitReached,
         )) => Some("an agent may have at most four direct children".into()),
@@ -2408,6 +2412,7 @@ fn respond(
                 depth: detail.depth,
                 state: detail.state,
                 delivery_json: detail.delivery_json,
+                terminal_json: detail.terminal_json,
                 workspace: detail.workspace,
             }))
         }

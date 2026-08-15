@@ -87,6 +87,17 @@ impl DaemonAgentWorkerFactory {
         tools
     }
 
+    fn worker_tool_registry(&self, workspace: &WorkerWorkspace) -> ToolRegistry {
+        let mut tools = (*self.tools).clone();
+        yi_agent_tools::register_builtin_tools_with_sandbox(
+            &mut tools,
+            workspace.path.clone(),
+            self.sandbox,
+            vec![git_dir_for_worktree(&workspace.path)],
+        );
+        tools
+    }
+
     fn worker_tool_names_for_workspace(&self, workspace: PathBuf) -> Vec<String> {
         let mut names = self
             .tool_registry_for_workspace(workspace)
@@ -364,8 +375,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 ))
             });
         };
-        let workspace_path = workspace.path.clone();
-        let worker_tools = Arc::new(self.tool_registry_for_workspace(workspace_path));
+        let worker_tools = Arc::new(self.worker_tool_registry(&workspace));
         let config = self.config.clone();
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
@@ -572,6 +582,17 @@ fn is_empty_delivery_error(error: &WorkerError) -> bool {
     error
         .to_string()
         .contains("child delivery has no commits beyond")
+}
+
+fn git_dir_for_worktree(workspace: &std::path::Path) -> PathBuf {
+    let git_dir = git_output(workspace, &["rev-parse", "--git-dir"])
+        .expect("worker workspace must have a Git directory");
+    let git_dir = PathBuf::from(git_dir);
+    if git_dir.is_absolute() {
+        git_dir
+    } else {
+        workspace.join(git_dir)
+    }
 }
 
 fn git_output(directory: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -1200,6 +1221,51 @@ mod tests {
             parent_branch: "main".into(),
             base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn child_worker_registry_allows_git_index_writes_in_its_repository() {
+        let repository = TempDir::new().unwrap();
+        let base_head = initialize_git_repository(repository.path());
+        let child_path = repository.path().join(".worktrees/child");
+        let child = WorktreeService::new()
+            .create_root(
+                repository.path(),
+                "feat/yi-agent-child-registry",
+                &child_path,
+            )
+            .unwrap();
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: repository.path().to_path_buf(),
+            path: child.path,
+            branch: child.branch,
+            parent_branch: child.parent_branch,
+            base_commit: base_head,
+        };
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            repository.path().join("runtime.sock"),
+        )
+        .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
+        let registry = factory.worker_tool_registry(&workspace);
+        let write = registry.get("write").expect("write tool");
+        assert!(
+            !write
+                .call(json!({"path":"delivery.txt","content":"ready\n"}))
+                .await
+                .is_error
+        );
+        let bash = registry.get("bash").expect("bash tool");
+        assert!(
+            !bash
+                .call(json!({"command":"git add delivery.txt"}))
+                .await
+                .is_error,
+            "child sandbox must permit its Git index writes"
+        );
     }
 
     #[tokio::test]

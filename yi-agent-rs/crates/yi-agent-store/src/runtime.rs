@@ -2457,9 +2457,11 @@ impl RuntimeCoordinator {
                     yi_agent_core::TaskState::Cancelled(_) => {
                         ("cancelled", RuntimeEvent::TaskCancelled, None)
                     }
-                    yi_agent_core::TaskState::Failed(_) => {
-                        ("failed", RuntimeEvent::TaskFailed, None)
-                    }
+                    yi_agent_core::TaskState::Failed(failure) => (
+                        "failed",
+                        RuntimeEvent::TaskFailed,
+                        Some(worker_failure_terminal_json(&failure.0)?),
+                    ),
                     _ => continue,
                 };
                 updates.push((task_id, attempt, state, event, terminal_json));
@@ -2752,6 +2754,28 @@ struct ProviderTurnAdmissions {
     queued: Mutex<HashMap<TaskId, QueuedProviderTurn>>,
     assigned: Mutex<HashMap<TaskId, LeaseId>>,
     notify: Arc<Notify>,
+}
+
+fn worker_failure_terminal_json(message: &str) -> Result<String, RuntimeCoordinatorError> {
+    const MAX_ERROR_BYTES: usize = 4 * 1024;
+    let error = truncate_utf8(message, MAX_ERROR_BYTES);
+    serde_json::to_string(&serde_json::json!({
+        "reason": "worker_failed",
+        "error": error,
+    }))
+    .map_err(RepositoryError::from)
+    .map_err(RuntimeCoordinatorError::from)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn text_completion_terminal_json(report: Option<&str>) -> Result<String, RuntimeCoordinatorError> {
@@ -3282,6 +3306,15 @@ impl Drop for ProviderTurnWaitCleanup {
 #[cfg(test)]
 mod provider_turn_admission_tests {
     use super::*;
+
+    #[test]
+    fn worker_failure_terminal_evidence_is_bounded_without_splitting_utf8() {
+        let message = format!("{}終", "x".repeat(4 * 1024));
+        let terminal = worker_failure_terminal_json(&message).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+        assert_eq!(payload["reason"], "worker_failed");
+        assert_eq!(payload["error"].as_str().unwrap(), "x".repeat(4 * 1024));
+    }
 
     fn test_repository(root: &RootSessionId, tasks: &[TaskId]) -> Arc<Mutex<RuntimeRepository>> {
         let mut repository = RuntimeRepository::open(":memory:").unwrap();

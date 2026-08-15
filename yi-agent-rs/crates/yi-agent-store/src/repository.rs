@@ -315,6 +315,7 @@ pub struct PersistedTaskDetail {
     pub depth: u8,
     pub state: String,
     pub delivery_json: String,
+    pub terminal_json: Option<String>,
     pub workspace: Option<WorkerWorkspace>,
 }
 
@@ -3610,8 +3611,11 @@ impl RuntimeRepository {
         let detail = self
             .connection
             .query_row(
-                "SELECT id, root_session_id, parent_id, depth, state_json, delivery_json
-                 FROM tasks WHERE id = ?1",
+                "SELECT tasks.id, tasks.root_session_id, tasks.parent_id, tasks.depth,
+                        tasks.state_json, tasks.delivery_json, attempts.terminal_json
+                 FROM tasks
+                 JOIN attempts ON attempts.id = tasks.active_attempt_id
+                 WHERE tasks.id = ?1",
                 params![task.to_string()],
                 |row| {
                     Ok(PersistedTaskDetail {
@@ -3621,6 +3625,7 @@ impl RuntimeRepository {
                         depth: row.get(3)?,
                         state: row.get(4)?,
                         delivery_json: row.get(5)?,
+                        terminal_json: row.get(6)?,
                         workspace: None,
                     })
                 },

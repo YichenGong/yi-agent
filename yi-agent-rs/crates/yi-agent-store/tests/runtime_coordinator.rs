@@ -2621,6 +2621,14 @@ async fn coordinator_persists_worker_failure_reported_by_the_factory() {
     coordinator.reconcile_worker_events().await.unwrap();
 
     assert_eq!(coordinator.task_state(&root).unwrap(), "failed");
+    let terminal = RuntimeRepository::open(&database)
+        .unwrap()
+        .attempt_terminal_json_for_task(&root)
+        .unwrap()
+        .expect("worker failure must persist terminal evidence");
+    let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+    assert_eq!(terminal["reason"], "worker_failed");
+    assert_eq!(terminal["error"], "provider disconnected");
 }
 
 #[tokio::test]
