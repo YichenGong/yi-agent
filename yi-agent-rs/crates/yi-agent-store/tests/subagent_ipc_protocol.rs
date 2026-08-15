@@ -5,7 +5,11 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use yi_agent_store::ipc::{Daemon, IpcRequest, RequestEnvelope, send_request};
+use yi_agent_core::subagent::task::{RootSessionId, TaskId};
+use yi_agent_store::ipc::{
+    Daemon, IpcRequest, IpcResponse, RequestEnvelope, send_request, subscribe,
+};
+use yi_agent_store::repository::{RuntimeEvent, RuntimeRepository};
 
 fn read_response(stream: UnixStream) -> Option<Value> {
     stream
@@ -31,6 +35,70 @@ fn assert_healthy(socket: &Path) {
         send_request(socket, IpcRequest::Status).unwrap(),
         yi_agent_store::ipc::IpcResponse::Status { .. }
     ));
+}
+
+#[test]
+fn subscription_reconnect_replays_strictly_ordered_events_without_duplicates() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_event(&task, RuntimeEvent::TaskQueued)
+        .unwrap();
+
+    let mut initial = subscribe(daemon.socket_path(), 0).unwrap();
+    let IpcResponse::Subscription(snapshot) = initial.next_response().unwrap() else {
+        panic!("expected initial subscription snapshot");
+    };
+    assert!(snapshot.events.is_empty());
+    repository
+        .transition_task(&task, "running", RuntimeEvent::TaskStarted)
+        .unwrap();
+    let IpcResponse::Event(initial_event) = initial.next_response().unwrap() else {
+        panic!("expected initial live event");
+    };
+    let saved_event_id = initial_event.event_id;
+    drop(initial);
+
+    repository
+        .transition_task(&task, "completed", RuntimeEvent::TaskCompleted)
+        .unwrap();
+    repository
+        .append_event(&task, RuntimeEvent::TaskProgress)
+        .unwrap();
+
+    let mut resumed = subscribe(daemon.socket_path(), saved_event_id).unwrap();
+    let IpcResponse::Subscription(snapshot) = resumed.next_response().unwrap() else {
+        panic!("expected resumed subscription snapshot");
+    };
+    let replay_ids = snapshot
+        .events
+        .iter()
+        .map(|event| event.event_id)
+        .collect::<Vec<_>>();
+    assert_eq!(replay_ids.len(), 2);
+    assert!(replay_ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(replay_ids.iter().all(|id| *id > saved_event_id));
+    assert_eq!(
+        replay_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        replay_ids.len()
+    );
+
+    repository
+        .append_event(&task, RuntimeEvent::TaskQueued)
+        .unwrap();
+    let IpcResponse::Event(live) = resumed.next_response().unwrap() else {
+        panic!("expected live event after reconnect");
+    };
+    assert!(live.event_id > *replay_ids.last().unwrap());
 }
 
 #[test]
