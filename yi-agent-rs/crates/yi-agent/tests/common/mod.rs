@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::Duration;
@@ -78,6 +80,36 @@ pub fn resolve_real_llm_test_config() -> Result<Option<RealLlmTestConfig>, Strin
             api_key: dedicated[3].1.clone().unwrap(),
         }));
     }
+    if let Some(api_key) = std::env::var("MODEL_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let provider = std::env::var("YI_AGENT_PROVIDER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "anthropic".into());
+        if !matches!(provider.as_str(), "anthropic" | "openai") {
+            return Err("YI_AGENT_PROVIDER must be anthropic or openai".into());
+        }
+        let (default_api_url, default_model) = if provider == "anthropic" {
+            ("https://api.anthropic.com", "claude-sonnet-4-20250514")
+        } else {
+            ("https://api.openai.com", "gpt-4o")
+        };
+        return Ok(Some(RealLlmTestConfig {
+            provider,
+            api_url: std::env::var("MODEL_API_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| default_api_url.into()),
+            model: std::env::var("YI_AGENT_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| default_model.into()),
+            api_key,
+        }));
+    }
+
     let (provider, api_key) = if let Some(key) = std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|value| !value.is_empty())
@@ -253,6 +285,74 @@ pub fn run_agent_with_timeout(workdir: &Path, prompt: &str) -> Result<Output, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvVarGuard {
+        original: BTreeMap<&'static str, Option<OsString>>,
+    }
+
+    impl EnvVarGuard {
+        fn new(names: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                original: names
+                    .into_iter()
+                    .map(|name| (name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.original {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_config_prefers_standard_environment_over_provider_key_fallback() {
+        let _env = EnvVarGuard::new([
+            "YI_AGENT_REAL_LLM_PROVIDER",
+            "YI_AGENT_REAL_LLM_API_URL",
+            "YI_AGENT_REAL_LLM_MODEL",
+            "YI_AGENT_REAL_LLM_API_KEY",
+            "YI_AGENT_PROVIDER",
+            "MODEL_API_URL",
+            "YI_AGENT_MODEL",
+            "MODEL_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ]);
+        unsafe {
+            for name in [
+                "YI_AGENT_REAL_LLM_PROVIDER",
+                "YI_AGENT_REAL_LLM_API_URL",
+                "YI_AGENT_REAL_LLM_MODEL",
+                "YI_AGENT_REAL_LLM_API_KEY",
+                "ANTHROPIC_API_KEY",
+            ] {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("YI_AGENT_PROVIDER", "openai");
+            std::env::set_var("MODEL_API_URL", "https://gateway.example.test/v1");
+            std::env::set_var("YI_AGENT_MODEL", "gateway-model");
+            std::env::set_var("MODEL_API_KEY", "gateway-key");
+            std::env::set_var("OPENAI_API_KEY", "fallback-key");
+        }
+
+        let config = resolve_real_llm_test_config()
+            .expect("configuration resolves")
+            .expect("standard configuration is present");
+
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.api_url, "https://gateway.example.test/v1");
+        assert_eq!(config.model, "gateway-model");
+    }
 
     #[test]
     fn owned_child_timeout_reports_timeout() {
