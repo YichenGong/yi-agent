@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
@@ -18,6 +19,18 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 /// Shared decision channel used to gate tool execution behind user confirmation.
 type DecisionRx = Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission::Decision)>>>;
+
+/// A handle held only while one provider request is active. Implementations
+/// release their runtime lease when the boxed value is dropped.
+pub trait ProviderTurnLease: Send {}
+
+impl<T: Send> ProviderTurnLease for T {}
+
+/// Runtime-owned admission for individual provider turns. This keeps the core
+/// loop independent from the store while enforcing real provider boundaries.
+pub trait ProviderTurnGate: Send + Sync {
+    fn acquire(&self) -> BoxFuture<'static, Result<Box<dyn ProviderTurnLease>, String>>;
+}
 
 /// In-memory message container. No persistence.
 #[derive(Debug, Clone, Default)]
@@ -160,6 +173,7 @@ pub struct Agent {
     cancel_token: CancellationToken,
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
+    provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
 }
 
 /// Events emitted during agent loop.
@@ -175,6 +189,10 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         result: ToolResult,
+    },
+    /// An explicitly retryable tool failed and is being retried internally.
+    ToolRetry {
+        id: String,
     },
     ToolOutputDelta {
         id: String,
@@ -248,6 +266,8 @@ const COMPLETION_AUDIT_PROMPT: &str =
 pub enum AgentError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
+    #[error("provider turn admission failed: {0}")]
+    ProviderTurnAdmission(String),
     #[error("compaction error: {0}")]
     Compact(#[from] crate::compact::CompactError),
 }
@@ -262,6 +282,7 @@ impl Agent {
             cancel_token: CancellationToken::new(),
             permission_checker: None,
             decision_rx: None,
+            provider_turn_gate: None,
         }
     }
 
@@ -270,6 +291,12 @@ impl Agent {
             session: Arc::new(Mutex::new(session)),
             ..self
         }
+    }
+
+    /// Restrict provider turns through the daemon-owned admission gate.
+    pub fn with_provider_turn_gate(mut self, gate: Arc<dyn ProviderTurnGate>) -> Self {
+        self.provider_turn_gate = Some(gate);
+        self
     }
 
     /// Attach a permission checker and decision channel for tool gating.
@@ -306,15 +333,21 @@ impl Agent {
         &mut self,
         user_prompt: String,
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
-        // 每次运行使用新的 cancel token,避免上一次 cancel 留下的状态
-        // 卡死后续运行(inline 模式的 Interrupt/ctrl_c/新 prompt 只 cancel
-        // 不重建 agent,如果不重置,后续 run() 会在 run_loop 开头立刻返回
-        // Cancelled)。
+        self.start_run(Some(user_prompt)).await
+    }
+
+    /// Restarts execution from the current session after a transient provider
+    /// failure without duplicating the user prompt already in that session.
+    pub async fn retry_current_session(&mut self) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        self.start_run(None).await
+    }
+
+    async fn start_run(&mut self, user_prompt: Option<String>) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        // Every run uses a fresh cancel token.
         self.cancel_token = CancellationToken::new();
-        self.session
-            .lock()
-            .unwrap()
-            .push(Message::user(user_prompt));
+        if let Some(user_prompt) = user_prompt {
+            self.session.lock().unwrap().push(Message::user(user_prompt));
+        }
 
         let provider = self.provider.clone();
         let tools = self.tools.clone();
@@ -323,6 +356,7 @@ impl Agent {
         let cancel_token = self.cancel_token.clone();
         let permission_checker = self.permission_checker.clone();
         let decision_rx = self.decision_rx.clone();
+        let provider_turn_gate = self.provider_turn_gate.clone();
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
@@ -338,6 +372,7 @@ impl Agent {
                 cancel_token,
                 permission_checker,
                 decision_rx,
+                provider_turn_gate,
             )
             .await;
         });
@@ -356,6 +391,7 @@ async fn run_loop(
     cancel_token: CancellationToken,
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
+    provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     // 记录进入 run_loop 时的 session 长度(含 Agent::run push 的 user 消息,
@@ -431,6 +467,23 @@ async fn run_loop(
         let prefill_estimate = estimate_prefill_tokens(&req);
         let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
+        let provider_turn_lease = match &provider_turn_gate {
+            Some(gate) => match tokio::select! {
+                lease = gate.acquire() => lease,
+                _ = cancel_token.cancelled() => {
+                    let _ = tx.send(AgentEvent::Cancelled).await;
+                    return;
+                }
+            } {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let _ = tx.send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error))).await;
+                    return;
+                }
+            },
+            None => None,
+        };
+
         let stream = match provider.call_stream(req).await {
             Ok(s) => {
                 tracing::info!(
@@ -505,6 +558,8 @@ async fn run_loop(
                 return;
             }
         }
+
+        drop(provider_turn_lease);
 
         messages.push(Message::assistant(content.clone()));
         session

@@ -126,6 +126,10 @@ pub enum Command {
         /// 等同于直接对话裸 LLM,无任何附加能力。
         #[arg(long)]
         naked: bool,
+
+        /// Enable local subagent delegation for this headless run.
+        #[arg(long)]
+        subagents: bool,
     },
     /// Start web config UI
     Web {
@@ -137,6 +141,137 @@ pub enum Command {
         #[arg(long, default_value = "7292")]
         port: u16,
     },
+    /// Inspect or stop the manually started local subagent runtime daemon.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+    /// List daemon-owned agent tasks.
+    Agents {
+        /// Limit to a project path when the daemon supports project filtering.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Include terminal tasks.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Inspect or control one daemon-owned agent task.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+    /// Preview or confirm a natural-language Cron schedule.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ScheduleAction {
+    /// Ask the configured model for a preview; persistence requires --confirm.
+    Add {
+        /// Natural-language recurrence and objective.
+        request: String,
+        /// Persist the validated preview through the local daemon.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, PartialEq, Eq)]
+pub enum AgentAction {
+    Show {
+        task_id: String,
+    },
+    Events {
+        task_id: String,
+        #[arg(long)]
+        follow: bool,
+    },
+    Diff {
+        task_id: String,
+    },
+    Mailbox {
+        task_id: String,
+    },
+    Message {
+        task_id: String,
+        text: String,
+        #[arg(long)]
+        trigger: bool,
+    },
+    Pause {
+        task_id: String,
+    },
+    Resume {
+        task_id: String,
+    },
+    Cancel {
+        task_id: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long)]
+        yes: bool,
+        /// Single-use token returned by the preceding cancel preview.
+        #[arg(long)]
+        confirmation: Option<String>,
+    },
+    Retry {
+        task_id: String,
+    },
+    Priority {
+        task_id: String,
+        level: String,
+    },
+    Budget {
+        task_id: String,
+        #[arg(long)]
+        turns: Option<u32>,
+        #[arg(long)]
+        tokens: Option<u64>,
+        #[arg(long)]
+        deadline: Option<u64>,
+    },
+    Accept {
+        task_id: String,
+        #[arg(long)]
+        yes: bool,
+        /// Single-use token returned by the preceding review preview.
+        #[arg(long)]
+        confirmation: Option<String>,
+    },
+    Rework {
+        task_id: String,
+        feedback: String,
+        #[arg(long)]
+        yes: bool,
+        /// Single-use token returned by the preceding review preview.
+        #[arg(long)]
+        confirmation: Option<String>,
+    },
+    Reject {
+        task_id: String,
+        reason: String,
+        #[arg(long)]
+        yes: bool,
+        /// Single-use token returned by the preceding review preview.
+        #[arg(long)]
+        confirmation: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    /// Start a detached local daemon process.
+    Start,
+    /// Report the daemon event high-water mark.
+    Status,
+    /// Request an orderly daemon stop.
+    Stop,
+    /// Internal long-running daemon worker.
+    #[command(hide = true)]
+    Serve,
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -1109,6 +1244,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_run_subagents_flag() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "run", "--subagents", "delegate"]);
+        let Some(Command::Run { subagents, .. }) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(subagents);
+    }
+
+    #[test]
+    fn cli_defaults_run_subagents_to_false() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "run", "ordinary"]);
+        let Some(Command::Run { subagents, .. }) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(!subagents);
+    }
+
+    #[test]
     fn cli_parses_run_naked_flag() {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "run", "--naked", "hi"]);
@@ -1118,6 +1273,7 @@ mod tests {
                 json: _,
                 stdin: _,
                 naked,
+                subagents: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(naked, "naked flag should be true");
@@ -1136,6 +1292,7 @@ mod tests {
                 json: _,
                 stdin: _,
                 naked,
+                subagents: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(!naked, "naked flag should default to false");
@@ -1149,6 +1306,19 @@ mod tests {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn cli_parses_daemon_status_and_stop() {
+        use clap::Parser;
+        for (argument, expected) in [
+            ("start", DaemonAction::Start),
+            ("status", DaemonAction::Status),
+            ("stop", DaemonAction::Stop),
+        ] {
+            let cli = Cli::parse_from(["yi-agent", "daemon", argument]);
+            assert!(matches!(cli.command, Some(Command::Daemon { action }) if action == expected));
+        }
     }
 
     #[test]
@@ -1352,5 +1522,76 @@ mod tests {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "--api-key", "test"]);
         assert!(!cli.debug);
+    }
+
+    #[test]
+    fn cli_parses_all_documented_task_controls_and_daemon_controls() {
+        use clap::Parser;
+
+        for argv in [
+            vec!["yi-agent", "agents"],
+            vec!["yi-agent", "agent", "show", "task"],
+            vec!["yi-agent", "agent", "events", "task"],
+            vec!["yi-agent", "agent", "mailbox", "task"],
+            vec!["yi-agent", "agent", "diff", "task"],
+            vec!["yi-agent", "agent", "cancel", "task"],
+            vec!["yi-agent", "agent", "retry", "task"],
+            vec!["yi-agent", "agent", "pause", "task"],
+            vec!["yi-agent", "agent", "resume", "task"],
+            vec!["yi-agent", "agent", "accept", "task"],
+            vec!["yi-agent", "agent", "rework", "task", "feedback"],
+            vec!["yi-agent", "agent", "reject", "task", "reason"],
+            vec!["yi-agent", "daemon", "status"],
+            vec!["yi-agent", "daemon", "stop"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok());
+        }
+    }
+
+    #[test]
+    fn cli_rejects_missing_required_task_control_arguments() {
+        use clap::Parser;
+
+        for argv in [
+            vec!["yi-agent", "agent", "cancel"],
+            vec!["yi-agent", "agent", "rework", "task"],
+            vec!["yi-agent", "agent", "reject", "task"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn cli_parses_documented_agent_control_grammar() {
+        use clap::Parser;
+
+        let agents = Cli::parse_from(["yi-agent", "agents", "--all"]);
+        assert!(matches!(
+            agents.command,
+            Some(Command::Agents { all: true, .. })
+        ));
+
+        let cancel = Cli::parse_from([
+            "yi-agent",
+            "agent",
+            "cancel",
+            "task-123",
+            "--recursive",
+            "--yes",
+            "--confirmation",
+            "preview-token",
+        ]);
+        assert!(matches!(
+            cancel.command,
+            Some(Command::Agent { action: AgentAction::Cancel { task_id, recursive: true, yes: true, confirmation: Some(confirmation) } })
+                if task_id == "task-123" && confirmation == "preview-token"
+        ));
+
+        let rework = Cli::parse_from(["yi-agent", "agent", "rework", "task-123", "tighten tests"]);
+        assert!(matches!(
+            rework.command,
+            Some(Command::Agent { action: AgentAction::Rework { task_id, feedback, .. } })
+                if task_id == "task-123" && feedback == "tighten tests"
+        ));
     }
 }

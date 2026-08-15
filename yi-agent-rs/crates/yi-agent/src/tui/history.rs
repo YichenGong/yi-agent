@@ -454,6 +454,7 @@ impl HistoryState {
             AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolExit { .. }
             | AgentEvent::ToolTimeout { .. }
+            | AgentEvent::ToolRetry { .. }
             | AgentEvent::EstimatedPrefill(_)
             | AgentEvent::DecodeDelta(_) => {
                 // Not tracked in history

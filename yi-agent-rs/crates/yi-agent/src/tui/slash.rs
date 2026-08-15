@@ -1,5 +1,7 @@
 //! Slash command definitions and popup state for the TUI.
 
+use crate::control_commands::{CommandSpec, ControlCommand};
+
 /// A slash command the user can invoke from the TUI input.
 ///
 /// Adds metadata (description, arg requirements) needed for the popup UI.
@@ -12,11 +14,62 @@ pub enum SlashCommand {
     Compact,
     Config,
     Help,
+    Agents,
+    Agent,
+    Events,
+    Diff,
+    Mailbox,
+    Message,
+    Pause,
+    Resume,
+    Cancel,
+    Retry,
+    Priority,
+    Approve,
+    Deny,
+    Review,
+    Accept,
+    Rework,
+    Reject,
+    Budget,
+    Daemon,
 }
 
 impl SlashCommand {
+    fn control_spec(self) -> Option<CommandSpec> {
+        let command = match self {
+            Self::Agents => ControlCommand::Agents,
+            Self::Agent => ControlCommand::Agent,
+            Self::Events => ControlCommand::Events,
+            Self::Diff => ControlCommand::Diff,
+            Self::Mailbox => ControlCommand::Mailbox,
+            Self::Message => ControlCommand::Message,
+            Self::Pause => ControlCommand::Pause,
+            Self::Resume => ControlCommand::Resume,
+            Self::Cancel => ControlCommand::Cancel,
+            Self::Retry => ControlCommand::Retry,
+            Self::Priority => ControlCommand::Priority,
+            Self::Approve => ControlCommand::Approve,
+            Self::Deny => ControlCommand::Deny,
+            Self::Review => ControlCommand::Review,
+            Self::Accept => ControlCommand::Accept,
+            Self::Rework => ControlCommand::Rework,
+            Self::Reject => ControlCommand::Reject,
+            Self::Budget => ControlCommand::Budget,
+            Self::Daemon => ControlCommand::Daemon,
+            Self::Help => ControlCommand::Help,
+            Self::Quit | Self::Clear | Self::Model | Self::Cost | Self::Compact | Self::Config => {
+                return None;
+            }
+        };
+        Some(command.spec())
+    }
+
     /// The serialized command name (without the leading `/`).
     pub fn name(&self) -> &'static str {
+        if let Some(spec) = self.control_spec() {
+            return spec.slash_name;
+        }
         match self {
             SlashCommand::Quit => "quit",
             SlashCommand::Clear => "clear",
@@ -25,11 +78,33 @@ impl SlashCommand {
             SlashCommand::Compact => "compact",
             SlashCommand::Config => "config",
             SlashCommand::Help => "help",
+            SlashCommand::Agents => "agents",
+            SlashCommand::Agent => "agent",
+            SlashCommand::Events => "events",
+            SlashCommand::Diff => "diff",
+            SlashCommand::Mailbox => "mailbox",
+            SlashCommand::Message => "message",
+            SlashCommand::Pause => "pause",
+            SlashCommand::Resume => "resume",
+            SlashCommand::Cancel => "cancel",
+            SlashCommand::Retry => "retry",
+            SlashCommand::Priority => "priority",
+            SlashCommand::Approve => "approve",
+            SlashCommand::Deny => "deny",
+            SlashCommand::Review => "review",
+            SlashCommand::Accept => "accept",
+            SlashCommand::Rework => "rework",
+            SlashCommand::Reject => "reject",
+            SlashCommand::Budget => "budget",
+            SlashCommand::Daemon => "daemon",
         }
     }
 
     /// Short Chinese description shown in the popup.
     pub fn description(&self) -> &'static str {
+        if let Some(spec) = self.control_spec() {
+            return spec.description;
+        }
         match self {
             SlashCommand::Quit => "退出程序",
             SlashCommand::Clear => "清空对话上下文",
@@ -38,13 +113,56 @@ impl SlashCommand {
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
             SlashCommand::Help => "显示帮助信息",
+            SlashCommand::Agents => "显示当前 session 的 agent 任务树",
+            SlashCommand::Agent => "显示单个 agent 详情 (需要任务 ID)",
+            SlashCommand::Events => "查看任务事件 (需要任务 ID)",
+            SlashCommand::Diff => "查看任务 diff (需要任务 ID)",
+            SlashCommand::Mailbox => "查看任务 mailbox (需要任务 ID)",
+            SlashCommand::Message => "向相邻 agent 发送消息",
+            SlashCommand::Pause => "暂停任务",
+            SlashCommand::Resume => "恢复任务",
+            SlashCommand::Cancel => "取消任务",
+            SlashCommand::Retry => "创建新的重试 attempt",
+            SlashCommand::Priority => "调整任务优先级",
+            SlashCommand::Approve => "批准权限请求",
+            SlashCommand::Deny => "拒绝权限请求",
+            SlashCommand::Review => "查看 delivery 审查",
+            SlashCommand::Accept => "接受并集成子任务 delivery",
+            SlashCommand::Rework => "请求子任务返工",
+            SlashCommand::Reject => "拒绝子任务 delivery",
+            SlashCommand::Budget => "查看或收窄任务预算",
+            SlashCommand::Daemon => "管理本地 runtime daemon",
         }
     }
 
-    /// Whether the command requires an argument (e.g. `/model gpt-4`).
-    #[allow(dead_code)]
+    /// Required positional arguments, rendered consistently in help and completion.
+    pub fn argument_usage(&self) -> Option<&'static str> {
+        if let Some(spec) = self.control_spec() {
+            return (!spec.usage.is_empty()).then_some(spec.usage);
+        }
+        match self {
+            SlashCommand::Agents => Some("[--all|--active]"),
+            SlashCommand::Model => Some("<model-name>"),
+            SlashCommand::Agent => Some("<task-id>"),
+            SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
+            SlashCommand::Message => Some("<task-id> <text>"),
+            SlashCommand::Cancel => Some("<task-id> [--recursive] [--confirm <token>]"),
+            SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => Some("<task-id>"),
+            SlashCommand::Priority => Some("<task-id> <level>"),
+            SlashCommand::Approve => Some("<request-id> [once|task]"),
+            SlashCommand::Deny => Some("<request-id>"),
+            SlashCommand::Review => Some("<task-id>"),
+            SlashCommand::Accept => Some("<task-id> [--confirm <token>]"),
+            SlashCommand::Rework => Some("<task-id> <feedback> [--confirm <token>]"),
+            SlashCommand::Reject => Some("<task-id> <reason> [--confirm <token>]"),
+            _ => None,
+        }
+    }
+
+    /// Whether the command requires an argument.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn needs_arg(&self) -> bool {
-        matches!(self, SlashCommand::Model)
+        self.argument_usage().is_some()
     }
 
     /// All available commands, in popup display order.
@@ -57,12 +175,71 @@ impl SlashCommand {
             SlashCommand::Compact,
             SlashCommand::Config,
             SlashCommand::Help,
+            SlashCommand::Agents,
+            SlashCommand::Agent,
+            SlashCommand::Events,
+            SlashCommand::Diff,
+            SlashCommand::Mailbox,
+            SlashCommand::Message,
+            SlashCommand::Pause,
+            SlashCommand::Resume,
+            SlashCommand::Cancel,
+            SlashCommand::Retry,
+            SlashCommand::Priority,
+            SlashCommand::Approve,
+            SlashCommand::Deny,
+            SlashCommand::Review,
+            SlashCommand::Accept,
+            SlashCommand::Rework,
+            SlashCommand::Reject,
+            SlashCommand::Budget,
+            SlashCommand::Daemon,
         ]
     }
 
     /// Look up a command by its name (without leading `/`).
     pub fn from_name(name: &str) -> Option<SlashCommand> {
+        if name == "?" {
+            return Some(Self::Help);
+        }
         Self::all().iter().copied().find(|cmd| cmd.name() == name)
+    }
+}
+
+/// Render the same command catalog used by slash completion and dispatch.
+pub fn help_text(target: Option<&str>) -> String {
+    match target
+        .map(|name| name.trim_start_matches('/'))
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => match SlashCommand::from_name(name) {
+            Some(command) => format!(
+                "/{}{}\n{}",
+                command.name(),
+                command
+                    .argument_usage()
+                    .map(|usage| format!(" {usage}"))
+                    .unwrap_or_default(),
+                command.description()
+            ),
+            None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
+        },
+        None => {
+            let mut text = String::from("可用命令:\n");
+            for command in SlashCommand::all() {
+                let usage = command
+                    .argument_usage()
+                    .map(|usage| format!(" {usage}"))
+                    .unwrap_or_default();
+                text.push_str(&format!(
+                    "  /{}{} {}\n",
+                    command.name(),
+                    usage,
+                    command.description()
+                ));
+            }
+            text
+        }
     }
 }
 
@@ -225,9 +402,47 @@ mod tests {
     }
 
     #[test]
-    fn needs_arg_only_for_model() {
+    fn help_alias_and_contextual_help_use_the_command_catalog() {
+        assert_eq!(SlashCommand::from_name("?"), Some(SlashCommand::Help));
+        assert!(help_text(Some("agents")).contains("/agents"));
+        assert!(help_text(Some("missing")).contains("未知命令"));
+    }
+
+    #[test]
+    fn task_controls_publish_usage_in_help_and_metadata() {
+        for command in [
+            SlashCommand::Pause,
+            SlashCommand::Resume,
+            SlashCommand::Retry,
+        ] {
+            assert_eq!(command.argument_usage(), Some("<task-id>"));
+            assert!(command.needs_arg());
+            assert!(
+                help_text(Some(command.name())).contains(&format!("/{} <task-id>", command.name()))
+            );
+        }
+    }
+
+    #[test]
+    fn executable_commands_publish_their_argument_signatures() {
+        for (command, usage) in [
+            (SlashCommand::Agent, "<task-id>"),
+            (SlashCommand::Message, "<task-id> <text>"),
+            (SlashCommand::Cancel, "<task-id> [--recursive]"),
+            (SlashCommand::Model, "<model-name>"),
+        ] {
+            assert_eq!(command.argument_usage(), Some(usage));
+            assert!(command.needs_arg());
+            assert!(
+                help_text(Some(command.name())).contains(&format!("/{} {usage}", command.name()))
+            );
+        }
+    }
+
+    #[test]
+    fn needs_arg_includes_commands_with_usage_metadata() {
         for cmd in SlashCommand::all() {
-            assert_eq!(cmd.needs_arg(), *cmd == SlashCommand::Model);
+            assert_eq!(cmd.needs_arg(), cmd.argument_usage().is_some());
         }
     }
 

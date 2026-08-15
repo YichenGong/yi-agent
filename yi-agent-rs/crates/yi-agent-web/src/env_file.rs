@@ -82,6 +82,18 @@ pub fn write(
     Ok(())
 }
 
+pub fn write_selected(path: &Path, values: &HashMap<String, String>) -> Result<()> {
+    let mut output = String::new();
+    let mut entries = values.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, value) in entries {
+        output.push_str(&format!("{key}={value}\n"));
+    }
+    std::fs::write(path, output)
+        .with_context(|| format!("failed to write .env file: {}", path.display()))?;
+    Ok(())
+}
+
 /// 对 secret 类型值做掩码：前4 + *** + 后4，不足12字符则全 ***。
 pub fn mask(value: &str) -> String {
     if value.len() < 12 {

@@ -1,17 +1,30 @@
 //! yi-agent CLI 入口。
 
 mod config;
+mod control_commands;
 mod llm_prefix;
+mod schedule_intent;
+mod subagent_runtime;
 mod tracing_init;
 mod tui;
 
-use std::{path::Path, sync::Arc};
+#[cfg(test)]
+mod control_commands_tests;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
 
-use crate::config::{Cli, Command};
+use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
+
+fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
+    match message {
+        Some(message) => format!("{code}: {message}"),
+        None => code.to_string(),
+    }
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -35,33 +48,771 @@ fn main() -> Result<()> {
             json,
             stdin,
             naked,
+            subagents,
         }) => {
             let prompt = prompt.clone();
-            run_headless(cli, prompt, json, stdin, naked)
+            run_headless(cli, prompt, json, stdin, naked, subagents)
         }
+        Some(Command::Daemon { action }) => control_daemon(&cli, action),
+        Some(Command::Agents { project, all }) => control_agents(project, all),
+        Some(Command::Agent { action }) => control_agent(action),
+        Some(Command::Schedule { ref action }) => control_schedule(&cli, action),
         None => run_agent(cli),
     }
+}
+
+fn control_agents(project: Option<std::path::PathBuf>, all: bool) -> Result<()> {
+    if project.is_some() {
+        anyhow::bail!("project filtering is not available from this daemon version")
+    }
+    let socket = runtime_directory()?.join("runtime.sock");
+    let mut subscription = yi_agent_store::ipc::subscribe(&socket, 0).map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })?;
+    let yi_agent_store::ipc::IpcResponse::Subscription(snapshot) = subscription.next_response()?
+    else {
+        anyhow::bail!("runtime daemon returned an invalid task snapshot")
+    };
+    for task in snapshot
+        .tasks
+        .into_iter()
+        .filter(|task| all || !matches!(task.state.as_str(), "completed" | "cancelled" | "failed"))
+    {
+        println!("{} {}", task.task_id, task.state);
+    }
+    Ok(())
+}
+
+fn control_agent(action: AgentAction) -> Result<()> {
+    let socket = runtime_directory()?.join("runtime.sock");
+    let request = match action {
+        AgentAction::Show { task_id } => yi_agent_store::ipc::IpcRequest::InspectTask { task_id },
+        AgentAction::Events { task_id, follow } => {
+            if follow {
+                return follow_task_events(&socket, task_id);
+            }
+            yi_agent_store::ipc::IpcRequest::ReadTaskEvents {
+                task_id,
+                after_event_id: None,
+            }
+        }
+        AgentAction::Mailbox { task_id } => {
+            yi_agent_store::ipc::IpcRequest::ReadTaskMailbox { task_id }
+        }
+        AgentAction::Diff { task_id } => yi_agent_store::ipc::IpcRequest::ReadTaskDiff { task_id },
+        AgentAction::Message { task_id, text, .. } => {
+            yi_agent_store::ipc::IpcRequest::SendUserMessage {
+                task_id,
+                message: text,
+            }
+        }
+        AgentAction::Cancel {
+            task_id,
+            recursive,
+            yes,
+            confirmation,
+        } => {
+            if !yes {
+                return show_cancel_preview(&socket, task_id, recursive);
+            }
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cancel confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmCancel {
+                task_id,
+                recursive,
+                confirmation_token,
+            }
+        }
+        AgentAction::Pause { task_id } => {
+            let session_id = inspect_session(&socket, &task_id)?;
+            yi_agent_store::ipc::IpcRequest::PauseTask {
+                session_id,
+                task_id,
+            }
+        }
+        AgentAction::Resume { task_id } => {
+            let session_id = inspect_session(&socket, &task_id)?;
+            yi_agent_store::ipc::IpcRequest::ResumeTask {
+                session_id,
+                task_id,
+            }
+        }
+        AgentAction::Retry { task_id } => {
+            let session_id = inspect_session(&socket, &task_id)?;
+            yi_agent_store::ipc::IpcRequest::RetryTask {
+                session_id,
+                task_id,
+            }
+        }
+        AgentAction::Accept {
+            task_id,
+            yes,
+            confirmation,
+        } => {
+            let decision = yi_agent_store::ipc::IpcReviewDecision::Accept {};
+            if !yes {
+                return show_review_preview(&socket, task_id, decision, "accept");
+            }
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmReview {
+                task_id,
+                decision,
+                confirmation_token,
+            }
+        }
+        AgentAction::Rework {
+            task_id,
+            feedback,
+            yes,
+            confirmation,
+        } => {
+            let decision = yi_agent_store::ipc::IpcReviewDecision::Rework { feedback };
+            if !yes {
+                return show_review_preview(&socket, task_id, decision, "rework");
+            }
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmReview {
+                task_id,
+                decision,
+                confirmation_token,
+            }
+        }
+        AgentAction::Reject {
+            task_id,
+            reason,
+            yes,
+            confirmation,
+        } => {
+            let decision = yi_agent_store::ipc::IpcReviewDecision::Reject { reason };
+            if !yes {
+                return show_review_preview(&socket, task_id, decision, "reject");
+            }
+            let confirmation_token = confirmation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review confirmation token is required; rerun without --yes to create a preview"
+                )
+            })?;
+            yi_agent_store::ipc::IpcRequest::ConfirmReview {
+                task_id,
+                decision,
+                confirmation_token,
+            }
+        }
+        other => {
+            anyhow::bail!("agent control `{other:?}` is not yet supported by this daemon version")
+        }
+    };
+    match yi_agent_store::ipc::send_request(&socket, request).map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })? {
+        yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => {
+            println!("{} {}", detail.task_id, detail.state);
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::TaskEvents { events } => {
+            for event in events {
+                println!("{}", task_event_line(&event));
+            }
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::TaskMailbox { messages } => {
+            for message in messages {
+                println!(
+                    "{} {} {} {}",
+                    message.message_id, message.kind, message.priority, message.payload_json
+                );
+            }
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::TaskDiff {
+            task_id,
+            delivery_json,
+        } => {
+            println!("{task_id} {delivery_json}");
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::TaskCancelled
+        | yi_agent_store::ipc::IpcResponse::TaskPaused
+        | yi_agent_store::ipc::IpcResponse::TaskResumed
+        | yi_agent_store::ipc::IpcResponse::TaskRetried
+        | yi_agent_store::ipc::IpcResponse::MessageQueued
+        | yi_agent_store::ipc::IpcResponse::ReviewApproved
+        | yi_agent_store::ipc::IpcResponse::ReviewReworkRequested
+        | yi_agent_store::ipc::IpcResponse::ReviewRejected => Ok(()),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => anyhow::bail!(
+            "runtime daemon rejected request: {}",
+            format_ipc_error(code, message)
+        ),
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+}
+
+fn show_review_preview(
+    socket: &std::path::Path,
+    task_id: String,
+    decision: yi_agent_store::ipc::IpcReviewDecision,
+    action: &str,
+) -> Result<()> {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::PreviewReview { task_id, decision },
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })? {
+        yi_agent_store::ipc::IpcResponse::ReviewPreview {
+            task_id,
+            delivery_id,
+            confirmation_token,
+            expires_in_secs,
+            ..
+        } => {
+            println!("task: {task_id}");
+            println!("delivery: {delivery_id}");
+            println!(
+                "rerun agent {action} with --yes --confirmation {confirmation_token} within {expires_in_secs}s"
+            );
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => anyhow::bail!(
+            "runtime daemon rejected review preview: {}",
+            format_ipc_error(code, message)
+        ),
+        other => anyhow::bail!("unexpected runtime review preview response: {other:?}"),
+    }
+}
+
+fn show_cancel_preview(socket: &std::path::Path, task_id: String, recursive: bool) -> Result<()> {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::PreviewCancel { task_id, recursive },
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })? {
+        yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token,
+            task_ids,
+            expires_in_secs,
+            ..
+        } => {
+            println!("affected tasks: {}", task_ids.join(", "));
+            println!(
+                "rerun with --yes --confirmation {confirmation_token} within {expires_in_secs}s"
+            );
+            Ok(())
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => anyhow::bail!(
+            "runtime daemon rejected cancel preview: {}",
+            format_ipc_error(code, message)
+        ),
+        other => anyhow::bail!("unexpected runtime cancel preview response: {other:?}"),
+    }
+}
+
+fn follow_task_events(socket: &std::path::Path, task_id: String) -> Result<()> {
+    let mut subscription = yi_agent_store::ipc::subscribe_with_filters(
+        socket,
+        0,
+        yi_agent_store::ipc::SubscriptionFilters {
+            task_ids: vec![task_id],
+            kinds: Vec::new(),
+        },
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
+    })?;
+
+    loop {
+        match subscription.next_response()? {
+            yi_agent_store::ipc::IpcResponse::Subscription(snapshot) => {
+                for event in snapshot.events {
+                    println!("{}", task_event_line(&event));
+                }
+            }
+            yi_agent_store::ipc::IpcResponse::Event(event) => {
+                println!("{}", task_event_line(&event));
+            }
+            yi_agent_store::ipc::IpcResponse::ResyncRequired => {
+                anyhow::bail!(
+                    "daemon event stream requires resync; rerun `yi-agent agent events --follow`"
+                )
+            }
+            yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+                anyhow::bail!(
+                    "runtime daemon rejected event subscription: {}",
+                    format_ipc_error(code, message)
+                )
+            }
+            other => anyhow::bail!("unexpected runtime event subscription response: {other:?}"),
+        }
+    }
+}
+
+fn task_event_line(event: &yi_agent_store::ipc::IpcEvent) -> String {
+    format!("{} {} {}", event.event_id, event.kind, event.payload_json)
+}
+
+fn inspect_session(socket: &std::path::Path, task_id: &str) -> Result<String> {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::InspectTask {
+            task_id: task_id.into(),
+        },
+    )? {
+        yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => Ok(detail.session_id),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected request: {}",
+                format_ipc_error(code, message)
+            )
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+}
+
+fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
+    let ScheduleAction::Add { request, confirm } = action;
+    let config = config::load(cli)?;
+    let provider: Arc<dyn Provider> = match config.provider.as_str() {
+        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
+            yi_agent_llm::AnthropicProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
+            yi_agent_llm::OpenaiProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        other => anyhow::bail!("unknown provider '{other}': expected 'anthropic' or 'openai'"),
+    };
+    let runtime = tokio::runtime::Runtime::new()?;
+    let preview = runtime.block_on(
+        schedule_intent::ScheduleIntentParser::new(provider, config.model).preview(request),
+    )?;
+    if !*confirm {
+        println!(
+            "Schedule preview (not saved): {} -> {}\nRun again with --confirm to create it.",
+            preview.definition.cron, preview.definition.objective
+        );
+        return Ok(());
+    }
+    let socket = runtime_directory()?.join("runtime.sock");
+    match yi_agent_store::ipc::send_request(
+        &socket,
+        yi_agent_store::ipc::IpcRequest::CreateSchedule {
+            cron: preview.definition.cron,
+            objective: preview.definition.objective,
+        },
+    )? {
+        yi_agent_store::ipc::IpcResponse::ScheduleCreated { schedule_id } => {
+            println!("schedule created: {schedule_id}")
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected schedule: {}",
+                format_ipc_error(code, message)
+            )
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
+    let runtime_dir = runtime_directory()?;
+    let runtime = runtime_dir.join("runtime.sock");
+    let database = runtime_dir.join("state.sqlite");
+    match action {
+        DaemonAction::Start => {
+            if yi_agent_store::ipc::send_request(&runtime, yi_agent_store::ipc::IpcRequest::Status)
+                .is_ok()
+            {
+                anyhow::bail!("runtime daemon is already running")
+            }
+            std::process::Command::new(std::env::current_exe()?)
+                .args(["daemon", "serve"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            for _ in 0..50 {
+                if yi_agent_store::ipc::send_request(
+                    &runtime,
+                    yi_agent_store::ipc::IpcRequest::Status,
+                )
+                .is_ok()
+                {
+                    println!("daemon started");
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            anyhow::bail!("daemon process did not become ready")
+        }
+        DaemonAction::Serve => yi_agent_store::ipc::Daemon::start_with_factory(
+            &runtime_dir,
+            &database,
+            build_daemon_worker_factory(cli, runtime_dir.join("runtime.sock"))?,
+        )
+        .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
+        .wait()
+        .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}")),
+        DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
+    }
+}
+
+fn build_daemon_worker_factory(
+    cli: &Cli,
+    runtime_socket: std::path::PathBuf,
+) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
+    let config = config::load(cli)?;
+    let provider: Arc<dyn Provider> = match config.provider.as_str() {
+        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
+            yi_agent_llm::AnthropicProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
+            yi_agent_llm::OpenaiProviderOpts {
+                base_url: Some(config.api_url.clone()),
+                api_key: Some(config.api_key.clone()),
+                ..Default::default()
+            },
+        )?),
+        other => anyhow::bail!("unknown provider '{other}': expected 'anthropic' or 'openai'"),
+    };
+
+    let skills = setup_skills(&config)?;
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    if let Some(skills) = &skills {
+        registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
+    }
+    let agent_config = yi_agent_core::AgentConfig {
+        model: config.model,
+        system_prompt: resolve_system_prompt_with_skills(
+            config.system_prompt,
+            &skills,
+            config.skills_catalog_budget,
+            config.skills_catalog_budget_explicit,
+        ),
+        max_turns: Some(config.max_turns),
+        compact_threshold: Some(config.compact_threshold),
+        compact_user_budget_tokens: config.compact_user_budget_tokens,
+        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
+        ..Default::default()
+    };
+    Ok(Arc::new(
+        subagent_runtime::DaemonAgentWorkerFactory::new(
+            provider,
+            Arc::new(registry),
+            agent_config,
+            runtime_socket,
+        )
+        // Recovery must inspect the same worktree ordinary builtin tools use.
+        .with_sandbox(config.sandbox, config.sandbox_writable_roots)
+        .with_workspace(config.workdir),
+    ))
+}
+
+fn runtime_directory() -> Result<std::path::PathBuf> {
+    let override_path = std::env::var_os("YI_AGENT_RUNTIME_DIR").map(std::path::PathBuf::from);
+    runtime_directory_from(override_path, dirs::home_dir())
+}
+
+fn runtime_directory_from(
+    override_path: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    override_path
+        .or_else(|| home.map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
+}
+
+fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Result<()> {
+    let request = match action {
+        DaemonAction::Status => yi_agent_store::ipc::IpcRequest::Status,
+        DaemonAction::Stop => yi_agent_store::ipc::IpcRequest::Stop,
+        DaemonAction::Start | DaemonAction::Serve => unreachable!("handled by launcher"),
+    };
+    let response = yi_agent_store::ipc::send_request(runtime, request)
+        .map_err(|error| anyhow::anyhow!("runtime daemon is unavailable: {error}"))?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::Status {
+            high_water_event_id,
+        } => println!("daemon running (event high-water: {high_water_event_id})"),
+        yi_agent_store::ipc::IpcResponse::Stopping => println!("daemon stopping"),
+        yi_agent_store::ipc::IpcResponse::UnsupportedProtocol { .. } => {
+            anyhow::bail!("runtime daemon protocol is incompatible")
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected request: {}",
+                format_ipc_error(code, message)
+            )
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn build_headless_root_tools(
+    config: &config::Config,
+    runtime_socket: std::path::PathBuf,
+    attached_root: &crate::tui::subagents::AttachedRoot,
+) -> Result<HeadlessSetup> {
+    let setup =
+        build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
+    let mut registry = (*setup.tools).clone();
+    crate::tui::subagents::register_attached_root_tools(
+        &mut registry,
+        runtime_socket,
+        attached_root,
+    );
+    Ok(HeadlessSetup {
+        tools: Arc::new(registry),
+        system_prompt: setup.system_prompt,
+    })
+}
+
+struct HeadlessRuntimeSession {
+    socket_path: std::path::PathBuf,
+    attached_root: crate::tui::subagents::AttachedRoot,
+    embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
+}
+
+fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
+    let runtime_dir = runtime_directory()?;
+    let database = runtime_dir.join("runtime.sqlite");
+    let socket_path = runtime_dir.join("runtime.sock");
+    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
+        &runtime_dir,
+        &database,
+        build_daemon_worker_factory(cli, socket_path.clone())?,
+    ) {
+        Ok(daemon) => Some(daemon),
+        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+        Err(error) => anyhow::bail!("could not start subagent runtime: {error}"),
+    };
+    let response = yi_agent_store::ipc::send_request(
+        &socket_path,
+        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
+            idempotency_key: format!(
+                "headless:{}:{}:{}",
+                std::process::id(),
+                config.workdir.display(),
+                uuid::Uuid::new_v4()
+            ),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("could not attach headless subagent runtime: {error}"))?;
+    let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace,
+    } = response
+    else {
+        anyhow::bail!("daemon rejected headless runtime attachment: {response:?}");
+    };
+    Ok(HeadlessRuntimeSession {
+        socket_path,
+        attached_root: crate::tui::subagents::AttachedRoot {
+            session_id,
+            task_id: root_task_id,
+            capability: message_capability,
+            workspace,
+        },
+        embedded_daemon,
+    })
+}
+
+fn activate_headless_runtime_root(runtime: &HeadlessRuntimeSession, objective: &str) -> Result<()> {
+    activate_tui_runtime_root(&runtime.socket_path, &runtime.attached_root, objective)
+        .map_err(|error| anyhow::anyhow!("could not activate headless subagent runtime: {error}"))
+}
+
+fn detach_headless_runtime_root(runtime: &HeadlessRuntimeSession) {
+    detach_tui_runtime_root(&runtime.socket_path, &runtime.attached_root);
+}
+
+fn build_tui_root_tools(
+    base_registry: &yi_agent_core::ToolRegistry,
+    config: &config::Config,
+    runtime_socket: std::path::PathBuf,
+    attached_root: &crate::tui::subagents::AttachedRoot,
+) -> yi_agent_core::ToolRegistry {
+    let mut registry = base_registry.clone();
+    yi_agent_tools::register_builtin_tools_with_sandbox(
+        &mut registry,
+        attached_root.workspace.path.clone(),
+        config.sandbox,
+        config.sandbox_writable_roots.clone(),
+    );
+    crate::tui::subagents::register_attached_root_tools(
+        &mut registry,
+        runtime_socket,
+        attached_root,
+    );
+    registry
+}
+
+struct TuiRuntimeSession {
+    socket_path: std::path::PathBuf,
+    attached_root: crate::tui::subagents::AttachedRoot,
+    embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
+}
+
+fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
+    let runtime_dir = runtime_directory()?;
+    let database = runtime_dir.join("runtime.sqlite");
+    let socket_path = runtime_dir.join("runtime.sock");
+    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
+        &runtime_dir,
+        &database,
+        build_daemon_worker_factory(cli, socket_path.clone())?,
+    ) {
+        Ok(daemon) => Some(daemon),
+        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+        Err(error) => {
+            tracing::warn!(error = %error, "subagent runtime unavailable; continuing without delegation");
+            return Ok(None);
+        }
+    };
+    let idempotency_key = format!(
+        "tui:{}:{}:{}",
+        std::process::id(),
+        config.workdir.display(),
+        uuid::Uuid::new_v4()
+    );
+    let response = match yi_agent_store::ipc::send_request(
+        &socket_path,
+        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot { idempotency_key },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not attach TUI to subagent runtime");
+            return Ok(None);
+        }
+    };
+    let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace,
+    } = response
+    else {
+        tracing::warn!(response = ?response, "daemon rejected TUI runtime attachment");
+        return Ok(None);
+    };
+    Ok(Some(TuiRuntimeSession {
+        socket_path,
+        attached_root: crate::tui::subagents::AttachedRoot {
+            session_id,
+            task_id: root_task_id,
+            capability: message_capability,
+            workspace,
+        },
+        embedded_daemon,
+    }))
+}
+
+fn activate_tui_runtime_root(
+    socket_path: &std::path::Path,
+    root: &crate::tui::subagents::AttachedRoot,
+    objective: &str,
+) -> Result<()> {
+    match yi_agent_store::ipc::send_request(
+        socket_path,
+        yi_agent_store::ipc::IpcRequest::ActivateApplicationRoot {
+            session_id: root.session_id.clone(),
+            root_task_id: root.task_id.clone(),
+            capability: root.capability.clone(),
+            objective: objective.to_owned(),
+        },
+    )? {
+        yi_agent_store::ipc::IpcResponse::ApplicationRootActivated => Ok(()),
+        other => anyhow::bail!("daemon rejected TUI runtime activation: {other:?}"),
+    }
+}
+
+fn detach_tui_runtime_root(
+    socket_path: &std::path::Path,
+    root: &crate::tui::subagents::AttachedRoot,
+) {
+    let response = yi_agent_store::ipc::send_request(
+        socket_path,
+        yi_agent_store::ipc::IpcRequest::DetachApplicationRoot {
+            session_id: root.session_id.clone(),
+            root_task_id: root.task_id.clone(),
+            capability: root.capability.clone(),
+        },
+    );
+    if let Err(error) = response {
+        tracing::warn!(error = %error, "could not detach TUI runtime root");
+    }
+}
+
+fn load_permission_checker_for_workdir(
+    workdir: std::path::PathBuf,
+    config: &config::Config,
+) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let permissions = rt
+        .block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
+        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?;
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
+    Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
+        permissions,
+        config.yolo,
+        workdir,
+        blocklist_fn,
+    )))
+}
+
+async fn load_permission_checker_for_workdir_async(
+    workdir: std::path::PathBuf,
+    config: &config::Config,
+) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
+    let permissions = yi_agent_core::permission::PermissionChecker::load(&workdir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?;
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
+    Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
+        permissions,
+        config.yolo,
+        workdir,
+        blocklist_fn,
+    )))
 }
 
 fn run_agent(cli: Cli) -> Result<()> {
     let config = config::load(&cli)?;
 
-    // Load permissions and construct checker
-    let workdir = config.workdir.clone();
-    let yolo = config.yolo;
-    let permissions = {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
-            .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
-    };
-    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
-        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
-    let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
-        permissions,
-        yolo,
-        workdir,
-        blocklist_fn,
-    ));
+    let agent_workdir = config.workdir.clone();
+
+    // Load permissions and construct checker for the initial project workspace.
+    let checker = load_permission_checker_for_workdir(agent_workdir.clone(), &config)?;
     let (decision_tx, decision_rx) =
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
 
@@ -87,28 +838,12 @@ fn run_agent(cli: Cli) -> Result<()> {
     };
 
     let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_tools::register_builtin_tools_with_sandbox(
-        &mut registry,
-        config.workdir.clone(),
-        config.sandbox,
-        config.sandbox_writable_roots.clone(),
-    );
-    let process_manager = yi_agent_tools::ProcessManager::with_sandbox(
-        config.workdir.clone(),
-        yi_agent_tools::SandboxPolicy::new(
-            config.sandbox,
-            &config.workdir,
-            config.sandbox_writable_roots.clone(),
-        ),
-    );
-    yi_agent_tools::register_process_tools(&mut registry, process_manager.clone());
 
     // --- Skills system setup ---
     let skills_service = setup_skills(&config)?;
 
     let system_prompt = resolve_system_prompt_with_skills(
         config.system_prompt.clone(),
-        &config.workdir,
         &skills_service,
         config.skills_catalog_budget,
         config.skills_catalog_budget_explicit,
@@ -118,6 +853,14 @@ fn run_agent(cli: Cli) -> Result<()> {
     if let Some(svc) = &skills_service {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
+
+    let base_registry = registry.clone();
+    yi_agent_tools::register_builtin_tools_with_sandbox(
+        &mut registry,
+        config.workdir.clone(),
+        config.sandbox,
+        config.sandbox_writable_roots.clone(),
+    );
 
     let tools = Arc::new(registry);
 
@@ -135,11 +878,13 @@ fn run_agent(cli: Cli) -> Result<()> {
         provider,
         tools,
         agent_config,
-        config.workdir.clone(),
+        agent_workdir,
         checker,
         decision_tx,
         decision_rx,
-        process_manager,
+        cli,
+        config,
+        base_registry,
     )
 }
 
@@ -183,6 +928,9 @@ async fn drain_stream_human<W: std::io::Write, E: std::io::Write>(
                     "[result:{id}] error={} content={:?}",
                     result.is_error, result.content
                 );
+            }
+            yi_agent_core::AgentEvent::ToolRetry { id } => {
+                let _ = writeln!(err, "[tool-retry:{id}]");
             }
             yi_agent_core::AgentEvent::Done { reason } => match reason {
                 // Normal completion is already signaled by exit code 0; the
@@ -255,7 +1003,6 @@ async fn drain_stream_json<W: std::io::Write>(
 struct HeadlessSetup {
     tools: Arc<yi_agent_core::ToolRegistry>,
     system_prompt: Option<String>,
-    process_manager: Option<Arc<yi_agent_tools::ProcessManager>>,
 }
 
 /// 根据 `naked` flag 构建 headless 模式用的工具集和 system prompt。
@@ -265,35 +1012,32 @@ struct HeadlessSetup {
 /// 注册 SkillTool、用 `resolve_system_prompt_with_skills` 拼接默认 prompt +
 /// 当前日期 + skills catalog。
 fn build_headless_setup(config: &config::Config, naked: bool) -> Result<HeadlessSetup> {
+    build_headless_setup_for_workspace(config, naked, config.workdir.clone())
+}
+
+fn build_headless_setup_for_workspace(
+    config: &config::Config,
+    naked: bool,
+    workspace: std::path::PathBuf,
+) -> Result<HeadlessSetup> {
     let mut registry = yi_agent_core::ToolRegistry::new();
 
     if naked {
         return Ok(HeadlessSetup {
             tools: Arc::new(registry),
             system_prompt: None,
-            process_manager: None,
         });
     }
 
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
-        config.workdir.clone(),
+        workspace,
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
-    let process_manager = yi_agent_tools::ProcessManager::with_sandbox(
-        config.workdir.clone(),
-        yi_agent_tools::SandboxPolicy::new(
-            config.sandbox,
-            &config.workdir,
-            config.sandbox_writable_roots.clone(),
-        ),
-    );
-    yi_agent_tools::register_process_tools(&mut registry, process_manager.clone());
     let skills_service = setup_skills(config)?;
     let system_prompt = resolve_system_prompt_with_skills(
         config.system_prompt.clone(),
-        &config.workdir,
         &skills_service,
         config.skills_catalog_budget,
         config.skills_catalog_budget_explicit,
@@ -305,7 +1049,6 @@ fn build_headless_setup(config: &config::Config, naked: bool) -> Result<Headless
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
         system_prompt,
-        process_manager: Some(process_manager),
     })
 }
 
@@ -317,6 +1060,7 @@ fn run_headless(
     json: bool,
     from_stdin: bool,
     naked: bool,
+    subagents: bool,
 ) -> Result<()> {
     let config = config::load(&cli)?;
 
@@ -333,7 +1077,21 @@ fn run_headless(
         anyhow::bail!("empty prompt");
     }
 
-    let workdir = config.workdir.clone();
+    if subagents && naked {
+        anyhow::bail!("--subagents cannot be combined with --naked");
+    }
+
+    let headless_runtime = if subagents {
+        let runtime = attach_headless_runtime(&cli, &config)?;
+        activate_headless_runtime_root(&runtime, &prompt_text)?;
+        Some(runtime)
+    } else {
+        None
+    };
+    let workdir = headless_runtime
+        .as_ref()
+        .map(|runtime| runtime.attached_root.workspace.path.clone())
+        .unwrap_or_else(|| config.workdir.clone());
     // Headless mode: auto-allow non-blacklisted tools (yolo behavior)
     let yolo = true;
     let permissions = {
@@ -376,17 +1134,18 @@ fn run_headless(
         ),
     };
 
-    let setup = build_headless_setup(&config, naked)?;
+    let setup = match &headless_runtime {
+        Some(runtime) => {
+            build_headless_root_tools(&config, runtime.socket_path.clone(), &runtime.attached_root)?
+        }
+        None => build_headless_setup(&config, naked)?,
+    };
     let tools = setup.tools;
-    let process_manager = setup.process_manager;
 
     let agent_config = yi_agent_core::AgentConfig {
         model: config.model.clone(),
         system_prompt: setup.system_prompt,
         max_turns: Some(config.max_turns),
-        compact_threshold: Some(config.compact_threshold),
-        compact_user_budget_tokens: config.compact_user_budget_tokens,
-        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
         ..Default::default()
     };
 
@@ -408,24 +1167,18 @@ fn run_headless(
         let stderr = std::io::stderr();
         let mut out = stdout.lock();
         let mut err = stderr.lock();
-        let exit_code = if json {
+        if json {
             drain_stream_json(stream, &mut out).await
         } else {
             drain_stream_human(stream, &mut out, &mut err).await
-        };
-        if let Some(process_manager) = process_manager {
-            match process_manager.shutdown().await {
-                Ok(retained) => {
-                    for process in retained {
-                        eprintln!("{}", retained_process_message(&process));
-                    }
-                }
-                Err(error) => eprintln!("process shutdown error: {error}"),
-            }
         }
-        exit_code
     });
 
+    if let Some(runtime) = &headless_runtime {
+        detach_headless_runtime_root(runtime);
+        let _embedded_daemon = runtime.embedded_daemon.as_ref();
+    }
+    drop(headless_runtime);
     std::process::exit(exit_code);
 }
 
@@ -439,7 +1192,9 @@ fn run_tui_agent(
     checker: Arc<yi_agent_core::permission::PermissionChecker>,
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     decision_rx: tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
-    process_manager: Arc<yi_agent_tools::ProcessManager>,
+    cli: Cli,
+    config: config::Config,
+    base_registry: yi_agent_core::ToolRegistry,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -452,57 +1207,70 @@ fn run_tui_agent(
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(8);
+        let (runtime_choice_tx, mut runtime_choice_rx) =
+            mpsc::channel::<crate::tui::subagents::RuntimeStartupChoice>(1);
+        let runtime_detach = Arc::new(std::sync::Mutex::new(None::<(
+            std::path::PathBuf,
+            crate::tui::subagents::AttachedRoot,
+        )>));
         let is_running = Arc::new(AtomicBool::new(false));
-        let tui_process_manager = process_manager.clone();
+
+        enum DriverInput {
+            Prompt(Option<String>),
+            Control(Option<ControlCommand>),
+            RuntimeChoice(Option<crate::tui::subagents::RuntimeStartupChoice>),
+        }
 
         // Spawn agent driver task (stays on the async runtime)
         let provider_clone = Arc::clone(&provider);
-        let tools_clone = Arc::clone(&tools);
+        let mut current_tools = Arc::clone(&tools);
+        let mut current_checker = Arc::clone(&checker);
         let config_clone = agent_config.clone();
         let is_running_clone = Arc::clone(&is_running);
-        let checker_clone = Arc::clone(&checker);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
-        // Keep extra clones for agent rebuild on /clear and /compact.
         let rebuild_provider = Arc::clone(&provider);
-        let rebuild_tools = Arc::clone(&tools);
         let rebuild_config = agent_config.clone();
-        let rebuild_checker = Arc::clone(&checker);
         let rebuild_decision_rx = Arc::clone(&decision_rx);
+        let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let driver = tokio::spawn(async move {
-            let mut agent = yi_agent_core::Agent::new(provider_clone, tools_clone, config_clone)
-                .with_permission(checker_clone, decision_rx);
+            let mut root_activated = false;
+            let mut current_runtime: Option<TuiRuntimeSession> = None;
+            let mut agent = yi_agent_core::Agent::new(
+                Arc::clone(&provider_clone),
+                Arc::clone(&current_tools),
+                config_clone,
+            )
+            .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx));
             let _ = workdir; // workdir already passed to tools registration
 
             loop {
-                // Wait for user input or a control command. Control commands
-                // take priority (biased) so /clear and /compact are handled
-                // even if a prompt is also pending.
-                let (prompt_text, control_cmd) = tokio::select! {
+                // Wait for user input, runtime startup choice, or a control command.
+                let input = tokio::select! {
                     biased;
-                    cmd = control_rx.recv() => (None, cmd),
-                    text = input_rx.recv() => (text, None),
+                    cmd = control_rx.recv() => DriverInput::Control(cmd),
+                    choice = runtime_choice_rx.recv() => DriverInput::RuntimeChoice(choice),
+                    text = input_rx.recv() => DriverInput::Prompt(text),
                 };
 
                 // Handle control commands first (rebuild agent, no prompt run).
-                if let Some(cmd) = control_cmd {
+                if let DriverInput::Control(Some(cmd)) = input {
                     match cmd {
                         ControlCommand::Clear => {
                             // Rebuild agent with empty session.
                             agent = yi_agent_core::Agent::new(
                                 Arc::clone(&rebuild_provider),
-                                Arc::clone(&rebuild_tools),
+                                Arc::clone(&current_tools),
                                 rebuild_config.clone(),
                             )
                             .with_session(yi_agent_core::Session::new())
                             .with_permission(
-                                Arc::clone(&rebuild_checker),
+                                Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                             );
                             tracing::info!("agent session cleared via /clear");
                         }
                         ControlCommand::Compact => {
                             let session = agent.session();
-                            let old_msg_count = session.messages().len();
                             match yi_agent_core::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
@@ -511,42 +1279,25 @@ fn run_tui_agent(
                             .await
                             {
                                 Ok(Some(new_session)) => {
-                                    let event = manual_compaction_outcome_event(
-                                        old_msg_count,
-                                        Ok(new_session.messages().len()),
-                                    );
                                     agent = yi_agent_core::Agent::new(
                                         Arc::clone(&rebuild_provider),
-                                        Arc::clone(&rebuild_tools),
+                                        Arc::clone(&current_tools),
                                         rebuild_config.clone(),
                                     )
                                     .with_session(new_session)
                                     .with_permission(
-                                        Arc::clone(&rebuild_checker),
+                                        Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                     );
-                                    tracing::info!(
-                                        old_msg_count,
-                                        "agent session compacted via /compact"
-                                    );
-                                    let _ = agent_tx.send(event).await;
+                                    tracing::info!("agent session compacted via /compact");
                                 }
                                 Ok(None) => {
-                                    let _ = agent_tx
-                                        .send(manual_compaction_outcome_event(
-                                            old_msg_count,
-                                            Err("没有可压缩的历史".into()),
-                                        ))
-                                        .await;
+                                    tracing::info!("no compactable session history");
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
-                                    let _ = agent_tx
-                                        .send(manual_compaction_outcome_event(
-                                            old_msg_count,
-                                            Err(e.to_string()),
-                                        ))
-                                        .await;
+                                    let _ =
+                                        agent_tx.send(yi_agent_core::AgentEvent::Error(e)).await;
                                 }
                             }
                         }
@@ -554,13 +1305,115 @@ fn run_tui_agent(
                     continue;
                 }
 
-                // Otherwise, a prompt arrived (or both channels closed).
-                let Some(text) = prompt_text else {
+                if let DriverInput::RuntimeChoice(choice) = input {
+                    match choice {
+                        Some(crate::tui::subagents::RuntimeStartupChoice::Start) => {
+                            match attach_tui_runtime(&cli, &config) {
+                                Ok(Some(runtime)) => {
+                                    if runtime.embedded_daemon.is_some() {
+                                        tracing::info!("embedded subagent runtime started for TUI");
+                                    }
+                                    *runtime_detach_for_driver
+                                        .lock()
+                                        .expect("runtime detach mutex poisoned") = Some((
+                                        runtime.socket_path.clone(),
+                                        runtime.attached_root.clone(),
+                                    ));
+                                    crate::tui::subagents::set_current_attached_root(
+                                        runtime.attached_root.clone(),
+                                    );
+                                    let runtime_workdir = runtime.attached_root.workspace.path.clone();
+                                    let next_tools = Arc::new(build_tui_root_tools(
+                                        &base_registry,
+                                        &config,
+                                        runtime.socket_path.clone(),
+                                        &runtime.attached_root,
+                                    ));
+                                    match load_permission_checker_for_workdir_async(runtime_workdir, &config).await {
+                                        Ok(next_checker) => {
+                                            let session = agent.session();
+                                            current_tools = next_tools;
+                                            current_checker = next_checker;
+                                            agent = yi_agent_core::Agent::new(
+                                                Arc::clone(&rebuild_provider),
+                                                Arc::clone(&current_tools),
+                                                rebuild_config.clone(),
+                                            )
+                                            .with_session(session)
+                                            .with_permission(
+                                                Arc::clone(&current_checker),
+                                                Arc::clone(&rebuild_decision_rx),
+                                            );
+                                            current_runtime = Some(runtime);
+                                            root_activated = false;
+                                        }
+                                        Err(error) => {
+                                            if let Some((socket, root)) = runtime_detach_for_driver
+                                                .lock()
+                                                .expect("runtime detach mutex poisoned")
+                                                .take()
+                                            {
+                                                detach_tui_runtime_root(&socket, &root);
+                                            }
+                                            let _ = agent_tx
+                                                .send(yi_agent_core::AgentEvent::Error(
+                                                    yi_agent_core::AgentError::ProviderTurnAdmission(
+                                                        error.to_string(),
+                                                    ),
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::warn!("subagent runtime unavailable; continuing without delegation");
+                                }
+                                Err(error) => {
+                                    let _ = agent_tx
+                                        .send(yi_agent_core::AgentEvent::Error(
+                                            yi_agent_core::AgentError::ProviderTurnAdmission(
+                                                error.to_string(),
+                                            ),
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                        Some(crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation) => {
+                            tracing::info!("TUI subagent runtime disabled by user choice");
+                        }
+                        None => break,
+                    }
+                    continue;
+                }
+
+                // Otherwise, a prompt arrived (or all channels closed).
+                let DriverInput::Prompt(Some(text)) = input else {
                     break;
                 };
 
                 // Clear any stale interrupt signal
                 let _ = interrupt_rx.try_recv();
+
+                if !root_activated {
+                    if let Some(runtime) = current_runtime.as_ref() {
+                        if let Err(error) = activate_tui_runtime_root(
+                            &runtime.socket_path,
+                            &runtime.attached_root,
+                            &text,
+                        ) {
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::Error(
+                                    yi_agent_core::AgentError::ProviderTurnAdmission(
+                                        error.to_string(),
+                                    ),
+                                ))
+                                .await;
+                            continue;
+                        }
+                    }
+                    root_activated = true;
+                }
 
                 // Run agent
                 is_running_clone.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -598,6 +1451,15 @@ fn run_tui_agent(
                 }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
             }
+            if current_runtime.is_some() {
+                if let Some((socket, root)) = runtime_detach_for_driver
+                    .lock()
+                    .expect("runtime detach mutex poisoned")
+                    .take()
+                {
+                    detach_tui_runtime_root(&socket, &root);
+                }
+            }
         });
 
         // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)
@@ -610,7 +1472,11 @@ fn run_tui_agent(
                 decision_tx,
                 is_running,
                 agent_config.model.clone(),
-                tui_process_manager,
+                Some(crate::tui::subagents::RuntimeStartPrompt {
+                    title: "启动本地 Agent Runtime?".into(),
+                    body: "启动后可以直接用自然语言创建和管理子 Agent。按 y 启动，按 n 跳过。".into(),
+                }),
+                Some(runtime_choice_tx),
             )
         });
 
@@ -620,17 +1486,17 @@ fn run_tui_agent(
             Err(e) => Err(anyhow::Error::from(e)),
         };
 
+        if let Some((socket, root)) = runtime_detach
+            .lock()
+            .expect("runtime detach mutex poisoned")
+            .take()
+        {
+            detach_tui_runtime_root(&socket, &root);
+        }
+
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
-        match process_manager.shutdown().await {
-            Ok(retained) => {
-                for process in retained {
-                    eprintln!("{}", retained_process_message(&process));
-                }
-            }
-            Err(error) => eprintln!("process shutdown error: {error}"),
-        }
 
         result
     });
@@ -651,53 +1517,15 @@ pub(crate) enum ControlCommand {
     Compact,
 }
 
-fn retained_process_message(process: &yi_agent_tools::ManagedProcessSnapshot) -> String {
-    format!(
-        "retained process: id={} name={} pid={:?}",
-        process.process_id,
-        process.name.as_deref().unwrap_or("-"),
-        process.pid
-    )
-}
-
-fn manual_compaction_outcome_event(
-    old_msg_count: usize,
-    result: Result<usize, String>,
-) -> yi_agent_core::AgentEvent {
-    match result {
-        Ok(new_msg_count) => yi_agent_core::AgentEvent::ManualCompacted {
-            old_msg_count,
-            new_msg_count,
-        },
-        Err(message) => yi_agent_core::AgentEvent::ManualCompactFailed { message },
-    }
-}
-
 /// Resolve the effective system prompt: fall back to the built-in default
 /// when the user did not provide one. The current local date is appended to
 /// the end so the model knows today's date; placed at the tail to avoid
 /// disrupting the cached prefix of the prompt.
-fn load_project_instructions(workdir: &Path) -> Option<String> {
-    let path = workdir.join("AGENTS.md");
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => Some(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            tracing::warn!(path = %path.display(), "failed to read project instructions: {error}");
-            None
-        }
-    }
-}
-
-fn resolve_system_prompt(user: Option<String>, workdir: &Path) -> Option<String> {
+fn resolve_system_prompt(user: Option<String>) -> Option<String> {
     let mut base = yi_agent_core::AgentConfig::default_system_prompt();
     if let Some(user) = user {
         base.push_str("\n\nUser-provided instructions:\n");
         base.push_str(&user);
-    }
-    if let Some(instructions) = load_project_instructions(workdir) {
-        base.push_str("\n\nProject instructions (AGENTS.md):\n");
-        base.push_str(&instructions);
     }
     let today = chrono::Local::now().format("%Y-%m-%d");
     Some(format!("{base}\n\nCurrent date: {today}"))
@@ -748,12 +1576,11 @@ fn setup_skills(config: &config::Config) -> Result<Option<Arc<yi_agent_skills::S
 /// Resolve the effective system prompt, appending the skills catalog if available.
 fn resolve_system_prompt_with_skills(
     user: Option<String>,
-    workdir: &Path,
     service: &Option<Arc<yi_agent_skills::SkillsService>>,
     budget: usize,
     budget_explicit: bool,
 ) -> Option<String> {
-    let base = resolve_system_prompt(user, workdir);
+    let base = resolve_system_prompt(user);
     let Some(svc) = service else {
         return base;
     };
@@ -806,25 +1633,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manual_compaction_outcome_events_preserve_counts_and_errors() {
-        assert!(matches!(
-            manual_compaction_outcome_event(9, Ok(3)),
-            yi_agent_core::AgentEvent::ManualCompacted {
-                old_msg_count: 9,
-                new_msg_count: 3,
-            }
-        ));
-        assert!(matches!(
-            manual_compaction_outcome_event(9, Err("没有可压缩的历史".into())),
-            yi_agent_core::AgentEvent::ManualCompactFailed { message }
-                if message == "没有可压缩的历史"
-        ));
-    }
-
-    #[test]
     fn resolve_system_prompt_none_uses_default() {
-        let resolved =
-            resolve_system_prompt(None, Path::new("/definitely-missing-yi-agent-test-root"));
+        let resolved = resolve_system_prompt(None);
         let default = yi_agent_core::AgentConfig::default_system_prompt();
         // The resolved prompt should start with the default prompt and have
         // the current date appended at the end.
@@ -841,10 +1651,7 @@ mod tests {
 
     #[test]
     fn resolve_system_prompt_custom_keeps_base_instructions() {
-        let resolved = resolve_system_prompt(
-            Some("custom".into()),
-            Path::new("/definitely-missing-yi-agent-test-root"),
-        );
+        let resolved = resolve_system_prompt(Some("custom".into()));
         let default = yi_agent_core::AgentConfig::default_system_prompt();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(
@@ -853,39 +1660,6 @@ mod tests {
                 && r.ends_with(&today)),
             "resolved should retain base instructions, append custom prompt, and end with date: {resolved:?}"
         );
-    }
-
-    #[test]
-    fn resolve_system_prompt_appends_root_agents_md_after_custom_instructions() {
-        let project = tempfile::tempdir().expect("create project root");
-        std::fs::write(
-            project.path().join("AGENTS.md"),
-            "Always run focused tests.",
-        )
-        .expect("write AGENTS.md");
-
-        let resolved = resolve_system_prompt(Some("Use concise output.".into()), project.path());
-        let prompt = resolved.expect("normal mode should have a system prompt");
-
-        assert!(prompt.contains("User-provided instructions:\nUse concise output."));
-        assert!(prompt.contains("Project instructions (AGENTS.md):\nAlways run focused tests."));
-        assert!(
-            prompt.find("User-provided instructions:").unwrap()
-                < prompt.find("Project instructions (AGENTS.md):").unwrap()
-        );
-        assert!(
-            prompt.find("Project instructions (AGENTS.md):").unwrap()
-                < prompt.find("Current date:").unwrap()
-        );
-    }
-
-    #[test]
-    fn resolve_system_prompt_ignores_missing_root_agents_md() {
-        let project = tempfile::tempdir().expect("create project root");
-        let prompt = resolve_system_prompt(None, project.path())
-            .expect("normal mode should have a system prompt");
-
-        assert!(!prompt.contains("Project instructions (AGENTS.md):"));
     }
 
     #[test]
@@ -915,9 +1689,8 @@ mod tests {
     fn resolve_system_prompt_with_skills_no_service_returns_base() {
         // When service is None, should fall back to base via resolve_system_prompt
         // (which appends the current date).
-        let workdir = Path::new("/definitely-missing-yi-agent-test-root");
-        let resolved = resolve_system_prompt_with_skills(None, workdir, &None, 8192, false);
-        let expected = resolve_system_prompt(None, workdir);
+        let resolved = resolve_system_prompt_with_skills(None, &None, 8192, false);
+        let expected = resolve_system_prompt(None);
         assert_eq!(resolved, expected);
     }
 
@@ -926,9 +1699,8 @@ mod tests {
         // When service is Some but catalog is empty (no skills discovered),
         // should return the base prompt unchanged (with current date appended).
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
-        let workdir = Path::new("/definitely-missing-yi-agent-test-root");
-        let expected = resolve_system_prompt(None, workdir);
-        let resolved = resolve_system_prompt_with_skills(None, workdir, &Some(svc), 8192, false);
+        let expected = resolve_system_prompt(None);
+        let resolved = resolve_system_prompt_with_skills(None, &Some(svc), 8192, false);
         assert_eq!(resolved, expected);
     }
 
@@ -956,14 +1728,75 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             system_prompt: None,
             compact_threshold: 160_000,
-            compact_user_budget_tokens: 20_000,
-            compact_tool_budget_tokens: 12_000,
+            compact_user_budget_tokens: 8192,
+            compact_tool_budget_tokens: 4096,
             yolo: false,
             sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
         }
+    }
+
+    fn attached_root_for_main_tests() -> crate::tui::subagents::AttachedRoot {
+        crate::tui::subagents::AttachedRoot {
+            session_id: "session-1".into(),
+            task_id: "task-1".into(),
+            capability: "capability-1".into(),
+            workspace: yi_agent_core::subagent::worker::WorkerWorkspace {
+                lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+                repository_root: "/tmp/repo".into(),
+                path: "/tmp/repo/.worktrees/root".into(),
+                branch: "feat/root".into(),
+                parent_branch: "main".into(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn headless_root_tools_include_delegation_only_when_attached() {
+        let config = test_config();
+        let ordinary = build_headless_setup(&config, false)
+            .expect("ordinary setup")
+            .tools;
+        assert!(ordinary.get("spawn_agent").is_none());
+
+        let root = attached_root_for_main_tests();
+        let registry = build_headless_root_tools(&config, "/tmp/runtime.sock".into(), &root)
+            .expect("attached headless setup");
+        let names = registry
+            .tools
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"send_message".to_string()));
+        assert!(names.contains(&"wait_agent".to_string()));
+        assert!(!names.contains(&"accept_review".to_string()));
+    }
+
+    #[test]
+    fn build_tui_root_tools_registers_subagent_tools_for_attached_runtime() {
+        let config = test_config();
+        let root = attached_root_for_main_tests();
+        let registry = build_tui_root_tools(
+            &yi_agent_core::ToolRegistry::new(),
+            &config,
+            "/tmp/runtime.sock".into(),
+            &root,
+        );
+        let names = registry
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"send_message".to_string()));
+        assert!(names.contains(&"wait_agent".to_string()));
+        assert!(names.contains(&"bash".to_string()));
     }
 
     #[test]
@@ -1014,64 +1847,6 @@ mod tests {
             names.iter().any(|n| n == "bash"),
             "default mode should register 'bash' tool, got: {names:?}"
         );
-    }
-
-    #[test]
-    fn default_mode_registers_process_tools_with_expected_permissions() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut registry = yi_agent_core::ToolRegistry::new();
-        yi_agent_tools::register_builtin_tools_with_sandbox(
-            &mut registry,
-            tmp.path().to_path_buf(),
-            yi_agent_tools::SandboxMode::DangerFullAccess,
-            Vec::new(),
-        );
-        let manager = yi_agent_tools::ProcessManager::new(tmp.path().to_path_buf());
-        yi_agent_tools::register_process_tools(&mut registry, manager);
-
-        let start = registry
-            .get("process_start")
-            .expect("process_start registered");
-        let list = registry
-            .get("process_list")
-            .expect("process_list registered");
-        let read = registry
-            .get("process_read")
-            .expect("process_read registered");
-        let kill = registry
-            .get("process_kill")
-            .expect("process_kill registered");
-
-        assert!(start.metadata().requires_confirmation);
-        assert!(!start.metadata().read_only);
-        assert!(!list.metadata().requires_confirmation);
-        assert!(list.metadata().read_only);
-        assert!(!read.metadata().requires_confirmation);
-        assert!(read.metadata().read_only);
-        assert!(kill.metadata().requires_confirmation);
-        assert!(!kill.metadata().read_only);
-    }
-
-    #[test]
-    fn retained_process_message_includes_id_name_and_pid() {
-        let snapshot = yi_agent_tools::ManagedProcessSnapshot {
-            process_id: "proc_1".into(),
-            name: Some("dev".into()),
-            pid: Some(1234),
-            command: "sleep 30".into(),
-            cwd: "/tmp".into(),
-            status: yi_agent_tools::ProcessStatus::Running,
-            ready: true,
-            on_exit: yi_agent_tools::OnExitPolicy::Keep,
-            exit_code: None,
-            elapsed_sec: 1.0,
-        };
-
-        let line = retained_process_message(&snapshot);
-
-        assert!(line.contains("proc_1"));
-        assert!(line.contains("dev"));
-        assert!(line.contains("1234"));
     }
 
     #[test]
@@ -1293,5 +2068,26 @@ mod tests {
             stderr.contains("[error:"),
             "stderr should contain error: {stderr}"
         );
+    }
+
+    #[test]
+    fn runtime_directory_prefers_an_explicit_override() {
+        assert_eq!(
+            runtime_directory_from(Some(std::path::PathBuf::from("/tmp/yi-runtime")), None)
+                .unwrap(),
+            std::path::PathBuf::from("/tmp/yi-runtime")
+        );
+    }
+
+    #[test]
+    fn task_event_line_uses_the_stable_event_wire_fields() {
+        let event = yi_agent_store::ipc::IpcEvent {
+            event_id: 42,
+            task_id: "task-1".into(),
+            kind: "task_progress".into(),
+            payload_json: r#"{"done":true}"#.into(),
+        };
+
+        assert_eq!(task_event_line(&event), "42 task_progress {\"done\":true}");
     }
 }

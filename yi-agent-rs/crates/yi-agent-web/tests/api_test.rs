@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use yi_agent_web::api::{AppState, get_config, index_html, put_config};
+use yi_agent_web::api::{
+    AppState, clear_real_llm_test_key, get_config, get_real_llm_test_config, index_html,
+    put_config, put_real_llm_test_config, validate_real_llm_test_config,
+};
 
 /// 构建 axum app 用于测试
 fn test_app(env_path: PathBuf) -> axum::Router {
@@ -16,13 +19,149 @@ fn test_app(env_path: PathBuf) -> axum::Router {
 fn test_app_with_global(env_path: PathBuf, global_env_path: Option<PathBuf>) -> axum::Router {
     use axum::routing::get;
     let state = AppState {
+        real_test_env_path: env_path.clone(),
         env_path,
         global_env_path,
     };
     axum::Router::new()
         .route("/", get(index_html))
         .route("/api/config", get(get_config).put(put_config))
+        .route(
+            "/api/real-llm-test-config",
+            get(get_real_llm_test_config).put(put_real_llm_test_config),
+        )
+        .route(
+            "/api/real-llm-test-config/validate",
+            axum::routing::post(validate_real_llm_test_config),
+        )
+        .route(
+            "/api/real-llm-test-config/api-key",
+            axum::routing::delete(clear_real_llm_test_key),
+        )
         .with_state(state)
+}
+
+#[tokio::test]
+async fn real_llm_save_does_not_append_a_second_form() {
+    let app = test_app(TempDir::new().unwrap().path().join("real-tests.env"));
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8(html.to_vec()).unwrap();
+
+    let save_handler = html
+        .lines()
+        .find(|line| line.contains("save.onclick"))
+        .expect("real LLM save handler");
+    assert!(
+        !save_handler.contains("renderRealLlmTestsTab(main)"),
+        "Save must not append another form by rerendering into the existing main element"
+    );
+}
+
+#[tokio::test]
+async fn real_llm_test_config_is_write_only_and_validates_without_network() {
+    let tmp = TempDir::new().unwrap();
+    let env_path = tmp.path().join("real-tests.env");
+    let sentinel = "real-test-secret-must-not-appear";
+    let app = test_app(env_path.clone());
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/api/real-llm-test-config")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "provider": "anthropic",
+                "api_url": "https://api.example.test",
+                "model": "test-model",
+                "api_key": sentinel,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = test_app(env_path.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/real-llm-test-config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains(sentinel));
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["api_key_configured"], true);
+    assert!(value.get("api_key").is_none());
+
+    let app = test_app(env_path.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/real-llm-test-config/validate")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = test_app(env_path.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/real-llm-test-config/api-key")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"confirm": true}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !yi_agent_web::env_file::read(&env_path)
+            .unwrap()
+            .contains_key("YI_AGENT_REAL_LLM_API_KEY")
+    );
+}
+
+#[tokio::test]
+async fn real_llm_test_config_rejects_invalid_shape() {
+    let tmp = TempDir::new().unwrap();
+    let app = test_app(tmp.path().join("real-tests.env"));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/real-llm-test-config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider": "invalid",
+                        "api_url": "ftp://example.test",
+                        "model": " ",
+                        "api_key": "",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

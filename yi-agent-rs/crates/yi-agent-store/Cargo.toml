@@ -10,3 +10,19 @@ authors.workspace = true
 
 [dependencies]
 yi-agent-core = { workspace = true }
+chrono = { workspace = true }
+croner = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = "0.7"
+futures = { workspace = true }
+toml = "0.8"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"

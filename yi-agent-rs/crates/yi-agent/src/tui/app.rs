@@ -24,16 +24,18 @@ use super::cell::HistoryCell;
 use super::cost::CostTracker;
 use super::history::{HistoryState, HistoryView, ViewportAnchor};
 use super::input::{InputAction, InputLine};
-use super::process_popup::{
-    ConfirmProcessKill as ConfirmProcessKillPopup, ProcessDetailPopup, ProcessListPopup,
-    ProcessPopup, RuntimeTab,
-};
-use super::slash::{CommandPopup, SlashCommand};
+use super::slash::{CommandPopup, SlashCommand, help_text};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
 
 const HISTORY_WHEEL_LINES: usize = 3;
-const HISTORY_KEY_LINES: usize = 3;
+
+fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
+    match message {
+        Some(message) => format!("{code}: {message}"),
+        None => code.to_string(),
+    }
+}
 
 /// Run the ratatui TUI main loop with the real terminal.
 ///
@@ -50,7 +52,10 @@ pub fn run_tui(
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     model: String,
-    process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
+    runtime_start_prompt: Option<crate::tui::subagents::RuntimeStartPrompt>,
+    runtime_choice_tx: Option<
+        tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
+    >,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -73,7 +78,8 @@ pub fn run_tui(
         &is_running,
         &CrosstermEventSource,
         &model,
-        process_manager,
+        runtime_start_prompt,
+        runtime_choice_tx,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -141,7 +147,8 @@ pub fn run_tui_with_backend<B: Backend>(
         is_running,
         &CrosstermEventSource,
         "test-model",
-        yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        None,
+        None,
     )
 }
 
@@ -172,7 +179,8 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         is_running,
         events,
         "test-model",
-        yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        None,
+        None,
     )
 }
 
@@ -189,7 +197,10 @@ fn run_loop<B: Backend, E: EventSource>(
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
     model: &str,
-    process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
+    runtime_start_prompt: Option<crate::tui::subagents::RuntimeStartPrompt>,
+    runtime_choice_tx: Option<
+        tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
+    >,
 ) -> std::io::Result<()> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
@@ -197,11 +208,8 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut statusbar_state = StatusBarState::default();
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
-    let mut runtime_popup = RuntimePopup::None;
-    let mut process_snapshots: Vec<yi_agent_tools::ManagedProcessSnapshot> = Vec::new();
-    let mut process_outputs: std::collections::HashMap<String, yi_agent_tools::ProcessReadResult> =
-        std::collections::HashMap::new();
-    let mut process_events = process_manager.subscribe();
+    let mut bash_popup: BashPopup = BashPopup::None;
+    let mut runtime_start_prompt = runtime_start_prompt;
     // Keep the rendered viewport location so geometry that changes between
     // frames (such as a resize or newly queued preview) has an old-width anchor.
     let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
@@ -297,14 +305,6 @@ fn run_loop<B: Backend, E: EventSource>(
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
-        if process_events.try_recv().is_ok() {
-            refresh_process_snapshots(
-                &process_manager,
-                &mut process_snapshots,
-                &mut process_outputs,
-            );
-            while process_events.try_recv().is_ok() {}
-        }
 
         // Pre-compute layout so mouse hit-testing uses the same chunk rects
         // as the draw closure below.
@@ -341,14 +341,100 @@ fn run_loop<B: Backend, E: EventSource>(
             let input_line = build_input_line(input, pending_quit, chunks[5].width);
             f.render_widget(input_line, chunks[5]);
 
-            render_runtime_popup(
-                f,
-                &runtime_popup,
-                &task_registry,
-                &process_snapshots,
-                &process_outputs,
-                chunks[0],
-            );
+            if let Some(prompt) = &runtime_start_prompt {
+                let box_w = 58u16.min(chunks[0].width.saturating_sub(4));
+                let box_h = 6u16.min(chunks[0].height.max(1));
+                let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
+                let box_y = chunks[0].y + (chunks[0].height.saturating_sub(box_h)) / 3;
+                let box_area = ratatui::layout::Rect {
+                    x: box_x,
+                    y: box_y,
+                    width: box_w,
+                    height: box_h,
+                };
+                f.render_widget(Clear, box_area);
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new(vec![
+                        ratatui::text::Line::raw(prompt.body.clone()),
+                        ratatui::text::Line::raw(""),
+                        ratatui::text::Line::raw("[y] 启动并启用子 Agent   [n/Esc] 暂不启用"),
+                    ])
+                    .block(
+                        ratatui::widgets::Block::default()
+                            .borders(ratatui::widgets::Borders::ALL)
+                            .title(prompt.title.clone()),
+                    ),
+                    box_area,
+                );
+            }
+
+            // Bash popup (covers the full screen above the input area).
+            match &bash_popup {
+                BashPopup::List(p) => {
+                    let list_area = ratatui::layout::Rect {
+                        x: chunks[0].x + 2,
+                        y: chunks[0].y + 1,
+                        width: chunks[0].width.saturating_sub(4),
+                        height: chunks[0]
+                            .height
+                            .saturating_sub(2)
+                            .min((p.task_ids.len() as u16 + 2).max(6)),
+                    };
+                    f.render_widget(Clear, list_area);
+                    f.render_widget(
+                        super::bash_popup::render_list_popup(p, &task_registry, list_area),
+                        list_area,
+                    );
+                }
+                BashPopup::Detail(p) => {
+                    if let Some(task) = task_registry.get(&p.task_id) {
+                        let detail_area = chunks[0];
+                        f.render_widget(Clear, detail_area);
+                        f.render_widget(
+                            super::bash_popup::render_detail_popup(p, task, detail_area),
+                            detail_area,
+                        );
+                    }
+                }
+                BashPopup::ConfirmKill(ck) => {
+                    // Draw the detail behind, then overlay a small confirm box.
+                    if let Some(task) = task_registry.get(&ck.task_id) {
+                        let detail_area = chunks[0];
+                        f.render_widget(Clear, detail_area);
+                        let detail = DetailPopup::new(ck.task_id.clone());
+                        f.render_widget(
+                            super::bash_popup::render_detail_popup(&detail, task, detail_area),
+                            detail_area,
+                        );
+                    }
+                    // Confirm box centered in the upper portion.
+                    let box_w = 40u16.min(chunks[0].width.saturating_sub(4));
+                    let box_h = 4u16;
+                    let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
+                    let box_y = chunks[0].y + (chunks[0].height.saturating_sub(box_h)) / 3;
+                    let box_area = ratatui::layout::Rect {
+                        x: box_x,
+                        y: box_y,
+                        width: box_w,
+                        height: box_h,
+                    };
+                    f.render_widget(Clear, box_area);
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new(vec![
+                            ratatui::text::Line::raw("kill this process?"),
+                            ratatui::text::Line::raw(""),
+                            ratatui::text::Line::raw("[y] confirm   [n/esc] cancel"),
+                        ])
+                        .block(
+                            ratatui::widgets::Block::default()
+                                .borders(ratatui::widgets::Borders::ALL)
+                                .title("confirm"),
+                        ),
+                        box_area,
+                    );
+                }
+                BashPopup::None => {}
+            }
         })?;
 
         // Poll for events with timeout (33ms → ~30hz refresh)
@@ -357,38 +443,39 @@ fn run_loop<B: Backend, E: EventSource>(
                 // Ctrl+P opens the bash task popup when no popup is active.
                 if key.code == KeyCode::Char('p')
                     && key.modifiers == KeyModifiers::CONTROL
-                    && runtime_popup.is_none()
+                    && matches!(bash_popup, BashPopup::None)
                 {
-                    refresh_process_snapshots(
-                        &process_manager,
-                        &mut process_snapshots,
-                        &mut process_outputs,
-                    );
                     let ids: Vec<String> =
                         task_registry.list().iter().map(|t| t.id.clone()).collect();
-                    runtime_popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(ids)));
+                    if !ids.is_empty() {
+                        bash_popup = BashPopup::List(ListPopup::new(ids));
+                    }
                     continue;
                 }
-                // Route keys to the runtime popup when active.
-                if !runtime_popup.is_none() {
-                    let process_to_kill = handle_runtime_popup_key(
-                        key,
-                        &mut runtime_popup,
-                        &task_registry,
-                        &process_snapshots,
-                        &process_outputs,
-                        layout.chunks[0].width,
-                        layout.chunks[0].height,
-                    );
-                    if let Some(process_id) = process_to_kill {
-                        let _ = tokio::runtime::Handle::current().block_on(
-                            process_manager.kill(yi_agent_tools::ProcessSelector::Id(process_id)),
-                        );
-                        refresh_process_snapshots(
-                            &process_manager,
-                            &mut process_snapshots,
-                            &mut process_outputs,
-                        );
+                // Route keys to the bash popup when active.
+                if !matches!(bash_popup, BashPopup::None) {
+                    handle_bash_popup_key(key, &mut bash_popup, &task_registry);
+                    continue;
+                }
+                if runtime_start_prompt.is_some() {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            if let Some(tx) = &runtime_choice_tx {
+                                let _ = tx.blocking_send(
+                                    crate::tui::subagents::RuntimeStartupChoice::Start,
+                                );
+                            }
+                            runtime_start_prompt = None;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            if let Some(tx) = &runtime_choice_tx {
+                                let _ = tx.blocking_send(
+                                    crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
+                                );
+                            }
+                            runtime_start_prompt = None;
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -423,14 +510,11 @@ fn run_loop<B: Backend, E: EventSource>(
                 sync_popup(&mut popup, &input.buffer);
             }
             Some(Event::Paste(text)) => {
-                if runtime_popup.blocks_text_input() {
-                    continue;
-                }
                 handle_paste(
                     text,
                     input,
                     history,
-                    runtime_popup.bash().unwrap_or(&BashPopup::None),
+                    &bash_popup,
                     &mut pending_quit,
                     &mut popup,
                 );
@@ -439,11 +523,9 @@ fn run_loop<B: Backend, E: EventSource>(
                 handle_mouse(
                     mouse,
                     &layout,
-                    &mut runtime_popup,
+                    &mut bash_popup,
                     history,
                     &task_registry,
-                    &process_snapshots,
-                    &process_outputs,
                     &mut pending_quit,
                 );
             }
@@ -454,359 +536,11 @@ fn run_loop<B: Backend, E: EventSource>(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-enum RuntimePopup {
-    None,
-    Bash(BashPopup),
-    Processes(ProcessPopup),
-}
-
-impl RuntimePopup {
-    fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-
-    fn bash(&self) -> Option<&BashPopup> {
-        match self {
-            Self::Bash(popup) => Some(popup),
-            _ => None,
-        }
-    }
-
-    fn blocks_text_input(&self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    fn switch_tab(&mut self, process_ids: Vec<String>) {
-        *self = match self.tab().map(RuntimeTab::next) {
-            Some(RuntimeTab::Processes) => {
-                Self::Processes(ProcessPopup::List(ProcessListPopup::new()))
-            }
-            Some(RuntimeTab::BashTasks) => Self::Bash(BashPopup::List(ListPopup::new(process_ids))),
-            None => Self::None,
-        };
-    }
-
-    fn tab(&self) -> Option<RuntimeTab> {
-        match self {
-            Self::None => None,
-            Self::Bash(_) => Some(RuntimeTab::BashTasks),
-            Self::Processes(_) => Some(RuntimeTab::Processes),
-        }
-    }
-}
-
-fn switch_runtime_tab(runtime_popup: &mut RuntimePopup, task_registry: &RunningTaskRegistry) {
-    let ids = task_registry.list().iter().map(|t| t.id.clone()).collect();
-    runtime_popup.switch_tab(ids);
-}
-
-#[cfg(test)]
-fn switch_runtime_tab_for_test(runtime_popup: &mut RuntimePopup, bash_ids: &[String]) {
-    *runtime_popup = match runtime_popup.tab().map(RuntimeTab::next) {
-        Some(RuntimeTab::Processes) => {
-            RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()))
-        }
-        Some(RuntimeTab::BashTasks) => {
-            RuntimePopup::Bash(BashPopup::List(ListPopup::new(bash_ids.to_vec())))
-        }
-        None => RuntimePopup::None,
-    };
-}
-
-fn refresh_process_snapshots(
-    process_manager: &yi_agent_tools::ProcessManager,
-    process_snapshots: &mut Vec<yi_agent_tools::ManagedProcessSnapshot>,
-    process_outputs: &mut std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
-) {
-    *process_snapshots = process_manager.list();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        for snapshot in process_snapshots.iter() {
-            if let Ok(output) = handle.block_on(process_manager.read(
-                yi_agent_tools::ProcessSelector::Id(snapshot.process_id.clone()),
-                None,
-                64 * 1024,
-            )) {
-                process_outputs.insert(snapshot.process_id.clone(), output);
-            }
-        }
-    }
-}
-
-fn render_runtime_popup(
-    f: &mut ratatui::Frame<'_>,
-    runtime_popup: &RuntimePopup,
-    task_registry: &RunningTaskRegistry,
-    process_snapshots: &[yi_agent_tools::ManagedProcessSnapshot],
-    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
-    area: ratatui::layout::Rect,
-) {
-    match runtime_popup {
-        RuntimePopup::None => {}
-        RuntimePopup::Bash(bash_popup) => {
-            render_existing_bash_popup(f, bash_popup, task_registry, area);
-        }
-        RuntimePopup::Processes(ProcessPopup::List(p)) => {
-            f.render_widget(Clear, area);
-            f.render_widget(
-                super::process_popup::render_process_list_popup(p, process_snapshots, area),
-                area,
-            );
-        }
-        RuntimePopup::Processes(ProcessPopup::Detail(p)) => {
-            if let Some(process) = process_snapshots
-                .iter()
-                .find(|p2| p2.process_id == p.process_id)
-            {
-                let _line_count = super::process_popup::process_detail_line_count(
-                    process,
-                    process_outputs.get(&p.process_id),
-                    area.width,
-                );
-                f.render_widget(Clear, area);
-                f.render_widget(
-                    super::process_popup::render_process_detail_popup(
-                        p,
-                        process,
-                        process_outputs.get(&p.process_id),
-                        area,
-                    ),
-                    area,
-                );
-            }
-        }
-        RuntimePopup::Processes(ProcessPopup::ConfirmKill(ck)) => {
-            if let Some(process) = process_snapshots
-                .iter()
-                .find(|p| p.process_id == ck.process_id)
-            {
-                f.render_widget(Clear, area);
-                let detail = ProcessDetailPopup::new(ck.process_id.clone());
-                f.render_widget(
-                    super::process_popup::render_process_detail_popup(
-                        &detail,
-                        process,
-                        process_outputs.get(&ck.process_id),
-                        area,
-                    ),
-                    area,
-                );
-                render_kill_confirmation_overlay(f, area, "kill this managed process?");
-            }
-        }
-    }
-}
-
-fn render_existing_bash_popup(
-    f: &mut ratatui::Frame<'_>,
-    bash_popup: &BashPopup,
-    task_registry: &RunningTaskRegistry,
-    area: ratatui::layout::Rect,
-) {
-    match bash_popup {
-        BashPopup::List(p) => {
-            let list_area = ratatui::layout::Rect {
-                x: area.x + 2,
-                y: area.y + 1,
-                width: area.width.saturating_sub(4),
-                height: area
-                    .height
-                    .saturating_sub(2)
-                    .min((p.task_ids.len() as u16 + 2).max(6)),
-            };
-            f.render_widget(Clear, list_area);
-            f.render_widget(
-                super::bash_popup::render_list_popup(p, task_registry, list_area),
-                list_area,
-            );
-        }
-        BashPopup::Detail(p) => {
-            if let Some(task) = task_registry.get(&p.task_id) {
-                f.render_widget(Clear, area);
-                f.render_widget(super::bash_popup::render_detail_popup(p, task, area), area);
-            }
-        }
-        BashPopup::ConfirmKill(ck) => {
-            if let Some(task) = task_registry.get(&ck.task_id) {
-                f.render_widget(Clear, area);
-                let detail = DetailPopup::new(ck.task_id.clone());
-                f.render_widget(
-                    super::bash_popup::render_detail_popup(&detail, task, area),
-                    area,
-                );
-            }
-            render_kill_confirmation_overlay(f, area, "kill this process?");
-        }
-        BashPopup::None => {}
-    }
-}
-
-fn render_kill_confirmation_overlay(
-    f: &mut ratatui::Frame<'_>,
-    area: ratatui::layout::Rect,
-    prompt: &str,
-) {
-    let box_w = 40u16.min(area.width.saturating_sub(4));
-    let box_h = 4u16;
-    let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
-    let box_y = area.y + (area.height.saturating_sub(box_h)) / 3;
-    let box_area = ratatui::layout::Rect {
-        x: box_x,
-        y: box_y,
-        width: box_w,
-        height: box_h,
-    };
-    f.render_widget(Clear, box_area);
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(vec![
-            ratatui::text::Line::raw(prompt.to_string()),
-            ratatui::text::Line::raw(""),
-            ratatui::text::Line::raw("[y] confirm   [n/esc] cancel"),
-        ])
-        .block(
-            ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title("confirm"),
-        ),
-        box_area,
-    );
-}
-
-#[cfg(test)]
-fn handle_runtime_popup_key_for_test(
-    key: KeyEvent,
-    runtime_popup: &mut RuntimePopup,
-    bash_ids: &[String],
-    processes: &[yi_agent_tools::ManagedProcessSnapshot],
-) {
-    if key.code == KeyCode::Tab {
-        switch_runtime_tab_for_test(runtime_popup, bash_ids);
-        return;
-    }
-    let registry = RunningTaskRegistry::new();
-    let outputs = std::collections::HashMap::new();
-    let _ = handle_runtime_popup_key(key, runtime_popup, &registry, processes, &outputs, 80, 24);
-}
-
-fn handle_runtime_popup_key(
-    key: KeyEvent,
-    runtime_popup: &mut RuntimePopup,
-    task_registry: &RunningTaskRegistry,
-    processes: &[yi_agent_tools::ManagedProcessSnapshot],
-    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
-    detail_width: u16,
-    detail_height: u16,
-) -> Option<String> {
-    match runtime_popup {
-        RuntimePopup::None => {}
-        RuntimePopup::Bash(bash_popup) => {
-            if key.code == KeyCode::Tab {
-                switch_runtime_tab(runtime_popup, task_registry);
-            } else {
-                handle_bash_popup_key(key, bash_popup, task_registry, detail_width);
-                if matches!(bash_popup, BashPopup::None) {
-                    *runtime_popup = RuntimePopup::None;
-                }
-            }
-        }
-        RuntimePopup::Processes(ProcessPopup::List(p)) => match key.code {
-            KeyCode::Tab => {
-                switch_runtime_tab(runtime_popup, task_registry);
-            }
-            KeyCode::Up => p.move_up(),
-            KeyCode::Down => p.move_down(processes.len()),
-            KeyCode::Enter => {
-                if let Some(id) = p.selected_id(processes) {
-                    *runtime_popup = RuntimePopup::Processes(ProcessPopup::Detail(
-                        ProcessDetailPopup::new(id.to_string()),
-                    ));
-                }
-            }
-            KeyCode::Esc | KeyCode::Char('q') => *runtime_popup = RuntimePopup::None,
-            _ => {}
-        },
-        RuntimePopup::Processes(ProcessPopup::Detail(d)) => match key.code {
-            KeyCode::Tab => {
-                switch_runtime_tab(runtime_popup, task_registry);
-            }
-            KeyCode::Char('k') => {
-                *runtime_popup =
-                    RuntimePopup::Processes(ProcessPopup::ConfirmKill(ConfirmProcessKillPopup {
-                        process_id: d.process_id.clone(),
-                    }));
-            }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                *runtime_popup =
-                    RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
-            }
-            KeyCode::Up => {
-                let max = process_detail_max_scroll(
-                    d,
-                    processes,
-                    process_outputs,
-                    detail_width,
-                    detail_height,
-                );
-                d.scroll_up_from_bottom(1, max);
-            }
-            KeyCode::Down => {
-                let max = process_detail_max_scroll(
-                    d,
-                    processes,
-                    process_outputs,
-                    detail_width,
-                    detail_height,
-                );
-                d.scroll_down(1, max);
-            }
-            KeyCode::Char('f') => d.scroll_to_bottom(),
-            _ => {}
-        },
-        RuntimePopup::Processes(ProcessPopup::ConfirmKill(ck)) => match key.code {
-            KeyCode::Char('n') | KeyCode::Esc => {
-                *runtime_popup = RuntimePopup::Processes(ProcessPopup::Detail(
-                    ProcessDetailPopup::new(ck.process_id.clone()),
-                ));
-            }
-            KeyCode::Char('y') => {
-                let process_id = ck.process_id.clone();
-                *runtime_popup =
-                    RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
-                return Some(process_id);
-            }
-            _ => {}
-        },
-    }
-    None
-}
-
-fn process_detail_max_scroll(
-    detail: &ProcessDetailPopup,
-    processes: &[yi_agent_tools::ManagedProcessSnapshot],
-    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
-    width: u16,
-    height: u16,
-) -> usize {
-    processes
-        .iter()
-        .find(|process| process.process_id == detail.process_id)
-        .map(|process| {
-            super::process_popup::process_detail_line_count(
-                process,
-                process_outputs.get(&detail.process_id),
-                width,
-            )
-            .saturating_sub(height as usize)
-        })
-        .unwrap_or(0)
-}
-
 /// Handle a key event for the bash popup state machine.
 fn handle_bash_popup_key(
     key: KeyEvent,
     bash_popup: &mut BashPopup,
     task_registry: &RunningTaskRegistry,
-    detail_width: u16,
 ) {
     match bash_popup {
         BashPopup::List(p) => match key.code {
@@ -848,9 +582,14 @@ fn handle_bash_popup_key(
                 d.scroll_up(1);
             }
             KeyCode::Down => {
+                // Approximate max scroll by stdout+stderr line count.
                 let lines = task_registry
                     .get(&d.task_id)
-                    .map(|t| super::bash_popup::detail_line_count(t, detail_width))
+                    .map(|t| {
+                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
+                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
+                        so + se + 6 // header + labels
+                    })
                     .unwrap_or(0);
                 d.scroll_down(1, lines);
             }
@@ -890,15 +629,12 @@ fn handle_bash_popup_key(
 /// 2. Otherwise, if the mouse is over the history region, scroll history.
 /// 3. If the mouse is over the input region, do nothing — the input widget
 ///    handles its own scrolling internally.
-#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     mouse: MouseEvent,
     layout: &LayoutInfo,
-    runtime_popup: &mut RuntimePopup,
+    bash_popup: &mut BashPopup,
     history: &mut HistoryState,
     task_registry: &RunningTaskRegistry,
-    processes: &[yi_agent_tools::ManagedProcessSnapshot],
-    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
     pending_quit: &mut bool,
 ) {
     // Only react to scroll-wheel events.
@@ -916,43 +652,22 @@ fn handle_mouse(
     let pos = ratatui::layout::Position::from((mouse.column, mouse.row));
 
     // The bash detail popup occupies the history region (chunks[0]).
-    if matches!(
-        runtime_popup,
-        RuntimePopup::Bash(BashPopup::Detail(_)) | RuntimePopup::Bash(BashPopup::ConfirmKill(_))
-    ) && history_area.contains(pos)
+    if matches!(bash_popup, BashPopup::Detail(_) | BashPopup::ConfirmKill(_))
+        && history_area.contains(pos)
     {
-        if let RuntimePopup::Bash(BashPopup::Detail(d)) = runtime_popup {
+        if let BashPopup::Detail(d) = bash_popup {
             if is_scroll_down {
                 let lines = task_registry
                     .get(&d.task_id)
-                    .map(|t| super::bash_popup::detail_line_count(t, history_area.width))
+                    .map(|t| {
+                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
+                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
+                        so + se + 6 // header + labels
+                    })
                     .unwrap_or(0);
                 d.scroll_down(delta, lines);
             } else {
                 d.scroll_up(delta);
-            }
-        }
-        return;
-    }
-
-    if matches!(
-        runtime_popup,
-        RuntimePopup::Processes(ProcessPopup::Detail(_))
-            | RuntimePopup::Processes(ProcessPopup::ConfirmKill(_))
-    ) && history_area.contains(pos)
-    {
-        if let RuntimePopup::Processes(ProcessPopup::Detail(d)) = runtime_popup {
-            let max = process_detail_max_scroll(
-                d,
-                processes,
-                process_outputs,
-                history_area.width,
-                history_area.height,
-            );
-            if is_scroll_down {
-                d.scroll_down(delta, max);
-            } else {
-                d.scroll_up_from_bottom(delta, max);
             }
         }
         return;
@@ -992,14 +707,16 @@ fn route_event(
             // counter so it doesn't linger at the previous turn's value
             // throughout the entire tool execution phase.
             statusbar.on_tool_call_phase();
-            if name == "bash" {
-                let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                let exp = input
-                    .get("expected_timeout_sec")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(120) as u32;
-                registry.on_tool_call(id, name, cmd, exp);
-            }
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let exp = input
+                .get("expected_timeout_sec")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120) as u32;
+            registry.on_tool_call(id, name, &cmd, exp);
         }
         AgentEvent::ToolOutputDelta { id, stream, text } => {
             registry.on_output_delta(id, *stream, text);
@@ -1013,6 +730,7 @@ fn route_event(
         AgentEvent::ToolResult { id, result } => {
             registry.on_result(id, result.is_error);
         }
+        AgentEvent::ToolRetry { .. } => {}
         // Turn-end events finalize any still-running tasks. This is a
         // defense-in-depth cleanup: in the happy path each ToolCall gets a
         // matching ToolExit before Done arrives. But ToolExit can be missed
@@ -1047,19 +765,6 @@ fn route_event(
                 "auto-compact: session compressed"
             );
         }
-        AgentEvent::ManualCompacted {
-            old_msg_count,
-            new_msg_count,
-        } => {
-            tracing::info!(
-                old_msg_count,
-                new_msg_count,
-                "manual compact: session compressed"
-            );
-        }
-        AgentEvent::ManualCompactFailed { message } => {
-            tracing::warn!(%message, "manual compact failed");
-        }
         _ => {}
     }
 }
@@ -1069,12 +774,6 @@ enum KeyOutcome {
     None,
     Quit,
     Submit(String),
-}
-
-fn starts_with_multi_segment_absolute_path(text: &str) -> bool {
-    text.split_whitespace()
-        .next()
-        .is_some_and(|token| token.starts_with('/') && token.matches('/').count() >= 2)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1134,14 +833,17 @@ fn handle_key(
     // Global keys first
     match key.code {
         KeyCode::Esc => {
-            // Popup dismissal takes precedence over cancelling an agent turn.
+            if *pending_quit {
+                return KeyOutcome::Quit;
+            }
+            // If popup is active, Esc dismisses it (without setting pending_quit)
             if popup.is_some() {
                 *popup = None;
                 return KeyOutcome::None;
             }
+            *pending_quit = true;
             if is_running.load(std::sync::atomic::Ordering::SeqCst) {
-                // Cancellation is idempotent; coalesce repeated Esc presses.
-                let _ = interrupt_tx.try_send(());
+                let _ = interrupt_tx.blocking_send(());
             }
             return KeyOutcome::None;
         }
@@ -1260,11 +962,11 @@ fn handle_key(
 
     match key.code {
         KeyCode::Up if key.modifiers.is_empty() => {
-            history.scroll_up(HISTORY_KEY_LINES, max_scroll_offset);
+            history.scroll_up(1, max_scroll_offset);
             return KeyOutcome::None;
         }
         KeyCode::Down if key.modifiers.is_empty() => {
-            history.scroll_down(HISTORY_KEY_LINES);
+            history.scroll_down(1);
             return KeyOutcome::None;
         }
         KeyCode::PageUp if key.modifiers.is_empty() => {
@@ -1291,7 +993,7 @@ fn handle_key(
         InputAction::Submit => {
             let text = input.take_submitted();
             // Check if this is a slash command
-            if text.starts_with('/') && !starts_with_multi_segment_absolute_path(&text) {
+            if text.starts_with('/') {
                 let name = text
                     .trim_start_matches('/')
                     .split_whitespace()
@@ -1411,11 +1113,12 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Help => {
-            let mut help_text = String::from("可用命令:\n");
-            for c in SlashCommand::all() {
-                help_text.push_str(&format!("  /{:<10} {}\n", c.name(), c.description()));
-            }
-            history.push(HistoryCell::UserMessage { text: help_text }, width);
+            history.push(
+                HistoryCell::UserMessage {
+                    text: help_text(args.as_deref()),
+                },
+                width,
+            );
             KeyOutcome::None
         }
         SlashCommand::Cost => {
@@ -1462,7 +1165,858 @@ fn execute_slash_command(
             }
             KeyOutcome::None
         }
+        SlashCommand::Agents => {
+            let text = match daemon_agents_summary(args.as_deref()) {
+                Ok(summary) => summary,
+                Err(error) => format!("无法读取本地 daemon runtime: {error}"),
+            };
+            history.push(HistoryCell::Markdown { text }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Agent => {
+            let label = match args.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+                Some(task_id) => match daemon_agent_detail(task_id) {
+                    Ok(detail) => detail,
+                    Err(error) => format!("无法读取 agent 详情: {error}"),
+                },
+                None => "用法: /agent <task-id>".into(),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Approve
+        | SlashCommand::Deny
+        | SlashCommand::Budget
+        | SlashCommand::Priority
+        | SlashCommand::Daemon => {
+            history.push(
+                HistoryCell::Separator {
+                    label: Some(format!(
+                        "/{} 将由本地 daemon runtime 执行 (控制客户端接入中)",
+                        cmd.name()
+                    )),
+                },
+                width,
+            );
+            KeyOutcome::None
+        }
+        SlashCommand::Review => {
+            let label = match parse_review_args(args.as_deref()) {
+                Ok(task_id) => match daemon_review(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法读取审查信息: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Accept => {
+            let label = match parse_accept_args(args.as_deref()) {
+                Ok((task_id, confirmation)) => match daemon_accept(task_id, confirmation) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法接受 delivery: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Rework => {
+            let label = match parse_rework_args(args.as_deref()) {
+                Ok((task_id, feedback, confirmation)) => {
+                    match daemon_rework(task_id, feedback, confirmation) {
+                        Ok(message) => message,
+                        Err(error) => format!("无法请求返工: {error}"),
+                    }
+                }
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Reject => {
+            let label = match parse_reject_args(args.as_deref()) {
+                Ok((task_id, reason, confirmation)) => {
+                    match daemon_reject(task_id, reason, confirmation) {
+                        Ok(message) => message,
+                        Err(error) => format!("无法拒绝 delivery: {error}"),
+                    }
+                }
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Events => {
+            let label = match parse_review_args(args.as_deref()) {
+                Ok(task_id) => match daemon_events(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法读取任务事件: {error}"),
+                },
+                Err(_) => "用法: /events <task-id>".into(),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Diff => {
+            let label = match parse_review_args(args.as_deref()) {
+                Ok(task_id) => match daemon_diff(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法读取任务 diff: {error}"),
+                },
+                Err(_) => "用法: /diff <task-id>".into(),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Mailbox => {
+            let label = match parse_review_args(args.as_deref()) {
+                Ok(task_id) => match daemon_mailbox(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法读取任务 mailbox: {error}"),
+                },
+                Err(_) => "用法: /mailbox <task-id>".into(),
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Pause => {
+            let label = match parse_pause_resume_args(args.as_deref(), "pause") {
+                Ok(task_id) => match daemon_pause(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法暂停任务: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Resume => {
+            let label = match parse_pause_resume_args(args.as_deref(), "resume") {
+                Ok(task_id) => match daemon_resume(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法恢复任务: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Cancel => {
+            let label = match parse_cancel_args(args.as_deref()) {
+                Ok((task_id, recursive, confirmation)) => {
+                    match daemon_cancel(task_id, recursive, confirmation) {
+                        Ok(message) => message,
+                        Err(error) => format!("无法取消任务: {error}"),
+                    }
+                }
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Retry => {
+            let label = match parse_retry_args(args.as_deref()) {
+                Ok(task_id) => match daemon_retry(task_id) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法重试任务: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
+        SlashCommand::Message => {
+            let label = match parse_user_message_args(args.as_deref()) {
+                Ok((task_id, message)) => match daemon_user_message(task_id, message) {
+                    Ok(message) => message,
+                    Err(error) => format!("无法发送用户指令: {error}"),
+                },
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
+            KeyOutcome::None
+        }
     }
+}
+
+fn daemon_agents_summary(args: Option<&str>) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_agents_summary_at(&runtime_dir.join("runtime.sock"), args)
+}
+
+fn daemon_agent_detail(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_agent_detail_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_agent_detail_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::InspectTask {
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let yi_agent_store::ipc::IpcResponse::TaskDetail(detail) = response else {
+        return Err("daemon 返回了非任务详情响应".into());
+    };
+    Ok(format!(
+        "Agent {}\nsession: {}\nparent: {}\ndepth: {}\nstate: {}\ndelivery: {}",
+        detail.task_id,
+        detail.session_id,
+        detail.parent_task_id.as_deref().unwrap_or("(root)"),
+        detail.depth,
+        detail.state,
+        detail.delivery_json,
+    ))
+}
+
+fn parse_cancel_args(args: Option<&str>) -> Result<(&str, bool, Option<&str>), String> {
+    let usage = "用法: /cancel <task-id> [--recursive] [--confirm <token>]";
+    let Some(args) = args else {
+        return Err(usage.into());
+    };
+    let mut parts = args.split_whitespace();
+    let Some(task_id) = parts.next() else {
+        return Err(usage.into());
+    };
+    let mut recursive = false;
+    let mut confirmation = None;
+    while let Some(argument) = parts.next() {
+        match argument {
+            "--recursive" if !recursive => recursive = true,
+            "--confirm" if confirmation.is_none() => {
+                confirmation = Some(parts.next().ok_or_else(|| usage.to_string())?);
+            }
+            _ => return Err(usage.into()),
+        }
+    }
+    Ok((task_id, recursive, confirmation))
+}
+
+fn parse_retry_args(args: Option<&str>) -> Result<&str, String> {
+    parse_pause_resume_args(args, "retry")
+}
+
+fn parse_review_args(args: Option<&str>) -> Result<&str, String> {
+    parse_pause_resume_args(args, "review")
+}
+
+fn parse_accept_args(args: Option<&str>) -> Result<(&str, Option<&str>), String> {
+    let usage = "用法: /accept <task-id> [--confirm <token>]";
+    let Some(args) = args else {
+        return Err(usage.into());
+    };
+    let mut parts = args.split_whitespace();
+    let Some(task_id) = parts.next() else {
+        return Err(usage.into());
+    };
+    let confirmation = match parts.next() {
+        None => None,
+        Some("--confirm") => Some(parts.next().ok_or_else(|| usage.to_string())?),
+        _ => return Err(usage.into()),
+    };
+    if parts.next().is_some() {
+        return Err(usage.into());
+    }
+    Ok((task_id, confirmation))
+}
+
+fn parse_rework_args(args: Option<&str>) -> Result<(&str, &str, Option<&str>), String> {
+    parse_review_text_args(args, "rework", "feedback")
+}
+
+fn parse_reject_args(args: Option<&str>) -> Result<(&str, &str, Option<&str>), String> {
+    parse_review_text_args(args, "reject", "reason")
+}
+
+fn parse_review_text_args<'a>(
+    args: Option<&'a str>,
+    command: &str,
+    text_name: &str,
+) -> Result<(&'a str, &'a str, Option<&'a str>), String> {
+    let usage = || format!("用法: /{command} <task-id> <{text_name}> [--confirm <token>]");
+    let Some(args) = args.map(str::trim).filter(|args| !args.is_empty()) else {
+        return Err(usage());
+    };
+    let Some((task_id, rest)) = args.split_once(char::is_whitespace) else {
+        return Err(usage());
+    };
+    let rest = rest.trim();
+    if task_id.is_empty() || rest.is_empty() {
+        return Err(usage());
+    }
+    let (text, confirmation) = match rest.rsplit_once(" --confirm ") {
+        Some((text, token)) => {
+            let token = token.trim();
+            if text.trim().is_empty() || token.is_empty() || token.split_whitespace().count() != 1 {
+                return Err(usage());
+            }
+            (text.trim(), Some(token))
+        }
+        None => (rest, None),
+    };
+    Ok((task_id, text, confirmation))
+}
+
+fn parse_pause_resume_args<'a>(args: Option<&'a str>, command: &str) -> Result<&'a str, String> {
+    let usage = || format!("用法: /{command} <task-id>");
+    let Some(args) = args else {
+        return Err(usage());
+    };
+    let mut parts = args.split_whitespace();
+    let Some(task_id) = parts.next() else {
+        return Err(usage());
+    };
+    if parts.next().is_some() {
+        return Err(usage());
+    }
+    Ok(task_id)
+}
+
+fn parse_user_message_args(args: Option<&str>) -> Result<(&str, &str), String> {
+    let Some(args) = args.map(str::trim).filter(|args| !args.is_empty()) else {
+        return Err("用法: /message <task-id> <text>".into());
+    };
+    let Some((task_id, message)) = args.split_once(char::is_whitespace) else {
+        return Err("用法: /message <task-id> <text>".into());
+    };
+    let message = message.trim();
+    if task_id.is_empty() || message.is_empty() {
+        return Err("用法: /message <task-id> <text>".into());
+    }
+    Ok((task_id, message))
+}
+
+fn daemon_user_message(task_id: &str, message: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_user_message_at(&runtime_dir.join("runtime.sock"), task_id, message)
+}
+
+fn daemon_user_message_at(
+    socket: &std::path::Path,
+    task_id: &str,
+    message: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::SendUserMessage {
+            task_id: task_id.to_owned(),
+            message: message.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::MessageQueued) {
+        return Err("daemon 返回了非消息响应".into());
+    }
+    Ok(format!("已排队用户指令至任务: {task_id}"))
+}
+
+fn daemon_task_session_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::InspectTask {
+            task_id: task_id.into(),
+        },
+    )
+    .map_err(|error| error.to_string())?
+    {
+        yi_agent_store::ipc::IpcResponse::TaskDetail(detail) => Ok(detail.session_id),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            Err(format_ipc_error(code, message))
+        }
+        _ => Err("daemon 返回了非任务详情响应".into()),
+    }
+}
+
+fn daemon_retry(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    let socket = runtime_dir.join("runtime.sock");
+    let session_id = daemon_task_session_at(&socket, task_id)?;
+    daemon_retry_at(&socket, &session_id, task_id)
+}
+
+fn daemon_pause(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    let socket = runtime_dir.join("runtime.sock");
+    let session_id = daemon_task_session_at(&socket, task_id)?;
+    daemon_pause_at(&socket, &session_id, task_id)
+}
+
+fn daemon_pause_at(
+    socket: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::PauseTask {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskPaused) {
+        return Err("daemon 返回了非暂停响应".into());
+    }
+    Ok(format!("已请求暂停任务: {task_id}"))
+}
+
+fn daemon_resume(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    let socket = runtime_dir.join("runtime.sock");
+    let session_id = daemon_task_session_at(&socket, task_id)?;
+    daemon_resume_at(&socket, &session_id, task_id)
+}
+
+fn daemon_resume_at(
+    socket: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ResumeTask {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskResumed) {
+        return Err("daemon 返回了非恢复响应".into());
+    }
+    Ok(format!("已请求恢复任务: {task_id}"))
+}
+
+fn daemon_retry_at(
+    socket: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::RetryTask {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !matches!(response, yi_agent_store::ipc::IpcResponse::TaskRetried) {
+        return Err("daemon 返回了非重试响应".into());
+    }
+    Ok(format!("已请求重试任务: {task_id}"))
+}
+
+fn daemon_cancel(
+    task_id: &str,
+    recursive: bool,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    let socket = runtime_dir.join("runtime.sock");
+    daemon_cancel_at(&socket, task_id, recursive, confirmation)
+}
+
+fn daemon_cancel_at(
+    socket: &std::path::Path,
+    task_id: &str,
+    recursive: bool,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    let request = match confirmation {
+        Some(confirmation_token) => yi_agent_store::ipc::IpcRequest::ConfirmCancel {
+            task_id: task_id.to_owned(),
+            recursive,
+            confirmation_token: confirmation_token.to_owned(),
+        },
+        None => yi_agent_store::ipc::IpcRequest::PreviewCancel {
+            task_id: task_id.to_owned(),
+            recursive,
+        },
+    };
+    let response =
+        yi_agent_store::ipc::send_request(socket, request).map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token,
+            task_ids,
+            expires_in_secs,
+            ..
+        } => Ok(format!(
+            "取消预览（{} 个任务）: {}；使用 /cancel {task_id}{} --confirm {confirmation_token} 在 {expires_in_secs}s 内确认",
+            task_ids.len(),
+            task_ids.join(", "),
+            if recursive { " --recursive" } else { "" },
+        )),
+        yi_agent_store::ipc::IpcResponse::TaskCancelled => Ok(if recursive {
+            format!("已递归取消任务树: {task_id}")
+        } else {
+            format!("已取消任务: {task_id}")
+        }),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝取消请求: {}",
+            format_ipc_error(code, message)
+        )),
+        _ => Err("daemon 返回了非取消响应".into()),
+    }
+}
+
+fn daemon_review(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_review_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_review_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskDiff { delivery_json, .. } => {
+            Ok(format!("Delivery 审查 {task_id}\n{delivery_json}"))
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝审查请求: {}",
+            format_ipc_error(code, message)
+        )),
+        _ => Err("daemon 返回了非审查响应".into()),
+    }
+}
+
+fn daemon_events(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_events_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_events_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ReadTaskEvents {
+            task_id: task_id.to_owned(),
+            after_event_id: None,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskEvents { events } if events.is_empty() => {
+            Ok(format!("Events {task_id}: 暂无事件"))
+        }
+        yi_agent_store::ipc::IpcResponse::TaskEvents { events } => {
+            let mut output = format!("Events {}（{} 条）", task_id, events.len());
+            for event in events {
+                output.push_str(&format!(
+                    "\n{} {} {}",
+                    event.event_id, event.kind, event.payload_json
+                ));
+            }
+            Ok(output)
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝事件请求: {}",
+            format_ipc_error(code, message)
+        )),
+        _ => Err("daemon 返回了非事件响应".into()),
+    }
+}
+
+fn daemon_diff(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_diff_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_diff_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskDiff { delivery_json, .. } => {
+            Ok(format!("Diff {task_id}\n{delivery_json}"))
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝 diff 请求: {}",
+            format_ipc_error(code, message)
+        )),
+        _ => Err("daemon 返回了非 diff 响应".into()),
+    }
+}
+
+fn daemon_mailbox(task_id: &str) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_mailbox_at(&runtime_dir.join("runtime.sock"), task_id)
+}
+
+fn daemon_mailbox_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ReadTaskMailbox {
+            task_id: task_id.to_owned(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskMailbox { messages } if messages.is_empty() => {
+            Ok(format!("Mailbox {task_id}: 暂无消息"))
+        }
+        yi_agent_store::ipc::IpcResponse::TaskMailbox { messages } => {
+            let mut output = format!("Mailbox {}（{} 条）", task_id, messages.len());
+            for message in messages {
+                output.push_str(&format!(
+                    "\n{} {} priority={} {}",
+                    message.message_id, message.kind, message.priority, message.payload_json
+                ));
+            }
+            Ok(output)
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝 mailbox 请求: {}",
+            format_ipc_error(code, message)
+        )),
+        _ => Err("daemon 返回了非 mailbox 响应".into()),
+    }
+}
+
+fn daemon_accept(task_id: &str, confirmation: Option<&str>) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_accept_at(&runtime_dir.join("runtime.sock"), task_id, confirmation)
+}
+
+fn daemon_accept_at(
+    socket: &std::path::Path,
+    task_id: &str,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    daemon_review_decision_at(
+        socket,
+        task_id,
+        yi_agent_store::ipc::IpcReviewDecision::Accept {},
+        confirmation,
+        format!("/accept {task_id}"),
+    )
+}
+
+fn daemon_rework(
+    task_id: &str,
+    feedback: &str,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_rework_at(
+        &runtime_dir.join("runtime.sock"),
+        task_id,
+        feedback,
+        confirmation,
+    )
+}
+
+fn daemon_rework_at(
+    socket: &std::path::Path,
+    task_id: &str,
+    feedback: &str,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    daemon_review_decision_at(
+        socket,
+        task_id,
+        yi_agent_store::ipc::IpcReviewDecision::Rework {
+            feedback: feedback.to_owned(),
+        },
+        confirmation,
+        format!("/rework {task_id} {feedback}"),
+    )
+}
+
+fn daemon_reject(
+    task_id: &str,
+    reason: &str,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
+        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
+    daemon_reject_at(
+        &runtime_dir.join("runtime.sock"),
+        task_id,
+        reason,
+        confirmation,
+    )
+}
+
+fn daemon_reject_at(
+    socket: &std::path::Path,
+    task_id: &str,
+    reason: &str,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    daemon_review_decision_at(
+        socket,
+        task_id,
+        yi_agent_store::ipc::IpcReviewDecision::Reject {
+            reason: reason.to_owned(),
+        },
+        confirmation,
+        format!("/reject {task_id} {reason}"),
+    )
+}
+
+fn daemon_review_decision_at(
+    socket: &std::path::Path,
+    task_id: &str,
+    decision: yi_agent_store::ipc::IpcReviewDecision,
+    confirmation: Option<&str>,
+    confirm_command: String,
+) -> Result<String, String> {
+    let request = match confirmation {
+        Some(confirmation_token) => yi_agent_store::ipc::IpcRequest::ConfirmReview {
+            task_id: task_id.to_owned(),
+            decision,
+            confirmation_token: confirmation_token.to_owned(),
+        },
+        None => yi_agent_store::ipc::IpcRequest::PreviewReview {
+            task_id: task_id.to_owned(),
+            decision,
+        },
+    };
+    let response =
+        yi_agent_store::ipc::send_request(socket, request).map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::ReviewPreview {
+            delivery_id,
+            confirmation_token,
+            expires_in_secs,
+            ..
+        } => Ok(format!(
+            "审查预览: task={task_id} delivery={delivery_id}；使用 {confirm_command} --confirm {confirmation_token} 在 {expires_in_secs}s 内确认"
+        )),
+        yi_agent_store::ipc::IpcResponse::ReviewApproved => {
+            Ok(format!("已接受 delivery: {task_id}"))
+        }
+        yi_agent_store::ipc::IpcResponse::ReviewReworkRequested => {
+            Ok(format!("已请求子任务返工: {task_id}"))
+        }
+        yi_agent_store::ipc::IpcResponse::ReviewRejected => {
+            Ok(format!("已拒绝 delivery: {task_id}"))
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "daemon 拒绝审查决策: {}",
+            format_ipc_error(code, message)
+        )),
+        _ => Err("daemon 返回了非审查决策响应".into()),
+    }
+}
+
+fn daemon_agents_summary_at(
+    socket: &std::path::Path,
+    args: Option<&str>,
+) -> Result<String, String> {
+    let (session_id, active_only, title, excluded_task_id, empty_label) =
+        match args.map(str::trim).filter(|args| !args.is_empty()) {
+            None => {
+                let root = crate::tui::subagents::current_attached_root().ok_or_else(|| {
+                    "当前 TUI 未接入 subagent runtime；使用 /agents --all 查看 daemon 全部任务"
+                        .to_string()
+                })?;
+                (
+                    Some(root.session_id),
+                    false,
+                    "Current session",
+                    Some(root.task_id),
+                    "暂无子任务",
+                )
+            }
+            Some("--all") => (None, false, "All agents", None, "暂无任务"),
+            Some("--active") => (None, true, "Active agents", None, "暂无任务"),
+            Some(_) => return Err("用法: /agents [--all|--active]".into()),
+        };
+    let response = yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id,
+            active_only,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } = response else {
+        return Err("daemon 返回了非任务摘要响应".into());
+    };
+    Ok(format_agents_summary(
+        title,
+        tasks,
+        excluded_task_id.as_deref(),
+        empty_label,
+    ))
+}
+
+fn format_agents_summary(
+    title: &str,
+    tasks: Vec<yi_agent_store::ipc::IpcTaskSummary>,
+    excluded_task_id: Option<&str>,
+    empty_label: &str,
+) -> String {
+    let tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|task| Some(task.task_id.as_str()) != excluded_task_id)
+        .collect();
+    if tasks.is_empty() {
+        return format!("**{title}**\n\n{empty_label}");
+    }
+    let mut output = format!("**{title} ({})**", tasks.len());
+    for task in tasks {
+        let root_label = if task.is_root { " **root**" } else { "" };
+        output.push_str(&format!(
+            "\n- `{}`: {}{}",
+            task.task_id, task.state, root_label
+        ));
+    }
+    output
 }
 
 /// Build the popup widget for rendering.
@@ -1472,7 +2026,13 @@ fn build_popup<'a>(popup: &'a CommandPopup) -> Paragraph<'a> {
         .iter()
         .enumerate()
         .map(|(i, cmd)| {
-            let name = format!("/{}", cmd.name());
+            let name = format!(
+                "/{}{}",
+                cmd.name(),
+                cmd.argument_usage()
+                    .map(|usage| format!(" {usage}"))
+                    .unwrap_or_default()
+            );
             let desc = cmd.description();
             let is_selected = i == popup.selected_index();
             let style = if is_selected {
@@ -1495,7 +2055,7 @@ fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> P
     if pending_quit {
         return Paragraph::new(Line::from(vec![
             prefix,
-            Span::styled("再按 Ctrl+C 退出", Style::new().fg(Color::Yellow)),
+            Span::styled("再按 Ctrl+C 或 Esc 退出", Style::new().fg(Color::Yellow)),
         ]))
         .style(Style::new().bg(Color::Indexed(240)));
     }
@@ -1684,14 +2244,149 @@ mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use futures::future::BoxFuture;
     use ratatui::backend::TestBackend;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tempfile::TempDir;
     use tokio::sync::mpsc;
-    use yi_agent_core::OutputStream;
+    use yi_agent_core::subagent::task::WorkspaceLeaseId;
+    use yi_agent_core::subagent::worker::{
+        AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+    };
+    use yi_agent_core::{OutputStream, RootSessionId, TaskId};
+
+    struct RecordingWorkerFactory;
+
+    impl AgentWorkerFactory for RecordingWorkerFactory {
+        fn recovery_context(&self) -> WorkerRecoveryContext {
+            WorkerRecoveryContext {
+                workspace_lease_id: Some("workspace:test".into()),
+                worktree_lease: Some("worktree:test".into()),
+                checkpoint_json: r#"{"git_head":"test","git_status":""}"#.into(),
+                tool_state_json: r#"{"state":"available","registered_tools":[]}"#.into(),
+            }
+        }
+
+        fn start(
+            &self,
+            request: WorkerStart,
+        ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+            Box::pin(async move {
+                let handle = WorkerHandle::new(request.cancellation);
+                let paused_handle = handle.clone();
+                let mut pause = handle.subscribe_pause();
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("test pause listener runtime must initialize");
+                    if runtime.block_on(pause.requested()) {
+                        paused_handle.report_paused();
+                    }
+                });
+                Ok(handle)
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct DeliveryRecordingFactory {
+        handles: std::sync::Mutex<Vec<WorkerHandle>>,
+        workspaces: std::sync::Mutex<Vec<WorkspaceLeaseId>>,
+    }
+
+    impl AgentWorkerFactory for DeliveryRecordingFactory {
+        fn recovery_context(&self) -> WorkerRecoveryContext {
+            WorkerRecoveryContext {
+                workspace_lease_id: Some("workspace:test".into()),
+                worktree_lease: Some("worktree:test".into()),
+                checkpoint_json: r#"{"git_head":"test","git_status":""}"#.into(),
+                tool_state_json: r#"{"state":"available","registered_tools":[]}"#.into(),
+            }
+        }
+
+        fn start(
+            &self,
+            request: WorkerStart,
+        ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+            let handle = WorkerHandle::new(request.cancellation);
+            self.workspaces
+                .lock()
+                .unwrap()
+                .push(request.workspace_lease_id.unwrap_or_default());
+            self.handles.lock().unwrap().push(handle.clone());
+            Box::pin(async move { Ok(handle) })
+        }
+    }
+
+    fn start_daemon_with_delivered_child() -> (TempDir, yi_agent_store::ipc::Daemon, String) {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let factory = Arc::new(DeliveryRecordingFactory::default());
+        let daemon = yi_agent_store::ipc::Daemon::start_with_factory(
+            directory.path().join("runtime"),
+            &database,
+            factory.clone(),
+        )
+        .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated {
+            session_id,
+            root_task_id,
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::CreateSession,
+        )
+        .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::StartWorker {
+                session_id: session_id.clone(),
+                task_id: root_task_id.clone(),
+            },
+        )
+        .unwrap();
+        let spawn_response = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::SpawnChild {
+                session_id,
+                parent_task_id: root_task_id,
+                objective: "实现 parser".into(),
+            },
+        )
+        .unwrap();
+        let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id } = spawn_response else {
+            panic!("expected a spawned child, got {spawn_response:?}");
+        };
+        let workspace = factory.workspaces.lock().unwrap()[1].clone();
+        factory.handles.lock().unwrap()[1].report_delivery(
+            yi_agent_core::subagent::task::DeliveryReport::coding(
+                "deadbeef",
+                "main",
+                workspace,
+                "cargo test -p child",
+            ),
+        );
+        for _ in 0..100 {
+            if yi_agent_store::repository::RuntimeRepository::open(&database)
+                .unwrap()
+                .task_state(&task_id.parse().unwrap())
+                .unwrap()
+                == "awaiting_parent_review"
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (directory, daemon, task_id)
+    }
 
     #[test]
     fn test_route_event_full_flow() {
@@ -1772,69 +2467,493 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_process_tab_kill_confirmation_sends_process_id() {
-        let mut runtime_popup = RuntimePopup::Processes(ProcessPopup::Detail(
-            ProcessDetailPopup::new("proc_1".into()),
-        ));
-        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+    fn agents_summary_reads_daemon_task_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let mut repository =
+            yi_agent_store::repository::RuntimeRepository::open(&database).unwrap();
+        let task = TaskId::new();
+        repository
+            .create_task(&task, &RootSessionId::new(), "queued")
+            .unwrap();
 
-        handle_runtime_popup_key_for_test(key, &mut runtime_popup, &[], &[]);
+        let summary = daemon_agents_summary_at(daemon.socket_path(), Some("--all")).unwrap();
 
-        assert!(matches!(
-            runtime_popup,
-            RuntimePopup::Processes(ProcessPopup::ConfirmKill(_))
-        ));
+        assert!(summary.starts_with("**All agents (1)**"));
+        assert!(summary.contains(&format!("- `{task}`: queued")));
+        assert!(summary.contains(&task.to_string()));
+        assert!(summary.contains("queued"));
     }
 
     #[test]
-    fn runtime_popup_tab_switches_between_bash_and_processes() {
-        let mut popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(vec!["bash_1".into()])));
-
-        popup.switch_tab(Vec::new());
-
-        assert!(matches!(
-            popup,
-            RuntimePopup::Processes(ProcessPopup::List(_))
-        ));
-    }
-
-    #[test]
-    fn process_runtime_popup_blocks_text_input() {
-        let popup = RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
-
-        assert!(popup.blocks_text_input());
-    }
-
-    #[test]
-    fn test_route_event_tracks_only_bash_tool_calls() {
-        let mut registry = RunningTaskRegistry::new();
-        let mut statusbar = StatusBarState::default();
-        let mut cost = CostTracker::default();
-
-        route_event(
-            &mut registry,
-            &mut statusbar,
-            &mut cost,
-            &AgentEvent::ToolCall {
-                id: "grep".into(),
-                name: "grep".into(),
-                input: serde_json::json!({"pattern": "TODO"}),
-            },
+    fn current_agents_summary_excludes_the_attached_root_task() {
+        let summary = format_agents_summary(
+            "Current session",
+            vec![
+                yi_agent_store::ipc::IpcTaskSummary {
+                    task_id: "root".into(),
+                    state: "queued".into(),
+                    is_root: true,
+                },
+                yi_agent_store::ipc::IpcTaskSummary {
+                    task_id: "child".into(),
+                    state: "running".into(),
+                    is_root: false,
+                },
+            ],
+            Some("root"),
+            "暂无子任务",
         );
-        assert!(registry.list().is_empty());
 
-        route_event(
-            &mut registry,
-            &mut statusbar,
-            &mut cost,
-            &AgentEvent::ToolCall {
-                id: "bash".into(),
-                name: "bash".into(),
-                input: serde_json::json!({"command": "echo hi", "expected_timeout_sec": 30}),
-            },
+        assert!(!summary.contains("root"));
+        assert!(summary.contains("Current session (1)"));
+        assert!(summary.contains("`child`: running"));
+    }
+
+    #[test]
+    fn all_agents_summary_marks_root_tasks() {
+        let summary = format_agents_summary(
+            "All agents",
+            vec![yi_agent_store::ipc::IpcTaskSummary {
+                task_id: "root".into(),
+                state: "running".into(),
+                is_root: true,
+            }],
+            None,
+            "暂无任务",
         );
-        assert_eq!(registry.list().len(), 1);
-        assert_eq!(registry.get("bash").unwrap().command, "echo hi");
+
+        assert!(summary.contains("`root`: running **root**"));
+    }
+
+    #[test]
+    fn agent_detail_reads_a_daemon_task_for_user_inspection() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(detail.contains(&root_task_id));
+        assert!(detail.contains("state: queued"));
+        assert!(detail.contains("depth: 0"));
+    }
+
+    #[test]
+    fn cancel_control_requires_a_preview_token_before_cancelling() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let preview = daemon_cancel_at(daemon.socket_path(), &root_task_id, true, None).unwrap();
+        assert!(preview.contains("取消预览"));
+        let yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token, ..
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::PreviewCancel {
+                task_id: root_task_id.clone(),
+                recursive: true,
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected a cancel preview");
+        };
+        let result = daemon_cancel_at(
+            daemon.socket_path(),
+            &root_task_id,
+            true,
+            Some(&confirmation_token),
+        )
+        .unwrap();
+
+        assert!(result.contains("递归"));
+        let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+        assert!(detail.contains("state: cancelled"));
+    }
+
+    #[test]
+    fn review_command_parsers_accept_confirmation_tokens_and_freeform_text() {
+        assert_eq!(parse_review_args(Some("task-1")).unwrap(), "task-1");
+        assert_eq!(
+            parse_accept_args(Some("task-1 --confirm token-1")).unwrap(),
+            ("task-1", Some("token-1"))
+        );
+        assert_eq!(
+            parse_rework_args(Some("task-1 修一下边界条件 --confirm token-2")).unwrap(),
+            ("task-1", "修一下边界条件", Some("token-2"))
+        );
+        assert_eq!(
+            parse_reject_args(Some("task-1 方向不对，先停止")).unwrap(),
+            ("task-1", "方向不对，先停止", None)
+        );
+    }
+
+    #[test]
+    fn review_control_reads_delivery_json_from_daemon() {
+        let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
+
+        let review = daemon_review_at(daemon.socket_path(), &task_id).unwrap();
+
+        assert!(review.contains("Delivery 审查"));
+        assert!(review.contains("deadbeef"));
+        assert!(review.contains("cargo test -p child"));
+    }
+
+    #[test]
+    fn events_control_reads_task_events_from_daemon() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::repository::RuntimeRepository::open(&database)
+            .unwrap()
+            .append_event(
+                &root_task_id.parse().unwrap(),
+                yi_agent_store::repository::RuntimeEvent::TaskStarted,
+            )
+            .unwrap();
+
+        let events = daemon_events_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(events.contains("Events"));
+        assert!(events.contains("task_started"));
+    }
+
+    #[test]
+    fn mailbox_control_reads_messages_without_consuming_them() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::SendUserMessage {
+                task_id: root_task_id.clone(),
+                message: "请汇报进展".into(),
+            },
+        )
+        .unwrap();
+
+        let mailbox = daemon_mailbox_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(mailbox.contains("Mailbox"));
+        assert!(mailbox.contains("user_override"));
+        assert!(mailbox.contains("请汇报进展"));
+        assert_eq!(
+            yi_agent_store::repository::RuntimeRepository::open(&database)
+                .unwrap()
+                .mailbox_messages_for_task(&root_task_id.parse().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn diff_control_reads_delivery_evidence_from_daemon() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let diff = daemon_diff_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(diff.contains("Diff"));
+        assert!(diff.contains("Root session objective not specified."));
+    }
+
+    #[test]
+    fn accept_control_previews_then_confirms_review_from_tui() {
+        let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
+
+        let preview = daemon_accept_at(daemon.socket_path(), &task_id, None).unwrap();
+
+        assert!(preview.contains("审查预览"));
+        assert!(preview.contains("/accept"));
+        let yi_agent_store::ipc::IpcResponse::ReviewPreview {
+            confirmation_token, ..
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::PreviewReview {
+                task_id: task_id.clone(),
+                decision: yi_agent_store::ipc::IpcReviewDecision::Accept {},
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected a review preview");
+        };
+        let result =
+            daemon_accept_at(daemon.socket_path(), &task_id, Some(&confirmation_token)).unwrap();
+
+        assert!(result.contains("已接受"));
+    }
+
+    #[test]
+    fn rework_control_previews_then_confirms_review_from_tui() {
+        let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
+
+        let preview = daemon_rework_at(daemon.socket_path(), &task_id, "补测试", None).unwrap();
+
+        assert!(preview.contains("审查预览"));
+        assert!(preview.contains("/rework"));
+        assert!(preview.contains("补测试"));
+        let yi_agent_store::ipc::IpcResponse::ReviewPreview {
+            confirmation_token, ..
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::PreviewReview {
+                task_id: task_id.clone(),
+                decision: yi_agent_store::ipc::IpcReviewDecision::Rework {
+                    feedback: "补测试".into(),
+                },
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected a review preview");
+        };
+        let result = daemon_rework_at(
+            daemon.socket_path(),
+            &task_id,
+            "补测试",
+            Some(&confirmation_token),
+        )
+        .unwrap();
+
+        assert!(result.contains("已请求子任务返工"));
+    }
+
+    #[test]
+    fn reject_control_previews_then_confirms_review_from_tui() {
+        let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
+
+        let preview = daemon_reject_at(daemon.socket_path(), &task_id, "方向不对", None).unwrap();
+
+        assert!(preview.contains("审查预览"));
+        assert!(preview.contains("/reject"));
+        assert!(preview.contains("方向不对"));
+        let yi_agent_store::ipc::IpcResponse::ReviewPreview {
+            confirmation_token, ..
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::PreviewReview {
+                task_id: task_id.clone(),
+                decision: yi_agent_store::ipc::IpcReviewDecision::Reject {
+                    reason: "方向不对".into(),
+                },
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected a review preview");
+        };
+        let result = daemon_reject_at(
+            daemon.socket_path(),
+            &task_id,
+            "方向不对",
+            Some(&confirmation_token),
+        )
+        .unwrap();
+
+        assert!(result.contains("已拒绝"));
+    }
+
+    #[test]
+    fn retry_control_routes_to_the_daemon_with_explicit_session_scope() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated {
+            session_id,
+            root_task_id,
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::CreateSession,
+        )
+        .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        let yi_agent_store::ipc::IpcResponse::CancelPreview {
+            confirmation_token, ..
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::PreviewCancel {
+                task_id: root_task_id.clone(),
+                recursive: false,
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected a cancel preview");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::ConfirmCancel {
+                task_id: root_task_id.clone(),
+                recursive: false,
+                confirmation_token,
+            },
+        )
+        .unwrap();
+
+        let result = daemon_retry_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+
+        assert!(result.contains("已请求重试"));
+    }
+
+    #[test]
+    fn pause_and_resume_controls_require_a_task_id() {
+        assert_eq!(
+            parse_pause_resume_args(Some("task-1"), "pause").unwrap(),
+            "task-1"
+        );
+        assert_eq!(
+            parse_pause_resume_args(Some("task-1 extra"), "pause").unwrap_err(),
+            "用法: /pause <task-id>"
+        );
+        assert_eq!(
+            parse_pause_resume_args(None, "resume").unwrap_err(),
+            "用法: /resume <task-id>"
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_controls_route_to_the_daemon_with_explicit_session_scope() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon = yi_agent_store::ipc::Daemon::start_with_factory(
+            directory.path().join("runtime"),
+            &database,
+            Arc::new(RecordingWorkerFactory),
+        )
+        .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated {
+            session_id,
+            root_task_id,
+        } = yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::CreateSession,
+        )
+        .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+        yi_agent_store::ipc::send_request(
+            daemon.socket_path(),
+            yi_agent_store::ipc::IpcRequest::StartWorker {
+                session_id: session_id.clone(),
+                task_id: root_task_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let paused = daemon_pause_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+        let paused_detail = (0..20)
+            .find_map(|_| {
+                let detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+                if detail.contains("state: paused") {
+                    Some(detail)
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("worker pause acknowledgement should be reconciled");
+        let resumed = daemon_resume_at(daemon.socket_path(), &session_id, &root_task_id).unwrap();
+        let resumed_detail = daemon_agent_detail_at(daemon.socket_path(), &root_task_id).unwrap();
+
+        assert!(paused.contains("已请求暂停"));
+        assert!(paused_detail.contains("state: paused"));
+        assert!(resumed.contains("已请求恢复"));
+        assert!(resumed_detail.contains("state: running"));
+    }
+
+    #[test]
+    fn message_control_routes_an_audited_user_override_to_the_daemon() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(directory.path().join("runtime"), &database)
+                .unwrap();
+        let yi_agent_store::ipc::IpcResponse::SessionCreated { root_task_id, .. } =
+            yi_agent_store::ipc::send_request(
+                daemon.socket_path(),
+                yi_agent_store::ipc::IpcRequest::CreateSession,
+            )
+            .unwrap()
+        else {
+            panic!("expected a created session");
+        };
+
+        let result = daemon_user_message_at(
+            daemon.socket_path(),
+            &root_task_id,
+            "请暂停并说明当前阻塞原因",
+        )
+        .unwrap();
+
+        assert!(result.contains("已排队用户指令"));
     }
 
     #[test]
@@ -1860,10 +2979,11 @@ mod tests {
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
     }
 
-    /// Non-Bash tools do not create Ctrl+P tasks, and their results are safe
-    /// to ignore in the Bash-task registry.
+    /// A normal (non-streaming) tool such as web_search returns ToolResult
+    /// without ToolExit. Its timer must stop when that result arrives rather
+    /// than continuing through the next LLM think phase until Done.
     #[test]
-    fn test_route_event_ignores_non_bash_tool_results() {
+    fn test_route_event_tool_result_finalizes_non_streaming_tool() {
         let mut registry = RunningTaskRegistry::new();
         let mut sb = StatusBarState::default();
         let mut cost = CostTracker::default();
@@ -1887,8 +3007,10 @@ mod tests {
             },
         );
 
-        assert!(registry.get("search").is_none());
-        assert!(registry.list().is_empty());
+        let elapsed = registry.get("search").unwrap().elapsed();
+        assert_eq!(registry.get("search").unwrap().status, TaskStatus::Done);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(registry.get("search").unwrap().elapsed(), elapsed);
     }
 
     /// Regression: a ToolCall that never receives a ToolExit (e.g. bash tool
@@ -2467,7 +3589,8 @@ mod tests {
             &is_running,
             &source,
             "test-model",
-            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2547,7 +3670,8 @@ mod tests {
             &is_running,
             &source,
             "test-model",
-            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2610,7 +3734,8 @@ mod tests {
             &is_running,
             &source,
             "test-model",
-            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2690,6 +3815,104 @@ mod tests {
             handle.await.unwrap();
             assert_eq!(input_rx.recv().await.unwrap(), "hello");
         });
+    }
+
+    #[test]
+    fn runtime_start_prompt_sends_start_choice_before_accepting_chat_input() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (runtime_choice_tx, mut runtime_choice_rx) = tokio::sync::mpsc::channel(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            ])),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            Some(crate::tui::subagents::RuntimeStartPrompt {
+                title: "启动本地 Agent Runtime?".into(),
+                body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
+            }),
+            Some(runtime_choice_tx),
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime_choice_rx.try_recv().unwrap(),
+            crate::tui::subagents::RuntimeStartupChoice::Start
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "startup choice must not be sent as chat input"
+        );
+    }
+
+    #[test]
+    fn runtime_start_prompt_can_continue_without_delegation() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (runtime_choice_tx, mut runtime_choice_rx) = tokio::sync::mpsc::channel(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            ])),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            Some(crate::tui::subagents::RuntimeStartPrompt {
+                title: "启动本地 Agent Runtime?".into(),
+                body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
+            }),
+            Some(runtime_choice_tx),
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime_choice_rx.try_recv().unwrap(),
+            crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "skip choice must not be sent as chat input"
+        );
     }
 
     /// Test that first Ctrl+C does NOT quit but shows a confirm prompt,
@@ -2772,9 +3995,9 @@ mod tests {
         );
     }
 
-    /// Repeated Esc interrupts only; Ctrl+Q remains the explicit terminator.
+    /// Test that Esc behaves the same as Ctrl+C (confirm first, quit on second).
     #[test]
-    fn repeated_esc_does_not_quit() {
+    fn esc_same_as_ctrl_c() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
@@ -2785,9 +4008,8 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // First Esc alone should not quit
         let events = Rc::new(RefCell::new(vec![
-            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
-            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         ]));
@@ -2805,15 +4027,8 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "repeated Esc must not quit the TUI, got: {:?}",
+            "two Esc should quit cleanly, got: {:?}",
             result
-        );
-        let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
-        let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
-        assert!(
-            row_text.contains('x'),
-            "the key after repeated Esc must be processed, got: {row_text:?}"
         );
     }
 
@@ -4237,7 +5452,7 @@ mod tests {
         history.scroll_offset = 5;
 
         for (key, expected_offset) in [
-            (KeyCode::Up, 8),
+            (KeyCode::Up, 6),
             (KeyCode::Down, 5),
             (KeyCode::PageUp, 25),
             (KeyCode::PageDown, 5),
@@ -4291,7 +5506,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_interrupts_active_agent_without_arming_quit() {
+    fn esc_when_running_sends_interrupt() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -4322,7 +5537,7 @@ mod tests {
             &mut popup,
         );
         assert_eq!(result, KeyOutcome::None);
-        assert!(!pending_quit, "Esc must not arm process exit");
+        assert!(pending_quit);
         assert!(
             interrupt_rx.try_recv().is_ok(),
             "interrupt should be sent when agent running"
@@ -4330,7 +5545,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_when_idle_does_nothing() {
+    fn esc_when_idle_does_not_send_interrupt() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -4361,7 +5576,7 @@ mod tests {
             &mut popup,
         );
         assert_eq!(result, KeyOutcome::None);
-        assert!(!pending_quit, "idle Esc must not arm process exit");
+        assert!(pending_quit);
         assert!(
             interrupt_rx.try_recv().is_err(),
             "interrupt should NOT be sent when idle"
@@ -4405,7 +5620,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_esc_does_not_quit_from_handle_key() {
+    fn double_esc_quits() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -4452,97 +5667,10 @@ mod tests {
             &mut pending_quit,
             &mut popup,
         );
-        assert_eq!(result, KeyOutcome::None);
+        assert_eq!(result, KeyOutcome::Quit);
     }
 
     // ----- handle_key Submit 分流 tests -----
-
-    #[test]
-    fn submit_multi_segment_absolute_path_sends_to_agent() {
-        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
-        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
-        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
-        let (decision_tx, _decision_rx) =
-            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
-        let is_running = Arc::new(AtomicBool::new(false));
-        let mut history = HistoryState::new();
-        let mut input = InputLine::new();
-        let mut queued = VecDeque::new();
-        let mut pending_quit = false;
-        let mut popup = None;
-        let path = "/Users/name/project explain this";
-
-        input.buffer = path.to_string();
-        input.cursor = input.buffer.len();
-
-        let result = handle_key(
-            make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &input_tx,
-            &interrupt_tx,
-            &control_tx,
-            &decision_tx,
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-        );
-
-        assert_eq!(result, KeyOutcome::Submit(path.to_string()));
-        assert_eq!(input_rx.try_recv().unwrap(), path);
-        assert!(matches!(
-            history.cells.as_slice(),
-            [HistoryCell::UserMessage { text }] if text == path
-        ));
-    }
-
-    #[test]
-    fn submit_single_segment_absolute_path_shows_unknown_command() {
-        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
-        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
-        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
-        let (decision_tx, _decision_rx) =
-            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
-        let is_running = Arc::new(AtomicBool::new(false));
-        let mut history = HistoryState::new();
-        let mut input = InputLine::new();
-        let mut queued = VecDeque::new();
-        let mut pending_quit = false;
-        let mut popup = None;
-
-        input.buffer = "/tmp".to_string();
-        input.cursor = input.buffer.len();
-
-        let result = handle_key(
-            make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &input_tx,
-            &interrupt_tx,
-            &control_tx,
-            &decision_tx,
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-        );
-
-        assert_eq!(result, KeyOutcome::None);
-        assert!(input_rx.try_recv().is_err());
-        assert!(matches!(
-            history.cells.as_slice(),
-            [HistoryCell::Separator { label: Some(label) }] if label == "未知命令: /tmp"
-        ));
-    }
 
     #[test]
     fn submit_while_running_goes_to_queue_not_history() {
@@ -4778,7 +5906,7 @@ mod tests {
     #[test]
     fn mouse_scroll_up_in_history_increases_offset() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = RuntimePopup::None;
+        let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         // Fill enough lines so scrolling is meaningful.
         for _ in 0..50 {
@@ -4800,8 +5928,6 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
-            &[],
-            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -4816,8 +5942,6 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
-            &[],
-            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(hist.scroll_offset, 6, "second ScrollUp should accumulate");
@@ -4826,7 +5950,7 @@ mod tests {
     #[test]
     fn mouse_scroll_uses_reserved_text_width_for_its_max_offset() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = RuntimePopup::None;
+        let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         // This fits the raw 80-column area (78 chars after the user prefix)
         // but wraps after the scrollbar reserves one column.
@@ -4853,8 +5977,6 @@ mod tests {
                 &mut bash_popup,
                 &mut hist,
                 &registry,
-                &[],
-                &std::collections::HashMap::new(),
                 &mut pending_quit,
             );
         }
@@ -4867,7 +5989,7 @@ mod tests {
     #[test]
     fn mouse_scroll_down_in_history_decreases_offset() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = RuntimePopup::None;
+        let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
             hist.push(
@@ -4889,8 +6011,6 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
-            &[],
-            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -4906,8 +6026,6 @@ mod tests {
                 &mut bash_popup,
                 &mut hist,
                 &registry,
-                &[],
-                &std::collections::HashMap::new(),
                 &mut pending_quit,
             );
         }
@@ -4919,7 +6037,7 @@ mod tests {
     fn mouse_scroll_in_input_region_ignores_history() {
         let (layout, _history_area) = layout_80x24();
         let input_area = layout.chunks[5];
-        let mut bash_popup = RuntimePopup::None;
+        let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
             hist.push(
@@ -4938,8 +6056,6 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
-            &[],
-            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -4952,7 +6068,7 @@ mod tests {
     #[test]
     fn mouse_click_is_ignored() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = RuntimePopup::None;
+        let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
             hist.push(
@@ -4975,8 +6091,6 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
-            &[],
-            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(hist.scroll_offset, 0, "click should not scroll");
@@ -4987,7 +6101,7 @@ mod tests {
     #[test]
     fn mouse_scroll_clears_pending_quit() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = RuntimePopup::None;
+        let mut bash_popup = BashPopup::None;
         let mut hist = HistoryState::new();
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = true;
@@ -4998,8 +6112,6 @@ mod tests {
             &mut bash_popup,
             &mut hist,
             &registry,
-            &[],
-            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert!(!pending_quit, "scrolling history should clear pending_quit");

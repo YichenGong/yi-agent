@@ -12,6 +12,98 @@ use std::time::Duration;
 /// 复杂测试超时上限(秒)。agent 挂起时强制 kill,避免测试无限阻塞。
 const COMPLEX_TIMEOUT: Duration = Duration::from_secs(300);
 
+pub struct RealLlmTestConfig {
+    pub provider: String,
+    pub api_url: String,
+    pub model: String,
+    api_key: String,
+}
+
+impl RealLlmTestConfig {
+    pub fn apply_to_command(&self, command: &mut Command) {
+        command
+            .env("YI_AGENT_PROVIDER", &self.provider)
+            .env("MODEL_API_URL", &self.api_url)
+            .env("YI_AGENT_MODEL", &self.model)
+            .env("MODEL_API_KEY", &self.api_key);
+    }
+}
+
+pub fn resolve_real_llm_test_config() -> Result<Option<RealLlmTestConfig>, String> {
+    let dedicated = [
+        (
+            "YI_AGENT_REAL_LLM_PROVIDER",
+            std::env::var("YI_AGENT_REAL_LLM_PROVIDER").ok(),
+        ),
+        (
+            "YI_AGENT_REAL_LLM_API_URL",
+            std::env::var("YI_AGENT_REAL_LLM_API_URL").ok(),
+        ),
+        (
+            "YI_AGENT_REAL_LLM_MODEL",
+            std::env::var("YI_AGENT_REAL_LLM_MODEL").ok(),
+        ),
+        (
+            "YI_AGENT_REAL_LLM_API_KEY",
+            std::env::var("YI_AGENT_REAL_LLM_API_KEY").ok(),
+        ),
+    ];
+    if let Some(provider) = dedicated[0]
+        .1
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let missing = dedicated
+            .iter()
+            .filter(|(_, value)| value.as_deref().is_none_or(|value| value.trim().is_empty()))
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "incomplete explicit real LLM configuration: missing {}",
+                missing.join(", ")
+            ));
+        }
+        if !matches!(provider, "anthropic" | "openai") {
+            return Err("YI_AGENT_REAL_LLM_PROVIDER must be anthropic or openai".into());
+        }
+        let api_url = dedicated[1].1.clone().unwrap();
+        if !(api_url.starts_with("https://") || api_url.starts_with("http://")) {
+            return Err("YI_AGENT_REAL_LLM_API_URL must be an absolute HTTP(S) URL".into());
+        }
+        return Ok(Some(RealLlmTestConfig {
+            provider: provider.into(),
+            api_url,
+            model: dedicated[2].1.clone().unwrap(),
+            api_key: dedicated[3].1.clone().unwrap(),
+        }));
+    }
+    let (provider, api_key) = if let Some(key) = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        ("anthropic", key)
+    } else if let Some(key) = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        ("openai", key)
+    } else {
+        return Ok(None);
+    };
+    let (api_url, model) = if provider == "anthropic" {
+        ("https://api.anthropic.com", "claude-sonnet-4-20250514")
+    } else {
+        ("https://api.openai.com", "gpt-4o")
+    };
+    Ok(Some(RealLlmTestConfig {
+        provider: provider.into(),
+        api_url: api_url.into(),
+        model: model.into(),
+        api_key,
+    }))
+}
+
 /// Path to the compiled yi-agent binary.
 pub fn yi_agent_bin() -> PathBuf {
     option_env!("CARGO_BIN_EXE_yi-agent")
