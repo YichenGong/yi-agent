@@ -390,6 +390,39 @@ mod tests {
     }
 
     #[test]
+    fn compacted_tool_history_preserves_openai_roles_and_pairing() {
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![
+                Message::user("[用户消息]\nfix the test"),
+                Message::assistant(vec![
+                    ContentBlock::Text("[对话摘要]\nprevious work".into()),
+                    ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path":"src/lib.rs"}),
+                    },
+                ]),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: vec![ContentBlock::Text("contents".into())],
+                    is_error: false,
+                }]),
+            ],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let request: OpenaiRequest = req.into();
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["messages"][1]["role"], "assistant");
+        assert_eq!(json["messages"][2]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(json["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
     fn serializes_request_json_correctly() {
         let req = ProviderRequest {
             model: "gpt-4o".to_string(),
