@@ -731,6 +731,10 @@ mod tests {
 
     #[test]
     fn load_includes_compact_defaults() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
         let cli = Cli {
             command: None,
             provider: None,
@@ -782,6 +786,10 @@ mod tests {
 
     #[test]
     fn load_falls_back_to_default_context_length() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
         let cli = Cli {
             command: None,
             provider: None,
