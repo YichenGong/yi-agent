@@ -121,14 +121,14 @@ Use the existing `TuiApp` event/render pattern; do not add screenshot or termina
 
 ## Ignored real-LLM subagent E2E
 
-Add a focused `#[ignore]` suite, using `RealLlmTestConfig` and `TempDir` isolated Git repositories. Tests use a 300-second deadline and structural assertions only.
+Add a focused `#[ignore]` suite, using `RealLlmTestConfig`, a local daemon IPC client, and `TempDir` isolated Git repositories. Tests use a 300-second deadline and structural assertions only. The real provider controls only the root/child agents' `spawn_agent`, `wait_agent`, and coding behavior. The test harness acts as the authorized human reviewer: it reads the child delivery from the temporary daemon and uses the existing two-step `PreviewReview` then `ConfirmReview` IPC flow. The harness never grants review controls to an LLM tool and never bypasses confirmation tokens.
 
 1. A parent delegates README inspection; terminal child report is non-empty and no repository file changes.
-2. A parent delegates creation of a uniquely marked file in a child worktree. After review and direct-parent acceptance, the file is visible on the parent branch and the accepted delivery commit is an ancestor of parent `HEAD`.
-3. A parent requests rework of a delivery that contains a known incorrect marker. The successor delivery must replace it with the correct marker; after acceptance, parent content contains the correct marker and excludes the incorrect marker.
-4. A parent delegates two independent uniquely marked files concurrently. Each child uses an isolated worktree and produces its own delivery evidence; after accepting both deliveries, both files and their distinct markers are visible on the parent branch without one overwriting the other.
+2. A real child creates a uniquely marked file and committed delivery in its assigned worktree. The harness accepts that delivery through preview/confirmation; the file is visible on the parent branch and the accepted child commit is an ancestor of parent `HEAD`.
+3. A real child creates a delivery containing a known incorrect marker. The harness requests rework through preview/confirmation, waits for the real successor attempt, then accepts the successor through preview/confirmation. Final parent content contains the correct marker and excludes the incorrect marker.
+4. A real parent delegates two independent uniquely marked files concurrently. The harness confirms acceptance of both child deliveries. Both files and their distinct markers are visible on the parent branch without one overwriting the other; each delivery has distinct child worktree/branch and ancestry evidence.
 
-The suite contains four independently named ignored tests, including the existing README smoke test. `just test-real-subagent` runs them serially with `--test-threads=1`; each uses an independent temporary Git repository and a 300-second deadline. Real tests may accept either configured provider. They must not assert exact prose, print secret values, or run in normal `cargo test`/CI execution.
+The suite contains four independently named ignored tests, including the existing README smoke test. `just test-real-subagent` runs them serially with `--test-threads=1`; each creates an independent temporary Git repository, daemon socket, SQLite runtime state, and child worktrees, all removed with its `TempDir`. Real tests may accept either configured provider. They must not assert exact prose, print secret values, or run in normal `cargo test`/CI execution.
 
 ## Recipes, documentation, and verification
 
