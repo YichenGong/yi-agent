@@ -320,7 +320,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         self.recovery_workspace
             .clone()
             .map(|workspace| self.recovery_context_for_workspace(workspace))
-            .unwrap_or_else(WorkerRecoveryContext::default)
+            .unwrap_or_default()
     }
 
     fn recovery_context_for(&self, request: &WorkerStart) -> WorkerRecoveryContext {

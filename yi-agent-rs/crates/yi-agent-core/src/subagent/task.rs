@@ -163,6 +163,10 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    // TaskTransitionError deliberately retains both complete states for durable,
+    // diagnosable reducer failures; boxing would make the public error API less
+    // ergonomic without reducing the copied state stored in the error.
+    #[allow(clippy::result_large_err)]
     pub fn can_transition_to(&self, next: Self) -> Result<(), TaskTransitionError> {
         let legal = matches!(
             (self, &next),
@@ -647,6 +651,8 @@ impl AgentTask {
             .expect("active attempt must be retained in attempt history")
     }
 
+    // Reducer errors preserve complete state-transition evidence for callers.
+    #[allow(clippy::result_large_err)]
     pub fn reduce(
         &mut self,
         event: TaskEvent,
@@ -871,6 +877,8 @@ pub enum TaskReduceError {
     Attempt(#[from] AttemptLifecycleError),
 }
 
+// Reducer errors preserve complete state-transition evidence for callers.
+#[allow(clippy::result_large_err)]
 pub fn reduce(
     task: &mut AgentTask,
     event: TaskEvent,
@@ -1061,6 +1069,8 @@ pub fn reduce(
     Ok(result)
 }
 
+// The reducer error includes the full unexpected state for operator diagnosis.
+#[allow(clippy::result_large_err)]
 fn require_review_delivery(
     task: &AgentTask,
     delivery_id: &DeliveryId,
@@ -1081,6 +1091,8 @@ fn require_review_delivery(
     Ok(())
 }
 
+// The reducer error includes the full unexpected state for operator diagnosis.
+#[allow(clippy::result_large_err)]
 fn transition(
     task: &mut AgentTask,
     next: TaskState,

@@ -1,5 +1,7 @@
 //! TUI-facing subagent runtime attachment model.
 
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -7,6 +9,7 @@ use yi_agent_core::ToolRegistry;
 use yi_agent_core::subagent::worker::WorkerWorkspace;
 
 use crate::subagent_runtime::register_application_subagent_tools;
+#[cfg(test)]
 use crate::tui::slash::SlashCommand;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,12 +49,15 @@ pub enum TuiRuntimeMode {
     Disabled { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RuntimeBootstrapState {
+    #[default]
     Disconnected,
     Prompting,
     Attached(AttachedRoot),
-    Disabled { reason: String },
+    Disabled {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,12 +69,6 @@ pub struct RuntimeStartPrompt {
 #[derive(Debug, Default)]
 pub struct RuntimeBootstrapModel {
     state: RuntimeBootstrapState,
-}
-
-impl Default for RuntimeBootstrapState {
-    fn default() -> Self {
-        Self::Disconnected
-    }
 }
 
 impl RuntimeBootstrapModel {

@@ -85,7 +85,7 @@ pub fn write(
 pub fn write_selected(path: &Path, values: &HashMap<String, String>) -> Result<()> {
     let mut output = String::new();
     let mut entries = values.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(key, _)| *key);
     for (key, value) in entries {
         output.push_str(&format!("{key}={value}\n"));
     }

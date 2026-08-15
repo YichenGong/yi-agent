@@ -403,7 +403,7 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
     };
     let runtime = tokio::runtime::Runtime::new()?;
     let preview = runtime.block_on(
-        schedule_intent::ScheduleIntentParser::new(provider, config.model).preview(&request),
+        schedule_intent::ScheduleIntentParser::new(provider, config.model).preview(request),
     )?;
     if !*confirm {
         println!(
@@ -551,7 +551,7 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
         DaemonAction::Stop => yi_agent_store::ipc::IpcRequest::Stop,
         DaemonAction::Start | DaemonAction::Serve => unreachable!("handled by launcher"),
     };
-    let response = yi_agent_store::ipc::send_request(&runtime, request)
+    let response = yi_agent_store::ipc::send_request(runtime, request)
         .map_err(|error| anyhow::anyhow!("runtime daemon is unavailable: {error}"))?;
     match response {
         yi_agent_store::ipc::IpcResponse::Status {
@@ -1067,6 +1067,7 @@ fn run_headless(
 }
 
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
+#[allow(clippy::too_many_arguments)]
 fn run_tui_agent(
     provider: Arc<dyn Provider>,
     tools: Arc<yi_agent_core::ToolRegistry>,

@@ -1021,6 +1021,7 @@ impl RuntimeRepository {
     /// Stores watchdog facts separately from recovery's tool-state payload.
     /// The upsert lets the daemon persist each meaningful progress or resource
     /// queue transition without creating another attempt.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_attempt_watchdog_snapshot(
         &mut self,
         task: &TaskId,
@@ -1165,6 +1166,7 @@ impl RuntimeRepository {
 
     /// Atomically adds durable worker usage and, for a non-generated progress
     /// point, records the event ID used by the idle watchdog.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_watchdog_progress(
         &mut self,
         task: &TaskId,
@@ -1908,6 +1910,7 @@ impl RuntimeRepository {
 
     /// Persists a rejected delivery and its durable reason without discarding
     /// the reviewed delivery or attempt evidence.
+    #[allow(clippy::too_many_arguments)]
     pub fn reject_delivery_review(
         &mut self,
         task: &TaskId,
@@ -2366,6 +2369,7 @@ impl RuntimeRepository {
 
     /// Enters controlled recovery while releasing process-local leases and
     /// retaining workspace/worktree leases needed for explicit resume.
+    #[allow(clippy::result_large_err)]
     pub fn transition_task_to_recovery_required_releasing_process_leases(
         &mut self,
         task: &TaskId,

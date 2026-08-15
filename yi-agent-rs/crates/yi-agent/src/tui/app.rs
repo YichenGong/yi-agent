@@ -43,6 +43,7 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 /// - `input_tx`: sends user-submitted input strings to the agent driver
 /// - `interrupt_tx`: signals to interrupt the current agent run
 /// - `is_running`: shared flag indicating if agent is currently running
+#[allow(clippy::too_many_arguments)]
 pub fn run_tui(
     mut agent_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::Sender<String>,
@@ -2009,7 +2010,7 @@ fn format_agents_summary(
     }
     let mut output = format!("**{title} ({})**", tasks.len());
     for task in tasks {
-        let root_label = task.is_root.then_some(" **root**").unwrap_or_default();
+        let root_label = if task.is_root { " **root**" } else { "" };
         output.push_str(&format!(
             "\n- `{}`: {}{}",
             task.task_id, task.state, root_label

@@ -620,6 +620,9 @@ impl RuntimeCoordinator {
         Ok(session_id)
     }
 
+    // This synchronous guard serializes the durable idempotency check and root
+    // creation; it intentionally spans awaits to prevent duplicate roots.
+    #[allow(clippy::await_holding_lock)]
     pub async fn attach_application_root(
         &self,
         idempotency_key: &str,

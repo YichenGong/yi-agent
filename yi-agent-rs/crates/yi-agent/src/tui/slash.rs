@@ -160,6 +160,7 @@ impl SlashCommand {
     }
 
     /// Whether the command requires an argument.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn needs_arg(&self) -> bool {
         self.argument_usage().is_some()
     }

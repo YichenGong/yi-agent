@@ -1073,7 +1073,6 @@ impl AgentSupervisor {
 
     /// Authenticates daemon-worker IPC before applying the ordinary adjacency
     /// rules. UI clients never receive this random per-worker capability.
-
     pub fn can_use_worker_capability(
         &self,
         task: &TaskId,

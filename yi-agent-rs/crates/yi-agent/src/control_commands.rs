@@ -37,6 +37,7 @@ pub struct CommandSpec {
 }
 
 impl ControlCommand {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const fn all() -> &'static [Self] {
         &[
             Self::Agents,
@@ -62,6 +63,7 @@ impl ControlCommand {
         ]
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const fn slash_name(self) -> &'static str {
         self.spec().slash_name
     }
