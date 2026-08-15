@@ -1654,7 +1654,10 @@ impl RuntimeRepository {
                    AND tasks.delivery_json = deliveries.payload_json
                    AND tasks.active_attempt_id = deliveries.attempt_id
                    AND attempts.task_id = tasks.id
-                   AND attempts.state = 'awaiting_parent_review'",
+                   AND attempts.state = 'awaiting_parent_review'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews WHERE reviews.delivery_id = deliveries.id
+                   )",
                 params![delivery.to_string(), task.to_string()],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -1758,7 +1761,10 @@ impl RuntimeRepository {
                    AND tasks.state_json = 'awaiting_parent_review'
                    AND tasks.delivery_json = deliveries.payload_json
                    AND attempts.task_id = tasks.id
-                   AND attempts.state = 'awaiting_parent_review'",
+                   AND attempts.state = 'awaiting_parent_review'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews WHERE reviews.delivery_id = deliveries.id
+                   )",
                 params![delivery.to_string(), task.to_string()],
                 |row| {
                     Ok((
@@ -1929,7 +1935,10 @@ impl RuntimeRepository {
                    AND tasks.state_json = 'awaiting_parent_review'
                    AND tasks.delivery_json = deliveries.payload_json
                    AND attempts.task_id = tasks.id
-                   AND attempts.state = 'awaiting_parent_review'",
+                   AND attempts.state = 'awaiting_parent_review'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews WHERE reviews.delivery_id = deliveries.id
+                   )",
                 params![delivery.to_string(), task.to_string()],
                 |row| {
                     Ok((
