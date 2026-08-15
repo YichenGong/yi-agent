@@ -379,7 +379,7 @@
       inputs[key] = input; field.append(labelEl, input); group.appendChild(field);
     }
     const save = document.createElement('button'); save.className = 'save-btn'; save.textContent = 'Save';
-    save.onclick = async () => { const response = await fetch('/api/real-llm-test-config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value])))}); showToast(response.ok ? 'Saved' : (await response.json()).error, !response.ok); if (response.ok) renderRealLlmTestsTab(main); };
+    save.onclick = async () => { const response = await fetch('/api/real-llm-test-config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value])))}); if (response.ok) { inputs.api_key.value = ''; inputs.api_key.placeholder = 'configured; leave blank to retain'; } showToast(response.ok ? 'Saved' : (await response.json()).error, !response.ok); };
     const validate = document.createElement('button'); validate.className = 'toggle-btn'; validate.textContent = 'Validate';
     validate.onclick = async () => { const response = await fetch('/api/real-llm-test-config/validate', {method:'POST'}); showToast(response.ok ? 'Configuration is valid' : (await response.json()).error, !response.ok); };
     const clear = document.createElement('button'); clear.className = 'toggle-btn'; clear.textContent = 'Clear API Key';

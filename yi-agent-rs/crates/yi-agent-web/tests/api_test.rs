@@ -42,6 +42,29 @@ fn test_app_with_global(env_path: PathBuf, global_env_path: Option<PathBuf>) -> 
 }
 
 #[tokio::test]
+async fn real_llm_save_does_not_append_a_second_form() {
+    let app = test_app(TempDir::new().unwrap().path().join("real-tests.env"));
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8(html.to_vec()).unwrap();
+
+    let save_handler = html
+        .lines()
+        .find(|line| line.contains("save.onclick"))
+        .expect("real LLM save handler");
+    assert!(
+        !save_handler.contains("renderRealLlmTestsTab(main)"),
+        "Save must not append another form by rerendering into the existing main element"
+    );
+}
+
+#[tokio::test]
 async fn real_llm_test_config_is_write_only_and_validates_without_network() {
     let tmp = TempDir::new().unwrap();
     let env_path = tmp.path().join("real-tests.env");
