@@ -94,8 +94,12 @@ test-real-complex:
 test-real-subagent:
     #!/usr/bin/env bash
     set -e
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
     if [ -f "$HOME/.yi-agent/.env" ]; then
         set -a; . "$HOME/.yi-agent/.env"; set +a
+    fi
+    if [ -f .env ]; then
+        set -a; . ./.env; set +a
     fi
     cargo test -p yi-agent --test subagent_real_e2e -- --ignored --test-threads=1
 
