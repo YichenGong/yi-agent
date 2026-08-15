@@ -131,11 +131,19 @@ pub static ALL_VARS: &[VarMeta] = &[
         options: &[],
     },
     VarMeta {
-        key: "YI_AGENT_COMPACT_KEEP_TURNS",
-        default: Some("4"),
+        key: "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
+        default: Some("20000"),
         var_type: VarType::Number,
         group: "Agent",
-        description: "Turns retained during compaction",
+        description: "Real user input tokens retained during compaction",
+        options: &[],
+    },
+    VarMeta {
+        key: "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
+        default: Some("12000"),
+        var_type: VarType::Number,
+        group: "Agent",
+        description: "Complete tool interaction tokens retained during compaction",
         options: &[],
     },
     // === Tools ===
@@ -171,8 +179,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_vars_count_is_15() {
-        assert_eq!(ALL_VARS.len(), 15);
+    fn all_vars_count_is_16() {
+        assert_eq!(ALL_VARS.len(), 16);
     }
 
     #[test]

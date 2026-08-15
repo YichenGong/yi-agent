@@ -289,6 +289,39 @@ mod tests {
     }
 
     #[test]
+    fn compacted_tool_history_preserves_anthropic_roles_and_pairing() {
+        let req = ProviderRequest {
+            model: "claude-sonnet-4-5".into(),
+            system: None,
+            messages: vec![
+                Message::user("[用户消息]\nfix the test"),
+                Message::assistant(vec![
+                    ContentBlock::Text("[对话摘要]\nprevious work".into()),
+                    ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path":"src/lib.rs"}),
+                    },
+                ]),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: vec![ContentBlock::Text("contents".into())],
+                    is_error: false,
+                }]),
+            ],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let request: AnthropicRequest = req.into();
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["messages"][1]["role"], "assistant");
+        assert_eq!(json["messages"][2]["role"], "user");
+        assert_eq!(json["messages"][1]["content"][1]["id"], "call_1");
+        assert_eq!(json["messages"][2]["content"][0]["tool_use_id"], "call_1");
+    }
+
+    #[test]
     fn serializes_request_json_correctly() {
         let req = ProviderRequest {
             model: "claude-sonnet-4-5".to_string(),

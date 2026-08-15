@@ -23,6 +23,7 @@ type DecisionRx = Arc<tokio::sync::Mutex<mpsc::Receiver<(u64, crate::permission:
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     messages: Vec<Message>,
+    last_input_tokens: Option<u32>,
 }
 
 impl Session {
@@ -36,6 +37,18 @@ impl Session {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn last_input_tokens(&self) -> Option<u32> {
+        self.last_input_tokens
+    }
+
+    pub fn set_last_input_tokens(&mut self, tokens: Option<u32>) {
+        self.last_input_tokens = tokens;
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
     }
 
     pub fn truncate(&mut self, len: usize) {
@@ -61,8 +74,10 @@ pub struct AgentConfig {
     pub gen_params: GenParams,
     /// Token count threshold to trigger auto-compact.
     pub compact_threshold: Option<u32>,
-    /// Number of recent turns to keep during compact.
-    pub compact_keep_turns: Option<u32>,
+    /// Real user input token budget retained during compact.
+    pub compact_user_budget_tokens: usize,
+    /// Complete raw tool interaction token budget retained during compact.
+    pub compact_tool_budget_tokens: usize,
     /// Max idle time (no provider events) during THINK before the stream is
     /// considered stalled. When elapsed, the agent emits `Done { EndTurn }`
     /// with whatever content was accumulated so far. `None` disables the idle
@@ -78,7 +93,8 @@ impl Default for AgentConfig {
             max_turns: Some(100),
             gen_params: Default::default(),
             compact_threshold: Some(100_000),
-            compact_keep_turns: Some(4),
+            compact_user_budget_tokens: crate::compact::DEFAULT_COMPACT_USER_BUDGET_TOKENS,
+            compact_tool_budget_tokens: crate::compact::DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
             // Default idle timeout: 60s between provider events. This is
             // intentionally generous (LLMs can pause between deltas while
             // thinking) but bounded so a stalled connection eventually
@@ -232,6 +248,8 @@ const COMPLETION_AUDIT_PROMPT: &str =
 pub enum AgentError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
+    #[error("compaction error: {0}")]
+    Compact(#[from] crate::compact::CompactError),
 }
 
 impl Agent {
@@ -345,7 +363,6 @@ async fn run_loop(
     // assistant(tool_use),避免下次 run 被 Anthropic API 拒绝(tool_use
     // 必须跟 tool_result)。
     let session_len = session.lock().unwrap().len();
-    let mut last_input_tokens: Option<u32> = None;
     let mut turn = 0u32;
     let mut verification_pending = false;
     let mut audit_attempted = false;
@@ -364,41 +381,11 @@ async fn run_loop(
             return;
         }
 
-        // auto-compact: 每轮 THINK 前用上次 input_tokens 判断
-        if let (Some(threshold), Some(tokens)) = (
-            config.compact_threshold.filter(|&t| t > 0),
-            last_input_tokens,
-        ) {
-            if tokens >= threshold && messages.len() > 4 {
-                let old_count = messages.len();
-                let keep_turns = config.compact_keep_turns.unwrap_or(4);
-                let session_snapshot = session.lock().unwrap().clone();
-                match crate::compact::compact_session(
-                    &provider,
-                    &config,
-                    &session_snapshot,
-                    keep_turns,
-                )
-                .await
-                {
-                    Ok(new_session) => {
-                        messages = new_session.messages().to_vec();
-                        *session.lock().unwrap() = new_session;
-                        // Reset logging cursor: compact replaced the entire
-                        // message list, so last_logged is now stale.
-                        last_logged = 0;
-                        let _ = tx
-                            .send(AgentEvent::AutoCompacting {
-                                old_msg_count: old_count,
-                                new_msg_count: messages.len(),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "auto-compact failed, will retry next turn");
-                    }
-                }
-            }
+        if let Some(new_messages) = maybe_auto_compact(&tx, &provider, &config, &session).await {
+            messages = new_messages;
+            // Compaction replaced the history, so the incremental request-log
+            // cursor no longer refers to this message vector.
+            last_logged = 0;
         }
 
         turn += 1;
@@ -491,7 +478,12 @@ async fn run_loop(
             }
         };
 
-        last_input_tokens = last_usage.map(|u| u.input_tokens);
+        if let Some(usage) = last_usage {
+            session
+                .lock()
+                .unwrap()
+                .set_last_input_tokens(Some(usage.input_tokens));
+        }
 
         // Log the full accumulated response content at debug level (never repeats across turns).
         debug!(turn, content = ?content, "think: response");
@@ -904,6 +896,44 @@ async fn handle_confirmation(
     }
 }
 
+async fn maybe_auto_compact(
+    tx: &mpsc::Sender<AgentEvent>,
+    provider: &Arc<dyn Provider>,
+    config: &AgentConfig,
+    session: &Arc<Mutex<Session>>,
+) -> Option<Vec<Message>> {
+    let threshold = config
+        .compact_threshold
+        .filter(|threshold| *threshold > 0)?;
+    let snapshot = session.lock().unwrap().clone();
+    if snapshot.last_input_tokens()? < threshold {
+        return None;
+    }
+
+    let old_count = snapshot.len();
+    match crate::compact::compact_session(provider, config, &snapshot).await {
+        Ok(Some(new_session)) if new_session.len() < old_count => {
+            let new_messages = new_session.messages().to_vec();
+            {
+                let mut current = session.lock().unwrap();
+                current.replace_messages(new_messages.clone());
+                current.set_last_input_tokens(None);
+            }
+            let _ = tx
+                .send(AgentEvent::AutoCompacting {
+                    old_msg_count: old_count,
+                    new_msg_count: new_messages.len(),
+                })
+                .await;
+            Some(new_messages)
+        }
+        Ok(Some(_)) | Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(error = %error, "auto-compact failed, will retry next think");
+            None
+        }
+    }
+}
 async fn accumulate_provider_stream(
     stream: BoxStream<'static, ProviderEvent>,
     tx: &mpsc::Sender<AgentEvent>,
@@ -1070,6 +1100,16 @@ mod tests {
 
     fn collect_events(stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
         futures::executor::block_on_stream(stream).collect()
+    }
+
+    #[tokio::test]
+    async fn session_tracks_and_clears_last_input_tokens() {
+        let mut session = Session::new();
+        assert_eq!(session.last_input_tokens(), None);
+        session.set_last_input_tokens(Some(160_000));
+        assert_eq!(session.last_input_tokens(), Some(160_000));
+        session.set_last_input_tokens(None);
+        assert_eq!(session.last_input_tokens(), None);
     }
 
     #[tokio::test]
@@ -1684,7 +1724,8 @@ mod tests {
     fn agent_config_has_compact_fields() {
         let config = AgentConfig::default();
         assert!(config.compact_threshold.is_some());
-        assert!(config.compact_keep_turns.is_some());
+        assert_eq!(config.compact_user_budget_tokens, 20_000);
+        assert_eq!(config.compact_tool_budget_tokens, 12_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2088,7 +2129,8 @@ mod tests {
                 ..Default::default()
             },
             compact_threshold: Some(50_000),
-            compact_keep_turns: Some(2),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             think_idle_timeout: None,
         };
         assert_eq!(config.model, "custom-model");
@@ -2397,6 +2439,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn auto_compact_runs_before_second_user_turn_from_session_usage() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::TextDelta("first answer".into()),
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 200,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("checkpoint".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("second answer".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let config = AgentConfig {
+            compact_threshold: Some(100),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(ToolRegistry::new()), config);
+        let first = agent.run("first request".into()).await.unwrap();
+        let _ = collect_events(first);
+        assert_eq!(agent.session().last_input_tokens(), Some(200));
+        let second = agent.run("second request".into()).await.unwrap();
+        let events = collect_events(second);
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::AutoCompacting { old_msg_count, new_msg_count } if old_msg_count > new_msg_count)));
+        assert_eq!(agent.session().last_input_tokens(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn auto_compact_triggers_when_threshold_exceeded() {
         // Pre-populate session with 4 messages (2 user/assistant pairs) so that
         // after turn 1 the session has 7 messages — enough for compact_session
@@ -2443,7 +2525,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2512,7 +2595,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2577,7 +2661,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: None,
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2642,7 +2727,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(0),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2693,7 +2779,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), config);
@@ -2798,7 +2885,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2831,7 +2919,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn auto_compact_resets_baseline() {
+    async fn auto_compact_success_clears_baseline_before_next_think() {
         // Verify compact → next THINK → compact again works.
         // Scripts:
         // 0: turn 1 — tool_use + Usage(200) + Stop
@@ -2899,7 +2987,8 @@ mod tests {
         tools.register(Arc::new(UpperEchoTool));
         let config = AgentConfig {
             compact_threshold: Some(100),
-            compact_keep_turns: Some(1),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             ..Default::default()
         };
         let mut session = Session::new();
@@ -2922,8 +3011,8 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::AutoCompacting { .. }))
             .count();
         assert_eq!(
-            compact_count, 2,
-            "should emit exactly 2 AutoCompacting events, got {compact_count}"
+            compact_count, 1,
+            "successful compact clears usage until a later provider report; got {compact_count}"
         );
         assert!(matches!(
             events.last(),

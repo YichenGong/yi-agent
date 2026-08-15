@@ -50,12 +50,12 @@ async fn get_config_returns_all_groups() {
     let groups = json["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 3); // Model Provider, Agent, Tools
 
-    // 验证包含所有 15 个变量
+    // 验证包含所有 16 个变量
     let total_vars: usize = groups
         .iter()
         .map(|g| g["vars"].as_array().unwrap().len())
         .sum();
-    assert_eq!(total_vars, 15);
+    assert_eq!(total_vars, 16);
 }
 
 #[tokio::test]

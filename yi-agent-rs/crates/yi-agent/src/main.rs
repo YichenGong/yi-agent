@@ -126,7 +126,8 @@ fn run_agent(cli: Cli) -> Result<()> {
         system_prompt,
         max_turns: Some(config.max_turns),
         compact_threshold: Some(config.compact_threshold),
-        compact_keep_turns: Some(config.compact_keep_turns),
+        compact_user_budget_tokens: config.compact_user_budget_tokens,
+        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
         ..Default::default()
     };
 
@@ -383,6 +384,9 @@ fn run_headless(
         model: config.model.clone(),
         system_prompt: setup.system_prompt,
         max_turns: Some(config.max_turns),
+        compact_threshold: Some(config.compact_threshold),
+        compact_user_budget_tokens: config.compact_user_budget_tokens,
+        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
         ..Default::default()
     };
 
@@ -499,16 +503,14 @@ fn run_tui_agent(
                         ControlCommand::Compact => {
                             let session = agent.session();
                             let old_msg_count = session.messages().len();
-                            let keep_turns = rebuild_config.compact_keep_turns.unwrap_or(4);
                             match yi_agent_core::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
                                 &session,
-                                keep_turns,
                             )
                             .await
                             {
-                                Ok(new_session) => {
+                                Ok(Some(new_session)) => {
                                     let event = manual_compaction_outcome_event(
                                         old_msg_count,
                                         Ok(new_session.messages().len()),
@@ -528,6 +530,14 @@ fn run_tui_agent(
                                         "agent session compacted via /compact"
                                     );
                                     let _ = agent_tx.send(event).await;
+                                }
+                                Ok(None) => {
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Err("没有可压缩的历史".into()),
+                                        ))
+                                        .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
@@ -805,9 +815,9 @@ mod tests {
             }
         ));
         assert!(matches!(
-            manual_compaction_outcome_event(9, Err("request failed".into())),
+            manual_compaction_outcome_event(9, Err("没有可压缩的历史".into())),
             yi_agent_core::AgentEvent::ManualCompactFailed { message }
-                if message == "request failed"
+                if message == "没有可压缩的历史"
         ));
     }
 
@@ -946,7 +956,8 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             system_prompt: None,
             compact_threshold: 160_000,
-            compact_keep_turns: 4,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
             yolo: false,
             sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
             sandbox_writable_roots: Vec::new(),
