@@ -117,6 +117,10 @@ pub enum Command {
         /// 等同于直接对话裸 LLM,无任何附加能力。
         #[arg(long)]
         naked: bool,
+
+        /// Enable local subagent delegation for this headless run.
+        #[arg(long)]
+        subagents: bool,
     },
     /// Start web config UI
     Web {
@@ -1213,6 +1217,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_run_subagents_flag() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "run", "--subagents", "delegate"]);
+        let Some(Command::Run { subagents, .. }) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(subagents);
+    }
+
+    #[test]
+    fn cli_defaults_run_subagents_to_false() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "run", "ordinary"]);
+        let Some(Command::Run { subagents, .. }) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(!subagents);
+    }
+
+    #[test]
     fn cli_parses_run_naked_flag() {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "run", "--naked", "hi"]);
@@ -1222,6 +1246,7 @@ mod tests {
                 json: _,
                 stdin: _,
                 naked,
+                subagents: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(naked, "naked flag should be true");
@@ -1240,6 +1265,7 @@ mod tests {
                 json: _,
                 stdin: _,
                 naked,
+                subagents: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(!naked, "naked flag should default to false");

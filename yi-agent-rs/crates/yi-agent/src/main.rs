@@ -48,9 +48,10 @@ fn main() -> Result<()> {
             json,
             stdin,
             naked,
+            subagents,
         }) => {
             let prompt = prompt.clone();
-            run_headless(cli, prompt, json, stdin, naked)
+            run_headless(cli, prompt, json, stdin, naked, subagents)
         }
         Some(Command::Daemon { action }) => control_daemon(&cli, action),
         Some(Command::Agents { project, all }) => control_agents(project, all),
@@ -969,6 +970,7 @@ fn run_headless(
     json: bool,
     from_stdin: bool,
     naked: bool,
+    _subagents: bool,
 ) -> Result<()> {
     let config = config::load(&cli)?;
 
