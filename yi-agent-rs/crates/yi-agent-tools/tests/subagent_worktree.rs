@@ -432,6 +432,72 @@ fn missing_child_worktree_cannot_be_inspected_or_merged() {
 }
 
 #[test]
+fn accepted_delivery_is_visible_in_parent_history_once() {
+    let (repo, head) = repository();
+    let child_root = TempDir::new().unwrap();
+    let child_path = child_root.path().join("history-child");
+    let service = WorktreeService::new();
+    let child = service
+        .create_child(repo.path(), &head, "child/history", &child_path)
+        .unwrap();
+    git(&child_path, &["config", "user.email", "test@example.com"]);
+    git(&child_path, &["config", "user.name", "Test"]);
+    std::fs::write(child_path.join("accepted.txt"), "accepted\n").unwrap();
+    git(&child_path, &["add", "accepted.txt"]);
+    git(&child_path, &["commit", "-m", "accepted delivery"]);
+    let delivery = service.inspect_delivery(&child).unwrap();
+    let parent_before = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    service
+        .merge_inspected_delivery(repo.path(), &child, &delivery, "accept delivery")
+        .unwrap();
+    let parent_after = git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(parent_after, parent_before);
+    assert_eq!(git(repo.path(), &["show", "HEAD:accepted.txt"]), "accepted");
+    git(
+        repo.path(),
+        &["merge-base", "--is-ancestor", &delivery.head_commit, "HEAD"],
+    );
+    assert!(
+        service
+            .merge_inspected_delivery(repo.path(), &child, &delivery, "accept again")
+            .is_err()
+    );
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), parent_after);
+}
+
+#[test]
+fn unaccepted_delivery_leaves_parent_history_unchanged() {
+    let (repo, head) = repository();
+    let child_root = TempDir::new().unwrap();
+    let child_path = child_root.path().join("unaccepted-child");
+    let service = WorktreeService::new();
+    let child = service
+        .create_child(repo.path(), &head, "child/unaccepted", &child_path)
+        .unwrap();
+    git(&child_path, &["config", "user.email", "test@example.com"]);
+    git(&child_path, &["config", "user.name", "Test"]);
+    std::fs::write(child_path.join("rejected.txt"), "not accepted\n").unwrap();
+    git(&child_path, &["add", "rejected.txt"]);
+    git(&child_path, &["commit", "-m", "unaccepted delivery"]);
+    let delivery = service.inspect_delivery(&child).unwrap();
+    let parent_head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let parent_readme = git(repo.path(), &["show", "HEAD:README.md"]);
+
+    assert!(delivery.clean);
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), parent_head);
+    assert_eq!(git(repo.path(), &["show", "HEAD:README.md"]), parent_readme);
+    assert!(
+        !Command::new("git")
+            .args(["cat-file", "-e", "HEAD:rejected.txt"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
 fn accepted_delivery_cannot_be_merged_twice_and_dirty_cleanup_is_refused() {
     let (repo, head) = repository();
     let service = WorktreeService::new();
