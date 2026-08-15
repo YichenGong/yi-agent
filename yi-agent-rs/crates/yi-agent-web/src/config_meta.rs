@@ -179,8 +179,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_vars_count_is_15() {
-        assert_eq!(ALL_VARS.len(), 15);
+    fn all_vars_count_is_16() {
+        assert_eq!(ALL_VARS.len(), 16);
     }
 
     #[test]
