@@ -119,6 +119,20 @@ Complete the currently unchecked project-management feature with deterministic t
 
 Use the existing `TuiApp` event/render pattern; do not add screenshot or terminal-timing tests.
 
+## Headless opt-in subagent runtime
+
+`yi-agent run` gains an explicit `--subagents` flag. Without the flag, headless runs retain the current builtin-only tool registry and do not start, connect to, attach to, or stop a daemon. With the flag, headless execution uses the same local-runtime lifecycle as the TUI without requiring terminal interaction:
+
+1. resolve the current `YI_AGENT_RUNTIME_DIR` (or normal runtime directory), start an embedded daemon with the production worker factory when none is running, or attach to the existing local daemon;
+2. attach an application root with a unique idempotency key;
+3. rebuild the root registry with ordinary headless tools plus `spawn_agent`, `wait_agent`, and `send_message` bound to that root's daemon capability and socket;
+4. activate the root with the prompt as objective before `Agent::run`;
+5. detach the root after stream drain; stop only the daemon embedded by this invocation, never an already-running daemon.
+
+The CLI flag is an opt-in capability boundary, not a shortcut around review controls. Root and child agents receive no accept, reject, or rework tool. Those decisions remain local-user daemon IPC operations requiring `PreviewReview` then a single-use `ConfirmReview` token.
+
+Deterministic CLI tests prove that the default headless registry lacks subagent tools, `--subagents` attaches a root and registers exactly the three delegation tools, and failure to attach returns a clear error without silently running a non-delegating agent. The real ignored subagent tests use `--subagents` and set a unique `YI_AGENT_RUNTIME_DIR` below their own `TempDir`.
+
 ## Ignored real-LLM subagent E2E
 
 Add a focused `#[ignore]` suite, using `RealLlmTestConfig`, a local daemon IPC client, and `TempDir` isolated Git repositories. Tests use a 300-second deadline and structural assertions only. The real provider controls only the root/child agents' `spawn_agent`, `wait_agent`, and coding behavior. The test harness acts as the authorized human reviewer: it reads the child delivery from the temporary daemon and uses the existing two-step `PreviewReview` then `ConfirmReview` IPC flow. The harness never grants review controls to an LLM tool and never bypasses confirmation tokens.
