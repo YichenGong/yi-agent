@@ -1426,6 +1426,43 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_all_documented_task_controls_and_daemon_controls() {
+        use clap::Parser;
+
+        for argv in [
+            vec!["yi-agent", "agents"],
+            vec!["yi-agent", "agent", "show", "task"],
+            vec!["yi-agent", "agent", "events", "task"],
+            vec!["yi-agent", "agent", "mailbox", "task"],
+            vec!["yi-agent", "agent", "diff", "task"],
+            vec!["yi-agent", "agent", "cancel", "task"],
+            vec!["yi-agent", "agent", "retry", "task"],
+            vec!["yi-agent", "agent", "pause", "task"],
+            vec!["yi-agent", "agent", "resume", "task"],
+            vec!["yi-agent", "agent", "accept", "task"],
+            vec!["yi-agent", "agent", "rework", "task", "feedback"],
+            vec!["yi-agent", "agent", "reject", "task", "reason"],
+            vec!["yi-agent", "daemon", "status"],
+            vec!["yi-agent", "daemon", "stop"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok());
+        }
+    }
+
+    #[test]
+    fn cli_rejects_missing_required_task_control_arguments() {
+        use clap::Parser;
+
+        for argv in [
+            vec!["yi-agent", "agent", "cancel"],
+            vec!["yi-agent", "agent", "rework", "task"],
+            vec!["yi-agent", "agent", "reject", "task"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
     fn cli_parses_documented_agent_control_grammar() {
         use clap::Parser;
 

@@ -7,7 +7,7 @@ pub mod env_file;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 
 /// 启动 Web 配置服务器。
 pub async fn serve(
@@ -32,6 +32,18 @@ pub async fn serve(
     let app = axum::Router::new()
         .route("/", get(api::index_html))
         .route("/api/config", get(api::get_config).put(api::put_config))
+        .route(
+            "/api/real-llm-test-config",
+            get(api::get_real_llm_test_config).put(api::put_real_llm_test_config),
+        )
+        .route(
+            "/api/real-llm-test-config/validate",
+            post(api::validate_real_llm_test_config),
+        )
+        .route(
+            "/api/real-llm-test-config/api-key",
+            delete(api::clear_real_llm_test_key),
+        )
         .with_state(state);
 
     let addr = format!("{host}:{port}");

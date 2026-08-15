@@ -8,6 +8,20 @@ use axum::response::{Html, IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+#[derive(Deserialize)]
+pub struct RealLlmTestConfigRequest {
+    pub provider: String,
+    pub api_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+#[derive(Deserialize)]
+pub struct ClearRealLlmTestKeyRequest {
+    pub confirm: bool,
+}
+
 use crate::config_meta::{ALL_VARS, VarType, groups};
 use crate::env_file;
 
@@ -21,6 +35,142 @@ pub struct AppState {
 /// GET / — 返回内嵌 HTML 页面
 pub async fn index_html() -> Html<&'static str> {
     Html(include_str!("assets/index.html"))
+}
+
+pub async fn get_real_llm_test_config(State(state): State<AppState>) -> impl IntoResponse {
+    let values = env_file::read(&state.env_path).unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "provider": values.get("YI_AGENT_REAL_LLM_PROVIDER").cloned().unwrap_or_default(),
+            "api_url": values.get("YI_AGENT_REAL_LLM_API_URL").cloned().unwrap_or_default(),
+            "model": values.get("YI_AGENT_REAL_LLM_MODEL").cloned().unwrap_or_default(),
+            "api_key_configured": values.get("YI_AGENT_REAL_LLM_API_KEY").is_some_and(|key| !key.trim().is_empty()),
+        })),
+    )
+}
+
+pub async fn put_real_llm_test_config(
+    State(state): State<AppState>,
+    Json(request): Json<RealLlmTestConfigRequest>,
+) -> impl IntoResponse {
+    let mut values = match env_file::read(&state.env_path) {
+        Ok(values) => values,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"cannot read real test configuration"})),
+            );
+        }
+    };
+    let key_present = !request.api_key.trim().is_empty()
+        || values
+            .get("YI_AGENT_REAL_LLM_API_KEY")
+            .is_some_and(|key| !key.trim().is_empty());
+    if let Err(error) = validate_real_config(
+        &request.provider,
+        &request.api_url,
+        &request.model,
+        key_present,
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": error})));
+    }
+    values.insert("YI_AGENT_REAL_LLM_PROVIDER".into(), request.provider);
+    values.insert("YI_AGENT_REAL_LLM_API_URL".into(), request.api_url);
+    values.insert("YI_AGENT_REAL_LLM_MODEL".into(), request.model);
+    if !request.api_key.trim().is_empty() {
+        values.insert("YI_AGENT_REAL_LLM_API_KEY".into(), request.api_key);
+    }
+    match env_file::write_selected(&state.env_path, &values) {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok":true}))),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"cannot write real test configuration"})),
+        ),
+    }
+}
+
+pub async fn validate_real_llm_test_config(State(state): State<AppState>) -> impl IntoResponse {
+    let values = match env_file::read(&state.env_path) {
+        Ok(values) => values,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"cannot read real test configuration"})),
+            );
+        }
+    };
+    let result = validate_real_config(
+        values
+            .get("YI_AGENT_REAL_LLM_PROVIDER")
+            .map(String::as_str)
+            .unwrap_or(""),
+        values
+            .get("YI_AGENT_REAL_LLM_API_URL")
+            .map(String::as_str)
+            .unwrap_or(""),
+        values
+            .get("YI_AGENT_REAL_LLM_MODEL")
+            .map(String::as_str)
+            .unwrap_or(""),
+        values
+            .get("YI_AGENT_REAL_LLM_API_KEY")
+            .is_some_and(|key| !key.trim().is_empty()),
+    );
+    match result {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok":true}))),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))),
+    }
+}
+
+pub async fn clear_real_llm_test_key(
+    State(state): State<AppState>,
+    Json(request): Json<ClearRealLlmTestKeyRequest>,
+) -> impl IntoResponse {
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"clear confirmation is required"})),
+        );
+    }
+    let mut values = match env_file::read(&state.env_path) {
+        Ok(values) => values,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"cannot read real test configuration"})),
+            );
+        }
+    };
+    values.remove("YI_AGENT_REAL_LLM_API_KEY");
+    match env_file::write_selected(&state.env_path, &values) {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok":true}))),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"cannot write real test configuration"})),
+        ),
+    }
+}
+
+fn validate_real_config(
+    provider: &str,
+    api_url: &str,
+    model: &str,
+    key_present: bool,
+) -> Result<(), String> {
+    if !matches!(provider, "anthropic" | "openai") {
+        return Err("provider must be anthropic or openai".into());
+    }
+    if !(api_url.starts_with("https://") || api_url.starts_with("http://")) {
+        return Err("API URL must be an absolute HTTP(S) URL".into());
+    }
+    if model.trim().is_empty() {
+        return Err("model is required".into());
+    }
+    if !key_present {
+        return Err("API key is required".into());
+    }
+    Ok(())
 }
 
 /// GET /api/config — 返回所有变量元数据 + 合并后的值(local 覆盖 global)

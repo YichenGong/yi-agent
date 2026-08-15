@@ -332,7 +332,7 @@
   function renderSidebar() {
     const sidebar = document.getElementById('sidebar');
     sidebar.innerHTML = '';
-    const tabs = ['Model Provider', 'Agent', 'Tools'];
+    const tabs = ['Model Provider', 'Agent', 'Tools', 'Real LLM Tests'];
     for (const tab of tabs) {
       const btn = document.createElement('button');
       btn.className = 'tab' + (tab === activeTab ? ' active' : '');
@@ -352,9 +352,39 @@
 
     if (activeTab === 'Model Provider') {
       renderModelProviderTab(main);
+    } else if (activeTab === 'Real LLM Tests') {
+      renderRealLlmTestsTab(main);
     } else {
       renderFlatTab(main, activeTab);
     }
+  }
+
+  async function renderRealLlmTestsTab(main) {
+    const response = await fetch('/api/real-llm-test-config');
+    const config = await response.json();
+    const group = document.createElement('div');
+    group.className = 'group';
+    group.innerHTML = '<h2>Real LLM Tests</h2><p class="desc">Saved regression credentials only. This page never runs a test or sends an LLM request.</p>';
+    const fields = [
+      ['provider', 'Provider', 'select'], ['api_url', 'API URL', 'text'],
+      ['model', 'Model', 'text'], ['api_key', 'API Key', 'password']
+    ];
+    const inputs = {};
+    for (const [key, label, type] of fields) {
+      const field = document.createElement('div'); field.className = 'field';
+      const labelEl = document.createElement('label'); labelEl.textContent = label;
+      const input = document.createElement(type === 'select' ? 'select' : 'input');
+      if (type === 'select') { for (const option of ['anthropic', 'openai']) { const el = document.createElement('option'); el.value = option; el.textContent = option; if (option === config.provider) el.selected = true; input.appendChild(el); } }
+      else { input.type = type; input.value = key === 'api_key' ? '' : (config[key] || ''); if (key === 'api_key') input.placeholder = config.api_key_configured ? 'configured; leave blank to retain' : 'required'; }
+      inputs[key] = input; field.append(labelEl, input); group.appendChild(field);
+    }
+    const save = document.createElement('button'); save.className = 'save-btn'; save.textContent = 'Save';
+    save.onclick = async () => { const response = await fetch('/api/real-llm-test-config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value])))}); showToast(response.ok ? 'Saved' : (await response.json()).error, !response.ok); if (response.ok) renderRealLlmTestsTab(main); };
+    const validate = document.createElement('button'); validate.className = 'toggle-btn'; validate.textContent = 'Validate';
+    validate.onclick = async () => { const response = await fetch('/api/real-llm-test-config/validate', {method:'POST'}); showToast(response.ok ? 'Configuration is valid' : (await response.json()).error, !response.ok); };
+    const clear = document.createElement('button'); clear.className = 'toggle-btn'; clear.textContent = 'Clear API Key';
+    clear.onclick = async () => { if (!confirm('Clear the saved real-test API key?')) return; const response = await fetch('/api/real-llm-test-config/api-key', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})}); showToast(response.ok ? 'API key cleared' : (await response.json()).error, !response.ok); if (response.ok) renderRealLlmTestsTab(main); };
+    const actions = document.createElement('div'); actions.className = 'actions'; actions.append(save, validate, clear); group.appendChild(actions); main.appendChild(group);
   }
 
   function renderModelProviderTab(main) {
