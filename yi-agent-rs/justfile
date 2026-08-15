@@ -90,8 +90,17 @@ test-real-complex:
     fi
     cargo test -p yi-agent --test e2e_complex -- --ignored --test-threads=1
 
+# 跑 subagent 真实 LLM 回归测试（忽略态；缺少任何 key 时成功 skip）
+test-real-subagent:
+    #!/usr/bin/env bash
+    set -e
+    if [ -f "$HOME/.yi-agent/.env" ]; then
+        set -a; . "$HOME/.yi-agent/.env"; set +a
+    fi
+    cargo test -p yi-agent --test subagent_real_e2e -- --ignored --test-threads=1
+
 # 跑所有真实 LLM 测试(Tier 1 + 2 + 3)
-test-real-all: test-real-llm test-real-e2e test-real-complex
+test-real-all: test-real-llm test-real-e2e test-real-complex test-real-subagent
     @echo "All real LLM tests passed"
 
 # === Release ===
