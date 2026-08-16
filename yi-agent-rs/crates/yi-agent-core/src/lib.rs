@@ -22,7 +22,9 @@ pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
     StopReason, TokenUsage,
 };
-pub use subagent::task::{AttemptId, RootSessionId, TaskDepth, TaskId, TaskState};
+pub use subagent::task::{
+    AgentTask, AttemptId, RootSessionId, TaskDepth, TaskEvent, TaskId, TaskState,
+};
 pub use tool::{
     OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,
 };

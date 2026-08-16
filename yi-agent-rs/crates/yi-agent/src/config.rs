@@ -179,7 +179,7 @@ pub enum ScheduleAction {
     },
 }
 
-#[derive(clap::Subcommand, Debug, PartialEq, Eq)]
+#[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
     Show {
         task_id: String,
@@ -344,6 +344,27 @@ pub fn is_workdir_explicit(cli: &Cli) -> bool {
             .is_some()
 }
 
+/// Resolve the effective workdir without loading provider configuration.
+///
+/// Priority is CLI `--workdir`, non-empty `YI_AGENT_WORKDIR`, then the current directory.
+pub fn resolve_workdir(cli: &Cli) -> Result<PathBuf> {
+    let workdir = cli
+        .workdir
+        .clone()
+        .or_else(|| {
+            std::env::var("YI_AGENT_WORKDIR")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    if !workdir.is_dir() {
+        bail!("working directory does not exist: {}", workdir.display());
+    }
+    Ok(workdir)
+}
+
 /// 从 CLI 参数 + 环境变量加载配置。
 ///
 /// 优先级：CLI 参数 > 环境变量 > 默认值。
@@ -403,21 +424,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
         })
         .unwrap_or(20);
 
-    let workdir = cli
-        .workdir
-        .clone()
-        .or_else(|| {
-            std::env::var("YI_AGENT_WORKDIR")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    // 验证工作目录存在
-    if !Path::new(&workdir).is_dir() {
-        bail!("working directory does not exist: {}", workdir.display());
-    }
+    let workdir = resolve_workdir(cli)?;
 
     let system_prompt = cli
         .system_prompt
@@ -522,6 +529,7 @@ pub fn load(cli: &Cli) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
@@ -651,6 +659,42 @@ mod tests {
         unsafe {
             std::env::remove_var("YI_AGENT_TEST_GUARD");
         }
+    }
+
+    #[test]
+    fn resolve_workdir_prefers_cli_value() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "--workdir",
+            temp.path().to_str().expect("UTF-8 temporary path"),
+            "daemon",
+            "status",
+        ]);
+
+        assert_eq!(
+            resolve_workdir(&cli).expect("resolve CLI workdir"),
+            temp.path()
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_uses_nonempty_environment_value() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
+        env.set(
+            "YI_AGENT_WORKDIR",
+            temp.path().to_str().expect("UTF-8 temporary path"),
+        );
+        let cli = Cli::parse_from(["yi-agent", "daemon", "status"]);
+
+        assert_eq!(
+            resolve_workdir(&cli).expect("resolve environment workdir"),
+            temp.path()
+        );
     }
 
     #[test]
