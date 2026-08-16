@@ -872,6 +872,15 @@ fn run_agent(cli: Cli) -> Result<()> {
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
+    let process_manager = yi_agent_tools::ProcessManager::with_sandbox(
+        config.workdir.clone(),
+        yi_agent_tools::SandboxPolicy::new(
+            config.sandbox,
+            &config.workdir,
+            config.sandbox_writable_roots.clone(),
+        ),
+    );
+    yi_agent_tools::register_process_tools(&mut registry, process_manager.clone());
 
     let tools = Arc::new(registry);
 
@@ -896,6 +905,7 @@ fn run_agent(cli: Cli) -> Result<()> {
         cli,
         config,
         base_registry,
+        process_manager,
     )
 }
 
@@ -1206,6 +1216,7 @@ fn run_tui_agent(
     cli: Cli,
     config: config::Config,
     base_registry: yi_agent_core::ToolRegistry,
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -1488,6 +1499,7 @@ fn run_tui_agent(
                     body: "启动后可以直接用自然语言创建和管理子 Agent。按 y 启动，按 n 跳过。".into(),
                 }),
                 Some(runtime_choice_tx),
+                process_manager,
             )
         });
 
