@@ -833,17 +833,14 @@ fn handle_key(
     // Global keys first
     match key.code {
         KeyCode::Esc => {
-            if *pending_quit {
-                return KeyOutcome::Quit;
-            }
-            // If popup is active, Esc dismisses it (without setting pending_quit)
+            // Popup dismissal takes precedence over cancelling an agent turn.
             if popup.is_some() {
                 *popup = None;
                 return KeyOutcome::None;
             }
-            *pending_quit = true;
             if is_running.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = interrupt_tx.blocking_send(());
+                // Cancellation is idempotent; coalesce repeated Esc presses.
+                let _ = interrupt_tx.try_send(());
             }
             return KeyOutcome::None;
         }
@@ -2055,7 +2052,7 @@ fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> P
     if pending_quit {
         return Paragraph::new(Line::from(vec![
             prefix,
-            Span::styled("再按 Ctrl+C 或 Esc 退出", Style::new().fg(Color::Yellow)),
+            Span::styled("再按 Ctrl+C 退出", Style::new().fg(Color::Yellow)),
         ]))
         .style(Style::new().bg(Color::Indexed(240)));
     }
@@ -3995,9 +3992,9 @@ mod tests {
         );
     }
 
-    /// Test that Esc behaves the same as Ctrl+C (confirm first, quit on second).
+    /// Repeated Esc must not terminate the loop; Ctrl+Q is the explicit terminator.
     #[test]
-    fn esc_same_as_ctrl_c() {
+    fn repeated_esc_does_not_quit() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
@@ -4008,8 +4005,10 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // First Esc alone should not quit
+        // ScriptedEvents pops from the end, so this yields Esc, Esc, x, Ctrl+Q.
         let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         ]));
@@ -4027,8 +4026,15 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "two Esc should quit cleanly, got: {:?}",
+            "Ctrl+Q should terminate the TUI cleanly, got: {:?}",
             result
+        );
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
+        assert!(
+            row_text.contains('x'),
+            "the key after repeated Esc must be processed, got: {row_text:?}"
         );
     }
 
@@ -5506,7 +5512,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_when_running_sends_interrupt() {
+    fn esc_interrupts_active_agent_without_arming_quit() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -5537,7 +5543,7 @@ mod tests {
             &mut popup,
         );
         assert_eq!(result, KeyOutcome::None);
-        assert!(pending_quit);
+        assert!(!pending_quit, "Esc must not arm process exit");
         assert!(
             interrupt_rx.try_recv().is_ok(),
             "interrupt should be sent when agent running"
@@ -5545,7 +5551,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_when_idle_does_not_send_interrupt() {
+    fn esc_when_idle_does_nothing() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -5576,7 +5582,7 @@ mod tests {
             &mut popup,
         );
         assert_eq!(result, KeyOutcome::None);
-        assert!(pending_quit);
+        assert!(!pending_quit, "idle Esc must not arm process exit");
         assert!(
             interrupt_rx.try_recv().is_err(),
             "interrupt should NOT be sent when idle"
@@ -5620,7 +5626,7 @@ mod tests {
     }
 
     #[test]
-    fn double_esc_quits() {
+    fn repeated_esc_does_not_quit_from_handle_key() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -5667,7 +5673,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
         );
-        assert_eq!(result, KeyOutcome::Quit);
+        assert_eq!(result, KeyOutcome::None);
     }
 
     // ----- handle_key Submit 分流 tests -----
