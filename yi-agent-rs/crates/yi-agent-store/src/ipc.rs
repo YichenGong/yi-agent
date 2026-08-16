@@ -140,6 +140,7 @@ pub enum IpcRequest {
     CreateSession,
     AttachApplicationRoot {
         idempotency_key: String,
+        workspace: PathBuf,
     },
     ActivateApplicationRoot {
         session_id: String,
@@ -2054,12 +2055,15 @@ fn respond(
                 root_task_id: root_task_id.to_string(),
             })
         }
-        IpcRequest::AttachApplicationRoot { idempotency_key } => {
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key,
+            workspace,
+        } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let attached =
-                runtime.block_on(coordinator.attach_application_root(&idempotency_key))?;
+            let attached = runtime
+                .block_on(coordinator.attach_application_root(&idempotency_key, &workspace))?;
             Ok(IpcResponse::ApplicationRootAttached {
                 session_id: attached.session_id.to_string(),
                 root_task_id: attached.root_task_id.to_string(),

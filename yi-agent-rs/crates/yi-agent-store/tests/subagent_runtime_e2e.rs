@@ -395,6 +395,7 @@ fn active_runtime() -> (
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "runtime-e2e-active".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -463,6 +464,7 @@ fn delivery_review_survives_restart_without_restarting_worker() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "runtime-e2e-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
