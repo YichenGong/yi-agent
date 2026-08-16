@@ -152,12 +152,14 @@ pub fn format_thousands(n: u64) -> String {
 /// Render the status bar as a single `Line`.
 ///
 /// Layout (left to right):
-///   `● <tool> <elapsed>`  (only when tasks running)
+///   `● <tool> <elapsed>`  (only when foreground tasks are running)
+///   `N proc running`  (only when managed background processes are active)
 ///   `prefill <n>  decode <m>`
 ///   `<model>`
 pub fn render_statusbar<'a>(
     state: &'a StatusBarState,
     tasks: &'a RunningTaskRegistry,
+    active_process_count: usize,
     model: &'a str,
 ) -> Line<'a> {
     let mut spans: Vec<Span<'a>> = Vec::new();
@@ -184,6 +186,10 @@ pub fn render_statusbar<'a>(
         spans.push(dot);
         spans.push(Span::raw(label));
         spans.push(Span::raw("  "));
+    }
+
+    if active_process_count > 0 {
+        spans.push(Span::raw(format!("{active_process_count} proc running  ")));
     }
 
     spans.push(Span::raw("prefill "));
@@ -273,7 +279,7 @@ mod tests {
     fn test_render_statusbar_empty_state() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, "claude-opus-4");
+        let line = render_statusbar(&state, &tasks, 0, "claude-opus-4");
         let text: String = line
             .spans
             .iter()
@@ -291,7 +297,7 @@ mod tests {
         let mut tasks = RunningTaskRegistry::new();
         tasks.on_tool_call("t1", "bash", "ls", 120);
         let state = StatusBarState::default();
-        let line = render_statusbar(&state, &tasks, "model");
+        let line = render_statusbar(&state, &tasks, 0, "model");
         let text: String = line
             .spans
             .iter()
@@ -299,6 +305,63 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("●"), "should show running dot: {text}");
         assert!(text.contains("bash"), "should show tool name: {text}");
+    }
+
+    #[test]
+    fn test_render_statusbar_omits_inactive_managed_processes() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::new();
+        let line = render_statusbar(&state, &tasks, 0, "model");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            !text.contains("proc running"),
+            "zero count must be omitted: {text}"
+        );
+    }
+
+    #[test]
+    fn test_render_statusbar_shows_managed_process_count_without_duration() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::new();
+        let line = render_statusbar(&state, &tasks, 2, "model");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("2 proc running"),
+            "count should be rendered: {text}"
+        );
+        assert!(
+            !text.contains("proc running 0."),
+            "process field must not include time: {text}"
+        );
+    }
+
+    #[test]
+    fn test_render_statusbar_shows_bash_and_managed_processes_together() {
+        let mut tasks = RunningTaskRegistry::new();
+        tasks.on_tool_call("bash-1", "bash", "sleep 10", 120);
+        let state = StatusBarState::default();
+        let line = render_statusbar(&state, &tasks, 1, "model");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("● bash"),
+            "bash indicator should remain: {text}"
+        );
+        assert!(
+            text.contains("1 proc running"),
+            "process count should render: {text}"
+        );
     }
 
     #[test]

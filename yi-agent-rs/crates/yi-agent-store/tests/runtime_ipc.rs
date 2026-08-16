@@ -156,6 +156,72 @@ impl AgentWorkerFactory for ReportingWorkerFactory {
 #[derive(Clone, Default)]
 struct StaticWorkspaceService;
 
+#[derive(Clone)]
+struct ProjectWorkspaceService {
+    repository_root: PathBuf,
+}
+
+impl AgentWorkspaceService for ProjectWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path: self
+                .repository_root
+                .join(".worktrees")
+                .join(task_id.to_string()),
+            branch: format!("feat/{task_id}"),
+            parent_branch: "main".into(),
+            base_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+        })
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        self.prepare_root(root_session_id, task_id, attempt_id)
+    }
+}
+
+#[derive(Clone, Default)]
+struct ProjectWorkspaceFactory;
+
+impl AgentWorkerFactory for ProjectWorkspaceFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn workspace_service_for_application_root(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+        Some(Arc::new(ProjectWorkspaceService {
+            repository_root: workspace.to_path_buf(),
+        }))
+    }
+
+    fn application_root_workspace_matches(
+        &self,
+        workspace: &std::path::Path,
+        recorded: &WorkerWorkspace,
+    ) -> bool {
+        workspace == recorded.repository_root
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+    }
+}
+
 impl AgentWorkspaceService for StaticWorkspaceService {
     fn prepare_root(
         &self,
@@ -309,6 +375,130 @@ fn v6_database_migrates_to_workspace_and_attachment_tables() {
 }
 
 #[test]
+fn application_roots_use_their_attaching_project_workspace() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ProjectWorkspaceFactory),
+    )
+    .unwrap();
+    let project_a = directory.path().join("project-a");
+    let project_b = directory.path().join("project-b");
+
+    let IpcResponse::ApplicationRootAttached {
+        workspace: first_workspace,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "project-a".into(),
+            workspace: project_a.clone(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected project A attachment");
+    };
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace: second_workspace,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "project-b".into(),
+            workspace: project_b.clone(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected project B attachment");
+    };
+    let IpcResponse::ApplicationRootActivated = send_request(
+        daemon.socket_path(),
+        IpcRequest::ActivateApplicationRoot {
+            session_id: session_id.clone(),
+            root_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "work on project B".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected project B activation");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "inspect project B".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected project B child");
+    };
+    let child_task_id: TaskId = child_task_id.parse().unwrap();
+    let child_workspace = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_workspace(&child_task_id)
+        .unwrap();
+
+    assert_eq!(first_workspace.repository_root, project_a);
+    assert_eq!(second_workspace.repository_root, project_b);
+    assert_eq!(child_workspace.repository_root, project_b);
+}
+
+#[test]
+fn application_root_reattach_rejects_a_different_project_workspace() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ProjectWorkspaceFactory),
+    )
+    .unwrap();
+    let project_a = directory.path().join("project-a");
+    let project_b = directory.path().join("project-b");
+
+    let attached = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "same-client".into(),
+            workspace: project_a,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        attached,
+        IpcResponse::ApplicationRootAttached { .. }
+    ));
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::AttachApplicationRoot {
+                idempotency_key: "same-client".into(),
+                workspace: project_b,
+            },
+        )
+        .unwrap(),
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::InvalidState,
+            message: Some(
+                "application root workspace does not match its recorded repository".into(),
+            ),
+        }
+    );
+}
+
+#[test]
 fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -318,6 +508,7 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-start-1".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap();
@@ -325,6 +516,7 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-start-1".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap();
@@ -369,6 +561,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-a".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -382,6 +575,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-b".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -418,6 +612,7 @@ fn application_root_capability_is_not_derived_from_idempotency_key() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-random-capability".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -456,6 +651,7 @@ fn concurrent_application_root_attach_reuses_one_durable_root() {
                     &socket,
                     IpcRequest::AttachApplicationRoot {
                         idempotency_key: "tui-concurrent".into(),
+                        workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
                     },
                 )
                 .unwrap()
@@ -515,6 +711,7 @@ fn application_root_activate_marks_the_foreground_root_running_without_starting_
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-activate".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -559,6 +756,7 @@ fn concurrent_application_root_activation_records_one_first_objective() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-concurrent-activate".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -632,6 +830,7 @@ fn application_root_activation_keeps_the_first_objective() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-first-objective".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -689,6 +888,7 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-detach".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -751,6 +951,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-send".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -811,6 +1012,7 @@ fn application_root_can_spawn_multiple_direct_children() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-multiple-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -857,6 +1059,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-second-spawn-while-running".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -922,6 +1125,7 @@ fn application_root_rejects_more_than_four_direct_children() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-direct-child-limit".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -980,6 +1184,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-terminal-slot-reuse".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -1047,6 +1252,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-paused-reattach".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -1087,6 +1293,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-paused-reattach".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -1146,6 +1353,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-reattach".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -1174,6 +1382,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-reattach".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -1219,6 +1428,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
             daemon.socket_path(),
             IpcRequest::AttachApplicationRoot {
                 idempotency_key: "tui-restart".into(),
+                workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             },
         )
         .unwrap();
@@ -1242,6 +1452,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2424,6 +2635,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2501,6 +2713,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-timeout".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2562,6 +2775,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-partial-timeout".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2645,6 +2859,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-any-terminal-only".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2728,6 +2943,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-completed-wake".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2800,6 +3016,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-timeout-auth".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2856,6 +3073,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-concurrent-client".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2928,6 +3146,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-report-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -2977,6 +3196,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
         restarted.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-report-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -3031,6 +3251,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-report".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()
@@ -3111,6 +3332,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
         daemon.socket_path(),
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-worker-wait".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
         },
     )
     .unwrap()

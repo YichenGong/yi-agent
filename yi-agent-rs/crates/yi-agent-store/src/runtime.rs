@@ -135,6 +135,9 @@ pub struct RuntimeCoordinator {
     repository: Arc<Mutex<RuntimeRepository>>,
     factory: Arc<dyn AgentWorkerFactory>,
     workspace_service: Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>>,
+    application_root_workspace_services: Mutex<
+        HashMap<RootSessionId, Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>>,
+    >,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
     resident_tasks: Mutex<HashSet<TaskId>>,
     resident_leases: Mutex<HashMap<TaskId, LeaseId>>,
@@ -569,6 +572,7 @@ impl RuntimeCoordinator {
             repository,
             factory,
             workspace_service,
+            application_root_workspace_services: Mutex::new(HashMap::new()),
             supervisors: Mutex::new(supervisors),
             resident_tasks: Mutex::new(HashSet::new()),
             resident_leases: Mutex::new(HashMap::new()),
@@ -626,6 +630,7 @@ impl RuntimeCoordinator {
     pub async fn attach_application_root(
         &self,
         idempotency_key: &str,
+        requested_workspace: &Path,
     ) -> Result<AttachedApplicationRoot, RuntimeCoordinatorError> {
         let _attach_guard = self
             .application_root_attach_lock
@@ -637,6 +642,14 @@ impl RuntimeCoordinator {
                 "application root idempotency key is required".into(),
             ));
         }
+        let service = self
+            .factory
+            .workspace_service_for_application_root(requested_workspace)
+            .ok_or_else(|| {
+                RuntimeCoordinatorError::Supervisor(
+                    "application root workspace service is unavailable".into(),
+                )
+            })?;
         let existing = {
             self.repository
                 .lock()
@@ -644,19 +657,31 @@ impl RuntimeCoordinator {
                 .application_root_attachment(idempotency_key)?
         };
         if let Some(existing) = existing {
-            if existing.state == "detached" {
-                self.repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned")
-                    .reattach_application_root(idempotency_key)?;
-            }
-            self.ensure_application_root_supervisor(&existing)?;
             let workspace = {
                 self.repository
                     .lock()
                     .expect("runtime repository mutex poisoned")
                     .task_workspace(&existing.root_task_id)?
             };
+            if !self
+                .factory
+                .application_root_workspace_matches(requested_workspace, &workspace)
+            {
+                return Err(RuntimeCoordinatorError::Supervisor(
+                    "application root workspace does not match its recorded repository".into(),
+                ));
+            }
+            if existing.state == "detached" {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .reattach_application_root(idempotency_key)?;
+            }
+            self.application_root_workspace_services
+                .lock()
+                .expect("runtime application root workspace service mutex poisoned")
+                .insert(existing.root_session_id.clone(), service);
+            self.ensure_application_root_supervisor(&existing)?;
             let capability = existing
                 .capability_secret
                 .clone()
@@ -673,6 +698,10 @@ impl RuntimeCoordinator {
         let capability_digest = digest_hex(&capability);
         let session_id =
             self.create_session_with_objective("TUI application root pending activation.".into())?;
+        self.application_root_workspace_services
+            .lock()
+            .expect("runtime application root workspace service mutex poisoned")
+            .insert(session_id.clone(), service);
         let supervisor_handle = self.supervisor(&session_id)?;
         let mut supervisor = supervisor_handle.lock().await;
         let root_task_id = supervisor.root_task_id().clone();
@@ -1433,7 +1462,14 @@ impl RuntimeCoordinator {
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             return Ok(Some(existing));
         }
-        let Some(service) = self.workspace_service.as_ref() else {
+        let service = self
+            .application_root_workspace_services
+            .lock()
+            .expect("runtime application root workspace service mutex poisoned")
+            .get(session)
+            .cloned()
+            .or_else(|| self.workspace_service.clone());
+        let Some(service) = service else {
             return Ok(None);
         };
         let task_snapshot = supervisor

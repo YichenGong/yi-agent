@@ -30,6 +30,15 @@ use super::statusbar::{StatusBarState, render_statusbar};
 
 const HISTORY_WHEEL_LINES: usize = 3;
 
+fn is_active_managed_process(status: &yi_agent_tools::ProcessStatus) -> bool {
+    matches!(
+        status,
+        yi_agent_tools::ProcessStatus::Starting
+            | yi_agent_tools::ProcessStatus::Running
+            | yi_agent_tools::ProcessStatus::Ready
+    )
+}
+
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
     match message {
         Some(message) => format!("{code}: {message}"),
@@ -56,6 +65,7 @@ pub fn run_tui(
     runtime_choice_tx: Option<
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
+    process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -80,6 +90,7 @@ pub fn run_tui(
         &model,
         runtime_start_prompt,
         runtime_choice_tx,
+        process_manager,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -149,6 +160,7 @@ pub fn run_tui_with_backend<B: Backend>(
         "test-model",
         None,
         None,
+        yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
     )
 }
 
@@ -181,6 +193,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         "test-model",
         None,
         None,
+        yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
     )
 }
 
@@ -201,6 +214,7 @@ fn run_loop<B: Backend, E: EventSource>(
     runtime_choice_tx: Option<
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
+    process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
 ) -> std::io::Result<()> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
@@ -210,6 +224,8 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut cost_tracker = CostTracker::default();
     let mut bash_popup: BashPopup = BashPopup::None;
     let mut runtime_start_prompt = runtime_start_prompt;
+    let mut process_events = process_manager.subscribe();
+    let mut process_snapshots = process_manager.list();
     // Keep the rendered viewport location so geometry that changes between
     // frames (such as a resize or newly queued preview) has an old-width anchor.
     let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
@@ -305,6 +321,9 @@ fn run_loop<B: Backend, E: EventSource>(
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
+        while process_events.try_recv().is_ok() {
+            process_snapshots = process_manager.list();
+        }
 
         // Pre-compute layout so mouse hit-testing uses the same chunk rects
         // as the draw closure below.
@@ -312,6 +331,10 @@ fn run_loop<B: Backend, E: EventSource>(
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let layout = compute_layout(area, input, pending_quit, &popup, queued_height);
 
+        let active_process_count = process_snapshots
+            .iter()
+            .filter(|snapshot| is_active_managed_process(&snapshot.status))
+            .count();
         terminal.draw(|f| {
             let chunks = layout.chunks.clone();
 
@@ -330,7 +353,12 @@ fn run_loop<B: Backend, E: EventSource>(
             }
 
             // Status bar
-            let statusbar_line = render_statusbar(&statusbar_state, &task_registry, model);
+            let statusbar_line = render_statusbar(
+                &statusbar_state,
+                &task_registry,
+                active_process_count,
+                model,
+            );
             f.render_widget(statusbar_line, chunks[2]);
 
             // Render queued messages preview
@@ -776,6 +804,12 @@ enum KeyOutcome {
     Submit(String),
 }
 
+fn starts_with_multi_segment_absolute_path(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|token| token.starts_with('/') && token.matches('/').count() >= 2)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
@@ -833,17 +867,14 @@ fn handle_key(
     // Global keys first
     match key.code {
         KeyCode::Esc => {
-            if *pending_quit {
-                return KeyOutcome::Quit;
-            }
-            // If popup is active, Esc dismisses it (without setting pending_quit)
+            // Popup dismissal takes precedence over cancelling an agent turn.
             if popup.is_some() {
                 *popup = None;
                 return KeyOutcome::None;
             }
-            *pending_quit = true;
             if is_running.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = interrupt_tx.blocking_send(());
+                // Cancellation is idempotent; coalesce repeated Esc presses.
+                let _ = interrupt_tx.try_send(());
             }
             return KeyOutcome::None;
         }
@@ -993,7 +1024,7 @@ fn handle_key(
         InputAction::Submit => {
             let text = input.take_submitted();
             // Check if this is a slash command
-            if text.starts_with('/') {
+            if text.starts_with('/') && !starts_with_multi_segment_absolute_path(&text) {
                 let name = text
                     .trim_start_matches('/')
                     .split_whitespace()
@@ -2055,7 +2086,7 @@ fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> P
     if pending_quit {
         return Paragraph::new(Line::from(vec![
             prefix,
-            Span::styled("再按 Ctrl+C 或 Esc 退出", Style::new().fg(Color::Yellow)),
+            Span::styled("再按 Ctrl+C 退出", Style::new().fg(Color::Yellow)),
         ]))
         .style(Style::new().bg(Color::Indexed(240)));
     }
@@ -2243,6 +2274,22 @@ fn wrap_input_buffer(
 mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
+
+    #[test]
+    fn active_managed_process_statuses_exclude_terminal_states() {
+        use yi_agent_tools::ProcessStatus;
+
+        assert!(is_active_managed_process(&ProcessStatus::Starting));
+        assert!(is_active_managed_process(&ProcessStatus::Running));
+        assert!(is_active_managed_process(&ProcessStatus::Ready));
+        assert!(!is_active_managed_process(&ProcessStatus::Exited {
+            code: Some(0)
+        }));
+        assert!(!is_active_managed_process(&ProcessStatus::Killed));
+        assert!(!is_active_managed_process(&ProcessStatus::FailedToStart {
+            reason: "spawn failed".into(),
+        }));
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use futures::future::BoxFuture;
     use ratatui::backend::TestBackend;
@@ -3591,6 +3638,7 @@ mod tests {
             "test-model",
             None,
             None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3672,6 +3720,7 @@ mod tests {
             "test-model",
             None,
             None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3736,6 +3785,7 @@ mod tests {
             "test-model",
             None,
             None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3853,6 +3903,7 @@ mod tests {
                 body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
             }),
             Some(runtime_choice_tx),
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3902,6 +3953,7 @@ mod tests {
                 body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
             }),
             Some(runtime_choice_tx),
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3995,9 +4047,9 @@ mod tests {
         );
     }
 
-    /// Test that Esc behaves the same as Ctrl+C (confirm first, quit on second).
+    /// Repeated Esc must not terminate the loop; Ctrl+Q is the explicit terminator.
     #[test]
-    fn esc_same_as_ctrl_c() {
+    fn repeated_esc_does_not_quit() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
@@ -4008,8 +4060,10 @@ mod tests {
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // First Esc alone should not quit
+        // ScriptedEvents pops from the end, so this yields Esc, Esc, x, Ctrl+Q.
         let events = Rc::new(RefCell::new(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         ]));
@@ -4027,8 +4081,15 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "two Esc should quit cleanly, got: {:?}",
+            "Ctrl+Q should terminate the TUI cleanly, got: {:?}",
             result
+        );
+        let buffer = terminal.backend().buffer();
+        let input_row = 23u16;
+        let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
+        assert!(
+            row_text.contains('x'),
+            "the key after repeated Esc must be processed, got: {row_text:?}"
         );
     }
 
@@ -5506,7 +5567,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_when_running_sends_interrupt() {
+    fn esc_interrupts_active_agent_without_arming_quit() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -5537,7 +5598,7 @@ mod tests {
             &mut popup,
         );
         assert_eq!(result, KeyOutcome::None);
-        assert!(pending_quit);
+        assert!(!pending_quit, "Esc must not arm process exit");
         assert!(
             interrupt_rx.try_recv().is_ok(),
             "interrupt should be sent when agent running"
@@ -5545,7 +5606,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_when_idle_does_not_send_interrupt() {
+    fn esc_when_idle_does_nothing() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -5576,7 +5637,7 @@ mod tests {
             &mut popup,
         );
         assert_eq!(result, KeyOutcome::None);
-        assert!(pending_quit);
+        assert!(!pending_quit, "idle Esc must not arm process exit");
         assert!(
             interrupt_rx.try_recv().is_err(),
             "interrupt should NOT be sent when idle"
@@ -5620,7 +5681,7 @@ mod tests {
     }
 
     #[test]
-    fn double_esc_quits() {
+    fn repeated_esc_does_not_quit_from_handle_key() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -5667,10 +5728,97 @@ mod tests {
             &mut pending_quit,
             &mut popup,
         );
-        assert_eq!(result, KeyOutcome::Quit);
+        assert_eq!(result, KeyOutcome::None);
     }
 
     // ----- handle_key Submit 分流 tests -----
+
+    #[test]
+    fn submit_multi_segment_absolute_path_sends_to_agent() {
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+        let path = "/Users/name/project explain this";
+
+        input.buffer = path.to_string();
+        input.cursor = input.buffer.len();
+
+        let result = handle_key(
+            make_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            1000,
+            80,
+            24,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+
+        assert_eq!(result, KeyOutcome::Submit(path.to_string()));
+        assert_eq!(input_rx.try_recv().unwrap(), path);
+        assert!(matches!(
+            history.cells.as_slice(),
+            [HistoryCell::UserMessage { text }] if text == path
+        ));
+    }
+
+    #[test]
+    fn submit_single_segment_absolute_path_shows_unknown_command() {
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        input.buffer = "/tmp".to_string();
+        input.cursor = input.buffer.len();
+
+        let result = handle_key(
+            make_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            1000,
+            80,
+            24,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+
+        assert_eq!(result, KeyOutcome::None);
+        assert!(input_rx.try_recv().is_err());
+        assert!(matches!(
+            history.cells.as_slice(),
+            [HistoryCell::Separator { label: Some(label) }] if label == "未知命令: /tmp"
+        ));
+    }
 
     #[test]
     fn submit_while_running_goes_to_queue_not_history() {

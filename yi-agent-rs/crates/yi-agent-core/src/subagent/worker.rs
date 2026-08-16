@@ -480,6 +480,26 @@ pub trait AgentWorkerFactory: Send + Sync {
         None
     }
 
+    /// Builds the Git workspace service for one application root attachment.
+    /// The daemon invokes this with the client-resolved project workspace rather
+    /// than its own startup directory, so concurrent projects stay isolated.
+    fn workspace_service_for_application_root(
+        &self,
+        _workspace: &std::path::Path,
+    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+        self.workspace_service()
+    }
+
+    /// Verifies that a client reattaching an existing root belongs to the
+    /// repository that owns its persisted workspace.
+    fn application_root_workspace_matches(
+        &self,
+        _workspace: &std::path::Path,
+        _recorded: &WorkerWorkspace,
+    ) -> bool {
+        true
+    }
+
     /// Supplies the facts that must survive an interrupted worker attempt.
     /// Factories without a workspace deliberately return explicit absence,
     /// which turns a later recovery attempt into a conflict instead of a
