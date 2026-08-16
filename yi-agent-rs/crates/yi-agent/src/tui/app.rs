@@ -30,6 +30,15 @@ use super::statusbar::{StatusBarState, render_statusbar};
 
 const HISTORY_WHEEL_LINES: usize = 3;
 
+fn is_active_managed_process(status: &yi_agent_tools::ProcessStatus) -> bool {
+    matches!(
+        status,
+        yi_agent_tools::ProcessStatus::Starting
+            | yi_agent_tools::ProcessStatus::Running
+            | yi_agent_tools::ProcessStatus::Ready
+    )
+}
+
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
     match message {
         Some(message) => format!("{code}: {message}"),
@@ -56,6 +65,7 @@ pub fn run_tui(
     runtime_choice_tx: Option<
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
+    process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -80,6 +90,7 @@ pub fn run_tui(
         &model,
         runtime_start_prompt,
         runtime_choice_tx,
+        process_manager,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -149,6 +160,7 @@ pub fn run_tui_with_backend<B: Backend>(
         "test-model",
         None,
         None,
+        yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
     )
 }
 
@@ -181,6 +193,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         "test-model",
         None,
         None,
+        yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
     )
 }
 
@@ -201,6 +214,7 @@ fn run_loop<B: Backend, E: EventSource>(
     runtime_choice_tx: Option<
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
+    process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
 ) -> std::io::Result<()> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
@@ -210,6 +224,8 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut cost_tracker = CostTracker::default();
     let mut bash_popup: BashPopup = BashPopup::None;
     let mut runtime_start_prompt = runtime_start_prompt;
+    let mut process_events = process_manager.subscribe();
+    let mut process_snapshots = process_manager.list();
     // Keep the rendered viewport location so geometry that changes between
     // frames (such as a resize or newly queued preview) has an old-width anchor.
     let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
@@ -305,6 +321,9 @@ fn run_loop<B: Backend, E: EventSource>(
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
+        while process_events.try_recv().is_ok() {
+            process_snapshots = process_manager.list();
+        }
 
         // Pre-compute layout so mouse hit-testing uses the same chunk rects
         // as the draw closure below.
@@ -312,6 +331,10 @@ fn run_loop<B: Backend, E: EventSource>(
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let layout = compute_layout(area, input, pending_quit, &popup, queued_height);
 
+        let active_process_count = process_snapshots
+            .iter()
+            .filter(|snapshot| is_active_managed_process(&snapshot.status))
+            .count();
         terminal.draw(|f| {
             let chunks = layout.chunks.clone();
 
@@ -330,7 +353,12 @@ fn run_loop<B: Backend, E: EventSource>(
             }
 
             // Status bar
-            let statusbar_line = render_statusbar(&statusbar_state, &task_registry, model);
+            let statusbar_line = render_statusbar(
+                &statusbar_state,
+                &task_registry,
+                active_process_count,
+                model,
+            );
             f.render_widget(statusbar_line, chunks[2]);
 
             // Render queued messages preview
@@ -2246,6 +2274,22 @@ fn wrap_input_buffer(
 mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
+
+    #[test]
+    fn active_managed_process_statuses_exclude_terminal_states() {
+        use yi_agent_tools::ProcessStatus;
+
+        assert!(is_active_managed_process(&ProcessStatus::Starting));
+        assert!(is_active_managed_process(&ProcessStatus::Running));
+        assert!(is_active_managed_process(&ProcessStatus::Ready));
+        assert!(!is_active_managed_process(&ProcessStatus::Exited {
+            code: Some(0)
+        }));
+        assert!(!is_active_managed_process(&ProcessStatus::Killed));
+        assert!(!is_active_managed_process(&ProcessStatus::FailedToStart {
+            reason: "spawn failed".into(),
+        }));
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use futures::future::BoxFuture;
     use ratatui::backend::TestBackend;
@@ -3594,6 +3638,7 @@ mod tests {
             "test-model",
             None,
             None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3675,6 +3720,7 @@ mod tests {
             "test-model",
             None,
             None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3739,6 +3785,7 @@ mod tests {
             "test-model",
             None,
             None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3856,6 +3903,7 @@ mod tests {
                 body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
             }),
             Some(runtime_choice_tx),
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
@@ -3905,6 +3953,7 @@ mod tests {
                 body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
             }),
             Some(runtime_choice_tx),
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         )
         .unwrap();
 
