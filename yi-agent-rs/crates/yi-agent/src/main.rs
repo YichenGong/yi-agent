@@ -54,18 +54,19 @@ fn main() -> Result<()> {
             run_headless(cli, prompt, json, stdin, naked, subagents)
         }
         Some(Command::Daemon { action }) => control_daemon(&cli, action),
-        Some(Command::Agents { project, all }) => control_agents(project, all),
-        Some(Command::Agent { action }) => control_agent(action),
+        Some(Command::Agents { ref project, all }) => control_agents(&cli, project.clone(), all),
+        Some(Command::Agent { ref action }) => control_agent(&cli, action.clone()),
         Some(Command::Schedule { ref action }) => control_schedule(&cli, action),
         None => run_agent(cli),
     }
 }
 
-fn control_agents(project: Option<std::path::PathBuf>, all: bool) -> Result<()> {
+fn control_agents(cli: &Cli, project: Option<std::path::PathBuf>, all: bool) -> Result<()> {
     if project.is_some() {
         anyhow::bail!("project filtering is not available from this daemon version")
     }
-    let socket = runtime_directory()?.join("runtime.sock");
+    let workdir = config::resolve_workdir(cli)?;
+    let socket = runtime_directory_for(&workdir).join("runtime.sock");
     let mut subscription = yi_agent_store::ipc::subscribe(&socket, 0).map_err(|error| {
         anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
     })?;
@@ -83,8 +84,9 @@ fn control_agents(project: Option<std::path::PathBuf>, all: bool) -> Result<()> 
     Ok(())
 }
 
-fn control_agent(action: AgentAction) -> Result<()> {
-    let socket = runtime_directory()?.join("runtime.sock");
+fn control_agent(cli: &Cli, action: AgentAction) -> Result<()> {
+    let workdir = config::resolve_workdir(cli)?;
+    let socket = runtime_directory_for(&workdir).join("runtime.sock");
     let request = match action {
         AgentAction::Show { task_id } => yi_agent_store::ipc::IpcRequest::InspectTask { task_id },
         AgentAction::Events { task_id, follow } => {
@@ -413,7 +415,7 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
         );
         return Ok(());
     }
-    let socket = runtime_directory()?.join("runtime.sock");
+    let socket = runtime_directory_for(&config.workdir).join("runtime.sock");
     match yi_agent_store::ipc::send_request(
         &socket,
         yi_agent_store::ipc::IpcRequest::CreateSchedule {
@@ -436,7 +438,8 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
 }
 
 fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
-    let runtime_dir = runtime_directory()?;
+    let workdir = config::resolve_workdir(cli)?;
+    let runtime_dir = runtime_directory_for(&workdir);
     let runtime = runtime_dir.join("runtime.sock");
     let database = runtime_dir.join("state.sqlite");
     match action {
@@ -451,6 +454,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .current_dir(&workdir)
                 .spawn()?;
             for _ in 0..50 {
                 if yi_agent_store::ipc::send_request(
@@ -533,18 +537,20 @@ fn build_daemon_worker_factory(
     ))
 }
 
-fn runtime_directory() -> Result<std::path::PathBuf> {
-    let override_path = std::env::var_os("YI_AGENT_RUNTIME_DIR").map(std::path::PathBuf::from);
-    runtime_directory_from(override_path, dirs::home_dir())
+fn runtime_directory_for(workdir: &std::path::Path) -> std::path::PathBuf {
+    runtime_directory_from(
+        std::env::var_os("YI_AGENT_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from),
+        workdir,
+    )
 }
 
 fn runtime_directory_from(
     override_path: Option<std::path::PathBuf>,
-    home: Option<std::path::PathBuf>,
-) -> Result<std::path::PathBuf> {
-    override_path
-        .or_else(|| home.map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
+    workdir: &std::path::Path,
+) -> std::path::PathBuf {
+    override_path.unwrap_or_else(|| workdir.join(".yi-agent/runtime"))
 }
 
 fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Result<()> {
@@ -610,7 +616,7 @@ fn attach_application_root_request(
 }
 
 fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
-    let runtime_dir = runtime_directory()?;
+    let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_dir.join("runtime.sqlite");
     let socket_path = runtime_dir.join("runtime.sock");
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
@@ -693,7 +699,7 @@ struct TuiRuntimeSession {
 }
 
 fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
-    let runtime_dir = runtime_directory()?;
+    let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_dir.join("runtime.sqlite");
     let socket_path = runtime_dir.join("runtime.sock");
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
@@ -2110,11 +2116,41 @@ mod tests {
     }
 
     #[test]
-    fn runtime_directory_prefers_an_explicit_override() {
+    fn runtime_directory_uses_workdir_local_default() {
         assert_eq!(
-            runtime_directory_from(Some(std::path::PathBuf::from("/tmp/yi-runtime")), None)
-                .unwrap(),
-            std::path::PathBuf::from("/tmp/yi-runtime")
+            runtime_directory_from(None, std::path::Path::new("/tmp/project-a")),
+            std::path::PathBuf::from("/tmp/project-a/.yi-agent/runtime"),
+        );
+    }
+
+    #[test]
+    fn runtime_directory_prefers_a_nonempty_explicit_override() {
+        assert_eq!(
+            runtime_directory_from(
+                Some(std::path::PathBuf::from("/tmp/shared-runtime")),
+                std::path::Path::new("/tmp/project-a"),
+            ),
+            std::path::PathBuf::from("/tmp/shared-runtime"),
+        );
+    }
+
+    #[test]
+    fn runtime_directory_isolated_between_workdirs() {
+        let first = runtime_directory_from(None, std::path::Path::new("/tmp/project-a"));
+        let second = runtime_directory_from(None, std::path::Path::new("/tmp/project-b"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn runtime_directory_for_workdir_uses_the_same_project_path_for_daemon_and_attachment() {
+        let workdir = std::path::PathBuf::from("/tmp/isolated-project");
+        let daemon_runtime = runtime_directory_from(None, &workdir);
+        let attachment_runtime = runtime_directory_from(None, &workdir);
+
+        assert_eq!(daemon_runtime, attachment_runtime);
+        assert_eq!(
+            daemon_runtime,
+            std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime"),
         );
     }
 
