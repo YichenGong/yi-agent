@@ -599,6 +599,16 @@ struct HeadlessRuntimeSession {
     embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
 }
 
+fn attach_application_root_request(
+    idempotency_key: String,
+    workspace: std::path::PathBuf,
+) -> yi_agent_store::ipc::IpcRequest {
+    yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
+        idempotency_key,
+        workspace,
+    }
+}
+
 fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
     let runtime_dir = runtime_directory()?;
     let database = runtime_dir.join("runtime.sqlite");
@@ -614,14 +624,15 @@ fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<Headles
     };
     let response = yi_agent_store::ipc::send_request(
         &socket_path,
-        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
-            idempotency_key: format!(
+        attach_application_root_request(
+            format!(
                 "headless:{}:{}:{}",
                 std::process::id(),
                 config.workdir.display(),
                 uuid::Uuid::new_v4()
             ),
-        },
+            config.workdir.clone(),
+        ),
     )
     .map_err(|error| anyhow::anyhow!("could not attach headless subagent runtime: {error}"))?;
     let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
@@ -705,7 +716,7 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
     );
     let response = match yi_agent_store::ipc::send_request(
         &socket_path,
-        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot { idempotency_key },
+        attach_application_root_request(idempotency_key, config.workdir.clone()),
     ) {
         Ok(response) => response,
         Err(error) => {
@@ -2068,6 +2079,22 @@ mod tests {
             stderr.contains("[error:"),
             "stderr should contain error: {stderr}"
         );
+    }
+
+    #[test]
+    fn attach_application_root_request_uses_the_configured_workdir() {
+        let yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
+            idempotency_key,
+            workspace,
+        } = attach_application_root_request(
+            "test-key".into(),
+            std::path::PathBuf::from("/projects/b"),
+        )
+        else {
+            panic!("expected an application-root attach request");
+        };
+        assert_eq!(idempotency_key, "test-key");
+        assert_eq!(workspace, std::path::PathBuf::from("/projects/b"));
     }
 
     #[test]

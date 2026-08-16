@@ -328,6 +328,25 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             .map(|service| Arc::clone(service) as Arc<dyn AgentWorkspaceService>)
     }
 
+    fn workspace_service_for_application_root(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+        Some(Arc::new(DaemonWorkspaceService::new(
+            workspace.to_path_buf(),
+        )))
+    }
+
+    fn application_root_workspace_matches(
+        &self,
+        workspace: &std::path::Path,
+        recorded: &WorkerWorkspace,
+    ) -> bool {
+        git_output(workspace, &["rev-parse", "--show-toplevel"]).is_some_and(|repository_root| {
+            recorded.repository_root == std::path::Path::new(&repository_root)
+        })
+    }
+
     fn recovery_context(&self) -> WorkerRecoveryContext {
         self.recovery_workspace
             .clone()
