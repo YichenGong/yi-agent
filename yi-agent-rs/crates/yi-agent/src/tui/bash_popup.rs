@@ -8,7 +8,6 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Top-level popup state.
 #[derive(Debug, Clone, Default)]
@@ -226,39 +225,19 @@ fn detail_lines(task: &TaskState, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Wrap text by terminal display width while preserving explicit newlines.
+///
+/// Delegates to the shared whitespace-preserving wrapper so the bash detail
+/// view and the permission prompt cannot drift apart.
 fn wrap_text(
     text: &str,
     width: u16,
     first_prefix: &str,
     continuation_prefix: &str,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut prefix = first_prefix;
-
-    for physical_line in text.split('\n') {
-        let available = (width as usize)
-            .saturating_sub(UnicodeWidthStr::width(prefix))
-            .max(1);
-        let mut current = String::new();
-        let mut current_width = 0;
-
-        for ch in physical_line.chars() {
-            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if current_width + char_width > available && !current.is_empty() {
-                lines.push(Line::raw(format!("{prefix}{current}")));
-                prefix = continuation_prefix;
-                current.clear();
-                current_width = 0;
-            }
-            current.push(ch);
-            current_width += char_width;
-        }
-
-        lines.push(Line::raw(format!("{prefix}{current}")));
-        prefix = continuation_prefix;
-    }
-
-    lines
+    crate::tui::wrap::wrap_by_display_width(text, width as usize, first_prefix, continuation_prefix)
+        .into_iter()
+        .map(Line::raw)
+        .collect()
 }
 
 fn truncate_str(s: &str, n: usize) -> String {
