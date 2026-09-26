@@ -90,6 +90,8 @@ export default function App() {
       setThreadInfo({ cwd: t.cwd, model: t.model });
     } catch (e) {
       session.lastError = formatError(e);
+      setThreadId(null);
+      setThreadInfo(null);
       force((v) => v + 1);
     } finally {
       resuming.current = false;
@@ -99,7 +101,7 @@ export default function App() {
 
   const renameThread = async (id: string, title: string) => {
     const c = clientRef.current;
-    if (!c) return;
+    if (!c || resuming.current) return;
     const prev = threads;
     setThreads((ts) => ts.map((t) => (t.thread_id === id ? { ...t, title } : t)));
     try {
@@ -114,7 +116,7 @@ export default function App() {
 
   const deleteThread = async (id: string) => {
     const c = clientRef.current;
-    if (!c || session.turnActive) return;
+    if (!c || session.turnActive || resuming.current) return;
     try {
       await c.request("thread/delete", { threadId: id });
     } catch (e) {
