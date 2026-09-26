@@ -24,7 +24,6 @@ struct ToolItem {
     item_id: String,
     name: String,
     input: Value,
-    completed: bool,
 }
 
 /// 把 `AgentEvent` 流翻译成 [`Notification`]。
@@ -33,6 +32,11 @@ struct ToolItem {
 /// [`Translator::set_turn`] 注入。内部维护"当前打开的 agentMessage"和
 /// 每个 `call_id` 对应的工具条目,以保证 `item/started` / `item/delta` /
 /// `item/completed` 生命周期配对。
+///
+/// `tool_items` 是有界的:条目在收到 `ToolResult` / `ToolExit` /
+/// `ToolTimeout` 或 turn 终结事件时被移除,不会跨 turn 累积。收到终结事件
+/// (`Done` / `Cancelled` / `Error`)后 `tool_items` 必为空;上层必须为下一个
+/// turn 调用 [`Translator::set_turn`] 再继续喂事件。
 pub struct Translator {
     thread_id: String,
     turn_id: String,
@@ -107,7 +111,8 @@ impl Translator {
 
     /// Mark a tool item completed, emitting `item/completed` exactly once.
     ///
-    /// Unknown `call_id` and already-completed items are no-ops.
+    /// The entry is removed from `tool_items`, so a second completion (or a
+    /// late `ToolOutputDelta`) for the same `call_id` is automatically a no-op.
     fn complete_tool(
         &mut self,
         call_id: &str,
@@ -115,43 +120,76 @@ impl Translator {
         result: Option<String>,
         out: &mut Vec<Notification>,
     ) {
-        let Some(tool) = self.tool_items.get_mut(call_id) else {
+        let Some(tool) = self.tool_items.remove(call_id) else {
             return;
         };
-        if tool.completed {
-            return;
-        }
-        tool.completed = true;
         out.push(Notification::ItemCompleted {
             thread_id: self.thread_id.clone(),
             item: Item::ToolCall {
-                id: tool.item_id.clone(),
+                id: tool.item_id,
                 call_id: call_id.to_string(),
-                name: tool.name.clone(),
-                input: tool.input.clone(),
+                name: tool.name,
+                input: tool.input,
                 status,
                 result,
             },
         });
     }
 
+    /// Close every still-open tool item with `status`.
+    ///
+    /// Terminal events (`Done` / `Cancelled` / `Error`) can arrive while tool
+    /// futures are still in flight (e.g. a cancelled turn drops them before a
+    /// `ToolResult` is emitted). This sweep guarantees the UI never leaves a
+    /// tool card stuck on `running`.
+    fn finalize_open_tools(&mut self, status: ToolStatus, out: &mut Vec<Notification>) {
+        let open: Vec<String> = self.tool_items.keys().cloned().collect();
+        for call_id in open {
+            self.complete_tool(&call_id, status.clone(), None, out);
+        }
+    }
+
+    /// Close the turn: finalize any open items, then emit `turn/completed`.
+    fn finish_turn(
+        &mut self,
+        status: TurnStatus,
+        error: Option<String>,
+        out: &mut Vec<Notification>,
+    ) {
+        self.finalize_agent_msg(out);
+        self.finalize_open_tools(ToolStatus::Failed, out);
+        out.push(Notification::TurnCompleted {
+            thread_id: self.thread_id.clone(),
+            turn_id: self.turn_id.clone(),
+            status,
+            error,
+        });
+    }
+
     /// Translate one agent event into zero or more protocol notifications.
+    ///
+    /// After a terminal event (`Done` / `Cancelled` / `Error`) all open items
+    /// are closed and `tool_items` is empty; call [`Translator::set_turn`] for
+    /// the next turn before feeding further events.
     pub fn on_event(&mut self, ev: AgentEvent) -> Vec<Notification> {
         let mut out = Vec::new();
         match ev {
             AgentEvent::AssistantText(s) | AgentEvent::DecodeDelta(s) => {
-                self.append_agent_text(s, &mut out);
+                if !s.is_empty() {
+                    self.append_agent_text(s, &mut out);
+                }
             }
             AgentEvent::ToolCall { id, name, input } => {
                 self.finalize_agent_msg(&mut out);
                 let item_id = self.alloc_item_id();
+                // Overwrites any existing entry with the same `call_id`; provider
+                // tool ids are unique in practice.
                 self.tool_items.insert(
                     id.clone(),
                     ToolItem {
                         item_id: item_id.clone(),
                         name: name.clone(),
                         input: input.clone(),
-                        completed: false,
                     },
                 );
                 out.push(Notification::ItemStarted {
@@ -204,35 +242,17 @@ impl Translator {
                 });
             }
             AgentEvent::Done { reason } => {
-                self.finalize_agent_msg(&mut out);
                 let (status, error) = match reason {
                     DoneReason::EndTurn | DoneReason::MaxTurns => (TurnStatus::Completed, None),
                     DoneReason::Interrupted { reason } => (TurnStatus::Interrupted, Some(reason)),
                 };
-                out.push(Notification::TurnCompleted {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    status,
-                    error,
-                });
+                self.finish_turn(status, error, &mut out);
             }
             AgentEvent::Cancelled => {
-                self.finalize_agent_msg(&mut out);
-                out.push(Notification::TurnCompleted {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    status: TurnStatus::Interrupted,
-                    error: None,
-                });
+                self.finish_turn(TurnStatus::Interrupted, None, &mut out);
             }
             AgentEvent::Error(e) => {
-                self.finalize_agent_msg(&mut out);
-                out.push(Notification::TurnCompleted {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    status: TurnStatus::Failed,
-                    error: Some(e.to_string()),
-                });
+                self.finish_turn(TurnStatus::Failed, Some(e.to_string()), &mut out);
             }
             // 暂不产生通知的事件。
             //
@@ -719,5 +739,188 @@ mod tests {
             Notification::TurnCompleted { turn_id, .. } => assert_eq!(turn_id, "u1"),
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_call_finalizes_open_agent_message_first() {
+        let mut t = translator();
+        t.on_event(AgentEvent::AssistantText("hi".into()));
+        let out = t.on_event(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        });
+        assert_eq!(out.len(), 2, "expected ItemCompleted then ItemStarted");
+        match &out[0] {
+            Notification::ItemCompleted {
+                item: Item::AgentMessage { text, .. },
+                ..
+            } => assert_eq!(text, "hi"),
+            other => panic!("expected ItemCompleted AgentMessage, got {other:?}"),
+        }
+        assert!(matches!(
+            out[1],
+            Notification::ItemStarted {
+                item: Item::ToolCall { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn done_max_turns_completes() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::Done {
+            reason: DoneReason::MaxTurns,
+        });
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Notification::TurnCompleted { status, error, .. } => {
+                assert!(matches!(status, TurnStatus::Completed));
+                assert!(error.is_none());
+            }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelled_finalizes_open_agent_message() {
+        let mut t = translator();
+        t.on_event(AgentEvent::AssistantText("hi".into()));
+        let out = t.on_event(AgentEvent::Cancelled);
+        assert_eq!(out.len(), 2, "expected ItemCompleted then TurnCompleted");
+        match &out[0] {
+            Notification::ItemCompleted {
+                item: Item::AgentMessage { text, .. },
+                ..
+            } => assert_eq!(text, "hi"),
+            other => panic!("expected ItemCompleted AgentMessage, got {other:?}"),
+        }
+        match &out[1] {
+            Notification::TurnCompleted { status, .. } => {
+                assert!(matches!(status, TurnStatus::Interrupted));
+            }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_finalizes_open_agent_message() {
+        let mut t = translator();
+        t.on_event(AgentEvent::AssistantText("hi".into()));
+        let out = t.on_event(AgentEvent::Error(AgentError::ProviderTurnAdmission(
+            "boom".into(),
+        )));
+        assert_eq!(out.len(), 2, "expected ItemCompleted then TurnCompleted");
+        match &out[0] {
+            Notification::ItemCompleted {
+                item: Item::AgentMessage { text, .. },
+                ..
+            } => assert_eq!(text, "hi"),
+            other => panic!("expected ItemCompleted AgentMessage, got {other:?}"),
+        }
+        match &out[1] {
+            Notification::TurnCompleted { status, error, .. } => {
+                assert!(matches!(status, TurnStatus::Failed));
+                assert!(
+                    error.as_deref().is_some_and(|e| e.contains("boom")),
+                    "error should carry the agent error text, got {error:?}"
+                );
+            }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelled_closes_open_tool_items() {
+        let mut t = translator();
+        t.on_event(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        });
+        let out = t.on_event(AgentEvent::Cancelled);
+        assert!(
+            out.iter().any(|n| matches!(
+                n,
+                Notification::ItemCompleted {
+                    item: Item::ToolCall {
+                        call_id,
+                        status: ToolStatus::Failed,
+                        result: None,
+                        ..
+                    },
+                    ..
+                } if call_id == "c1"
+            )),
+            "expected ItemCompleted Failed for call_id c1, got {out:?}"
+        );
+        assert!(
+            out.iter().any(|n| matches!(
+                n,
+                Notification::TurnCompleted {
+                    status: TurnStatus::Interrupted,
+                    ..
+                }
+            )),
+            "expected TurnCompleted Interrupted, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn error_closes_open_tool_items() {
+        let mut t = translator();
+        t.on_event(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        });
+        let out = t.on_event(AgentEvent::Error(AgentError::ProviderTurnAdmission(
+            "boom".into(),
+        )));
+        assert!(
+            out.iter().any(|n| matches!(
+                n,
+                Notification::ItemCompleted {
+                    item: Item::ToolCall {
+                        call_id,
+                        status: ToolStatus::Failed,
+                        ..
+                    },
+                    ..
+                } if call_id == "c1"
+            )),
+            "expected ItemCompleted Failed for call_id c1, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn tool_output_delta_after_completion_is_noop() {
+        let mut t = translator();
+        t.on_event(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        });
+        t.on_event(AgentEvent::ToolResult {
+            id: "c1".into(),
+            result: ToolResult::text("ok"),
+        });
+        let out = t.on_event(AgentEvent::ToolOutputDelta {
+            id: "c1".into(),
+            stream: yi_agent_core::tool::OutputStream::Stdout,
+            text: "late".into(),
+        });
+        assert!(
+            out.is_empty(),
+            "late ToolOutputDelta for a completed call must be a no-op, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn empty_assistant_text_is_noop() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::AssistantText(String::new()));
+        assert!(out.is_empty(), "empty delta must not open a message");
     }
 }
