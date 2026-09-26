@@ -545,12 +545,44 @@ where
                             .await?;
                             continue;
                         }
-                        // 活跃 thread:先中断,再从内存移除(drop prompt_tx 让 driver 收尾)。
-                        if let Some(s) = threads.get(&thread_id) {
-                            if let Some(tid) = s.active_turn_id.clone() {
-                                let _ = s.interrupt_tx.try_send(tid);
+                        // 活跃 thread:先中断,再等 driver 落盘完成才删文件。
+                        // driver 是「先发 turn/completed,后 append/touch」,而
+                        // `TurnEvent::Finished` 在落盘之后才发出。若像旧实现那样在
+                        // driver 落盘前就删文件,driver 的 `append_turn`
+                        // (`create(true)`)会把 `<id>.jsonl` 复活,导致删除后
+                        // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
+                        // 故复用 resume 的等待模式,等落盘后再删。
+                        if let Some(tid) = threads
+                            .get(&thread_id)
+                            .and_then(|s| s.active_turn_id.clone())
+                        {
+                            if let Some(s) = threads.get(&thread_id) {
+                                let _ = s.interrupt_tx.try_send(tid.clone());
                             }
+                            let wait_for_persist = async {
+                                while let Some(TurnEvent::Finished {
+                                    thread_id: done_id,
+                                    turn_id: done_turn,
+                                }) = turn_rx.recv().await
+                                {
+                                    if let Some(s) = threads.get_mut(&done_id) {
+                                        if s.active_turn_id.as_deref() == Some(done_turn.as_str()) {
+                                            s.active_turn_id = None;
+                                        }
+                                    }
+                                    if done_id == thread_id && done_turn == tid {
+                                        break;
+                                    }
+                                }
+                            };
+                            // 有界等待:driver 异常卡死时不至于拖垮整个请求循环。
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                wait_for_persist,
+                            )
+                            .await;
                         }
+                        // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         if let Err(e) = store.delete(&thread_id) {
                             eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
@@ -2486,7 +2518,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn thread_delete_active_thread_removes_it_from_memory() {
-        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        // 用隔离 workdir:删除活跃 thread 时必须能断言磁盘状态。
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_slow_agent, PERMISSION_TIMEOUT);
         let tid = start_thread(&mut h).await;
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
@@ -2514,6 +2550,21 @@ mod tests {
         }
         assert!(deleted, "thread/delete must respond");
 
+        // 留出窗口让「未等待落盘」的实现迟到写入:driver 收到中断后仍会
+        // append_turn,若 delete 抢在它之前删文件,日志会被复活。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 删除后磁盘上两个文件都必须消失(活跃 turn 落盘不得复活 .jsonl)。
+        let threads_dir = dir.path().join(".yi-agent/threads");
+        assert!(
+            !threads_dir.join(format!("{tid}.meta.json")).exists(),
+            "meta must be gone after deleting an active thread"
+        );
+        assert!(
+            !threads_dir.join(format!("{tid}.jsonl")).exists(),
+            "log must be gone after deleting an active thread"
+        );
+
         // 删除后该 thread 已不在内存:再发 turn 应得 -32011。
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"x"}}]}}}}"#
@@ -2525,6 +2576,22 @@ mod tests {
                 assert_eq!(
                     v["error"]["code"], -32011,
                     "deleted thread must be unknown: {v}"
+                );
+                break;
+            }
+        }
+
+        // 磁盘无日志 → resume 不能复活已删除的 thread。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                assert_eq!(
+                    v["error"]["code"], -32011,
+                    "resume must not resurrect a deleted thread: {v}"
                 );
                 break;
             }
