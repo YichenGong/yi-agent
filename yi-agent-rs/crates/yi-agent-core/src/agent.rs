@@ -159,7 +159,14 @@ File discovery:
   subdirectories, file-type constrained patterns, or search-first workflows.
 - Avoid scanning generated or heavy directories such as `.git/`, `target/`,
   `node_modules/`, `.worktrees/`, caches, and build outputs unless explicitly
-  required."#
+  required.
+
+Subagent integration:
+- When a delegated child reports a delivery, integrate it yourself before you
+  finish: run `git merge --no-ff <commit>` in your own worktree, resolve any
+  conflicts, and re-run the relevant verification.
+- A child is only completed, and its worktree only recycled, once its delivered
+  commit is an ancestor of your HEAD. If you never merge it, it stays in review."#
             .to_string()
     }
 }

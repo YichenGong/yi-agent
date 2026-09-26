@@ -1686,6 +1686,15 @@ mod tests {
     }
 
     #[test]
+    fn default_system_prompt_requires_parent_integration_of_deliveries() {
+        let prompt = yi_agent_core::AgentConfig::default_system_prompt();
+        assert!(
+            prompt.contains("git merge --no-ff"),
+            "default prompt must instruct parents to merge delivered commits"
+        );
+    }
+
+    #[test]
     fn resolve_system_prompt_custom_keeps_base_instructions() {
         let resolved = resolve_system_prompt(Some("custom".into()));
         let default = yi_agent_core::AgentConfig::default_system_prompt();
