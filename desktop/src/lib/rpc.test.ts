@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { RpcClient, type Transport } from "./rpc";
 
-function fakeTransport() {
+function fakeTransport(opts: { failSend?: boolean } = {}) {
   const sent: any[] = [];
   let onMessage: (m: unknown) => void = () => {};
   const transport: Transport = {
     send: async (m) => {
+      if (opts.failSend) throw new Error("sidecar down");
       sent.push(m);
     },
     respond: async () => {},
@@ -39,13 +40,13 @@ describe("RpcClient", () => {
     await expect(p).rejects.toMatchObject({ code: -32601 });
   });
 
-  it("buffers a response that arrives before the id is registered", async () => {
+  it("rejects with a buffered error response when the matching request is made later", async () => {
     const { transport, emit } = fakeTransport();
     const client = new RpcClient(transport);
-    // Emit first, then request — the client must not lose the response.
+    // Error response arrives before any request allocates this id.
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "no" } });
     const p = client.request("initialize", {});
-    emit({ jsonrpc: "2.0", id: 1, result: 42 });
-    await expect(p).resolves.toBe(42);
+    await expect(p).rejects.toMatchObject({ code: -32601 });
   });
 
   it("drains a buffered response when the matching request is made later", async () => {
@@ -62,5 +63,23 @@ describe("RpcClient", () => {
     const second = client.request("thread/list", {});
     emit({ jsonrpc: "2.0", id: 2, result: ["t1"] });
     await expect(second).resolves.toEqual(["t1"]);
+  });
+
+  it("fans notifications out to subscribers and stops after unsubscribe", () => {
+    const { transport, emit } = fakeTransport();
+    const client = new RpcClient(transport);
+    const seen: unknown[] = [];
+    const off = client.onNotification((n) => seen.push(n));
+    emit({ jsonrpc: "2.0", method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
+    expect(seen).toHaveLength(1);
+    off();
+    emit({ jsonrpc: "2.0", method: "turn/started", params: { thread_id: "t", turn_id: "u2" } });
+    expect(seen).toHaveLength(1);
+  });
+
+  it("rejects when the transport send fails", async () => {
+    const { transport } = fakeTransport({ failSend: true });
+    const client = new RpcClient(transport);
+    await expect(client.request("initialize", {})).rejects.toThrow("sidecar down");
   });
 });

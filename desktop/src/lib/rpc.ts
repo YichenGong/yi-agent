@@ -18,9 +18,13 @@ interface Pending {
  * Correlates JSON-RPC requests with their responses and fans notifications out
  * to subscribers.
  *
- * Request ids increase monotonically. A response that arrives before its id has
- * a pending entry (possible with out-of-order IPC) is buffered and drained by
- * the next request that allocates that id, so no response is ever lost.
+ * Request ids increase monotonically. `request()` registers its pending entry
+ * synchronously before its first `await`, and a well-behaved server can only
+ * respond after the request line has been written, so a response normally
+ * always finds its pending entry. The buffer is retained as cheap defensive
+ * insurance against protocol violations — unmatched, duplicate, or out-of-order
+ * responses. A response with no pending entry is parked in `buffered` and
+ * drained by the next request that allocates that id, so it is not lost.
  */
 export class RpcClient {
   private nextId = 1;
@@ -49,16 +53,24 @@ export class RpcClient {
     const id = this.nextId++;
     const early = this.buffered.get(id);
     if (early) {
-      // Response already arrived for this id: consume it instead of waiting.
-      this.buffered.delete(id);
+      // Response already arrived for this id: send, then consume it. The buffer
+      // entry is only dropped after a successful send so a send failure does not
+      // discard an already-received response.
       await this.transport.send({ id, method, params });
+      this.buffered.delete(id);
       if (early.error) throw early.error;
       return early.result as T;
     }
     const promise = new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
     });
-    await this.transport.send({ id, method, params });
+    try {
+      await this.transport.send({ id, method, params });
+    } catch (error) {
+      // Don't leak the pending entry if the request never made it onto the wire.
+      this.pending.delete(id);
+      throw error;
+    }
     return promise;
   }
 
