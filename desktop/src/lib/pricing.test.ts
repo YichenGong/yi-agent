@@ -12,9 +12,14 @@ const usage = (over: Partial<Parameters<typeof estimateCost>[0]>) => ({
 
 describe("priceFor", () => {
   it("matches by longest prefix", () => {
-    // gpt-4o-mini 必须匹配 gpt-4o-mini 而不是 gpt-4o
+    // shorter prefixes are listed BEFORE their longer extensions, so a broken
+    // first-match-wins implementation would fail these assertions.
     expect(priceFor("gpt-4o-mini")?.input).toBe(0.15);
     expect(priceFor("gpt-4o")?.input).toBe(2.5);
+    expect(priceFor("o1-mini")?.input).toBe(1.1);
+    expect(priceFor("o1")?.input).toBe(15);
+    expect(priceFor("o3-mini")?.input).toBe(1.1);
+    expect(priceFor("o3")?.input).toBe(10);
   });
 
   it("returns null for unknown models", () => {

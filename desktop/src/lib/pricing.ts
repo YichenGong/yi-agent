@@ -13,17 +13,22 @@ export interface Price {
  *
  * 单价为官方公开定价(USD / 1M tokens),核对日期 2026-09-27。官方调价后需手动更新。
  * OpenAI 的自动 prompt caching 不额外计费写入,故 cacheWrite = 0。
+ *
+ * 排序约束:若某前缀是另一前缀的前缀(如 `o1` / `o1-mini`),较短的必须排在前面。
+ * 这样即使实现退化成"首个匹配即命中",重叠对也会命中较长的那个,保证测试可判别。
  */
 const PRICES: Array<[prefix: string, price: Price]> = [
   ["claude-opus-4", { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 }],
   ["claude-sonnet-4", { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }],
   ["claude-3-5-sonnet", { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }],
   ["claude-3-5-haiku", { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 }],
-  ["gpt-4o-mini", { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0 }],
   ["gpt-4o", { input: 2.5, output: 10, cacheRead: 1.25, cacheWrite: 0 }],
+  ["gpt-4o-mini", { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0 }],
   ["gpt-4.1", { input: 2, output: 8, cacheRead: 0.5, cacheWrite: 0 }],
   ["o3", { input: 10, output: 40, cacheRead: 2.5, cacheWrite: 0 }],
+  ["o3-mini", { input: 1.1, output: 4.4, cacheRead: 0.55, cacheWrite: 0 }],
   ["o1", { input: 15, output: 60, cacheRead: 7.5, cacheWrite: 0 }],
+  ["o1-mini", { input: 1.1, output: 4.4, cacheRead: 0.55, cacheWrite: 0 }],
 ];
 
 /** 模型对应的单价;未知模型返回 null。最长前缀优先。 */
