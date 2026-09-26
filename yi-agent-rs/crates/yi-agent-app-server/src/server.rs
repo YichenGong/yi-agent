@@ -215,8 +215,10 @@ where
                     }
                     "thread/list" => match store.list() {
                         Ok(metas) => {
+                            // 显式映射而非直接序列化 ThreadMeta:wire 契约与存储结构解耦,
+                            // 存储字段重命名不会悄悄改变 RPC 输出。
                             let threads: Vec<serde_json::Value> = metas
-                                .iter()
+                                .into_iter()
                                 .map(|m| {
                                     json!({
                                         "thread_id": m.thread_id,
@@ -1917,7 +1919,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn thread_list_returns_created_threads_newest_first() {
+    async fn thread_list_returns_created_threads() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.workdir = dir.path().to_path_buf();
@@ -1943,14 +1945,17 @@ mod tests {
         let v = listed.expect("thread/list must respond");
         let threads = v["result"]["threads"].as_array().unwrap();
         assert_eq!(threads.len(), 2);
-        // 两次 start 可能同毫秒;只断言集合与字段存在。
         let ids: std::collections::HashSet<&str> = threads
             .iter()
             .map(|t| t["thread_id"].as_str().unwrap())
             .collect();
         assert!(ids.contains(tid_a.as_str()) && ids.contains(tid_b.as_str()));
-        assert!(threads[0]["created_at"].is_number());
-        assert!(threads[0]["updated_at"].is_number());
+        // 两次 start 可能同毫秒,顺序不定(排序由 thread_store 单测锁定);
+        // 此处只断言每个条目都带时间戳字段。
+        for t in threads {
+            assert!(t["created_at"].is_number());
+            assert!(t["updated_at"].is_number());
+        }
         h.shutdown().await;
     }
 
