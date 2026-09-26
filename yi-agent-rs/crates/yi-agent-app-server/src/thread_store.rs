@@ -716,6 +716,56 @@ mod tests {
         let loaded = s.load("thread-a").unwrap().expect("log still present");
         assert_eq!(loaded.meta.title.as_deref(), Some("recover me"));
         assert_eq!(loaded.meta.thread_id, "thread-a");
+        // rebuild_meta 留空 cwd/model,由上层兜底——锁住该契约。
+        assert_eq!(loaded.meta.cwd, "");
+        assert_eq!(loaded.meta.model, "");
+    }
+
+    #[test]
+    fn load_rebuilds_meta_when_corrupt() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn("thread-a", &turn(vec![], vec![Message::user("recover me")]))
+            .unwrap();
+        std::fs::write(s.meta_path("thread-a"), "{ not json").unwrap();
+
+        let loaded = s.load("thread-a").unwrap().expect("log still present");
+        assert_eq!(loaded.meta.title.as_deref(), Some("recover me"));
+        assert_eq!(loaded.meta.thread_id, "thread-a");
+    }
+
+    #[test]
+    fn load_tolerates_truncated_final_line() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn(
+            "thread-a",
+            &turn(
+                vec![Item::UserMessage {
+                    id: "u1".into(),
+                    text: "ok".into(),
+                }],
+                vec![Message::user("ok")],
+            ),
+        )
+        .unwrap();
+        // 模拟崩溃:最后一行只写了一半,没有换行。
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(s.log_path("thread-a"))
+                .unwrap();
+            f.write_all(b"{\"type\":\"turn\",\"items\":[").unwrap();
+        }
+
+        let loaded = s.load("thread-a").unwrap().unwrap();
+        assert_eq!(
+            loaded.items.len(),
+            1,
+            "truncated final line must be skipped, not fatal"
+        );
+        assert_eq!(loaded.messages, vec![Message::user("ok")]);
     }
 
     #[test]
