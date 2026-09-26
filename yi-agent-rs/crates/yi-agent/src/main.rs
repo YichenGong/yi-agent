@@ -863,6 +863,7 @@ fn run_agent(cli: Cli) -> Result<()> {
         config,
         base_registry,
         process_manager,
+        prompt.catalog,
     )
 }
 
@@ -1102,6 +1103,7 @@ fn run_tui_agent(
     config: config::Config,
     base_registry: yi_agent_core::ToolRegistry,
     process_manager: Arc<yi_agent_tools::ProcessManager>,
+    catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -1142,6 +1144,7 @@ fn run_tui_agent(
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
+            let catalog = catalog;
             let mut agent = yi_agent_core::Agent::new(
                 Arc::clone(&provider_clone),
                 Arc::clone(&current_tools),
@@ -1324,6 +1327,11 @@ fn run_tui_agent(
 
                 // Run agent
                 is_running_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = &catalog {
+                    if let Some(prompt) = handle.current_system_prompt() {
+                        agent.set_system_prompt(Some(prompt));
+                    }
+                }
                 match agent.run(text).await {
                     Ok(stream) => {
                         let mut stream = Box::pin(stream);
