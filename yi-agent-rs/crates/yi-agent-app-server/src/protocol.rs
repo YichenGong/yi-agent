@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const JSONRPC_VERSION: &str = "2.0";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,7 +14,7 @@ pub enum RequestId {
     Str(String),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestEnvelope {
     #[serde(default)]
     pub jsonrpc: Option<String>,
@@ -23,7 +24,7 @@ pub struct RequestEnvelope {
     pub params: Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
     #[serde(default)]
     pub jsonrpc: Option<String>,
@@ -43,61 +44,37 @@ pub struct RpcError {
 }
 
 impl RpcError {
-    pub fn parse_error(msg: impl Into<String>) -> Self {
+    fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
-            code: -32700,
-            message: msg.into(),
+            code,
+            message: message.into(),
             data: None,
         }
+    }
+
+    pub fn parse_error(msg: impl Into<String>) -> Self {
+        Self::new(-32700, msg)
     }
     pub fn invalid_request(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32600,
-            message: msg.into(),
-            data: None,
-        }
+        Self::new(-32600, msg)
     }
     pub fn method_not_found(m: &str) -> Self {
-        Self {
-            code: -32601,
-            message: format!("method not found: {m}"),
-            data: None,
-        }
+        Self::new(-32601, format!("method not found: {m}"))
     }
     pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32602,
-            message: msg.into(),
-            data: None,
-        }
+        Self::new(-32602, msg)
     }
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32603,
-            message: msg.into(),
-            data: None,
-        }
+        Self::new(-32603, msg)
     }
     pub fn not_initialized() -> Self {
-        Self {
-            code: -32010,
-            message: "server not initialized".into(),
-            data: None,
-        }
+        Self::new(-32010, "server not initialized")
     }
     pub fn unknown_thread(id: &str) -> Self {
-        Self {
-            code: -32011,
-            message: format!("unknown thread: {id}"),
-            data: None,
-        }
+        Self::new(-32011, format!("unknown thread: {id}"))
     }
     pub fn turn_in_progress(id: &str) -> Self {
-        Self {
-            code: -32012,
-            message: format!("turn already in progress: {id}"),
-            data: None,
-        }
+        Self::new(-32012, format!("turn already in progress: {id}"))
     }
 }
 
@@ -140,6 +117,26 @@ pub enum Notification {
     },
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+/// 服务端 → 客户端通知的 JSON-RPC 2.0 信封。
+///
+/// `Notification` 自身只带 `method` / `params`,缺 `jsonrpc` 字段;发到线上
+/// 前需经本信封补齐 `"jsonrpc":"2.0"`。
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationEnvelope<'a> {
+    pub jsonrpc: &'a str,
+    #[serde(flatten)]
+    pub notification: &'a Notification,
+}
+
+impl<'a> NotificationEnvelope<'a> {
+    pub fn new(notification: &'a Notification) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            notification,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,14 +205,19 @@ mod tests {
     }
 
     #[test]
-    fn notification_serializes_with_method_tag() {
+    fn notification_serializes_with_jsonrpc_and_method_tag() {
         let n = Notification::TurnStarted {
             thread_id: "t1".into(),
             turn_id: "u1".into(),
         };
-        let v: Value = serde_json::to_value(&n).unwrap();
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
         assert_eq!(v["method"], "turn/started");
         assert_eq!(v["params"]["thread_id"], "t1");
+        assert!(
+            v.get("notification").is_none(),
+            "flattened envelope must not nest under `notification`"
+        );
     }
 
     #[test]

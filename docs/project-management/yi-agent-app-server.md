@@ -30,4 +30,4 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - [ ] 权限审批反向请求闭环（服务端 → 客户端请求 / 客户端响应）
 - [ ] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环）
 
-**验证命令：** `cargo test -p yi-agent-app-server`（12 个测试）
+**验证命令：** `cargo test -p yi-agent-app-server`（14 个测试）
