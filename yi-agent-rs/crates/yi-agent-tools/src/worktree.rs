@@ -392,20 +392,7 @@ impl WorktreeService {
     /// Exit code 0 means ancestor, 1 means not an ancestor, anything else is a
     /// real git error (for example an unknown revision).
     pub fn contains_commit(&self, worktree: &Path, rev: &str) -> Result<bool, WorktreeError> {
-        let output = Command::new("git")
-            .args(["merge-base", "--is-ancestor", rev, "HEAD"])
-            .current_dir(worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            }),
-        }
+        self.is_ancestor(worktree, rev, "HEAD")
     }
 
     pub fn remove_clean(
@@ -413,26 +400,7 @@ impl WorktreeService {
         owner_worktree: &Path,
         child_path: &Path,
     ) -> Result<(), WorktreeError> {
-        let status = git(child_path, &["status", "--porcelain"])?;
-        if !status.trim().is_empty() {
-            return Err(WorktreeError::DirtyChild {
-                path: child_path.to_path_buf(),
-            });
-        }
-        let output = Command::new("git")
-            .args(["worktree", "remove"])
-            .arg(child_path)
-            .current_dir(owner_worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        Ok(())
+        self.reclaim_directory(owner_worktree, child_path)
     }
 
     pub fn remove_created(
