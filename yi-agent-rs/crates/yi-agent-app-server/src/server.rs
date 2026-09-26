@@ -272,6 +272,7 @@ where
                             Arc::clone(&pending),
                             permission_timeout,
                             Arc::clone(&perm_seq),
+                            Arc::clone(&store),
                         ));
 
                         write_notification(
@@ -513,12 +514,17 @@ async fn run_thread_driver<W>(
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
     permission_timeout: Duration,
     perm_seq: Arc<AtomicU64>,
+    store: Arc<crate::thread_store::ThreadStore>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // 每个 thread 一个 translator:item 计数器跨 turn 单调递增,避免 id 重复。
     let mut translator = Translator::new(thread_id.clone());
     while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
+        // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
+        let mut completed_items: Vec<crate::protocol::Item> = Vec::new();
+        let mut last_usage: Option<crate::thread_store::TurnUsage> = None;
+        let prompt_for_title = prompt.clone();
         translator.set_turn(turn_id.clone());
 
         let mut stream = match agent.run(prompt).await {
@@ -596,7 +602,17 @@ async fn run_thread_driver<W>(
                             }
                         }
                         Some(e) => {
+                            if let yi_agent_core::AgentEvent::Usage { model, usage } = &e {
+                                last_usage = Some(crate::thread_store::TurnUsage {
+                                    model: model.clone(),
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                });
+                            }
                             for n in translator.on_event(e) {
+                                if let crate::protocol::Notification::ItemCompleted { item, .. } = &n {
+                                    completed_items.push(item.clone());
+                                }
                                 if write_notification(&writer, &n).await.is_err() {
                                     // 客户端可能已断开;先上报 Finished,
                                     // 避免 active_turn_id 永久卡住。
@@ -617,6 +633,27 @@ async fn run_thread_driver<W>(
                     // 继续消费 stream,直到 run loop 发 Cancelled 并结束。
                 }
             }
+        }
+
+        // 落盘(尽力而为):合成一条 userMessage item 放在首部,再拼本轮最终 item。
+        // 基线 server 不 emit userMessage,必须在此补齐,否则 resume 会丢用户提问。
+        let mut items = Vec::with_capacity(completed_items.len() + 1);
+        items.push(crate::protocol::Item::UserMessage {
+            id: format!("user-{turn_id}"),
+            text: prompt_for_title.clone(),
+        });
+        items.append(&mut completed_items);
+
+        let record = crate::thread_store::TurnLine::Turn {
+            items,
+            usage: last_usage.take(),
+            messages: agent.session().messages().to_vec(),
+        };
+        if let Err(e) = store.append_turn(&thread_id, &record) {
+            eprintln!("[app-server] failed to persist turn {turn_id} of {thread_id}: {e}");
+        }
+        if let Err(e) = store.touch(&thread_id, Some(prompt_for_title.as_str())) {
+            eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
         }
 
         let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
@@ -1271,6 +1308,9 @@ mod tests {
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let writer = Arc::new(MessageWriter::new(server_w));
 
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             build_delayed_agent(None).unwrap().agent,
@@ -1282,6 +1322,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
+            store,
         ));
 
         // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1336,6 +1377,9 @@ mod tests {
         drop(client_r); // 断开读端 → 写通知失败
         let writer = Arc::new(MessageWriter::new(server_w));
 
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             build_test_agent(None).unwrap().agent,
@@ -1347,6 +1391,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
+            store,
         ));
 
         prompt_tx
@@ -1377,6 +1422,9 @@ mod tests {
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let writer = Arc::new(MessageWriter::new(server_w));
 
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             build_test_agent(None).unwrap().agent,
@@ -1388,6 +1436,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
+            store,
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1726,6 +1775,9 @@ mod tests {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let perm_seq = Arc::new(AtomicU64::new(1));
 
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
         let built = build_permission_agent(None).unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
@@ -1738,6 +1790,7 @@ mod tests {
             Arc::clone(&pending),
             Duration::from_secs(60),
             Arc::clone(&perm_seq),
+            store,
         ));
 
         prompt_tx
@@ -1819,6 +1872,64 @@ mod tests {
         assert_eq!(loaded.meta.cwd, dir.path().display().to_string());
         assert!(loaded.meta.title.is_none(), "title starts empty");
         assert!(loaded.items.is_empty(), "no turns yet");
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_completion_persists_items_and_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = {
+            let mut c = test_config();
+            c.workdir = dir.path().to_path_buf();
+            c
+        };
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        let log = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.jsonl"));
+        // 落盘是尽力而为且发生在 driver 写完 turn/completed 之后,故轮询等待。
+        let mut text = String::new();
+        for _ in 0..100 {
+            match std::fs::read_to_string(&log) {
+                Ok(t) if !t.trim().is_empty() => {
+                    text = t;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(!text.is_empty(), "turn must be persisted");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one turn = one line");
+
+        // 第一行必须含合成的 userMessage item 与 agent 回复。
+        assert!(
+            text.contains(r#""type":"userMessage""#),
+            "missing user item: {text}"
+        );
+        assert!(text.contains("hello"), "missing prompt text: {text}");
+        assert!(
+            text.contains(r#""type":"agentMessage""#),
+            "missing agent item: {text}"
+        );
+        assert!(
+            text.contains(r#""role":"User""#),
+            "missing core message: {text}"
+        );
 
         h.shutdown().await;
     }
