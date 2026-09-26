@@ -37,6 +37,27 @@ pub struct ResponseEnvelope {
     pub error: Option<RpcError>,
 }
 
+/// 客户端 → 服务端、针对反向请求的响应(id 与请求匹配,无 `method`)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientResponse {
+    #[serde(default)]
+    pub jsonrpc: Option<String>,
+    pub id: RequestId,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<Value>,
+}
+
+/// 服务端 → 客户端的反向请求(带 `id`,需要客户端回响应)。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReverseRequest<'a> {
+    pub jsonrpc: &'a str,
+    pub id: String,
+    pub method: &'a str,
+    pub params: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcError {
     pub code: i64,
@@ -196,6 +217,34 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":"perm-3","method":"x","params":{}}"#;
         let req: RequestEnvelope = serde_json::from_str(raw).unwrap();
         assert!(matches!(req.id, RequestId::Str(ref s) if s == "perm-3"));
+    }
+
+    #[test]
+    fn client_response_parses_reverse_request_reply() {
+        let raw = r#"{"jsonrpc":"2.0","id":"perm-3","result":{"decision":"allow_once"}}"#;
+        let resp: ClientResponse = serde_json::from_str(raw).unwrap();
+        assert!(matches!(resp.id, RequestId::Str(ref s) if s == "perm-3"));
+        assert_eq!(resp.result.as_ref().unwrap()["decision"], "allow_once");
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn reverse_request_serializes_with_flat_envelope() {
+        let reverse = ReverseRequest {
+            jsonrpc: JSONRPC_VERSION,
+            id: "perm-1".into(),
+            method: "item/toolCall/requestApproval",
+            params: serde_json::json!({"tool_name": "bash"}),
+        };
+        let v: Value = serde_json::to_value(&reverse).unwrap();
+        assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
+        assert_eq!(v["id"], "perm-1");
+        assert_eq!(v["method"], "item/toolCall/requestApproval");
+        assert_eq!(v["params"]["tool_name"], "bash");
+        assert!(
+            v.get("reverse_request").is_none(),
+            "reverse request must not nest: {v}"
+        );
     }
 
     #[test]

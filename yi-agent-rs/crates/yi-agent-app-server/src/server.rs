@@ -7,24 +7,36 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
 
+use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::protocol::{
-    JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION, RequestEnvelope,
-    RequestId, ResponseEnvelope, RpcError,
+    ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
+    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError,
 };
 use crate::session::{ThreadSession, TurnPrompt};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 
+/// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
+const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// driver task → 主循环的完成事件。
 enum TurnEvent {
     Finished { thread_id: String, turn_id: String },
+}
+
+/// 工厂产出的 agent 及其权限决定通道。
+struct BuiltAgent {
+    agent: yi_agent_core::Agent,
+    /// 交互模式下的权限决定回传端;None 表示该 agent 不需要审批。
+    decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
 }
 
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
@@ -36,12 +48,15 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let cfg_for_factory = cfg.clone();
-    run_with(reader, writer, cfg, move || {
+    run_with(reader, writer, cfg, PERMISSION_TIMEOUT, move || {
         yi_agent_runtime::bootstrap::bootstrap_agent(
             &cfg_for_factory,
             yi_agent_runtime::bootstrap::PermissionMode::Interactive,
         )
-        .map(|b| b.agent)
+        .map(|b| BuiltAgent {
+            agent: b.agent,
+            decision_tx: b.decision_tx,
+        })
     })
     .await
 }
@@ -55,12 +70,13 @@ async fn run_with<R, W, F>(
     reader: R,
     writer: W,
     cfg: RuntimeConfig,
+    permission_timeout: Duration,
     build_agent: F,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    F: Fn() -> anyhow::Result<yi_agent_core::Agent> + Send + 'static,
+    F: Fn() -> anyhow::Result<BuiltAgent> + Send + 'static,
 {
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -89,6 +105,11 @@ where
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
+
+    // 反向权限请求的等待登记表:key 为 `perm-<request_id>`,value 为向 driver
+    // 回传决定的 oneshot 端。主循环在读到客户端响应时据此路由。
+    let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let mut initialized = false;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
@@ -119,8 +140,8 @@ where
                 if line.trim().is_empty() {
                     continue;
                 }
-                let req: RequestEnvelope = match serde_json::from_str(&line) {
-                    Ok(r) => r,
+                let value: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
                     Err(e) => {
                         tracing::warn!("app-server parse error: {e}");
                         // 畸形帧里没有可用的 id。JSON-RPC 2.0 要求此时响应
@@ -131,6 +152,25 @@ where
                             err_response(RequestId::Num(0), RpcError::parse_error(e.to_string())),
                         )
                         .await?;
+                        continue;
+                    }
+                };
+                let req: RequestEnvelope = match serde_json::from_value(value.clone()) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // 没有 `method`:可能是客户端对反向请求的响应。
+                        if let Ok(resp) = serde_json::from_value::<ClientResponse>(value) {
+                            route_client_response(resp, &pending).await;
+                        } else {
+                            write_response(
+                                &writer,
+                                err_response(
+                                    RequestId::Num(0),
+                                    RpcError::parse_error("malformed frame"),
+                                ),
+                            )
+                            .await?;
+                        }
                         continue;
                     }
                 };
@@ -169,7 +209,7 @@ where
                         let thread_id = format!("thread-{next_thread}");
                         next_thread += 1;
 
-                        let agent = match build_agent() {
+                        let BuiltAgent { agent, decision_tx } = match build_agent() {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -206,6 +246,9 @@ where
                             interrupt_rx,
                             driver_writer,
                             driver_turn_tx,
+                            decision_tx,
+                            Arc::clone(&pending),
+                            permission_timeout,
                         ));
 
                         write_notification(
@@ -375,11 +418,48 @@ async fn write_notification<W: tokio::io::AsyncWrite + Unpin>(
     writer.write_value(&NotificationEnvelope::new(n)).await
 }
 
+/// 把客户端对反向请求的响应路由到等待中的 driver。
+async fn route_client_response(
+    resp: ClientResponse,
+    pending: &Mutex<HashMap<String, oneshot::Sender<Decision>>>,
+) {
+    let RequestId::Str(key) = resp.id else {
+        tracing::warn!("ignoring client response with non-string id");
+        return;
+    };
+    let Some(tx) = pending.lock().await.remove(&key) else {
+        tracing::warn!("no pending approval request for id {key}");
+        return;
+    };
+    let _ = tx.send(parse_client_decision(resp.result.as_ref()));
+}
+
+/// 解析客户端的权限决定;任何未知/畸形取值一律按 Deny 处理(fail-safe)。
+fn parse_client_decision(result: Option<&serde_json::Value>) -> Decision {
+    let Some(result) = result else {
+        return Decision::Deny;
+    };
+    match result.get("decision").and_then(|d| d.as_str()) {
+        Some("allow_once") => Decision::AllowOnce,
+        Some("always_allow_tool") => Decision::AlwaysAllowTool,
+        Some("always_allow_prefix") => match result.get("prefix").and_then(|p| p.as_str()) {
+            Some(p) => Decision::AlwaysAllowPrefix(p.to_string()),
+            None => Decision::Deny,
+        },
+        _ => Decision::Deny,
+    }
+}
+
 /// 单个 thread 的 driver task:串行消费 turn,驱动 `agent.run()` 的 stream,
 /// 经 `Translator` 写成协议通知。
 ///
 /// **取消安全**:`Agent::run()` 每次都会重置 cancel token,因此必须在
 /// `run().await` 返回**之后**再取 `cancel_token()`,否则 `turn/interrupt` 无效。
+///
+/// **权限审批闭环**:遇到 `AgentEvent::PermissionRequest` 时,driver 发出反向
+/// 请求 `item/toolCall/requestApproval`(id = `perm-<request_id>`)并等待客户端
+/// 经 `pending` 登记表回传的决定;超时或中断按 `Deny` 处理。
+#[allow(clippy::too_many_arguments)]
 async fn run_thread_driver<W>(
     thread_id: String,
     mut agent: yi_agent_core::Agent,
@@ -387,6 +467,9 @@ async fn run_thread_driver<W>(
     mut interrupt_rx: mpsc::Receiver<String>,
     writer: Arc<MessageWriter<W>>,
     turn_tx: mpsc::Sender<TurnEvent>,
+    decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
+    permission_timeout: Duration,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -420,6 +503,52 @@ async fn run_thread_driver<W>(
             tokio::select! {
                 ev = stream.next() => {
                     match ev {
+                        Some(yi_agent_core::AgentEvent::PermissionRequest {
+                            request_id, tool_name, tool_input, prefix_suggestion, kind,
+                        }) => {
+                            let perm_id = format!("perm-{request_id}");
+                            let (dtx, drx) = oneshot::channel::<Decision>();
+                            pending.lock().await.insert(perm_id.clone(), dtx);
+
+                            let reverse = ReverseRequest {
+                                jsonrpc: JSONRPC_VERSION,
+                                id: perm_id.clone(),
+                                method: "item/toolCall/requestApproval",
+                                params: json!({
+                                    "thread_id": thread_id,
+                                    "turn_id": turn_id,
+                                    "request_id": request_id,
+                                    "tool_name": tool_name,
+                                    "tool_input": tool_input,
+                                    "prefix_suggestion": prefix_suggestion,
+                                    "kind": kind,
+                                }),
+                            };
+                            if writer.write_value(&reverse).await.is_err() {
+                                pending.lock().await.remove(&perm_id);
+                                let _ = turn_tx.send(TurnEvent::Finished { thread_id: thread_id.clone(), turn_id: turn_id.clone() }).await;
+                                return;
+                            }
+
+                            // 等客户端决定;超时或中断按 Deny 处理。
+                            let decision = tokio::select! {
+                                d = drx => d.unwrap_or(Decision::Deny),
+                                _ = tokio::time::sleep(permission_timeout) => {
+                                    pending.lock().await.remove(&perm_id);
+                                    Decision::Deny
+                                }
+                                _ = interrupt_rx.recv(), if !cancel_sent => {
+                                    cancel_sent = true;
+                                    cancel_token.cancel();
+                                    pending.lock().await.remove(&perm_id);
+                                    Decision::Deny
+                                }
+                            };
+
+                            if let Some(tx) = &decision_tx {
+                                let _ = tx.send((request_id, decision)).await;
+                            }
+                        }
                         Some(e) => {
                             for n in translator.on_event(e) {
                                 if write_notification(&writer, &n).await.is_err() {
@@ -498,6 +627,7 @@ fn extract_prompt(params: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -578,28 +708,37 @@ mod tests {
         }
     }
 
-    fn build_test_agent() -> anyhow::Result<yi_agent_core::Agent> {
-        Ok(yi_agent_core::Agent::new(
-            Arc::new(MockProvider),
-            Arc::new(yi_agent_core::ToolRegistry::new()),
-            yi_agent_core::AgentConfig::default(),
-        ))
+    fn build_test_agent() -> anyhow::Result<BuiltAgent> {
+        Ok(BuiltAgent {
+            agent: yi_agent_core::Agent::new(
+                Arc::new(MockProvider),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                yi_agent_core::AgentConfig::default(),
+            ),
+            decision_tx: None,
+        })
     }
 
-    fn build_slow_agent() -> anyhow::Result<yi_agent_core::Agent> {
-        Ok(yi_agent_core::Agent::new(
-            Arc::new(SlowProvider),
-            Arc::new(yi_agent_core::ToolRegistry::new()),
-            yi_agent_core::AgentConfig::default(),
-        ))
+    fn build_slow_agent() -> anyhow::Result<BuiltAgent> {
+        Ok(BuiltAgent {
+            agent: yi_agent_core::Agent::new(
+                Arc::new(SlowProvider),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                yi_agent_core::AgentConfig::default(),
+            ),
+            decision_tx: None,
+        })
     }
 
-    fn build_delayed_agent() -> anyhow::Result<yi_agent_core::Agent> {
-        Ok(yi_agent_core::Agent::new(
-            Arc::new(DelayedProvider),
-            Arc::new(yi_agent_core::ToolRegistry::new()),
-            yi_agent_core::AgentConfig::default(),
-        ))
+    fn build_delayed_agent() -> anyhow::Result<BuiltAgent> {
+        Ok(BuiltAgent {
+            agent: yi_agent_core::Agent::new(
+                Arc::new(DelayedProvider),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                yi_agent_core::AgentConfig::default(),
+            ),
+            decision_tx: None,
+        })
     }
 
     fn test_config() -> RuntimeConfig {
@@ -631,17 +770,23 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            Self::with_factory(build_test_agent)
+            Self::with_factory(build_test_agent, PERMISSION_TIMEOUT)
         }
 
-        /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断测试需要)。
-        fn with_factory<F>(build: F) -> Self
+        /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
+        fn with_factory<F>(build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn() -> anyhow::Result<yi_agent_core::Agent> + Send + 'static,
+            F: Fn() -> anyhow::Result<BuiltAgent> + Send + 'static,
         {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-            let handle = tokio::spawn(run_with(server_r, server_w, test_config(), build));
+            let handle = tokio::spawn(run_with(
+                server_r,
+                server_w,
+                test_config(),
+                permission_timeout,
+                build,
+            ));
             Self {
                 client_w,
                 client_r: BufReader::new(client_r),
@@ -799,6 +944,7 @@ mod tests {
             server_r,
             server_w,
             test_config(),
+            PERMISSION_TIMEOUT,
             build_test_agent,
         ));
 
@@ -842,9 +988,13 @@ mod tests {
     async fn agent_factory_failure_returns_internal_error() {
         let (mut client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-        let handle = tokio::spawn(run_with(server_r, server_w, test_config(), || {
-            Err::<yi_agent_core::Agent, _>(anyhow::anyhow!("boom"))
-        }));
+        let handle = tokio::spawn(run_with(
+            server_r,
+            server_w,
+            test_config(),
+            PERMISSION_TIMEOUT,
+            || Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
+        ));
 
         let mut client_r = BufReader::new(client_r);
 
@@ -890,6 +1040,7 @@ mod tests {
             server_r,
             server_w,
             test_config(),
+            PERMISSION_TIMEOUT,
             build_test_agent,
         ));
 
@@ -1000,7 +1151,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn turn_start_while_turn_in_progress_returns_turn_in_progress() {
-        let mut h = Harness::with_factory(build_slow_agent);
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
         let tid = start_thread(&mut h).await;
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
@@ -1032,7 +1183,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn turn_interrupt_cancels_active_turn() {
-        let mut h = Harness::with_factory(build_slow_agent);
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
         let tid = start_thread(&mut h).await;
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
@@ -1075,11 +1226,14 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent().unwrap(),
+            build_delayed_agent().unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
             turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(60),
         ));
 
         // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1136,11 +1290,14 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent().unwrap(),
+            build_test_agent().unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
             turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(60),
         ));
 
         prompt_tx
@@ -1173,11 +1330,14 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent().unwrap(),
+            build_test_agent().unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
             turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(60),
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1231,5 +1391,212 @@ mod tests {
 
         drop(prompt_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// 第一次调用触发一个受权限管控的 bash 工具调用;第二次调用返回文本并结束。
+    struct PermissionMockProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for PermissionMockProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            use yi_agent_core::provider::{ProviderEvent, StopReason};
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = if n == 0 {
+                vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "c1".into(),
+                        partial_json: r#"{"cmd":"ls"}"#.into(),
+                    },
+                    ProviderEvent::ToolUseEnd { id: "c1".into() },
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                    },
+                ]
+            } else {
+                vec![
+                    ProviderEvent::TextDelta("done".into()),
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                    },
+                ]
+            };
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    struct FakeBash;
+
+    #[async_trait]
+    impl yi_agent_core::Tool for FakeBash {
+        fn name(&self) -> &str {
+            "bash"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn description(&self) -> &str {
+            "fake bash"
+        }
+        async fn call(&self, _args: serde_json::Value) -> yi_agent_core::ToolResult {
+            yi_agent_core::ToolResult::text("ran")
+        }
+    }
+
+    /// 构造一个会触发 bash 审批的 agent,并把决定通道交给 driver。
+    fn build_permission_agent() -> anyhow::Result<BuiltAgent> {
+        let provider = Arc::new(PermissionMockProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        registry.register(Arc::new(FakeBash));
+        let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+            yi_agent_core::permission::PermissionsConfig::default(),
+            false,
+            std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+            Arc::new(|_cmd: &str| None),
+        ));
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
+        let rx_arc = Arc::new(Mutex::new(decision_rx));
+        let agent = yi_agent_core::Agent::new(
+            provider,
+            Arc::new(registry),
+            yi_agent_core::AgentConfig::default(),
+        )
+        .with_permission(checker, rx_arc);
+        Ok(BuiltAgent {
+            agent,
+            decision_tx: Some(decision_tx),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permission_request_round_trip_allows_tool() {
+        let mut h = Harness::with_factory(build_permission_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        let mut saw_request = false;
+        let mut saw_tool_started = false;
+        let mut perm_id: Option<String> = None;
+        for _ in 0..20 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("item/toolCall/requestApproval") => {
+                    assert_eq!(v["id"], "perm-1", "reverse request id: {v}");
+                    assert_eq!(v["params"]["tool_name"], "bash", "reverse params: {v}");
+                    perm_id = v["id"].as_str().map(|s| s.to_string());
+                    saw_request = true;
+                    break;
+                }
+                Some("item/started") if v["params"]["item"]["type"] == "toolCall" => {
+                    saw_tool_started = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_request,
+            "expected an item/toolCall/requestApproval request"
+        );
+        let perm_id = perm_id.expect("reverse request must carry a string id");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":"{perm_id}","result":{{"decision":"allow_once"}}}}"#
+        ))
+        .await;
+
+        let mut completed: Option<serde_json::Value> = None;
+        for _ in 0..20 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("item/started") if v["params"]["item"]["type"] == "toolCall" => {
+                    saw_tool_started = true;
+                }
+                Some("turn/completed") => {
+                    completed = Some(v);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let completed = completed.expect("expected a turn/completed notification");
+        assert_eq!(completed["params"]["status"], "completed");
+        assert!(
+            saw_tool_started,
+            "an allowed tool must emit an item/started toolCall item"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permission_timeout_defaults_to_deny() {
+        let mut h = Harness::with_factory(build_permission_agent, Duration::from_millis(150));
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        let mut saw_request = false;
+        let mut saw_tool_started = false;
+        for _ in 0..20 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("item/toolCall/requestApproval") => {
+                    assert_eq!(v["id"], "perm-1", "reverse request id: {v}");
+                    saw_request = true;
+                    break;
+                }
+                Some("item/started") if v["params"]["item"]["type"] == "toolCall" => {
+                    saw_tool_started = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_request,
+            "expected an item/toolCall/requestApproval request"
+        );
+
+        // 不回复:driver 应在超时后按 Deny 处理,turn 仍能正常完成。
+        let mut completed: Option<serde_json::Value> = None;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("item/started") if v["params"]["item"]["type"] == "toolCall" => {
+                    saw_tool_started = true;
+                }
+                Some("turn/completed") => {
+                    completed = Some(v);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let completed = completed.expect("expected a turn/completed notification");
+        assert_eq!(
+            completed["params"]["status"], "completed",
+            "the agent must not hang after a permission timeout"
+        );
+        assert!(
+            !saw_tool_started,
+            "a denied tool must not emit an item/started toolCall item"
+        );
+        h.shutdown().await;
     }
 }
