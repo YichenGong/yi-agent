@@ -10,6 +10,7 @@ members = [
     "crates/yi-agent-web",
     "crates/yi-agent-skills",
     "crates/yi-agent-runtime",
+    "crates/yi-agent-app-server",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ yi-agent-store = { path = "crates/yi-agent-store" }
 yi-agent-web = { path = "crates/yi-agent-web" }
 yi-agent-skills = { path = "crates/yi-agent-skills" }
 yi-agent-runtime = { path = "crates/yi-agent-runtime" }
+yi-agent-app-server = { path = "crates/yi-agent-app-server" }
 
 # 共享公共依赖
 tokio = { version = "1", features = ["full"] }
