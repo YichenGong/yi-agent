@@ -4,10 +4,12 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run sidecar && vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "sidecar": "bash scripts/build-sidecar.sh",
+    "sidecar:release": "bash scripts/build-sidecar.sh release",
     "tauri": "tauri"
   },
   "dependencies": {
