@@ -1,4 +1,4 @@
-import { memo, type MouseEvent, type ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -10,13 +10,21 @@ import "highlight.js/styles/github-dark.css";
  * 非 Tauri 环境(vitest / 浏览器开发)下 `openUrl` 会 reject,吞掉即可。
  */
 function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
-  const onClick = (e: MouseEvent<HTMLAnchorElement>) => {
-    if (!href || !/^https?:/i.test(href)) return;
-    e.preventDefault();
-    void openUrl(href).catch(() => {});
-  };
+  const isHttp = !!href && /^https?:/i.test(href);
+  if (!isHttp) {
+    // 非 http(s)(相对路径、被 urlTransform 清空的危险协议等)渲染为惰性文本,
+    // 避免 webview 被导航走或整页重载。
+    return <span>{children}</span>;
+  }
   return (
-    <a href={href} onClick={onClick} rel="noreferrer">
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault();
+        void openUrl(href).catch(() => {});
+      }}
+      rel="noreferrer"
+    >
       {children}
     </a>
   );
