@@ -29,9 +29,11 @@ pub struct ResponseEnvelope {
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub id: RequestId,
-    #[serde(default)]
+    /// 成功响应时省略;与 `error` 互斥。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(default)]
+    /// 错误响应时省略;与 `result` 互斥。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
 }
 

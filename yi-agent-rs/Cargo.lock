@@ -3677,12 +3677,16 @@ name = "yi-agent-app-server"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "yi-agent-core",
  "yi-agent-runtime",
+ "yi-agent-tools",
 ]
 
 [[package]]

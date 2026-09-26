@@ -27,8 +27,9 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - [x] 会话条目模型 `Item`（`userMessage` / `agentMessage` / `toolCall`）与 `ToolStatus`；`None` 字段序列化时省略 — `src/protocol.rs:152` / `src/protocol.rs:174`
 - [x] stdio JSONL 传输：`MessageReader::next_line`（CRLF 归一、EOF 返回 `None`、内容超过 `MAX_FRAME_BYTES`（不含行终止符）报错）、`MessageWriter::write_value`（序列化失败返回错误，不 panic 不静默丢弃）— `src/transport.rs:29` / `src/transport.rs:67`
 - [x] `AgentEvent` → 通知翻译层 `translate.rs`（`Translator::on_event`）— `src/translate.rs:36`
-- [ ] thread/turn 状态机 + server 主循环
+- [x] server 主循环 + thread/start（`initialize` / `thread/start` / `config/read` / 错误码 / EOF 退出）— `src/server.rs:33`
+- [ ] turn/start + turn/interrupt + driver task（当前占位返回 `method_not_found`）— `src/server.rs`
 - [ ] 权限审批反向请求闭环（服务端 → 客户端请求 / 客户端响应）
 - [ ] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环）
 
-**验证命令：** `cargo test -p yi-agent-app-server`（44 个测试）
+**验证命令：** `cargo test -p yi-agent-app-server`（50 个测试）
