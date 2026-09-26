@@ -321,15 +321,18 @@ impl AgentSupervisor {
         self.workspace_modes.insert(task_id.clone(), mode);
     }
 
-    /// The task's workspace mode. A root with no explicit entry is coding (it
-    /// owns session isolation); an unregistered non-root task is read-only.
+    /// The task's workspace mode. A registered entry wins; otherwise the root
+    /// defaults to `Coding` (it owns session isolation) and any other task to
+    /// `ReadOnly`. The root's implicit `Coding` is a default pending persisted
+    /// mode hydration.
     pub fn workspace_mode(&self, task_id: &TaskId) -> TaskWorkspaceMode {
         if let Some(mode) = self.workspace_modes.get(task_id) {
             return *mode;
         }
-        match self.tasks.get(task_id).map(|task| task.depth) {
-            Some(super::task::TaskDepth::Root) => TaskWorkspaceMode::Coding,
-            _ => TaskWorkspaceMode::ReadOnly,
+        if task_id == &self.root_task_id {
+            TaskWorkspaceMode::Coding
+        } else {
+            TaskWorkspaceMode::ReadOnly
         }
     }
 
@@ -1716,12 +1719,13 @@ impl Tool for SpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
-        let mode = match args.get("mode").and_then(Value::as_str) {
+        let mode = match args.get("mode") {
             None => TaskWorkspaceMode::ReadOnly,
-            Some(value) => match TaskWorkspaceMode::parse(value) {
+            Some(Value::String(value)) => match TaskWorkspaceMode::parse(value) {
                 Some(mode) => mode,
                 None => return ToolResult::error("mode must be 'coding' or 'read_only'"),
             },
+            Some(_) => return ToolResult::error("mode must be a string"),
         };
         let mut supervisor = self
             .tools
