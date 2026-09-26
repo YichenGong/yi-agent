@@ -3758,7 +3758,7 @@ mod provider_turn_admission_tests {
         let root = RootSessionId::new();
         let missing_task = TaskId::new();
         let valid_task = TaskId::new();
-        let repository = test_repository(&root, &[valid_task.clone()]);
+        let repository = test_repository(&root, std::slice::from_ref(&valid_task));
         let admissions = ProviderTurnAdmissions::new(Arc::new(Mutex::new(resources)), repository);
 
         // The foreign-key write fails because this task was never persisted.

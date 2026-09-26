@@ -106,7 +106,7 @@ fn fragmented_status_frames_preserve_request_correlation() {
     let directory = TempDir::new().unwrap();
     let daemon = Daemon::start(
         directory.path().join("runtime"),
-        &directory.path().join("runtime.sqlite"),
+        directory.path().join("runtime.sqlite"),
     )
     .unwrap();
     let envelope = RequestEnvelope {
@@ -132,7 +132,7 @@ fn malformed_and_oversized_clients_do_not_stop_healthy_requests() {
     let directory = TempDir::new().unwrap();
     let daemon = Daemon::start(
         directory.path().join("runtime"),
-        &directory.path().join("runtime.sqlite"),
+        directory.path().join("runtime.sqlite"),
     )
     .unwrap();
     for frame in [

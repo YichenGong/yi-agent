@@ -2113,12 +2113,13 @@ async fn restart_hydrates_rework_once_with_its_durable_message_id() {
 
     first_restart.start_worker(&session, &child).await.unwrap();
 
-    let first_starts = first_factory.starts.lock().unwrap();
-    assert_eq!(first_starts.len(), 1);
-    assert_eq!(first_starts[0].attempt_id, successor);
-    assert_eq!(first_starts[0].initial_user_messages.len(), 1);
-    assert_eq!(first_starts[0].initial_user_messages[0].id, feedback_id);
-    drop(first_starts);
+    {
+        let first_starts = first_factory.starts.lock().unwrap();
+        assert_eq!(first_starts.len(), 1);
+        assert_eq!(first_starts[0].attempt_id, successor);
+        assert_eq!(first_starts[0].initial_user_messages.len(), 1);
+        assert_eq!(first_starts[0].initial_user_messages[0].id, feedback_id);
+    }
     assert!(
         RuntimeRepository::open(&database)
             .unwrap()
@@ -2214,8 +2215,8 @@ fn git_output(directory: &Path, args: &[&str]) -> Result<String, WorkerError> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(String::from_utf8(output.stdout)
-        .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?)
+    String::from_utf8(output.stdout)
+        .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
 }
 
 fn git_ok(directory: &Path, args: &[&str]) -> Result<(), WorkerError> {
@@ -3407,11 +3408,12 @@ async fn retry_replays_an_unconsumed_external_override_but_not_an_acknowledged_o
         .unwrap();
     coordinator.retry_task(&session, &root).await.unwrap();
 
-    let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 2);
-    assert_eq!(starts[1].initial_user_messages.len(), 1);
-    let message_id = starts[1].initial_user_messages[0].id.clone();
-    drop(starts);
+    let message_id = {
+        let starts = factory.starts.lock().unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1].initial_user_messages.len(), 1);
+        starts[1].initial_user_messages[0].id.clone()
+    };
 
     factory.handles.lock().unwrap()[1].report_message_consumed(message_id);
     coordinator.reconcile_worker_events().await.unwrap();

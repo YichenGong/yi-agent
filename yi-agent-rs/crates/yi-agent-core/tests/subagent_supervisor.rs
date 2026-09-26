@@ -61,7 +61,7 @@ fn spawning_enqueues_child_and_emits_a_structured_event() {
 
     let child = supervisor.spawn(root.clone()).unwrap();
 
-    assert_eq!(supervisor.children_of(&root), &[child.clone()]);
+    assert_eq!(supervisor.children_of(&root), std::slice::from_ref(&child));
     assert!(matches!(
         supervisor.events().last(),
         Some(SupervisorEvent::TaskSpawned { parent_id, task_id }) if parent_id == &root && task_id == &child
@@ -152,16 +152,17 @@ async fn spawn_tool_parses_optional_mode_and_rejects_invalid_values() {
     assert!(!coding_result.is_error);
     let coding_child = spawned_child_id(&coding_result.content);
 
-    let supervisor = supervisor.lock().unwrap();
-    assert_eq!(
-        supervisor.workspace_mode(&default_child),
-        TaskWorkspaceMode::ReadOnly
-    );
-    assert_eq!(
-        supervisor.workspace_mode(&coding_child),
-        TaskWorkspaceMode::Coding
-    );
-    drop(supervisor);
+    {
+        let supervisor = supervisor.lock().unwrap();
+        assert_eq!(
+            supervisor.workspace_mode(&default_child),
+            TaskWorkspaceMode::ReadOnly
+        );
+        assert_eq!(
+            supervisor.workspace_mode(&coding_child),
+            TaskWorkspaceMode::Coding
+        );
+    }
 
     // Unknown enum values are rejected rather than defaulted.
     assert!(
@@ -446,15 +447,13 @@ async fn worker_consumption_acknowledges_a_user_override_only_after_inbox_receip
     supervisor.start_worker(&factory, &child).await.unwrap();
     assert!(supervisor.take_consumed_user_override_ids().is_empty());
 
-    let received = handle
+    let mut mailbox = handle
         .lock()
         .unwrap()
         .as_ref()
         .unwrap()
-        .subscribe_messages()
-        .recv()
-        .await
-        .unwrap();
+        .subscribe_messages();
+    let received = mailbox.recv().await.unwrap();
     assert_eq!(received.id, message_id);
     assert!(supervisor.take_consumed_user_override_ids().is_empty());
 
@@ -587,6 +586,8 @@ async fn send_message_delivers_to_a_direct_child_mailbox() {
     );
 }
 
+// `start_worker` takes `&mut self`, so the guard must span the await.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn send_message_wakes_the_recipient_worker_inbox() {
     let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
@@ -686,15 +687,14 @@ async fn wait_any_returns_after_the_first_terminal_child() {
 
     let result = waiting.await.unwrap();
     assert!(!result.is_error);
-    assert_eq!(
-        supervisor
+    assert!(
+        !supervisor
             .lock()
             .unwrap()
             .task(&second)
             .unwrap()
             .state()
-            .is_terminal(),
-        false
+            .is_terminal()
     );
 }
 

@@ -16,7 +16,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - 两步退出确认（仅 Ctrl+C 两次退出）
 - 输入排队（agent 运行期间粘贴的输入进队列，结束后回放）
 - 状态栏（实时 token 计数 + 模型名 + 运行中任务指示）
-- Bash 全屏弹窗（Ctrl+P 查看运行中/已完成 bash 实时输出 + exit code）
+- 运行时全屏弹窗（Ctrl+P 打开，Bash Tasks / Processes 两个 tab；Bash tab 查看运行中/已完成 bash 实时输出 + exit code，Processes tab 查看托管进程状态并支持 kill 确认）
 
 **不做什么：**
 - 不做 InlineRenderer 的功能扩展（已 deprecated，待移除）
@@ -36,7 +36,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] 输入框光标可见 — `tui/input.rs` 反色显示（白底黑字）
 - [x] 输入排队 — `tui/queued.rs::QueuedInput` 在 agent 运行期间缓存输入 — [设计](../plans/2026-07-25-tui-queued-input-design.md)
 - [x] 状态栏 — `tui/statusbar.rs` 显示实时 token + 模型名 + 运行中任务 — [设计](../plans/2026-07-25-task-perception-design.md)
-- [x] Bash 全屏弹窗 — `tui/bash_popup.rs` Ctrl+P 打开，显示实时输出 + exit code — [设计](../plans/2026-07-25-task-perception-design.md)
+- [x] Bash 全屏弹窗 — `tui/app.rs::RuntimePopup` Ctrl+P 打开默认 Bash tab，`tui/bash_popup.rs` 显示实时输出 + exit code — [设计](../plans/2026-07-25-task-perception-design.md)
 - [x] Ctrl+P managed process tab — `tui/process_popup.rs` and `tui/app.rs` add a `Processes` tab beside Bash Tasks, showing managed process status/output and kill confirmation; verification: `cargo test -p yi-agent --bin yi-agent tui::process_popup::tests` and `cargo test -p yi-agent --bin yi-agent runtime_popup`
 - [x] 托管后台进程状态栏计数 — `tui/app.rs::is_active_managed_process` 统计 `Starting` / `Running` / `Ready` 快照，`tui/statusbar.rs::render_statusbar` 显示无耗时的 `N proc running`；验证：`cargo test -p yi-agent --bin yi-agent tui::statusbar::tests` 和 `cargo test -p yi-agent --bin yi-agent active_managed_process_statuses_exclude_terminal_states`
 - [x] Ctrl+P 仅显示 Bash 任务 — `tui/app.rs::route_event` 只注册 `bash` 工具调用，避免其他工具显示空详情；验证：`cargo test -p yi-agent --bin yi-agent tui::app::tests::test_route_event_tracks_only_bash_tool_calls`
