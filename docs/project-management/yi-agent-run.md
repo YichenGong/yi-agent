@@ -27,6 +27,7 @@
 - [x] `--json` JSONL 输出 — `AgentEvent` 实现 `Serialize`，`--json` 切换输出格式
 - [x] `--stdin` 追加输入 — `config.rs::Run.stdin` flag 读取 stdin
 - [x] `--naked` 裸模型模式 — `main.rs` naked 分支跳过工具/skills/系统提示词 — [设计](../plans/2026-07-26-run-naked-flag-design.md)
-- [x] 配置层级合并 — `config.rs::load_env_files()` 本地覆盖全局 — [设计](../plans/2026-07-25-config-layering-design.md)
+- [x] 配置层级合并 — 由 `yi-agent-runtime/src/config.rs`（`RuntimeConfig::load`）实现本地 `.yi-agent/.env` 覆盖全局 `~/.yi-agent/.env` — [设计](../plans/2026-07-25-config-layering-design.md)
+- [x] headless 工具集与 TUI 对齐 — `yi-agent-runtime/src/bootstrap.rs::build_tool_setup_in` 注册内置工具 + 进程工具 + `SkillTool`（`--naked` 除外，`--subagents` 时改用 `build_headless_root_tools`）；验证：`cargo test -p yi-agent --bin yi-agent build_headless_setup_`
 - [x] 真实 LLM 端到端测试 — `crates/yi-agent/tests/e2e_real.rs` 用 `#[ignore]` gate — [设计](../plans/2026-07-26-real-llm-testing-design.md)
 - [x] 复杂 one-shot 任务测试(Tier 3)— `crates/yi-agent/tests/e2e_complex.rs` 4 个场景 — [设计](../plans/2026-07-26-graded-test-system-design.md)

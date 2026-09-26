@@ -27,5 +27,5 @@ yi-agent 的 skills 系统，提供可发现的 skill 目录（类似 Claude Cod
 - [x] 多根目录发现与 YAML 加载 — `discovery.rs::discover_skills()` + `loader.rs` 实现 YAML 解析校验
 - [x] `SkillsService` — `service.rs::SkillsService` 提供 `snapshot()` / `render_catalog()` / `full_catalog_size()`
 - [x] 系统内置 skill 安装 — `system.rs::install_system_skills()` + `assets/` 目录含内置 skill 定义
-- [x] `SkillTool` 注册到 agent — `crates/yi-agent-tools/src/skill_tool.rs` 实现 `Tool` trait，`main.rs:105` 注册
-- [x] 系统提示词注入 skill catalog — `main.rs::resolve_system_prompt_with_skills()` 按 `--skills-catalog-budget` 截断注入
+- [x] `SkillTool` 注册到 agent — `crates/yi-agent-tools/src/skill_tool.rs` 实现 `Tool` trait；注册点：`yi-agent-runtime/src/bootstrap.rs:114`（TUI / headless）、`crates/yi-agent/src/main.rs`（daemon worker / TUI 根工具）
+- [x] 系统提示词注入 skill catalog — `yi-agent-runtime/src/bootstrap.rs::resolve_system_prompt_with_skills()` 按 `--skills-catalog-budget` 截断注入；验证：`cargo test -p yi-agent-runtime --lib resolve_system_prompt_with_skills_`
