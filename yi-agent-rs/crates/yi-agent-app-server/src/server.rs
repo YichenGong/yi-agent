@@ -1801,24 +1801,24 @@ mod tests {
         let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
 
         let tid = start_thread(&mut h).await;
+        let uuid_part = tid
+            .strip_prefix("thread-")
+            .unwrap_or_else(|| panic!("expected thread-<uuid>, got {tid}"));
         assert!(
-            tid.starts_with("thread-"),
-            "expected thread-<uuid>, got {tid}"
-        );
-        assert!(
-            tid.len() > "thread-".len() + 8,
-            "expected a uuid suffix: {tid}"
+            uuid_part.parse::<uuid::Uuid>().is_ok(),
+            "suffix must be a uuid: {tid}"
         );
 
-        let meta = dir
-            .path()
-            .join(".yi-agent/threads")
-            .join(format!("{tid}.meta.json"));
-        assert!(
-            meta.exists(),
-            "thread/start must write meta at {}",
-            meta.display()
-        );
+        // 通过 store API 读取,锁住落盘内容(不依赖文件布局细节)。
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("thread/start must persist meta");
+        assert_eq!(loaded.meta.thread_id, tid);
+        assert_eq!(loaded.meta.model, "test-model");
+        assert_eq!(loaded.meta.cwd, dir.path().display().to_string());
+        assert!(loaded.meta.title.is_none(), "title starts empty");
+        assert!(loaded.items.is_empty(), "no turns yet");
 
         h.shutdown().await;
     }
