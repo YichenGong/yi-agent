@@ -92,10 +92,17 @@ pub struct AgentConfig {
     /// Complete raw tool interaction token budget retained during compact.
     pub compact_tool_budget_tokens: usize,
     /// Max idle time (no provider events) during THINK before the stream is
-    /// considered stalled. When elapsed, the agent emits `Done { EndTurn }`
-    /// with whatever content was accumulated so far. `None` disables the idle
-    /// timeout (stream can hang forever, as before).
+    /// considered stalled. When elapsed, the stream is treated as stalled and
+    /// retried up to `think_stall_retry_limit` times before the turn is
+    /// interrupted. `None` disables the idle timeout (stream can hang forever,
+    /// as before).
     pub think_idle_timeout: Option<std::time::Duration>,
+    /// Max automatic retries when the THINK stream stalls (no provider event
+    /// within `think_idle_timeout`). `0` disables stall retries.
+    pub think_stall_retry_limit: u16,
+    /// Base delay for stall retry backoff. Attempt `n` (1-based) waits
+    /// `base * 2^(n-1)`, capped at 30s. Defaults to 2s → 2s/4s/8s.
+    pub think_stall_backoff_base: std::time::Duration,
 }
 
 impl Default for AgentConfig {
@@ -113,6 +120,8 @@ impl Default for AgentConfig {
             // thinking) but bounded so a stalled connection eventually
             // resolves instead of hanging forever.
             think_idle_timeout: Some(std::time::Duration::from_secs(60)),
+            think_stall_retry_limit: 3,
+            think_stall_backoff_base: std::time::Duration::from_secs(2),
         }
     }
 }
@@ -200,6 +209,15 @@ pub enum AgentEvent {
     /// An explicitly retryable tool failed and is being retried internally.
     ToolRetry {
         id: String,
+    },
+    /// The THINK stream stalled and is being retried internally. `attempt` is
+    /// the 1-based retry number, `max` the configured retry limit, and
+    /// `idle_secs` how long the stream was silent. Consumers must surface this
+    /// to the user: a silent retry leaves the user staring at a frozen screen.
+    ProviderRetry {
+        attempt: u16,
+        max: u16,
+        idle_secs: u64,
     },
     ToolOutputDelta {
         id: String,
@@ -396,6 +414,14 @@ impl Agent {
     }
 }
 
+/// Delay before stall retry `attempt` (1-based): `base * 2^(attempt-1)`,
+/// capped at 30s to match the runtime retry policy.
+fn stall_backoff_delay(base: std::time::Duration, attempt: u16) -> std::time::Duration {
+    let shift = u32::from(attempt.saturating_sub(1)).min(5);
+    let scaled = base.saturating_mul(1u32 << shift);
+    scaled.min(std::time::Duration::from_secs(30))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: mpsc::Sender<AgentEvent>,
@@ -482,70 +508,117 @@ async fn run_loop(
         let prefill_estimate = estimate_prefill_tokens(&req);
         let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
-        let provider_turn_lease = match &provider_turn_gate {
-            Some(gate) => match tokio::select! {
-                lease = gate.acquire() => lease,
+        // Retry loop for a transiently stalled THINK stream. Each attempt is a
+        // fresh provider turn (own lease); a stalled attempt's partial content
+        // is not committed to the session.
+        let mut stall_retries: u16 = 0;
+        let (content, stop_reason, last_usage) = loop {
+            let provider_turn_lease = match &provider_turn_gate {
+                Some(gate) => match tokio::select! {
+                    lease = gate.acquire() => lease,
+                    _ = cancel_token.cancelled() => {
+                        let _ = tx.send(AgentEvent::Cancelled).await;
+                        return;
+                    }
+                } {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
+                            .await;
+                        return;
+                    }
+                },
+                None => None,
+            };
+
+            let stream = match provider.call_stream(req.clone()).await {
+                Ok(s) => {
+                    tracing::info!(
+                        turn,
+                        "provider call_stream returned Ok, entering accumulate"
+                    );
+                    s
+                }
+                Err(e) => {
+                    warn!(turn, error = %e, "provider call failed");
+                    if tx
+                        .send(AgentEvent::Error(AgentError::Provider(e)))
+                        .await
+                        .is_err()
+                    {
+                        return; // Receiver dropped, stop the loop
+                    }
+                    return;
+                }
+            };
+
+            // Check 2: THINK 中 — select! between accumulate and cancel
+            let attempt = tokio::select! {
+                result = accumulate_provider_stream(stream, &tx, &model, config.think_idle_timeout) => match result {
+                    Ok(v) => {
+                        tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
+                        v
+                    }
+                    Err(e) => {
+                        warn!(turn, error = %e, "provider stream error");
+                        if tx.send(AgentEvent::Error(e)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                },
                 _ = cancel_token.cancelled() => {
+                    info!(turn, "agent loop cancelled during think");
+                    // THINK 阶段 cancel: session 里只有 user 消息(无 assistant
+                    // 回复),truncate 到 session_len 保留 user 消息(可接受,
+                    // Anthropic 允许 user 无 assistant 回复)。
+                    session.lock().unwrap().truncate(session_len);
                     let _ = tx.send(AgentEvent::Cancelled).await;
                     return;
                 }
-            } {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    let _ = tx
-                        .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
-                        .await;
-                    return;
-                }
-            },
-            None => None,
-        };
+            };
 
-        let stream = match provider.call_stream(req).await {
-            Ok(s) => {
-                tracing::info!(
+            // Release the turn lease before sleeping: a retry backoff must not
+            // hold provider capacity.
+            drop(provider_turn_lease);
+
+            let stalled = matches!(attempt.1, StopReason::Stalled);
+            if stalled && stall_retries < config.think_stall_retry_limit {
+                stall_retries += 1;
+                let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+                let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
+                tracing::warn!(
                     turn,
-                    "provider call_stream returned Ok, entering accumulate"
+                    attempt = stall_retries,
+                    max = config.think_stall_retry_limit,
+                    delay_ms = delay.as_millis() as u64,
+                    "think phase stalled; retrying after backoff"
                 );
-                s
-            }
-            Err(e) => {
-                warn!(turn, error = %e, "provider call failed");
+                // Surface the retry: a silent backoff looks like a hang.
                 if tx
-                    .send(AgentEvent::Error(AgentError::Provider(e)))
+                    .send(AgentEvent::ProviderRetry {
+                        attempt: stall_retries,
+                        max: config.think_stall_retry_limit,
+                        idle_secs,
+                    })
                     .await
                     .is_err()
                 {
                     return; // Receiver dropped, stop the loop
                 }
-                return;
-            }
-        };
-
-        // Check 2: THINK 中 — select! between accumulate and cancel
-        let (content, stop_reason, last_usage) = tokio::select! {
-            result = accumulate_provider_stream(stream, &tx, &model, config.think_idle_timeout) => match result {
-                Ok(v) => {
-                    tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
-                    v
-                }
-                Err(e) => {
-                    warn!(turn, error = %e, "provider stream error");
-                    if tx.send(AgentEvent::Error(e)).await.is_err() {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel_token.cancelled() => {
+                        info!(turn, "agent loop cancelled during stall backoff");
+                        session.lock().unwrap().truncate(session_len);
+                        let _ = tx.send(AgentEvent::Cancelled).await;
                         return;
                     }
-                    return;
                 }
-            },
-            _ = cancel_token.cancelled() => {
-                info!(turn, "agent loop cancelled during think");
-                // THINK 阶段 cancel: session 里只有 user 消息(无 assistant
-                // 回复),truncate 到 session_len 保留 user 消息(可接受,
-                // Anthropic 允许 user 无 assistant 回复)。
-                session.lock().unwrap().truncate(session_len);
-                let _ = tx.send(AgentEvent::Cancelled).await;
-                return;
+                continue;
             }
+            break attempt;
         };
 
         if let Some(usage) = last_usage {
@@ -558,15 +631,11 @@ async fn run_loop(
         // Log the full accumulated response content at debug level (never repeats across turns).
         debug!(turn, content = ?content, "think: response");
 
-        // Detect idle stall: accumulate_stream synthesizes this stop reason
-        // when no provider event arrives within the idle timeout.
+        // A provider-reported stream error surfaces as a terminal Error. An
+        // idle stall is no longer reported through this string channel: it is
+        // `StopReason::Stalled` and is handled by the retry loop above.
         if let StopReason::Other(ref s) = stop_reason {
-            if s == "idle timeout" {
-                tracing::warn!(
-                    turn,
-                    "think phase ended due to idle timeout (stalled stream)"
-                );
-            } else if let Some(message) = s.strip_prefix("stream error: ") {
+            if let Some(message) = s.strip_prefix("stream error: ") {
                 let _ = tx
                     .send(AgentEvent::Error(AgentError::Provider(
                         ProviderError::Stream(message.to_string()),
@@ -576,8 +645,6 @@ async fn run_loop(
             }
         }
 
-        drop(provider_turn_lease);
-
         messages.push(Message::assistant(content.clone()));
         session
             .lock()
@@ -586,11 +653,10 @@ async fn run_loop(
 
         match stop_reason {
             StopReason::Stalled => {
-                tracing::warn!(turn, "think phase stalled (idle timeout)");
                 let _ = tx
                     .send(AgentEvent::Done {
                         reason: DoneReason::Interrupted {
-                            reason: "idle timeout".into(),
+                            reason: format!("idle timeout after {stall_retries} retries"),
                         },
                     })
                     .await;
@@ -1591,6 +1657,71 @@ mod tests {
         }
     }
 
+    /// Emits one delta then stalls on the first call; succeeds on later calls.
+    struct StallOnceThenSucceedProvider {
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl StallOnceThenSucceedProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StallOnceThenSucceedProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let stream = if *calls == 1 {
+                futures::stream::iter(vec![ProviderEvent::TextDelta("stale".into())])
+                    .chain(futures::stream::pending())
+                    .boxed()
+            } else {
+                futures::stream::iter(vec![
+                    ProviderEvent::TextDelta("fresh".into()),
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                    },
+                ])
+                .boxed()
+            };
+            Ok(stream)
+        }
+    }
+
+    /// Every call stalls, so retries are always exhausted.
+    struct AlwaysStallProvider {
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl AlwaysStallProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for AlwaysStallProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            *self.calls.lock().unwrap() += 1;
+            let stream = futures::stream::iter(vec![ProviderEvent::TextDelta("partial".into())])
+                .chain(futures::stream::pending())
+                .boxed();
+            Ok(stream)
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_cancel_during_think_emits_cancelled() {
         let provider = Arc::new(HangingProvider);
@@ -1624,9 +1755,12 @@ mod tests {
         let provider = Arc::new(StallAfterDeltaProvider);
         let tools = Arc::new(ToolRegistry::new());
         // Short idle timeout so the test runs fast (the stall is detected
-        // quickly instead of waiting for the 60s default).
+        // quickly instead of waiting for the 60s default). Stall retries are
+        // disabled here: this test asserts the *terminal* outcome, and the
+        // retry path is covered by the dedicated stall-retry tests below.
         let config = AgentConfig {
             think_idle_timeout: Some(std::time::Duration::from_millis(500)),
+            think_stall_retry_limit: 0,
             ..Default::default()
         };
         let mut agent = Agent::new(provider, tools, config);
@@ -1659,6 +1793,155 @@ mod tests {
             has_terminal,
             "should emit a terminal event (Done or Error) after stall, got: {:?}",
             events
+        );
+    }
+
+    fn fast_stall_config() -> AgentConfig {
+        AgentConfig {
+            think_idle_timeout: Some(std::time::Duration::from_millis(50)),
+            think_stall_retry_limit: 3,
+            think_stall_backoff_base: std::time::Duration::from_millis(10),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_retries_a_transient_idle_stall_and_completes() {
+        let provider = Arc::new(StallOnceThenSucceedProvider::new());
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        // The retry is announced so the user is not left in silent limbo...
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ProviderRetry {
+                    attempt: 1,
+                    max: 3,
+                    ..
+                }
+            )),
+            "expected a ProviderRetry event, got: {events:?}"
+        );
+        // ...and the turn completes normally instead of reporting an interruption.
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Done {
+                    reason: DoneReason::Interrupted { .. }
+                }
+            )),
+            "a transient stall must not surface as Interrupted"
+        );
+        // The stalled partial ("stale") is NOT committed: only the retried text is kept.
+        let session = agent.session();
+        let assistants: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants, vec!["fresh"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_exhausts_stall_retries_then_reports_interruption() {
+        let provider = Arc::new(AlwaysStallProvider::new());
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        // 1 initial attempt + 3 retries.
+        assert_eq!(*calls.calls.lock().unwrap(), 4);
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ProviderRetry { .. }))
+            .count();
+        assert_eq!(retries, 3, "expected 3 retries, got: {events:?}");
+        match events.last() {
+            Some(AgentEvent::Done {
+                reason: DoneReason::Interrupted { reason },
+            }) => assert_eq!(reason, "idle timeout after 3 retries"),
+            other => panic!("expected Interrupted after retries, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancels_during_stall_backoff() {
+        let provider = Arc::new(AlwaysStallProvider::new());
+        let tools = Arc::new(ToolRegistry::new());
+        // Long backoff so the cancel lands while sleeping, not mid-stream.
+        let config = AgentConfig {
+            think_idle_timeout: Some(std::time::Duration::from_millis(50)),
+            think_stall_retry_limit: 3,
+            think_stall_backoff_base: std::time::Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(provider, tools, config);
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        // run() resets the cancel token, so capture it AFTER run() returns.
+        let cancel_token = agent.cancel_token();
+        let _handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancel_token.cancel();
+        });
+
+        let events = collect_events_async(stream).await;
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "expected Cancelled, got: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
+            "a cancelled run must not also report Done"
+        );
+    }
+
+    #[test]
+    fn agent_config_defaults_stall_retry_policy() {
+        let config = AgentConfig::default();
+        assert_eq!(config.think_stall_retry_limit, 3);
+        assert_eq!(
+            config.think_stall_backoff_base,
+            std::time::Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn stall_backoff_delay_doubles_and_caps() {
+        let base = std::time::Duration::from_secs(2);
+        assert_eq!(
+            stall_backoff_delay(base, 1),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            stall_backoff_delay(base, 2),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            stall_backoff_delay(base, 3),
+            std::time::Duration::from_secs(8)
+        );
+        // Capped at 30s no matter how many retries.
+        assert_eq!(
+            stall_backoff_delay(base, 10),
+            std::time::Duration::from_secs(30)
         );
     }
 
@@ -2205,6 +2488,8 @@ mod tests {
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             think_idle_timeout: None,
+            think_stall_retry_limit: 0,
+            think_stall_backoff_base: std::time::Duration::from_secs(1),
         };
         assert_eq!(config.model, "custom-model");
         assert_eq!(config.max_turns, Some(50));
