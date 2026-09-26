@@ -140,6 +140,11 @@ pub enum Notification {
         /// Why the turn is being retried: `"idle_stall"` or `"request_timeout"`.
         cause: String,
     },
+    /// 用量更新通知。
+    ///
+    /// 携带的是**本轮累积快照**,而非单条原始 provider 事件:Anthropic 把一次
+    /// 调用的用量拆成 `message_start`(input/cache)与 `message_delta`(output)
+    /// 两个事件,翻译层按字段合并后发出,故每条通知都是迄今完整的本轮用量。
     #[serde(rename = "thread/tokenUsage/updated")]
     TokenUsage {
         thread_id: String,

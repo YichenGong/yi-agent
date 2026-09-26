@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use yi_agent_core::message::ContentBlock;
-use yi_agent_core::{AgentEvent, DoneReason};
+use yi_agent_core::{AgentEvent, DoneReason, TokenUsage};
 
 use crate::protocol::{Item, Notification, ToolStatus, TurnStatus};
 
@@ -26,6 +26,39 @@ struct ToolItem {
     input: Value,
 }
 
+/// 单个 turn 内的用量快照。
+///
+/// Anthropic 把一次 provider 调用拆成两个事件:`message_start` 带 input/cache,
+/// `message_delta` 带 output。故按字段合并(而非整体替换)才能拼回一次调用的完整
+/// 用量;多步 turn 下即最后一次调用的快照。
+#[derive(Default)]
+struct UsageSnapshot {
+    model: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+}
+
+impl UsageSnapshot {
+    /// 字段级合并:仅在事件携带非零值 / `Some` 时覆盖,使拆分事件可拼回完整快照。
+    fn merge(&mut self, model: &str, usage: &TokenUsage) {
+        self.model = model.to_string();
+        if usage.input_tokens > 0 {
+            self.input_tokens = usage.input_tokens;
+        }
+        if usage.output_tokens > 0 {
+            self.output_tokens = usage.output_tokens;
+        }
+        if let Some(v) = usage.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = v;
+        }
+        if let Some(v) = usage.cache_read_input_tokens {
+            self.cache_read_input_tokens = v;
+        }
+    }
+}
+
 /// 把 `AgentEvent` 流翻译成 [`Notification`]。
 ///
 /// 每个 `Translator` 绑定一个 thread;当前 turn id 由上层在 turn 开始时通过
@@ -37,12 +70,17 @@ struct ToolItem {
 /// `ToolTimeout` 或 turn 终结事件时被移除,不会跨 turn 累积。收到终结事件
 /// (`Done` / `Cancelled` / `Error`)后 `tool_items` 必为空;上层必须为下一个
 /// turn 调用 [`Translator::set_turn`] 再继续喂事件。
+///
+/// `TokenUsage` 通知携带的是**本轮累积快照**:provider 可能把一次调用的用量
+/// 拆成多个事件(Anthropic 的 `message_start` 带 input/cache、`message_delta`
+/// 带 output),翻译层按字段合并后发出,故每条通知都是迄今完整的本轮用量。
 pub struct Translator {
     thread_id: String,
     turn_id: String,
     next_item: u64,
     active_agent_msg: Option<ActiveAgentMsg>,
     tool_items: HashMap<String, ToolItem>,
+    usage: UsageSnapshot,
 }
 
 impl Translator {
@@ -54,6 +92,7 @@ impl Translator {
             next_item: 1,
             active_agent_msg: None,
             tool_items: HashMap::new(),
+            usage: UsageSnapshot::default(),
         }
     }
 
@@ -62,6 +101,7 @@ impl Translator {
     /// Notifications that carry `turn_id` use this value. Emits nothing.
     pub fn set_turn(&mut self, turn_id: String) {
         self.turn_id = turn_id;
+        self.usage = UsageSnapshot::default();
     }
 
     fn alloc_item_id(&mut self) -> String {
@@ -234,13 +274,14 @@ impl Translator {
                 self.complete_tool(&id, ToolStatus::Failed, None, &mut out);
             }
             AgentEvent::Usage { model, usage } => {
+                self.usage.merge(&model, &usage);
                 out.push(Notification::TokenUsage {
                     thread_id: self.thread_id.clone(),
-                    model,
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                    cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                    model: self.usage.model.clone(),
+                    input_tokens: self.usage.input_tokens,
+                    output_tokens: self.usage.output_tokens,
+                    cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: self.usage.cache_read_input_tokens,
                 });
             }
             AgentEvent::Done { reason } => {
@@ -767,6 +808,82 @@ mod tests {
             } => {
                 assert_eq!(*cache_creation_input_tokens, 0);
                 assert_eq!(*cache_read_input_tokens, 0);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_merges_split_anthropic_events() {
+        let mut t = translator();
+        // message_start:input + cache
+        let _ = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_creation_input_tokens: Some(7),
+                cache_read_input_tokens: Some(9),
+            },
+        });
+        // message_delta:output only
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 42,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                ..
+            } => {
+                assert_eq!(*input_tokens, 100, "input from message_start must survive");
+                assert_eq!(
+                    *output_tokens, 42,
+                    "output from message_delta must be merged"
+                );
+                assert_eq!(*cache_creation_input_tokens, 7);
+                assert_eq!(*cache_read_input_tokens, 9);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_snapshot_resets_each_turn() {
+        let mut t = translator();
+        let _ = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 42,
+                ..Default::default()
+            },
+        });
+        t.set_turn("turn-2".into());
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 5,
+                output_tokens: 0,
+                ..Default::default()
+            },
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(*input_tokens, 5);
+                assert_eq!(*output_tokens, 0, "previous turn's output must not leak");
             }
             other => panic!("expected TokenUsage, got {other:?}"),
         }

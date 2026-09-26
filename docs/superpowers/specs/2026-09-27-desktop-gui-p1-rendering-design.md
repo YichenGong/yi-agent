@@ -152,6 +152,12 @@ session.ts    →  session.usage = { model, input, output, cacheRead, cacheWrite
 StatusBar     →  紧凑显示 + 点击展开 UsagePanel
 ```
 
+Anthropic 把一次 provider 调用的用量拆成两个事件:`message_start` 带
+input + cache、`message_delta` 带 output。故 `translate.rs` 在发出
+`thread/tokenUsage/updated` 前按字段合并这两条事件(仅当字段非零 / `Some`
+时覆盖),拼回**本轮累积快照**——`input` 即上下文大小,`output` 即最后一次响应。
+多步 turn 下每条通知都是迄今完整的本轮用量,最后一条即落盘/面板最终值。
+
 ### 6.2 协议变更(`yi-agent-app-server/src/protocol.rs`)
 
 `Notification::ThreadTokenUsageUpdated` 增加两个字段:
@@ -171,10 +177,12 @@ ThreadTokenUsageUpdated {
 
 `#[serde(default)]` 保证与旧帧的兼容(缺字段按 0)。
 
-### 6.3 翻译层(`translate.rs:236-243`)
+### 6.3 翻译层(`translate.rs:276`)
 
-`AgentEvent::Usage { model, usage }` 分支把 `usage.cache_creation_input_tokens` /
-`usage.cache_read_input_tokens` 一并写入通知(当前被丢弃)。
+`AgentEvent::Usage { model, usage }` 分支先经 `UsageSnapshot::merge`
+(`translate.rs:45`)按字段合并到本轮快照(见 §6.1),再把快照的
+`input_tokens` / `output_tokens` / `cache_creation_input_tokens` /
+`cache_read_input_tokens` 一并写入通知;`set_turn` 时重置快照,不跨 turn 泄漏。
 
 ### 6.4 持久化(`thread_store.rs:28-33`)
 
