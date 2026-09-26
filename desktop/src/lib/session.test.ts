@@ -49,6 +49,20 @@ describe("Session", () => {
     expect(s.items[0]).toMatchObject({ type: "toolCall", status: "completed", result: "ok" });
   });
 
+  it("ignores deltas targeting a non-agent item", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: {
+        thread_id: "t",
+        item: { type: "toolCall", id: "i1", call_id: "c1", name: "bash", input: {}, status: "running" },
+      },
+    });
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "i1", delta: "stdout" } });
+    expect(s.items).toHaveLength(1);
+    expect(s.items[0]).toMatchObject({ type: "toolCall", status: "running" });
+  });
+
   it("tracks turn lifecycle", () => {
     const s = new Session();
     expect(s.turnActive).toBe(false);

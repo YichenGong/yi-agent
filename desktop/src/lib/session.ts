@@ -35,12 +35,14 @@ export class Session {
       case "item/delta": {
         const { item_id, delta } = notification.params;
         const index = this.items.findIndex((i) => i.id === item_id);
-        if (index >= 0 && this.items[index].type === "agentMessage") {
+        if (index < 0) {
+          this.items.push({ type: "agentMessage", id: item_id, text: delta });
+        } else if (this.items[index].type === "agentMessage") {
           const item = this.items[index] as { type: "agentMessage"; id: string; text: string };
           item.text += delta;
-        } else {
-          this.items.push({ type: "agentMessage", id: item_id, text: delta });
         }
+        // else: delta for a non-agent item (e.g. streamed tool output) — ignore
+        // in the baseline UI.
         break;
       }
       case "turn/started":
