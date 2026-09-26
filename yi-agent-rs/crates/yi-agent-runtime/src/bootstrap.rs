@@ -420,6 +420,21 @@ mod tests {
     use super::*;
     use crate::config::sample_config;
 
+    fn write_skills(dir: &std::path::Path, count: usize, desc_len: usize) {
+        for i in 0..count {
+            let d = dir.join(format!("s{i:02}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!(
+                    "---\nname: s{i:02}\ndescription: {}\n---\nbody",
+                    "x".repeat(desc_len)
+                ),
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn build_provider_rejects_unknown_name() {
         let mut cfg = sample_config();
@@ -471,18 +486,9 @@ mod tests {
     #[test]
     fn catalog_handle_none_budget_does_not_truncate() {
         let tmp = tempfile::TempDir::new().unwrap();
-        for i in 0..20 {
-            let dir = tmp.path().join(format!("s{i:02}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("SKILL.md"),
-                format!(
-                    "---\nname: s{i:02}\ndescription: {}\n---\nbody",
-                    "x".repeat(200)
-                ),
-            )
-            .unwrap();
-        }
+        // 20 skills x ~600-char descriptions => full catalog well over 8192 bytes,
+        // so only an effectively-unlimited budget can include the last skill.
+        write_skills(tmp.path(), 20, 600);
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![(
             tmp.path().to_path_buf(),
             yi_agent_skills::SkillScope::User,
@@ -490,6 +496,10 @@ mod tests {
 
         let unlimited = SkillsCatalogHandle::for_test(svc.clone(), Some("BASE".into()), None);
         let all = unlimited.current_system_prompt().unwrap();
+        assert!(
+            all.len() > 8192,
+            "fixture must exceed the default budget to be a meaningful test"
+        );
         assert!(all.contains("s19"), "None budget must include every skill");
 
         let limited = SkillsCatalogHandle::for_test(svc, Some("BASE".into()), Some(400));
@@ -503,39 +513,21 @@ mod tests {
     #[test]
     fn catalog_handle_none_budget_survives_refresh() {
         let tmp = tempfile::TempDir::new().unwrap();
-        for i in 0..20 {
-            let dir = tmp.path().join(format!("s{i:02}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("SKILL.md"),
-                format!(
-                    "---\nname: s{i:02}\ndescription: {}\n---\nbody",
-                    "x".repeat(200)
-                ),
-            )
-            .unwrap();
-        }
+        write_skills(tmp.path(), 20, 600);
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![(
             tmp.path().to_path_buf(),
             yi_agent_skills::SkillScope::User,
         )]));
         let handle = SkillsCatalogHandle::for_test(svc, Some("BASE".into()), None);
-        // Warm once, then add another skill and confirm it still shows up
-        // (i.e. refresh + no truncation both hold).
-        assert!(handle.current_system_prompt().unwrap().contains("s19"));
-
-        let dir = tmp.path().join("s99");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("SKILL.md"),
-            format!(
-                "---\nname: s99\ndescription: {}\n---\nbody",
-                "x".repeat(200)
-            ),
-        )
-        .unwrap();
         assert!(
-            handle.current_system_prompt().unwrap().contains("s99"),
+            handle.current_system_prompt().unwrap().contains("s19"),
+            "None budget must include every skill before refresh"
+        );
+
+        // Add one more skill, then confirm refresh picks it up with no truncation.
+        write_skills(tmp.path(), 21, 600);
+        assert!(
+            handle.current_system_prompt().unwrap().contains("s20"),
             "newly added skill must appear under a None budget"
         );
     }
