@@ -3651,7 +3651,6 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
- "dotenvy",
  "futures",
  "pulldown-cmark",
  "ratatui",
