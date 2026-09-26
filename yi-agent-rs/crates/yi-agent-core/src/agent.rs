@@ -709,41 +709,28 @@ async fn run_loop(
                         }
                     }
                     crate::permission::CheckResult::Blacklisted(req) => {
-                        if let Some(decision_rx) = &decision_rx {
-                            let id_clone = id.clone();
-                            match handle_confirmation(
-                                &tx,
-                                checker,
-                                decision_rx,
-                                &cancel_token,
-                                id,
-                                name,
-                                input,
-                                req,
-                                "user denied blacklisted command",
-                            )
-                            .await
-                            {
-                                Some((id, name, input)) => checked_uses.push((id, name, input)),
-                                None => denied_results.push((
-                                    id_clone,
-                                    ToolResult::error("user denied blacklisted command"),
-                                )),
-                            }
-                        } else {
-                            let _ = tx
-                                .send(AgentEvent::ToolResult {
-                                    id: id.clone(),
-                                    result: ToolResult::error(
-                                        "blacklisted command requires confirmation",
-                                    ),
-                                })
-                                .await;
-                            denied_results.push((
-                                id.clone(),
-                                ToolResult::error("blacklisted command requires confirmation"),
-                            ));
-                        }
+                        // 黑名单是硬红线:不可通过 Allow once / Always allow 绕过,
+                        // 因此不走确认流程。这里仍先发 ToolCall,让 TUI 能渲染出
+                        // 这次被拒的调用;否则拒绝会变成静默,用户会误以为命令已执行。
+                        let reason = match &req.kind {
+                            crate::permission::PermissionKind::Blacklisted(reason) => reason.clone(),
+                            _ => "blacklisted command".to_string(),
+                        };
+                        let message = format!("blocked by safety filter: {reason}");
+                        let _ = tx
+                            .send(AgentEvent::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::ToolResult {
+                                id: id.clone(),
+                                result: ToolResult::error(message.clone()),
+                            })
+                            .await;
+                        denied_results.push((id.clone(), ToolResult::error(message)));
                     }
                 }
             } else {
@@ -913,7 +900,8 @@ async fn wait_for_decision(
     }
 }
 
-/// Handles a permission request that needs user confirmation (NeedConfirm or Blacklisted).
+/// Handles a permission request that needs user confirmation (NeedConfirm only).
+/// Blacklisted commands never reach here: they are hard-denied in the check loop.
 /// Sends PermissionRequest event, waits for decision, sends PermissionResolved event.
 /// Returns Some((id, name, input)) if user allows execution, None if user denies.
 #[allow(clippy::too_many_arguments)]
@@ -2508,6 +2496,88 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
+    }
+
+    /// 黑名单命令在 yolo 下必须硬拒绝:不弹确认框,且拒绝要可见。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blacklisted_command_hard_denies_without_confirmation() {
+        // 黑名单函数:任何含 "blocked-cmd" 的命令都视为黑名单。
+        let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|cmd: &str| {
+            cmd.contains("blocked-cmd").then(|| "test rule".to_string())
+        });
+        let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
+            crate::permission::PermissionsConfig::default(),
+            true, // yolo
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        ));
+        // 通道的 sender 必须 drop:通道关闭后,当前(未修复)代码会走
+        // `recv()` 返回 None 的分支快速失败。若 sender 存活且无人应答,
+        // 该路径会永久阻塞、测试挂起而不是失败 —— 已实测确认。
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, crate::permission::Decision)>(16);
+        drop(decision_tx);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"command":"blocked-cmd"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("ok".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default())
+            .with_permission(checker, decision_rx);
+
+        let stream = agent.run("test".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        // 1. 不得出现确认框。
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PermissionRequest { .. })),
+            "blacklisted command must not prompt for confirmation"
+        );
+        // 2. 拒绝必须可见:先有 ToolCall。
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "bash")),
+            "deny must emit ToolCall so the TUI can render it"
+        );
+        // 3. 拒绝原因出现在错误 ToolResult 中。
+        //    注意:ToolResult::error 会把文本包成 "error: {text}"
+        //    (见 yi-agent-core/src/tool.rs),所以匹配子串而非整串。
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolResult { result, .. }
+                    if result.is_error
+                        && result.content.iter().any(|b| matches!(
+                            b,
+                            crate::message::ContentBlock::Text(t)
+                                if t.contains("blocked by safety filter: test rule")
+                        ))
+            )),
+            "deny must carry the blocklist reason in an error ToolResult"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
