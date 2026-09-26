@@ -1,4 +1,4 @@
-import type { Item, Notification, RetryCause, TurnStatus } from "./protocol";
+import type { Item, Notification, RetryCause, TurnStatus, Usage } from "./protocol";
 
 let localSeq = 0;
 const nextLocalId = () => `local-${++localSeq}`;
@@ -16,7 +16,7 @@ export class Session {
   turnActive = false;
   lastStatus: TurnStatus | null = null;
   lastError: string | null = null;
-  usage: { model: string; input: number; output: number } | null = null;
+  usage: Usage | null = null;
   retrying: { attempt: number; max: number; cause: RetryCause } | null = null;
 
   /**
@@ -86,6 +86,8 @@ export class Session {
           model: notification.params.model,
           input: notification.params.input_tokens,
           output: notification.params.output_tokens,
+          cacheWrite: notification.params.cache_creation_input_tokens ?? 0,
+          cacheRead: notification.params.cache_read_input_tokens ?? 0,
         };
         break;
       case "error":
