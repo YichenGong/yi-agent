@@ -29,8 +29,8 @@ struct ToolItem {
 /// 单个 turn 内的用量快照。
 ///
 /// Anthropic 把一次 provider 调用拆成两个事件:`message_start` 带 input/cache,
-/// `message_delta` 带 output。故按字段合并(而非整体替换)才能拼回一次调用的完整
-/// 用量;多步 turn 下即最后一次调用的快照。
+/// `message_delta` 带 output。翻译层把一次调用的多个事件合并成完整快照
+/// (新调用整体替换、同一调用内按字段补齐);多步 turn 下即最后一次调用的快照。
 #[derive(Default)]
 struct UsageSnapshot {
     model: String,
@@ -46,6 +46,9 @@ impl UsageSnapshot {
     /// `input_tokens > 0` 标识一次新的 provider 调用(`message_start`,或 OpenAI 的
     /// 单条合并事件):此时整体替换,避免上一次调用的字段残留。同一次调用的后续
     /// 事件(`message_delta`,只带 output)按字段合并。
+    ///
+    /// 假设一次新调用必带非零 `input_tokens`(Anthropic / OpenAI 均如此);若某网关
+    /// 省略该字段,会被误判为同一调用的后续事件。
     fn merge(&mut self, model: &str, usage: &TokenUsage) {
         self.model = model.to_string();
         if usage.input_tokens > 0 {
@@ -83,7 +86,8 @@ impl UsageSnapshot {
 ///
 /// `TokenUsage` 通知携带的是**本轮累积快照**:provider 可能把一次调用的用量
 /// 拆成多个事件(Anthropic 的 `message_start` 带 input/cache、`message_delta`
-/// 带 output),翻译层按字段合并后发出,故每条通知都是迄今完整的本轮用量。
+/// 带 output),翻译层合并后发出(新调用整体替换、同一调用内按字段补齐),
+/// 故每条通知都是迄今完整的本轮用量。
 pub struct Translator {
     thread_id: String,
     turn_id: String,
