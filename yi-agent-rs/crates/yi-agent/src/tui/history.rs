@@ -399,14 +399,17 @@ impl HistoryState {
                 prefix_suggestion,
                 kind,
             } => {
-                let display = format!("{}: {}", tool_name, tool_input);
+                let summary = format!("{}: {}", tool_name, tool_input);
+                let full = format!("{}: {}", tool_name, tool_input);
                 self.cells.push(HistoryCell::PermissionRequest {
                     request_id,
                     tool_name,
-                    display,
+                    summary,
+                    full,
                     prefix_suggestion,
                     kind,
                     resolved: false,
+                    expanded: false,
                 });
             }
             AgentEvent::PermissionResolved {

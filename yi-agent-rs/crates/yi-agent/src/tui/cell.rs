@@ -1,6 +1,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+
+use super::wrap::{MAX_COLLAPSED_LINES, wrap_by_display_width};
 use unicode_width::UnicodeWidthStr;
 
 /// One unit of conversation history displayed in the history area.
@@ -32,13 +34,19 @@ pub enum HistoryCell {
     /// Full-width dim separator line between turns.
     Separator { label: Option<String> },
     /// Permission request prompt. Shows a menu for the user to choose a decision.
+    /// Permission request prompt. Shows a menu for the user to choose a decision.
     PermissionRequest {
         request_id: u64,
         tool_name: String,
-        display: String,
+        /// Compact, always-visible description of what is being requested.
+        summary: String,
+        /// Complete, unabridged description shown when expanded.
+        full: String,
         prefix_suggestion: Option<String>,
         kind: yi_agent_core::permission::PermissionKind,
         resolved: bool,
+        /// Whether the body is shown in full instead of truncated.
+        expanded: bool,
     },
     /// Permission resolved notification. Shows the decision that was made.
     PermissionResolved {
@@ -84,17 +92,21 @@ impl HistoryCell {
             Self::Separator { label } => vec![render_separator(label.as_deref(), width)],
             Self::PermissionRequest {
                 tool_name,
-                display,
+                summary,
+                full,
                 prefix_suggestion,
                 kind,
                 resolved,
+                expanded,
                 ..
             } => render_permission_request(
                 tool_name,
-                display,
+                summary,
+                full,
                 prefix_suggestion.as_deref(),
                 kind,
                 *resolved,
+                *expanded,
                 width,
             ),
             Self::PermissionResolved { decision } => render_permission_resolved(decision),
@@ -208,63 +220,104 @@ fn render_separator(label: Option<&str>, width: u16) -> Line<'static> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_permission_request(
     tool_name: &str,
-    display: &str,
+    summary: &str,
+    full: &str,
     prefix_suggestion: Option<&str>,
     kind: &yi_agent_core::permission::PermissionKind,
     resolved: bool,
-    _width: u16,
+    expanded: bool,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let warn_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     let dim_style = Style::new().add_modifier(Modifier::DIM);
     let menu_style = Style::new().fg(Color::Cyan);
+    let w = width.max(1) as usize;
 
     if resolved {
-        return vec![Line::from(vec![
-            Span::styled("  [resolved] ", dim_style),
-            Span::raw(display.to_string()),
-        ])];
+        return wrap_by_display_width(summary, w, "  [resolved] ", "  ")
+            .into_iter()
+            .map(|chunk| Line::from(chunk).style(dim_style))
+            .collect();
     }
 
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("? ", warn_style),
-            Span::styled(format!("Permission needed: {tool_name}"), warn_style),
-        ]),
-        Line::from(format!("  {display}")).style(dim_style),
-    ];
+    let body = if expanded { full } else { summary };
+    let body_lines = wrap_by_display_width(body, w, "  ", "  ");
+    let truncated = !expanded && body_lines.len() > MAX_COLLAPSED_LINES;
 
-    // Menu options
+    // Every line goes through the wrapper, including the header and the
+    // menu: at narrow widths those are themselves wider than the terminal
+    // and would otherwise be truncated by ratatui.
+    let mut lines: Vec<Line<'static>> = {
+        let mut header: Vec<Line<'static>> = Vec::new();
+        let header_text = format!("? Permission needed: {tool_name}");
+        for (i, chunk) in wrap_by_display_width(&header_text, w, "", "  ")
+            .into_iter()
+            .enumerate()
+        {
+            if i == 0 {
+                header.push(Line::from(Span::styled(chunk, warn_style)));
+            } else {
+                header.push(Line::from(Span::styled(chunk, warn_style)));
+            }
+        }
+        header
+    };
+
+    let shown = if truncated {
+        MAX_COLLAPSED_LINES
+    } else {
+        body_lines.len()
+    };
+    for line in body_lines.iter().take(shown) {
+        lines.push(Line::from(line.clone()).style(dim_style));
+    }
+    if truncated {
+        let hidden = body_lines.len() - MAX_COLLAPSED_LINES;
+        for chunk in wrap_by_display_width(
+            &format!("  … (+{hidden} more lines, [e] to expand)"),
+            w,
+            "",
+            "  ",
+        ) {
+            lines.push(Line::from(chunk).style(dim_style));
+        }
+    } else if expanded {
+        for chunk in wrap_by_display_width("  [e] to collapse", w, "", "  ") {
+            lines.push(Line::from(chunk).style(dim_style));
+        }
+    }
+
     let blacklisted = matches!(
         kind,
         yi_agent_core::permission::PermissionKind::Blacklisted(_)
     );
     if blacklisted {
-        lines.push(Line::from(vec![Span::styled(
-            "  [!] Blacklisted command",
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )]));
+        let style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+        for chunk in wrap_by_display_width("  [!] Blacklisted command", w, "", "  ") {
+            lines.push(Line::from(Span::styled(chunk, style)));
+        }
     }
 
-    let option_lines = match prefix_suggestion {
-        Some(p) => vec![Span::styled("  [1] Allow once", menu_style)]
-            .into_iter()
-            .chain(vec![Span::styled("  [2] Always allow tool", menu_style)])
-            .chain(vec![Span::styled(
-                format!("  [3] Always allow prefix: {p}"),
-                menu_style,
-            )])
-            .chain(vec![Span::styled("  [4] Deny", menu_style)])
-            .collect::<Vec<_>>(),
+    let option_lines: Vec<(String, Style)> = match prefix_suggestion {
+        Some(p) => vec![
+            ("  [1] Allow once".to_string(), menu_style),
+            ("  [2] Always allow tool".to_string(), menu_style),
+            (format!("  [3] Always allow prefix: {p}"), menu_style),
+            ("  [4] Deny".to_string(), menu_style),
+        ],
         None => vec![
-            Span::styled("  [1] Allow once", menu_style),
-            Span::styled("  [2] Always allow tool", menu_style),
-            Span::styled("  [4] Deny", menu_style),
+            ("  [1] Allow once".to_string(), menu_style),
+            ("  [2] Always allow tool".to_string(), menu_style),
+            ("  [4] Deny".to_string(), menu_style),
         ],
     };
-    for span in option_lines {
-        lines.push(Line::from(span));
+    for (text, style) in option_lines {
+        for chunk in wrap_by_display_width(&text, w, "", "  ") {
+            lines.push(Line::from(Span::styled(chunk, style)));
+        }
     }
 
     let default_hint = if blacklisted {
@@ -272,7 +325,9 @@ fn render_permission_request(
     } else {
         "  Enter = Allow once"
     };
-    lines.push(Line::from(default_hint).style(dim_style));
+    for chunk in wrap_by_display_width(default_hint, w, "", "  ") {
+        lines.push(Line::from(chunk).style(dim_style));
+    }
 
     lines
 }
@@ -634,6 +689,161 @@ mod tests {
         assert!(
             joined.contains("a") && joined.contains("b"),
             "should have data: {joined}"
+        );
+    }
+    fn perm_cell(summary: &str, full: &str, expanded: bool) -> HistoryCell {
+        HistoryCell::PermissionRequest {
+            request_id: 1,
+            tool_name: "bash".into(),
+            summary: summary.into(),
+            full: full.into(),
+            prefix_suggestion: Some("cd".into()),
+            kind: yi_agent_core::permission::PermissionKind::Normal,
+            resolved: false,
+            expanded,
+        }
+    }
+
+    fn line_widths(lines: &[Line<'static>]) -> Vec<usize> {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn joined_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    }
+
+    const LONG_CMD: &str = "cd /Users/someone/projects/personalProjects/yi-agent && cargo test -p yi-agent-core --lib permission";
+
+    #[test]
+    fn permission_body_never_exceeds_width() {
+        // Includes narrow widths where the header and menu themselves wrap.
+        for width in [20u16, 30, 40, 80] {
+            for expanded in [false, true] {
+                let cell = perm_cell(LONG_CMD, LONG_CMD, expanded);
+                let widths = line_widths(&cell.lines(width));
+                assert!(
+                    widths.iter().all(|w| *w <= width as usize),
+                    "width {width} expanded={expanded}: some line exceeds it: {widths:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn permission_wrap_preserves_exact_command_whitespace() {
+        let cmd = r#"git commit -m "fix:  two  spaces""#;
+        let cell = perm_cell(cmd, cmd, true);
+        let text = joined_text(&cell.lines(200));
+        assert!(
+            text.contains(cmd),
+            "command text was rewritten during rendering: {text:?}"
+        );
+    }
+
+    #[test]
+    fn permission_collapsed_body_is_bounded() {
+        // Hard requirement: fit the history area (21 rows in a 24-row terminal).
+        for width in [20u16, 30, 40, 80] {
+            let cell = perm_cell(LONG_CMD, LONG_CMD, false);
+            let lines = cell.lines(width);
+            assert!(
+                lines.len() <= 21,
+                "width {width}: collapsed cell too tall: {} lines",
+                lines.len()
+            );
+        }
+        // At a normal width only the body wraps, so the tight bound holds.
+        let cell = perm_cell(LONG_CMD, LONG_CMD, false);
+        assert!(cell.lines(80).len() <= 1 + MAX_COLLAPSED_LINES + 1 + 5 + 1);
+    }
+
+    #[test]
+    fn permission_collapsed_shows_expand_hint_when_truncated() {
+        let cell = perm_cell(LONG_CMD, LONG_CMD, false);
+        let text = joined_text(&cell.lines(20));
+        assert!(text.contains("[e]"), "expected expand hint: {text:?}");
+    }
+
+    #[test]
+    fn permission_not_truncated_has_no_expand_hint() {
+        let cell = perm_cell("ls", "ls", false);
+        let text = joined_text(&cell.lines(80));
+        assert!(!text.contains("[e]"), "unexpected hint: {text:?}");
+    }
+
+    #[test]
+    fn permission_expanded_recovers_command_tail() {
+        // Width 20 forces truncation; width 40 happens to fit in 4 lines.
+        let cell = perm_cell(LONG_CMD, LONG_CMD, true);
+        let text = joined_text(&cell.lines(20));
+        assert!(
+            text.contains("permission"),
+            "expanded body should reach the command tail: {text:?}"
+        );
+        assert!(
+            !text.contains("more lines"),
+            "expanded body must not claim to be truncated: {text:?}"
+        );
+    }
+
+    #[test]
+    fn permission_menu_rendered_after_body() {
+        let cell = perm_cell(LONG_CMD, LONG_CMD, false);
+        let lines = cell.lines(80);
+        let text = joined_text(&lines);
+        for opt in [
+            "[1] Allow once",
+            "[2] Always allow tool",
+            "[3] Always allow prefix: cd",
+            "[4] Deny",
+        ] {
+            assert!(text.contains(opt), "missing menu option {opt}: {text:?}");
+        }
+        let body_line = lines
+            .iter()
+            .position(|l| joined_text(std::slice::from_ref(l)).contains("&&"))
+            .expect("body marker '&&' not found");
+        let menu_line = lines
+            .iter()
+            .position(|l| joined_text(std::slice::from_ref(l)).contains("[1] Allow once"))
+            .expect("menu not found");
+        assert!(menu_line > body_line, "menu must render after body");
+    }
+
+    #[test]
+    fn permission_cjk_body_wraps_at_display_width() {
+        let cjk = "这是一条很长的中文命令需要按显示宽度换行";
+        for width in [30u16, 80] {
+            let cell = perm_cell(cjk, cjk, true);
+            let widths = line_widths(&cell.lines(width));
+            assert!(
+                widths.iter().all(|w| *w <= width as usize),
+                "width {width}: CJK line too wide: {widths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_resolved_line_wraps() {
+        let mut cell = perm_cell(LONG_CMD, LONG_CMD, false);
+        if let HistoryCell::PermissionRequest { resolved, .. } = &mut cell {
+            *resolved = true;
+        }
+        let widths = line_widths(&cell.lines(40));
+        assert!(
+            widths.iter().all(|w| *w <= 40),
+            "resolved line too wide: {widths:?}"
         );
     }
 }
