@@ -1978,7 +1978,8 @@ mod tests {
         };
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Report whether the sub-agent is healthy.")
-            .with_workspace(workspace);
+            .with_workspace(workspace)
+            .with_workspace_mode(TaskWorkspaceMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let report = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2001,6 +2002,59 @@ mod tests {
         })
         .await
         .expect("worker should report text completion");
+
+        assert_eq!(report, "sub-agent 正常完成，结果可读");
+    }
+
+    #[tokio::test]
+    async fn daemon_read_only_worker_reports_text_completion() {
+        let directory = TempDir::new().unwrap();
+        let base_commit = initialize_git_repository(directory.path());
+        let branch = git_output(directory.path(), &["branch", "--show-current"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(TextAnswerProvider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: directory.path().to_path_buf(),
+            branch,
+            parent_branch: "main".into(),
+            base_commit,
+        };
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Report whether the sub-agent is healthy.")
+            .with_workspace(workspace)
+            .with_workspace_mode(TaskWorkspaceMode::ReadOnly);
+        let handle = factory.start(request).await.unwrap();
+
+        let report = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(report) = handle
+                    .take_events()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        WorkerEvent::Completed { report } => Some(report),
+                        WorkerEvent::CompletedWithoutDelivery => {
+                            panic!("read-only completion should carry a report")
+                        }
+                        _ => None,
+                    })
+                {
+                    return report;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("read-only worker should report text completion");
 
         assert_eq!(report, "sub-agent 正常完成，结果可读");
     }
