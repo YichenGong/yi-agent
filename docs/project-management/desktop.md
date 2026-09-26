@@ -9,7 +9,7 @@
 （`desktop/src/lib/protocol.ts`），从不依赖 Rust 类型。
 
 `desktop/` **不是** `yi-agent-rs/` cargo workspace 的成员，独立构建。Rust workspace
-不受本模块影响：`cargo test -p yi-agent-app-server`（103 个测试）与
+不受本模块影响：`cargo test -p yi-agent-app-server`（109 个测试）与
 `cargo test -p yi-agent-runtime`（全绿）仍全绿。
 
 ## 范围边界
@@ -22,9 +22,10 @@
 - 聊天 UI（消息列表、自动滚动、错误横幅、输入框、工具调用卡片、状态栏）
 - 权限审批弹窗（Allow once / Always allow tool / Always allow prefix / Deny）
 - 历史侧栏（列表 / 恢复继续对话 / 双击内联重命名 / 删除 / New thread）
+- agentMessage markdown 富渲染 + 代码高亮（react-markdown + remark-gfm + rehype-highlight）
+- 用量/成本面板（StatusBar 可展开：input / output / cache read / cache write + 估算成本）
 
 **不做什么（延后）：**
-- 不做 markdown 富渲染 / 代码高亮
 - 不做文件树 / diff 视图
 - 不做多标签页
 - 不做 MCP / 子 agent 任务树
@@ -45,5 +46,6 @@
 - [x] macOS 打包产出可启动的 `.app` / `.dmg` 并内嵌 sidecar — 判据：`cd desktop && npm run sidecar:release && npm run tauri build` 产出 `desktop/src-tauri/target/release/bundle/macos/yi-agent.app`（内含 `Contents/MacOS/desktop` 启动器 + `Contents/MacOS/yi-agent` sidecar）与 `desktop/src-tauri/target/release/bundle/dmg/yi-agent_0.1.0_aarch64.dmg`；`open yi-agent.app` 后 `ps` 可见 `desktop` 与子进程 `yi-agent app-server --listen stdio://`
 - [ ] 手动端到端冒烟（原生窗口 / 流式文本 / 工具卡片 / 审批弹窗放行与拒绝 / Stop 中断 / 杀 sidecar 不崩）— 判据：`cd desktop && npm run sidecar && npm run tauri dev` 后人工逐项确认（设计文档 §12 成功判据，`docs/superpowers/plans/2026-09-26-desktop-gui-design.md:354`）；自动化可覆盖部分已验：应用可启动、sidecar 子进程被拉起
 - [x] 会话持久化 + 历史侧栏（列表 / 恢复并继续对话 / 双击内联重命名 / 删除 / New thread / 当前高亮）— `desktop/src/lib/session.ts:29`（`reset`）/ `desktop/src/components/ThreadSidebar.tsx:17` / `desktop/src/App.tsx:44`（`refreshThreads`）/ `desktop/src/App.tsx:55`（`resumeThread` 前置同步 `reset` 防回放竞态）
+- [x] agentMessage markdown 富渲染 + 代码高亮 + 用量/成本面板 — `desktop/src/components/MarkdownText.tsx:39`（memo 按 text 记忆 + remark-gfm + rehype-highlight + 外链走 opener）/ `desktop/src/components/ChatView.tsx:42`（接线）/ `desktop/src/lib/pricing.ts:35`（定价表 + `estimateCost`）/ `desktop/src/components/UsagePanel.tsx:5` / `desktop/src/components/StatusBar.tsx:28`（点击展开）
 
-**验证命令：** `cd desktop && npx vitest run`（18 个前端单测，`desktop/src/lib/rpc.test.ts` 7 个 + `desktop/src/lib/session.test.ts` 11 个）+ `cd desktop && npm run build` + `cd desktop/src-tauri && cargo test` + `cd desktop && npm run sidecar:release && npm run tauri build`（产出 `.app` / `.dmg`）
+**验证命令：** `cd desktop && npx vitest run`（33 个前端单测，`desktop/src/lib/rpc.test.ts` 7 个 + `desktop/src/lib/session.test.ts` 14 个 + `desktop/src/lib/pricing.test.ts` 7 个 + `desktop/src/components/MarkdownText.test.tsx` 5 个）+ `cd desktop && npm run build` + `cd desktop/src-tauri && cargo test` + `cd desktop && npm run sidecar:release && npm run tauri build`（产出 `.app` / `.dmg`）
