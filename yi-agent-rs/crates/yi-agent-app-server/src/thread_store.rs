@@ -659,4 +659,76 @@ mod tests {
         );
         assert!(!s.exists("thread-a"));
     }
+
+    #[test]
+    fn load_skips_corrupt_log_lines() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn(
+            "thread-a",
+            &turn(
+                vec![Item::UserMessage {
+                    id: "u1".into(),
+                    text: "ok".into(),
+                }],
+                vec![Message::user("ok")],
+            ),
+        )
+        .unwrap();
+        // 模拟崩溃截断:追加一行非法 JSON。
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(s.log_path("thread-a"))
+                .unwrap();
+            writeln!(f, "{{ not json").unwrap();
+        }
+        s.append_turn(
+            "thread-a",
+            &turn(
+                vec![Item::UserMessage {
+                    id: "u2".into(),
+                    text: "still here".into(),
+                }],
+                vec![Message::user("still here")],
+            ),
+        )
+        .unwrap();
+
+        let loaded = s.load("thread-a").unwrap().unwrap();
+        assert_eq!(
+            loaded.items.len(),
+            2,
+            "corrupt line must be skipped, not fatal"
+        );
+        assert_eq!(loaded.messages, vec![Message::user("still here")]);
+    }
+
+    #[test]
+    fn load_rebuilds_meta_when_missing() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn("thread-a", &turn(vec![], vec![Message::user("recover me")]))
+            .unwrap();
+        std::fs::remove_file(s.meta_path("thread-a")).unwrap();
+
+        let loaded = s.load("thread-a").unwrap().expect("log still present");
+        assert_eq!(loaded.meta.title.as_deref(), Some("recover me"));
+        assert_eq!(loaded.meta.thread_id, "thread-a");
+    }
+
+    #[test]
+    fn list_skips_orphan_and_corrupt_meta() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        // 孤立 .jsonl(无 meta)不应出现在 list 里。
+        s.append_turn("thread-orphan", &turn(vec![], vec![]))
+            .unwrap();
+        // 损坏 meta 也不应出现。
+        std::fs::write(s.meta_path("thread-bad"), "{ not json").unwrap();
+
+        let ids: Vec<String> = s.list().unwrap().into_iter().map(|m| m.thread_id).collect();
+        assert_eq!(ids, vec!["thread-a"]);
+    }
 }
