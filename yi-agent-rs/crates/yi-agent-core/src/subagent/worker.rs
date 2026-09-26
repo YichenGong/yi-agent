@@ -12,7 +12,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::ProviderTurnGate;
 
-use super::task::{AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId, WorkspaceLeaseId};
+use super::task::{
+    AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId, TaskWorkspaceMode,
+    WorkspaceLeaseId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerWorkspace {
@@ -33,6 +36,8 @@ pub struct WorkerStart {
     pub workspace_lease_id: Option<WorkspaceLeaseId>,
     /// Full application-owned workspace assignment for this task, when known.
     pub workspace: Option<WorkerWorkspace>,
+    /// Whether this worker owns a writable worktree or runs read-only in place.
+    pub workspace_mode: TaskWorkspaceMode,
     pub cancellation: CancellationToken,
     /// Opaque daemon-issued capability required for worker IPC mutations.
     pub message_capability: String,
@@ -92,6 +97,7 @@ impl WorkerStart {
             root_session_id,
             workspace_lease_id: None,
             workspace: None,
+            workspace_mode: TaskWorkspaceMode::default(),
             cancellation: CancellationToken::new(),
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
@@ -112,6 +118,11 @@ impl WorkerStart {
     pub fn with_workspace(mut self, workspace: WorkerWorkspace) -> Self {
         self.workspace_lease_id = Some(workspace.lease_id.clone());
         self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_workspace_mode(mut self, workspace_mode: TaskWorkspaceMode) -> Self {
+        self.workspace_mode = workspace_mode;
         self
     }
 
@@ -156,6 +167,16 @@ mod tests {
 
         assert_eq!(start.workspace_lease_id, Some(lease));
         assert_eq!(start.workspace, Some(workspace));
+    }
+
+    #[test]
+    fn worker_start_defaults_to_read_only_and_accepts_an_override() {
+        let default = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new());
+        assert_eq!(default.workspace_mode, TaskWorkspaceMode::ReadOnly);
+
+        let coding = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_workspace_mode(TaskWorkspaceMode::Coding);
+        assert_eq!(coding.workspace_mode, TaskWorkspaceMode::Coding);
     }
 }
 
