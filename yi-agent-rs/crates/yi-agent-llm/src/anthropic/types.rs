@@ -122,7 +122,7 @@ impl From<ContentBlock> for AnthropicContentBlock {
                 content: content.into_iter().map(Into::into).collect(),
                 is_error,
             },
-            ContentBlock::Image { source } => AnthropicContentBlock::Image {
+            ContentBlock::Image { source, .. } => AnthropicContentBlock::Image {
                 source: source.into(),
             },
         }

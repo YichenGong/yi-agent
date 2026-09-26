@@ -35,7 +35,29 @@ pub enum ContentBlock {
 
     Image {
         source: ImageSource,
+        #[serde(default)]
+        detail: ImageDetail,
     },
+}
+
+/// Requested fidelity for an image block. Only affects how the image is
+/// resized before being sent; OpenAI maps it to `image_url.detail`,
+/// Anthropic has no equivalent field and ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ImageDetail {
+    #[default]
+    High,
+    Original,
+}
+
+impl ImageDetail {
+    /// Lowercase name used on the wire (OpenAI `image_url.detail`).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            ImageDetail::High => "high",
+            ImageDetail::Original => "original",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +155,7 @@ mod tests {
                         media_type: "image/png".into(),
                         data: "base64data".into(),
                     },
+                    detail: ImageDetail::High,
                 },
             ],
             is_error: false,
@@ -145,10 +168,45 @@ mod tests {
     #[test]
     fn image_source_url_serde_roundtrip() {
         let source = ImageSource::Url("https://example.com/img.png".into());
-        let block = ContentBlock::Image { source };
+        let block = ContentBlock::Image {
+            source,
+            detail: ImageDetail::High,
+        };
         let json = serde_json::to_string(&block).unwrap();
         let back: ContentBlock = serde_json::from_str(&json).unwrap();
         assert_eq!(block, back);
+    }
+
+    #[test]
+    fn image_detail_defaults_to_high_when_absent() {
+        // A block deserialized without `detail` must default to High so old
+        // serialized sessions keep loading.
+        let json = r#"{"Image":{"source":{"Base64":{"media_type":"image/png","data":"AAA"}}}}"#;
+        let block: ContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            ContentBlock::Image { detail, .. } => assert_eq!(detail, ImageDetail::High),
+            _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn image_detail_roundtrips_original() {
+        let block = ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAA".into(),
+            },
+            detail: ImageDetail::Original,
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, back);
+    }
+
+    #[test]
+    fn image_detail_wire_str() {
+        assert_eq!(ImageDetail::High.as_wire_str(), "high");
+        assert_eq!(ImageDetail::Original.as_wire_str(), "original");
     }
 
     #[test]
