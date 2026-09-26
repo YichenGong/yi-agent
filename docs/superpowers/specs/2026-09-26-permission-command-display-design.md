@@ -105,6 +105,14 @@
   `[3] Always allow prefix` 的语义（用户看到的 prefix 与真实命令不匹配）。
 - **`bash_popup.rs:229 wrap_text` 是按字符宽度切分**，保留原始字符，是正确
   的模型。
+- **权限装配路径已迁移，但不影响本设计**：最新 `main` 新增了
+  `yi-agent-runtime` / `yi-agent-app-server` 两个 crate，权限检查器的构造
+  移至 `yi-agent-runtime/src/bootstrap.rs:231-254`
+  `load_permission_checker(workdir, yolo)`。该函数只组装
+  `PermissionChecker`（config、yolo、workdir、blocklist_fn），**不改变
+  `PermissionRequest` 事件的形状或内容**。事件仍由
+  `yi-agent-core/src/agent.rs:932-938` 从 `req.tool_input` 等字段构造，字段
+  集合未变。因此本设计的渲染层改动不受该迁移影响。
 
 ## 4. 设计
 
