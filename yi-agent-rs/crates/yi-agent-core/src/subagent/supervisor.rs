@@ -13,8 +13,8 @@ use super::scheduler::AdmissionPriority;
 use super::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, IntegrationValidation,
     MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
-    RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind,
-    WatchdogEvidence, WorkspaceLeaseId,
+    RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState, TaskWorkspaceMode,
+    TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::worker::{
     AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
@@ -78,6 +78,7 @@ pub struct AgentSupervisor {
     root_task_id: TaskId,
     tasks: HashMap<TaskId, AgentTask>,
     objectives: HashMap<TaskId, String>,
+    workspace_modes: HashMap<TaskId, TaskWorkspaceMode>,
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
@@ -116,6 +117,7 @@ impl AgentSupervisor {
             root_task_id,
             tasks,
             objectives,
+            workspace_modes: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -151,6 +153,7 @@ impl AgentSupervisor {
             root_task_id,
             tasks,
             objectives,
+            workspace_modes: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -201,6 +204,7 @@ impl AgentSupervisor {
             root_task_id,
             tasks,
             objectives,
+            workspace_modes: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -216,6 +220,7 @@ impl AgentSupervisor {
         &mut self,
         task: AgentTask,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<(), String> {
         let parent_id = task
             .parent_id
@@ -228,6 +233,7 @@ impl AgentSupervisor {
         self.tasks.insert(task_id.clone(), task);
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
+        self.workspace_modes.insert(task_id.clone(), workspace_mode);
         self.children.entry(parent_id).or_default().push(task_id);
         Ok(())
     }
@@ -258,6 +264,7 @@ impl AgentSupervisor {
         attempt_number: u32,
         recovery_gated: bool,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<(), String> {
         if !self.tasks.contains_key(&parent_id) {
             return Err("recovered child parent is missing".into());
@@ -293,6 +300,7 @@ impl AgentSupervisor {
         self.tasks.insert(task_id.clone(), task);
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
+        self.workspace_modes.insert(task_id.clone(), workspace_mode);
         self.children.entry(parent_id).or_default().push(task_id);
         Ok(())
     }
@@ -307,6 +315,22 @@ impl AgentSupervisor {
 
     pub fn objective(&self, task_id: &TaskId) -> Option<&str> {
         self.objectives.get(task_id).map(String::as_str)
+    }
+
+    pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: TaskWorkspaceMode) {
+        self.workspace_modes.insert(task_id.clone(), mode);
+    }
+
+    /// The task's workspace mode. A root with no explicit entry is coding (it
+    /// owns session isolation); an unregistered non-root task is read-only.
+    pub fn workspace_mode(&self, task_id: &TaskId) -> TaskWorkspaceMode {
+        if let Some(mode) = self.workspace_modes.get(task_id) {
+            return *mode;
+        }
+        match self.tasks.get(task_id).map(|task| task.depth) {
+            Some(super::task::TaskDepth::Root) => TaskWorkspaceMode::Coding,
+            _ => TaskWorkspaceMode::ReadOnly,
+        }
     }
 
     pub fn set_objective(&mut self, task_id: &TaskId, objective: String) -> Result<(), String> {
@@ -499,6 +523,7 @@ impl AgentSupervisor {
             task.root_session_id.clone(),
         )
         .with_objective(objective)
+        .with_workspace_mode(self.workspace_mode(task_id))
         .with_message_capability(Uuid::new_v4().to_string())
         .with_initial_user_messages(
             initial_user_messages
@@ -910,13 +935,18 @@ impl AgentSupervisor {
     }
 
     pub fn spawn(&mut self, parent_id: TaskId) -> Result<TaskId, SpawnError> {
-        self.spawn_with_objective(parent_id, "Complete the delegated task.".into())
+        self.spawn_with_objective(
+            parent_id,
+            "Complete the delegated task.".into(),
+            TaskWorkspaceMode::ReadOnly,
+        )
     }
 
     pub fn spawn_with_objective(
         &mut self,
         parent_id: TaskId,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<TaskId, SpawnError> {
         let parent = self
             .tasks
@@ -944,6 +974,8 @@ impl AgentSupervisor {
         let child_id = child.id.clone();
         self.tasks.insert(child_id.clone(), child);
         self.objectives.insert(child_id.clone(), objective);
+        self.workspace_modes
+            .insert(child_id.clone(), workspace_mode);
         self.mailboxes.insert(child_id.clone(), Mailbox::default());
         self.children
             .entry(parent_id.clone())
@@ -1664,7 +1696,14 @@ impl Tool for SpawnAgentTool {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task": { "type": "string", "description": "Delegated objective." } },
+            "properties": {
+                "task": { "type": "string", "description": "Delegated objective." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["coding", "read_only"],
+                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                }
+            },
             "required": ["task"],
             "additionalProperties": false
         })
@@ -1677,12 +1716,19 @@ impl Tool for SpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
+        let mode = match args.get("mode").and_then(Value::as_str) {
+            None => TaskWorkspaceMode::ReadOnly,
+            Some(value) => match TaskWorkspaceMode::parse(value) {
+                Some(mode) => mode,
+                None => return ToolResult::error("mode must be 'coding' or 'read_only'"),
+            },
+        };
         let mut supervisor = self
             .tools
             .supervisor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match supervisor.spawn_with_objective(self.tools.caller.clone(), task.to_string()) {
+        match supervisor.spawn_with_objective(self.tools.caller.clone(), task.to_string(), mode) {
             Ok(task_id) => ToolResult::text(
                 json!({ "task_id": task_id.to_string(), "status": "queued" }).to_string(),
             ),

@@ -12,7 +12,9 @@ use yi_agent_core::subagent::task::{
     PauseReason, PermissionRequestId, RootSessionId, TaskDepth, TaskState,
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
-use yi_agent_core::{ContentBlock, ProviderTurnGate, ProviderTurnLease, ToolRegistry};
+use yi_agent_core::{
+    ContentBlock, ProviderTurnGate, ProviderTurnLease, TaskWorkspaceMode, ToolRegistry,
+};
 
 #[test]
 fn spawn_enforces_depth_two_and_four_direct_children() {
@@ -72,13 +74,41 @@ fn spawning_with_an_objective_retains_the_worker_instruction() {
     let root = supervisor.root_task_id().clone();
 
     let child = supervisor
-        .spawn_with_objective(root, "Audit the scheduler fairness tests".into())
+        .spawn_with_objective(
+            root,
+            "Audit the scheduler fairness tests".into(),
+            TaskWorkspaceMode::ReadOnly,
+        )
         .unwrap();
 
     assert_eq!(
         supervisor.objective(&child),
         Some("Audit the scheduler fairness tests")
     );
+}
+
+#[test]
+fn children_default_to_read_only_and_can_be_spawned_as_coding() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+
+    let read_only = supervisor
+        .spawn_with_objective(root.clone(), "audit".into(), TaskWorkspaceMode::ReadOnly)
+        .unwrap();
+    let coding = supervisor
+        .spawn_with_objective(root.clone(), "implement".into(), TaskWorkspaceMode::Coding)
+        .unwrap();
+
+    assert_eq!(
+        supervisor.workspace_mode(&read_only),
+        TaskWorkspaceMode::ReadOnly
+    );
+    assert_eq!(
+        supervisor.workspace_mode(&coding),
+        TaskWorkspaceMode::Coding
+    );
+    // Root with no explicit entry defaults to coding.
+    assert_eq!(supervisor.workspace_mode(&root), TaskWorkspaceMode::Coding);
 }
 
 struct ImmediateWorkerFactory;

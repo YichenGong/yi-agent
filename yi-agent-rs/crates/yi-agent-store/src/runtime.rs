@@ -371,7 +371,11 @@ impl RuntimeCoordinator {
                     })?;
                     if supervisor.task(&ancestor.task_id).is_none() {
                         supervisor
-                            .insert_hydrated_review_child(hydrated, objective)
+                            .insert_hydrated_review_child(
+                                hydrated,
+                                objective,
+                                yi_agent_core::TaskWorkspaceMode::ReadOnly,
+                            ) // Task 5 threads the persisted mode through here.
                             .map_err(RuntimeCoordinatorError::Supervisor)?;
                         hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                     }
@@ -394,6 +398,8 @@ impl RuntimeCoordinator {
                         task.attempt_number,
                         task.recovery_gated || task.recovery_attested,
                         task.objective,
+                        // Task 5 threads the persisted mode through here.
+                        yi_agent_core::TaskWorkspaceMode::ReadOnly,
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
             } else {
@@ -465,7 +471,11 @@ impl RuntimeCoordinator {
                         RuntimeCoordinatorError::Supervisor("review hydration is busy".into())
                     })?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective)
+                    .insert_hydrated_review_child(
+                        hydrated,
+                        objective,
+                        yi_agent_core::TaskWorkspaceMode::ReadOnly,
+                    ) // Task 5 threads the persisted mode through here.
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
             }
@@ -792,7 +802,11 @@ impl RuntimeCoordinator {
                     )
                 })?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective)
+                    .insert_hydrated_review_child(
+                        hydrated,
+                        objective,
+                        yi_agent_core::TaskWorkspaceMode::ReadOnly,
+                    ) // Task 5 threads the persisted mode through here.
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(supervisor, task_id, completion_report)?;
             }
@@ -1065,7 +1079,11 @@ impl RuntimeCoordinator {
         let supervisor = self.supervisor(session)?;
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
-            let child = supervisor.spawn_with_objective(parent.clone(), objective.clone())?;
+            let child = supervisor.spawn_with_objective(
+                parent.clone(),
+                objective.clone(),
+                yi_agent_core::TaskWorkspaceMode::ReadOnly, // Task 6 threads the requested mode through here.
+            )?;
             let depth = match supervisor
                 .task(&child)
                 .expect("newly spawned task exists")
