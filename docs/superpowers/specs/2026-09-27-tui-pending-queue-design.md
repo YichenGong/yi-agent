@@ -158,7 +158,16 @@ impl PendingQueue {
 | P1 1:1 不变量靠约定 | 不变量成为 `PendingQueue` 的内部性质 |
 | P1 Esc 语义反直觉 | 行为保持，但变为**显式且可见**：转正即发送，预览区本就展示待发内容 |
 
-### 4.1 附带修正
+### 4.1 `/clear` 清空待发队列
+
+`/clear`（`app.rs:1156-1163`）当前只清 history 并发 `ControlCommand::Clear`，
+不触及队列。本设计要求它**同时清空 `PendingQueue` 的待发消息**：`/clear` 的语义是
+「从头开始」，保留上一轮语境下排队的消息与之矛盾。
+
+清空后 `in_flight` 一并复位（避免 driver 已重建、TUI 仍认为有轮次在途而永不发送）。
+history 提示行在「对话已清空」后追加被丢弃的条数，让清空行为可见。
+
+### 4.2 附带修正
 
 - **未知 slash 命令绕过队列**（`app.rs:1073-1083`）：该分支在队列逻辑之前
   `return`，与其他输入路径不一致。本设计不改其行为（它本就不该进队列，因为
@@ -198,6 +207,8 @@ impl PendingQueue {
 8. 满时提交 → 文本回到输入框、history 出现提示、通道无消息
 9. 回归：`in_flight` 语义——模拟"看到 `Done` 时 `is_running` 仍为 true"，
    验证仍能正确发送下一条（此测试直接覆盖 §1.3 的死锁场景）
+10. `/clear` 清空：队列有 3 条待发时执行 `/clear` → 队列空、`in_flight` 复位、
+    history 提示丢弃条数
 
 现有测试更新：`submit_while_running_goes_to_queue_not_history`、
 `submit_while_idle_goes_to_history_not_queue` 语义不变，仅适配构造方式。
