@@ -224,7 +224,7 @@ Note: `cargo test` accepts at most one positional test filter (`error: unexpecte
 
 - [ ] **Step 3: Write the implementation**
 
-In `yi-agent-rs/crates/yi-agent-tools/src/worktree.rs`, add these three methods inside `impl WorktreeService`, directly after `remove_accepted_clean` (which ends around line 287, just before `contains_commit`):
+In `yi-agent-rs/crates/yi-agent-tools/src/worktree.rs`, add these three methods inside `impl WorktreeService`, directly after `remove_accepted_clean` (which spans lines 254-293, just before `contains_commit` at line 299):
 
 ```rust
     /// Remove only the worktree directory, leaving its branch ref intact.
@@ -419,7 +419,7 @@ Expected: FAIL to compile — `no method named reclaim_worktree` / `reattach_wor
 
 - [ ] **Step 3: Add the trait methods**
 
-In `yi-agent-rs/crates/yi-agent-core/src/subagent/worker.rs`, add to `trait AgentWorkspaceService`, directly after `cleanup_accepted` (around line 492, before the closing brace of the trait):
+In `yi-agent-rs/crates/yi-agent-core/src/subagent/worker.rs`, add to `trait AgentWorkspaceService`, directly after `cleanup_accepted` (which spans lines 487-493; the trait's closing brace is line 494):
 
 ```rust
     /// Remove a task's worktree directory while keeping its branch ref and its
@@ -445,7 +445,7 @@ In `yi-agent-rs/crates/yi-agent-core/src/subagent/worker.rs`, add to `trait Agen
 
 - [ ] **Step 4: Implement both methods on `DaemonWorkspaceService`**
 
-In `yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs`, inside `impl AgentWorkspaceService for DaemonWorkspaceService`, add directly after `cleanup_accepted` (around line 346, before the closing brace at line 347):
+In `yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs`, inside `impl AgentWorkspaceService for DaemonWorkspaceService`, add directly after `cleanup_accepted` (which spans lines 330-346; the impl's closing brace is line 347):
 
 ```rust
     fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
@@ -503,7 +503,7 @@ This task is what makes Task 1's "keep the branch" decision usable. Without it, 
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `yi-agent-rs/crates/yi-agent-store/tests/runtime_coordinator.rs`. This file already has `initialize_git_repository`, `git_ok`, `git_output`, `MessageRecordingFactory`, and `GitWorkspaceService`; reuse them. Add a `reclaim_worktree` implementation to the test `GitWorkspaceService` first, inside `impl AgentWorkspaceService for GitWorkspaceService` (around line 165):
+Add to `yi-agent-rs/crates/yi-agent-store/tests/runtime_coordinator.rs`. This file already has `initialize_git_repository`, `git_ok`, `git_output`, `MessageRecordingFactory`, and `GitWorkspaceService`; reuse them. Add a `reclaim_worktree` implementation to the test `GitWorkspaceService` first, inside `impl AgentWorkspaceService for GitWorkspaceService` (starts at line 181):
 
 ```rust
     fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
@@ -765,7 +765,7 @@ Expected: FAIL to compile — `no method named reclaim_candidates`. If the helpe
 
 - [ ] **Step 3: Implement the query**
 
-In `yi-agent-rs/crates/yi-agent-store/src/repository.rs`, add directly after `task_workspace_optional` (around line 3239). Reuse the row-decoding shape from `task_detail` (around line 3676) so the `PersistedTaskDetail` fields are populated consistently.
+In `yi-agent-rs/crates/yi-agent-store/src/repository.rs`, add directly after `task_workspace_optional` (the function spans lines 3222-3267; add after line 3267). Reuse the row-decoding shape from `task_detail` (around line 3676) so the `PersistedTaskDetail` fields are populated consistently.
 
 ```rust
     /// Every task in a session that owns a worktree, deepest first.
@@ -1030,7 +1030,7 @@ Expected: FAIL to compile — `no method named reclaim_session_worktrees`.
 
 - [ ] **Step 4: Implement `reclaim_session_worktrees`**
 
-In `yi-agent-rs/crates/yi-agent-store/src/runtime.rs`, add after `recycle_accepted_delivery` (which ends around line 2131). This method is synchronous: it runs git subprocesses and must not be called from a context that holds the repository mutex.
+In `yi-agent-rs/crates/yi-agent-store/src/runtime.rs`, add after `recycle_accepted_delivery` (which spans lines 2076-2131). This method is synchronous: it runs git subprocesses and must not be called from a context that holds the repository mutex.
 
 ```rust
     /// Reclaims every reclaimable worktree directory in a session.
@@ -1177,7 +1177,7 @@ git commit -m "feat(store): reclaim a session's merged worktree directories"
 
 Add to `yi-agent-rs/crates/yi-agent-store/tests/runtime_ipc.rs`. That file has `application_root_daemon` and a `StaticWorkspaceService`; a recording service is needed to observe the reclaim.
 
-First, widen `ApplicationRootFactory`'s field so any service can be injected. Change its declaration (around line 269) from the concrete type to the trait object:
+First, widen `ApplicationRootFactory`'s field so any service can be injected. Change its declaration (the struct spans lines 269-272; the field is line 270) from the concrete type to the trait object:
 
 ```rust
 #[derive(Clone)]
@@ -1839,7 +1839,7 @@ In `yi-agent-rs/crates/yi-agent/src/config.rs`, add to `DaemonAction` (lines 256
     Gc,
 ```
 
-In `yi-agent-rs/crates/yi-agent-store/src/ipc.rs`, add to `IpcRequest` after `DetachApplicationRoot` (around line 155):
+In `yi-agent-rs/crates/yi-agent-store/src/ipc.rs`, add to `IpcRequest` after `DetachApplicationRoot` (the variant spans lines 151-155):
 
 ```rust
     PreviewGc,
