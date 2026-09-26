@@ -6,7 +6,8 @@ import { ChatView } from "./components/ChatView";
 import { MessageInput } from "./components/MessageInput";
 import { StatusBar } from "./components/StatusBar";
 import { ApprovalDialog } from "./components/ApprovalDialog";
-import type { ApprovalRequest } from "./lib/protocol";
+import { ThreadSidebar } from "./components/ThreadSidebar";
+import type { ApprovalRequest, ThreadSummary } from "./lib/protocol";
 
 interface ThreadInfo {
   cwd: string;
@@ -35,6 +36,91 @@ export default function App() {
   const [threadInfo, setThreadInfo] = useState<ThreadInfo | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [status, setStatus] = useState<string>("connecting");
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+
+  const busy = session.turnActive;
+
+  const refreshThreads = async () => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      const r = await c.request<{ threads: ThreadSummary[] }>("thread/list", {});
+      setThreads(r.threads);
+    } catch {
+      // 列表刷新失败不打断对话;下一次事件会再试。
+    }
+  };
+
+  const resumeThread = async (threadId: string) => {
+    const c = clientRef.current;
+    if (!c || session.turnActive) return;
+    // 必须同步 reset:回放通知可能先于 resume 响应到达。
+    session.reset();
+    force((v) => v + 1);
+    try {
+      const t = await c.request<ThreadInfo & { thread_id: string }>("thread/resume", {
+        threadId,
+      });
+      setThreadId(t.thread_id);
+      setThreadInfo({ cwd: t.cwd, model: t.model });
+    } catch (e) {
+      session.lastError = formatError(e);
+      setThreadId(null);
+      setThreadInfo(null);
+      force((v) => v + 1);
+    }
+    await refreshThreads();
+  };
+
+  const newThread = async () => {
+    const c = clientRef.current;
+    if (!c || session.turnActive) return;
+    session.reset();
+    force((v) => v + 1);
+    try {
+      const t = await c.request<ThreadInfo & { thread_id: string }>("thread/start", {});
+      setThreadId(t.thread_id);
+      setThreadInfo({ cwd: t.cwd, model: t.model });
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+    }
+    await refreshThreads();
+  };
+
+  const renameThread = async (id: string, title: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    const prev = threads;
+    setThreads((ts) => ts.map((t) => (t.thread_id === id ? { ...t, title } : t)));
+    try {
+      await c.request("thread/rename", { threadId: id, title });
+    } catch (e) {
+      setThreads(prev);
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+    }
+    await refreshThreads();
+  };
+
+  const deleteThread = async (id: string) => {
+    const c = clientRef.current;
+    if (!c || session.turnActive) return;
+    try {
+      await c.request("thread/delete", { threadId: id });
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+      return;
+    }
+    if (id === threadId) {
+      session.reset();
+      setThreadId(null);
+      setThreadInfo(null);
+      force((v) => v + 1);
+    }
+    await refreshThreads();
+  };
 
   useEffect(() => {
     if (inited.current) return; // guard against React StrictMode double-invoke
@@ -44,14 +130,19 @@ export default function App() {
     client.onNotification((n) => {
       session.apply(n);
       force((v) => v + 1);
+      if (n.method === "turn/completed") void refreshThreads();
     });
     client.onApproval((r) => setApproval(r));
     client.onStatus((s) => setStatus(s.state));
     (async () => {
       await client.request("initialize", {});
-      const thread = await client.request<ThreadInfo & { thread_id: string }>("thread/start", {});
-      setThreadId(thread.thread_id);
-      setThreadInfo({ cwd: thread.cwd, model: thread.model });
+      const list = await client.request<{ threads: ThreadSummary[] }>("thread/list", {});
+      setThreads(list.threads);
+      if (list.threads.length > 0) {
+        await resumeThread(list.threads[0].thread_id);
+      } else {
+        await newThread();
+      }
       setStatus("connected");
     })().catch((e) => {
       const msg = formatError(e);
@@ -92,17 +183,28 @@ export default function App() {
   return (
     <>
       <div
-        className="flex h-screen flex-col bg-neutral-950 text-neutral-100"
+        className="flex h-screen flex-row bg-neutral-950 text-neutral-100"
         inert={approval !== null}
       >
-        <StatusBar
-          cwd={threadInfo?.cwd ?? null}
-          model={threadInfo?.model ?? null}
-          status={status}
-          usage={session.usage}
+        <ThreadSidebar
+          threads={threads}
+          currentId={threadId}
+          busy={busy}
+          onSelect={resumeThread}
+          onRename={renameThread}
+          onDelete={deleteThread}
+          onNew={newThread}
         />
-        <ChatView items={session.items} error={session.lastError} />
-        <MessageInput turnActive={session.turnActive} onSend={send} onInterrupt={interrupt} />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <StatusBar
+            cwd={threadInfo?.cwd ?? null}
+            model={threadInfo?.model ?? null}
+            status={status}
+            usage={session.usage}
+          />
+          <ChatView items={session.items} error={session.lastError} />
+          <MessageInput turnActive={session.turnActive} onSend={send} onInterrupt={interrupt} />
+        </div>
       </div>
       {approval && (
         <ApprovalDialog
