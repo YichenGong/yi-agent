@@ -94,3 +94,14 @@ desktop/
   src-tauri/            # Tauri Rust backend (sidecar lifecycle + RPC bridge)
   scripts/              # build-sidecar.sh (Task P2)
 ```
+
+## Verification status
+
+Frontend unit tests (`npm test`, 14 tests) and the frontend production build
+(`npm run build`) are green. The native bundle and the manual smoke checklist
+are **pending verification** — see `docs/project-management/desktop.md`:
+
+```bash
+npm run sidecar:release && npm run tauri build   # → src-tauri/target/release/bundle/macos/yi-agent.app
+npm run sidecar && npm run tauri dev             # manual end-to-end smoke
+```
