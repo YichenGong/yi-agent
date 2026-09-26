@@ -330,6 +330,10 @@ mod tests {
     #[case::root("rm -rf /", true)]
     #[case::root_star("rm -rf /*", true)]
     #[case::root_dashdash("rm -rf / --", true)]
+    // 仍必须拦:被引号/命令连接符包住的根删除(既有 test_composite 要求,
+    // 也是终止条件不能用纯空白的原因)
+    #[case::root_quoted("echo \"rm -rf /\"", true)]
+    #[case::root_chained("git status && rm -rf /", true)]
     // 仍必须拦:.. 爬回根
     #[case::dotdot_root("rm -rf /tmp/../", true)]
     // 不得误伤:.. 之后还有真实段
