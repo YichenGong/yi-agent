@@ -13,6 +13,19 @@ interface ThreadInfo {
   model: string;
 }
 
+/**
+ * RPC rejections are `RpcError` objects, so `String(e)` would render
+ * `[object Object]`. Prefer the `message` field when present, falling back to
+ * the default coercion for primitives and other shapes.
+ */
+function formatError(e: unknown): string {
+  if (e && typeof e === "object" && "message" in e) {
+    const m = (e as { message?: unknown }).message;
+    if (typeof m === "string") return m;
+  }
+  return String(e);
+}
+
 export default function App() {
   const [session] = useState(() => new Session());
   const [, force] = useState(0);
@@ -40,7 +53,7 @@ export default function App() {
       setThreadId(thread.thread_id);
       setThreadInfo({ cwd: thread.cwd, model: thread.model });
       setStatus("connected");
-    })().catch((e) => setStatus(`error: ${String(e)}`));
+    })().catch((e) => setStatus(`error: ${formatError(e)}`));
   }, [session]);
 
   const send = async (text: string): Promise<boolean> => {
@@ -54,7 +67,7 @@ export default function App() {
       });
       return true;
     } catch (e) {
-      session.lastError = String(e);
+      session.lastError = formatError(e);
       // Roll back the optimistic bubble so a rejected turn (e.g. -32012 turn
       // already in progress) does not leave a phantom user message.
       const last = session.items[session.items.length - 1];
@@ -82,8 +95,14 @@ export default function App() {
         <ApprovalDialog
           request={approval}
           onDecide={async (decision) => {
-            await clientRef.current?.respond(approval.id, decision);
-            setApproval(null);
+            try {
+              await clientRef.current?.respond(approval.id, decision);
+            } catch (e) {
+              session.lastError = formatError(e);
+              force((v) => v + 1);
+            } finally {
+              setApproval(null);
+            }
           }}
         />
       )}
