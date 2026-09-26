@@ -1953,10 +1953,16 @@ impl RuntimeCoordinator {
                     .lock()
                     .expect("runtime repository mutex poisoned")
                     .delete_task_workspace(child);
-                if deleted.is_ok() {
-                    self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycled);
-                } else {
-                    self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+                match deleted {
+                    Ok(()) => {
+                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycled);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "yi-agent: failed to delete recycled workspace row for {child}: {error}"
+                        );
+                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+                    }
                 }
             }
             Err(error) => {
