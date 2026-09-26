@@ -1893,4 +1893,55 @@ mod tests {
         let mut s = HistoryState::new();
         assert!(!s.toggle_pending_permission_expanded());
     }
+
+    /// 黑名单拒绝的事件序列必须渲染出一次失败的工具调用,且带拒绝原因。
+    #[test]
+    fn blacklist_deny_is_visible_as_failed_tool_call() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::ToolCall {
+                id: "deny-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "blocked-cmd"}),
+            },
+            80,
+        );
+        s.push_event(
+            AgentEvent::ToolResult {
+                id: "deny-1".into(),
+                result: ToolResult {
+                    content: vec![yi_agent_core::ContentBlock::Text(
+                        "blocked by safety filter: test rule".into(),
+                    )],
+                    is_error: true,
+                },
+            },
+            80,
+        );
+
+        // 调用单元存在且被标记为失败。
+        let call = s
+            .cells
+            .iter()
+            .find_map(|c| match c {
+                HistoryCell::ToolCall { id, state, .. } if id == "deny-1" => Some(state),
+                _ => None,
+            })
+            .expect("ToolCall cell must exist so the refusal is visible");
+        assert_eq!(*call, crate::tui::cell::CallState::Failed);
+
+        // 拒绝原因出现在渲染输出中。
+        let rendered: Vec<String> = s
+            .cells
+            .iter()
+            .flat_map(|c| c.lines(80))
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("blocked by safety filter: test rule")),
+            "deny reason must be rendered; got: {rendered:?}"
+        );
+    }
 }
