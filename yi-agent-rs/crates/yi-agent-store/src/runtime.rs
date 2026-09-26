@@ -2645,7 +2645,80 @@ impl RuntimeCoordinator {
             }
             self.release_resident_lease(&task_id);
         }
+        self.reconcile_integrated_deliveries().await;
         Ok(())
+    }
+
+    /// Accepts deliveries whose commit a parent has already integrated.
+    ///
+    /// This is the production entry to `accept_review`. It never parses agent
+    /// text: the ancestry of the child's delivered commit in the parent's
+    /// worktree HEAD is the only proof of integration. It runs on every
+    /// reconcile pass because the application root is not a daemon worker, so
+    /// its merge is only observable through git.
+    ///
+    /// Failures are logged, not propagated: reconcile runs on every IPC request
+    /// and a transient mismatch must not fail unrelated traffic.
+    async fn reconcile_integrated_deliveries(&self) {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .iter()
+            .map(|(session, supervisor)| (session.clone(), Arc::clone(supervisor)))
+            .collect::<Vec<_>>();
+        let mut awaiting: Vec<(RootSessionId, TaskId, TaskId, String)> = Vec::new();
+        for (session, supervisor) in &supervisors {
+            let supervisor = supervisor.lock().await;
+            for child in supervisor.tasks_awaiting_parent_review() {
+                let Some(task) = supervisor.task(&child) else {
+                    continue;
+                };
+                let Some(parent) = task.parent_id.clone() else {
+                    continue;
+                };
+                let Some(commit) = task
+                    .active_attempt()
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.commit.clone())
+                else {
+                    continue;
+                };
+                awaiting.push((session.clone(), child, parent, commit));
+            }
+        }
+        for (session, child, parent, commit) in awaiting {
+            let Some(service) = self.workspace_service_for(&session) else {
+                continue;
+            };
+            let owner_workspace = {
+                let repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                repository.task_workspace_optional(&parent).ok().flatten()
+            };
+            let Some(owner_workspace) = owner_workspace else {
+                continue;
+            };
+            match service.contains_commit(&owner_workspace, &commit) {
+                Ok(true) => {
+                    let integration = IntegrationValidation::passed(format!(
+                        "child commit {commit} is an ancestor of parent {parent} HEAD"
+                    ));
+                    if let Err(error) = self.accept_review(&child, integration).await {
+                        eprintln!(
+                            "yi-agent: integrated delivery accept failed for {child}: {error}"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("yi-agent: integration ancestry check failed for {child}: {error}");
+                }
+            }
+        }
     }
 
     pub async fn worker_cancellation(
