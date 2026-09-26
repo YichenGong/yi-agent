@@ -146,6 +146,8 @@ pub enum Notification {
         model: String,
         input_tokens: u32,
         output_tokens: u32,
+        cache_creation_input_tokens: u32,
+        cache_read_input_tokens: u32,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -318,5 +320,23 @@ mod tests {
         let v: Value = serde_json::to_value(&n).unwrap();
         assert_eq!(v["params"]["status"], "completed");
         assert!(v["params"].get("error").is_none());
+    }
+
+    #[test]
+    fn token_usage_notification_includes_cache_fields() {
+        let n = Notification::TokenUsage {
+            thread_id: "t1".into(),
+            model: "m".into(),
+            input_tokens: 10,
+            output_tokens: 3,
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 200,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/tokenUsage/updated");
+        assert_eq!(v["params"]["input_tokens"], 10);
+        assert_eq!(v["params"]["output_tokens"], 3);
+        assert_eq!(v["params"]["cache_creation_input_tokens"], 100);
+        assert_eq!(v["params"]["cache_read_input_tokens"], 200);
     }
 }

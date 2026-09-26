@@ -239,6 +239,8 @@ impl Translator {
                     model,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                    cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
                 });
             }
             AgentEvent::Done { reason } => {
@@ -714,6 +716,57 @@ mod tests {
                 assert_eq!(model, "m");
                 assert_eq!(*input_tokens, 3);
                 assert_eq!(*output_tokens, 5);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_carries_cache_tokens() {
+        let mut t = translator();
+        let usage = TokenUsage {
+            input_tokens: 3,
+            output_tokens: 5,
+            cache_creation_input_tokens: Some(100),
+            cache_read_input_tokens: Some(200),
+        };
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage,
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                ..
+            } => {
+                assert_eq!(*cache_creation_input_tokens, 100);
+                assert_eq!(*cache_read_input_tokens, 200);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_missing_cache_tokens_defaults_to_zero() {
+        let mut t = translator();
+        let usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Default::default()
+        };
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage,
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                ..
+            } => {
+                assert_eq!(*cache_creation_input_tokens, 0);
+                assert_eq!(*cache_read_input_tokens, 0);
             }
             other => panic!("expected TokenUsage, got {other:?}"),
         }
