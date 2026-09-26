@@ -294,6 +294,11 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
     }
 
     fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        if workspace.branch.is_empty() {
+            // A read-only workspace owns no worktree or branch; its `path` is
+            // the parent's view and must not be removed.
+            return Ok(());
+        }
         self.service
             .remove_created(
                 &workspace.repository_root,
@@ -1505,6 +1510,16 @@ mod tests {
     #[test]
     fn non_git_workspace_service_supports_only_read_only() {
         let directory = tempfile::TempDir::new().unwrap();
+        if std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(directory.path())
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skip: temp dir is inside a git repository");
+            return;
+        }
         let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
 
         assert!(!service.supports_coding());
@@ -1515,6 +1530,15 @@ mod tests {
         assert_eq!(workspace.path, directory.path());
         assert!(workspace.branch.is_empty());
         assert!(workspace.base_commit.is_empty());
+    }
+
+    #[test]
+    fn git_workspace_service_supports_coding() {
+        let directory = tempfile::TempDir::new().unwrap();
+        initialize_git_repository(directory.path());
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+
+        assert!(service.supports_coding());
     }
 
     #[test]
