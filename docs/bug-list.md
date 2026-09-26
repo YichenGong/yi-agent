@@ -13,6 +13,7 @@
 - [ ] 自动压缩后，Prefill的数字好像不会自动更新了。
 - [ ] 出现多次连续自动压缩的情况
 - [ ] subagent 如果一直不停。怎么办。
-- [ ] 当前启动subagent runtime 就会创建worktree。太多了怎么清理。（部分修复：已集成 delivery 验收后自动回收 worktree/branch/workspace 行，见 `runtime.rs` `recycle_accepted_delivery`；已交付但父未集成/未 merge，以及失败/取消/驳回任务仍不回收）
+- [ ] 当前启动subagent runtime 就会创建worktree。太多了怎么清理。（大幅缓解：subagent 现默认只读、不建 worktree，只有显式 `mode: "coding"` 的 child 才建；已集成 delivery 验收后自动回收 worktree/branch/workspace 行，见 `runtime.rs` `recycle_accepted_delivery`。剩余：coding child 已交付但父未集成/未 merge，以及失败/取消/驳回的 coding 任务仍不回收）
+- [x] 非 git 目录下 subagent session 不可用（修复：非 git session 降级为只读原地模式，root 不建 worktree；coding child 以 `coding_requires_git_repository` 明确失败。见 `yi-agent-rs/crates/yi-agent-store/src/runtime.rs` `prepare_task_workspace`、`yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs` `DaemonWorkspaceService`，验证：`cargo test -p yi-agent-store --test runtime_coordinator coding_child_fails_clearly_without_a_git_repository`）
 - [x] `daemon serve` 用 `state.sqlite`、内嵌 TUI/headless runtime 用 `runtime.sqlite`，同一项目任务历史分裂（修复：`main.rs` `runtime_database_path` 统一为 `runtime.sqlite`）
 - [x] resident lease 释放与 resource coordinator 锁序反转，reconcile 热路径可死锁（修复：`runtime.rs` `release_resident_lease` 不再同时持两把锁）
