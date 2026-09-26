@@ -297,4 +297,29 @@ mod tests {
             "cache should serve stale data, not re-scan filesystem"
         );
     }
+
+    #[test]
+    fn refresh_picks_up_new_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        std::fs::write(
+            tmp.path().join("foo/SKILL.md"),
+            "---\nname: foo\ndescription: x\n---\nbody",
+        )
+        .unwrap();
+        let s = SkillsService::new(vec![(tmp.path().to_path_buf(), SkillScope::User)]);
+        assert_eq!(s.snapshot().unwrap().len(), 1);
+
+        std::fs::create_dir_all(tmp.path().join("bar")).unwrap();
+        std::fs::write(
+            tmp.path().join("bar/SKILL.md"),
+            "---\nname: bar\ndescription: y\n---\nbody",
+        )
+        .unwrap();
+
+        // refresh() re-scans and sees the new skill...
+        assert_eq!(s.refresh().unwrap().len(), 2);
+        // ...and the refreshed result replaces the cache for later snapshots.
+        assert_eq!(s.snapshot().unwrap().len(), 2);
+    }
 }
