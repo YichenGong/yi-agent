@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use yi_agent_core::subagent::task::DeliveryReport;
-use yi_agent_core::subagent::task::{AttemptId, RootSessionId, TaskId, WorkspaceLeaseId};
+use yi_agent_core::subagent::task::{
+    AttemptId, RootSessionId, TaskId, TaskWorkspaceMode, WorkspaceLeaseId,
+};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
     WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerRecoveryPreflight,
@@ -941,6 +943,19 @@ fn format_ipc_rejection(action: &str, response: &yi_agent_store::ipc::IpcRespons
     }
 }
 
+/// Resolves the optional `mode` argument for a daemon `spawn_agent` call via the
+/// canonical [`TaskWorkspaceMode::parse`], so the tool, the core tool, and the
+/// IPC helper agree on the accepted spellings. An omitted mode defaults to
+/// read-only; an explicit unknown or non-string value is rejected.
+fn spawn_mode(args: &Value) -> Result<TaskWorkspaceMode, ToolResult> {
+    match args.get("mode") {
+        None => Ok(TaskWorkspaceMode::ReadOnly),
+        Some(Value::String(value)) => TaskWorkspaceMode::parse(value)
+            .ok_or_else(|| ToolResult::error("mode must be 'coding' or 'read_only'")),
+        Some(_) => Err(ToolResult::error("mode must be a string")),
+    }
+}
+
 struct DaemonSpawnAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
@@ -994,15 +1009,9 @@ impl Tool for DaemonApplicationSpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
-        let mode = match args.get("mode") {
-            None => "read_only",
-            Some(Value::String(value)) if value == "coding" || value == "read_only" => {
-                value.as_str()
-            }
-            Some(Value::String(_)) => {
-                return ToolResult::error("mode must be 'coding' or 'read_only'");
-            }
-            Some(_) => return ToolResult::error("mode must be a string"),
+        let mode = match spawn_mode(&args) {
+            Ok(mode) => mode,
+            Err(error) => return error,
         };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
@@ -1011,7 +1020,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 parent_task_id: self.caller_task_id.clone(),
                 capability: self.application_capability.clone(),
                 objective: task.to_string(),
-                mode: Some(mode.to_string()),
+                mode: Some(mode.as_str().to_string()),
             },
         );
         match response {
@@ -1107,15 +1116,9 @@ impl Tool for DaemonSpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
-        let mode = match args.get("mode") {
-            None => "read_only",
-            Some(Value::String(value)) if value == "coding" || value == "read_only" => {
-                value.as_str()
-            }
-            Some(Value::String(_)) => {
-                return ToolResult::error("mode must be 'coding' or 'read_only'");
-            }
-            Some(_) => return ToolResult::error("mode must be a string"),
+        let mode = match spawn_mode(&args) {
+            Ok(mode) => mode,
+            Err(error) => return error,
         };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
@@ -1123,7 +1126,7 @@ impl Tool for DaemonSpawnAgentTool {
                 session_id: self.session_id.clone(),
                 parent_task_id: self.caller_task_id.clone(),
                 objective: task.to_string(),
-                mode: Some(mode.to_string()),
+                mode: Some(mode.as_str().to_string()),
             },
         );
         match response {
@@ -1180,6 +1183,38 @@ mod tests {
             format_ipc_rejection("spawn request", &response),
             "daemon rejected spawn request: invalid_state: an agent may have at most four direct children"
         );
+    }
+
+    #[test]
+    fn daemon_spawn_mode_uses_the_canonical_parser() {
+        assert_eq!(
+            spawn_mode(&json!({})).unwrap(),
+            TaskWorkspaceMode::ReadOnly,
+            "an omitted mode defaults to read-only"
+        );
+        assert_eq!(
+            spawn_mode(&json!({ "mode": "coding" })).unwrap(),
+            TaskWorkspaceMode::Coding
+        );
+        assert_eq!(
+            spawn_mode(&json!({ "mode": "read_only" })).unwrap(),
+            TaskWorkspaceMode::ReadOnly
+        );
+
+        let unknown = spawn_mode(&json!({ "mode": "bogus" })).unwrap_err();
+        assert!(unknown.is_error);
+        assert!(matches!(
+            unknown.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("mode must be 'coding' or 'read_only'")
+        ));
+
+        let non_string = spawn_mode(&json!({ "mode": 5 })).unwrap_err();
+        assert!(non_string.is_error);
+        assert!(matches!(
+            non_string.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)] if text.contains("mode must be a string")
+        ));
     }
 
     #[derive(Default)]

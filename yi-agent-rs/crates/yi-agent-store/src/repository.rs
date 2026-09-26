@@ -893,7 +893,9 @@ impl RuntimeRepository {
             attempt_number,
             state,
             "Root session objective not specified.",
-            TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
+            // Root tasks own an isolated session worktree, so this convenience
+            // wrapper keeps the coding mode.
+            TaskWorkspaceMode::Coding,
         )
     }
 
@@ -978,7 +980,9 @@ impl RuntimeRepository {
             attempt_number,
             state,
             "Complete the delegated task.",
-            TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
+            // Legacy compat wrapper used only by tests; callers needing a
+            // read-only child go through `create_child_task_with_attempt_and_objective`.
+            TaskWorkspaceMode::Coding,
         )
     }
 

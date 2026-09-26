@@ -190,24 +190,6 @@ impl AgentWorkspaceService for ProjectWorkspaceService {
     ) -> Result<WorkerWorkspace, WorkerError> {
         self.prepare_root(root_session_id, task_id, attempt_id)
     }
-
-    fn prepare_read_only(
-        &self,
-        parent: Option<&WorkerWorkspace>,
-        _task_id: &TaskId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let path = parent
-            .map(|workspace| workspace.path.clone())
-            .unwrap_or_else(|| self.repository_root.clone());
-        Ok(WorkerWorkspace {
-            lease_id: WorkspaceLeaseId::new(),
-            repository_root: self.repository_root.clone(),
-            path,
-            branch: String::new(),
-            parent_branch: String::new(),
-            base_commit: String::new(),
-        })
-    }
 }
 
 #[derive(Clone, Default)]
@@ -4184,7 +4166,7 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Implement the parser".into(),
-            mode: None,
+            mode: Some("coding".into()),
         },
     )
     .unwrap()
@@ -4536,7 +4518,7 @@ fn delivered_child_over_ipc(
             session_id,
             parent_task_id: root_task_id,
             objective: "Implement the parser".into(),
-            mode: None,
+            mode: Some("coding".into()),
         },
     )
     .unwrap()
