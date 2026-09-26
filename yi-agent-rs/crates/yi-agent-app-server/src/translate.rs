@@ -254,6 +254,16 @@ impl Translator {
             AgentEvent::Error(e) => {
                 self.finish_turn(TurnStatus::Failed, Some(e.to_string()), &mut out);
             }
+            AgentEvent::ProviderRetry { attempt, max, .. } => {
+                // The desktop client shows this so a stalled stream does not
+                // look like a hang during the backoff window.
+                out.push(Notification::TurnRetry {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    attempt,
+                    max,
+                });
+            }
             // 暂不产生通知的事件。
             //
             // 翻译层有意忽略 `PermissionRequest` / `PermissionResolved`:

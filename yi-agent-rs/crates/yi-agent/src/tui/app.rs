@@ -759,6 +759,9 @@ fn route_event(
             registry.on_result(id, result.is_error);
         }
         AgentEvent::ToolRetry { .. } => {}
+        // The retry is surfaced through a history separator; the status bar
+        // needs no extra state (which would raise "when do we clear it?").
+        AgentEvent::ProviderRetry { .. } => {}
         // Turn-end events finalize any still-running tasks. This is a
         // defense-in-depth cleanup: in the happy path each ToolCall gets a
         // matching ToolExit before Done arrives. But ToolExit can be missed

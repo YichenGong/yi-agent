@@ -364,6 +364,21 @@ impl HistoryState {
 
         match event {
             AgentEvent::Start => {}
+            AgentEvent::ProviderRetry {
+                attempt,
+                max,
+                idle_secs,
+            } => {
+                // Make the stall retry visible: the user should know the stream
+                // went quiet and that yi-agent is retrying, rather than watching
+                // a frozen screen during the backoff. The partial text that was
+                // already streamed stays on screen above this line.
+                self.cells.push(HistoryCell::Separator {
+                    label: Some(format!(
+                        "Provider stalled (no output for {idle_secs}s) — retrying {attempt}/{max}"
+                    )),
+                });
+            }
             AgentEvent::AssistantText(text) => match self.cells.last_mut() {
                 Some(HistoryCell::AssistantMessage { .. }) => {
                     self.cells.last_mut().unwrap().append_assistant_text(&text);
@@ -1732,6 +1747,62 @@ mod tests {
             HistoryCell::Separator { label: Some(label) }
                 if label == "压缩完成（12 → 5 条消息）"
         ));
+    }
+
+    #[test]
+    fn push_event_provider_retry_shows_visible_separator() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("partial text".into()), 80);
+
+        s.push_event(
+            AgentEvent::ProviderRetry {
+                attempt: 1,
+                max: 3,
+                idle_secs: 60,
+            },
+            80,
+        );
+
+        // The retry must be visible, not silent.
+        assert_eq!(s.cells.len(), 2, "partial + retry separator");
+        assert!(matches!(
+            &s.cells[1],
+            HistoryCell::Separator { label: Some(label) }
+                if label.contains("retrying 1/3") && label.contains("60s")
+        ));
+        // The already-streamed partial is preserved for the user.
+        assert!(matches!(
+            &s.cells[0],
+            HistoryCell::AssistantMessage { markdown } if markdown == "partial text"
+        ));
+    }
+
+    #[test]
+    fn push_event_provider_retry_keeps_history_before_it() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("done earlier".into()), 80);
+        s.push_event(
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            80,
+        );
+        let before = s.cells.len();
+
+        s.push_event(
+            AgentEvent::ProviderRetry {
+                attempt: 2,
+                max: 3,
+                idle_secs: 60,
+            },
+            80,
+        );
+
+        assert_eq!(s.cells.len(), before + 1, "only the separator is appended");
+        assert!(matches!(s.cells[0], HistoryCell::AssistantMessage { .. }));
+        assert!(matches!(s.cells[1], HistoryCell::ToolCall { .. }));
     }
 
     #[test]

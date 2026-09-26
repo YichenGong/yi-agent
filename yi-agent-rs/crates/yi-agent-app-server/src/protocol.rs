@@ -131,6 +131,13 @@ pub enum Notification {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    #[serde(rename = "turn/retry")]
+    TurnRetry {
+        thread_id: String,
+        turn_id: String,
+        attempt: u16,
+        max: u16,
+    },
     #[serde(rename = "thread/tokenUsage/updated")]
     TokenUsage {
         thread_id: String,
