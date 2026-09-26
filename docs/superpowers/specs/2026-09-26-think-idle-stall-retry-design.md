@@ -4,7 +4,7 @@
 指数退避重试（默认 3 次，2s/4s/8s）；并且**重试过程对用户可见**——用户应当被告知
 "provider 停滞了，正在重试 1/3"，而不是在无提示的静默中等待。
 
-**状态:** 设计已确认（v2，按"重试必须可见"修正），待转实现计划。
+**状态:** 设计已确认（v3，新增请求超时重试），待转实现计划。
 
 **修订关系:** 本设计修订 `2026-07-27-agent-completion-design.md` 的 Non-goals 中
 "不自动重试 provider 错误"一条，**仅限** THINK 阶段的空闲停滞。网络错误、鉴权失败、
@@ -12,6 +12,11 @@
 
 **v2 修正说明:** v1 设计把重试做成对用户完全不可见（丢弃 partial、TUI 不产生任何
 痕迹）。该取舍被否决：重试必须是**可感知**的。v2 改为保留 partial 并插入显式提示。
+
+**v3 修正说明:** 请求超时（§9）此前仍是硬失败、无重试。用户要求请求超时也要重试
+3 次，故纳入同一 attempt 循环。为此必须先把超时的**类型**信息保留到 core：实测
+超时的错误 Display 是 `"error decoding response body"`（不含 "timed out"），所以
+**不能靠字符串判定**，只能靠 `reqwest::Error::is_timeout()` 在 `stream.rs` 分类。
 
 ---
 
@@ -238,3 +243,150 @@ cargo test -p yi-agent-app-server --lib
 cd ../desktop && npm test
 cargo fmt --all -- --check
 ```
+
+---
+
+## 9. 请求超时重试（v3 新增）
+
+### 9.1 问题
+
+`reqwest::ClientBuilder::timeout` 是**总时长上限**（reqwest 文档原话："applied from
+when the request starts connecting until the response body has finished. Also
+considered a total deadline"），默认 300s（`anthropic/client.rs:18`、
+`openai/client.rs:17`），且 `bootstrap.rs` 未暴露该配置（用户改不了）。实测（见
+§9.5）该上限会在**流仍在持续输出**时把连接切断。
+
+切断后：`Error` → `run_loop` 立即 `return`，交互模式**不重试**，用户看到
+`Error:` 分隔线、headless 退出码 1。与 idle stall 一样，这通常是瞬时故障
+（网络抖动、服务端排队、中间设备静默丢连接），重发往往成功。
+
+### 9.2 关键约束：超时信息在源头丢失
+
+`anthropic/stream.rs:312`（openai 同构）把字节流错误字符串化：
+
+```rust
+Err(e) => Poll::Ready(Some(Err(ProviderError::Network(e.to_string())))),
+```
+
+`e` 是 `reqwest::Error`，这里丢掉后 `is_timeout()` 再不可得。实测该错误的
+Display 是 `"error decoding response body"`——**字符串里没有 "timed out"**，
+因此按字符串匹配超时是不可行的（这也是 §9.4 要用类型化 stop reason 的原因）。
+
+实测（本 worktree 真实 TCP trickle 服务器 + 1s 超时）：
+
+```
+PROBE display  = error decoding response body
+PROBE is_timeout = true
+PROBE is_decode  = true
+```
+
+注意 `is_decode()` 对同一错误也返回 true，所以判定必须**先查 `is_timeout`**。
+
+### 9.3 可重试 vs 不可重试
+
+`"stream error: "` 前缀混合了两种性质，不能笼统重试：
+
+| 情形 | 性质 | 处置 |
+| --- | --- | --- |
+| 传输超时（`is_timeout`） | 瞬时 | **重试**（本次目标） |
+| 连接重置 / 传输中断（`is_connect`/`is_request`/`is_body` 等） | 瞬时 | 不重试（非目标，见 §9.7） |
+| SSE 载荷非法（`ProviderError::Stream`，如 `invalid SSE JSON`） | provider 发了坏数据 | **不重试**，仍终结 |
+
+既有测试 `agent_reports_provider_stream_stop_as_error`（`agent.rs:1500`，用
+`StopReason::Other("stream error: invalid SSE payload")`）锁的是第三种，必须保持
+终结。§9.4 的类型化设计天然满足：非法载荷走 `ProviderError::Stream` → `Error`，
+不进入重试分支。
+
+### 9.4 设计
+
+**(a) `ProviderEvent` 新增类型化终态**
+
+```rust
+pub enum ProviderEvent {
+    // ...
+    Stop { reason: StopReason },
+    /// A mid-stream transport failure, preserving its classification so the
+    /// agent loop can decide retryability without string matching.
+    StreamError(ProviderError),
+    Usage(TokenUsage),
+}
+```
+
+两个 client 的 `map` 改为：
+
+```rust
+Err(e) => ProviderEvent::StreamError(e),   // 原来是 Stop{Other("stream error: {e}")}
+```
+
+`stream.rs` 保留分类：字节错误处 `if e.is_timeout() { Network(...) } else { Stream(...) }`
+（超时归入可重试的 `Network`，其余保持现状），具体分类规则由实现计划细化。
+
+**(b) `accumulate_stream` 返回类型化失败**
+
+`accumulate_stream` 的返回由 `Result<(content, stop_reason, usage), ProviderError>`
+改为 `Result<(content, stop_reason, usage), AgentError>`（或等价地用一个内部枚举），
+使**部分内容随错误一起返回**——这是 §2.7「partial 保留显示」在超时路径上的延伸。
+
+**(c) 同一 attempt 循环，按类型判定**
+
+`run_loop` 的 attempt 循环增加一条可重试条件：
+
+```rust
+let stalled = matches!(stop_reason, StopReason::Stalled);
+let timed_out = matches!(&err, AgentError::Provider(ProviderError::Network(_)));
+if (stalled || timed_out) && stall_retries < config.think_stall_retry_limit { /* 退避重试 */ }
+```
+
+复用同一 `stall_retries` 计数与 `stall_backoff_delay`（2s/4s/8s，封顶 30s），因此
+「idle stall + 超时」合计最多 3 次重试，与用户要求的「超时需要 3 次重试」一致。
+
+**(d) 终态**
+
+重试耗尽后仍是 `Done { Interrupted { reason } }`，reason 形如
+`"request timeout after 3 retries"`（与 stall 的 `"idle timeout after 3 retries"` 对称）。
+
+### 9.5 实证记录（写入测试）
+
+新增测试 `request_timeout_is_a_total_deadline_not_an_idle_timeout`
+（`yi-agent-llm/tests/integration.rs`，commit `b7a6fde`）用真实 TCP 服务器每 300ms
+持续发事件、共 3s，provider 超时 1s：
+
+- 1s 超时下流在 **1.01s** 被切断（终态 `Stop{Other("stream error: ...")}`）
+- 把超时改为 10s 复跑，同一流跑满 **3.02s** 并正常完成
+
+两者共同证明：服务端从未空闲，切断确实来自「总时长」语义。该测试在本次改动后需要
+适配新的事件形态（终态从 `Stop{Other}` 变为 `StreamError(Network)`）。
+
+### 9.6 可见性
+
+超时重试复用 `AgentEvent::ProviderRetry`，新增 `cause` 字段以区分文案：
+
+```rust
+ProviderRetry { attempt: u16, max: u16, idle_secs: u64, cause: RetryCause }
+
+pub enum RetryCause { IdleStall, RequestTimeout }
+```
+
+| 消费端 | 超时文案 |
+| --- | --- |
+| TUI 历史 | `Provider request timed out — retrying 1/3` |
+| headless stderr | `[provider-retry:1/3 timeout]`（stall 保持 `[provider-retry:1/3]` 兼容） |
+| app-server → desktop | `TurnRetry { attempt, max, cause }`；desktop 横幅文案按 cause 切换 |
+
+`AgentEvent` 与 `Notification` 都是普通枚举，穷尽匹配点（`tui/history.rs`、
+`tui/app.rs`、`main.rs`、`translate.rs`、`subagent_runtime.rs`）需同步。
+
+### 9.7 非目标
+
+- 不重试连接重置等**其他**传输错误（只做超时）。它们同样经 `StreamError` 到达
+  core，后续要覆盖只需扩展 (c) 的判定，无需再改协议。
+- 不改 300s 总时长上限的数值，也不把它改成「空闲超时」语义（那是另一个问题：
+  长流被总时长切断的根因）。仅在本设计中记录为已知限制。
+- 不把该超时做成用户可配置项（`bootstrap.rs` 仍用默认值）。
+
+### 9.8 最坏耗时（更新）
+
+默认 `60s idle × 4 + 14s 退避 = 254s`（纯 stall），超时路径为
+`300s × 4 + 14s = 1214s`。daemon 侧 `max_wall_time_secs = 2700`（`schedule.rs:159`）
+可容纳；但交互模式无 wall-clock 上限，用户需知道超时重试最坏约 20 分钟。TUI 的
+可见提示（§9.6）是这里的必要缓冲。
