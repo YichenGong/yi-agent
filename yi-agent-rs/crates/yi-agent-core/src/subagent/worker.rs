@@ -440,6 +440,25 @@ pub trait AgentWorkspaceService: Send + Sync {
         attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError>;
 
+    /// Whether this service can create coding worktrees. A non-git service
+    /// returns `false`, forcing the session into read-only mode.
+    fn supports_coding(&self) -> bool {
+        true
+    }
+
+    /// Supplies the in-place execution root for a read-only task. `parent` is
+    /// the nearest ancestor workspace, when one exists. The default cannot
+    /// invent a path and therefore fails.
+    fn prepare_read_only(
+        &self,
+        _parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup(
+            "workspace service does not support read-only tasks".into(),
+        ))
+    }
+
     fn inspect_delivery(
         &self,
         _workspace: &WorkerWorkspace,

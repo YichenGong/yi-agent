@@ -163,18 +163,20 @@ impl DaemonAgentWorkerFactory {
 pub struct DaemonWorkspaceService {
     repository_root: PathBuf,
     worktree_root: PathBuf,
+    is_git_repository: bool,
     service: yi_agent_tools::worktree::WorktreeService,
 }
 
 impl DaemonWorkspaceService {
     pub fn new(workspace: PathBuf) -> Self {
-        let repository_root = git_output(&workspace, &["rev-parse", "--show-toplevel"])
-            .map(PathBuf::from)
-            .unwrap_or(workspace);
+        let git_root = git_output(&workspace, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
+        let is_git_repository = git_root.is_some();
+        let repository_root = git_root.unwrap_or(workspace);
         let worktree_root = repository_root.join(".worktrees");
         Self {
             repository_root,
             worktree_root,
+            is_git_repository,
             service: yi_agent_tools::worktree::WorktreeService::new(),
         }
     }
@@ -210,6 +212,28 @@ impl DaemonWorkspaceService {
 }
 
 impl AgentWorkspaceService for DaemonWorkspaceService {
+    fn supports_coding(&self) -> bool {
+        self.is_git_repository
+    }
+
+    fn prepare_read_only(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let path = parent
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| self.repository_root.clone());
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        })
+    }
+
     fn prepare_root(
         &self,
         root_session_id: &RootSessionId,
@@ -1476,6 +1500,40 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[test]
+    fn non_git_workspace_service_supports_only_read_only() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+
+        assert!(!service.supports_coding());
+
+        let workspace = service
+            .prepare_read_only(None, &TaskId::new())
+            .expect("read-only workspace is always available");
+        assert_eq!(workspace.path, directory.path());
+        assert!(workspace.branch.is_empty());
+        assert!(workspace.base_commit.is_empty());
+    }
+
+    #[test]
+    fn read_only_workspace_inherits_the_parent_path() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let parent = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: directory.path().join("parent-view"),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+
+        let workspace = service
+            .prepare_read_only(Some(&parent), &TaskId::new())
+            .unwrap();
+        assert_eq!(workspace.path, parent.path);
     }
 
     #[test]
