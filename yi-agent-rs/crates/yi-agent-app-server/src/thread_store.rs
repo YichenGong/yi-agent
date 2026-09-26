@@ -562,8 +562,14 @@ mod tests {
     #[test]
     fn exists_true_if_either_file_present() {
         let (_d, s) = store();
-        assert!(!s.exists("thread-a"));
+        assert!(!s.exists("thread-a"), "neither file: must not exist");
+
+        // log-only (append_turn creates the log but no meta)
+        s.append_turn("thread-a", &turn(vec![], vec![])).unwrap();
+        assert!(s.exists("thread-a"), "log-only must count as existing");
+
+        // meta present too
         s.create(&meta("thread-a")).unwrap();
-        assert!(s.exists("thread-a"));
+        assert!(s.exists("thread-a"), "meta+log must exist");
     }
 }
