@@ -74,9 +74,3 @@ export type Decision =
   | { decision: "always_allow_tool" }
   | { decision: "always_allow_prefix"; prefix: string }
   | { decision: "deny" };
-
-export interface ServerResponse {
-  id: RequestId;
-  result?: unknown;
-  error?: RpcError;
-}

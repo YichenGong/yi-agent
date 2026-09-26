@@ -53,7 +53,11 @@ export default function App() {
       setThreadId(thread.thread_id);
       setThreadInfo({ cwd: thread.cwd, model: thread.model });
       setStatus("connected");
-    })().catch((e) => setStatus(`error: ${formatError(e)}`));
+    })().catch((e) => {
+      const msg = formatError(e);
+      session.lastError = msg;
+      setStatus(`error: ${msg}`);
+    });
   }, [session]);
 
   const send = async (text: string): Promise<boolean> => {
@@ -78,7 +82,11 @@ export default function App() {
   };
 
   const interrupt = () => {
-    if (threadId) void clientRef.current?.request("turn/interrupt", { threadId });
+    if (!threadId) return;
+    clientRef.current?.request("turn/interrupt", { threadId }).catch((e) => {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+    });
   };
 
   return (

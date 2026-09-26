@@ -80,11 +80,22 @@ pub fn rpc_respond(
 
 /// Spawn the sidecar and forward its stdout frames as Tauri events.
 pub fn spawn(app: &AppHandle) -> Result<(), String> {
-    let (mut rx, child) = app
+    let mut cmd = app
         .shell()
         .sidecar("yi-agent")
         .map_err(|e| format!("sidecar not found: {e}"))?
-        .args(["app-server", "--listen", "stdio://"])
+        .args(["app-server", "--listen", "stdio://"]);
+
+    // A bundled app launched from Finder inherits `/` as its cwd, which would
+    // make the agent's workdir (and its runtime directory) the filesystem root.
+    // Anchor the sidecar to the user's home directory so packaged and dev
+    // launches behave predictably.
+    match app.path().home_dir() {
+        Ok(home) => cmd = cmd.current_dir(home),
+        Err(e) => eprintln!("[sidecar] home_dir unavailable, using inherited cwd: {e}"),
+    }
+
+    let (mut rx, child) = cmd
         .spawn()
         .map_err(|e| format!("sidecar spawn failed: {e}"))?;
 

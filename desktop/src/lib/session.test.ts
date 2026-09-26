@@ -91,4 +91,29 @@ describe("Session", () => {
     });
     expect(s.usage).toEqual({ model: "m", input: 10, output: 3 });
   });
+
+  it("records an error notification", () => {
+    const s = new Session();
+    s.apply({ method: "error", params: { message: "boom" } });
+    expect(s.lastError).toBe("boom");
+  });
+
+  it("records the error from a failed turn", () => {
+    const s = new Session();
+    s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
+    s.apply({
+      method: "turn/completed",
+      params: { thread_id: "t", turn_id: "u1", status: "failed", error: "kaboom" },
+    });
+    expect(s.turnActive).toBe(false);
+    expect(s.lastStatus).toBe("failed");
+    expect(s.lastError).toBe("kaboom");
+  });
+
+  it("clears lastError when a new turn starts", () => {
+    const s = new Session();
+    s.apply({ method: "error", params: { message: "boom" } });
+    s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
+    expect(s.lastError).toBeNull();
+  });
 });
