@@ -258,6 +258,11 @@ Choose the right location for the skill:
 
 Project skills take precedence in the catalog when both exist with the same name (both are listed, but project appears first).
 
-## Restart to Reload
+## Reloading
 
-yi-agent discovers skills at startup. After adding or modifying a skill, restart yi-agent to load the changes. There is no hot-reload.
+yi-agent re-scans the skill roots automatically: the TUI and app-server refresh
+the catalog before each message/turn, and the daemon refreshes it before each
+worker task. New or renamed skills therefore appear without a restart.
+
+A skill's body is read from disk on every `Skill` tool call, so edits to an
+existing skill take effect immediately.
