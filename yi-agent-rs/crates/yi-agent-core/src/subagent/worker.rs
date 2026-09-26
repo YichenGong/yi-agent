@@ -511,6 +511,14 @@ pub trait AgentWorkspaceService: Send + Sync {
             "workspace service cannot rebuild a reclaimed worktree".into(),
         ))
     }
+
+    /// Whether `branch` is already merged into `owner`'s current branch. Used
+    /// to refuse reclaiming a worktree whose work has not been integrated. The
+    /// default cannot inspect git and reports "not merged", which is the safe
+    /// answer.
+    fn is_merged_into(&self, _owner: &WorkerWorkspace, _branch: &str) -> Result<bool, WorkerError> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Default)]

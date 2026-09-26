@@ -368,6 +368,19 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
             )
             .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
     }
+
+    fn is_merged_into(&self, owner: &WorkerWorkspace, branch: &str) -> Result<bool, WorkerError> {
+        if branch.is_empty() {
+            return Ok(false);
+        }
+        let owner_branch = git_output(&owner.path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok_or_else(|| {
+                WorkerError::Startup("Git workspace error: owner HEAD is detached".into())
+            })?;
+        self.service
+            .is_ancestor(&owner.path, branch, owner_branch.trim())
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    }
 }
 
 fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {

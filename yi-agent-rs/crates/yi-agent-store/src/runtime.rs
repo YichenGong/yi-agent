@@ -2140,6 +2140,117 @@ impl RuntimeCoordinator {
         }
     }
 
+    /// Reclaims every reclaimable worktree directory in a session.
+    ///
+    /// Removes directories only: branch refs and `task_workspaces` rows survive,
+    /// so nothing is lost and every worktree can be rebuilt by
+    /// `prepare_task_workspace`. Returns the number of directories reclaimed.
+    ///
+    /// Candidates are processed deepest first. A child's merge check runs with
+    /// the owner worktree as its working directory, so reclaiming a parent first
+    /// would break its children.
+    pub fn reclaim_session_worktrees(&self, session: &RootSessionId) -> usize {
+        let candidates = self.reclaim_candidates_in_session(session);
+        self.reclaim_candidate_directories(session, candidates)
+    }
+
+    /// Reads the session's reclaim candidates under a short repository lock.
+    ///
+    /// Split out from [`Self::reclaim_session_worktrees`] so the TTL sweep can
+    /// filter the same candidate set without re-reading it.
+    fn reclaim_candidates_in_session(
+        &self,
+        session: &RootSessionId,
+    ) -> Vec<crate::repository::PersistedTaskDetail> {
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        match repository.reclaim_candidates(session) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                eprintln!("yi-agent: reclaim candidate lookup failed for {session}: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Reclaims the directories of an already-selected candidate set.
+    ///
+    /// The caller chooses which candidates are eligible; this function enforces
+    /// the merge check and the directory removal. Splitting the two means the
+    /// "reclaim everything" path and the "reclaim only idle tasks" path share
+    /// one implementation of ordering, the merge gate, and event recording.
+    fn reclaim_candidate_directories(
+        &self,
+        session: &RootSessionId,
+        candidates: Vec<crate::repository::PersistedTaskDetail>,
+    ) -> usize {
+        let Some(service) = self.workspace_service_for(session) else {
+            return 0;
+        };
+        let mut reclaimed = 0;
+        for candidate in candidates {
+            let Some(child_workspace) = candidate.workspace.clone() else {
+                continue;
+            };
+            let Some(task_id) = candidate.task_id.parse::<TaskId>().ok() else {
+                continue;
+            };
+            // The owner is the parent's workspace when there is a parent, and the
+            // repository root otherwise. A root's `parent_branch` is the main
+            // branch, which a root branch rarely merges into, so the root is
+            // reclaimed without a merge check.
+            let owner_workspace = match candidate.parent_task_id.as_ref() {
+                Some(parent) => {
+                    let resolved = {
+                        let repository = self
+                            .repository
+                            .lock()
+                            .expect("runtime repository mutex poisoned");
+                        let parsed = parent.parse::<TaskId>().ok();
+                        match parsed {
+                            Some(parsed) => {
+                                repository.task_workspace_optional(&parsed).ok().flatten()
+                            }
+                            None => None,
+                        }
+                    };
+                    match resolved {
+                        Some(workspace) => Some(workspace),
+                        None => continue,
+                    }
+                }
+                None => None,
+            };
+            if let Some(owner_workspace) = owner_workspace.as_ref() {
+                match service.is_merged_into(owner_workspace, &child_workspace.branch) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        eprintln!(
+                            "yi-agent: merge check failed for {task_id}, skipping reclaim: {error}"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if !child_workspace.path.exists() {
+                continue;
+            }
+            match service.reclaim_worktree(&child_workspace) {
+                Ok(()) => {
+                    reclaimed += 1;
+                    self.record_recycle_event(&task_id, RuntimeEvent::TaskWorkspaceRecycled);
+                }
+                Err(error) => {
+                    eprintln!("yi-agent: worktree reclaim failed for {task_id}: {error}");
+                }
+            }
+        }
+        reclaimed
+    }
+
     fn record_recycle_event(&self, task: &TaskId, event: RuntimeEvent) {
         if let Err(error) = self
             .repository

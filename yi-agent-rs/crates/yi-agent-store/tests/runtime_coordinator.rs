@@ -351,6 +351,16 @@ impl AgentWorkspaceService for GitWorkspaceService {
         Ok(())
     }
 
+    fn is_merged_into(&self, owner: &WorkerWorkspace, branch: &str) -> Result<bool, WorkerError> {
+        let owner_branch = git_output(&owner.path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", branch, owner_branch.trim()])
+            .current_dir(&owner.path)
+            .status()
+            .map_err(|error| WorkerError::Startup(format!("git merge-base failed: {error}")))?;
+        Ok(output.success())
+    }
+
     fn contains_commit(&self, owner: &WorkerWorkspace, commit: &str) -> Result<bool, WorkerError> {
         let output = Command::new("git")
             .args(["merge-base", "--is-ancestor", commit, "HEAD"])
@@ -4130,5 +4140,111 @@ async fn a_reclaimed_worktree_is_rebuilt_before_a_worker_starts() {
             .unwrap()
             .is_some(),
         "the workspace row is untouched"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_ones() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+
+    let merged = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "merged child".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &merged).await.unwrap();
+    let merged_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+    std::fs::write(merged_workspace.path.join("merged.txt"), "ready\n").unwrap();
+    git_ok(&merged_workspace.path, &["add", "merged.txt"]).unwrap();
+    git_ok(&merged_workspace.path, &["commit", "-m", "merged delivery"]).unwrap();
+    git_ok(
+        &root_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &merged_workspace.branch,
+            "-m",
+            "integrate",
+        ],
+    )
+    .unwrap();
+
+    let unmerged = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "unmerged child".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &unmerged).await.unwrap();
+    let unmerged_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+    std::fs::write(unmerged_workspace.path.join("pending.txt"), "wip\n").unwrap();
+    git_ok(&unmerged_workspace.path, &["add", "pending.txt"]).unwrap();
+    git_ok(
+        &unmerged_workspace.path,
+        &["commit", "-m", "unmerged delivery"],
+    )
+    .unwrap();
+
+    let reclaimed = coordinator.reclaim_session_worktrees(&session);
+
+    assert!(
+        !merged_workspace.path.exists(),
+        "a merged child's directory is reclaimed"
+    );
+    assert!(
+        unmerged_workspace.path.exists(),
+        "an unmerged child's directory is left alone"
+    );
+    assert!(
+        !root_workspace.path.exists(),
+        "the root is reclaimed without a merge check"
+    );
+    // Two directories: the merged child and the root. The root owns a row
+    // because a worker was started for it, and a root has no parent to merge
+    // into, so it is reclaimed unconditionally. The unmerged child is skipped.
+    assert_eq!(reclaimed, 2, "the merged child and the root are reclaimed");
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_workspace_optional(&merged)
+            .unwrap()
+            .is_some(),
+        "the row survives so the worktree can be rebuilt"
     );
 }
