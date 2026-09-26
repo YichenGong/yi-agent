@@ -1133,13 +1133,18 @@ async fn recycle_failure_does_not_fail_the_accept() {
             .is_some(),
         "a failed recycle leaves the child's workspace row for later handling"
     );
+    let events = repository.event_records_for_task_after(&child, 0).unwrap();
     assert!(
-        repository
-            .event_records_for_task_after(&child, 0)
-            .unwrap()
+        events
             .iter()
             .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycleFailed),
         "a recycle-failure event is recorded"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event != RuntimeEvent::TaskWorkspaceRecycled),
+        "a failed recycle must not record a success event"
     );
 }
 

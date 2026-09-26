@@ -664,13 +664,21 @@ In `yi-agent-rs/crates/yi-agent-store/src/runtime.rs`:
                 .lock()
                 .expect("runtime repository mutex poisoned");
             (
-                repository.task_workspace_optional(owner).ok().flatten(),
-                repository.task_workspace_optional(child).ok().flatten(),
+                repository.task_workspace_optional(owner),
+                repository.task_workspace_optional(child),
             )
         };
-        let (Some(owner_workspace), Some(child_workspace)) = (owner_workspace, child_workspace)
-        else {
-            return;
+        let (owner_workspace, child_workspace) = match (owner_workspace, child_workspace) {
+            (Ok(Some(owner_workspace)), Ok(Some(child_workspace))) => {
+                (owner_workspace, child_workspace)
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
+                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+                return;
+            }
+            // A genuinely absent workspace row is not a recycle failure: nothing to recycle.
+            _ => return,
         };
         match service.cleanup_accepted(&owner_workspace, &child_workspace) {
             Ok(()) => {
