@@ -708,7 +708,8 @@ async fn run_thread_driver<W>(
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // 每个 thread 一个 translator:item 计数器跨 turn 单调递增,避免 id 重复。
+    // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
+    // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
     let mut translator = Translator::new(thread_id.clone());
     while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
         // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
