@@ -332,6 +332,25 @@ impl AgentWorkspaceService for GitWorkspaceService {
         Ok(())
     }
 
+    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        let _ = Command::new("git")
+            .args(["worktree", "remove", workspace.path.to_str().unwrap()])
+            .current_dir(&workspace.repository_root)
+            .status();
+        Ok(())
+    }
+
+    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        Command::new("git")
+            .args(["worktree", "add"])
+            .arg(&workspace.path)
+            .arg(&workspace.branch)
+            .current_dir(&workspace.repository_root)
+            .status()
+            .map_err(|error| WorkerError::Startup(format!("git worktree add failed: {error}")))?;
+        Ok(())
+    }
+
     fn contains_commit(&self, owner: &WorkerWorkspace, commit: &str) -> Result<bool, WorkerError> {
         let output = Command::new("git")
             .args(["merge-base", "--is-ancestor", commit, "HEAD"])
@@ -4066,4 +4085,50 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_reclaimed_worktree_is_rebuilt_before_a_worker_starts() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    let service = factory.workspace_service.clone().unwrap();
+    service.reclaim_worktree(&workspace).unwrap();
+    assert!(
+        !workspace.path.exists(),
+        "precondition: the directory is reclaimed while the row survives"
+    );
+
+    // Make the task terminal so retry is legal, then retry. The retry restarts
+    // the worker, which must rebuild the directory before handing it over.
+    coordinator
+        .cancel_task(&session, &root, false)
+        .await
+        .unwrap();
+    coordinator.retry_task(&session, &root).await.unwrap();
+
+    assert!(
+        workspace.path.exists(),
+        "the rebuild path restored the directory before the worker started"
+    );
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_workspace_optional(&root)
+            .unwrap()
+            .is_some(),
+        "the workspace row is untouched"
+    );
 }

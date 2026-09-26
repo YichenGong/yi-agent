@@ -1618,6 +1618,16 @@ impl RuntimeCoordinator {
             .expect("runtime repository mutex poisoned")
             .task_workspace_optional(task)?;
         if let Some(existing) = existing {
+            // A reclaimed worktree keeps its row, so the row can outlive its
+            // directory. Rebuild before handing the path to a worker.
+            if !existing.path.exists() {
+                let Some(service) = self.workspace_service_for(session) else {
+                    return Ok(None);
+                };
+                service
+                    .reattach_workspace(&existing)
+                    .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+            }
             supervisor
                 .assign_workspace(task, existing.lease_id.clone())
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
