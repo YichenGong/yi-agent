@@ -74,12 +74,18 @@ impl ThreadStore {
     }
 
     pub fn create(&self, meta: &ThreadMeta) -> io::Result<()> {
+        if !valid_id(&meta.thread_id) {
+            return Err(invalid_id(&meta.thread_id));
+        }
         std::fs::create_dir_all(&self.root)?;
         let bytes = serde_json::to_vec_pretty(meta).map_err(io_err)?;
         write_atomic(&self.meta_path(&meta.thread_id), &bytes)
     }
 
     pub fn append_turn(&self, id: &str, turn: &TurnLine) -> io::Result<()> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
         std::fs::create_dir_all(&self.root)?;
         let mut line = serde_json::to_string(turn).map_err(io_err)?;
         line.push('\n');
@@ -91,6 +97,9 @@ impl ThreadStore {
     }
 
     pub fn load(&self, id: &str) -> io::Result<Option<LoadedThread>> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
         let log = self.log_path(id);
         let meta_path = self.meta_path(id);
         if !log.exists() && !meta_path.exists() {
@@ -100,30 +109,34 @@ impl ThreadStore {
         let mut items: Vec<Item> = Vec::new();
         let mut messages: Vec<Message> = Vec::new();
         let mut usage: Option<TurnUsage> = None;
-        if let Ok(text) = std::fs::read_to_string(&log) {
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<TurnLine>(line) {
-                    Ok(TurnLine::Turn {
-                        items: turn_items,
-                        usage: turn_usage,
-                        messages: turn_messages,
-                    }) => {
-                        items.extend(turn_items);
-                        if !turn_messages.is_empty() {
-                            messages = turn_messages;
-                        }
-                        if turn_usage.is_some() {
-                            usage = turn_usage;
-                        }
+        match std::fs::read_to_string(&log) {
+            Ok(text) => {
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
                     }
-                    Err(e) => {
-                        eprintln!("[app-server] skipping corrupt thread log line ({id}): {e}");
+                    match serde_json::from_str::<TurnLine>(line) {
+                        Ok(TurnLine::Turn {
+                            items: turn_items,
+                            usage: turn_usage,
+                            messages: turn_messages,
+                        }) => {
+                            items.extend(turn_items);
+                            if !turn_messages.is_empty() {
+                                messages = turn_messages;
+                            }
+                            if turn_usage.is_some() {
+                                usage = turn_usage;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[app-server] skipping corrupt thread log line ({id}): {e}");
+                        }
                     }
                 }
             }
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("[app-server] failed to read thread log ({id}): {e}"),
         }
 
         let meta = std::fs::read_to_string(&meta_path)
@@ -144,6 +157,23 @@ fn io_err(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+/// Generated ids look like `thread-<uuid>`; allow only a conservative charset so
+/// an id can never name a path outside the store root or a nested file.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn invalid_id(id: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid thread id: {id:?}"),
+    )
+}
+
 /// epoch 毫秒。
 pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -152,15 +182,27 @@ pub fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 用临时文件 + rename 原子替换,避免半写状态。
+///
+/// 临时名带 pid + 进程内递增序号:同一文件可能有多个写者(driver 的 touch 与
+/// 主循环的 rename),固定名会互相截断。
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+    let tmp = PathBuf::from(tmp_name);
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// 把一段文本规整为标题:压缩空白 + 截断到 30 个字符。
@@ -303,5 +345,44 @@ mod tests {
         let loaded = s.load("thread-a").unwrap().unwrap();
         assert_eq!(loaded.items.len(), 2, "items must be concatenated");
         assert_eq!(loaded.messages, last_messages, "last record's messages win");
+    }
+
+    #[test]
+    fn rejects_ids_that_escape_the_store_root() {
+        let (_d, s) = store();
+        for bad in ["../evil", "a/b", "..", "", "a\\b"] {
+            assert!(s.load(bad).is_err(), "load must reject escaping id {bad:?}");
+            assert!(
+                s.append_turn(bad, &turn(vec![], vec![])).is_err(),
+                "append_turn must reject escaping id {bad:?}"
+            );
+            let bad_meta = ThreadMeta {
+                thread_id: bad.into(),
+                ..meta("placeholder")
+            };
+            assert!(
+                s.create(&bad_meta).is_err(),
+                "create must reject escaping id {bad:?}"
+            );
+        }
+        // A valid id still works end to end.
+        s.create(&meta("thread-a")).unwrap();
+        assert!(s.load("thread-a").unwrap().is_some());
+    }
+
+    #[test]
+    fn load_log_read_error_is_not_fatal() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        // Put a directory where the log file is expected so read_to_string fails
+        // with a non-NotFound error (IsADirectory).
+        std::fs::create_dir(s.log_path("thread-a")).unwrap();
+
+        let loaded = s
+            .load("thread-a")
+            .expect("read error must be logged, not propagated")
+            .expect("meta exists, so thread must load");
+        assert!(loaded.items.is_empty(), "unreadable log yields no items");
+        assert_eq!(loaded.meta.thread_id, "thread-a");
     }
 }
