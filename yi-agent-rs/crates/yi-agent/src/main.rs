@@ -16,6 +16,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
+// Headless 模式的工具 + system prompt 构建结果。类型来自共享 crate
+// (`ToolSetup` 两个字段都是 `pub`),`build_headless_root_tools` 直接用
+// `HeadlessSetup { tools, system_prompt }` 字面量构造仍然成立。
+use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
 
@@ -944,12 +948,6 @@ async fn drain_stream_json<W: std::io::Write>(
     exit_code
 }
 
-// Headless 模式的工具 + system prompt 构建结果。
-//
-// 类型来自共享 crate(`ToolSetup` 两个字段都是 `pub`),`build_headless_root_tools`
-// 直接用 `HeadlessSetup { tools, system_prompt }` 字面量构造仍然成立。
-use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
-
 /// 根据 `naked` flag 构建 headless 模式用的工具集和 system prompt。
 ///
 /// `naked = true`:不注册任何工具,不加载 skills,`system_prompt = None`(裸模型)。
@@ -1544,6 +1542,10 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "bash"),
             "default mode should register 'bash' tool, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "process_start"),
+            "non-naked headless setup must register process tools, got: {names:?}"
         );
     }
 
