@@ -141,6 +141,7 @@ impl EventSource for CrosstermEventSource {
 /// Does NOT call enable_raw_mode / EnterAlternateScreen.
 #[cfg(test)]
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_tui_with_backend<B: Backend>(
     terminal: &mut Terminal<B>,
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
