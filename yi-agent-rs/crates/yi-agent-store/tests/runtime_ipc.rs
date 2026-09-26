@@ -4838,3 +4838,77 @@ fn a_daemon_starts_and_serves_a_client_when_the_runtime_directory_is_too_long() 
         "a client using the daemon's reported socket must reach it"
     );
 }
+
+/// Regression: the instance lock was a plain file holding a PID, and liveness
+/// was decided with `kill -0`. A crashed daemon left the file behind, and once
+/// the OS recycled that PID onto any unrelated live process, the stale lock
+/// looked permanently "owned" — the runtime reported `AlreadyRunning` while no
+/// daemon listened on the socket, so delegation was disabled with no way out.
+///
+/// A lock whose owner is gone must never block a new daemon, even if the PID it
+/// recorded now belongs to some other live process. Using this test's own PID as
+/// the recorded owner is the strongest form of that case: the PID is certainly
+/// alive, and certainly not a daemon.
+#[test]
+fn a_stale_lock_whose_pid_now_belongs_to_a_live_process_does_not_block_a_new_daemon() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(
+        runtime.join("runtime.lock"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+    let database = directory.path().join("runtime.sqlite");
+
+    assert!(
+        Daemon::start(&runtime, &database).is_ok(),
+        "a lock left by a dead daemon must be reclaimable even when its PID is reused"
+    );
+}
+
+/// The lock must be held for exactly as long as the daemon lives: not released
+/// early, and not leaked after a failed start.
+#[test]
+fn a_failed_start_does_not_leave_a_lock_that_blocks_the_next_attempt() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    let database = directory.path().join("runtime.sqlite");
+
+    // First daemon holds the lock and serves.
+    let first = Daemon::start(&runtime, &database).unwrap();
+
+    // A second attempt must fail (the lock is genuinely held)...
+    assert!(Daemon::start(&runtime, &database).is_err());
+
+    // ...and that failure must not leave extra state behind: once the first
+    // daemon stops, the next start must succeed.
+    drop(first);
+    let _second =
+        Daemon::start(&runtime, &database).expect("lock must be free after the owner stops");
+}
+
+/// A daemon killed with SIGKILL leaves its socket file behind. The next start
+/// must clean that stale node up: `bind` fails with `EADDRINUSE` on an existing
+/// path, so a leftover socket would otherwise wedge the runtime forever.
+#[test]
+fn a_stale_socket_left_by_a_killed_daemon_does_not_block_a_new_daemon() {
+    let directory = TempDir::new().unwrap();
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let database = directory.path().join("runtime.sqlite");
+
+    // Start and stop cleanly, then recreate the socket node the way a crash
+    // would leave it: a file on disk with no process listening on it.
+    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime).unwrap();
+    let first = Daemon::start(&runtime, &database).unwrap();
+    drop(first);
+    assert!(!socket_path.exists(), "a clean stop removes its own socket");
+
+    std::fs::write(&socket_path, b"").unwrap();
+    assert!(socket_path.exists(), "the stale socket node is in place");
+
+    let restarted = Daemon::start(&runtime, &database)
+        .expect("a stale socket node must not block a new daemon");
+    drop(restarted);
+}
