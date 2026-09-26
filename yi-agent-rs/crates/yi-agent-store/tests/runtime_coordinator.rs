@@ -10,7 +10,7 @@ use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
     AttemptId, BudgetKind, DeliveryReport, IntegrationValidation, MessageId, PermissionDecision,
-    PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
+    PermissionRequestId, TaskId, TaskWorkspaceMode, TimeoutKind, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
@@ -259,6 +259,24 @@ impl AgentWorkspaceService for GitWorkspaceService {
         })
     }
 
+    fn prepare_read_only(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let path = parent
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| self.repository_root.clone());
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        })
+    }
+
     fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
         let status = git_output(&workspace.path, &["status", "--porcelain"])?;
         if !status.is_empty() {
@@ -321,6 +339,61 @@ impl AgentWorkspaceService for GitWorkspaceService {
             .output()
             .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
         Ok(output.status.success())
+    }
+}
+
+/// Models a non-git application root: read-only provisioning works in place,
+/// while any coding request must be rejected by the coordinator before the
+/// service is asked for a worktree.
+#[derive(Clone)]
+struct NonGitWorkspaceService {
+    repository_root: std::path::PathBuf,
+}
+
+impl AgentWorkspaceService for NonGitWorkspaceService {
+    fn supports_coding(&self) -> bool {
+        false
+    }
+
+    fn prepare_read_only(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let path = parent
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| self.repository_root.clone());
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        })
+    }
+
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup(
+            "non-git workspace has no root worktree".into(),
+        ))
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup(
+            "non-git workspace has no child worktree".into(),
+        ))
     }
 }
 
@@ -657,7 +730,15 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
     let session = coordinator.create_session().unwrap();
     let root = coordinator.root_task_id(&session).unwrap();
     coordinator.start_worker(&session, &root).await.unwrap();
-    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "Complete the delegated task.".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
 
     coordinator.start_worker(&session, &child).await.unwrap();
 
@@ -695,7 +776,15 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
     let session = coordinator.create_session().unwrap();
     let root = coordinator.root_task_id(&session).unwrap();
     coordinator.start_worker(&session, &root).await.unwrap();
-    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "Complete the delegated task.".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
     coordinator.start_worker(&session, &child).await.unwrap();
     let workspace = starts.lock().unwrap()[1]
         .workspace_lease_id
@@ -2194,7 +2283,15 @@ async fn delivered_child_coordinator(
     if factory.workspace_service.is_some() {
         coordinator.start_worker(&session, &parent).await.unwrap();
     }
-    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &parent,
+            "Complete the delegated task.".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
     coordinator.start_worker(&session, &child).await.unwrap();
     let child_start = factory.starts.lock().unwrap().last().unwrap().clone();
     let workspace = child_start.workspace_lease_id.clone().unwrap();
@@ -3794,4 +3891,101 @@ async fn coordinator_resolves_permission_with_a_daemon_owned_actor() {
         .expect("permission resolution is audited");
     assert!(event.payload_json.contains("local_user"));
     assert!(!event.payload_json.contains(&task.to_string()));
+}
+
+#[tokio::test]
+async fn read_only_child_runs_in_place_without_a_workspace_row() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    // `spawn_child` defaults to read-only, so the child must run in place.
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_none(),
+        "read-only child must not own a task_workspaces row"
+    );
+
+    let starts = factory.starts.lock().unwrap();
+    let root_workspace = starts[0]
+        .workspace
+        .as_ref()
+        .expect("root worker owns a worktree");
+    let child_workspace = starts[1]
+        .workspace
+        .as_ref()
+        .expect("read-only child still receives a workspace");
+    assert_eq!(child_workspace.path, root_workspace.path);
+    assert!(child_workspace.branch.is_empty());
+}
+
+#[tokio::test]
+async fn coding_child_fails_clearly_without_a_git_repository() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let application_root = directory.path().join("not-a-repo");
+    std::fs::create_dir(&application_root).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: application_root.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let attached = coordinator
+        .attach_application_root("non-git-project", &application_root)
+        .await
+        .unwrap();
+
+    // A non-git application root degrades to read-only: no worktree row.
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        repository
+            .task_workspace_optional(&attached.root_task_id)
+            .unwrap()
+            .is_none(),
+        "non-git root must not own a worktree"
+    );
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &attached.session_id,
+            &attached.root_task_id,
+            "Change the files.".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        coordinator
+            .start_worker(&attached.session_id, &child)
+            .await
+            .is_err()
+    );
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&child).unwrap(), "failed");
+    let terminal = repository
+        .attempt_terminal_json_for_task(&child)
+        .unwrap()
+        .expect("coding failure is terminal evidence");
+    let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+    assert_eq!(terminal["reason"], "coding_requires_git_repository");
 }
