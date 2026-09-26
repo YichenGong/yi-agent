@@ -909,6 +909,9 @@ async fn drain_stream_human<W: std::io::Write, E: std::io::Write>(
             yi_agent_core::AgentEvent::ToolRetry { id } => {
                 let _ = writeln!(err, "[tool-retry:{id}]");
             }
+            yi_agent_core::AgentEvent::ProviderRetry { attempt, max, .. } => {
+                let _ = writeln!(err, "[provider-retry:{attempt}/{max}]");
+            }
             yi_agent_core::AgentEvent::Done { reason } => match reason {
                 // Normal completion is already signaled by exit code 0; the
                 // [done:EndTurn] line is noise on stderr and is suppressed
@@ -1680,6 +1683,38 @@ mod tests {
         assert!(
             !stderr.contains("[done:"),
             "EndTurn must not emit [done:EndTurn] on stderr; got: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn drain_stream_human_reports_provider_retry_on_stderr() {
+        let stream = futures::stream::iter(vec![
+            AgentEvent::AssistantText("partial".into()),
+            AgentEvent::ProviderRetry {
+                attempt: 1,
+                max: 3,
+                idle_secs: 60,
+            },
+            AgentEvent::Done {
+                reason: yi_agent_core::DoneReason::EndTurn,
+            },
+        ])
+        .boxed();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+
+        let code = drain_stream_human_sync(stream, &mut out, &mut err);
+
+        assert_eq!(code, 0);
+        let err_text = String::from_utf8(err).unwrap();
+        assert!(
+            err_text.contains("[provider-retry:1/3]"),
+            "the retry must be announced on stderr, got: {err_text}"
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "partial\n",
+            "stdout must carry only assistant text"
         );
     }
 
