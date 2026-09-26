@@ -8,8 +8,8 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use yi_agent_core::{
-    ContentBlock, GenParams, Message, Provider, ProviderError, ProviderEvent, ProviderRequest,
-    ProviderResponse, StopReason,
+    ContentBlock, GenParams, ImageDetail, ImageSource, Message, Provider, ProviderError,
+    ProviderEvent, ProviderRequest, ProviderResponse, Role, StopReason,
 };
 use yi_agent_llm::{OpenaiProvider, OpenaiProviderOpts};
 
@@ -376,4 +376,91 @@ async fn mid_stream_error_becomes_terminal_stop() {
         _ => panic!("expected Stop{{Other}}, got: {:?}", events[1]),
     }
     assert_eq!(events.len(), 2, "stream should terminate after Stop");
+}
+
+#[tokio::test]
+async fn user_image_reaches_request_body_as_image_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("\"image_url\""))
+        .and(wiremock::matchers::body_string_contains(
+            "data:image/png;base64,AAA",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "\"detail\":\"high\"",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let req = ProviderRequest {
+        model: "gpt-4o".to_string(),
+        system: None,
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text("what is this?".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAA".into(),
+                    },
+                    detail: ImageDetail::High,
+                },
+            ],
+        }],
+        tools: vec![],
+        params: GenParams::default(),
+    };
+    let _ = provider.call_stream(req).await.expect("stream ok");
+}
+
+#[tokio::test]
+async fn tool_result_image_reaches_request_body_as_image_url() {
+    let server = MockServer::start().await;
+    // The mock only matches if the body carries the image as a data URL, which
+    // proves the tool-result image survived the tool -> user split.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("\"image_url\""))
+        .and(wiremock::matchers::body_string_contains(
+            "data:image/png;base64,BBB",
+        ))
+        .and(wiremock::matchers::body_string_contains("image attached"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let req = ProviderRequest {
+        model: "gpt-4o".to_string(),
+        system: None,
+        messages: vec![Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_01".into(),
+            content: vec![
+                ContentBlock::Text("viewed logo.png".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "BBB".into(),
+                    },
+                    detail: ImageDetail::Original,
+                },
+            ],
+            is_error: false,
+        }])],
+        tools: vec![],
+        params: GenParams::default(),
+    };
+    let _ = provider.call_stream(req).await.expect("stream ok");
 }
