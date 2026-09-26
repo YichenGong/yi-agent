@@ -24,6 +24,10 @@ use super::cell::HistoryCell;
 use super::cost::CostTracker;
 use super::history::{HistoryState, HistoryView, ViewportAnchor};
 use super::input::{InputAction, InputLine};
+use super::process_popup::{
+    ConfirmProcessKill as ConfirmProcessKillPopup, ProcessDetailPopup, ProcessListPopup,
+    ProcessPopup, RuntimeTab,
+};
 use super::slash::{CommandPopup, SlashCommand, help_text};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
@@ -222,10 +226,12 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut statusbar_state = StatusBarState::default();
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
-    let mut bash_popup: BashPopup = BashPopup::None;
+    let mut runtime_popup: RuntimePopup = RuntimePopup::None;
     let mut runtime_start_prompt = runtime_start_prompt;
     let mut process_events = process_manager.subscribe();
     let mut process_snapshots = process_manager.list();
+    let mut process_outputs: std::collections::HashMap<String, yi_agent_tools::ProcessReadResult> =
+        std::collections::HashMap::new();
     // Keep the rendered viewport location so geometry that changes between
     // frames (such as a resize or newly queued preview) has an old-width anchor.
     let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
@@ -321,8 +327,13 @@ fn run_loop<B: Backend, E: EventSource>(
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
-        while process_events.try_recv().is_ok() {
-            process_snapshots = process_manager.list();
+        if process_events.try_recv().is_ok() {
+            refresh_process_snapshots(
+                &process_manager,
+                &mut process_snapshots,
+                &mut process_outputs,
+            );
+            while process_events.try_recv().is_ok() {}
         }
 
         // Pre-compute layout so mouse hit-testing uses the same chunk rects
@@ -396,93 +407,56 @@ fn run_loop<B: Backend, E: EventSource>(
                 );
             }
 
-            // Bash popup (covers the full screen above the input area).
-            match &bash_popup {
-                BashPopup::List(p) => {
-                    let list_area = ratatui::layout::Rect {
-                        x: chunks[0].x + 2,
-                        y: chunks[0].y + 1,
-                        width: chunks[0].width.saturating_sub(4),
-                        height: chunks[0]
-                            .height
-                            .saturating_sub(2)
-                            .min((p.task_ids.len() as u16 + 2).max(6)),
-                    };
-                    f.render_widget(Clear, list_area);
-                    f.render_widget(
-                        super::bash_popup::render_list_popup(p, &task_registry, list_area),
-                        list_area,
-                    );
-                }
-                BashPopup::Detail(p) => {
-                    if let Some(task) = task_registry.get(&p.task_id) {
-                        let detail_area = chunks[0];
-                        f.render_widget(Clear, detail_area);
-                        f.render_widget(
-                            super::bash_popup::render_detail_popup(p, task, detail_area),
-                            detail_area,
-                        );
-                    }
-                }
-                BashPopup::ConfirmKill(ck) => {
-                    // Draw the detail behind, then overlay a small confirm box.
-                    if let Some(task) = task_registry.get(&ck.task_id) {
-                        let detail_area = chunks[0];
-                        f.render_widget(Clear, detail_area);
-                        let detail = DetailPopup::new(ck.task_id.clone());
-                        f.render_widget(
-                            super::bash_popup::render_detail_popup(&detail, task, detail_area),
-                            detail_area,
-                        );
-                    }
-                    // Confirm box centered in the upper portion.
-                    let box_w = 40u16.min(chunks[0].width.saturating_sub(4));
-                    let box_h = 4u16;
-                    let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
-                    let box_y = chunks[0].y + (chunks[0].height.saturating_sub(box_h)) / 3;
-                    let box_area = ratatui::layout::Rect {
-                        x: box_x,
-                        y: box_y,
-                        width: box_w,
-                        height: box_h,
-                    };
-                    f.render_widget(Clear, box_area);
-                    f.render_widget(
-                        ratatui::widgets::Paragraph::new(vec![
-                            ratatui::text::Line::raw("kill this process?"),
-                            ratatui::text::Line::raw(""),
-                            ratatui::text::Line::raw("[y] confirm   [n/esc] cancel"),
-                        ])
-                        .block(
-                            ratatui::widgets::Block::default()
-                                .borders(ratatui::widgets::Borders::ALL)
-                                .title("confirm"),
-                        ),
-                        box_area,
-                    );
-                }
-                BashPopup::None => {}
-            }
+            render_runtime_popup(
+                f,
+                &runtime_popup,
+                &task_registry,
+                &process_snapshots,
+                &process_outputs,
+                chunks[0],
+            );
         })?;
 
         // Poll for events with timeout (33ms → ~30hz refresh)
         match events.poll(Duration::from_millis(33))? {
             Some(Event::Key(key)) => {
-                // Ctrl+P opens the bash task popup when no popup is active.
+                // Ctrl+P opens the runtime popup (bash tasks tab) when no popup
+                // is active. Tab then switches to the managed-processes tab.
                 if key.code == KeyCode::Char('p')
                     && key.modifiers == KeyModifiers::CONTROL
-                    && matches!(bash_popup, BashPopup::None)
+                    && runtime_popup.is_none()
                 {
+                    refresh_process_snapshots(
+                        &process_manager,
+                        &mut process_snapshots,
+                        &mut process_outputs,
+                    );
                     let ids: Vec<String> =
                         task_registry.list().iter().map(|t| t.id.clone()).collect();
-                    if !ids.is_empty() {
-                        bash_popup = BashPopup::List(ListPopup::new(ids));
-                    }
+                    runtime_popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(ids)));
                     continue;
                 }
-                // Route keys to the bash popup when active.
-                if !matches!(bash_popup, BashPopup::None) {
-                    handle_bash_popup_key(key, &mut bash_popup, &task_registry);
+                // Route keys to the runtime popup when active.
+                if !runtime_popup.is_none() {
+                    let process_to_kill = handle_runtime_popup_key(
+                        key,
+                        &mut runtime_popup,
+                        &task_registry,
+                        &process_snapshots,
+                        &process_outputs,
+                        layout.chunks[0].width,
+                        layout.chunks[0].height,
+                    );
+                    if let Some(process_id) = process_to_kill {
+                        let _ = tokio::runtime::Handle::current().block_on(
+                            process_manager.kill(yi_agent_tools::ProcessSelector::Id(process_id)),
+                        );
+                        refresh_process_snapshots(
+                            &process_manager,
+                            &mut process_snapshots,
+                            &mut process_outputs,
+                        );
+                    }
                     continue;
                 }
                 if runtime_start_prompt.is_some() {
@@ -542,7 +516,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     text,
                     input,
                     history,
-                    &bash_popup,
+                    &runtime_popup,
                     &mut pending_quit,
                     &mut popup,
                 );
@@ -551,9 +525,11 @@ fn run_loop<B: Backend, E: EventSource>(
                 handle_mouse(
                     mouse,
                     &layout,
-                    &mut bash_popup,
+                    &mut runtime_popup,
                     history,
                     &task_registry,
+                    &process_snapshots,
+                    &process_outputs,
                     &mut pending_quit,
                 );
             }
@@ -564,11 +540,354 @@ fn run_loop<B: Backend, E: EventSource>(
     Ok(())
 }
 
+/// Top-level runtime popup: a Bash-tasks tab and a managed-processes tab,
+/// switched with Tab. Wraps the per-tab popup state machines.
+#[derive(Debug, Clone)]
+enum RuntimePopup {
+    None,
+    Bash(BashPopup),
+    Processes(ProcessPopup),
+}
+
+impl RuntimePopup {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    fn blocks_text_input(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn switch_tab(&mut self, process_ids: Vec<String>) {
+        *self = match self.tab().map(RuntimeTab::next) {
+            Some(RuntimeTab::Processes) => {
+                Self::Processes(ProcessPopup::List(ProcessListPopup::new()))
+            }
+            Some(RuntimeTab::BashTasks) => Self::Bash(BashPopup::List(ListPopup::new(process_ids))),
+            None => Self::None,
+        };
+    }
+
+    fn tab(&self) -> Option<RuntimeTab> {
+        match self {
+            Self::None => None,
+            Self::Bash(_) => Some(RuntimeTab::BashTasks),
+            Self::Processes(_) => Some(RuntimeTab::Processes),
+        }
+    }
+}
+
+fn switch_runtime_tab(runtime_popup: &mut RuntimePopup, task_registry: &RunningTaskRegistry) {
+    let ids = task_registry.list().iter().map(|t| t.id.clone()).collect();
+    runtime_popup.switch_tab(ids);
+}
+
+#[cfg(test)]
+fn switch_runtime_tab_for_test(runtime_popup: &mut RuntimePopup, bash_ids: &[String]) {
+    *runtime_popup = match runtime_popup.tab().map(RuntimeTab::next) {
+        Some(RuntimeTab::Processes) => {
+            RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()))
+        }
+        Some(RuntimeTab::BashTasks) => {
+            RuntimePopup::Bash(BashPopup::List(ListPopup::new(bash_ids.to_vec())))
+        }
+        None => RuntimePopup::None,
+    };
+}
+
+/// Refresh the managed-process snapshot list and, for each process, read its
+/// buffered output. Called on process events and when the popup opens.
+fn refresh_process_snapshots(
+    process_manager: &yi_agent_tools::ProcessManager,
+    process_snapshots: &mut Vec<yi_agent_tools::ManagedProcessSnapshot>,
+    process_outputs: &mut std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
+) {
+    *process_snapshots = process_manager.list();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        for snapshot in process_snapshots.iter() {
+            if let Ok(output) = handle.block_on(process_manager.read(
+                yi_agent_tools::ProcessSelector::Id(snapshot.process_id.clone()),
+                None,
+                64 * 1024,
+            )) {
+                process_outputs.insert(snapshot.process_id.clone(), output);
+            }
+        }
+    }
+}
+
+fn render_runtime_popup(
+    f: &mut ratatui::Frame<'_>,
+    runtime_popup: &RuntimePopup,
+    task_registry: &RunningTaskRegistry,
+    process_snapshots: &[yi_agent_tools::ManagedProcessSnapshot],
+    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
+    area: ratatui::layout::Rect,
+) {
+    match runtime_popup {
+        RuntimePopup::None => {}
+        RuntimePopup::Bash(bash_popup) => {
+            render_existing_bash_popup(f, bash_popup, task_registry, area);
+        }
+        RuntimePopup::Processes(ProcessPopup::List(p)) => {
+            f.render_widget(Clear, area);
+            f.render_widget(
+                super::process_popup::render_process_list_popup(p, process_snapshots, area),
+                area,
+            );
+        }
+        RuntimePopup::Processes(ProcessPopup::Detail(p)) => {
+            if let Some(process) = process_snapshots
+                .iter()
+                .find(|p2| p2.process_id == p.process_id)
+            {
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    super::process_popup::render_process_detail_popup(
+                        p,
+                        process,
+                        process_outputs.get(&p.process_id),
+                        area,
+                    ),
+                    area,
+                );
+            }
+        }
+        RuntimePopup::Processes(ProcessPopup::ConfirmKill(ck)) => {
+            if let Some(process) = process_snapshots
+                .iter()
+                .find(|p| p.process_id == ck.process_id)
+            {
+                f.render_widget(Clear, area);
+                let detail = ProcessDetailPopup::new(ck.process_id.clone());
+                f.render_widget(
+                    super::process_popup::render_process_detail_popup(
+                        &detail,
+                        process,
+                        process_outputs.get(&ck.process_id),
+                        area,
+                    ),
+                    area,
+                );
+                render_kill_confirmation_overlay(f, area, "kill this managed process?");
+            }
+        }
+    }
+}
+
+/// Render the bash-tasks tab (list / detail / kill-confirm) into `area`.
+fn render_existing_bash_popup(
+    f: &mut ratatui::Frame<'_>,
+    bash_popup: &BashPopup,
+    task_registry: &RunningTaskRegistry,
+    area: ratatui::layout::Rect,
+) {
+    match bash_popup {
+        BashPopup::List(p) => {
+            let list_area = ratatui::layout::Rect {
+                x: area.x + 2,
+                y: area.y + 1,
+                width: area.width.saturating_sub(4),
+                height: area
+                    .height
+                    .saturating_sub(2)
+                    .min((p.task_ids.len() as u16 + 2).max(6)),
+            };
+            f.render_widget(Clear, list_area);
+            f.render_widget(
+                super::bash_popup::render_list_popup(p, task_registry, list_area),
+                list_area,
+            );
+        }
+        BashPopup::Detail(p) => {
+            if let Some(task) = task_registry.get(&p.task_id) {
+                f.render_widget(Clear, area);
+                f.render_widget(super::bash_popup::render_detail_popup(p, task, area), area);
+            }
+        }
+        BashPopup::ConfirmKill(ck) => {
+            if let Some(task) = task_registry.get(&ck.task_id) {
+                f.render_widget(Clear, area);
+                let detail = DetailPopup::new(ck.task_id.clone());
+                f.render_widget(
+                    super::bash_popup::render_detail_popup(&detail, task, area),
+                    area,
+                );
+            }
+            render_kill_confirmation_overlay(f, area, "kill this process?");
+        }
+        BashPopup::None => {}
+    }
+}
+
+fn render_kill_confirmation_overlay(
+    f: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    prompt: &str,
+) {
+    let box_w = 40u16.min(area.width.saturating_sub(4));
+    let box_h = 4u16;
+    let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
+    let box_y = area.y + (area.height.saturating_sub(box_h)) / 3;
+    let box_area = ratatui::layout::Rect {
+        x: box_x,
+        y: box_y,
+        width: box_w,
+        height: box_h,
+    };
+    f.render_widget(Clear, box_area);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(vec![
+            ratatui::text::Line::raw(prompt.to_string()),
+            ratatui::text::Line::raw(""),
+            ratatui::text::Line::raw("[y] confirm   [n/esc] cancel"),
+        ])
+        .block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title("confirm"),
+        ),
+        box_area,
+    );
+}
+
+#[cfg(test)]
+fn handle_runtime_popup_key_for_test(
+    key: KeyEvent,
+    runtime_popup: &mut RuntimePopup,
+    bash_ids: &[String],
+    processes: &[yi_agent_tools::ManagedProcessSnapshot],
+) {
+    if key.code == KeyCode::Tab {
+        switch_runtime_tab_for_test(runtime_popup, bash_ids);
+        return;
+    }
+    let registry = RunningTaskRegistry::new();
+    let outputs = std::collections::HashMap::new();
+    let _ = handle_runtime_popup_key(key, runtime_popup, &registry, processes, &outputs, 80, 24);
+}
+
+/// Route a key to the active runtime popup. Returns `Some(process_id)` when the
+/// user confirms a kill in the managed-processes tab.
+fn handle_runtime_popup_key(
+    key: KeyEvent,
+    runtime_popup: &mut RuntimePopup,
+    task_registry: &RunningTaskRegistry,
+    processes: &[yi_agent_tools::ManagedProcessSnapshot],
+    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
+    detail_width: u16,
+    detail_height: u16,
+) -> Option<String> {
+    match runtime_popup {
+        RuntimePopup::None => {}
+        RuntimePopup::Bash(bash_popup) => {
+            if key.code == KeyCode::Tab {
+                switch_runtime_tab(runtime_popup, task_registry);
+            } else {
+                handle_bash_popup_key(key, bash_popup, task_registry, detail_width);
+                if matches!(bash_popup, BashPopup::None) {
+                    *runtime_popup = RuntimePopup::None;
+                }
+            }
+        }
+        RuntimePopup::Processes(ProcessPopup::List(p)) => match key.code {
+            KeyCode::Tab => {
+                switch_runtime_tab(runtime_popup, task_registry);
+            }
+            KeyCode::Up => p.move_up(),
+            KeyCode::Down => p.move_down(processes.len()),
+            KeyCode::Enter => {
+                if let Some(id) = p.selected_id(processes) {
+                    *runtime_popup = RuntimePopup::Processes(ProcessPopup::Detail(
+                        ProcessDetailPopup::new(id.to_string()),
+                    ));
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => *runtime_popup = RuntimePopup::None,
+            _ => {}
+        },
+        RuntimePopup::Processes(ProcessPopup::Detail(d)) => match key.code {
+            KeyCode::Tab => {
+                switch_runtime_tab(runtime_popup, task_registry);
+            }
+            KeyCode::Char('k') => {
+                *runtime_popup =
+                    RuntimePopup::Processes(ProcessPopup::ConfirmKill(ConfirmProcessKillPopup {
+                        process_id: d.process_id.clone(),
+                    }));
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                *runtime_popup =
+                    RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
+            }
+            KeyCode::Up => {
+                let max = process_detail_max_scroll(
+                    d,
+                    processes,
+                    process_outputs,
+                    detail_width,
+                    detail_height,
+                );
+                d.scroll_up_from_bottom(1, max);
+            }
+            KeyCode::Down => {
+                let max = process_detail_max_scroll(
+                    d,
+                    processes,
+                    process_outputs,
+                    detail_width,
+                    detail_height,
+                );
+                d.scroll_down(1, max);
+            }
+            KeyCode::Char('f') => d.scroll_to_bottom(),
+            _ => {}
+        },
+        RuntimePopup::Processes(ProcessPopup::ConfirmKill(ck)) => match key.code {
+            KeyCode::Char('n') | KeyCode::Esc => {
+                *runtime_popup = RuntimePopup::Processes(ProcessPopup::Detail(
+                    ProcessDetailPopup::new(ck.process_id.clone()),
+                ));
+            }
+            KeyCode::Char('y') => {
+                let process_id = ck.process_id.clone();
+                *runtime_popup =
+                    RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
+                return Some(process_id);
+            }
+            _ => {}
+        },
+    }
+    None
+}
+
+fn process_detail_max_scroll(
+    detail: &ProcessDetailPopup,
+    processes: &[yi_agent_tools::ManagedProcessSnapshot],
+    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
+    width: u16,
+    height: u16,
+) -> usize {
+    processes
+        .iter()
+        .find(|process| process.process_id == detail.process_id)
+        .map(|process| {
+            super::process_popup::process_detail_line_count(
+                process,
+                process_outputs.get(&detail.process_id),
+                width,
+            )
+            .saturating_sub(height as usize)
+        })
+        .unwrap_or(0)
+}
+
 /// Handle a key event for the bash popup state machine.
 fn handle_bash_popup_key(
     key: KeyEvent,
     bash_popup: &mut BashPopup,
     task_registry: &RunningTaskRegistry,
+    detail_width: u16,
 ) {
     match bash_popup {
         BashPopup::List(p) => match key.code {
@@ -610,14 +929,9 @@ fn handle_bash_popup_key(
                 d.scroll_up(1);
             }
             KeyCode::Down => {
-                // Approximate max scroll by stdout+stderr line count.
                 let lines = task_registry
                     .get(&d.task_id)
-                    .map(|t| {
-                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
-                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
-                        so + se + 6 // header + labels
-                    })
+                    .map(|t| super::bash_popup::detail_line_count(t, detail_width))
                     .unwrap_or(0);
                 d.scroll_down(1, lines);
             }
@@ -652,17 +966,20 @@ fn handle_bash_popup_key(
 /// the cursor is over. Only scroll events are handled; clicks are ignored.
 ///
 /// Routing priority:
-/// 1. If a bash detail popup is active and the mouse is over the history
-///    region (where the popup is rendered), scroll the popup.
+/// 1. If a bash/process detail popup is active and the mouse is over the
+///    history region (where the popup is rendered), scroll the popup.
 /// 2. Otherwise, if the mouse is over the history region, scroll history.
 /// 3. If the mouse is over the input region, do nothing — the input widget
 ///    handles its own scrolling internally.
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     mouse: MouseEvent,
     layout: &LayoutInfo,
-    bash_popup: &mut BashPopup,
+    runtime_popup: &mut RuntimePopup,
     history: &mut HistoryState,
     task_registry: &RunningTaskRegistry,
+    processes: &[yi_agent_tools::ManagedProcessSnapshot],
+    process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
     pending_quit: &mut bool,
 ) {
     // Only react to scroll-wheel events.
@@ -680,22 +997,43 @@ fn handle_mouse(
     let pos = ratatui::layout::Position::from((mouse.column, mouse.row));
 
     // The bash detail popup occupies the history region (chunks[0]).
-    if matches!(bash_popup, BashPopup::Detail(_) | BashPopup::ConfirmKill(_))
-        && history_area.contains(pos)
+    if matches!(
+        runtime_popup,
+        RuntimePopup::Bash(BashPopup::Detail(_)) | RuntimePopup::Bash(BashPopup::ConfirmKill(_))
+    ) && history_area.contains(pos)
     {
-        if let BashPopup::Detail(d) = bash_popup {
+        if let RuntimePopup::Bash(BashPopup::Detail(d)) = runtime_popup {
             if is_scroll_down {
                 let lines = task_registry
                     .get(&d.task_id)
-                    .map(|t| {
-                        let so = String::from_utf8_lossy(&t.stdout).lines().count();
-                        let se = String::from_utf8_lossy(&t.stderr).lines().count();
-                        so + se + 6 // header + labels
-                    })
+                    .map(|t| super::bash_popup::detail_line_count(t, history_area.width))
                     .unwrap_or(0);
                 d.scroll_down(delta, lines);
             } else {
                 d.scroll_up(delta);
+            }
+        }
+        return;
+    }
+
+    if matches!(
+        runtime_popup,
+        RuntimePopup::Processes(ProcessPopup::Detail(_))
+            | RuntimePopup::Processes(ProcessPopup::ConfirmKill(_))
+    ) && history_area.contains(pos)
+    {
+        if let RuntimePopup::Processes(ProcessPopup::Detail(d)) = runtime_popup {
+            let max = process_detail_max_scroll(
+                d,
+                processes,
+                process_outputs,
+                history_area.width,
+                history_area.height,
+            );
+            if is_scroll_down {
+                d.scroll_down(delta, max);
+            } else {
+                d.scroll_up_from_bottom(delta, max);
             }
         }
         return;
@@ -735,16 +1073,14 @@ fn route_event(
             // counter so it doesn't linger at the previous turn's value
             // throughout the entire tool execution phase.
             statusbar.on_tool_call_phase();
-            let cmd = input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let exp = input
-                .get("expected_timeout_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(120) as u32;
-            registry.on_tool_call(id, name, &cmd, exp);
+            if name == "bash" {
+                let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let exp = input
+                    .get("expected_timeout_sec")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(120) as u32;
+                registry.on_tool_call(id, name, cmd, exp);
+            }
         }
         AgentEvent::ToolOutputDelta { id, stream, text } => {
             registry.on_output_delta(id, *stream, text);
@@ -1102,11 +1438,11 @@ fn handle_paste(
     text: String,
     input: &mut InputLine,
     history: &HistoryState,
-    bash_popup: &BashPopup,
+    runtime_popup: &RuntimePopup,
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
 ) {
-    if !matches!(bash_popup, BashPopup::None) || history.pending_permission_info().is_some() {
+    if runtime_popup.blocks_text_input() || history.pending_permission_info().is_some() {
         return;
     }
 
@@ -3028,6 +3364,38 @@ mod tests {
     }
 
     #[test]
+    fn test_route_event_tracks_only_bash_tool_calls() {
+        let mut registry = RunningTaskRegistry::new();
+        let mut statusbar = StatusBarState::default();
+        let mut cost = CostTracker::default();
+
+        route_event(
+            &mut registry,
+            &mut statusbar,
+            &mut cost,
+            &AgentEvent::ToolCall {
+                id: "grep".into(),
+                name: "grep".into(),
+                input: serde_json::json!({"pattern": "TODO"}),
+            },
+        );
+        assert!(registry.list().is_empty());
+
+        route_event(
+            &mut registry,
+            &mut statusbar,
+            &mut cost,
+            &AgentEvent::ToolCall {
+                id: "bash".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "echo hi", "expected_timeout_sec": 30}),
+            },
+        );
+        assert_eq!(registry.list().len(), 1);
+        assert_eq!(registry.get("bash").unwrap().command, "echo hi");
+    }
+
+    #[test]
     fn test_route_event_tool_timeout() {
         let mut registry = RunningTaskRegistry::new();
         let mut sb = StatusBarState::default();
@@ -3050,11 +3418,10 @@ mod tests {
         assert_eq!(registry.get("t").unwrap().status, TaskStatus::Timeout);
     }
 
-    /// A normal (non-streaming) tool such as web_search returns ToolResult
-    /// without ToolExit. Its timer must stop when that result arrives rather
-    /// than continuing through the next LLM think phase until Done.
+    /// Non-Bash tools do not create Ctrl+P tasks, and their results are safe
+    /// to ignore in the Bash-task registry.
     #[test]
-    fn test_route_event_tool_result_finalizes_non_streaming_tool() {
+    fn test_route_event_ignores_non_bash_tool_results() {
         let mut registry = RunningTaskRegistry::new();
         let mut sb = StatusBarState::default();
         let mut cost = CostTracker::default();
@@ -3078,10 +3445,8 @@ mod tests {
             },
         );
 
-        let elapsed = registry.get("search").unwrap().elapsed();
-        assert_eq!(registry.get("search").unwrap().status, TaskStatus::Done);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        assert_eq!(registry.get("search").unwrap().elapsed(), elapsed);
+        assert!(registry.get("search").is_none());
+        assert!(registry.list().is_empty());
     }
 
     /// Regression: a ToolCall that never receives a ToolExit (e.g. bash tool
@@ -4422,7 +4787,7 @@ mod tests {
     fn paste_inserts_text_clears_pending_quit_and_filters_slash_popup() {
         let history = HistoryState::new();
         let mut input = InputLine::new();
-        let bash_popup = BashPopup::None;
+        let runtime_popup = RuntimePopup::None;
         let mut pending_quit = true;
         let mut popup = None;
 
@@ -4430,7 +4795,7 @@ mod tests {
             "/cl".to_string(),
             &mut input,
             &history,
-            &bash_popup,
+            &runtime_popup,
             &mut pending_quit,
             &mut popup,
         );
@@ -4448,7 +4813,7 @@ mod tests {
         let mut history = HistoryState::new();
         history.push_event(make_permission_request_normal(1), 80);
         let mut input = InputLine::new();
-        let bash_popup = BashPopup::None;
+        let runtime_popup = RuntimePopup::None;
         let mut pending_quit = true;
         let mut popup = None;
 
@@ -4456,7 +4821,7 @@ mod tests {
             "/cl".to_string(),
             &mut input,
             &history,
-            &bash_popup,
+            &runtime_popup,
             &mut pending_quit,
             &mut popup,
         );
@@ -4467,10 +4832,11 @@ mod tests {
     }
 
     #[test]
-    fn paste_is_ignored_while_bash_popup_is_active() {
+    fn paste_is_ignored_while_runtime_popup_is_active() {
         let history = HistoryState::new();
         let mut input = InputLine::new();
-        let bash_popup = BashPopup::List(ListPopup::new(vec!["task-1".to_string()]));
+        let runtime_popup =
+            RuntimePopup::Bash(BashPopup::List(ListPopup::new(vec!["task-1".to_string()])));
         let mut pending_quit = true;
         let mut popup = None;
 
@@ -4478,7 +4844,7 @@ mod tests {
             "/cl".to_string(),
             &mut input,
             &history,
-            &bash_popup,
+            &runtime_popup,
             &mut pending_quit,
             &mut popup,
         );
@@ -4486,6 +4852,40 @@ mod tests {
         assert!(input.buffer.is_empty());
         assert!(pending_quit);
         assert!(popup.is_none());
+    }
+
+    #[test]
+    fn ctrl_p_process_tab_kill_confirmation_sends_process_id() {
+        let mut runtime_popup = RuntimePopup::Processes(ProcessPopup::Detail(
+            ProcessDetailPopup::new("proc_1".into()),
+        ));
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+
+        handle_runtime_popup_key_for_test(key, &mut runtime_popup, &[], &[]);
+
+        assert!(matches!(
+            runtime_popup,
+            RuntimePopup::Processes(ProcessPopup::ConfirmKill(_))
+        ));
+    }
+
+    #[test]
+    fn runtime_popup_tab_switches_between_bash_and_processes() {
+        let mut popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(vec!["bash_1".into()])));
+
+        popup.switch_tab(Vec::new());
+
+        assert!(matches!(
+            popup,
+            RuntimePopup::Processes(ProcessPopup::List(_))
+        ));
+    }
+
+    #[test]
+    fn process_runtime_popup_blocks_text_input() {
+        let popup = RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
+
+        assert!(popup.blocks_text_input());
     }
 
     #[test]
@@ -6078,7 +6478,7 @@ mod tests {
     #[test]
     fn mouse_scroll_up_in_history_increases_offset() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = BashPopup::None;
+        let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         // Fill enough lines so scrolling is meaningful.
         for _ in 0..50 {
@@ -6097,9 +6497,11 @@ mod tests {
         handle_mouse(
             make_mouse(MouseEventKind::ScrollUp, 0, row),
             &layout,
-            &mut bash_popup,
+            &mut runtime_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -6111,9 +6513,11 @@ mod tests {
         handle_mouse(
             make_mouse(MouseEventKind::ScrollUp, 5, row + 3),
             &layout,
-            &mut bash_popup,
+            &mut runtime_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(hist.scroll_offset, 6, "second ScrollUp should accumulate");
@@ -6122,7 +6526,7 @@ mod tests {
     #[test]
     fn mouse_scroll_uses_reserved_text_width_for_its_max_offset() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = BashPopup::None;
+        let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         // This fits the raw 80-column area (78 chars after the user prefix)
         // but wraps after the scrollbar reserves one column.
@@ -6146,9 +6550,11 @@ mod tests {
             handle_mouse(
                 make_mouse(MouseEventKind::ScrollUp, 0, history_area.y),
                 &layout,
-                &mut bash_popup,
+                &mut runtime_popup,
                 &mut hist,
                 &registry,
+                &[],
+                &std::collections::HashMap::new(),
                 &mut pending_quit,
             );
         }
@@ -6161,7 +6567,7 @@ mod tests {
     #[test]
     fn mouse_scroll_down_in_history_decreases_offset() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = BashPopup::None;
+        let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
             hist.push(
@@ -6180,9 +6586,11 @@ mod tests {
         handle_mouse(
             make_mouse(MouseEventKind::ScrollDown, 0, history_area.y),
             &layout,
-            &mut bash_popup,
+            &mut runtime_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -6195,9 +6603,11 @@ mod tests {
             handle_mouse(
                 make_mouse(MouseEventKind::ScrollDown, 0, history_area.y),
                 &layout,
-                &mut bash_popup,
+                &mut runtime_popup,
                 &mut hist,
                 &registry,
+                &[],
+                &std::collections::HashMap::new(),
                 &mut pending_quit,
             );
         }
@@ -6209,7 +6619,7 @@ mod tests {
     fn mouse_scroll_in_input_region_ignores_history() {
         let (layout, _history_area) = layout_80x24();
         let input_area = layout.chunks[5];
-        let mut bash_popup = BashPopup::None;
+        let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
             hist.push(
@@ -6225,9 +6635,11 @@ mod tests {
         handle_mouse(
             make_mouse(MouseEventKind::ScrollUp, 0, input_area.y),
             &layout,
-            &mut bash_popup,
+            &mut runtime_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(
@@ -6240,7 +6652,7 @@ mod tests {
     #[test]
     fn mouse_click_is_ignored() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = BashPopup::None;
+        let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
             hist.push(
@@ -6260,9 +6672,11 @@ mod tests {
                 history_area.y,
             ),
             &layout,
-            &mut bash_popup,
+            &mut runtime_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert_eq!(hist.scroll_offset, 0, "click should not scroll");
@@ -6273,7 +6687,7 @@ mod tests {
     #[test]
     fn mouse_scroll_clears_pending_quit() {
         let (layout, history_area) = layout_80x24();
-        let mut bash_popup = BashPopup::None;
+        let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         let registry = RunningTaskRegistry::new();
         let mut pending_quit = true;
@@ -6281,9 +6695,11 @@ mod tests {
         handle_mouse(
             make_mouse(MouseEventKind::ScrollUp, 0, history_area.y),
             &layout,
-            &mut bash_popup,
+            &mut runtime_popup,
             &mut hist,
             &registry,
+            &[],
+            &std::collections::HashMap::new(),
             &mut pending_quit,
         );
         assert!(!pending_quit, "scrolling history should clear pending_quit");

@@ -253,15 +253,8 @@ fn render_permission_request(
     let mut lines: Vec<Line<'static>> = {
         let mut header: Vec<Line<'static>> = Vec::new();
         let header_text = format!("? Permission needed: {tool_name}");
-        for (i, chunk) in wrap_by_display_width(&header_text, w, "", "  ")
-            .into_iter()
-            .enumerate()
-        {
-            if i == 0 {
-                header.push(Line::from(Span::styled(chunk, warn_style)));
-            } else {
-                header.push(Line::from(Span::styled(chunk, warn_style)));
-            }
+        for chunk in wrap_by_display_width(&header_text, w, "", "  ") {
+            header.push(Line::from(Span::styled(chunk, warn_style)));
         }
         header
     };
