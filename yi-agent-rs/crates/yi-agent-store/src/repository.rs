@@ -3239,6 +3239,16 @@ impl RuntimeRepository {
         }
     }
 
+    /// Deletes a task's workspace assignment row. Idempotent: a missing row is
+    /// not an error, so recycling can be retried safely.
+    pub fn delete_task_workspace(&self, task: &TaskId) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "DELETE FROM task_workspaces WHERE task_id = ?1",
+            params![task.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT state FROM attempts WHERE id = ?1",
