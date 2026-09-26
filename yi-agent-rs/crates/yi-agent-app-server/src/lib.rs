@@ -3,6 +3,7 @@
 pub mod protocol;
 pub mod server;
 pub mod session;
+pub mod thread_store;
 pub mod translate;
 pub mod transport;
 

@@ -148,4 +148,30 @@ describe("Session", () => {
     });
     expect(s.retrying).toBeNull();
   });
+
+  it("reset clears all state and starts a fresh items array", () => {
+    const s = new Session();
+    const before = s.items;
+    s.addUserMessage("hi");
+    s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
+    s.apply({
+      method: "thread/tokenUsage/updated",
+      params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2 },
+    });
+    s.apply({ method: "error", params: { message: "boom" } });
+    s.apply({
+      method: "turn/completed",
+      params: { thread_id: "t", turn_id: "u1", status: "completed" },
+    });
+    expect(s.lastStatus).not.toBeNull();
+
+    s.reset();
+
+    expect(s.items).not.toBe(before);
+    expect(s.items).toHaveLength(0);
+    expect(s.turnActive).toBe(false);
+    expect(s.lastStatus).toBeNull();
+    expect(s.lastError).toBeNull();
+    expect(s.usage).toBeNull();
+  });
 });

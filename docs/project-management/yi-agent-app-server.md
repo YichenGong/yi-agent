@@ -14,6 +14,7 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - stdio JSONL 分帧传输（读一行、写一行，帧大小上限保护）
 - 权限审批反向请求（服务端 → 客户端请求 / 客户端响应）
 - CLI 子命令 `yi-agent app-server`（装配 runtime 并驱动 stdio 循环）
+- 会话持久化与历史方法（`thread/list` / `thread/resume` / `thread/rename` / `thread/delete`，落 `<workdir>/.yi-agent/threads/`）
 
 **不做什么：**
 - 不做 TUI（由 `yi-agent-tui` 负责）
@@ -27,10 +28,11 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - [x] 服务端 → 客户端通知 `Notification`（`thread/started`、`turn/started`、`item/*`、`turn/completed`、`thread/tokenUsage/updated`、`error`）、`NotificationEnvelope`（补齐 `jsonrpc:"2.0"` 字段）与 `TurnStatus` — `src/protocol.rs:107` / `src/protocol.rs:150` / `src/protocol.rs:167`
 - [x] 会话条目模型 `Item`（`userMessage` / `agentMessage` / `toolCall`）与 `ToolStatus`；`None` 字段序列化时省略 — `src/protocol.rs:175` / `src/protocol.rs:197`
 - [x] stdio JSONL 传输：`MessageReader::next_line`（CRLF 归一、EOF 返回 `None`、内容超过 `MAX_FRAME_BYTES`（不含行终止符）报错）、`MessageWriter::write_value`（序列化失败返回错误，不 panic 不静默丢弃）— `src/transport.rs:29` / `src/transport.rs:67`
-- [x] `AgentEvent` → 通知翻译层 `translate.rs`（`Translator::on_event`）— `src/translate.rs:36`
+- [x] `AgentEvent` → 通知翻译层 `translate.rs`（`Translator::on_event`）— `src/translate.rs:174`
 - [x] server 主循环 + thread/start（`initialize` / `thread/start` / `config/read` / 错误码 / EOF 退出）— `src/server.rs:46`
-- [x] turn/start + turn/interrupt + 每 thread driver task（`turn-{n}` 编号、`turn/started`→响应→投递顺序、`-32011`/`-32012`/`-32602` 错误码、`Agent::run()` 之后取 cancel token 保证中断有效、中断信号携带目标 turn id 以丢弃残留、写失败也上报 `Finished` 防 `active_turn_id` 卡死）— `src/server.rs:285` / `src/server.rs:355` / `src/server.rs:480`
-- [x] 权限审批反向请求闭环（`AgentEvent::PermissionRequest` → 服务端反向请求 `item/toolCall/requestApproval`（id 取自进程级 `perm_seq` 计数器，跨 thread 全局唯一）→ 客户端响应 `ClientResponse` → `pending` 登记表路由 → `Decision` 回传 agent；审批等待内的中断按目标 turn id 过滤，超时/中断/畸形取值一律按 `Deny` fail-safe）— `src/protocol.rs:42` / `src/protocol.rs:54` / `src/server.rs:116` / `src/server.rs:431` / `src/server.rs:447` / `src/server.rs:480`
+- [x] turn/start + turn/interrupt + 每 thread driver task（`turn-<uuid>` 编号、`turn/started`→响应→投递顺序、`-32011`/`-32012`/`-32602` 错误码、`Agent::run()` 之后取 cancel token 保证中断有效、中断信号携带目标 turn id 以丢弃残留、写失败也上报 `Finished` 防 `active_turn_id` 卡死）— `src/server.rs:531` / `src/server.rs:600` / `src/server.rs:782`
+- [x] 权限审批反向请求闭环（`AgentEvent::PermissionRequest` → 服务端反向请求 `item/toolCall/requestApproval`（id 取自进程级 `perm_seq` 计数器，跨 thread 全局唯一）→ 客户端响应 `ClientResponse` → `pending` 登记表路由 → `Decision` 回传 agent；审批等待内的中断按目标 turn id 过滤，超时/中断/畸形取值一律按 `Deny` fail-safe）— `src/protocol.rs:42` / `src/protocol.rs:54` / `src/server.rs:113` / `src/server.rs:835` / `src/server.rs:878` / `src/server.rs:782`
 - [x] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环，仅支持 `stdio://`）— `yi-agent-rs/crates/yi-agent/src/config.rs:154`（`Command::AppServer` 变体）/ `yi-agent-rs/crates/yi-agent/src/main.rs:74`（`ensure_stdio_listen`）/ `yi-agent-rs/crates/yi-agent/src/main.rs:85`（`run_app_server`）
+- [x] 会话持久化 + 历史方法（`thread_store.rs`：每 thread 一个只追加 `.jsonl` + 一个可变 `.meta.json`，落 `<workdir>/.yi-agent/threads/`；`thread/start` 分配 `thread-<uuid>` 并写 meta；driver 每 turn 落盘最终 Item + 完整 session `Message` 快照；新增 `thread/list` / `thread/resume`（回放 + `Agent::with_session` 恢复上下文）/ `thread/rename` / `thread/delete`；删除活跃 thread 时先中断并等 driver 落盘再删，避免 `create(true)` 复活文件）— `src/thread_store.rs:1` / `src/server.rs:214`（thread/list）/ `src/server.rs:239`（thread/start）/ `src/server.rs:323`（thread/resume）/ `src/server.rs:461`（thread/rename）/ `src/server.rs:502`（thread/delete）/ `src/server.rs:932`（driver 落盘）
 
-**验证命令：** `cargo test -p yi-agent-app-server`（69 个测试）+ `cargo test -p yi-agent --bin yi-agent stdio`（CLI 子命令 4 个测试）
+**验证命令：** `cargo test -p yi-agent-app-server`（103 个测试）+ `cargo test -p yi-agent --bin yi-agent stdio`（CLI 子命令 4 个测试）

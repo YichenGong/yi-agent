@@ -51,15 +51,15 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let cfg_for_factory = cfg.clone();
-    run_with(reader, writer, cfg, PERMISSION_TIMEOUT, move || {
-        yi_agent_runtime::bootstrap::bootstrap_agent(
+    run_with(reader, writer, cfg, PERMISSION_TIMEOUT, move |session| {
+        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
             &cfg_for_factory,
             yi_agent_runtime::bootstrap::PermissionMode::Interactive,
-        )
-        .map(|b| BuiltAgent {
-            agent: b.agent,
-            decision_tx: b.decision_tx,
-            catalog: b.catalog,
+        )?;
+        Ok(BuiltAgent {
+            agent: apply_session(built.agent, session),
+            decision_tx: built.decision_tx,
+            catalog: built.catalog,
         })
     })
     .await
@@ -80,7 +80,7 @@ async fn run_with<R, W, F>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    F: Fn() -> anyhow::Result<BuiltAgent> + Send + 'static,
+    F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
 {
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -106,6 +106,7 @@ where
     });
 
     let writer = Arc::new(MessageWriter::new(writer));
+    let store = Arc::new(crate::thread_store::ThreadStore::new(&cfg.workdir));
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
@@ -120,9 +121,6 @@ where
 
     let mut initialized = false;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
-    let mut next_thread: u64 = 1;
-    // 主循环用该计数器分配 turn id(`turn-{n}`)。
-    let mut next_turn: u64 = 1;
 
     loop {
         tokio::select! {
@@ -216,15 +214,35 @@ where
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
+                    "thread/list" => match store.list() {
+                        Ok(metas) => {
+                            // 显式映射而非直接序列化 ThreadMeta:wire 契约与存储结构解耦,
+                            // 存储字段重命名不会悄悄改变 RPC 输出。
+                            let threads: Vec<serde_json::Value> = metas
+                                .into_iter()
+                                .map(|m| {
+                                    json!({
+                                        "thread_id": m.thread_id,
+                                        "cwd": m.cwd,
+                                        "model": m.model,
+                                        "created_at": m.created_at,
+                                        "updated_at": m.updated_at,
+                                        "title": m.title,
+                                    })
+                                })
+                                .collect();
+                            write_response(&writer, ok_response(id, json!({ "threads": threads })))
+                                .await?;
+                        }
+                        Err(e) => {
+                            write_response(&writer, err_response(id, RpcError::internal(e.to_string())))
+                                .await?;
+                        }
+                    },
                     "thread/start" => {
-                        let thread_id = format!("thread-{next_thread}");
-                        next_thread += 1;
+                        let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
 
-                        let BuiltAgent {
-                            agent,
-                            decision_tx,
-                            catalog,
-                        } = match build_agent() {
+                        let BuiltAgent { agent, decision_tx, catalog } = match build_agent(None) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -237,6 +255,21 @@ where
 
                         let cwd = cfg.workdir.display().to_string();
                         let model = cfg.model.clone();
+
+                        let now = crate::thread_store::now_millis();
+                        let meta = crate::thread_store::ThreadMeta {
+                            thread_id: thread_id.clone(),
+                            cwd: cwd.clone(),
+                            model: model.clone(),
+                            created_at: now,
+                            updated_at: now,
+                            title: None,
+                        };
+                        if let Err(e) = store.create(&meta) {
+                            // 持久化是尽力而为:写失败不阻断 thread 创建。
+                            eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
+                        }
+
                         threads.insert(
                             thread_id.clone(),
                             ThreadSession {
@@ -266,6 +299,7 @@ where
                             permission_timeout,
                             Arc::clone(&perm_seq),
                             catalog,
+                            Arc::clone(&store),
                         ));
 
                         write_notification(
@@ -290,6 +324,215 @@ where
                         )
                         .await?;
                     }
+                    "thread/resume" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
+                        // 落盘完成,否则紧随 turn/completed 的 resume 会读到尚未写入
+                        // 的历史。详见 `interrupt_and_wait_for_persist`。
+                        interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
+
+                        let loaded = match store.load(&thread_id) {
+                            Ok(Some(l)) => l,
+                            Ok(None) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+
+                        // meta 缺 cwd/model 时(损坏重建)用当前配置兜底。
+                        let cwd = if loaded.meta.cwd.is_empty() {
+                            cfg.workdir.display().to_string()
+                        } else {
+                            loaded.meta.cwd.clone()
+                        };
+                        let model = if loaded.meta.model.is_empty() {
+                            cfg.model.clone()
+                        } else {
+                            loaded.meta.model.clone()
+                        };
+
+                        let mut session = yi_agent_core::Session::new();
+                        // 恢复上次用量,使 auto-compact 在 resume 后的首轮即生效。
+                        if let Some(u) = &loaded.usage {
+                            session.set_last_input_tokens(Some(u.input_tokens));
+                        }
+                        session.replace_messages(loaded.messages);
+
+                        let BuiltAgent { agent, decision_tx, catalog } = match build_agent(Some(session)) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+
+                        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+                        let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+                        threads.insert(
+                            thread_id.clone(),
+                            ThreadSession {
+                                thread_id: thread_id.clone(),
+                                cwd: cwd.clone(),
+                                model: model.clone(),
+                                active_turn_id: None,
+                                prompt_tx,
+                                interrupt_tx,
+                            },
+                        );
+
+                        let driver_writer = Arc::clone(&writer);
+                        let driver_turn_tx = turn_tx.clone();
+                        let driver_thread_id = thread_id.clone();
+                        tokio::spawn(run_thread_driver(
+                            driver_thread_id,
+                            agent,
+                            prompt_rx,
+                            interrupt_rx,
+                            driver_writer,
+                            driver_turn_tx,
+                            decision_tx,
+                            Arc::clone(&pending),
+                            permission_timeout,
+                            Arc::clone(&perm_seq),
+                            catalog,
+                            Arc::clone(&store),
+                        ));
+
+                        // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
+                        write_notification(
+                            &writer,
+                            &Notification::ThreadStarted {
+                                thread_id: thread_id.clone(),
+                                cwd: cwd.clone(),
+                                model: model.clone(),
+                            },
+                        )
+                        .await?;
+                        for item in loaded.items {
+                            write_notification(
+                                &writer,
+                                &Notification::ItemCompleted {
+                                    thread_id: thread_id.clone(),
+                                    item,
+                                },
+                            )
+                            .await?;
+                        }
+                        if let Some(u) = loaded.usage {
+                            write_notification(
+                                &writer,
+                                &Notification::TokenUsage {
+                                    thread_id: thread_id.clone(),
+                                    model: u.model,
+                                    input_tokens: u.input_tokens,
+                                    output_tokens: u.output_tokens,
+                                },
+                            )
+                            .await?;
+                        }
+                        write_response(
+                            &writer,
+                            ok_response(
+                                id,
+                                json!({
+                                    "thread_id": thread_id,
+                                    "cwd": cwd,
+                                    "model": model,
+                                }),
+                            ),
+                        )
+                        .await?;
+                    }
+                    "thread/rename" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let title = req
+                            .params
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if title.is_empty() {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("title must not be empty")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        match store.rename(&thread_id, &title) {
+                            Ok(true) => {
+                                write_response(&writer, ok_response(id, json!({}))).await?;
+                            }
+                            Ok(false) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    "thread/delete" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let in_memory = threads.contains_key(&thread_id);
+                        let on_disk = store.exists(&thread_id);
+                        if !in_memory && !on_disk {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // 活跃 thread:先中断,再等 driver 落盘完成才删文件。若像旧
+                        // 实现那样在 driver 落盘前就删文件,driver 的 `append_turn`
+                        // (`create(true)`)会把 `<id>.jsonl` 复活,导致删除后
+                        // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
+                        // 故复用 resume 的等待模式,等落盘后再删。
+                        interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
+                        // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
+                        threads.remove(&thread_id);
+                        if let Err(e) = store.delete(&thread_id) {
+                            eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
+                        }
+                        write_response(&writer, ok_response(id, json!({}))).await?;
+                    }
                     "turn/start" => {
                         // `id` 后续响应仍需使用,故传 clone。
                         let Some(thread_id) =
@@ -312,7 +555,7 @@ where
                             }
                         };
 
-                        let turn_id = format!("turn-{next_turn}");
+                        let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
                         // 内层作用域:让 `&mut threads` 的借用先结束,后续错误
                         // 路径才能再次 `threads.get_mut`。
                         let prompt_tx = {
@@ -332,7 +575,6 @@ where
                                 .await?;
                                 continue;
                             }
-                            next_turn += 1;
                             session.active_turn_id = Some(turn_id.clone());
                             session.prompt_tx.clone()
                         };
@@ -401,6 +643,17 @@ where
     }
 
     Ok(())
+}
+
+/// 恢复会话:`Some` 时用载入的历史覆盖 agent 的 session,`None` 时保持新建的空 session。
+fn apply_session(
+    agent: yi_agent_core::Agent,
+    session: Option<yi_agent_core::Session>,
+) -> yi_agent_core::Agent {
+    match session {
+        Some(s) => agent.with_session(s),
+        None => agent,
+    }
 }
 
 fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
@@ -475,6 +728,52 @@ fn finished_event(thread_id: &str, turn_id: &str) -> TurnEvent {
     }
 }
 
+/// 若 `thread_id` 有活跃 turn,中断它并等待 driver 落盘完成。
+///
+/// driver 是「先发 turn/completed,后 append/touch」,而 `TurnEvent::Finished`
+/// 在落盘之后才发出;因此本函数返回后,调用方可以依赖「该 turn 已落盘」。
+/// 有界等待:driver 异常卡死时不至于拖垮整个请求循环。
+async fn interrupt_and_wait_for_persist(
+    threads: &mut HashMap<String, ThreadSession>,
+    turn_rx: &mut mpsc::Receiver<TurnEvent>,
+    thread_id: &str,
+) {
+    let Some(tid) = threads
+        .get(thread_id)
+        .and_then(|s| s.active_turn_id.clone())
+    else {
+        return;
+    };
+    if let Some(s) = threads.get(thread_id) {
+        let _ = s.interrupt_tx.try_send(tid.clone());
+    }
+    let wait_for_persist = async {
+        while let Some(TurnEvent::Finished {
+            thread_id: done_id,
+            turn_id: done_turn,
+        }) = turn_rx.recv().await
+        {
+            if let Some(s) = threads.get_mut(&done_id) {
+                if s.active_turn_id.as_deref() == Some(done_turn.as_str()) {
+                    s.active_turn_id = None;
+                }
+            }
+            if done_id == thread_id && done_turn == tid {
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_persist)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "[app-server] timed out waiting for turn of {thread_id} to persist; \
+             a late driver append may resurrect its files"
+        );
+    }
+}
+
 /// 单个 thread 的 driver task:串行消费 turn,驱动 `agent.run()` 的 stream,
 /// 经 `Translator` 写成协议通知。
 ///
@@ -497,12 +796,19 @@ async fn run_thread_driver<W>(
     permission_timeout: Duration,
     perm_seq: Arc<AtomicU64>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    store: Arc<crate::thread_store::ThreadStore>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // 每个 thread 一个 translator:item 计数器跨 turn 单调递增,避免 id 重复。
+    // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
+    // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
     let mut translator = Translator::new(thread_id.clone());
     while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
+        // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
+        // `last_usage` 记录的是本轮**最后一次** provider 调用,而非多步 turn 的累加。
+        let mut completed_items: Vec<crate::protocol::Item> = Vec::new();
+        let mut last_usage: Option<crate::thread_store::TurnUsage> = None;
+        let user_prompt = prompt.clone();
         translator.set_turn(turn_id.clone());
 
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
@@ -588,7 +894,17 @@ async fn run_thread_driver<W>(
                             }
                         }
                         Some(e) => {
+                            if let yi_agent_core::AgentEvent::Usage { model, usage } = &e {
+                                last_usage = Some(crate::thread_store::TurnUsage {
+                                    model: model.clone(),
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                });
+                            }
                             for n in translator.on_event(e) {
+                                if let crate::protocol::Notification::ItemCompleted { item, .. } = &n {
+                                    completed_items.push(item.clone());
+                                }
                                 if write_notification(&writer, &n).await.is_err() {
                                     // 客户端可能已断开;先上报 Finished,
                                     // 避免 active_turn_id 永久卡住。
@@ -609,6 +925,28 @@ async fn run_thread_driver<W>(
                     // 继续消费 stream,直到 run loop 发 Cancelled 并结束。
                 }
             }
+        }
+
+        // 落盘(尽力而为):合成一条 userMessage item 放在首部,再拼本轮最终 item。
+        // 基线 server 不 emit userMessage,必须在此补齐,否则 resume 会丢用户提问。
+        let mut items = Vec::with_capacity(completed_items.len() + 1);
+        items.push(crate::protocol::Item::UserMessage {
+            id: format!("user-{turn_id}"),
+            text: user_prompt.clone(),
+        });
+        items.append(&mut completed_items);
+
+        let record = crate::thread_store::TurnLine::Turn {
+            items,
+            usage: last_usage,
+            messages: agent.session().messages().to_vec(),
+        };
+        // append 失败则跳过 touch:避免 updated_at/title 被推进却无日志内容,
+        // 留下 `thread/list` 会列出的"幽灵" thread。
+        if let Err(e) = store.append_turn(&thread_id, &record) {
+            eprintln!("[app-server] failed to persist turn {turn_id} of {thread_id}: {e}");
+        } else if let Err(e) = store.touch(&thread_id, Some(user_prompt.as_str())) {
+            eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
         }
 
         let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
@@ -686,6 +1024,32 @@ mod tests {
         }
     }
 
+    /// 记录每次调用收到的 message 数,并回显 `n=<count>` 作为 agent 文本。
+    struct RecordingProvider {
+        seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for RecordingProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            let n = req.messages.len();
+            self.seen.lock().unwrap().push(n);
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta(format!("n={n}")),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
     /// 永不自行结束的 provider:每 5ms 吐一个 delta,turn 会一直活跃,
     /// 直到被 `turn/interrupt` 取消。
     struct SlowProvider;
@@ -736,36 +1100,45 @@ mod tests {
         }
     }
 
-    fn build_test_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_test_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
-            agent: yi_agent_core::Agent::new(
-                Arc::new(MockProvider),
-                Arc::new(yi_agent_core::ToolRegistry::new()),
-                yi_agent_core::AgentConfig::default(),
+            agent: apply_session(
+                yi_agent_core::Agent::new(
+                    Arc::new(MockProvider),
+                    Arc::new(yi_agent_core::ToolRegistry::new()),
+                    yi_agent_core::AgentConfig::default(),
+                ),
+                session,
             ),
             decision_tx: None,
             catalog: None,
         })
     }
 
-    fn build_slow_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_slow_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
-            agent: yi_agent_core::Agent::new(
-                Arc::new(SlowProvider),
-                Arc::new(yi_agent_core::ToolRegistry::new()),
-                yi_agent_core::AgentConfig::default(),
+            agent: apply_session(
+                yi_agent_core::Agent::new(
+                    Arc::new(SlowProvider),
+                    Arc::new(yi_agent_core::ToolRegistry::new()),
+                    yi_agent_core::AgentConfig::default(),
+                ),
+                session,
             ),
             decision_tx: None,
             catalog: None,
         })
     }
 
-    fn build_delayed_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_delayed_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
-            agent: yi_agent_core::Agent::new(
-                Arc::new(DelayedProvider),
-                Arc::new(yi_agent_core::ToolRegistry::new()),
-                yi_agent_core::AgentConfig::default(),
+            agent: apply_session(
+                yi_agent_core::Agent::new(
+                    Arc::new(DelayedProvider),
+                    Arc::new(yi_agent_core::ToolRegistry::new()),
+                    yi_agent_core::AgentConfig::default(),
+                ),
+                session,
             ),
             decision_tx: None,
             catalog: None,
@@ -807,17 +1180,19 @@ mod tests {
         /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
         fn with_factory<F>(build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn() -> anyhow::Result<BuiltAgent> + Send + 'static,
+            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+        {
+            Self::with_config(test_config(), build, permission_timeout)
+        }
+
+        /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
+        fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
+        where
+            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
         {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-            let handle = tokio::spawn(run_with(
-                server_r,
-                server_w,
-                test_config(),
-                permission_timeout,
-                build,
-            ));
+            let handle = tokio::spawn(run_with(server_r, server_w, cfg, permission_timeout, build));
             Self {
                 client_w,
                 client_r: BufReader::new(client_r),
@@ -1024,7 +1399,7 @@ mod tests {
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
-            || Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
+            |_s: Option<yi_agent_core::Session>| Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1255,9 +1630,12 @@ mod tests {
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let writer = Arc::new(MessageWriter::new(server_w));
 
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent().unwrap().agent,
+            build_delayed_agent(None).unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1267,6 +1645,7 @@ mod tests {
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
             None,
+            store,
         ));
 
         // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1321,9 +1700,12 @@ mod tests {
         drop(client_r); // 断开读端 → 写通知失败
         let writer = Arc::new(MessageWriter::new(server_w));
 
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent().unwrap().agent,
+            build_test_agent(None).unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1333,6 +1715,7 @@ mod tests {
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
             None,
+            store,
         ));
 
         prompt_tx
@@ -1363,9 +1746,12 @@ mod tests {
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let writer = Arc::new(MessageWriter::new(server_w));
 
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent().unwrap().agent,
+            build_test_agent(None).unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1375,6 +1761,7 @@ mod tests {
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
             None,
+            store,
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1492,7 +1879,9 @@ mod tests {
     }
 
     /// 构造一个会触发 bash 审批的 agent,并把决定通道交给 driver。
-    fn build_permission_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_permission_agent(
+        session: Option<yi_agent_core::Session>,
+    ) -> anyhow::Result<BuiltAgent> {
         let provider = Arc::new(PermissionMockProvider {
             calls: AtomicUsize::new(0),
         });
@@ -1506,12 +1895,15 @@ mod tests {
         ));
         let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
         let rx_arc = Arc::new(Mutex::new(decision_rx));
-        let agent = yi_agent_core::Agent::new(
-            provider,
-            Arc::new(registry),
-            yi_agent_core::AgentConfig::default(),
-        )
-        .with_permission(checker, rx_arc);
+        let agent = apply_session(
+            yi_agent_core::Agent::new(
+                provider,
+                Arc::new(registry),
+                yi_agent_core::AgentConfig::default(),
+            )
+            .with_permission(checker, rx_arc),
+            session,
+        );
         Ok(BuiltAgent {
             agent,
             decision_tx: Some(decision_tx),
@@ -1709,7 +2101,10 @@ mod tests {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let perm_seq = Arc::new(AtomicU64::new(1));
 
-        let built = build_permission_agent().unwrap();
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
+        let built = build_permission_agent(None).unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             built.agent,
@@ -1722,6 +2117,7 @@ mod tests {
             Duration::from_secs(60),
             Arc::clone(&perm_seq),
             None,
+            store,
         ));
 
         prompt_tx
@@ -1775,5 +2171,439 @@ mod tests {
 
         drop(prompt_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_allocates_uuid_id_and_writes_meta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+
+        let tid = start_thread(&mut h).await;
+        let uuid_part = tid
+            .strip_prefix("thread-")
+            .unwrap_or_else(|| panic!("expected thread-<uuid>, got {tid}"));
+        assert!(
+            uuid_part.parse::<uuid::Uuid>().is_ok(),
+            "suffix must be a uuid: {tid}"
+        );
+
+        // 通过 store API 读取,锁住落盘内容(不依赖文件布局细节)。
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("thread/start must persist meta");
+        assert_eq!(loaded.meta.thread_id, tid);
+        assert_eq!(loaded.meta.model, "test-model");
+        assert_eq!(loaded.meta.cwd, dir.path().display().to_string());
+        assert!(loaded.meta.title.is_none(), "title starts empty");
+        assert!(loaded.items.is_empty(), "no turns yet");
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_empty_returns_empty_array() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["threads"], serde_json::json!([]));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_returns_created_threads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_a = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_b = read_thread_start_response(&mut h, 3).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/list must respond");
+        let threads = v["result"]["threads"].as_array().unwrap();
+        assert_eq!(threads.len(), 2);
+        let ids: std::collections::HashSet<&str> = threads
+            .iter()
+            .map(|t| t["thread_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(tid_a.as_str()) && ids.contains(tid_b.as_str()));
+        // 两次 start 可能同毫秒,顺序不定(排序由 thread_store 单测锁定);
+        // 此处只断言每个条目都带时间戳字段。
+        for t in threads {
+            assert!(t["created_at"].is_number());
+            assert!(t["updated_at"].is_number());
+        }
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_completion_persists_items_and_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = {
+            let mut c = test_config();
+            c.workdir = dir.path().to_path_buf();
+            c
+        };
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        let log = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.jsonl"));
+        // 落盘是尽力而为且发生在 driver 写完 turn/completed 之后,故轮询等待。
+        let mut text = String::new();
+        for _ in 0..100 {
+            match std::fs::read_to_string(&log) {
+                Ok(t) if !t.trim().is_empty() => {
+                    text = t;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(!text.is_empty(), "turn must be persisted");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one turn = one line");
+
+        // 第一行必须含合成的 userMessage item 与 agent 回复。
+        assert!(
+            text.contains(r#""type":"userMessage""#),
+            "missing user item: {text}"
+        );
+        assert!(text.contains("hello"), "missing prompt text: {text}");
+        assert!(
+            text.contains(r#""type":"agentMessage""#),
+            "missing agent item: {text}"
+        );
+        assert!(
+            text.contains(r#""role":"User""#),
+            "missing core message: {text}"
+        );
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_replays_history_and_restores_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_factory = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>| {
+            Ok(BuiltAgent {
+                agent: apply_session(
+                    yi_agent_core::Agent::new(
+                        Arc::new(RecordingProvider {
+                            seen: Arc::clone(&seen_factory),
+                        }),
+                        Arc::new(yi_agent_core::ToolRegistry::new()),
+                        yi_agent_core::AgentConfig::default(),
+                    ),
+                    session,
+                ),
+                decision_tx: None,
+                catalog: None,
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // turn 1
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"first"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        // resume:期望 thread/started → item/completed(含 user + agent) → 响应
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut replayed: Vec<String> = Vec::new();
+        let mut item_ids: Vec<String> = Vec::new();
+        let mut resumed = false;
+        for _ in 0..12 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("thread/started") => {}
+                Some("item/completed") => {
+                    replayed.push(v["params"]["item"]["type"].as_str().unwrap().to_string());
+                    item_ids.push(v["params"]["item"]["id"].as_str().unwrap().to_string());
+                }
+                _ => {}
+            }
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                assert_eq!(v["result"]["thread_id"], tid);
+                resumed = true;
+                break;
+            }
+        }
+        assert!(resumed, "thread/resume must respond");
+        assert!(
+            replayed.contains(&"userMessage".to_string()),
+            "replay must include the user item: {replayed:?}"
+        );
+        assert!(
+            replayed.contains(&"agentMessage".to_string()),
+            "replay must include the agent item: {replayed:?}"
+        );
+
+        // turn 2:provider 应看到恢复后的完整上下文(user + assistant + 新 user)
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"second"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed") {
+                item_ids.push(v["params"]["item"]["id"].as_str().unwrap().to_string());
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        let counts = seen.lock().unwrap().clone();
+        assert_eq!(
+            counts,
+            vec![1, 3],
+            "resumed turn must carry prior context (user + assistant + new user): {counts:?}"
+        );
+
+        // 回归:resume 后新 turn 的 item id 不得与回放的历史 id 冲突,
+        // 否则前端按 id upsert 会覆盖历史。
+        let mut unique = item_ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            item_ids.len(),
+            "item ids must be unique across replay + resumed turn: {item_ids:?}"
+        );
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_unknown_returns_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{"threadId":"nope"}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_rename_updates_title() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/rename","params":{{"threadId":"{tid}","title":"my chat"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 3);
+        assert!(v.get("error").is_none(), "rename must succeed: {v}");
+
+        let meta = std::fs::read_to_string(
+            dir.path()
+                .join(".yi-agent/threads")
+                .join(format!("{tid}.meta.json")),
+        )
+        .unwrap();
+        assert!(
+            meta.contains("my chat"),
+            "meta must carry the title: {meta}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_rename_rejects_empty_title() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/rename","params":{{"threadId":"{tid}","title":"   "}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "blank title must be rejected: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_rename_unknown_returns_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/rename","params":{"threadId":"nope","title":"x"}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_delete_removes_files_and_unknown_is_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert!(v.get("error").is_none(), "delete must succeed: {v}");
+        assert!(
+            !dir.path()
+                .join(".yi-agent/threads")
+                .join(format!("{tid}.meta.json"))
+                .exists(),
+            "meta must be gone"
+        );
+
+        // 再次删除:thread 已完全未知 → -32011。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_delete_active_thread_removes_it_from_memory() {
+        // 用隔离 workdir:删除活跃 thread 时必须能断言磁盘状态。
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        // 等 turn 活跃。
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/started") {
+                break;
+            }
+        }
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut deleted = false;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                assert!(v.get("error").is_none(), "delete must succeed: {v}");
+                deleted = true;
+                break;
+            }
+        }
+        assert!(deleted, "thread/delete must respond");
+
+        // 留出窗口让「未等待落盘」的实现迟到写入:driver 收到中断后仍会
+        // append_turn,若 delete 抢在它之前删文件,日志会被复活。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 删除后磁盘上两个文件都必须消失(活跃 turn 落盘不得复活 .jsonl)。
+        let threads_dir = dir.path().join(".yi-agent/threads");
+        assert!(
+            !threads_dir.join(format!("{tid}.meta.json")).exists(),
+            "meta must be gone after deleting an active thread"
+        );
+        assert!(
+            !threads_dir.join(format!("{tid}.jsonl")).exists(),
+            "log must be gone after deleting an active thread"
+        );
+
+        // 删除后该 thread 已不在内存:再发 turn 应得 -32011。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"x"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                assert_eq!(
+                    v["error"]["code"], -32011,
+                    "deleted thread must be unknown: {v}"
+                );
+                break;
+            }
+        }
+
+        // 磁盘无日志 → resume 不能复活已删除的 thread。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                assert_eq!(
+                    v["error"]["code"], -32011,
+                    "resume must not resurrect a deleted thread: {v}"
+                );
+                break;
+            }
+        }
+        h.shutdown().await;
     }
 }

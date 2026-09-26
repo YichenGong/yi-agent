@@ -87,3 +87,13 @@ export type Decision =
   | { decision: "always_allow_tool" }
   | { decision: "always_allow_prefix"; prefix: string }
   | { decision: "deny" };
+
+/** A persisted thread as returned by `thread/list`. */
+export interface ThreadSummary {
+  thread_id: string;
+  cwd: string;
+  model: string;
+  created_at: number;
+  updated_at: number;
+  title: string | null;
+}
