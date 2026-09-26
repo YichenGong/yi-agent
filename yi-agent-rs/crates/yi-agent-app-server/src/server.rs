@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -106,10 +107,13 @@ where
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
 
-    // 反向权限请求的等待登记表:key 为 `perm-<request_id>`,value 为向 driver
+    // 反向权限请求的等待登记表:key 为 `perm-<seq>`,value 为向 driver
     // 回传决定的 oneshot 端。主循环在读到客户端响应时据此路由。
     let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // 审批 id 必须跨 thread 全局唯一:每个 thread 的 PermissionChecker 都从
+    // request_id=1 开始,若用 request_id 直接做 key 会跨 thread 碰撞。
+    let perm_seq = Arc::new(AtomicU64::new(1));
 
     let mut initialized = false;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
@@ -158,18 +162,22 @@ where
                 let req: RequestEnvelope = match serde_json::from_value(value.clone()) {
                     Ok(r) => r,
                     Err(_) => {
-                        // 没有 `method`:可能是客户端对反向请求的响应。
-                        if let Ok(resp) = serde_json::from_value::<ClientResponse>(value) {
-                            route_client_response(resp, &pending).await;
-                        } else {
-                            write_response(
-                                &writer,
-                                err_response(
-                                    RequestId::Num(0),
-                                    RpcError::parse_error("malformed frame"),
-                                ),
-                            )
-                            .await?;
+                        // 没有 `method`:可能是客户端对反向请求的响应。必须带
+                        // `result` 或 `error` 才算响应,否则视为畸形帧报错。
+                        match serde_json::from_value::<ClientResponse>(value) {
+                            Ok(resp) if resp.result.is_some() || resp.error.is_some() => {
+                                route_client_response(resp, &pending).await;
+                            }
+                            _ => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        RequestId::Num(0),
+                                        RpcError::parse_error("malformed frame"),
+                                    ),
+                                )
+                                .await?;
+                            }
                         }
                         continue;
                     }
@@ -249,6 +257,7 @@ where
                             decision_tx,
                             Arc::clone(&pending),
                             permission_timeout,
+                            Arc::clone(&perm_seq),
                         ));
 
                         write_notification(
@@ -450,6 +459,14 @@ fn parse_client_decision(result: Option<&serde_json::Value>) -> Decision {
     }
 }
 
+/// 构造一个 `TurnEvent::Finished`,避免在 driver 里重复拼字段。
+fn finished_event(thread_id: &str, turn_id: &str) -> TurnEvent {
+    TurnEvent::Finished {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+    }
+}
+
 /// 单个 thread 的 driver task:串行消费 turn,驱动 `agent.run()` 的 stream,
 /// 经 `Translator` 写成协议通知。
 ///
@@ -457,7 +474,7 @@ fn parse_client_decision(result: Option<&serde_json::Value>) -> Decision {
 /// `run().await` 返回**之后**再取 `cancel_token()`,否则 `turn/interrupt` 无效。
 ///
 /// **权限审批闭环**:遇到 `AgentEvent::PermissionRequest` 时,driver 发出反向
-/// 请求 `item/toolCall/requestApproval`(id = `perm-<request_id>`)并等待客户端
+/// 请求 `item/toolCall/requestApproval`(id 取自进程级 `perm_seq`)并等待客户端
 /// 经 `pending` 登记表回传的决定;超时或中断按 `Deny` 处理。
 #[allow(clippy::too_many_arguments)]
 async fn run_thread_driver<W>(
@@ -470,6 +487,7 @@ async fn run_thread_driver<W>(
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
     permission_timeout: Duration,
+    perm_seq: Arc<AtomicU64>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -485,12 +503,7 @@ async fn run_thread_driver<W>(
                 for n in translator.on_event(yi_agent_core::AgentEvent::Error(e)) {
                     let _ = write_notification(&writer, &n).await;
                 }
-                let _ = turn_tx
-                    .send(TurnEvent::Finished {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                    })
-                    .await;
+                let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                 continue;
             }
         };
@@ -506,8 +519,8 @@ async fn run_thread_driver<W>(
                         Some(yi_agent_core::AgentEvent::PermissionRequest {
                             request_id, tool_name, tool_input, prefix_suggestion, kind,
                         }) => {
-                            let perm_id = format!("perm-{request_id}");
-                            let (dtx, drx) = oneshot::channel::<Decision>();
+                            let perm_id = format!("perm-{}", perm_seq.fetch_add(1, Ordering::SeqCst));
+                            let (dtx, mut drx) = oneshot::channel::<Decision>();
                             pending.lock().await.insert(perm_id.clone(), dtx);
 
                             let reverse = ReverseRequest {
@@ -526,22 +539,30 @@ async fn run_thread_driver<W>(
                             };
                             if writer.write_value(&reverse).await.is_err() {
                                 pending.lock().await.remove(&perm_id);
-                                let _ = turn_tx.send(TurnEvent::Finished { thread_id: thread_id.clone(), turn_id: turn_id.clone() }).await;
+                                let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                                 return;
                             }
 
-                            // 等客户端决定;超时或中断按 Deny 处理。
-                            let decision = tokio::select! {
-                                d = drx => d.unwrap_or(Decision::Deny),
-                                _ = tokio::time::sleep(permission_timeout) => {
-                                    pending.lock().await.remove(&perm_id);
-                                    Decision::Deny
-                                }
-                                _ = interrupt_rx.recv(), if !cancel_sent => {
-                                    cancel_sent = true;
-                                    cancel_token.cancel();
-                                    pending.lock().await.remove(&perm_id);
-                                    Decision::Deny
+                            // 等客户端决定;超时或中断按 Deny 处理。只接受针对当前 turn 的中断,
+                            // 其它 turn 的残留信号忽略后继续等待(deadline 不重置)。
+                            let timeout = tokio::time::sleep(permission_timeout);
+                            tokio::pin!(timeout);
+                            let decision = loop {
+                                tokio::select! {
+                                    d = &mut drx => break d.unwrap_or(Decision::Deny),
+                                    _ = &mut timeout => {
+                                        pending.lock().await.remove(&perm_id);
+                                        break Decision::Deny;
+                                    }
+                                    Some(target) = interrupt_rx.recv(), if !cancel_sent => {
+                                        if target == turn_id {
+                                            cancel_sent = true;
+                                            cancel_token.cancel();
+                                            pending.lock().await.remove(&perm_id);
+                                            break Decision::Deny;
+                                        }
+                                        // 其它 turn 的残留信号:忽略,继续等待。
+                                    }
                                 }
                             };
 
@@ -554,12 +575,7 @@ async fn run_thread_driver<W>(
                                 if write_notification(&writer, &n).await.is_err() {
                                     // 客户端可能已断开;先上报 Finished,
                                     // 避免 active_turn_id 永久卡住。
-                                    let _ = turn_tx
-                                        .send(TurnEvent::Finished {
-                                            thread_id: thread_id.clone(),
-                                            turn_id: turn_id.clone(),
-                                        })
-                                        .await;
+                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                                     return;
                                 }
                             }
@@ -578,12 +594,7 @@ async fn run_thread_driver<W>(
             }
         }
 
-        let _ = turn_tx
-            .send(TurnEvent::Finished {
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-            })
-            .await;
+        let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
     }
 }
 
@@ -627,7 +638,7 @@ fn extract_prompt(params: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1234,6 +1245,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
+            Arc::new(AtomicU64::new(1)),
         ));
 
         // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1298,6 +1310,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
+            Arc::new(AtomicU64::new(1)),
         ));
 
         prompt_tx
@@ -1338,6 +1351,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
+            Arc::new(AtomicU64::new(1)),
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1598,5 +1612,143 @@ mod tests {
             "a denied tool must not emit an item/started toolCall item"
         );
         h.shutdown().await;
+    }
+
+    /// 读到下一个 `item/toolCall/requestApproval` 通知,返回其 id。
+    async fn read_until_approval(h: &mut Harness) -> String {
+        for _ in 0..20 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/toolCall/requestApproval") {
+                return v["id"]
+                    .as_str()
+                    .expect("approval id must be a string")
+                    .to_string();
+            }
+        }
+        panic!("expected an item/toolCall/requestApproval notification");
+    }
+
+    /// 读帧直到出现 `id == want` 的响应,返回其 `result.thread_id`。
+    async fn read_thread_start_response(h: &mut Harness, want: u64) -> String {
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(want)) {
+                return v["result"]["thread_id"]
+                    .as_str()
+                    .expect("thread/start response must carry thread_id")
+                    .to_string();
+            }
+        }
+        panic!("no thread/start response for id {want}");
+    }
+
+    /// 两个并发 thread 的审批 id 必须不同:否则一个 thread 的 Allow 会被
+    /// 应用到另一个 thread 的工具上(跨 thread 授权错配)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permission_request_ids_are_unique_across_threads() {
+        let mut h = Harness::with_factory(build_permission_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // thread A。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_a = read_thread_start_response(&mut h, 2).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid_a}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        let id_a = read_until_approval(&mut h).await;
+
+        // thread B(其 PermissionChecker 的 request_id 也从 1 开始)。
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_b = read_thread_start_response(&mut h, 4).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{tid_b}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        let id_b = read_until_approval(&mut h).await;
+
+        assert_ne!(id_a, id_b, "approval ids must be unique across threads");
+        h.shutdown().await;
+    }
+
+    /// 上一轮残留的中断信号不得取消当前 turn 的审批等待(同 `e6068b0` 的
+    /// bug 类:中断必须按目标 turn id 过滤)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_interrupt_does_not_cancel_turn_during_approval() {
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let writer = Arc::new(MessageWriter::new(server_w));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let perm_seq = Arc::new(AtomicU64::new(1));
+
+        let built = build_permission_agent().unwrap();
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-1".into(),
+            built.agent,
+            prompt_rx,
+            interrupt_rx,
+            writer,
+            turn_tx,
+            built.decision_tx,
+            Arc::clone(&pending),
+            Duration::from_secs(60),
+            Arc::clone(&perm_seq),
+        ));
+
+        prompt_tx
+            .send(TurnPrompt {
+                turn_id: "turn-1".into(),
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+
+        // 读到反向请求 id(此时 driver 已进入内层审批等待)。
+        let mut client_r = BufReader::new(client_r);
+        let mut approval_id = None;
+        for _ in 0..20 {
+            let mut buf = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(5), client_r.read_line(&mut buf))
+                .await
+                .expect("timed out")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            let v: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+            if v["method"] == "item/toolCall/requestApproval" {
+                approval_id = Some(v["id"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        let approval_id = approval_id.expect("expected a reverse request");
+
+        // 现在投递一个属于上一轮(turn-0)的残留中断:它必须被忽略。
+        interrupt_tx.try_send("turn-0".into()).unwrap();
+
+        // 给 driver 足够时间处理该信号;若残留中断未被过滤,它会在此刻
+        // 取走 pending 项并取消本轮。
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // 用正确的决定回应;若 pending 项已被残留中断移除,这里为 None → 断言失败。
+        let sender = pending
+            .lock()
+            .await
+            .remove(&approval_id)
+            .expect("pending approval must survive a stale interrupt");
+        sender.send(Decision::AllowOnce).unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+            .await
+            .expect("turn must finish")
+            .unwrap();
+        assert!(matches!(ev, TurnEvent::Finished { ref turn_id, .. } if turn_id == "turn-1"));
+
+        drop(prompt_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 }

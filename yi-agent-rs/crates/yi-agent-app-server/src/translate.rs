@@ -256,8 +256,10 @@ impl Translator {
             }
             // 暂不产生通知的事件。
             //
-            // `PermissionRequest` / `PermissionResolved` 由后续任务 C5
-            // (权限审批反向请求闭环)接入;此处先按 no-op 处理,不 panic。
+            // 翻译层有意忽略 `PermissionRequest` / `PermissionResolved`:
+            // `PermissionRequest` 由 server 的 driver 直接拦截并发出反向请求
+            // `item/toolCall/requestApproval`(不走 translator);`PermissionResolved`
+            // 在 baseline 中保持 no-op。此处不 panic。
             AgentEvent::Start
             | AgentEvent::ToolRetry { .. }
             | AgentEvent::EstimatedPrefill(_)
@@ -675,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_request_is_noop_for_now() {
+    fn permission_request_is_noop_in_translator() {
         let mut t = translator();
         let out = t.on_event(AgentEvent::PermissionRequest {
             request_id: 1,
@@ -688,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_resolved_is_noop_for_now() {
+    fn permission_resolved_is_noop_in_translator() {
         let mut t = translator();
         let out = t.on_event(AgentEvent::PermissionResolved {
             request_id: 1,
