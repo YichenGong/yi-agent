@@ -645,11 +645,16 @@ async fn run_loop(
             }
         }
 
-        messages.push(Message::assistant(content.clone()));
-        session
-            .lock()
-            .unwrap()
-            .push(Message::assistant(content.clone()));
+        // An exhausted stall is terminal and its partial must NOT enter the
+        // session: a stalled stream can end mid-tool-call, leaving an unpaired
+        // `tool_use` that would make the next provider request invalid.
+        if !matches!(stop_reason, StopReason::Stalled) {
+            messages.push(Message::assistant(content.clone()));
+            session
+                .lock()
+                .unwrap()
+                .push(Message::assistant(content.clone()));
+        }
 
         match stop_reason {
             StopReason::Stalled => {
@@ -1695,6 +1700,33 @@ mod tests {
         }
     }
 
+    /// Stalls after emitting a complete tool_use, so the partial contains an
+    /// unpaired `tool_use` that must never reach the session.
+    struct StallingToolUseProvider;
+
+    #[async_trait]
+    impl Provider for StallingToolUseProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let stream = futures::stream::iter(vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"hi"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ])
+            .chain(futures::stream::pending())
+            .boxed();
+            Ok(stream)
+        }
+    }
+
     /// Every call stalls, so retries are always exhausted.
     struct AlwaysStallProvider {
         calls: std::sync::Mutex<u32>,
@@ -1878,6 +1910,30 @@ mod tests {
             }) => assert_eq!(reason, "idle timeout after 3 retries"),
             other => panic!("expected Interrupted after retries, got: {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_exhausted_stall_does_not_commit_partial_to_session() {
+        let provider = Arc::new(StallingToolUseProvider);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::Interrupted { .. }
+            })
+        ));
+        // The stalled partial holds an unpaired `tool_use`; committing it would
+        // make the next provider request invalid.
+        let session = agent.session();
+        assert!(
+            !session.messages().iter().any(|m| m.role == Role::Assistant),
+            "stalled partial must not be committed, got: {:?}",
+            session.messages()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
