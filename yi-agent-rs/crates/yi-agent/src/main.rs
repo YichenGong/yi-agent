@@ -592,6 +592,7 @@ fn build_headless_root_tools(
     );
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
+        catalog: setup.catalog,
         system_prompt: setup.system_prompt,
     })
 }

@@ -31,23 +31,54 @@ pub fn build_provider(cfg: &RuntimeConfig) -> Result<Arc<dyn yi_agent_core::Prov
     }
 }
 
+/// 刷新 skills catalog 并重新拼装 system prompt 的句柄。
+///
+/// 持有启动时确定的 base prompt 与预算策略;`current_system_prompt()` 每次调用
+/// 都重扫 skill 根目录并重渲染 catalog。catalog 未变化时输出逐字节相同,因此
+/// 不会破坏 provider 的 prompt cache。
+pub struct SkillsCatalogHandle {
+    service: Arc<yi_agent_skills::SkillsService>,
+    base_prompt: Option<String>,
+    /// `None` = 不截断(启动时用户选择了"纳入全部")。
+    budget: Option<usize>,
+}
+
+impl SkillsCatalogHandle {
+    /// Re-scan the skill roots and rebuild the system prompt.
+    pub fn current_system_prompt(&self) -> Option<String> {
+        let _ = self.service.refresh();
+        let catalog = match self.budget {
+            Some(budget) => self.service.render_catalog(budget),
+            None => self.service.render_catalog(usize::MAX),
+        };
+        if catalog.is_empty() {
+            return self.base_prompt.clone();
+        }
+        match &self.base_prompt {
+            Some(base) => Some(format!("{base}\n\n{catalog}")),
+            None => Some(catalog),
+        }
+    }
+}
+
 /// skills 服务 + 解析后的 system prompt 的装配结果。
 pub struct PromptSetup {
     pub skills: Option<Arc<yi_agent_skills::SkillsService>>,
+    pub catalog: Option<SkillsCatalogHandle>,
     pub system_prompt: Option<String>,
 }
 
 /// 装配 skills 服务并解析 system prompt(默认 prompt + 当前日期 + skills catalog)。
 pub fn build_prompt_setup(cfg: &RuntimeConfig) -> Result<PromptSetup> {
     let skills = build_skills_service(cfg)?;
-    let system_prompt = resolve_system_prompt_with_skills(
-        cfg.system_prompt.clone(),
-        &skills,
-        cfg.skills_catalog_budget,
-        cfg.skills_catalog_budget_explicit,
-    );
+    let catalog = build_catalog_handle(cfg, &skills);
+    let system_prompt = match &catalog {
+        Some(handle) => handle.current_system_prompt(),
+        None => resolve_system_prompt(cfg.system_prompt.clone()),
+    };
     Ok(PromptSetup {
         skills,
+        catalog,
         system_prompt,
     })
 }
@@ -55,6 +86,7 @@ pub fn build_prompt_setup(cfg: &RuntimeConfig) -> Result<PromptSetup> {
 /// 工具集 + system prompt 的装配结果。
 pub struct ToolSetup {
     pub tools: Arc<yi_agent_core::ToolRegistry>,
+    pub catalog: Option<SkillsCatalogHandle>,
     pub system_prompt: Option<String>,
 }
 
@@ -102,6 +134,7 @@ pub fn build_tool_setup_in(
     if naked {
         return Ok(ToolSetup {
             tools: Arc::new(yi_agent_core::ToolRegistry::new()),
+            catalog: None,
             system_prompt: None,
         });
     }
@@ -133,6 +166,7 @@ pub fn build_tool_setup_in(
 
     Ok(ToolSetup {
         tools: Arc::new(registry),
+        catalog: prompt.catalog,
         system_prompt: prompt.system_prompt,
     })
 }
@@ -160,6 +194,8 @@ pub struct AgentBootstrap {
     pub decision_tx: Option<tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>>,
     /// app-server 持有 rx 以接收权限决定;AutoAllow 时返回 None。
     pub decision_rx: Option<DecisionReceiver>,
+    /// 刷新 skills catalog 的句柄;无 skills 服务时为 `None`。
+    pub catalog: Option<SkillsCatalogHandle>,
 }
 
 /// 由运行时配置构造 [`yi_agent_core::AgentConfig`](集中一处,避免各调用点漂移)。
@@ -204,6 +240,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 permission: checker,
                 decision_tx: Some(decision_tx),
                 decision_rx: Some(rx_arc),
+                catalog: setup.catalog,
             })
         }
         PermissionMode::AutoAllow => {
@@ -218,6 +255,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 permission: checker,
                 decision_tx: None,
                 decision_rx: None,
+                catalog: setup.catalog,
             })
         }
     }
@@ -311,37 +349,38 @@ fn build_skills_service(
     }
 }
 
-/// Resolve the effective system prompt, appending the skills catalog if available.
-fn resolve_system_prompt_with_skills(
-    user: Option<String>,
-    service: &Option<Arc<yi_agent_skills::SkillsService>>,
-    budget: usize,
-    budget_explicit: bool,
-) -> Option<String> {
-    let base = resolve_system_prompt(user);
-    let Some(svc) = service else {
-        return base;
-    };
-
-    let total = svc.full_catalog_size();
-    let effective_budget = resolve_effective_budget(total, budget, budget_explicit);
-    let catalog = svc.render_catalog(effective_budget);
-
-    if catalog.is_empty() {
-        return base;
-    }
-
-    match base {
-        Some(p) => Some(format!("{p}\n\n{catalog}")),
-        None => Some(catalog),
-    }
+/// 构造 catalog 刷新句柄。无 skills service 时返回 None。
+fn build_catalog_handle(
+    cfg: &RuntimeConfig,
+    skills: &Option<Arc<yi_agent_skills::SkillsService>>,
+) -> Option<SkillsCatalogHandle> {
+    let service = skills.as_ref()?.clone();
+    let total = service.full_catalog_size();
+    let budget = resolve_catalog_budget_policy(
+        total,
+        cfg.skills_catalog_budget,
+        cfg.skills_catalog_budget_explicit,
+    );
+    Some(SkillsCatalogHandle {
+        service,
+        base_prompt: resolve_system_prompt(cfg.system_prompt.clone()),
+        budget,
+    })
 }
 
-fn resolve_effective_budget(total: usize, default: usize, explicit: bool) -> usize {
-    if explicit || total <= default || !is_interactive() {
-        return default;
+/// 启动时把预算决策固化为策略:`Some(n)` 截断到 n 字节,`None` 不截断。
+///
+/// 仅在交互式且 catalog 超预算且未显式指定预算时才询问;刷新路径不调用本函数,
+/// 因此不会在会话中途打断用户。
+fn resolve_catalog_budget_policy(total: usize, budget: usize, explicit: bool) -> Option<usize> {
+    if explicit || total <= budget || !is_interactive() {
+        return Some(budget);
     }
-    prompt_catalog_budget(total, default).unwrap_or(default)
+    if prompt_include_all(total, budget) {
+        None
+    } else {
+        Some(budget)
+    }
 }
 
 fn is_interactive() -> bool {
@@ -349,7 +388,7 @@ fn is_interactive() -> bool {
     std::io::stdin().is_terminal()
 }
 
-fn prompt_catalog_budget(total: usize, default: usize) -> Option<usize> {
+fn prompt_include_all(total: usize, default: usize) -> bool {
     let total_kb = total / 1024;
     let default_kb = default / 1024;
     eprintln!(
@@ -358,12 +397,9 @@ fn prompt_catalog_budget(total: usize, default: usize) -> Option<usize> {
     );
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
-        return None;
+        return false;
     }
-    match input.trim().to_lowercase().as_str() {
-        "" | "y" | "yes" => Some(total),
-        _ => Some(default),
-    }
+    matches!(input.trim().to_lowercase().as_str(), "" | "y" | "yes")
 }
 
 #[cfg(test)]
@@ -456,45 +492,95 @@ mod tests {
     }
 
     #[test]
-    fn resolve_effective_budget_explicit_returns_default() {
-        // When explicit=true, should return default regardless of total.
-        assert_eq!(resolve_effective_budget(100_000, 8192, true), 8192);
-        assert_eq!(resolve_effective_budget(0, 8192, true), 8192);
-        assert_eq!(resolve_effective_budget(8192, 8192, true), 8192);
+    fn resolve_catalog_budget_policy_explicit_returns_budget() {
+        assert_eq!(
+            resolve_catalog_budget_policy(100_000, 8192, true),
+            Some(8192)
+        );
+        assert_eq!(resolve_catalog_budget_policy(0, 8192, true), Some(8192));
     }
 
     #[test]
-    fn resolve_effective_budget_total_under_default_returns_default() {
-        // When total <= default, should return default.
-        assert_eq!(resolve_effective_budget(4096, 8192, false), 8192);
-        assert_eq!(resolve_effective_budget(8192, 8192, false), 8192);
-        assert_eq!(resolve_effective_budget(0, 8192, false), 8192);
+    fn resolve_catalog_budget_policy_under_budget_returns_budget() {
+        assert_eq!(resolve_catalog_budget_policy(4096, 8192, false), Some(8192));
+        assert_eq!(resolve_catalog_budget_policy(8192, 8192, false), Some(8192));
+        assert_eq!(resolve_catalog_budget_policy(0, 8192, false), Some(8192));
     }
 
     #[test]
-    fn resolve_effective_budget_non_interactive_returns_default() {
+    fn resolve_catalog_budget_policy_non_interactive_returns_budget() {
         // Tests run non-interactive (stdin is not a TTY), so even when
-        // total > default and explicit=false, should return default without prompting.
-        assert_eq!(resolve_effective_budget(100_000, 8192, false), 8192);
+        // total > budget and explicit=false, return the budget without prompting.
+        assert_eq!(
+            resolve_catalog_budget_policy(100_000, 8192, false),
+            Some(8192)
+        );
     }
 
     #[test]
-    fn resolve_system_prompt_with_skills_no_service_returns_base() {
-        // When service is None, should fall back to base via resolve_system_prompt
-        // (which appends the current date).
-        let resolved = resolve_system_prompt_with_skills(None, &None, 8192, false);
-        let expected = resolve_system_prompt(None);
-        assert_eq!(resolved, expected);
+    fn catalog_handle_no_skills_returns_none() {
+        let cfg = sample_config();
+        assert!(build_catalog_handle(&cfg, &None).is_none());
     }
 
     #[test]
-    fn resolve_system_prompt_with_skills_empty_catalog_returns_base() {
-        // When service is Some but catalog is empty (no skills discovered),
-        // should return the base prompt unchanged (with current date appended).
+    fn catalog_handle_empty_catalog_returns_base_prompt() {
+        let cfg = sample_config();
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
-        let expected = resolve_system_prompt(None);
-        let resolved = resolve_system_prompt_with_skills(None, &Some(svc), 8192, false);
-        assert_eq!(resolved, expected);
+        let handle = build_catalog_handle(&cfg, &Some(svc)).expect("handle");
+        assert_eq!(handle.current_system_prompt(), resolve_system_prompt(None));
+    }
+
+    #[test]
+    fn catalog_handle_is_byte_stable_when_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        std::fs::write(
+            tmp.path().join("foo/SKILL.md"),
+            "---\nname: foo\ndescription: x\n---\nbody",
+        )
+        .unwrap();
+        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![(
+            tmp.path().to_path_buf(),
+            yi_agent_skills::SkillScope::User,
+        )]));
+        let cfg = sample_config();
+        let handle = build_catalog_handle(&cfg, &Some(svc)).expect("handle");
+
+        let first = handle.current_system_prompt();
+        let second = handle.current_system_prompt();
+        assert_eq!(first, second, "unchanged catalog must render identically");
+        assert!(first.unwrap().contains("foo"));
+    }
+
+    #[test]
+    fn catalog_handle_picks_up_new_skill_after_refresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        std::fs::write(
+            tmp.path().join("foo/SKILL.md"),
+            "---\nname: foo\ndescription: x\n---\nbody",
+        )
+        .unwrap();
+        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![(
+            tmp.path().to_path_buf(),
+            yi_agent_skills::SkillScope::User,
+        )]));
+        let cfg = sample_config();
+        let handle = build_catalog_handle(&cfg, &Some(svc)).expect("handle");
+
+        let before = handle.current_system_prompt().unwrap();
+        assert!(!before.contains("bar"));
+
+        std::fs::create_dir_all(tmp.path().join("bar")).unwrap();
+        std::fs::write(
+            tmp.path().join("bar/SKILL.md"),
+            "---\nname: bar\ndescription: y\n---\nbody",
+        )
+        .unwrap();
+
+        let after = handle.current_system_prompt().unwrap();
+        assert!(after.contains("bar"), "new skill must appear after refresh");
     }
 
     #[test]
