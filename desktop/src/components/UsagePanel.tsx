@@ -4,7 +4,11 @@ import type { Usage } from "../lib/protocol";
 /** StatusBar 用量区展开后的明细浮层:四类 token + 估算成本。 */
 export function UsagePanel({ usage }: { usage: Usage }) {
   return (
-    <div className="absolute right-4 top-full z-10 mt-1 w-64 rounded-md border border-neutral-700 bg-neutral-900 p-3 text-xs shadow-lg">
+    <div
+      id="usage-panel"
+      role="dialog"
+      className="absolute right-4 top-full z-10 mt-1 w-64 rounded-md border border-neutral-700 bg-neutral-900 p-3 text-xs shadow-lg"
+    >
       <div className="mb-2 font-semibold text-neutral-200">Usage</div>
       <dl className="grid grid-cols-2 gap-y-1 font-mono">
         <dt className="text-neutral-400">Input</dt>

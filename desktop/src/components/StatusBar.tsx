@@ -27,7 +27,10 @@ export function StatusBar({
       {usage && (
         <button
           type="button"
-          className="ml-auto font-mono hover:text-neutral-200"
+          className="ml-auto cursor-pointer font-mono hover:text-neutral-200"
+          aria-expanded={showUsage}
+          aria-controls="usage-panel"
+          aria-label="Token usage details"
           onClick={() => setShowUsage((v) => !v)}
         >
           {usage.input} in / {usage.output} out
