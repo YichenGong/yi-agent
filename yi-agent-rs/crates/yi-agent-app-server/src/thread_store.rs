@@ -151,6 +151,104 @@ impl ThreadStore {
             usage,
         }))
     }
+
+    /// 列出所有 thread 的 meta,按 `updated_at` 降序。
+    ///
+    /// 只读 `*.meta.json`;损坏的 meta 跳过并记 stderr。目录不存在视为空。
+    pub fn list(&self) -> io::Result<Vec<ThreadMeta>> {
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".meta.json") {
+                continue;
+            }
+            match std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|t| serde_json::from_str::<ThreadMeta>(&t).ok())
+            {
+                Some(m) => out.push(m),
+                None => eprintln!("[app-server] skipping corrupt meta: {name}"),
+            }
+        }
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(out)
+    }
+
+    /// 只重写 meta 的 `title` + `updated_at`。返回 false 表示 thread 不存在。
+    pub fn rename(&self, id: &str, title: &str) -> io::Result<bool> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let path = self.meta_path(id);
+        let Some(mut meta) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<ThreadMeta>(&t).ok())
+        else {
+            return Ok(false);
+        };
+        meta.title = Some(title.to_string());
+        meta.updated_at = now_millis();
+        let bytes = serde_json::to_vec_pretty(&meta).map_err(io_err)?;
+        write_atomic(&path, &bytes)?;
+        Ok(true)
+    }
+
+    /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
+    /// `title_hint`(本轮 prompt)填充。thread 不存在时静默返回。
+    pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let path = self.meta_path(id);
+        let Some(mut meta) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<ThreadMeta>(&t).ok())
+        else {
+            return Ok(());
+        };
+        meta.updated_at = now_millis();
+        if meta.title.is_none() {
+            if let Some(hint) = title_hint {
+                let t = title_from(hint);
+                if !t.is_empty() {
+                    meta.title = Some(t);
+                }
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&meta).map_err(io_err)?;
+        write_atomic(&path, &bytes)
+    }
+
+    /// thread 是否已知(meta 或 log 任一存在)。
+    pub fn exists(&self, id: &str) -> bool {
+        if !valid_id(id) {
+            return false;
+        }
+        self.meta_path(id).exists() || self.log_path(id).exists()
+    }
+
+    /// 删除两个文件;文件缺失不算错误。返回删除前是否存在。
+    pub fn delete(&self, id: &str) -> io::Result<bool> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let meta = self.meta_path(id);
+        let log = self.log_path(id);
+        let existed = meta.exists() || log.exists();
+        for p in [meta, log] {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(existed)
+    }
 }
 
 fn io_err(e: serde_json::Error) -> io::Error {
@@ -350,7 +448,8 @@ mod tests {
     #[test]
     fn rejects_ids_that_escape_the_store_root() {
         let (_d, s) = store();
-        for bad in ["../evil", "a/b", "..", "", "a\\b"] {
+        let long = "a".repeat(129);
+        for bad in ["../evil", "a/b", "..", "", "a\\b", long.as_str()] {
             assert!(s.load(bad).is_err(), "load must reject escaping id {bad:?}");
             assert!(
                 s.append_turn(bad, &turn(vec![], vec![])).is_err(),
@@ -384,5 +483,87 @@ mod tests {
             .expect("meta exists, so thread must load");
         assert!(loaded.items.is_empty(), "unreadable log yields no items");
         assert_eq!(loaded.meta.thread_id, "thread-a");
+    }
+
+    #[test]
+    fn list_returns_meta_sorted_by_updated_at_desc() {
+        let (_d, s) = store();
+        for (id, updated) in [("thread-old", 10), ("thread-new", 30), ("thread-mid", 20)] {
+            let mut m = meta(id);
+            m.updated_at = updated;
+            s.create(&m).unwrap();
+        }
+        let ids: Vec<String> = s.list().unwrap().into_iter().map(|m| m.thread_id).collect();
+        assert_eq!(ids, vec!["thread-new", "thread-mid", "thread-old"]);
+    }
+
+    #[test]
+    fn list_on_missing_root_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let s = ThreadStore::new(&dir.path().join("does-not-exist"));
+        assert!(s.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_updates_only_meta() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn("thread-a", &turn(vec![], vec![Message::user("hi")]))
+            .unwrap();
+        let log_before = std::fs::read_to_string(s.log_path("thread-a")).unwrap();
+
+        assert!(s.rename("thread-a", "new title").unwrap());
+        assert_eq!(
+            s.load("thread-a").unwrap().unwrap().meta.title.as_deref(),
+            Some("new title")
+        );
+        assert_eq!(
+            std::fs::read_to_string(s.log_path("thread-a")).unwrap(),
+            log_before,
+            "rename must not touch the log"
+        );
+    }
+
+    #[test]
+    fn rename_unknown_returns_false() {
+        let (_d, s) = store();
+        assert!(!s.rename("nope", "x").unwrap());
+    }
+
+    #[test]
+    fn touch_sets_title_only_when_absent_and_bumps_updated_at() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.touch("thread-a", Some("  first   message  ")).unwrap();
+        let m = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(m.title.as_deref(), Some("first message"));
+        assert!(m.updated_at > 1, "updated_at must be bumped");
+
+        s.touch("thread-a", Some("ignored")).unwrap();
+        assert_eq!(
+            s.load("thread-a").unwrap().unwrap().meta.title.as_deref(),
+            Some("first message"),
+            "an existing title must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn delete_removes_both_files_and_is_repeatable() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn("thread-a", &turn(vec![], vec![])).unwrap();
+
+        assert!(s.delete("thread-a").unwrap());
+        assert!(!s.meta_path("thread-a").exists());
+        assert!(!s.log_path("thread-a").exists());
+        assert!(!s.delete("thread-a").unwrap());
+    }
+
+    #[test]
+    fn exists_true_if_either_file_present() {
+        let (_d, s) = store();
+        assert!(!s.exists("thread-a"));
+        s.create(&meta("thread-a")).unwrap();
+        assert!(s.exists("thread-a"));
     }
 }
