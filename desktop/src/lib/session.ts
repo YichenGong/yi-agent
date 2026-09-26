@@ -18,6 +18,22 @@ export class Session {
   lastError: string | null = null;
   usage: { model: string; input: number; output: number } | null = null;
 
+  /**
+   * Drop all accumulated state. Must be called *before* issuing
+   * `thread/resume`, because replay notifications can arrive before the resume
+   * response — resetting after would wipe the freshly replayed history.
+   *
+   * Replaces `items` with a new array (rather than truncating in place) so
+   * React's identity-based memoization notices the change.
+   */
+  reset(): void {
+    this.items = [];
+    this.turnActive = false;
+    this.lastStatus = null;
+    this.lastError = null;
+    this.usage = null;
+  }
+
   addUserMessage(text: string): void {
     this.items.push({ type: "userMessage", id: nextLocalId(), text });
   }
