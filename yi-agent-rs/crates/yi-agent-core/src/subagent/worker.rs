@@ -431,6 +431,26 @@ pub trait AgentWorkspaceService: Send + Sync {
     fn cleanup_prepared(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
         Ok(())
     }
+
+    /// Whether `commit` is already contained in `owner`'s worktree HEAD. The
+    /// default cannot inspect git and therefore reports "not integrated".
+    fn contains_commit(
+        &self,
+        _owner: &WorkerWorkspace,
+        _commit: &str,
+    ) -> Result<bool, WorkerError> {
+        Ok(false)
+    }
+
+    /// Remove an accepted child's worktree and branch once `owner` provably
+    /// contains its delivery. The default is a no-op for non-git services.
+    fn cleanup_accepted(
+        &self,
+        _owner: &WorkerWorkspace,
+        _child: &WorkerWorkspace,
+    ) -> Result<(), WorkerError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
