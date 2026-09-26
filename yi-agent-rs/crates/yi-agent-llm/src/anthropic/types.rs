@@ -219,7 +219,7 @@ impl From<ProviderRequest> for AnthropicRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yi_agent_core::{GenParams, Message};
+    use yi_agent_core::{GenParams, ImageDetail, ImageSource, Message};
 
     #[test]
     fn converts_simple_user_text_request() {
@@ -344,5 +344,41 @@ mod tests {
         assert!(json.get("system").is_none() || json["system"].is_null());
         // tools should be absent
         assert!(json.get("tools").is_none() || json["tools"].is_null());
+    }
+
+    #[test]
+    fn tool_result_image_is_preserved() {
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: vec![
+                ContentBlock::Text("viewed logo.png (8x8, image/png)".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAA".into(),
+                    },
+                    detail: ImageDetail::High,
+                },
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "claude-sonnet-4-5".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let a: AnthropicRequest = req.into();
+        let json = serde_json::to_value(&a).unwrap();
+        // Tool role -> "user" message whose content[0] is the tool_result.
+        let content = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "tool_result");
+        let inner = content[0]["content"].as_array().unwrap();
+        assert_eq!(inner[0]["type"], "text");
+        assert_eq!(inner[1]["type"], "image");
+        assert_eq!(inner[1]["source"]["type"], "base64");
+        assert_eq!(inner[1]["source"]["media_type"], "image/png");
+        assert_eq!(inner[1]["source"]["data"], "AAA");
     }
 }
