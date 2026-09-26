@@ -178,7 +178,7 @@ where
                         };
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
-                        let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(8);
+                        let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
 
                         let cwd = cfg.workdir.display().to_string();
                         let model = cfg.model.clone();
@@ -231,16 +231,11 @@ where
                         .await?;
                     }
                     "turn/start" => {
-                        let thread_id = match req.params.get("threadId").and_then(|v| v.as_str()) {
-                            Some(s) => s.to_string(),
-                            None => {
-                                write_response(
-                                    &writer,
-                                    err_response(id, RpcError::invalid_params("missing threadId")),
-                                )
-                                .await?;
-                                continue;
-                            }
+                        // `id` 后续响应仍需使用,故传 clone。
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
                         };
                         let prompt = match extract_prompt(&req.params) {
                             Some(p) => p,
@@ -306,16 +301,10 @@ where
                         }
                     }
                     "turn/interrupt" => {
-                        let thread_id = match req.params.get("threadId").and_then(|v| v.as_str()) {
-                            Some(s) => s.to_string(),
-                            None => {
-                                write_response(
-                                    &writer,
-                                    err_response(id, RpcError::invalid_params("missing threadId")),
-                                )
-                                .await?;
-                                continue;
-                            }
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
                         };
                         let Some(session) = threads.get(&thread_id) else {
                             write_response(
@@ -325,8 +314,9 @@ where
                             .await?;
                             continue;
                         };
-                        if session.active_turn_id.is_some() {
-                            let _ = session.interrupt_tx.send(()).await;
+                        if let Some(turn_id) = session.active_turn_id.clone() {
+                            // 幂等 level 信号:用 try_send 避免主循环在满队列上阻塞。
+                            let _ = session.interrupt_tx.try_send(turn_id);
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
                     }
@@ -394,14 +384,15 @@ async fn run_thread_driver<W>(
     thread_id: String,
     mut agent: yi_agent_core::Agent,
     mut prompt_rx: mpsc::Receiver<TurnPrompt>,
-    mut interrupt_rx: mpsc::Receiver<()>,
+    mut interrupt_rx: mpsc::Receiver<String>,
     writer: Arc<MessageWriter<W>>,
     turn_tx: mpsc::Sender<TurnEvent>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // 每个 thread 一个 translator:item 计数器跨 turn 单调递增,避免 id 重复。
+    let mut translator = Translator::new(thread_id.clone());
     while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
-        let mut translator = Translator::new(thread_id.clone());
         translator.set_turn(turn_id.clone());
 
         let mut stream = match agent.run(prompt).await {
@@ -432,7 +423,14 @@ async fn run_thread_driver<W>(
                         Some(e) => {
                             for n in translator.on_event(e) {
                                 if write_notification(&writer, &n).await.is_err() {
-                                    // 客户端可能已断开;结束该 thread 的 driver。
+                                    // 客户端可能已断开;先上报 Finished,
+                                    // 避免 active_turn_id 永久卡住。
+                                    let _ = turn_tx
+                                        .send(TurnEvent::Finished {
+                                            thread_id: thread_id.clone(),
+                                            turn_id: turn_id.clone(),
+                                        })
+                                        .await;
                                     return;
                                 }
                             }
@@ -440,9 +438,12 @@ async fn run_thread_driver<W>(
                         None => break,
                     }
                 }
-                _ = interrupt_rx.recv(), if !cancel_sent => {
-                    cancel_sent = true;
-                    cancel_token.cancel();
+                Some(target) = interrupt_rx.recv(), if !cancel_sent => {
+                    // 只接受针对当前 turn 的中断;忽略上一轮残留的信号。
+                    if target == turn_id {
+                        cancel_sent = true;
+                        cancel_token.cancel();
+                    }
                     // 继续消费 stream,直到 run loop 发 Cancelled 并结束。
                 }
             }
@@ -454,6 +455,25 @@ async fn run_thread_driver<W>(
                 turn_id: turn_id.clone(),
             })
             .await;
+    }
+}
+
+/// 从 params 提取 `threadId`;缺失时写 `-32602` 并返回 `Ok(None)`。
+async fn require_thread_id<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &MessageWriter<W>,
+    params: &serde_json::Value,
+    id: RequestId,
+) -> anyhow::Result<Option<String>> {
+    match params.get("threadId").and_then(|v| v.as_str()) {
+        Some(s) => Ok(Some(s.to_string())),
+        None => {
+            write_response(
+                writer,
+                err_response(id, RpcError::invalid_params("missing threadId")),
+            )
+            .await?;
+            Ok(None)
+        }
     }
 }
 
@@ -532,6 +552,32 @@ mod tests {
         }
     }
 
+    /// 首帧延迟 20ms 的 provider:保证 driver 的 interrupt 分支在 stream
+    /// 首次 yield 之前已被轮询到(用于确定性地测试中断标记)。
+    struct DelayedProvider;
+
+    #[async_trait]
+    impl yi_agent_core::Provider for DelayedProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            let events = futures::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                yi_agent_core::provider::ProviderEvent::TextDelta("hi".into())
+            })
+            .chain(futures::stream::once(async {
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                }
+            }));
+            Ok(events.boxed())
+        }
+    }
+
     fn build_test_agent() -> anyhow::Result<yi_agent_core::Agent> {
         Ok(yi_agent_core::Agent::new(
             Arc::new(MockProvider),
@@ -543,6 +589,14 @@ mod tests {
     fn build_slow_agent() -> anyhow::Result<yi_agent_core::Agent> {
         Ok(yi_agent_core::Agent::new(
             Arc::new(SlowProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        ))
+    }
+
+    fn build_delayed_agent() -> anyhow::Result<yi_agent_core::Agent> {
+        Ok(yi_agent_core::Agent::new(
+            Arc::new(DelayedProvider),
             Arc::new(yi_agent_core::ToolRegistry::new()),
             yi_agent_core::AgentConfig::default(),
         ))
@@ -1009,5 +1063,101 @@ mod tests {
         let completed = completed.expect("expected a turn/completed notification");
         assert_eq!(completed["params"]["status"], "interrupted");
         h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_ignores_interrupt_tagged_with_other_turn() {
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let writer = Arc::new(MessageWriter::new(server_w));
+
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-1".into(),
+            build_delayed_agent().unwrap(),
+            prompt_rx,
+            interrupt_rx,
+            writer,
+            turn_tx,
+        ));
+
+        // 上一轮残留的中断(属于 turn-0)必须被忽略。
+        interrupt_tx.try_send("turn-0".into()).unwrap();
+        prompt_tx
+            .send(TurnPrompt {
+                turn_id: "turn-1".into(),
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut client_r = BufReader::new(client_r);
+        let mut status = None;
+        for _ in 0..10 {
+            let mut buf = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(5), client_r.read_line(&mut buf))
+                .await
+                .expect("timed out waiting for a notification")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            let v: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+            if v["method"] == "turn/completed" {
+                status = Some(v["params"]["status"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        assert_eq!(
+            status.as_deref(),
+            Some("completed"),
+            "a stale interrupt must not cancel the new turn"
+        );
+
+        drop(prompt_tx);
+        drop(interrupt_tx);
+        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ev, TurnEvent::Finished { .. }));
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_reports_finished_when_writer_fails() {
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 断开读端 → 写通知失败
+        let writer = Arc::new(MessageWriter::new(server_w));
+
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-1".into(),
+            build_test_agent().unwrap(),
+            prompt_rx,
+            interrupt_rx,
+            writer,
+            turn_tx,
+        ));
+
+        prompt_tx
+            .send(TurnPrompt {
+                turn_id: "turn-1".into(),
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+            .await
+            .expect("driver must report Finished even when writes fail")
+            .expect("turn channel must stay open");
+        assert!(matches!(ev, TurnEvent::Finished { ref turn_id, .. } if turn_id == "turn-1"));
+
+        drop(prompt_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 }
