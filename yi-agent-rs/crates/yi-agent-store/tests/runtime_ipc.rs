@@ -4805,3 +4805,36 @@ fn daemon_spawn_agent_defaults_to_read_only() {
         "a read-only child runs in place and owns no worktree row"
     );
 }
+
+/// Regression: a deep project path made `<runtime_dir>/runtime.sock` exceed
+/// `sockaddr_un.sun_path`, so `bind` failed with `AF_UNIX path too long` and
+/// subagent delegation was silently disabled. The daemon must start and serve a
+/// client even when the runtime directory itself is too long for a socket.
+#[test]
+fn a_daemon_starts_and_serves_a_client_when_the_runtime_directory_is_too_long() {
+    let directory = TempDir::new().unwrap();
+    // Build a runtime directory whose direct socket path overflows the limit.
+    let deep = directory.path().join("d".repeat(90)).join("runtime");
+    assert!(
+        deep.join("runtime.sock").as_os_str().len() > 103,
+        "precondition: the direct socket path must overflow the platform limit"
+    );
+    let database = directory.path().join("runtime.sqlite");
+
+    let daemon = Daemon::start(&deep, &database).expect("daemon must start for a long runtime dir");
+
+    // The socket must be reachable through the daemon's own reported path.
+    let socket = daemon.socket_path();
+    assert!(
+        socket.as_os_str().len() <= 103,
+        "daemon socket must fit the platform limit, got {} bytes",
+        socket.as_os_str().len()
+    );
+    assert!(
+        matches!(
+            send_request(socket, IpcRequest::Status),
+            Ok(IpcResponse::Status { .. })
+        ),
+        "a client using the daemon's reported socket must reach it"
+    );
+}

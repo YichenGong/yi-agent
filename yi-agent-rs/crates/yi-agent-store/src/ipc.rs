@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, Timelike};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 use yi_agent_core::subagent::task::{
@@ -108,6 +109,11 @@ pub enum IpcError {
     FrameTooLarge,
     #[error("daemon listener thread panicked during shutdown")]
     ListenerPanicked,
+    #[error(
+        "socket path {path} exceeds this platform's {limit}-byte limit; \
+         shorten the project path or set YI_AGENT_RUNTIME_DIR to a short directory"
+    )]
+    SocketPathTooLong { path: String, limit: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -631,7 +637,7 @@ impl Daemon {
         fs::create_dir_all(runtime_dir)?;
         fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700))?;
 
-        let socket_path = runtime_dir.join("runtime.sock");
+        let socket_path = socket_path_for(runtime_dir)?;
         let lock_path = runtime_dir.join("runtime.lock");
         let mut lock = acquire_lock(runtime_dir, &lock_path, &socket_path)?;
         writeln!(lock, "{}", std::process::id())?;
@@ -743,6 +749,49 @@ impl Daemon {
         }
         Ok(())
     }
+}
+
+/// The longest socket path `sockaddr_un.sun_path` accepts, excluding the
+/// terminating NUL. Linux allows 108; macOS and the BSDs allow 104. Taking the
+/// smaller bound keeps one behaviour across platforms.
+pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+
+/// Resolves the Unix-domain socket for a runtime directory.
+///
+/// A runtime directory normally owns its socket (`<runtime_dir>/runtime.sock`).
+/// That layout cannot always work: `sun_path` is capped at
+/// [`MAX_SOCKET_PATH_BYTES`], so a deep project path — the default runtime
+/// directory is `<workdir>/.yi-agent/runtime` — overflows it and `bind` fails
+/// with `AF_UNIX path too long`, silently disabling subagent delegation.
+///
+/// When the direct path does not fit, the socket moves to a short, stable name
+/// under the platform temporary directory, derived from the runtime directory
+/// so that the daemon and every client agree on one location. Distinct projects
+/// keep distinct sockets; an explicitly shared runtime directory keeps sharing.
+pub fn socket_path_for(runtime_dir: &Path) -> Result<PathBuf, IpcError> {
+    let direct = runtime_dir.join("runtime.sock");
+    if direct.as_os_str().len() <= MAX_SOCKET_PATH_BYTES {
+        return Ok(direct);
+    }
+    let name = socket_file_name(runtime_dir);
+    let fallback_dir = std::env::temp_dir();
+    let fallback = fallback_dir.join(&name);
+    if fallback.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+        return Err(IpcError::SocketPathTooLong {
+            path: fallback.display().to_string(),
+            limit: MAX_SOCKET_PATH_BYTES,
+        });
+    }
+    Ok(fallback)
+}
+
+/// The stable file name used when a socket cannot live beside its runtime
+/// directory. Derived from the runtime directory, not the working directory, so
+/// callers that share a runtime directory also share its socket.
+fn socket_file_name(runtime_dir: &Path) -> String {
+    let digest = Sha256::digest(runtime_dir.as_os_str().as_encoded_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("yi-agent-{}.sock", &hex[..16])
 }
 
 fn acquire_lock(
@@ -2565,5 +2614,84 @@ impl AgentWorkerFactory for UnavailableWorkerFactory {
                 "no application worker factory registered".into(),
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    use super::*;
+
+    /// The real project path that produced `AF_UNIX path too long` in practice:
+    /// `<repo>/.yi-agent/runtime/runtime.sock` measured 108 bytes.
+    const LONG_RUNTIME_DIR: &str = "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/runtime";
+
+    #[test]
+    fn a_short_runtime_directory_keeps_the_socket_inside_it() {
+        let runtime_dir = Path::new("/tmp/project/.yi-agent/runtime");
+
+        let socket = socket_path_for(runtime_dir).expect("short paths resolve");
+
+        assert_eq!(
+            socket,
+            runtime_dir.join("runtime.sock"),
+            "a runtime directory that fits must keep its existing layout"
+        );
+    }
+
+    #[test]
+    fn a_long_runtime_directory_yields_a_socket_that_fits_the_platform_limit() {
+        let runtime_dir = Path::new(LONG_RUNTIME_DIR);
+        assert!(
+            runtime_dir.join("runtime.sock").as_os_str().len() > MAX_SOCKET_PATH_BYTES,
+            "precondition: the direct socket path must overflow the limit"
+        );
+
+        let socket = socket_path_for(runtime_dir).expect("long paths fall back, not fail");
+
+        assert!(
+            socket.as_os_str().len() <= MAX_SOCKET_PATH_BYTES,
+            "socket must fit sockaddr_un.sun_path, got {} bytes: {}",
+            socket.as_os_str().len(),
+            socket.display()
+        );
+    }
+
+    #[test]
+    fn the_fallback_is_deterministic_for_one_runtime_directory() {
+        let runtime_dir = Path::new(LONG_RUNTIME_DIR);
+
+        let first = socket_path_for(runtime_dir).expect("resolves");
+        let second = socket_path_for(runtime_dir).expect("resolves");
+
+        assert_eq!(
+            first, second,
+            "the daemon and every client must resolve the identical socket"
+        );
+    }
+
+    #[test]
+    fn distinct_runtime_directories_get_distinct_sockets() {
+        let one = socket_path_for(Path::new(LONG_RUNTIME_DIR)).expect("resolves");
+        let other =
+            socket_path_for(Path::new(&format!("{LONG_RUNTIME_DIR}-other"))).expect("resolves");
+
+        assert_ne!(
+            one, other,
+            "project isolation must survive the fallback: different projects need different sockets"
+        );
+    }
+
+    #[test]
+    fn a_shared_runtime_directory_resolves_to_one_socket() {
+        // An explicitly shared runtime directory must still yield a single socket,
+        // so two projects pointed at it attach to the same daemon.
+        let shared = Path::new(
+            "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/shared-runtime-dir/runtime",
+        );
+
+        let first = socket_path_for(shared).expect("resolves");
+        let second = socket_path_for(shared).expect("resolves");
+
+        assert_eq!(first, second);
     }
 }
