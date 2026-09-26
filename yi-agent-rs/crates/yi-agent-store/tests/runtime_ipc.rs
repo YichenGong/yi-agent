@@ -14,7 +14,7 @@ use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
     WorkerStart, WorkerWorkspace,
 };
-use yi_agent_core::{AttemptId, RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
 use yi_agent_store::ipc::{
     Daemon, IpcRequest, IpcResponse, IpcReviewDecision, SubscriptionFilters, send_request,
     send_request_with_version, subscribe, subscribe_with_filters,
@@ -73,14 +73,14 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 8);
+    assert_eq!(repository.schema_version().unwrap(), 9);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
             "DROP TABLE task_workspaces;
              DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version IN (7, 8);",
+             DELETE FROM schema_migrations WHERE version IN (7, 8, 9);",
         )
         .unwrap();
     database
@@ -336,7 +336,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 8);
+    assert_eq!(repository.schema_version().unwrap(), 9);
     for table in [
         "sessions",
         "tasks",
@@ -365,7 +365,7 @@ fn v6_database_migrates_to_workspace_and_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 8);
+    assert_eq!(repository.schema_version().unwrap(), 9);
     assert!(repository.has_table("task_workspaces").unwrap());
     assert!(
         repository
@@ -1584,7 +1584,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 8);
+    assert_eq!(repository.schema_version().unwrap(), 9);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -4581,4 +4581,51 @@ fn daemon_retries_a_terminal_task_through_its_control_api() {
         detail,
         IpcResponse::TaskDetail(detail) if detail.state == "running"
     ));
+}
+
+#[test]
+fn workspace_mode_is_persisted_and_recovered() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 9);
+
+    let session = RootSessionId::new();
+    let root = TaskId::new();
+    let root_attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt_and_objective(
+            &root,
+            &session,
+            &root_attempt,
+            1,
+            "queued",
+            "root",
+            TaskWorkspaceMode::Coding,
+        )
+        .unwrap();
+    assert_eq!(
+        repository.task_workspace_mode(&root).unwrap(),
+        TaskWorkspaceMode::Coding
+    );
+
+    let child = TaskId::new();
+    let child_attempt = AttemptId::new();
+    repository
+        .create_child_task_with_attempt_and_objective(
+            &child,
+            &session,
+            &root,
+            1,
+            &child_attempt,
+            1,
+            "queued",
+            "child",
+            TaskWorkspaceMode::ReadOnly,
+        )
+        .unwrap();
+    assert_eq!(
+        repository.task_workspace_mode(&child).unwrap(),
+        TaskWorkspaceMode::ReadOnly
+    );
 }

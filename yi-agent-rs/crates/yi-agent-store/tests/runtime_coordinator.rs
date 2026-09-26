@@ -2811,6 +2811,7 @@ async fn recovered_child_resumes_after_runtime_restart() {
             1,
             "running",
             "Preserve this recovered child objective.",
+            yi_agent_core::TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
         )
         .unwrap();
     repository.recover_inflight_tasks().unwrap();

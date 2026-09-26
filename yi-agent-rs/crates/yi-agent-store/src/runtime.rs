@@ -630,6 +630,7 @@ impl RuntimeCoordinator {
                 root_attempt.number,
                 "queued",
                 &objective,
+                yi_agent_core::TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
             )?;
         self.supervisors
             .lock()
@@ -1112,6 +1113,7 @@ impl RuntimeCoordinator {
                 attempt.number,
                 "queued",
                 &objective,
+                yi_agent_core::TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
             )?;
         Ok(child)
     }
