@@ -2683,6 +2683,45 @@ async fn global_resident_capacity_leaves_excess_child_queued() {
 }
 
 #[tokio::test]
+async fn releasing_a_resident_lease_admits_a_queued_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let mut children = Vec::new();
+    for _ in 0..17 {
+        let session = coordinator.create_session().unwrap();
+        let root = coordinator.root_task_id(&session).unwrap();
+        let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        children.push((session, child));
+    }
+    for (session, child) in children.iter().take(16) {
+        coordinator.start_worker(session, child).await.unwrap();
+    }
+    let (queued_session, queued_child) = &children[16];
+    assert!(
+        coordinator
+            .start_worker(queued_session, queued_child)
+            .await
+            .is_err()
+    );
+
+    // Freeing one resident slot must release its capacity so the queued child
+    // becomes admissible. This pins the `release_resident_lease` bookkeeping
+    // that the lock-order fix narrowed without changing its observable effect.
+    let (victim_session, victim_child) = &children[0];
+    coordinator
+        .cancel_task(victim_session, victim_child, false)
+        .await
+        .unwrap();
+
+    coordinator
+        .start_worker(queued_session, queued_child)
+        .await
+        .unwrap();
+    assert_eq!(coordinator.task_state(queued_child).unwrap(), "running");
+}
+
+#[tokio::test]
 async fn fair_resident_grant_is_retained_for_the_selected_queued_child() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
