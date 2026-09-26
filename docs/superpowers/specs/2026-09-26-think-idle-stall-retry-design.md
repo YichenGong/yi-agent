@@ -233,7 +233,7 @@ cd yi-agent-rs
 cargo test -p yi-agent-core --lib provider::
 cargo test -p yi-agent-core --lib agent::
 cargo test -p yi-agent --bin yi-agent drain_stream
-cargo test -p yi-agent --lib tui::history
+cargo test -p yi-agent --bin yi-agent tui::history
 cargo test -p yi-agent-app-server --lib
 cd ../desktop && npm test
 cargo fmt --all -- --check

@@ -58,7 +58,7 @@
 - Consumes: 无（首个任务）。
 - Produces: `StopReason::Stalled`（unit 变体，无字段）。Task 2 依赖它作为可重试停滞的唯一判据。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent-core/src/provider.rs` 的 `mod tests` 内、`accumulate_stream_eof_without_stop_is_abnormal`（`:366`）之后追加：
 
@@ -84,13 +84,13 @@
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test -p yi-agent-core --lib provider::tests::accumulate_stream_idle_stall_reports_stalled`
 
 Expected: 编译失败，报 `no variant named Stalled found for enum StopReason`。
 
-- [ ] **Step 3: 新增变体并改 stall 分支**
+- [x] **Step 3: 新增变体并改 stall 分支**
 
 在 `crates/yi-agent-core/src/provider.rs:52-59` 的枚举中加入变体：
 
@@ -141,13 +141,13 @@ pub enum StopReason {
             }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p yi-agent-core --lib provider::`
 
 Expected: 全部 PASS（`accumulate_stream_eof_without_stop_is_abnormal` 仍断言 `Other("stream ended without stop")`，不受影响）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -176,7 +176,7 @@ git commit -m "feat(core): distinguish synthesized idle stall as StopReason::Sta
   - `fn stall_backoff_delay(base: std::time::Duration, attempt: u16) -> std::time::Duration`
   - 终态 reason 字符串 `"idle timeout after {n} retries"`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent-core/src/agent.rs` 的 `mod tests` 内，先加两个测试用 provider（放在既有 `StallAfterDeltaProvider`（`:1568`）之后）：
 
@@ -387,13 +387,13 @@ git commit -m "feat(core): distinguish synthesized idle stall as StopReason::Sta
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test -p yi-agent-core --lib agent::tests::agent_config_defaults_stall_retry_policy`
 
 Expected: 编译失败，报 `no field think_stall_retry_limit on struct AgentConfig`（以及 `no variant ProviderRetry`、`cannot find function stall_backoff_delay`）。
 
-- [ ] **Step 3: 加配置字段、事件变体与退避函数**
+- [x] **Step 3: 加配置字段、事件变体与退避函数**
 
 在 `crates/yi-agent-core/src/agent.rs:82-99` 的 `AgentConfig` 末尾（`think_idle_timeout` 之后）追加：
 
@@ -439,7 +439,7 @@ fn stall_backoff_delay(base: std::time::Duration, attempt: u16) -> std::time::Du
 }
 ```
 
-- [ ] **Step 4: 用 attempt 循环替换单次 provider 调用**
+- [x] **Step 4: 用 attempt 循环替换单次 provider 调用**
 
 把 `crates/yi-agent-core/src/agent.rs:485-579`（从 `let provider_turn_lease = match &provider_turn_gate {` 到 `drop(provider_turn_lease);`）整体替换为：
 
@@ -575,7 +575,7 @@ fn stall_backoff_delay(base: std::time::Duration, attempt: u16) -> std::time::Du
             }
 ```
 
-- [ ] **Step 5: 逐个运行新测试确认通过**
+- [x] **Step 5: 逐个运行新测试确认通过**
 
 Run: `cargo test -p yi-agent-core --lib agent::tests::agent_retries_a_transient_idle_stall_and_completes`
 
@@ -589,13 +589,13 @@ Run: `cargo test -p yi-agent-core --lib agent::tests::stall_backoff_delay_double
 
 Expected: 全部 PASS。（cargo 一次只接受一个过滤串，故逐条运行。）
 
-- [ ] **Step 6: 跑整个 core lib 测试确认无回归**
+- [x] **Step 6: 跑整个 core lib 测试确认无回归**
 
 Run: `cargo test -p yi-agent-core --lib`
 
 Expected: 全部 PASS。特别确认 `agent_does_not_report_abnormal_stop_as_end_turn` 仍通过（它走 `Other("idle timeout")`，是 provider 主动上报，不触发重试）。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -616,7 +616,7 @@ git commit -m "feat(core): retry a transiently stalled THINK stream with backoff
 - Consumes: `AgentEvent::ProviderRetry { attempt, max, idle_secs }`（Task 2）。
 - Produces: 无新公开 API。`HistoryState::push_event` 在收到 `ProviderRetry` 时 push 一个 `HistoryCell::Separator`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent/src/tui/history.rs` 的 `mod tests` 内追加：
 
@@ -678,13 +678,13 @@ git commit -m "feat(core): retry a transiently stalled THINK stream with backoff
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
-Run: `cargo test -p yi-agent --lib tui::history::tests::push_event_provider_retry_shows_visible_separator`
+Run: `cargo test -p yi-agent --bin yi-agent tui::history::tests::push_event_provider_retry_shows_visible_separator`
 
 Expected: 编译失败，报 `no variant named ProviderRetry found for enum AgentEvent`（若 core 改动未在同一 worktree，先确认 Task 2 已提交）。
 
-- [ ] **Step 3: 实现可见分隔线**
+- [x] **Step 3: 实现可见分隔线**
 
 在 `crates/yi-agent/src/tui/history.rs` 的 `push_event` 中，于 `AgentEvent::Start => {}`（`:366`）之后加入：
 
@@ -714,19 +714,19 @@ Expected: 编译失败，报 `no variant named ProviderRetry found for enum Agen
         AgentEvent::ProviderRetry { .. } => {}
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
-Run: `cargo test -p yi-agent --lib tui::history::tests::push_event_provider_retry`
+Run: `cargo test -p yi-agent --bin yi-agent tui::history::tests::push_event_provider_retry`
 
 Expected: 两个测试都 PASS。
 
-- [ ] **Step 5: 跑 TUI 测试确认无回归**
+- [x] **Step 5: 跑 TUI 测试确认无回归**
 
-Run: `cargo test -p yi-agent --lib tui::`
+Run: `cargo test -p yi-agent --bin yi-agent tui::`
 
 Expected: 全部 PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -747,7 +747,7 @@ git commit -m "feat(tui): show a visible notice when the provider stalls and ret
 - Consumes: `AgentEvent::ProviderRetry { attempt, max, idle_secs }`（Task 2）。
 - Produces: 无新 API。`drain_stream_human` 向 stderr 打印 `[provider-retry:{attempt}/{max}]`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent/src/main.rs` 的 `mod tests` 内、`drain_stream_human_suppresses_done_endturn_on_stderr`（`:1659`）之后追加：
 
@@ -785,13 +785,13 @@ git commit -m "feat(tui): show a visible notice when the provider stalls and ret
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test -p yi-agent --bin yi-agent drain_stream_human_reports_provider_retry_on_stderr`
 
 Expected: 编译失败，报 `no variant named ProviderRetry found for enum AgentEvent`。
 
-- [ ] **Step 3: 实现两个消费端**
+- [x] **Step 3: 实现两个消费端**
 
 `crates/yi-agent/src/main.rs`：在 `drain_stream_human` 的 `AgentEvent::ToolRetry { id }`（`:909-911`）之后加入：
 
@@ -809,19 +809,19 @@ Expected: 编译失败，报 `no variant named ProviderRetry found for enum Agen
                                         }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p yi-agent --bin yi-agent drain_stream`
 
 Expected: 全部 PASS，含新测试。
 
-- [ ] **Step 5: 跑相关测试确认无回归**
+- [x] **Step 5: 跑相关测试确认无回归**
 
 Run: `cargo test -p yi-agent --bin yi-agent subagent_runtime`
 
 Expected: 全部 PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -849,7 +849,7 @@ git commit -m "feat: announce provider stall retries in headless and subagent mo
   - `Notification::TurnRetry { thread_id: String, turn_id: String, attempt: u16, max: u16 }`（wire method `turn/retry`）
   - `Session.retrying: { attempt: number; max: number } | null`
 
-- [ ] **Step 1: 写失败测试（Rust 侧）**
+- [x] **Step 1: 写失败测试（Rust 侧）**
 
 在 `crates/yi-agent-app-server/src/translate.rs` 的 `mod tests` 内追加（该文件已有
 `fn translator() -> Translator` helper，直接复用）：
@@ -877,13 +877,13 @@ git commit -m "feat: announce provider stall retries in headless and subagent mo
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test -p yi-agent-app-server --lib provider_retry_becomes_turn_retry_notification`
 
 Expected: 编译失败，报 `no variant named TurnRetry found for enum Notification`。
 
-- [ ] **Step 3: 加通知变体与翻译**
+- [x] **Step 3: 加通知变体与翻译**
 
 `crates/yi-agent-app-server/src/protocol.rs`：在 `Notification`（`:104-143`）的 `TurnCompleted` 之后加入：
 
@@ -914,13 +914,13 @@ Expected: 编译失败，报 `no variant named TurnRetry found for enum Notifica
 
 并从忽略分支（`:263-270`）中确认没有重复列出 `ProviderRetry`。
 
-- [ ] **Step 4: 运行 Rust 侧测试确认通过**
+- [x] **Step 4: 运行 Rust 侧测试确认通过**
 
 Run: `cargo test -p yi-agent-app-server --lib`
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 写失败测试（desktop 侧）**
+- [x] **Step 5: 写失败测试（desktop 侧）**
 
 在 `desktop/src/lib/session.test.ts` 末尾追加：
 
@@ -951,13 +951,13 @@ Expected: 全部 PASS。
   });
 ```
 
-- [ ] **Step 6: 运行测试确认失败**
+- [x] **Step 6: 运行测试确认失败**
 
 Run: `cd desktop && npm test`
 
 Expected: FAIL —— `s.retrying` 为 `undefined`，且 `turn/retry` 不是已知 method（TS 类型报错）。
 
-- [ ] **Step 7: 实现 desktop 侧**
+- [x] **Step 7: 实现 desktop 侧**
 
 `desktop/src/lib/protocol.ts`：在 `Notification` 联合类型中加入：
 
@@ -1036,7 +1036,7 @@ export function ChatView({
         />
 ```
 
-- [ ] **Step 8: 运行 desktop 测试与类型检查**
+- [x] **Step 8: 运行 desktop 测试与类型检查**
 
 Run: `cd desktop && npm test`
 
@@ -1044,7 +1044,7 @@ Run: `cd desktop && npx tsc --noEmit`
 
 Expected: 全部 PASS，无类型错误。
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1069,21 +1069,21 @@ git commit -m "feat(desktop): show a retry notice while the provider stalls"
 - Consumes: 前五个任务的实现与测试命令。
 - Produces: 无代码接口。
 
-- [ ] **Step 1: 更新 bug-list**
+- [x] **Step 1: 更新 bug-list**
 
 把 `docs/bug-list.md` 中这一行：
 
 ```
-- [ ] agent.rs:608  的  StopReason::Other("idle timeout")  分支应该带退避重试（比如 3次、2s/4s/8s），而不是  return 。这样瞬时 stall 对用户就不可见了。
+- [x] agent.rs:608  的  StopReason::Other("idle timeout")  分支应该带退避重试（比如 3次、2s/4s/8s），而不是  return 。这样瞬时 stall 对用户就不可见了。
 ```
 
 改为：
 
 ```
-- [x] THINK 阶段瞬时 stall 直接终结整轮任务（修复：停滞信号改为专用 `StopReason::Stalled`，`agent.rs` attempt 循环带 2s/4s/8s 退避重试 3 次并新增 `AgentEvent::ProviderRetry { attempt, max, idle_secs }`；重试对用户可见——TUI 历史分隔线、headless stderr `[provider-retry:n/max]`、app-server `turn/retry` → desktop 横幅；停滞 partial 保留显示但不写入 session。验证：`cargo test -p yi-agent-core --lib agent::tests::agent_retries_a_transient_idle_stall_and_completes`、`cargo test -p yi-agent --lib tui::history::tests::push_event_provider_retry_shows_visible_separator`、`cargo test -p yi-agent --bin yi-agent drain_stream_human_reports_provider_retry_on_stderr`、`cargo test -p yi-agent-app-server --lib provider_retry_becomes_turn_retry_notification`、`cd desktop && npm test`。见 [设计](../superpowers/specs/2026-09-26-think-idle-stall-retry-design.md)）
+- [x] THINK 阶段瞬时 stall 直接终结整轮任务（修复：停滞信号改为专用 `StopReason::Stalled`，`agent.rs` attempt 循环带 2s/4s/8s 退避重试 3 次并新增 `AgentEvent::ProviderRetry { attempt, max, idle_secs }`；重试对用户可见——TUI 历史分隔线、headless stderr `[provider-retry:n/max]`、app-server `turn/retry` → desktop 横幅；停滞 partial 保留显示但不写入 session。验证：`cargo test -p yi-agent-core --lib agent::tests::agent_retries_a_transient_idle_stall_and_completes`、`cargo test -p yi-agent --bin yi-agent tui::history::tests::push_event_provider_retry_shows_visible_separator`、`cargo test -p yi-agent --bin yi-agent drain_stream_human_reports_provider_retry_on_stderr`、`cargo test -p yi-agent-app-server --lib provider_retry_becomes_turn_retry_notification`、`cd desktop && npm test`。见 [设计](../superpowers/specs/2026-09-26-think-idle-stall-retry-design.md)）
 ```
 
-- [ ] **Step 2: 更新 core 模块进度**
+- [x] **Step 2: 更新 core 模块进度**
 
 在 `docs/project-management/yi-agent-core.md` 的 Features 列表末尾（插件系统那条之前）加入：
 
@@ -1091,7 +1091,7 @@ git commit -m "feat(desktop): show a retry notice while the provider stalls"
 - [x] THINK 阶段空闲停滞退避重试 — `provider.rs::StopReason::Stalled` + `agent.rs` attempt 循环（默认 3 次、2s/4s/8s，封顶 30s）；`AgentConfig.think_stall_retry_limit` / `think_stall_backoff_base` 可调；停滞 partial 不写入 session；`AgentEvent::ProviderRetry` 使重试对用户可见；验证：`cargo test -p yi-agent-core --lib agent::tests::agent_exhausts_stall_retries_then_reports_interruption` — [设计](../superpowers/specs/2026-09-26-think-idle-stall-retry-design.md)
 ```
 
-- [ ] **Step 3: 同步 README 计数**
+- [x] **Step 3: 同步 README 计数**
 
 在 `docs/project-management/README.md` 中把 yi-agent-core 行由 `15 / 16` 改为：
 
@@ -1099,13 +1099,13 @@ git commit -m "feat(desktop): show a retry notice while the provider stalls"
 | yi-agent-core | 16 / 17 | [详情](./yi-agent-core.md) |
 ```
 
-- [ ] **Step 4: 校验文档无残留未完成标记**
+- [x] **Step 4: 校验文档无残留未完成标记**
 
 Run: `grep -n "idle timeout" docs/bug-list.md`
 
 Expected: 只剩已修复的 `[x]` 行，无 `[ ]` 行。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs/bug-list.md docs/project-management/yi-agent-core.md docs/project-management/README.md
@@ -1120,7 +1120,7 @@ Run: `cd yi-agent-rs && cargo fmt --all -- --check`
 
 Run: `cargo test -p yi-agent-core --lib`
 
-Run: `cargo test -p yi-agent --lib tui::`
+Run: `cargo test -p yi-agent --bin yi-agent tui::`
 
 Run: `cargo test -p yi-agent --bin yi-agent drain_stream`
 
