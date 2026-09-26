@@ -5,7 +5,7 @@
 - [ ] 显示内容太密集，user 和 system 的内容之间加空行
 - [ ] bash 目前没有后台模式
 - [ ] 命令行需要输入密码的话，TUI会出现显示故障。
-- [ ] 排队user request加入对话的逻辑不是很清晰。
+- [x] 排队user request加入对话的逻辑不是很清晰。（修复：队列收敛为单一 `PendingQueue`（`tui/queued.rs`），同时至多 1 条在途，发送改用 `try_send`，消除队列满时 `blocking_send` 冻结 UI；转正与发送合并为同一动作，不再依赖 driver 是否取走；满队列拒收并把文本退回输入框。见 [设计](../superpowers/specs/2026-09-27-tui-pending-queue-design.md)、[计划](../superpowers/plans/2026-09-27-tui-pending-queue.md)。验证：`cargo test -p yi-agent --bin yi-agent -- tui::queued::tests`、`cargo test -p yi-agent --bin yi-agent -- tui::app::tests`）
 - [ ] 我希望在运行的时候能够切换模型。目前看起来没什么选择
 - [x] 确认是否支持图片读取。（修复：新增 `view_image` 工具读取 png/jpeg/gif/webp 并返回 `ContentBlock::Image`；Anthropic/OpenAI 两个 provider 均可序列化，OpenAI 侧把 tool 结果里的图片拆到紧随的 user 消息。见 `yi-agent-rs/crates/yi-agent-tools/src/fs/view_image.rs`、`yi-agent-rs/crates/yi-agent-llm/src/openai/types.rs`；验证：`cargo test -p yi-agent-tools --lib fs::view_image`、`cargo test -p yi-agent-llm --lib openai::types`）
 - [ ] 如果输入框输入的是一个路径开始的内容。系统会把他当成slash command，然后会反馈说“未知命令”
