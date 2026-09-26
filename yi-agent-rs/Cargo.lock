@@ -3669,6 +3669,7 @@ dependencies = [
  "yi-agent-core",
  "yi-agent-llm",
  "yi-agent-mcp",
+ "yi-agent-runtime",
  "yi-agent-skills",
  "yi-agent-store",
  "yi-agent-tools",

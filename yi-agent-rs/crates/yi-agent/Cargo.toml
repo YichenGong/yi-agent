@@ -20,6 +20,7 @@ yi-agent-mcp = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-web = { workspace = true }
 yi-agent-skills = { workspace = true }
+yi-agent-runtime = { workspace = true }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }

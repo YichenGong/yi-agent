@@ -1,30 +1,15 @@
-//! 配置加载：环境变量 + CLI 参数 > 默认值。
+//! CLI 配置适配层:把 clap 解析出的 [`Cli`] 转成共享 crate 的覆盖项。
+//!
+//! 实际的配置加载语义(覆盖项 + 环境变量 > 默认值)由
+//! `yi_agent_runtime::config` 拥有,CLI 与未来的 GUI 共用同一实现。
+//! 本模块只负责参数解析与类型转换。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
+use anyhow::Result;
 
-/// 运行时配置，由 CLI 参数和环境变量合并而来。
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub provider: String,
-    pub api_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub max_turns: u32,
-    pub workdir: PathBuf,
-    pub system_prompt: Option<String>,
-    pub compact_threshold: u32, // computed: context_length * ratio / 100
-    pub compact_user_budget_tokens: usize,
-    pub compact_tool_budget_tokens: usize,
-    pub yolo: bool,
-    pub sandbox: yi_agent_tools::SandboxMode,
-    pub sandbox_writable_roots: Vec<PathBuf>,
-    pub skills_catalog_budget: usize,
-    /// True if user explicitly set the budget via CLI flag or env var (skips interactive prompt).
-    pub skills_catalog_budget_explicit: bool,
-}
+/// CLI 侧仍以 `Config` 之名引用运行时配置;实际类型来自共享 crate。
+pub type Config = yi_agent_runtime::config::RuntimeConfig;
 
 /// clap CLI 参数定义。
 #[derive(clap::Parser, Debug)]
@@ -274,256 +259,62 @@ pub enum DaemonAction {
     Serve,
 }
 
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-}
-
-/// 解析 .env 文件路径：优先 workdir CLI 参数，否则 YI_AGENT_WORKDIR 环境变量，否则当前目录。
-/// 所有路径均使用 `.yi-agent/.env` 子目录结构，避免与项目自身的 .env 冲突。
-pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
-    cli.workdir
-        .as_ref()
-        .map(|w| w.join(".yi-agent").join(".env"))
-        .or_else(|| {
-            std::env::var("YI_AGENT_WORKDIR")
-                .ok()
-                .map(PathBuf::from)
-                .map(|p| p.join(".yi-agent").join(".env"))
-        })
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".yi-agent")
-                .join(".env")
-        })
-}
-
-/// 加载 .env 文件到进程环境变量(不覆盖已存在的)。
+/// 把 CLI 参数转换成共享 crate 的纯数据覆盖项。
 ///
-/// - `local_path`: 本地 .env 路径(必填,不存在则静默跳过)
-/// - `global_path`: 全局 .env 路径(可选,None 表示跳过全局)
-///
-/// 加载顺序:先 local 后 global。dotenvy 默认不覆盖已存在的环境变量,
-/// 因此真实环境变量 > local > global。
-pub fn load_env_files(local_path: &Path, global_path: Option<&Path>) {
-    load_one_env(local_path);
-    if let Some(global) = global_path {
-        load_one_env(global);
-    }
-}
-
-/// 加载单个 .env 文件,不存在则静默跳过,其他错误打印警告。
-fn load_one_env(path: &Path) {
-    if let Err(e) = dotenvy::from_path(path) {
-        if !e.not_found() {
-            eprintln!(
-                "warning: failed to load .env from {}: {}",
-                path.display(),
-                e
-            );
+/// 必须逐一映射所有字段:`ConfigOverrides` 里缺省(未提供)的项会回退到环境
+/// 变量或默认值,漏映射会静默改变 CLI 行为。
+impl From<&Cli> for yi_agent_runtime::config::ConfigOverrides {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            provider: cli.provider.clone(),
+            api_url: cli.api_url.clone(),
+            api_key: cli.api_key.clone(),
+            model: cli.model.clone(),
+            max_turns: cli.max_turns,
+            workdir: cli.workdir.clone(),
+            system_prompt: cli.system_prompt.clone(),
+            model_context_length: cli.model_context_length,
+            compact_ratio: cli.compact_ratio,
+            compact_keep_turns: cli.compact_keep_turns,
+            compact_user_budget_tokens: cli.compact_user_budget_tokens,
+            compact_tool_budget_tokens: cli.compact_tool_budget_tokens,
+            yolo: cli.yolo,
+            skip_permissions: cli.skip_permissions,
+            sandbox: cli.sandbox,
+            sandbox_writable_roots: cli.sandbox_writable_roots.clone(),
+            skills_catalog_budget: cli.skills_catalog_budget,
         }
     }
 }
 
+/// 解析 .env 文件路径:优先 workdir CLI 参数,否则 YI_AGENT_WORKDIR 环境变量,否则当前目录。
+/// 所有路径均使用 `.yi-agent/.env` 子目录结构,避免与项目自身的 .env 冲突。
+pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
+    yi_agent_runtime::config::resolve_env_path(&cli.into())
+}
+
 /// 解析全局 .env 路径:~/.yi-agent/.env
 pub fn resolve_global_env_path() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .map(|h| h.join(".yi-agent").join(".env"))
+    yi_agent_runtime::config::resolve_global_env_path()
 }
 
 /// 判断是否为显式指定 workdir(CLI 参数或环境变量)
 pub fn is_workdir_explicit(cli: &Cli) -> bool {
-    cli.workdir.is_some()
-        || std::env::var("YI_AGENT_WORKDIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some()
+    yi_agent_runtime::config::is_workdir_explicit(&cli.into())
 }
 
 /// Resolve the effective workdir without loading provider configuration.
 ///
 /// Priority is CLI `--workdir`, non-empty `YI_AGENT_WORKDIR`, then the current directory.
 pub fn resolve_workdir(cli: &Cli) -> Result<PathBuf> {
-    let workdir = cli
-        .workdir
-        .clone()
-        .or_else(|| {
-            std::env::var("YI_AGENT_WORKDIR")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    if !workdir.is_dir() {
-        bail!("working directory does not exist: {}", workdir.display());
-    }
-    Ok(workdir)
+    yi_agent_runtime::config::resolve_workdir(&cli.into())
 }
 
 /// 从 CLI 参数 + 环境变量加载配置。
 ///
-/// 优先级：CLI 参数 > 环境变量 > 默认值。
-/// .env 加载:显式指定 workdir 时只加载指定目录,fallback 模式合并全局兜底。
-/// fallback 模式下只读取已存在的 `.yi-agent/.env`,不主动创建目录。
+/// 优先级:CLI 参数 > 环境变量 > 默认值。实际语义由 runtime crate 实现。
 pub fn load(cli: &Cli) -> Result<Config> {
-    let local_env_path = resolve_env_path(cli);
-    let global_env_path = if is_workdir_explicit(cli) {
-        None
-    } else {
-        resolve_global_env_path()
-    };
-    load_env_files(&local_env_path, global_env_path.as_deref());
-
-    let provider = cli
-        .provider
-        .clone()
-        .or_else(|| std::env::var("YI_AGENT_PROVIDER").ok())
-        .unwrap_or_else(|| "anthropic".to_string());
-
-    let api_key = cli
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("MODEL_API_KEY").ok())
-        .context("API key required: set MODEL_API_KEY or use --api-key")?;
-    if api_key.is_empty() {
-        bail!("API key is empty: set MODEL_API_KEY or use --api-key");
-    }
-
-    let default_api_url = match provider.as_str() {
-        "openai" => "https://api.openai.com",
-        _ => "https://api.anthropic.com",
-    };
-    let default_model = match provider.as_str() {
-        "openai" => "gpt-4o",
-        _ => "claude-sonnet-4-20250514",
-    };
-
-    let api_url = cli
-        .api_url
-        .clone()
-        .or_else(|| std::env::var("MODEL_API_URL").ok())
-        .unwrap_or_else(|| default_api_url.to_string());
-
-    let model = cli
-        .model
-        .clone()
-        .or_else(|| std::env::var("YI_AGENT_MODEL").ok())
-        .unwrap_or_else(|| default_model.to_string());
-
-    let max_turns = cli
-        .max_turns
-        .or_else(|| {
-            std::env::var("YI_AGENT_MAX_TURNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(20);
-
-    let workdir = resolve_workdir(cli)?;
-
-    let system_prompt = cli
-        .system_prompt
-        .clone()
-        .or_else(|| std::env::var("YI_AGENT_SYSTEM_PROMPT").ok())
-        .filter(|s| !s.is_empty());
-
-    let model_context_length = cli.model_context_length.or_else(|| {
-        std::env::var("YI_AGENT_MODEL_CONTEXT_LENGTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-    });
-
-    let compact_ratio = cli
-        .compact_ratio
-        .or_else(|| {
-            std::env::var("YI_AGENT_COMPACT_RATIO")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(80);
-
-    let effective_context_length = model_context_length.unwrap_or(200_000);
-    let compact_threshold = effective_context_length * compact_ratio / 100;
-
-    let deprecated_keep_turns = cli.compact_keep_turns.is_some()
-        || std::env::var("YI_AGENT_COMPACT_KEEP_TURNS")
-            .ok()
-            .is_some_and(|value| !value.is_empty());
-    if deprecated_keep_turns {
-        eprintln!(
-            "warning: YI_AGENT_COMPACT_KEEP_TURNS/--compact-keep-turns is deprecated and ignored; use compact token budgets instead"
-        );
-    }
-
-    let compact_user_budget_tokens = cli
-        .compact_user_budget_tokens
-        .or_else(|| env_usize("YI_AGENT_COMPACT_USER_BUDGET_TOKENS"))
-        .unwrap_or(20_000);
-    if compact_user_budget_tokens == 0 {
-        bail!("compact user budget tokens must be greater than zero");
-    }
-    let compact_tool_budget_tokens = cli
-        .compact_tool_budget_tokens
-        .or_else(|| env_usize("YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS"))
-        .unwrap_or(12_000);
-
-    let yolo = cli.yolo
-        || cli.skip_permissions
-        || std::env::var("YI_AGENT_YOLO")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-
-    let sandbox = match cli.sandbox {
-        Some(mode) => mode,
-        None => match std::env::var("YI_AGENT_SANDBOX") {
-            Ok(value) => yi_agent_tools::SandboxMode::from_str(&value, true).map_err(|_| {
-                anyhow::anyhow!(
-                    "invalid YI_AGENT_SANDBOX: expected read-only, workspace-write, or danger-full-access"
-                )
-            })?,
-            Err(_) if cli.yolo => yi_agent_tools::SandboxMode::DangerFullAccess,
-            Err(_) => yi_agent_tools::SandboxMode::default(),
-        },
-    };
-
-    let sandbox_writable_roots = cli.sandbox_writable_roots.clone();
-
-    let skills_catalog_budget_explicit = cli.skills_catalog_budget.is_some()
-        || std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
-    let skills_catalog_budget = cli
-        .skills_catalog_budget
-        .or_else(|| {
-            std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(8192);
-
-    Ok(Config {
-        provider,
-        api_url,
-        api_key,
-        model,
-        max_turns,
-        workdir,
-        system_prompt,
-        compact_threshold,
-        compact_user_budget_tokens,
-        compact_tool_budget_tokens,
-        yolo,
-        sandbox,
-        sandbox_writable_roots,
-        skills_catalog_budget,
-        skills_catalog_budget_explicit,
-    })
+    yi_agent_runtime::config::RuntimeConfig::load(&cli.into())
 }
 
 #[cfg(test)]
@@ -532,6 +323,7 @@ mod tests {
     use clap::Parser;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use yi_agent_runtime::config::ConfigOverrides;
 
     /// 测试用互斥锁:涉及环境变量的测试必须串行执行,避免并行干扰。
     static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -547,15 +339,6 @@ mod tests {
                 .map(|name| (name, std::env::var_os(name)))
                 .collect();
             Self { original }
-        }
-
-        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-            self.original
-                .entry(name)
-                .or_insert_with(|| std::env::var_os(name));
-            unsafe {
-                std::env::set_var(name, value);
-            }
         }
 
         fn remove(&mut self, name: &'static str) {
@@ -578,62 +361,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    fn isolated_config_env() -> EnvVarGuard {
-        let mut env = EnvVarGuard::new([
-            "MODEL_API_KEY",
-            "MODEL_API_URL",
-            "YI_AGENT_PROVIDER",
-            "YI_AGENT_MODEL",
-            "YI_AGENT_WORKDIR",
-            "YI_AGENT_YOLO",
-            "YI_AGENT_SANDBOX",
-            "YI_AGENT_MAX_TURNS",
-            "YI_AGENT_SYSTEM_PROMPT",
-            "YI_AGENT_MODEL_CONTEXT_LENGTH",
-            "YI_AGENT_COMPACT_RATIO",
-            "YI_AGENT_COMPACT_KEEP_TURNS",
-            "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
-            "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
-            "YI_AGENT_SKILLS_CATALOG_BUDGET",
-        ]);
-        for key in [
-            "MODEL_API_KEY",
-            "MODEL_API_URL",
-            "YI_AGENT_PROVIDER",
-            "YI_AGENT_MODEL",
-            "YI_AGENT_WORKDIR",
-            "YI_AGENT_YOLO",
-            "YI_AGENT_SANDBOX",
-            "YI_AGENT_MAX_TURNS",
-            "YI_AGENT_SYSTEM_PROMPT",
-            "YI_AGENT_MODEL_CONTEXT_LENGTH",
-            "YI_AGENT_COMPACT_RATIO",
-            "YI_AGENT_COMPACT_KEEP_TURNS",
-            "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
-            "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
-            "YI_AGENT_SKILLS_CATALOG_BUDGET",
-        ] {
-            env.remove(key);
-        }
-        env
-    }
-
-    struct CurrentDirGuard(std::path::PathBuf);
-
-    impl CurrentDirGuard {
-        fn change_to(path: &Path) -> Self {
-            let original = std::env::current_dir().expect("read current directory");
-            std::env::set_current_dir(path).expect("change current directory");
-            Self(original)
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.0).expect("restore current directory");
         }
     }
 
@@ -661,604 +388,104 @@ mod tests {
         }
     }
 
+    /// 所有 17 个覆盖项字段都必须从 clap 参数一一映射,漏映射会静默改变 CLI 行为。
     #[test]
-    fn resolve_workdir_prefers_cli_value() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
+    fn cli_adapter_maps_all_overrides() {
         let cli = Cli::parse_from([
             "yi-agent",
+            "--provider",
+            "openai",
+            "--api-url",
+            "https://example.com",
+            "--api-key",
+            "secret-key",
+            "--model",
+            "gpt-4o",
+            "--max-turns",
+            "7",
             "--workdir",
-            temp.path().to_str().expect("UTF-8 temporary path"),
-            "daemon",
-            "status",
+            "/tmp/adapter-workdir",
+            "--system-prompt",
+            "be terse",
+            "--model-context-length",
+            "123456",
+            "--compact-ratio",
+            "42",
+            "--compact-keep-turns",
+            "9",
+            "--compact-user-budget-tokens",
+            "3333",
+            "--compact-tool-budget-tokens",
+            "4444",
+            "--yolo",
+            "--sandbox",
+            "read-only",
+            "--sandbox-writable-root",
+            "/tmp/one",
+            "--sandbox-writable-root",
+            "/tmp/two",
+            "--dangerously-skip-permissions",
+            "--skills-catalog-budget",
+            "2048",
         ]);
 
+        let overrides: ConfigOverrides = (&cli).into();
+
+        assert_eq!(overrides.provider.as_deref(), Some("openai"));
+        assert_eq!(overrides.api_url.as_deref(), Some("https://example.com"));
+        assert_eq!(overrides.api_key.as_deref(), Some("secret-key"));
+        assert_eq!(overrides.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(overrides.max_turns, Some(7));
         assert_eq!(
-            resolve_workdir(&cli).expect("resolve CLI workdir"),
-            temp.path()
+            overrides.workdir,
+            Some(PathBuf::from("/tmp/adapter-workdir"))
         );
-    }
-
-    #[test]
-    fn resolve_workdir_uses_nonempty_environment_value() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
-        env.set(
-            "YI_AGENT_WORKDIR",
-            temp.path().to_str().expect("UTF-8 temporary path"),
+        assert_eq!(overrides.system_prompt.as_deref(), Some("be terse"));
+        assert_eq!(overrides.model_context_length, Some(123_456));
+        assert_eq!(overrides.compact_ratio, Some(42));
+        assert_eq!(overrides.compact_keep_turns, Some(9));
+        assert_eq!(overrides.compact_user_budget_tokens, Some(3_333));
+        assert_eq!(overrides.compact_tool_budget_tokens, Some(4_444));
+        assert!(overrides.yolo, "--yolo must set yolo");
+        assert!(
+            overrides.skip_permissions,
+            "--dangerously-skip-permissions must set skip_permissions"
         );
-        let cli = Cli::parse_from(["yi-agent", "daemon", "status"]);
-
         assert_eq!(
-            resolve_workdir(&cli).expect("resolve environment workdir"),
-            temp.path()
+            overrides.sandbox,
+            Some(yi_agent_tools::SandboxMode::ReadOnly)
         );
-    }
-
-    #[test]
-    fn load_requires_api_key() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            // An explicit empty workdir prevents fallback loading of a local
-            // or global .yi-agent/.env file.
-            workdir: Some(temp.path().to_path_buf()),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let result = load(&cli);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("API key"),
-            "error should mention API key, got: {msg}"
+        assert_eq!(
+            overrides.sandbox_writable_roots,
+            vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
         );
+        assert_eq!(overrides.skills_catalog_budget, Some(2_048));
     }
 
+    /// 未传任何 flag 时,所有覆盖项都必须为空,让环境变量 / 默认值生效。
     #[test]
-    fn load_loads_from_cli_args() {
-        let cli = Cli {
-            command: None,
-            provider: Some("openai".into()),
-            api_url: Some("https://example.com".into()),
-            api_key: Some("test-key".into()),
-            model: Some("test-model".into()),
-            max_turns: Some(5),
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: Some("custom prompt".into()),
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.api_url, "https://example.com");
-        assert_eq!(config.api_key, "test-key");
-        assert_eq!(config.model, "test-model");
-        assert_eq!(config.max_turns, 5);
-        assert_eq!(config.system_prompt.as_deref(), Some("custom prompt"));
-    }
+    fn cli_adapter_defaults_have_no_overrides() {
+        let cli = Cli::parse_from(["yi-agent"]);
 
-    #[test]
-    fn load_defaults_api_url_and_model() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.api_url, "https://api.anthropic.com");
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
-        assert_eq!(config.max_turns, 20);
-        assert!(config.system_prompt.is_none());
-    }
+        let overrides: ConfigOverrides = (&cli).into();
 
-    #[test]
-    fn load_includes_compact_defaults() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
-        assert_eq!(config.compact_user_budget_tokens, 20_000);
-        assert_eq!(config.compact_tool_budget_tokens, 12_000);
-    }
-
-    #[test]
-    fn load_computes_threshold_from_context_and_ratio() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: Some(100_000),
-            compact_ratio: Some(50),
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.compact_threshold, 50_000); // 100000 * 50 / 100
-    }
-
-    #[test]
-    fn load_falls_back_to_default_context_length() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: Some(80),
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
-    }
-
-    #[test]
-    fn load_rejects_nonexistent_workdir() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from("/nonexistent/path/that/should/not/exist")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let result = load(&cli);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn load_defaults_provider_to_anthropic() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.provider, "anthropic");
-    }
-
-    #[test]
-    fn load_defaults_openai_provider() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let cli = Cli {
-            command: None,
-            provider: Some("openai".into()),
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.provider, "openai");
-        assert_eq!(config.api_url, "https://api.openai.com");
-        assert_eq!(config.model, "gpt-4o");
-    }
-
-    #[test]
-    fn load_reads_dotenv_file() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        env.remove("MODEL_API_KEY");
-        // 创建临时目录和 .yi-agent/.env 文件
-        let temp_dir = std::env::temp_dir().join(".env_test_dotenv_dir");
-        let yi_agent_dir = temp_dir.join(".yi-agent");
-        std::fs::create_dir_all(&yi_agent_dir).unwrap();
-        let env_path = yi_agent_dir.join(".env");
-        std::fs::write(&env_path, "MODEL_API_KEY=from-dotenv-file\n").unwrap();
-
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: Some(temp_dir.clone()),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert_eq!(config.api_key, "from-dotenv-file");
-
-        std::fs::remove_dir_all(&temp_dir).ok();
-    }
-
-    #[test]
-    fn resolve_env_path_uses_yi_agent_subdir_for_workdir() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from("/tmp/my-project")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let path = resolve_env_path(&cli);
-        assert_eq!(path, PathBuf::from("/tmp/my-project/.yi-agent/.env"));
-    }
-
-    #[test]
-    fn resolve_env_path_uses_yi_agent_subdir_for_env_var() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
-        env.set("YI_AGENT_WORKDIR", "/tmp/my-env-dir");
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: None,
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let path = resolve_env_path(&cli);
-        assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
-    }
-
-    #[test]
-    fn load_env_files_loads_global_when_no_local() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // local 不存在,global 存在 → 应该加载 global
-        let temp = std::env::temp_dir().join(".env_test_global_only");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
-
-        env.remove("MODEL_API_KEY");
-        load_env_files(&local_path, Some(&global_path));
-
-        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-global");
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_env_files_local_overrides_global() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // local 和 global 都存在 → local 覆盖 global
-        let temp = std::env::temp_dir().join(".env_test_local_overrides");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
-
-        env.remove("MODEL_API_KEY");
-        load_env_files(&local_path, Some(&global_path));
-
-        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-local");
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_env_files_skips_global_when_none() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // global_path = None → 不加载 global(显式指定 --workdir 的场景)
-        let temp = std::env::temp_dir().join(".env_test_no_global");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
-
-        env.remove("MODEL_API_KEY");
-        load_env_files(&local_path, None);
-
-        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-local");
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_env_files_real_env_overrides_all() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // 真实环境变量 > local > global
-        let temp = std::env::temp_dir().join(".env_test_real_env");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
-
-        env.set("MODEL_API_KEY", "from-real-env");
-        load_env_files(&local_path, Some(&global_path));
-
-        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-real-env");
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_does_not_create_local_yi_agent_dir_in_fallback_mode() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // fallback 模式只读取本地 .yi-agent/.env,不应污染启动目录。
-        let temp = std::env::temp_dir().join(".env_test_auto_create_local");
-        std::fs::remove_dir_all(&temp).ok();
-        std::fs::create_dir_all(&temp).unwrap();
-        let yi_agent_dir = temp.join(".yi-agent");
-        assert!(!yi_agent_dir.exists());
-
-        // 临时切换 current_dir 到 temp
-        let _cwd = CurrentDirGuard::change_to(&temp);
-
-        // 清除可能干扰的环境变量
-        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR", "MODEL_API_KEY"]);
-        env.remove("YI_AGENT_WORKDIR");
-        env.remove("MODEL_API_KEY");
-
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: None,
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let result = load(&cli);
-        assert!(result.is_ok(), "load should succeed: {:?}", result.err());
-
-        assert!(
-            !yi_agent_dir.exists(),
-            ".yi-agent/ should not be created until yi-agent writes a project file"
-        );
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_falls_back_to_current_dir_when_workdir_env_empty() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
-        // 设置空字符串环境变量,应该 fallback 到 current_dir 而非变成空路径
-        env.set("YI_AGENT_WORKDIR", "");
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: None,
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert!(
-            config.workdir.is_absolute(),
-            "workdir should be a valid absolute path (current_dir fallback), got: {}",
-            config.workdir.display()
-        );
+        assert_eq!(overrides.provider, None);
+        assert_eq!(overrides.api_url, None);
+        assert_eq!(overrides.api_key, None);
+        assert_eq!(overrides.model, None);
+        assert_eq!(overrides.max_turns, None);
+        assert_eq!(overrides.workdir, None);
+        assert_eq!(overrides.system_prompt, None);
+        assert_eq!(overrides.model_context_length, None);
+        assert_eq!(overrides.compact_ratio, None);
+        assert_eq!(overrides.compact_keep_turns, None);
+        assert_eq!(overrides.compact_user_budget_tokens, None);
+        assert_eq!(overrides.compact_tool_budget_tokens, None);
+        assert!(!overrides.yolo);
+        assert!(!overrides.skip_permissions);
+        assert_eq!(overrides.sandbox, None);
+        assert!(overrides.sandbox_writable_roots.is_empty());
+        assert_eq!(overrides.skills_catalog_budget, None);
     }
 
     #[test]
@@ -1366,32 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn yolo_env_var_enables_yolo() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_YOLO"]);
-        env.set("YI_AGENT_YOLO", "true");
-        let yolo = std::env::var("YI_AGENT_YOLO")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        assert!(yolo);
-    }
-
-    #[test]
-    fn yolo_env_var_false_by_default() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_YOLO"]);
-        env.remove("YI_AGENT_YOLO");
-        let yolo = std::env::var("YI_AGENT_YOLO")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        assert!(!yolo);
-    }
-
-    #[test]
     fn cli_parses_yolo_flag() {
         use clap::Parser;
         let cli = Cli::parse_from(["yi-agent", "--yolo", "--api-key", "test"]);
@@ -1431,127 +632,6 @@ mod tests {
         ]);
         assert!(!cli.yolo);
         assert!(cli.skip_permissions);
-    }
-
-    fn test_cli() -> Cli {
-        Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        }
-    }
-
-    #[test]
-    fn load_yolo_from_cli_flag() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
-        env.remove("YI_AGENT_SANDBOX");
-        let mut cli = test_cli();
-        cli.yolo = true;
-        let config = load(&cli).unwrap();
-        assert!(config.yolo);
-        assert_eq!(
-            config.sandbox,
-            yi_agent_tools::SandboxMode::DangerFullAccess
-        );
-    }
-
-    #[test]
-    fn explicit_cli_sandbox_overrides_yolo() {
-        let mut cli = test_cli();
-        cli.yolo = true;
-        cli.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
-        assert_eq!(
-            load(&cli).unwrap().sandbox,
-            yi_agent_tools::SandboxMode::ReadOnly
-        );
-    }
-
-    #[test]
-    fn environment_sandbox_overrides_yolo() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
-        env.set("YI_AGENT_SANDBOX", "read-only");
-        let mut cli = test_cli();
-        cli.yolo = true;
-        assert_eq!(
-            load(&cli).unwrap().sandbox,
-            yi_agent_tools::SandboxMode::ReadOnly
-        );
-    }
-
-    #[test]
-    fn skip_permissions_keeps_default_sandbox() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
-        env.remove("YI_AGENT_SANDBOX");
-        let mut cli = test_cli();
-        cli.skip_permissions = true;
-        let config = load(&cli).unwrap();
-        assert!(config.yolo);
-        assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
-    }
-
-    #[test]
-    fn yolo_environment_variable_keeps_default_sandbox() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_YOLO", "YI_AGENT_SANDBOX"]);
-        env.set("YI_AGENT_YOLO", "true");
-        env.remove("YI_AGENT_SANDBOX");
-        let config = load(&test_cli()).unwrap();
-        assert!(config.yolo);
-        assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
-    }
-
-    #[test]
-    fn load_yolo_defaults_false() {
-        let cli = Cli {
-            command: None,
-            provider: None,
-            api_url: None,
-            api_key: Some("test-key".into()),
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from(".")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-            debug: false,
-        };
-        let config = load(&cli).unwrap();
-        assert!(!config.yolo);
     }
 
     #[test]
