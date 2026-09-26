@@ -3791,6 +3791,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "yi-agent-core",
  "yi-agent-runtime",
  "yi-agent-tools",
