@@ -31,6 +31,27 @@ pub fn build_provider(cfg: &RuntimeConfig) -> Result<Arc<dyn yi_agent_core::Prov
     }
 }
 
+/// skills 服务 + 解析后的 system prompt 的装配结果。
+pub struct PromptSetup {
+    pub skills: Option<Arc<yi_agent_skills::SkillsService>>,
+    pub system_prompt: Option<String>,
+}
+
+/// 装配 skills 服务并解析 system prompt(默认 prompt + 当前日期 + skills catalog)。
+pub fn build_prompt_setup(cfg: &RuntimeConfig) -> Result<PromptSetup> {
+    let skills = build_skills_service(cfg)?;
+    let system_prompt = resolve_system_prompt_with_skills(
+        cfg.system_prompt.clone(),
+        &skills,
+        cfg.skills_catalog_budget,
+        cfg.skills_catalog_budget_explicit,
+    );
+    Ok(PromptSetup {
+        skills,
+        system_prompt,
+    })
+}
+
 /// 工具集 + system prompt 的装配结果。
 pub struct ToolSetup {
     pub tools: Arc<yi_agent_core::ToolRegistry>,
@@ -46,9 +67,9 @@ pub fn build_tools(cfg: &RuntimeConfig) -> Result<Arc<yi_agent_core::ToolRegistr
 
 /// 解析 system prompt(默认 prompt + 当前日期 + skills catalog)。
 ///
-/// 非 naked 路径下 [`build_tool_setup`] 恒返回 `Some`;若装配意外失败则返回空串。
+/// 非 naked 路径下 [`build_prompt_setup`] 恒返回 `Some`;若装配意外失败则返回空串。
 pub fn build_system_prompt(cfg: &RuntimeConfig) -> String {
-    build_tool_setup(cfg, false)
+    build_prompt_setup(cfg)
         .map(|setup| setup.system_prompt.unwrap_or_default())
         .unwrap_or_default()
 }
@@ -66,6 +87,18 @@ pub fn build_system_prompt(cfg: &RuntimeConfig) -> String {
 /// **可能读取 stdin** 以询问是否纳入完整 catalog。stdin 非 TTY 的调用方(如
 /// app-server sidecar,其 stdin 是管道)永远不会触发该询问。
 pub fn build_tool_setup(cfg: &RuntimeConfig, naked: bool) -> Result<ToolSetup> {
+    build_tool_setup_in(cfg, naked, &cfg.workdir)
+}
+
+/// 同 [`build_tool_setup`],但内置工具以 `workspace` 为根(子 agent 的 worktree 场景)。
+///
+/// 注意 `workspace` 只影响内置工具与进程工具的根;skills 的项目根仍取
+/// `cfg.workdir`——这一不对称是有意保留的,与无头路径的历史行为一致。
+pub fn build_tool_setup_in(
+    cfg: &RuntimeConfig,
+    naked: bool,
+    workspace: &Path,
+) -> Result<ToolSetup> {
     if naked {
         return Ok(ToolSetup {
             tools: Arc::new(yi_agent_core::ToolRegistry::new()),
@@ -75,30 +108,24 @@ pub fn build_tool_setup(cfg: &RuntimeConfig, naked: bool) -> Result<ToolSetup> {
 
     let mut registry = yi_agent_core::ToolRegistry::new();
 
-    let skills_service = build_skills_service(cfg)?;
-    let system_prompt = resolve_system_prompt_with_skills(
-        cfg.system_prompt.clone(),
-        &skills_service,
-        cfg.skills_catalog_budget,
-        cfg.skills_catalog_budget_explicit,
-    );
+    let prompt = build_prompt_setup(cfg)?;
 
-    if let Some(svc) = &skills_service {
+    if let Some(svc) = &prompt.skills {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
-        cfg.workdir.clone(),
+        workspace.to_path_buf(),
         cfg.sandbox,
         cfg.sandbox_writable_roots.clone(),
     );
 
     let process_manager = yi_agent_tools::ProcessManager::with_sandbox(
-        cfg.workdir.clone(),
+        workspace.to_path_buf(),
         yi_agent_tools::SandboxPolicy::new(
             cfg.sandbox,
-            &cfg.workdir,
+            workspace,
             cfg.sandbox_writable_roots.clone(),
         ),
     );
@@ -106,7 +133,7 @@ pub fn build_tool_setup(cfg: &RuntimeConfig, naked: bool) -> Result<ToolSetup> {
 
     Ok(ToolSetup {
         tools: Arc::new(registry),
-        system_prompt,
+        system_prompt: prompt.system_prompt,
     })
 }
 
@@ -135,6 +162,22 @@ pub struct AgentBootstrap {
     pub decision_rx: Option<DecisionReceiver>,
 }
 
+/// 由运行时配置构造 [`yi_agent_core::AgentConfig`](集中一处,避免各调用点漂移)。
+pub fn build_agent_config(
+    cfg: &RuntimeConfig,
+    system_prompt: Option<String>,
+) -> yi_agent_core::AgentConfig {
+    yi_agent_core::AgentConfig {
+        model: cfg.model.clone(),
+        system_prompt,
+        max_turns: Some(cfg.max_turns),
+        compact_threshold: Some(cfg.compact_threshold),
+        compact_user_budget_tokens: cfg.compact_user_budget_tokens,
+        compact_tool_budget_tokens: cfg.compact_tool_budget_tokens,
+        ..Default::default()
+    }
+}
+
 /// 组装 provider + 工具 + 权限通道,返回可运行的 agent。
 pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<AgentBootstrap> {
     let provider = build_provider(cfg)?;
@@ -150,15 +193,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
     let rx_arc = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
-    let agent_config = yi_agent_core::AgentConfig {
-        model: cfg.model.clone(),
-        system_prompt: setup.system_prompt,
-        max_turns: Some(cfg.max_turns),
-        compact_threshold: Some(cfg.compact_threshold),
-        compact_user_budget_tokens: cfg.compact_user_budget_tokens,
-        compact_tool_budget_tokens: cfg.compact_tool_budget_tokens,
-        ..Default::default()
-    };
+    let agent_config = build_agent_config(cfg, setup.system_prompt);
 
     match mode {
         PermissionMode::Interactive => {
@@ -193,7 +228,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
 /// `PermissionChecker::load` 是 async,但 [`bootstrap_agent`] 是同步函数。
 /// 当调用方本身已处于 Tokio runtime 内时,直接 `Runtime::block_on` 会 panic,
 /// 因此在专用线程(无 runtime 上下文)上跑加载——无论调用方是否在 runtime 内都成立。
-fn load_permission_checker(
+pub fn load_permission_checker(
     workdir: &Path,
     yolo: bool,
 ) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
@@ -388,6 +423,117 @@ mod tests {
         let cfg = sample_config();
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("Current date:"), "prompt was: {prompt}");
+    }
+
+    #[test]
+    fn resolve_system_prompt_none_uses_default() {
+        let resolved = resolve_system_prompt(None);
+        let default = yi_agent_core::AgentConfig::default_system_prompt();
+        // The resolved prompt should start with the default prompt and have
+        // the current date appended at the end.
+        assert!(
+            resolved.as_deref().is_some_and(|r| r.starts_with(&default)),
+            "resolved should start with default prompt"
+        );
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            resolved.as_deref().is_some_and(|r| r.ends_with(&today)),
+            "resolved should end with today's date: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_system_prompt_custom_keeps_base_instructions() {
+        let resolved = resolve_system_prompt(Some("custom".into()));
+        let default = yi_agent_core::AgentConfig::default_system_prompt();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            resolved.as_deref().is_some_and(|r| r.starts_with(&default)
+                && r.contains("User-provided instructions:\ncustom")
+                && r.ends_with(&today)),
+            "resolved should retain base instructions, append custom prompt, and end with date: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_budget_explicit_returns_default() {
+        // When explicit=true, should return default regardless of total.
+        assert_eq!(resolve_effective_budget(100_000, 8192, true), 8192);
+        assert_eq!(resolve_effective_budget(0, 8192, true), 8192);
+        assert_eq!(resolve_effective_budget(8192, 8192, true), 8192);
+    }
+
+    #[test]
+    fn resolve_effective_budget_total_under_default_returns_default() {
+        // When total <= default, should return default.
+        assert_eq!(resolve_effective_budget(4096, 8192, false), 8192);
+        assert_eq!(resolve_effective_budget(8192, 8192, false), 8192);
+        assert_eq!(resolve_effective_budget(0, 8192, false), 8192);
+    }
+
+    #[test]
+    fn resolve_effective_budget_non_interactive_returns_default() {
+        // Tests run non-interactive (stdin is not a TTY), so even when
+        // total > default and explicit=false, should return default without prompting.
+        assert_eq!(resolve_effective_budget(100_000, 8192, false), 8192);
+    }
+
+    #[test]
+    fn resolve_system_prompt_with_skills_no_service_returns_base() {
+        // When service is None, should fall back to base via resolve_system_prompt
+        // (which appends the current date).
+        let resolved = resolve_system_prompt_with_skills(None, &None, 8192, false);
+        let expected = resolve_system_prompt(None);
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_system_prompt_with_skills_empty_catalog_returns_base() {
+        // When service is Some but catalog is empty (no skills discovered),
+        // should return the base prompt unchanged (with current date appended).
+        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
+        let expected = resolve_system_prompt(None);
+        let resolved = resolve_system_prompt_with_skills(None, &Some(svc), 8192, false);
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn build_agent_config_maps_all_fields() {
+        let mut cfg = sample_config();
+        cfg.model = "mapped-model".into();
+        cfg.max_turns = 7;
+        cfg.compact_threshold = 42_000;
+        cfg.compact_user_budget_tokens = 1_234;
+        cfg.compact_tool_budget_tokens = 5_678;
+
+        let agent_config = build_agent_config(&cfg, Some("sys".into()));
+
+        assert_eq!(agent_config.model, "mapped-model");
+        assert_eq!(agent_config.system_prompt.as_deref(), Some("sys"));
+        assert_eq!(agent_config.max_turns, Some(7));
+        assert_eq!(agent_config.compact_threshold, Some(42_000));
+        assert_eq!(agent_config.compact_user_budget_tokens, 1_234);
+        assert_eq!(agent_config.compact_tool_budget_tokens, 5_678);
+    }
+
+    #[test]
+    fn build_tool_setup_in_uses_workspace() {
+        let cfg = sample_config();
+        let workspace = std::path::Path::new("/tmp/other-workspace");
+
+        let setup = build_tool_setup_in(&cfg, false, workspace).expect("build setup in workspace");
+        assert!(
+            !setup.tools.is_empty(),
+            "non-naked setup registers builtin tools"
+        );
+        assert!(
+            setup.system_prompt.is_some(),
+            "non-naked setup resolves a system prompt"
+        );
+
+        let naked = build_tool_setup_in(&cfg, true, workspace).expect("build naked setup");
+        assert!(naked.tools.is_empty());
+        assert!(naked.system_prompt.is_none());
     }
 
     #[tokio::test]
