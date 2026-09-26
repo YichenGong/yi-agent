@@ -49,14 +49,14 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let cfg_for_factory = cfg.clone();
-    run_with(reader, writer, cfg, PERMISSION_TIMEOUT, move || {
-        yi_agent_runtime::bootstrap::bootstrap_agent(
+    run_with(reader, writer, cfg, PERMISSION_TIMEOUT, move |session| {
+        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
             &cfg_for_factory,
             yi_agent_runtime::bootstrap::PermissionMode::Interactive,
-        )
-        .map(|b| BuiltAgent {
-            agent: b.agent,
-            decision_tx: b.decision_tx,
+        )?;
+        Ok(BuiltAgent {
+            agent: apply_session(built.agent, session),
+            decision_tx: built.decision_tx,
         })
     })
     .await
@@ -77,7 +77,7 @@ async fn run_with<R, W, F>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    F: Fn() -> anyhow::Result<BuiltAgent> + Send + 'static,
+    F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
 {
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -103,6 +103,7 @@ where
     });
 
     let writer = Arc::new(MessageWriter::new(writer));
+    let store = Arc::new(crate::thread_store::ThreadStore::new(&cfg.workdir));
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
@@ -117,7 +118,6 @@ where
 
     let mut initialized = false;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
-    let mut next_thread: u64 = 1;
     // 主循环用该计数器分配 turn id(`turn-{n}`)。
     let mut next_turn: u64 = 1;
 
@@ -214,10 +214,9 @@ where
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
                     "thread/start" => {
-                        let thread_id = format!("thread-{next_thread}");
-                        next_thread += 1;
+                        let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
 
-                        let BuiltAgent { agent, decision_tx } = match build_agent() {
+                        let BuiltAgent { agent, decision_tx } = match build_agent(None) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -230,6 +229,21 @@ where
 
                         let cwd = cfg.workdir.display().to_string();
                         let model = cfg.model.clone();
+
+                        let now = crate::thread_store::now_millis();
+                        let meta = crate::thread_store::ThreadMeta {
+                            thread_id: thread_id.clone(),
+                            cwd: cwd.clone(),
+                            model: model.clone(),
+                            created_at: now,
+                            updated_at: now,
+                            title: None,
+                        };
+                        if let Err(e) = store.create(&meta) {
+                            // 持久化是尽力而为:写失败不阻断 thread 创建。
+                            eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
+                        }
+
                         threads.insert(
                             thread_id.clone(),
                             ThreadSession {
@@ -393,6 +407,17 @@ where
     }
 
     Ok(())
+}
+
+/// 恢复会话:`Some` 时用载入的历史覆盖 agent 的 session,`None` 时保持新建的空 session。
+fn apply_session(
+    agent: yi_agent_core::Agent,
+    session: Option<yi_agent_core::Session>,
+) -> yi_agent_core::Agent {
+    match session {
+        Some(s) => agent.with_session(s),
+        None => agent,
+    }
 }
 
 fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
@@ -719,34 +744,43 @@ mod tests {
         }
     }
 
-    fn build_test_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_test_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
-            agent: yi_agent_core::Agent::new(
-                Arc::new(MockProvider),
-                Arc::new(yi_agent_core::ToolRegistry::new()),
-                yi_agent_core::AgentConfig::default(),
+            agent: apply_session(
+                yi_agent_core::Agent::new(
+                    Arc::new(MockProvider),
+                    Arc::new(yi_agent_core::ToolRegistry::new()),
+                    yi_agent_core::AgentConfig::default(),
+                ),
+                session,
             ),
             decision_tx: None,
         })
     }
 
-    fn build_slow_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_slow_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
-            agent: yi_agent_core::Agent::new(
-                Arc::new(SlowProvider),
-                Arc::new(yi_agent_core::ToolRegistry::new()),
-                yi_agent_core::AgentConfig::default(),
+            agent: apply_session(
+                yi_agent_core::Agent::new(
+                    Arc::new(SlowProvider),
+                    Arc::new(yi_agent_core::ToolRegistry::new()),
+                    yi_agent_core::AgentConfig::default(),
+                ),
+                session,
             ),
             decision_tx: None,
         })
     }
 
-    fn build_delayed_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_delayed_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
-            agent: yi_agent_core::Agent::new(
-                Arc::new(DelayedProvider),
-                Arc::new(yi_agent_core::ToolRegistry::new()),
-                yi_agent_core::AgentConfig::default(),
+            agent: apply_session(
+                yi_agent_core::Agent::new(
+                    Arc::new(DelayedProvider),
+                    Arc::new(yi_agent_core::ToolRegistry::new()),
+                    yi_agent_core::AgentConfig::default(),
+                ),
+                session,
             ),
             decision_tx: None,
         })
@@ -787,17 +821,19 @@ mod tests {
         /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
         fn with_factory<F>(build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn() -> anyhow::Result<BuiltAgent> + Send + 'static,
+            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+        {
+            Self::with_config(test_config(), build, permission_timeout)
+        }
+
+        /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
+        fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
+        where
+            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
         {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-            let handle = tokio::spawn(run_with(
-                server_r,
-                server_w,
-                test_config(),
-                permission_timeout,
-                build,
-            ));
+            let handle = tokio::spawn(run_with(server_r, server_w, cfg, permission_timeout, build));
             Self {
                 client_w,
                 client_r: BufReader::new(client_r),
@@ -1004,7 +1040,7 @@ mod tests {
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
-            || Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
+            |_s: Option<yi_agent_core::Session>| Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1237,7 +1273,7 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent().unwrap().agent,
+            build_delayed_agent(None).unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1302,7 +1338,7 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent().unwrap().agent,
+            build_test_agent(None).unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1343,7 +1379,7 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent().unwrap().agent,
+            build_test_agent(None).unwrap().agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1469,7 +1505,9 @@ mod tests {
     }
 
     /// 构造一个会触发 bash 审批的 agent,并把决定通道交给 driver。
-    fn build_permission_agent() -> anyhow::Result<BuiltAgent> {
+    fn build_permission_agent(
+        session: Option<yi_agent_core::Session>,
+    ) -> anyhow::Result<BuiltAgent> {
         let provider = Arc::new(PermissionMockProvider {
             calls: AtomicUsize::new(0),
         });
@@ -1483,12 +1521,15 @@ mod tests {
         ));
         let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
         let rx_arc = Arc::new(Mutex::new(decision_rx));
-        let agent = yi_agent_core::Agent::new(
-            provider,
-            Arc::new(registry),
-            yi_agent_core::AgentConfig::default(),
-        )
-        .with_permission(checker, rx_arc);
+        let agent = apply_session(
+            yi_agent_core::Agent::new(
+                provider,
+                Arc::new(registry),
+                yi_agent_core::AgentConfig::default(),
+            )
+            .with_permission(checker, rx_arc),
+            session,
+        );
         Ok(BuiltAgent {
             agent,
             decision_tx: Some(decision_tx),
@@ -1685,7 +1726,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let perm_seq = Arc::new(AtomicU64::new(1));
 
-        let built = build_permission_agent().unwrap();
+        let built = build_permission_agent(None).unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             built.agent,
@@ -1750,5 +1791,35 @@ mod tests {
 
         drop(prompt_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_allocates_uuid_id_and_writes_meta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+
+        let tid = start_thread(&mut h).await;
+        assert!(
+            tid.starts_with("thread-"),
+            "expected thread-<uuid>, got {tid}"
+        );
+        assert!(
+            tid.len() > "thread-".len() + 8,
+            "expected a uuid suffix: {tid}"
+        );
+
+        let meta = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.meta.json"));
+        assert!(
+            meta.exists(),
+            "thread/start must write meta at {}",
+            meta.display()
+        );
+
+        h.shutdown().await;
     }
 }
