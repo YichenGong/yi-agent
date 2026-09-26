@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
+import { MarkdownText } from "./MarkdownText";
 import { ToolCallCard } from "./ToolCallCard";
 
 export function ChatView({
@@ -40,11 +41,8 @@ export function ChatView({
             );
           case "agentMessage":
             return (
-              <div
-                key={item.id}
-                className="my-1 max-w-[90%] self-start font-mono text-sm whitespace-pre-wrap text-neutral-100"
-              >
-                {item.text}
+              <div key={item.id} className="my-1 max-w-[90%] self-start">
+                <MarkdownText text={item.text} />
               </div>
             );
           case "toolCall":
