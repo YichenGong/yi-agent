@@ -329,6 +329,27 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_becomes_turn_retry_notification() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::ProviderRetry {
+            attempt: 1,
+            max: 3,
+            idle_secs: 60,
+        });
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Notification::TurnRetry {
+                    attempt: 1,
+                    max: 3,
+                    ..
+                }]
+            ),
+            "expected TurnRetry, got: {out:?}"
+        );
+    }
+
+    #[test]
     fn assistant_text_starts_agent_message() {
         let mut t = translator();
         let out = t.on_event(AgentEvent::AssistantText("hello".into()));
