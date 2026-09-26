@@ -488,6 +488,75 @@ where
                         )
                         .await?;
                     }
+                    "thread/rename" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let title = req
+                            .params
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if title.is_empty() {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("title must not be empty")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        match store.rename(&thread_id, &title) {
+                            Ok(true) => {
+                                write_response(&writer, ok_response(id, json!({}))).await?;
+                            }
+                            Ok(false) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    "thread/delete" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let in_memory = threads.contains_key(&thread_id);
+                        let on_disk = store.exists(&thread_id);
+                        if !in_memory && !on_disk {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // 活跃 thread:先中断,再从内存移除(drop prompt_tx 让 driver 收尾)。
+                        if let Some(s) = threads.get(&thread_id) {
+                            if let Some(tid) = s.active_turn_id.clone() {
+                                let _ = s.interrupt_tx.try_send(tid);
+                            }
+                        }
+                        threads.remove(&thread_id);
+                        if let Err(e) = store.delete(&thread_id) {
+                            eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
+                        }
+                        write_response(&writer, ok_response(id, json!({}))).await?;
+                    }
                     "turn/start" => {
                         // `id` 后续响应仍需使用,故传 clone。
                         let Some(thread_id) =
@@ -2325,6 +2394,141 @@ mod tests {
         let v = h.read_value().await;
         assert_eq!(v["id"], 2);
         assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_rename_updates_title() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/rename","params":{{"threadId":"{tid}","title":"my chat"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 3);
+        assert!(v.get("error").is_none(), "rename must succeed: {v}");
+
+        let meta = std::fs::read_to_string(
+            dir.path()
+                .join(".yi-agent/threads")
+                .join(format!("{tid}.meta.json")),
+        )
+        .unwrap();
+        assert!(
+            meta.contains("my chat"),
+            "meta must carry the title: {meta}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_rename_rejects_empty_title() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/rename","params":{{"threadId":"{tid}","title":"   "}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "blank title must be rejected: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_rename_unknown_returns_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/rename","params":{"threadId":"nope","title":"x"}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_delete_removes_files_and_unknown_is_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert!(v.get("error").is_none(), "delete must succeed: {v}");
+        assert!(
+            !dir.path()
+                .join(".yi-agent/threads")
+                .join(format!("{tid}.meta.json"))
+                .exists(),
+            "meta must be gone"
+        );
+
+        // 再次删除:thread 已完全未知 → -32011。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_delete_active_thread_removes_it_from_memory() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        // 等 turn 活跃。
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/started") {
+                break;
+            }
+        }
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut deleted = false;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                assert!(v.get("error").is_none(), "delete must succeed: {v}");
+                deleted = true;
+                break;
+            }
+        }
+        assert!(deleted, "thread/delete must respond");
+
+        // 删除后该 thread 已不在内存:再发 turn 应得 -32011。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"x"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                assert_eq!(
+                    v["error"]["code"], -32011,
+                    "deleted thread must be unknown: {v}"
+                );
+                break;
+            }
+        }
         h.shutdown().await;
     }
 }
