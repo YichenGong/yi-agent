@@ -3,7 +3,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use yi_agent_core::{ContentBlock, ProviderRequest, Role, ToolSchema};
+use yi_agent_core::{ContentBlock, ImageSource, ProviderRequest, Role, ToolSchema};
 
 /// OpenAI /v1/chat/completions request body.
 #[derive(Serialize)]
@@ -42,7 +42,24 @@ pub struct OpenaiMessage {
 #[serde(untagged)]
 pub enum OpenaiContent {
     Text(String),
+    Parts(Vec<OpenaiContentPart>),
     ToolCalls(Vec<OpenaiToolCall>),
+}
+
+/// A content part inside a user message. Only user messages may carry image
+/// parts — tool messages are restricted to text by the Chat Completions API.
+#[derive(Serialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenaiContentPart {
+    Text { text: String },
+    ImageUrl { image_url: OpenaiImageUrl },
+}
+
+#[derive(Serialize, Debug)]
+pub struct OpenaiImageUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -107,6 +124,45 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .join("")
 }
 
+/// Build an `image_url` part from an image content block.
+fn image_part(block: &ContentBlock) -> Option<OpenaiContentPart> {
+    match block {
+        ContentBlock::Image { source, detail } => {
+            let url = match source {
+                ImageSource::Base64 { media_type, data } => {
+                    format!("data:{media_type};base64,{data}")
+                }
+                ImageSource::Url(url) => url.clone(),
+            };
+            Some(OpenaiContentPart::ImageUrl {
+                image_url: OpenaiImageUrl {
+                    url,
+                    detail: Some(detail.as_wire_str().to_string()),
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+/// User-message content: a bare string when there are no images, otherwise a
+/// content-part array (OpenAI only accepts image parts in user messages).
+fn user_content(blocks: &[ContentBlock]) -> OpenaiContent {
+    let has_image = blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Image { .. }));
+    if !has_image {
+        return OpenaiContent::Text(extract_text(blocks));
+    }
+    let mut parts: Vec<OpenaiContentPart> = Vec::new();
+    let text = extract_text(blocks);
+    if !text.is_empty() {
+        parts.push(OpenaiContentPart::Text { text });
+    }
+    parts.extend(blocks.iter().filter_map(image_part));
+    OpenaiContent::Parts(parts)
+}
+
 impl From<ProviderRequest> for OpenaiRequest {
     fn from(req: ProviderRequest) -> Self {
         let mut messages: Vec<OpenaiMessage> = Vec::new();
@@ -137,11 +193,10 @@ impl From<ProviderRequest> for OpenaiRequest {
                     }
                 }
                 Role::User => {
-                    let text = extract_text(&m.content);
                     messages.push(OpenaiMessage {
                         role: "user".to_string(),
                         name: None,
-                        content: Some(OpenaiContent::Text(text)),
+                        content: Some(user_content(&m.content)),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -190,6 +245,12 @@ impl From<ProviderRequest> for OpenaiRequest {
                     });
                 }
                 Role::Tool => {
+                    // OpenAI tool messages may only carry text, and all tool
+                    // messages for one assistant turn must be contiguous.
+                    // Collect images and emit them afterwards in a single
+                    // user message (the only role that accepts image parts).
+                    let mut image_parts: Vec<OpenaiContentPart> = Vec::new();
+
                     for block in m.content {
                         if let ContentBlock::ToolResult {
                             tool_use_id,
@@ -198,11 +259,22 @@ impl From<ProviderRequest> for OpenaiRequest {
                         } = block
                         {
                             let text = extract_text(&content);
-                            let body = if is_error {
+                            let has_image = content
+                                .iter()
+                                .any(|b| matches!(b, ContentBlock::Image { .. }));
+                            if has_image {
+                                image_parts.extend(content.iter().filter_map(image_part));
+                            }
+
+                            let mut body = if is_error {
                                 format!("error: {}", text)
                             } else {
                                 text
                             };
+                            if has_image {
+                                body.push_str("\n[image attached in the following message]");
+                            }
+
                             messages.push(OpenaiMessage {
                                 role: "tool".to_string(),
                                 name: None,
@@ -211,6 +283,16 @@ impl From<ProviderRequest> for OpenaiRequest {
                                 tool_call_id: Some(tool_use_id),
                             });
                         }
+                    }
+
+                    if !image_parts.is_empty() {
+                        messages.push(OpenaiMessage {
+                            role: "user".to_string(),
+                            name: None,
+                            content: Some(OpenaiContent::Parts(image_parts)),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
                     }
                 }
             }
@@ -237,7 +319,7 @@ impl From<ProviderRequest> for OpenaiRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yi_agent_core::{GenParams, Message};
+    use yi_agent_core::{GenParams, ImageDetail, ImageSource, Message, Role};
 
     #[test]
     fn converts_simple_user_text_request() {
@@ -466,5 +548,164 @@ mod tests {
         let o: OpenaiRequest = req.into();
         let json = serde_json::to_value(&o).unwrap();
         assert_eq!(json["stop"], serde_json::json!(["END"]));
+    }
+
+    #[test]
+    fn user_message_with_image_serializes_content_parts() {
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text("what is this?".into()),
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "AAA".into(),
+                        },
+                        detail: ImageDetail::High,
+                    },
+                ],
+            }],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        let content = &json["messages"][0]["content"];
+        assert!(
+            content.is_array(),
+            "content must be an array when it has an image"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAA");
+        assert_eq!(content[1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn user_message_without_image_stays_string() {
+        // Regression: plain text user content must still serialize as a bare string.
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        assert_eq!(json["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn tool_result_with_image_splits_into_tool_then_user() {
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "call_01".into(),
+            content: vec![
+                ContentBlock::Text("viewed logo.png (8x8, image/png)".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAA".into(),
+                    },
+                    detail: ImageDetail::High,
+                },
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "expected tool message + follow-up user message"
+        );
+
+        // 1) tool message: string content, image replaced by placeholder
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "call_01");
+        let body = msgs[0]["content"]
+            .as_str()
+            .expect("tool content must be a string");
+        assert!(body.contains("viewed logo.png"));
+        assert!(body.contains("image attached"));
+
+        // 2) user message: image_url part
+        assert_eq!(msgs[1]["role"], "user");
+        let content = &msgs[1]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,AAA");
+    }
+
+    #[test]
+    fn tool_results_with_images_emit_all_tools_before_user() {
+        // Two tool results, both with images: both tool messages must precede
+        // the single user message, or OpenAI rejects the pairing.
+        let mk = |id: &str, data: &str| ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: vec![
+                ContentBlock::Text("viewed".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: data.into(),
+                    },
+                    detail: ImageDetail::High,
+                },
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![
+                mk("c1", "AAA"),
+                mk("c2", "BBB"),
+            ])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "c1");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "c2");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tool_result_without_image_stays_string() {
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "call_01".into(),
+            content: vec![ContentBlock::Text("ok".into())],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        assert_eq!(json["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(json["messages"][0]["content"], "ok");
     }
 }
