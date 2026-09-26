@@ -327,39 +327,9 @@ where
                             continue;
                         };
                         // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
-                        // 落盘完成。driver 是「先发 turn/completed,后 append/touch」,
-                        // 而 `TurnEvent::Finished` 在落盘之后才发出,故必须等它,
-                        // 否则紧随 turn/completed 的 resume 会读到尚未写入的历史。
-                        if let Some(tid) = threads
-                            .get(&thread_id)
-                            .and_then(|s| s.active_turn_id.clone())
-                        {
-                            if let Some(s) = threads.get(&thread_id) {
-                                let _ = s.interrupt_tx.try_send(tid.clone());
-                            }
-                            let wait_for_persist = async {
-                                while let Some(TurnEvent::Finished {
-                                    thread_id: done_id,
-                                    turn_id: done_turn,
-                                }) = turn_rx.recv().await
-                                {
-                                    if let Some(s) = threads.get_mut(&done_id) {
-                                        if s.active_turn_id.as_deref() == Some(done_turn.as_str()) {
-                                            s.active_turn_id = None;
-                                        }
-                                    }
-                                    if done_id == thread_id && done_turn == tid {
-                                        break;
-                                    }
-                                }
-                            };
-                            // 有界等待:driver 异常卡死时不至于拖垮整个请求循环。
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                wait_for_persist,
-                            )
-                            .await;
-                        }
+                        // 落盘完成,否则紧随 turn/completed 的 resume 会读到尚未写入
+                        // 的历史。详见 `interrupt_and_wait_for_persist`。
+                        interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
 
                         let loaded = match store.load(&thread_id) {
                             Ok(Some(l)) => l,
@@ -545,43 +515,12 @@ where
                             .await?;
                             continue;
                         }
-                        // 活跃 thread:先中断,再等 driver 落盘完成才删文件。
-                        // driver 是「先发 turn/completed,后 append/touch」,而
-                        // `TurnEvent::Finished` 在落盘之后才发出。若像旧实现那样在
-                        // driver 落盘前就删文件,driver 的 `append_turn`
+                        // 活跃 thread:先中断,再等 driver 落盘完成才删文件。若像旧
+                        // 实现那样在 driver 落盘前就删文件,driver 的 `append_turn`
                         // (`create(true)`)会把 `<id>.jsonl` 复活,导致删除后
                         // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
                         // 故复用 resume 的等待模式,等落盘后再删。
-                        if let Some(tid) = threads
-                            .get(&thread_id)
-                            .and_then(|s| s.active_turn_id.clone())
-                        {
-                            if let Some(s) = threads.get(&thread_id) {
-                                let _ = s.interrupt_tx.try_send(tid.clone());
-                            }
-                            let wait_for_persist = async {
-                                while let Some(TurnEvent::Finished {
-                                    thread_id: done_id,
-                                    turn_id: done_turn,
-                                }) = turn_rx.recv().await
-                                {
-                                    if let Some(s) = threads.get_mut(&done_id) {
-                                        if s.active_turn_id.as_deref() == Some(done_turn.as_str()) {
-                                            s.active_turn_id = None;
-                                        }
-                                    }
-                                    if done_id == thread_id && done_turn == tid {
-                                        break;
-                                    }
-                                }
-                            };
-                            // 有界等待:driver 异常卡死时不至于拖垮整个请求循环。
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                wait_for_persist,
-                            )
-                            .await;
-                        }
+                        interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         if let Err(e) = store.delete(&thread_id) {
@@ -781,6 +720,52 @@ fn finished_event(thread_id: &str, turn_id: &str) -> TurnEvent {
     TurnEvent::Finished {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
+    }
+}
+
+/// 若 `thread_id` 有活跃 turn,中断它并等待 driver 落盘完成。
+///
+/// driver 是「先发 turn/completed,后 append/touch」,而 `TurnEvent::Finished`
+/// 在落盘之后才发出;因此本函数返回后,调用方可以依赖「该 turn 已落盘」。
+/// 有界等待:driver 异常卡死时不至于拖垮整个请求循环。
+async fn interrupt_and_wait_for_persist(
+    threads: &mut HashMap<String, ThreadSession>,
+    turn_rx: &mut mpsc::Receiver<TurnEvent>,
+    thread_id: &str,
+) {
+    let Some(tid) = threads
+        .get(thread_id)
+        .and_then(|s| s.active_turn_id.clone())
+    else {
+        return;
+    };
+    if let Some(s) = threads.get(thread_id) {
+        let _ = s.interrupt_tx.try_send(tid.clone());
+    }
+    let wait_for_persist = async {
+        while let Some(TurnEvent::Finished {
+            thread_id: done_id,
+            turn_id: done_turn,
+        }) = turn_rx.recv().await
+        {
+            if let Some(s) = threads.get_mut(&done_id) {
+                if s.active_turn_id.as_deref() == Some(done_turn.as_str()) {
+                    s.active_turn_id = None;
+                }
+            }
+            if done_id == thread_id && done_turn == tid {
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_persist)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "[app-server] timed out waiting for turn of {thread_id} to persist; \
+             a late driver append may resurrect its files"
+        );
     }
 }
 
