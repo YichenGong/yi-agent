@@ -71,9 +71,14 @@ After installing a skill, verify it is valid:
 
 If any check fails, remove the skill directory and report the issue.
 
-## Restart to Load
+## Reloading
 
-yi-agent discovers skills at startup. After installing a new skill, restart yi-agent to load it. There is no hot-reload.
+yi-agent re-scans the skill roots automatically: the TUI and app-server refresh
+the catalog before each message/turn, and the daemon refreshes it before each
+worker task. New or renamed skills therefore appear without a restart.
+
+A skill's body is read from disk on every `Skill` tool call, so edits to an
+existing skill take effect immediately.
 
 ## Communication
 
@@ -85,7 +90,7 @@ ls ~/.yi-agent/skills/ <project>/.yi-agent/skills/ 2>/dev/null
 
 After installing a skill, tell the user:
 - The skill is installed at `<path>`
-- It will be available on the next yi-agent restart
+- The skill is available immediately; yi-agent re-scans skills automatically, so no restart is needed
 - They can trigger it by asking yi-agent to do something related to the skill's description
 
 ## Behavior and Options

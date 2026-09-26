@@ -22,10 +22,11 @@ yi-agent 的 skills 系统，提供可发现的 skill 目录（类似 Claude Cod
 
 ## Features
 
-- [x] Skills 系统设计 — 设计与实现文档齐全 — [设计](../plans/2026-07-25-skills-design.md) · [实现](../plans/2026-07-25-skills-impl.md)
+- [x] Skills 系统设计 — 设计与实现文档齐全 — [设计](../superpowers/plans/2026-07-25-skills-design.md) · [实现](../superpowers/plans/2026-07-25-skills-impl.md)
 - [x] Skill 元数据与作用域 — `crates/yi-agent-skills/src/model.rs` 定义 `SkillMetadata` + `SkillScope`（Project/User/System）
 - [x] 多根目录发现与 YAML 加载 — `discovery.rs::discover_skills()` + `loader.rs` 实现 YAML 解析校验
 - [x] `SkillsService` — `service.rs::SkillsService` 提供 `snapshot()` / `render_catalog()` / `full_catalog_size()`
 - [x] 系统内置 skill 安装 — `system.rs::install_system_skills()` + `assets/` 目录含内置 skill 定义
 - [x] `SkillTool` 注册到 agent — `crates/yi-agent-tools/src/skill_tool.rs` 实现 `Tool` trait；注册点：`yi-agent-runtime/src/bootstrap.rs:114`（TUI / headless）、`crates/yi-agent/src/main.rs`（daemon worker / TUI 根工具）
-- [x] 系统提示词注入 skill catalog — `yi-agent-runtime/src/bootstrap.rs::resolve_system_prompt_with_skills()` 按 `--skills-catalog-budget` 截断注入；验证：`cargo test -p yi-agent-runtime --lib resolve_system_prompt_with_skills_`
+- [x] 系统提示词注入 skill catalog — `yi-agent-runtime/src/bootstrap.rs::SkillsCatalogHandle::current_system_prompt()` 渲染 catalog（`build_catalog_handle` + `resolve_catalog_budget_policy`），仍按 `--skills-catalog-budget` 截断注入；验证：`cargo test -p yi-agent-runtime --lib catalog_handle_`
+- [x] Skills catalog 热重载 — `yi-agent-runtime/src/bootstrap.rs::SkillsCatalogHandle::current_system_prompt()` 每条消息/每轮/每任务重扫；验证：`cargo test -p yi-agent-runtime --lib catalog_handle_`

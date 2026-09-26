@@ -38,6 +38,8 @@ struct BuiltAgent {
     agent: yi_agent_core::Agent,
     /// 交互模式下的权限决定回传端;None 表示该 agent 不需要审批。
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
+    /// 刷新 skills catalog 的句柄;无 skills 服务时为 `None`。
+    catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
 }
 
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
@@ -57,6 +59,7 @@ where
         .map(|b| BuiltAgent {
             agent: b.agent,
             decision_tx: b.decision_tx,
+            catalog: b.catalog,
         })
     })
     .await
@@ -217,7 +220,11 @@ where
                         let thread_id = format!("thread-{next_thread}");
                         next_thread += 1;
 
-                        let BuiltAgent { agent, decision_tx } = match build_agent() {
+                        let BuiltAgent {
+                            agent,
+                            decision_tx,
+                            catalog,
+                        } = match build_agent() {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -258,6 +265,7 @@ where
                             Arc::clone(&pending),
                             permission_timeout,
                             Arc::clone(&perm_seq),
+                            catalog,
                         ));
 
                         write_notification(
@@ -488,6 +496,7 @@ async fn run_thread_driver<W>(
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
     permission_timeout: Duration,
     perm_seq: Arc<AtomicU64>,
+    catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -495,6 +504,14 @@ async fn run_thread_driver<W>(
     let mut translator = Translator::new(thread_id.clone());
     while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
         translator.set_turn(turn_id.clone());
+
+        // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
+        // system prompt(catalog 未变时输出逐字节相同,不破坏 prompt cache)。
+        if let Some(handle) = &catalog {
+            if let Some(new_prompt) = handle.current_system_prompt() {
+                agent.set_system_prompt(Some(new_prompt));
+            }
+        }
 
         let mut stream = match agent.run(prompt).await {
             Ok(s) => s,
@@ -727,6 +744,7 @@ mod tests {
                 yi_agent_core::AgentConfig::default(),
             ),
             decision_tx: None,
+            catalog: None,
         })
     }
 
@@ -738,6 +756,7 @@ mod tests {
                 yi_agent_core::AgentConfig::default(),
             ),
             decision_tx: None,
+            catalog: None,
         })
     }
 
@@ -749,6 +768,7 @@ mod tests {
                 yi_agent_core::AgentConfig::default(),
             ),
             decision_tx: None,
+            catalog: None,
         })
     }
 
@@ -1246,6 +1266,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
+            None,
         ));
 
         // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1311,6 +1332,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
+            None,
         ));
 
         prompt_tx
@@ -1352,6 +1374,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(1)),
+            None,
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1492,6 +1515,7 @@ mod tests {
         Ok(BuiltAgent {
             agent,
             decision_tx: Some(decision_tx),
+            catalog: None,
         })
     }
 
@@ -1697,6 +1721,7 @@ mod tests {
             Arc::clone(&pending),
             Duration::from_secs(60),
             Arc::clone(&perm_seq),
+            None,
         ));
 
         prompt_tx

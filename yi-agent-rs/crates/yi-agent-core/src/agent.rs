@@ -352,6 +352,15 @@ impl Agent {
         self
     }
 
+    /// Replace the system prompt used by subsequent runs.
+    ///
+    /// `run()` clones the config at the start of each run, so setting this
+    /// before `run()` takes effect for that run. Used by hot-reload paths
+    /// (e.g. the skills catalog) to refresh the prompt between messages.
+    pub fn set_system_prompt(&mut self, prompt: Option<String>) {
+        self.config.system_prompt = prompt;
+    }
+
     pub fn session(&self) -> Session {
         self.session.lock().unwrap().clone()
     }
@@ -2852,6 +2861,47 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.system_prompt.as_deref(), Some("be brief"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_system_prompt_is_used_by_next_run() {
+        use crate::provider::{ProviderError, ProviderEvent};
+
+        struct InspectingProvider(std::sync::Mutex<Option<ProviderRequest>>);
+
+        #[async_trait]
+        impl Provider for InspectingProvider {
+            async fn call_stream(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<futures::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+            {
+                *self.0.lock().unwrap() = Some(request);
+                Ok(futures::stream::iter(vec![ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                }])
+                .boxed())
+            }
+        }
+
+        let provider = Arc::new(InspectingProvider(std::sync::Mutex::new(None)));
+        let config = AgentConfig {
+            system_prompt: Some("original".into()),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(
+            provider.clone() as Arc<dyn Provider>,
+            Arc::new(ToolRegistry::new()),
+            config,
+        );
+
+        agent.set_system_prompt(Some("refreshed".into()));
+        let stream = agent.run("hi".into()).await.unwrap();
+        let _ = collect_events(stream);
+
+        let guard = provider.0.lock().unwrap();
+        let seen = guard.as_ref().expect("provider was called");
+        assert_eq!(seen.system.as_deref(), Some("refreshed"));
     }
 
     #[test]

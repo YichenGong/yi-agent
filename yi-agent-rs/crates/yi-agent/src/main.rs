@@ -17,8 +17,8 @@ use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
 // Headless 模式的工具 + system prompt 构建结果。类型来自共享 crate
-// (`ToolSetup` 两个字段都是 `pub`),`build_headless_root_tools` 直接用
-// `HeadlessSetup { tools, system_prompt }` 字面量构造仍然成立。
+// (`ToolSetup` 三个字段都是 `pub`),`build_headless_root_tools` 直接用
+// `HeadlessSetup { tools, catalog, system_prompt }` 字面量构造仍然成立。
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
@@ -508,6 +508,7 @@ fn build_daemon_worker_factory(
     // Skills-only registry: the worker's deliberate contract is to NOT register
     // builtin/process tools here (recovery path adds its own workspace-rooted set).
     let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(&config)?;
+    let catalog = prompt.catalog;
     let mut registry = yi_agent_core::ToolRegistry::new();
     if let Some(skills) = &prompt.skills {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
@@ -521,6 +522,7 @@ fn build_daemon_worker_factory(
             agent_config,
             runtime_socket,
         )
+        .with_catalog(catalog)
         // Recovery must inspect the same worktree ordinary builtin tools use.
         .with_sandbox(config.sandbox, config.sandbox_writable_roots)
         .with_workspace(config.workdir),
@@ -592,6 +594,7 @@ fn build_headless_root_tools(
     );
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
+        catalog: setup.catalog,
         system_prompt: setup.system_prompt,
     })
 }
@@ -862,6 +865,7 @@ fn run_agent(cli: Cli) -> Result<()> {
         config,
         base_registry,
         process_manager,
+        prompt.catalog,
     )
 }
 
@@ -1118,6 +1122,7 @@ fn run_tui_agent(
     config: config::Config,
     base_registry: yi_agent_core::ToolRegistry,
     process_manager: Arc<yi_agent_tools::ProcessManager>,
+    catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -1158,6 +1163,7 @@ fn run_tui_agent(
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
+            let catalog = catalog;
             let mut agent = yi_agent_core::Agent::new(
                 Arc::clone(&provider_clone),
                 Arc::clone(&current_tools),
@@ -1340,6 +1346,11 @@ fn run_tui_agent(
 
                 // Run agent
                 is_running_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = &catalog {
+                    if let Some(prompt) = handle.current_system_prompt() {
+                        agent.set_system_prompt(Some(prompt));
+                    }
+                }
                 match agent.run(text).await {
                     Ok(stream) => {
                         let mut stream = Box::pin(stream);

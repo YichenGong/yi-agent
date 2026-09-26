@@ -111,9 +111,20 @@ fn catalog_entry(s: &SkillMetadata) -> String {
     )
 }
 
-fn full_catalog_string(skills: &[SkillMetadata]) -> String {
+/// Sort skills into the catalog's canonical order: scope, then name, then path.
+///
+/// The path is the final tiebreaker so that two skills with the same name in the
+/// same scope render in a stable, readdir-independent order (byte-stable prompt).
+fn sorted_skills(skills: &[SkillMetadata]) -> Vec<&SkillMetadata> {
     let mut sorted: Vec<&SkillMetadata> = skills.iter().collect();
-    sorted.sort_by_key(|s| (scope_order(s.scope), s.name.clone()));
+    sorted.sort_by(|a, b| {
+        (scope_order(a.scope), &a.name, &a.path).cmp(&(scope_order(b.scope), &b.name, &b.path))
+    });
+    sorted
+}
+
+fn full_catalog_string(skills: &[SkillMetadata]) -> String {
+    let sorted = sorted_skills(skills);
     let mut out = String::from(CATALOG_HEADER);
     for s in &sorted {
         out.push_str(&catalog_entry(s));
@@ -126,8 +137,7 @@ fn render_catalog_with_budget(skills: &[SkillMetadata], budget_bytes: usize) -> 
     if skills.is_empty() {
         return String::new();
     }
-    let mut sorted: Vec<&SkillMetadata> = skills.iter().collect();
-    sorted.sort_by_key(|s| (scope_order(s.scope), s.name.clone()));
+    let sorted = sorted_skills(skills);
 
     let header_len = CATALOG_HEADER.len();
     if header_len >= budget_bytes {
@@ -296,5 +306,52 @@ mod tests {
             1,
             "cache should serve stale data, not re-scan filesystem"
         );
+    }
+
+    #[test]
+    fn refresh_picks_up_new_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        std::fs::write(
+            tmp.path().join("foo/SKILL.md"),
+            "---\nname: foo\ndescription: x\n---\nbody",
+        )
+        .unwrap();
+        let s = SkillsService::new(vec![(tmp.path().to_path_buf(), SkillScope::User)]);
+        assert_eq!(s.snapshot().unwrap().len(), 1);
+
+        std::fs::create_dir_all(tmp.path().join("bar")).unwrap();
+        std::fs::write(
+            tmp.path().join("bar/SKILL.md"),
+            "---\nname: bar\ndescription: y\n---\nbody",
+        )
+        .unwrap();
+
+        // refresh() re-scans and sees the new skill...
+        assert_eq!(s.refresh().unwrap().len(), 2);
+        // ...and the refreshed result replaces the cache for later snapshots.
+        assert_eq!(s.snapshot().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn same_name_same_scope_ordered_by_path() {
+        let mk = |p: &str| SkillMetadata {
+            name: "dup".into(),
+            description: "x".into(),
+            path: PathBuf::from(p),
+            scope: SkillScope::User,
+            body: String::new(),
+        };
+        let s = SkillsService::new(vec![]);
+        // Seed zzz BEFORE aaa so readdir/insertion order cannot mask a
+        // missing path tiebreak in the sort key.
+        {
+            let mut cache = s.cache.write().unwrap();
+            *cache = Some(vec![mk("/t/zzz/SKILL.md"), mk("/t/aaa/SKILL.md")]);
+        }
+        let catalog = s.render_catalog(8192);
+        let aaa = catalog.find("/t/aaa").expect("aaa listed");
+        let zzz = catalog.find("/t/zzz").expect("zzz listed");
+        assert!(aaa < zzz, "same-name skills must be ordered by path");
     }
 }

@@ -40,6 +40,7 @@ pub struct DaemonAgentWorkerFactory {
     sandbox_writable_roots: Vec<PathBuf>,
     workspace_service: Option<Arc<DaemonWorkspaceService>>,
     recovery_workspace: Option<PathBuf>,
+    catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
 }
 
 impl DaemonAgentWorkerFactory {
@@ -58,6 +59,7 @@ impl DaemonAgentWorkerFactory {
             sandbox_writable_roots: Vec::new(),
             workspace_service: None,
             recovery_workspace: None,
+            catalog: None,
         }
     }
 
@@ -75,6 +77,15 @@ impl DaemonAgentWorkerFactory {
     pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
         self.recovery_workspace = Some(workspace.clone());
         self.workspace_service = Some(Arc::new(DaemonWorkspaceService::new(workspace)));
+        self
+    }
+
+    /// Refresh the skills catalog before each worker task starts.
+    pub fn with_catalog(
+        mut self,
+        catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    ) -> Self {
+        self.catalog = catalog;
         self
     }
 
@@ -463,7 +474,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         };
         let workspace_mode = request.workspace_mode;
         let worker_tools = Arc::new(self.worker_tool_registry(&workspace, workspace_mode));
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        if let Some(catalog) = &self.catalog {
+            if let Some(prompt) = catalog.current_system_prompt() {
+                config.system_prompt = Some(prompt);
+            }
+        }
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
         let objective = request.objective;
