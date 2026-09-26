@@ -59,6 +59,19 @@ impl SkillsCatalogHandle {
             None => Some(catalog),
         }
     }
+
+    #[cfg(test)]
+    fn for_test(
+        service: Arc<yi_agent_skills::SkillsService>,
+        base_prompt: Option<String>,
+        budget: Option<usize>,
+    ) -> Self {
+        Self {
+            service,
+            base_prompt,
+            budget,
+        }
+    }
 }
 
 /// skills 服务 + 解析后的 system prompt 的装配结果。
@@ -451,7 +464,80 @@ mod tests {
         let cfg = sample_config();
         let setup = build_tool_setup(&cfg, true).expect("build naked setup");
         assert!(setup.tools.is_empty());
+        assert!(setup.catalog.is_none());
         assert!(setup.system_prompt.is_none());
+    }
+
+    #[test]
+    fn catalog_handle_none_budget_does_not_truncate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for i in 0..20 {
+            let dir = tmp.path().join(format!("s{i:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: s{i:02}\ndescription: {}\n---\nbody",
+                    "x".repeat(200)
+                ),
+            )
+            .unwrap();
+        }
+        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![(
+            tmp.path().to_path_buf(),
+            yi_agent_skills::SkillScope::User,
+        )]));
+
+        let unlimited = SkillsCatalogHandle::for_test(svc.clone(), Some("BASE".into()), None);
+        let all = unlimited.current_system_prompt().unwrap();
+        assert!(all.contains("s19"), "None budget must include every skill");
+
+        let limited = SkillsCatalogHandle::for_test(svc, Some("BASE".into()), Some(400));
+        let truncated = limited.current_system_prompt().unwrap();
+        assert!(
+            !truncated.contains("s19"),
+            "a small Some budget must truncate the catalog"
+        );
+    }
+
+    #[test]
+    fn catalog_handle_none_budget_survives_refresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for i in 0..20 {
+            let dir = tmp.path().join(format!("s{i:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: s{i:02}\ndescription: {}\n---\nbody",
+                    "x".repeat(200)
+                ),
+            )
+            .unwrap();
+        }
+        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![(
+            tmp.path().to_path_buf(),
+            yi_agent_skills::SkillScope::User,
+        )]));
+        let handle = SkillsCatalogHandle::for_test(svc, Some("BASE".into()), None);
+        // Warm once, then add another skill and confirm it still shows up
+        // (i.e. refresh + no truncation both hold).
+        assert!(handle.current_system_prompt().unwrap().contains("s19"));
+
+        let dir = tmp.path().join("s99");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: s99\ndescription: {}\n---\nbody",
+                "x".repeat(200)
+            ),
+        )
+        .unwrap();
+        assert!(
+            handle.current_system_prompt().unwrap().contains("s99"),
+            "newly added skill must appear under a None budget"
+        );
     }
 
     #[test]

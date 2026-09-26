@@ -113,7 +113,9 @@ fn catalog_entry(s: &SkillMetadata) -> String {
 
 fn full_catalog_string(skills: &[SkillMetadata]) -> String {
     let mut sorted: Vec<&SkillMetadata> = skills.iter().collect();
-    sorted.sort_by_key(|s| (scope_order(s.scope), s.name.clone()));
+    sorted.sort_by(|a, b| {
+        (scope_order(a.scope), &a.name, &a.path).cmp(&(scope_order(b.scope), &b.name, &b.path))
+    });
     let mut out = String::from(CATALOG_HEADER);
     for s in &sorted {
         out.push_str(&catalog_entry(s));
@@ -127,7 +129,9 @@ fn render_catalog_with_budget(skills: &[SkillMetadata], budget_bytes: usize) -> 
         return String::new();
     }
     let mut sorted: Vec<&SkillMetadata> = skills.iter().collect();
-    sorted.sort_by_key(|s| (scope_order(s.scope), s.name.clone()));
+    sorted.sort_by(|a, b| {
+        (scope_order(a.scope), &a.name, &a.path).cmp(&(scope_order(b.scope), &b.name, &b.path))
+    });
 
     let header_len = CATALOG_HEADER.len();
     if header_len >= budget_bytes {
@@ -321,5 +325,24 @@ mod tests {
         assert_eq!(s.refresh().unwrap().len(), 2);
         // ...and the refreshed result replaces the cache for later snapshots.
         assert_eq!(s.snapshot().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn same_name_same_scope_ordered_by_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Two skills with the SAME frontmatter name, in different dirs, same scope.
+        for dir in ["aaa", "zzz"] {
+            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            std::fs::write(
+                tmp.path().join(dir).join("SKILL.md"),
+                "---\nname: dup\ndescription: x\n---\nbody",
+            )
+            .unwrap();
+        }
+        let s = SkillsService::new(vec![(tmp.path().to_path_buf(), SkillScope::User)]);
+        let catalog = s.render_catalog(8192);
+        let aaa = catalog.find("aaa").expect("aaa skill listed");
+        let zzz = catalog.find("zzz").expect("zzz skill listed");
+        assert!(aaa < zzz, "same-name skills must be ordered by path");
     }
 }
