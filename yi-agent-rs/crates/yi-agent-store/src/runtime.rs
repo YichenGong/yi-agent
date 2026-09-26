@@ -1078,12 +1078,13 @@ impl RuntimeCoordinator {
             return Err(RuntimeCoordinatorError::QueueCapacityExceeded);
         }
         let supervisor = self.supervisor(session)?;
+        let workspace_mode = yi_agent_core::TaskWorkspaceMode::ReadOnly; // Task 6 threads the requested mode through here.
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(
                 parent.clone(),
                 objective.clone(),
-                yi_agent_core::TaskWorkspaceMode::ReadOnly, // Task 6 threads the requested mode through here.
+                workspace_mode,
             )?;
             let depth = match supervisor
                 .task(&child)
@@ -1113,7 +1114,7 @@ impl RuntimeCoordinator {
                 attempt.number,
                 "queued",
                 &objective,
-                yi_agent_core::TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
+                workspace_mode,
             )?;
         Ok(child)
     }

@@ -931,6 +931,9 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    /// Legacy/compat child insert that does not set `workspace_mode`; it
+    /// therefore defaults to `'coding'`. Do not use for subagent children —
+    /// use `create_child_task_with_attempt_and_objective` and pass the mode.
     pub fn create_child_task(
         &mut self,
         task: &TaskId,

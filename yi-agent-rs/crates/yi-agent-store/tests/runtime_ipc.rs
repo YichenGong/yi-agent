@@ -4609,6 +4609,8 @@ fn workspace_mode_is_persisted_and_recovered() {
         TaskWorkspaceMode::Coding
     );
 
+    // A recoverable child carries a non-default mode so the `recovered_tasks`
+    // column read and parse path is exercised, not just the getter.
     let child = TaskId::new();
     let child_attempt = AttemptId::new();
     repository
@@ -4619,7 +4621,7 @@ fn workspace_mode_is_persisted_and_recovered() {
             1,
             &child_attempt,
             1,
-            "queued",
+            "recovery_required",
             "child",
             TaskWorkspaceMode::ReadOnly,
         )
@@ -4627,5 +4629,21 @@ fn workspace_mode_is_persisted_and_recovered() {
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
         TaskWorkspaceMode::ReadOnly
+    );
+
+    let recovered = repository.recovered_tasks().unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].task_id, child);
+    assert_eq!(recovered[0].workspace_mode, TaskWorkspaceMode::ReadOnly);
+
+    // The legacy insert omits `workspace_mode`, so it must fall back to the
+    // DDL default of 'coding'.
+    let legacy = TaskId::new();
+    repository
+        .create_child_task(&legacy, &session, &root, 1, "queued")
+        .unwrap();
+    assert_eq!(
+        repository.task_workspace_mode(&legacy).unwrap(),
+        TaskWorkspaceMode::Coding
     );
 }
