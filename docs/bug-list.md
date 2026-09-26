@@ -7,7 +7,7 @@
 - [ ] 命令行需要输入密码的话，TUI会出现显示故障。
 - [ ] 排队user request加入对话的逻辑不是很清晰。
 - [ ] 我希望在运行的时候能够切换模型。目前看起来没什么选择
-- [ ] 确认是否支持图片读取。
+- [x] 确认是否支持图片读取。（修复：新增 `view_image` 工具读取 png/jpeg/gif/webp 并返回 `ContentBlock::Image`；Anthropic/OpenAI 两个 provider 均可序列化，OpenAI 侧把 tool 结果里的图片拆到紧随的 user 消息。见 `yi-agent-rs/crates/yi-agent-tools/src/fs/view_image.rs`、`yi-agent-rs/crates/yi-agent-llm/src/openai/types.rs`；验证：`cargo test -p yi-agent-tools --lib fs::view_image`、`cargo test -p yi-agent-llm --lib openai::types`）
 - [ ] 如果输入框输入的是一个路径开始的内容。系统会把他当成slash command，然后会反馈说“未知命令”
 - [ ] 当遇到一系列的待确认项的时候，最好有进度条。
 - [ ] 自动压缩后，Prefill的数字好像不会自动更新了。
@@ -20,3 +20,4 @@
 - [ ] 权限被拒的工具只发 `ToolResult` 无 `ToolCall`，app-server `translate` 层按未知 id 丢弃，UI 看不到该次拒绝（待 C5 处理）
 - [ ] app-server `render_content` 不截断工具输出，超大工具结果可能超过 `MAX_FRAME_BYTES`（1MB）导致客户端拒收该帧
 - [ ] app-server 解析失败/传输错误响应使用 id 0，而 JSON-RPC 2.0 要求 id 为 null；RequestId 需支持 Null 变体
+- [ ] compaction 的 token 估算把 `ContentBlock::Image` 记为 0 token（`yi-agent-rs/crates/yi-agent-core/src/compact.rs`、`yi-agent-rs/crates/yi-agent-core/src/agent.rs`），图片进入上下文后可能低估用量、延迟 auto-compact 触发

@@ -32,5 +32,5 @@ yi-agent 的核心库，定义消息模型、工具系统、Provider 抽象和 A
 - [x] Codex 式 auto-compact — `compact.rs::plan_compaction` 保留最多 20,000 token 的真实 User 输入、12,000 token 的完整工具后缀并生成 handoff 摘要；`agent.rs::Session` 在 pre-turn/mid-turn 基于持久化 `Usage.input_tokens` 触发；验证：`cd yi-agent-rs && cargo test -p yi-agent-core --lib compact::tests && cargo test -p yi-agent-core --lib 'agent::tests::auto_compact_'` — [设计](../superpowers/specs/2026-08-15-compact-history-redesign-design.md)
 - [x] Agent 完成语义与变更审计 — `agent.rs::DoneReason` 区分正常完成、截断和异常中断；`run_loop` 在变更型工具后要求一次 read/diff/build/test 审计；验证：`cargo test -p yi-agent-core --lib agent_`
 - [x] 显式可重试工具失败 — `tool.rs::Tool::retryable()` 默认关闭；`agent.rs` 仅对明确 opt-in 的工具最多重试两次并发出 `ToolRetry`；验证：`cargo test -p yi-agent-core --lib agent_retries_only_an_explicitly_retryable_tool_failure`
-- [ ] 图片工具（`ContentBlock::Image` 已留类型，无对应 Tool 实现）
+- [x] 图片工具类型与工具实现（`ContentBlock::Image` + `ImageDetail`，工具在 `yi-agent-tools::ViewImageTool`）— `crates/yi-agent-core/src/message.rs` 的 `ImageDetail { High, Original }`（`detail` 带 `#[serde(default)]`，缺省 High，旧会话可反序列化）；工具实现见 [yi-agent-tools](./yi-agent-tools.md)；验证：`cargo test -p yi-agent-core --lib message::` — [设计](../superpowers/specs/2026-09-26-view-image-tool-design.md)
 - [ ] 插件系统（`ToolSource::Plugin` 枚举已留，无加载机制）
