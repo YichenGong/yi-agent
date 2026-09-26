@@ -89,13 +89,24 @@ impl DaemonAgentWorkerFactory {
         tools
     }
 
-    fn worker_tool_registry(&self, workspace: &WorkerWorkspace) -> ToolRegistry {
+    fn worker_tool_registry(
+        &self,
+        workspace: &WorkerWorkspace,
+        workspace_mode: TaskWorkspaceMode,
+    ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
+        let (sandbox, writable_roots) = match workspace_mode {
+            TaskWorkspaceMode::Coding => (
+                self.sandbox,
+                git_dir_for_worktree(&workspace.path).into_iter().collect(),
+            ),
+            TaskWorkspaceMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
+        };
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
             workspace.path.clone(),
-            self.sandbox,
-            git_dir_for_worktree(&workspace.path).into_iter().collect(),
+            sandbox,
+            writable_roots,
         );
         tools
     }
@@ -450,7 +461,8 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 ))
             });
         };
-        let worker_tools = Arc::new(self.worker_tool_registry(&workspace));
+        let workspace_mode = request.workspace_mode;
+        let worker_tools = Arc::new(self.worker_tool_registry(&workspace, workspace_mode));
         let config = self.config.clone();
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
@@ -577,16 +589,20 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 assistant_report.clear();
                                                 continue 'run;
                                             }
-                                            if let Some(service) = workspace_service.as_ref() {
-                                                match service.inspect_delivery(&workspace_for_delivery) {
-                                                    Ok(delivery) => reporter.report_delivery(delivery),
-                                                    Err(error)
-                                                        if !assistant_report.trim().is_empty()
-                                                            && is_empty_delivery_error(&error) =>
-                                                    {
-                                                        reporter.report_completed(assistant_report.trim())
+                                            if workspace_mode == TaskWorkspaceMode::Coding {
+                                                if let Some(service) = workspace_service.as_ref() {
+                                                    match service.inspect_delivery(&workspace_for_delivery) {
+                                                        Ok(delivery) => reporter.report_delivery(delivery),
+                                                        Err(error)
+                                                            if !assistant_report.trim().is_empty()
+                                                                && is_empty_delivery_error(&error) =>
+                                                        {
+                                                            reporter.report_completed(assistant_report.trim())
+                                                        }
+                                                        Err(error) => reporter.report_failure(error.to_string()),
                                                     }
-                                                    Err(error) => reporter.report_failure(error.to_string()),
+                                                } else {
+                                                    reporter.report_completed(assistant_report.trim());
                                                 }
                                             } else {
                                                 reporter.report_completed(assistant_report.trim());
@@ -1393,7 +1409,7 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace);
+        let registry = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -1462,6 +1478,51 @@ mod tests {
         .tool_registry_for_workspace(child.path().to_path_buf());
         assert!(read_only.get("write").is_none());
         assert!(read_only.get("edit").is_none());
+    }
+
+    #[test]
+    fn read_only_workers_get_no_write_tools() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: directory.path().to_path_buf(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+
+        let read_only = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::ReadOnly);
+        let read_only_names: Vec<_> = read_only
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        assert!(
+            !read_only_names
+                .iter()
+                .any(|name| name == "write" || name == "edit"),
+            "read-only registry must omit write/edit, got {read_only_names:?}"
+        );
+
+        let coding = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
+        let coding_names: Vec<_> = coding
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        assert!(
+            coding_names.iter().any(|name| name == "write")
+                && coding_names.iter().any(|name| name == "edit"),
+            "coding registry must include write/edit, got {coding_names:?}"
+        );
     }
 
     #[test]
@@ -1831,7 +1892,8 @@ mod tests {
         .with_workspace(directory.path().to_path_buf());
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Return immediately after one clean provider turn.")
-            .with_workspace(workspace.clone());
+            .with_workspace(workspace.clone())
+            .with_workspace_mode(TaskWorkspaceMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let delivery = tokio::time::timeout(Duration::from_secs(1), async {
