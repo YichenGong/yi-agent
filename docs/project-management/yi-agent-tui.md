@@ -52,3 +52,4 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [ ] 项目 AGENTS.md 提示词加载 — 全仓未找到 `load_project_instructions` / `AGENTS.md` 的代码实现（仅文档提及），需重新实现或确认已放弃。提示词装配本身已迁至 `yi-agent-runtime/src/bootstrap.rs::build_prompt_setup`（默认 prompt + 当前日期 + skills catalog），`--naked` 保持不加载；验证：`cargo test -p yi-agent-runtime --lib resolve_system_prompt_`
 - [x] 启动不污染项目目录 — `yi-agent-runtime/src/config.rs::RuntimeConfig::load()` 只读取已存在的 `<workdir>/.yi-agent/.env`，不在 fallback 启动时创建 `<workdir>/.yi-agent`；验证：`cargo test -p yi-agent-runtime --lib config::tests::load_does_not_create_local_yi_agent_dir_in_fallback_mode`
 - [ ] InlineRenderer 退役 — `tui/` 仍保留 deprecated 的 InlineRenderer 代码，待删除
+- [x] 权限确认弹窗完整可见 — `tui/wrap.rs::wrap_by_display_width` 优先空白断行、逐字符保留原文；`tui/cell.rs` 折叠 4 行 + `[e]` 展开；`tui/app.rs` 待确认时放行 `e` 与滚动键；验证：`cargo test -p yi-agent --bin yi-agent tui::wrap::` 和 `cargo test -p yi-agent --bin yi-agent tui::app::tests::permission_key_e_toggles_expanded`

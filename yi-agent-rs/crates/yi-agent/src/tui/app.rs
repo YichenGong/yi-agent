@@ -828,20 +828,40 @@ fn handle_key(
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
 ) -> KeyOutcome {
-    // Check if there's a pending permission request
-    if let Some((request_id, _tool_name, prefix_suggestion, kind)) =
-        history.pending_permission_info()
-    {
+    // Check if there's a pending permission request. Clone the small fields
+    // we need so the immutable borrow ends before we mutate history.
+    let pending_permission = history.pending_permission_info().map(
+        |(request_id, tool_name, prefix_suggestion, kind)| {
+            (
+                request_id,
+                tool_name.to_string(),
+                prefix_suggestion.map(str::to_string),
+                kind.clone(),
+            )
+        },
+    );
+    if let Some((request_id, _tool_name, prefix_suggestion, kind)) = pending_permission {
         // Allow quit keys to pass through even when permission is pending
         let is_quit_key = matches!(key.code, KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL)
             || matches!(key.code, KeyCode::Esc);
-        if is_quit_key {
+        // Scrolling stays available so an expanded body can be read. These
+        // keys are non-destructive and cannot resolve the request.
+        let is_scroll_key = matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+        );
+        if is_quit_key || is_scroll_key {
             // Fall through to global key handling below
         } else {
+            if key.code == KeyCode::Char('e') && key.modifiers.is_empty() {
+                history.toggle_pending_permission_expanded();
+                return KeyOutcome::None;
+            }
             let decision = match key.code {
                 KeyCode::Char('1') => Some(yi_agent_core::permission::Decision::AllowOnce),
                 KeyCode::Char('2') => Some(yi_agent_core::permission::Decision::AlwaysAllowTool),
                 KeyCode::Char('3') => prefix_suggestion
+                    .as_deref()
                     .map(|p| yi_agent_core::permission::Decision::AlwaysAllowPrefix(p.to_string())),
                 KeyCode::Char('4') => Some(yi_agent_core::permission::Decision::Deny),
                 KeyCode::Enter => {
@@ -6333,6 +6353,95 @@ mod tests {
         assert!(
             !history_text.contains("line-39"),
             "after scrolling up 2, the last line should be off-screen; got: {history_text:?}"
+        );
+    }
+    #[test]
+    fn permission_key_e_toggles_expanded() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, mut decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        history.push_event(make_permission_request_normal(1), 80);
+
+        let outcome = handle_key(
+            make_key(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            0,
+            80,
+            20,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert!(matches!(outcome, KeyOutcome::None));
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "'e' must not resolve the permission"
+        );
+        match &history.cells[0] {
+            HistoryCell::PermissionRequest { expanded, .. } => {
+                assert!(*expanded, "'e' should expand the pending request")
+            }
+            _ => panic!("expected PermissionRequest"),
+        }
+    }
+
+    #[test]
+    fn scroll_keys_work_while_permission_pending() {
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = VecDeque::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        for _ in 0..120 {
+            history.push(HistoryCell::Separator { label: None }, 80);
+        }
+        history.push_event(make_permission_request_normal(1), 80);
+        history.scroll_offset = 0;
+
+        let outcome = handle_key(
+            make_key(KeyCode::Up, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            100,
+            80,
+            20,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+        );
+        assert!(matches!(outcome, KeyOutcome::None));
+        assert_eq!(
+            history.scroll_offset, 1,
+            "Up should scroll history while a permission is pending"
         );
     }
 }

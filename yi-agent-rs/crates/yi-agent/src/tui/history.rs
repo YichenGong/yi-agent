@@ -20,6 +20,34 @@ fn has_spacer_after(cell: &HistoryCell, next_cell: Option<&HistoryCell>) -> bool
             ))
 }
 
+/// Compact one-line description of a permission request.
+///
+/// Bash-like tools show only the command, since that is what the user is
+/// judging. File tools show the target path plus the size of each payload
+/// field rather than inlining the payload, which can be thousands of bytes.
+fn permission_summary(tool_name: &str, input: &serde_json::Value) -> String {
+    match tool_name {
+        "bash" | "process_start" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        "write" | "edit" => {
+            let path = input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown path>");
+            let mut parts = vec![format!("path: {path}")];
+            for key in ["content", "old_string", "new_string"] {
+                if let Some(value) = input.get(key).and_then(|v| v.as_str()) {
+                    parts.push(format!("{key}: {} bytes", value.len()));
+                }
+            }
+            parts.join(", ")
+        }
+        _ => input.to_string(),
+    }
+}
 /// A location in the history content, independent of its current wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ViewportAnchor {
@@ -293,6 +321,23 @@ impl HistoryState {
             _ => None,
         })
     }
+
+    /// Toggle the expanded state of the most recent unresolved permission
+    /// request. Returns `false` when no request is pending.
+    pub fn toggle_pending_permission_expanded(&mut self) -> bool {
+        for cell in self.cells.iter_mut().rev() {
+            if let HistoryCell::PermissionRequest {
+                resolved: false,
+                expanded,
+                ..
+            } = cell
+            {
+                *expanded = !*expanded;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl HistoryState {
@@ -399,14 +444,22 @@ impl HistoryState {
                 prefix_suggestion,
                 kind,
             } => {
-                let display = format!("{}: {}", tool_name, tool_input);
+                let summary = permission_summary(&tool_name, &tool_input);
+                let full = format!(
+                    "{}: {}",
+                    tool_name,
+                    serde_json::to_string_pretty(&tool_input)
+                        .unwrap_or_else(|_| tool_input.to_string())
+                );
                 self.cells.push(HistoryCell::PermissionRequest {
                     request_id,
                     tool_name,
-                    display,
+                    summary,
+                    full,
                     prefix_suggestion,
                     kind,
                     resolved: false,
+                    expanded: false,
                 });
             }
             AgentEvent::PermissionResolved {
@@ -1722,5 +1775,122 @@ mod tests {
             HistoryCell::Separator { label: Some(label) }
                 if label == "已自动压缩（10 → 4 条消息）"
         ));
+    }
+    #[test]
+    fn permission_summary_for_bash_drops_json_noise() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({
+                    "command": "cargo test",
+                    "expected_timeout_sec": 120
+                }),
+                prefix_suggestion: Some("cargo".into()),
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
+        match &s.cells[0] {
+            HistoryCell::PermissionRequest { summary, full, .. } => {
+                assert_eq!(summary, "cargo test");
+                assert!(!summary.contains("expected_timeout_sec"));
+                assert!(
+                    full.contains("expected_timeout_sec"),
+                    "full keeps everything"
+                );
+            }
+            _ => panic!("expected PermissionRequest"),
+        }
+    }
+
+    #[test]
+    fn permission_summary_for_write_hides_content_blob() {
+        let mut s = HistoryState::new();
+        let content = "x".repeat(500);
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "write".into(),
+                tool_input: serde_json::json!({ "path": "src/main.rs", "content": content }),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
+        match &s.cells[0] {
+            HistoryCell::PermissionRequest { summary, .. } => {
+                assert!(summary.contains("src/main.rs"), "summary: {summary}");
+                assert!(summary.contains("500 bytes"), "summary: {summary}");
+                assert!(
+                    !summary.contains(&"x".repeat(50)),
+                    "summary must not inline the blob: {summary}"
+                );
+            }
+            _ => panic!("expected PermissionRequest"),
+        }
+    }
+
+    #[test]
+    fn permission_summary_for_edit_reports_both_field_sizes() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "edit".into(),
+                tool_input: serde_json::json!({
+                    "path": "a.rs", "old_string": "aa", "new_string": "bbbb"
+                }),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
+        match &s.cells[0] {
+            HistoryCell::PermissionRequest { summary, .. } => {
+                assert!(summary.contains("a.rs"), "summary: {summary}");
+                assert!(
+                    summary.contains("old_string: 2 bytes"),
+                    "summary: {summary}"
+                );
+                assert!(
+                    summary.contains("new_string: 4 bytes"),
+                    "summary: {summary}"
+                );
+            }
+            _ => panic!("expected PermissionRequest"),
+        }
+    }
+
+    #[test]
+    fn toggle_pending_permission_expanded_toggles_only_pending() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({"command": "ls"}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            80,
+        );
+        assert!(s.toggle_pending_permission_expanded());
+        match &s.cells[0] {
+            HistoryCell::PermissionRequest { expanded, .. } => assert!(*expanded),
+            _ => panic!("expected PermissionRequest"),
+        }
+        assert!(s.toggle_pending_permission_expanded());
+        match &s.cells[0] {
+            HistoryCell::PermissionRequest { expanded, .. } => assert!(!*expanded),
+            _ => panic!("expected PermissionRequest"),
+        }
+    }
+
+    #[test]
+    fn toggle_pending_permission_expanded_returns_false_when_none() {
+        let mut s = HistoryState::new();
+        assert!(!s.toggle_pending_permission_expanded());
     }
 }

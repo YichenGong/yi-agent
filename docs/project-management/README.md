@@ -13,10 +13,10 @@
 | yi-agent-llm | 4 / 7 | [详情](./yi-agent-llm.md) |
 | yi-agent-tools | 10 / 10 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 7 / 7 | [详情](./yi-agent-skills.md) |
-| yi-agent-tui | 25 / 26 | [详情](./yi-agent-tui.md) |
+| yi-agent-tui | 26 / 27 | [详情](./yi-agent-tui.md) |
 | yi-agent-run | 8 / 8 | [详情](./yi-agent-run.md) |
 | yi-agent-web | 6 / 6 | [详情](./yi-agent-web.md) |
-| permission | 7 / 7 | [详情](./permission.md) |
+| permission | 8 / 8 | [详情](./permission.md) |
 | ci-cd | 11 / 13 | [详情](./ci-cd.md) |
 | tooling | 3 / 3 | [详情](./tooling.md) |
 | yi-agent-mcp | 0 / 1 | [详情](./yi-agent-mcp.md) |
