@@ -97,11 +97,20 @@ desktop/
 
 ## Verification status
 
-Frontend unit tests (`npm test`, 14 tests) and the frontend production build
-(`npm run build`) are green. The native bundle and the manual smoke checklist
-are **pending verification** — see `docs/project-management/desktop.md`:
+Frontend unit tests (`npm test`, 14 tests), the frontend production build
+(`npm run build`), and the Rust backend tests (`cd src-tauri && cargo test`) are
+green.
+
+The native bundle is built and verified: `npm run sidecar:release && npm run
+tauri build` produces `src-tauri/target/release/bundle/macos/yi-agent.app` (with
+the sidecar embedded at `Contents/MacOS/yi-agent`) and
+`src-tauri/target/release/bundle/dmg/yi-agent_0.1.0_aarch64.dmg`. Launching the
+`.app` spawns the `yi-agent app-server --listen stdio://` child process.
+
+The **manual end-to-end smoke checklist** (streaming text, tool cards, approval
+allow/deny, Stop interrupt, sidecar-kill banner) still requires human
+interaction — see `docs/project-management/desktop.md`:
 
 ```bash
-npm run sidecar:release && npm run tauri build   # → src-tauri/target/release/bundle/macos/yi-agent.app
 npm run sidecar && npm run tauri dev             # manual end-to-end smoke
 ```
