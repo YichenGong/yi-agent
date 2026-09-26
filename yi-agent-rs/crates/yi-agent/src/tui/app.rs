@@ -234,7 +234,7 @@ fn run_loop<B: Backend, E: EventSource>(
         let size = terminal.size()?;
         let width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let initial_queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
+        let initial_queued_lines = crate::tui::queued::render_queued_preview(queued.make_contiguous(), width);
         let initial_layout = compute_layout(
             area,
             input,
@@ -276,7 +276,7 @@ fn run_loop<B: Backend, E: EventSource>(
         for _ in 0..promotion_count {
             final_queue.pop_front();
         }
-        let final_queued_lines = crate::tui::queued::render_queued_preview(&final_queue, width);
+        let final_queued_lines = crate::tui::queued::render_queued_preview(final_queue.make_contiguous(), width);
         let final_layout = compute_layout(
             area,
             input,
@@ -317,7 +317,7 @@ fn run_loop<B: Backend, E: EventSource>(
             .capture_viewport_anchor(final_text_width, final_history_area.height)
             .map(|anchor| (anchor, final_text_width, final_history_area.height));
 
-        let queued_lines = crate::tui::queued::render_queued_preview(&queued, width);
+        let queued_lines = crate::tui::queued::render_queued_preview(queued.make_contiguous(), width);
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
