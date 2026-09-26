@@ -63,6 +63,13 @@ describe("Session", () => {
     expect(s.items[0]).toMatchObject({ type: "toolCall", status: "running" });
   });
 
+  it("creates an agent message when a delta arrives with no prior item", () => {
+    const s = new Session();
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a9", delta: "hi" } });
+    expect(s.items).toHaveLength(1);
+    expect(s.items[0]).toMatchObject({ type: "agentMessage", id: "a9", text: "hi" });
+  });
+
   it("tracks turn lifecycle", () => {
     const s = new Session();
     expect(s.turnActive).toBe(false);

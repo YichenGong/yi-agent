@@ -4,6 +4,27 @@ import type { ApprovalRequest } from "./lib/protocol";
 import type { Transport } from "./lib/rpc";
 
 /**
+ * Subscribes to a bridge event and returns an unsubscribe function that is safe
+ * to call before `listen` resolves. Without the `disposed` flag an early
+ * unsubscribe would be lost: `listen` would later assign the real unlistener
+ * into a closure that nobody calls, leaking the listener.
+ */
+function subscribe<T>(event: string, cb: (payload: T) => void): () => void {
+  let unlisten: (() => void) | null = null;
+  let disposed = false;
+  void listen<T>(event, (e) => cb(e.payload))
+    .then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    })
+    .catch((e) => console.error(`failed to listen on ${event}`, e));
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
+}
+
+/**
  * `Transport` backed by the Tauri bridge. Each hook subscribes to a bridge
  * event; `send`/`respond` invoke the two commands the Rust side exposes.
  */
@@ -15,24 +36,9 @@ export function tauriTransport(): Transport {
     respond: async (id, result) => {
       await invoke("rpc_respond", { id, result });
     },
-    onMessage: (cb) => {
-      let unlisten = () => {};
-      void listen<unknown>("app-server://message", (e) => cb(e.payload)).then((u) => (unlisten = u));
-      return () => unlisten();
-    },
-    onRequest: (cb) => {
-      let unlisten = () => {};
-      void listen<ApprovalRequest>("app-server://request", (e) => cb(e.payload)).then(
-        (u) => (unlisten = u),
-      );
-      return () => unlisten();
-    },
-    onStatus: (cb) => {
-      let unlisten = () => {};
-      void listen<{ state: string; code?: number | null }>("app-server://status", (e) =>
-        cb(e.payload),
-      ).then((u) => (unlisten = u));
-      return () => unlisten();
-    },
+    onMessage: (cb) => subscribe<unknown>("app-server://message", cb),
+    onRequest: (cb) => subscribe<ApprovalRequest>("app-server://request", cb),
+    onStatus: (cb) =>
+      subscribe<{ state: string; code?: number | null }>("app-server://status", cb),
   };
 }

@@ -43,8 +43,8 @@ export default function App() {
     })().catch((e) => setStatus(`error: ${String(e)}`));
   }, [session]);
 
-  const send = async (text: string) => {
-    if (!threadId || !clientRef.current) return;
+  const send = async (text: string): Promise<boolean> => {
+    if (!threadId || !clientRef.current) return false;
     session.addUserMessage(text);
     force((v) => v + 1);
     try {
@@ -52,9 +52,15 @@ export default function App() {
         threadId,
         input: [{ type: "text", text }],
       });
+      return true;
     } catch (e) {
       session.lastError = String(e);
+      // Roll back the optimistic bubble so a rejected turn (e.g. -32012 turn
+      // already in progress) does not leave a phantom user message.
+      const last = session.items[session.items.length - 1];
+      if (last && last.type === "userMessage" && last.text === text) session.items.pop();
       force((v) => v + 1);
+      return false;
     }
   };
 

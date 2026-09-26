@@ -6,15 +6,23 @@ export function MessageInput({
   onInterrupt,
 }: {
   turnActive: boolean;
-  onSend: (text: string) => void;
+  onSend: (text: string) => Promise<boolean>;
   onInterrupt: () => void;
 }) {
   const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
 
-  const send = () => {
-    if (!text.trim()) return;
-    onSend(text);
-    setText("");
+  const handleSend = async () => {
+    if (!text.trim() || sending) return;
+    setSending(true);
+    try {
+      const ok = await onSend(text);
+      // Only discard the draft once the send was actually accepted; otherwise
+      // the user's text would be lost on a rejected turn/start.
+      if (ok) setText("");
+    } finally {
+      setSending(false);
+    }
   };
 
   return (
@@ -25,20 +33,23 @@ export function MessageInput({
         onKeyDown={(e) => {
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
-            send();
+            if (turnActive) onInterrupt();
+            else void handleSend();
           }
         }}
+        disabled={sending}
         rows={3}
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-        className="flex-1 resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-500 focus:outline-none"
+        className="flex-1 resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-500 focus:outline-none disabled:opacity-50"
       />
       <button
         type="button"
-        onClick={turnActive ? onInterrupt : send}
+        onClick={turnActive ? onInterrupt : () => void handleSend()}
+        disabled={sending}
         className={
           turnActive
-            ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500"
-            : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500"
+            ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
+            : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50"
         }
       >
         {turnActive ? "Stop" : "Send"}
