@@ -441,7 +441,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     let workdir = config::resolve_workdir(cli)?;
     let runtime_dir = runtime_directory_for(&workdir);
     let runtime = runtime_dir.join("runtime.sock");
-    let database = runtime_dir.join("state.sqlite");
+    let database = runtime_database_path(&runtime_dir);
     match action {
         DaemonAction::Start => {
             if yi_agent_store::ipc::send_request(&runtime, yi_agent_store::ipc::IpcRequest::Status)
@@ -553,6 +553,13 @@ fn runtime_directory_from(
     override_path.unwrap_or_else(|| workdir.join(".yi-agent/runtime"))
 }
 
+/// Single source of truth for the runtime database filename. The daemon and the
+/// embedded TUI/headless runtimes must share one store, so they all resolve the
+/// path here instead of hardcoding a name that can drift apart.
+fn runtime_database_path(runtime_dir: &std::path::Path) -> std::path::PathBuf {
+    runtime_dir.join("runtime.sqlite")
+}
+
 fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Result<()> {
     let request = match action {
         DaemonAction::Status => yi_agent_store::ipc::IpcRequest::Status,
@@ -617,7 +624,7 @@ fn attach_application_root_request(
 
 fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
     let runtime_dir = runtime_directory_for(&config.workdir);
-    let database = runtime_dir.join("runtime.sqlite");
+    let database = runtime_database_path(&runtime_dir);
     let socket_path = runtime_dir.join("runtime.sock");
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
@@ -700,7 +707,7 @@ struct TuiRuntimeSession {
 
 fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
     let runtime_dir = runtime_directory_for(&config.workdir);
-    let database = runtime_dir.join("runtime.sqlite");
+    let database = runtime_database_path(&runtime_dir);
     let socket_path = runtime_dir.join("runtime.sock");
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
@@ -2151,6 +2158,19 @@ mod tests {
         assert_eq!(
             daemon_runtime,
             std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime"),
+        );
+    }
+
+    #[test]
+    fn runtime_database_path_is_shared_by_daemon_and_attachment() {
+        let workdir = std::path::PathBuf::from("/tmp/isolated-project");
+        let daemon_database = runtime_database_path(&runtime_directory_from(None, &workdir));
+        let attachment_database = runtime_database_path(&runtime_directory_from(None, &workdir));
+
+        assert_eq!(daemon_database, attachment_database);
+        assert_eq!(
+            daemon_database,
+            std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime/runtime.sqlite"),
         );
     }
 

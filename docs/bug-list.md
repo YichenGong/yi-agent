@@ -14,3 +14,4 @@
 - [ ] 出现多次连续自动压缩的情况
 - [ ] subagent 如果一直不停。怎么办。
 - [ ] 当前启动subagent runtime 就会创建worktree。太多了怎么清理。
+- [x] `daemon serve` 用 `state.sqlite`、内嵌 TUI/headless runtime 用 `runtime.sqlite`，同一项目任务历史分裂（修复：`main.rs` `runtime_database_path` 统一为 `runtime.sqlite`）
