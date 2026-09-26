@@ -529,7 +529,17 @@ fn build_daemon_worker_factory(
     ))
 }
 
-fn runtime_directory_for(workdir: &std::path::Path) -> std::path::PathBuf {
+/// The runtime socket for a project, resolved identically everywhere.
+///
+/// The TUI's slash commands and the CLI must reach the same daemon, so both
+/// resolve through here rather than each inventing their own location.
+pub(crate) fn runtime_socket_for(
+    workdir: &std::path::Path,
+) -> Result<std::path::PathBuf, yi_agent_store::ipc::IpcError> {
+    yi_agent_store::ipc::socket_path_for(&runtime_directory_for(workdir))
+}
+
+pub(crate) fn runtime_directory_for(workdir: &std::path::Path) -> std::path::PathBuf {
     runtime_directory_from(
         std::env::var_os("YI_AGENT_RUNTIME_DIR")
             .filter(|value| !value.is_empty())
@@ -1466,6 +1476,7 @@ fn run_tui_agent(
                 }),
                 Some(runtime_choice_tx),
                 process_manager,
+                workdir.clone(),
             )
         });
 

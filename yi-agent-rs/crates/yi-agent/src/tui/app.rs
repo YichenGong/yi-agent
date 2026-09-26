@@ -66,6 +66,7 @@ pub fn run_tui(
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
+    workdir: std::path::PathBuf,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -91,6 +92,7 @@ pub fn run_tui(
         runtime_start_prompt,
         runtime_choice_tx,
         process_manager,
+        workdir,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -143,6 +145,7 @@ pub fn run_tui_with_backend<B: Backend>(
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    workdir: &std::path::Path,
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
@@ -161,6 +164,7 @@ pub fn run_tui_with_backend<B: Backend>(
         None,
         None,
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        workdir.to_path_buf(),
     )
 }
 
@@ -194,6 +198,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         None,
         None,
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        std::env::temp_dir(),
     )
 }
 
@@ -215,6 +220,7 @@ fn run_loop<B: Backend, E: EventSource>(
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
+    workdir: std::path::PathBuf,
 ) -> std::io::Result<()> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
@@ -527,6 +533,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     &mut queued,
                     &mut pending_quit,
                     &mut popup,
+                    &workdir,
                 ) {
                     KeyOutcome::Quit => break,
                     KeyOutcome::Submit(_) => {
@@ -830,6 +837,7 @@ fn handle_key(
     queued: &mut std::collections::VecDeque<String>,
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
+    workdir: &std::path::Path,
 ) -> KeyOutcome {
     // Check if there's a pending permission request. Clone the small fields
     // we need so the immutable borrow ends before we mutate history.
@@ -995,6 +1003,7 @@ fn handle_key(
                             input_tx,
                             interrupt_tx,
                             control_tx,
+                            workdir,
                         );
                     } else {
                         // No command selected (empty filter) — show error
@@ -1069,6 +1078,7 @@ fn handle_key(
                         input_tx,
                         interrupt_tx,
                         control_tx,
+                        workdir,
                     );
                 } else {
                     // Unknown slash command
@@ -1150,6 +1160,7 @@ fn execute_slash_command(
     _input_tx: &tokio::sync::mpsc::Sender<String>,
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
+    workdir: &std::path::Path,
 ) -> KeyOutcome {
     match cmd {
         SlashCommand::Quit => KeyOutcome::Quit,
@@ -1220,7 +1231,7 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Agents => {
-            let text = match daemon_agents_summary(args.as_deref()) {
+            let text = match daemon_agents_summary(workdir, args.as_deref()) {
                 Ok(summary) => summary,
                 Err(error) => format!("无法读取本地 daemon runtime: {error}"),
             };
@@ -1229,7 +1240,7 @@ fn execute_slash_command(
         }
         SlashCommand::Agent => {
             let label = match args.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
-                Some(task_id) => match daemon_agent_detail(task_id) {
+                Some(task_id) => match daemon_agent_detail(workdir, task_id) {
                     Ok(detail) => detail,
                     Err(error) => format!("无法读取 agent 详情: {error}"),
                 },
@@ -1256,7 +1267,7 @@ fn execute_slash_command(
         }
         SlashCommand::Review => {
             let label = match parse_review_args(args.as_deref()) {
-                Ok(task_id) => match daemon_review(task_id) {
+                Ok(task_id) => match daemon_review(workdir, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法读取审查信息: {error}"),
                 },
@@ -1267,10 +1278,12 @@ fn execute_slash_command(
         }
         SlashCommand::Accept => {
             let label = match parse_accept_args(args.as_deref()) {
-                Ok((task_id, confirmation)) => match daemon_accept(task_id, confirmation) {
-                    Ok(message) => message,
-                    Err(error) => format!("无法接受 delivery: {error}"),
-                },
+                Ok((task_id, confirmation)) => {
+                    match daemon_accept(workdir, task_id, confirmation) {
+                        Ok(message) => message,
+                        Err(error) => format!("无法接受 delivery: {error}"),
+                    }
+                }
                 Err(error) => error,
             };
             history.push(HistoryCell::Separator { label: Some(label) }, width);
@@ -1279,7 +1292,7 @@ fn execute_slash_command(
         SlashCommand::Rework => {
             let label = match parse_rework_args(args.as_deref()) {
                 Ok((task_id, feedback, confirmation)) => {
-                    match daemon_rework(task_id, feedback, confirmation) {
+                    match daemon_rework(workdir, task_id, feedback, confirmation) {
                         Ok(message) => message,
                         Err(error) => format!("无法请求返工: {error}"),
                     }
@@ -1292,7 +1305,7 @@ fn execute_slash_command(
         SlashCommand::Reject => {
             let label = match parse_reject_args(args.as_deref()) {
                 Ok((task_id, reason, confirmation)) => {
-                    match daemon_reject(task_id, reason, confirmation) {
+                    match daemon_reject(workdir, task_id, reason, confirmation) {
                         Ok(message) => message,
                         Err(error) => format!("无法拒绝 delivery: {error}"),
                     }
@@ -1304,7 +1317,7 @@ fn execute_slash_command(
         }
         SlashCommand::Events => {
             let label = match parse_review_args(args.as_deref()) {
-                Ok(task_id) => match daemon_events(task_id) {
+                Ok(task_id) => match daemon_events(workdir, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法读取任务事件: {error}"),
                 },
@@ -1315,7 +1328,7 @@ fn execute_slash_command(
         }
         SlashCommand::Diff => {
             let label = match parse_review_args(args.as_deref()) {
-                Ok(task_id) => match daemon_diff(task_id) {
+                Ok(task_id) => match daemon_diff(workdir, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法读取任务 diff: {error}"),
                 },
@@ -1326,7 +1339,7 @@ fn execute_slash_command(
         }
         SlashCommand::Mailbox => {
             let label = match parse_review_args(args.as_deref()) {
-                Ok(task_id) => match daemon_mailbox(task_id) {
+                Ok(task_id) => match daemon_mailbox(workdir, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法读取任务 mailbox: {error}"),
                 },
@@ -1337,7 +1350,7 @@ fn execute_slash_command(
         }
         SlashCommand::Pause => {
             let label = match parse_pause_resume_args(args.as_deref(), "pause") {
-                Ok(task_id) => match daemon_pause(task_id) {
+                Ok(task_id) => match daemon_pause(workdir, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法暂停任务: {error}"),
                 },
@@ -1348,7 +1361,7 @@ fn execute_slash_command(
         }
         SlashCommand::Resume => {
             let label = match parse_pause_resume_args(args.as_deref(), "resume") {
-                Ok(task_id) => match daemon_resume(task_id) {
+                Ok(task_id) => match daemon_resume(workdir, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法恢复任务: {error}"),
                 },
@@ -1360,7 +1373,7 @@ fn execute_slash_command(
         SlashCommand::Cancel => {
             let label = match parse_cancel_args(args.as_deref()) {
                 Ok((task_id, recursive, confirmation)) => {
-                    match daemon_cancel(task_id, recursive, confirmation) {
+                    match daemon_cancel(workdir, task_id, recursive, confirmation) {
                         Ok(message) => message,
                         Err(error) => format!("无法取消任务: {error}"),
                     }
@@ -1372,7 +1385,7 @@ fn execute_slash_command(
         }
         SlashCommand::Retry => {
             let label = match parse_retry_args(args.as_deref()) {
-                Ok(task_id) => match daemon_retry(task_id) {
+                Ok(task_id) => match daemon_retry(workdir, task_id) {
                     Ok(message) => message,
                     Err(error) => format!("无法重试任务: {error}"),
                 },
@@ -1383,7 +1396,7 @@ fn execute_slash_command(
         }
         SlashCommand::Message => {
             let label = match parse_user_message_args(args.as_deref()) {
-                Ok((task_id, message)) => match daemon_user_message(task_id, message) {
+                Ok((task_id, message)) => match daemon_user_message(workdir, task_id, message) {
                     Ok(message) => message,
                     Err(error) => format!("无法发送用户指令: {error}"),
                 },
@@ -1395,20 +1408,14 @@ fn execute_slash_command(
     }
 }
 
-fn daemon_agents_summary(args: Option<&str>) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_agents_summary_at(&runtime_dir.join("runtime.sock"), args)
+fn daemon_agents_summary(workdir: &std::path::Path, args: Option<&str>) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_agents_summary_at(&socket, args)
 }
 
-fn daemon_agent_detail(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_agent_detail_at(&runtime_dir.join("runtime.sock"), task_id)
+fn daemon_agent_detail(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_agent_detail_at(&socket, task_id)
 }
 
 fn daemon_agent_detail_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
@@ -1550,12 +1557,13 @@ fn parse_user_message_args(args: Option<&str>) -> Result<(&str, &str), String> {
     Ok((task_id, message))
 }
 
-fn daemon_user_message(task_id: &str, message: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_user_message_at(&runtime_dir.join("runtime.sock"), task_id, message)
+fn daemon_user_message(
+    workdir: &std::path::Path,
+    task_id: &str,
+    message: &str,
+) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_user_message_at(&socket, task_id, message)
 }
 
 fn daemon_user_message_at(
@@ -1594,22 +1602,14 @@ fn daemon_task_session_at(socket: &std::path::Path, task_id: &str) -> Result<Str
     }
 }
 
-fn daemon_retry(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    let socket = runtime_dir.join("runtime.sock");
+fn daemon_retry(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
     let session_id = daemon_task_session_at(&socket, task_id)?;
     daemon_retry_at(&socket, &session_id, task_id)
 }
 
-fn daemon_pause(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    let socket = runtime_dir.join("runtime.sock");
+fn daemon_pause(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
     let session_id = daemon_task_session_at(&socket, task_id)?;
     daemon_pause_at(&socket, &session_id, task_id)
 }
@@ -1633,12 +1633,8 @@ fn daemon_pause_at(
     Ok(format!("已请求暂停任务: {task_id}"))
 }
 
-fn daemon_resume(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    let socket = runtime_dir.join("runtime.sock");
+fn daemon_resume(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
     let session_id = daemon_task_session_at(&socket, task_id)?;
     daemon_resume_at(&socket, &session_id, task_id)
 }
@@ -1682,15 +1678,12 @@ fn daemon_retry_at(
 }
 
 fn daemon_cancel(
+    workdir: &std::path::Path,
     task_id: &str,
     recursive: bool,
     confirmation: Option<&str>,
 ) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    let socket = runtime_dir.join("runtime.sock");
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
     daemon_cancel_at(&socket, task_id, recursive, confirmation)
 }
 
@@ -1738,12 +1731,9 @@ fn daemon_cancel_at(
     }
 }
 
-fn daemon_review(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_review_at(&runtime_dir.join("runtime.sock"), task_id)
+fn daemon_review(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_review_at(&socket, task_id)
 }
 
 fn daemon_review_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
@@ -1766,12 +1756,9 @@ fn daemon_review_at(socket: &std::path::Path, task_id: &str) -> Result<String, S
     }
 }
 
-fn daemon_events(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_events_at(&runtime_dir.join("runtime.sock"), task_id)
+fn daemon_events(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_events_at(&socket, task_id)
 }
 
 fn daemon_events_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
@@ -1805,12 +1792,9 @@ fn daemon_events_at(socket: &std::path::Path, task_id: &str) -> Result<String, S
     }
 }
 
-fn daemon_diff(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_diff_at(&runtime_dir.join("runtime.sock"), task_id)
+fn daemon_diff(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_diff_at(&socket, task_id)
 }
 
 fn daemon_diff_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
@@ -1833,12 +1817,9 @@ fn daemon_diff_at(socket: &std::path::Path, task_id: &str) -> Result<String, Str
     }
 }
 
-fn daemon_mailbox(task_id: &str) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_mailbox_at(&runtime_dir.join("runtime.sock"), task_id)
+fn daemon_mailbox(workdir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_mailbox_at(&socket, task_id)
 }
 
 fn daemon_mailbox_at(socket: &std::path::Path, task_id: &str) -> Result<String, String> {
@@ -1871,12 +1852,13 @@ fn daemon_mailbox_at(socket: &std::path::Path, task_id: &str) -> Result<String, 
     }
 }
 
-fn daemon_accept(task_id: &str, confirmation: Option<&str>) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_accept_at(&runtime_dir.join("runtime.sock"), task_id, confirmation)
+fn daemon_accept(
+    workdir: &std::path::Path,
+    task_id: &str,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_accept_at(&socket, task_id, confirmation)
 }
 
 fn daemon_accept_at(
@@ -1894,20 +1876,13 @@ fn daemon_accept_at(
 }
 
 fn daemon_rework(
+    workdir: &std::path::Path,
     task_id: &str,
     feedback: &str,
     confirmation: Option<&str>,
 ) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_rework_at(
-        &runtime_dir.join("runtime.sock"),
-        task_id,
-        feedback,
-        confirmation,
-    )
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_rework_at(&socket, task_id, feedback, confirmation)
 }
 
 fn daemon_rework_at(
@@ -1928,20 +1903,13 @@ fn daemon_rework_at(
 }
 
 fn daemon_reject(
+    workdir: &std::path::Path,
     task_id: &str,
     reason: &str,
     confirmation: Option<&str>,
 ) -> Result<String, String> {
-    let runtime_dir = std::env::var_os("YI_AGENT_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".yi-agent/runtime")))
-        .ok_or_else(|| "无法确定 runtime 目录".to_string())?;
-    daemon_reject_at(
-        &runtime_dir.join("runtime.sock"),
-        task_id,
-        reason,
-        confirmation,
-    )
+    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
+    daemon_reject_at(&socket, task_id, reason, confirmation)
 }
 
 fn daemon_reject_at(
@@ -2297,6 +2265,24 @@ fn wrap_input_buffer(
 mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
+
+    /// The TUI's slash commands must talk to the same daemon the CLI does.
+    /// They used to fall back to `~/.yi-agent/runtime`, while the daemon listens
+    /// under `<workdir>/.yi-agent/runtime` — so `/agents`, `/diff`, `/pause` and
+    /// friends queried a socket that no daemon ever bound.
+    #[test]
+    fn slash_commands_resolve_the_same_runtime_socket_as_the_daemon() {
+        let workdir = std::path::Path::new("/tmp/some-project");
+
+        let from_tui = crate::runtime_socket_for(workdir).expect("resolves");
+        let from_cli = yi_agent_store::ipc::socket_path_for(&crate::runtime_directory_for(workdir))
+            .expect("resolves");
+
+        assert_eq!(
+            from_tui, from_cli,
+            "the TUI and the CLI must agree on one runtime socket"
+        );
+    }
 
     #[test]
     fn active_managed_process_statuses_exclude_terminal_states() {
@@ -3663,6 +3649,7 @@ mod tests {
             None,
             None,
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
         )
         .unwrap();
 
@@ -3745,6 +3732,7 @@ mod tests {
             None,
             None,
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
         )
         .unwrap();
 
@@ -3810,6 +3798,7 @@ mod tests {
             None,
             None,
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
         )
         .unwrap();
 
@@ -3928,6 +3917,7 @@ mod tests {
             }),
             Some(runtime_choice_tx),
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
         )
         .unwrap();
 
@@ -3978,6 +3968,7 @@ mod tests {
             }),
             Some(runtime_choice_tx),
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
         )
         .unwrap();
 
@@ -5560,6 +5551,7 @@ mod tests {
                 &mut queued,
                 &mut pending_quit,
                 &mut popup,
+                &std::env::temp_dir(),
             );
             assert_eq!(outcome, KeyOutcome::None);
             assert_eq!(history.scroll_offset, expected_offset, "key {key:?}");
@@ -5582,6 +5574,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         assert_eq!(history.selected, Some(4));
         assert_eq!(
@@ -5620,6 +5613,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "Esc must not arm process exit");
@@ -5659,6 +5653,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "idle Esc must not arm process exit");
@@ -5698,6 +5693,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(pending_quit);
@@ -5734,6 +5730,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         let result = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
@@ -5751,6 +5748,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         assert_eq!(result, KeyOutcome::None);
     }
@@ -5791,6 +5789,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
 
         assert_eq!(result, KeyOutcome::Submit(path.to_string()));
@@ -5834,6 +5833,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
 
         assert_eq!(result, KeyOutcome::None);
@@ -5877,6 +5877,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -5928,6 +5929,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -5970,6 +5972,7 @@ mod tests {
             &input_tx,
             &interrupt_tx,
             &control_tx,
+            &std::env::temp_dir(),
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -6004,6 +6007,7 @@ mod tests {
             &input_tx,
             &interrupt_tx,
             &control_tx,
+            &std::env::temp_dir(),
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -6391,6 +6395,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert!(
@@ -6441,6 +6446,7 @@ mod tests {
             &mut queued,
             &mut pending_quit,
             &mut popup,
+            &std::env::temp_dir(),
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert_eq!(
