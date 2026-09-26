@@ -22,7 +22,8 @@ tokio-util = "0.7"
 futures = { workspace = true }
 toml = "0.8"
 sha2 = "0.10"
+# Advisory file locking for the daemon instance lock (`flock`).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-libc = "0.2"

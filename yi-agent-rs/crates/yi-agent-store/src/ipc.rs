@@ -3,9 +3,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -611,6 +611,9 @@ pub struct Daemon {
     stop: Arc<AtomicBool>,
     coordinator: Arc<RuntimeCoordinator>,
     listener: Option<JoinHandle<()>>,
+    /// Held for the daemon's whole lifetime. Dropping it releases the kernel
+    /// lock, so a crashed daemon can never leave a lock behind.
+    _instance_lock: InstanceLock,
 }
 
 impl Daemon {
@@ -639,8 +642,12 @@ impl Daemon {
 
         let socket_path = socket_path_for(runtime_dir)?;
         let lock_path = runtime_dir.join("runtime.lock");
-        let mut lock = acquire_lock(runtime_dir, &lock_path, &socket_path)?;
-        writeln!(lock, "{}", std::process::id())?;
+        let instance_lock = InstanceLock::acquire(runtime_dir, &lock_path)?;
+        // Holding the exclusive lock proves no live daemon serves this directory,
+        // so any socket node still on disk was left by a killed process. `bind`
+        // fails with `EADDRINUSE` on an existing path, so the stale node must go
+        // before we bind our own listener.
+        remove_if_exists(&socket_path)?;
         let mut repository = RuntimeRepository::open(database_path.as_ref())?;
         repository.recover_inflight_tasks()?;
         drop(repository);
@@ -719,6 +726,7 @@ impl Daemon {
             stop,
             coordinator: daemon_coordinator,
             listener: Some(listener),
+            _instance_lock: instance_lock,
         })
     }
 
@@ -794,55 +802,52 @@ fn socket_file_name(runtime_dir: &Path) -> String {
     format!("yi-agent-{}.sock", &hex[..16])
 }
 
-fn acquire_lock(
-    runtime_dir: &Path,
-    lock_path: &Path,
-    socket_path: &Path,
-) -> Result<std::fs::File, IpcError> {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(lock_path)
-    {
-        Ok(lock) => Ok(lock),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if lock_owner_is_alive(lock_path) || UnixStream::connect(socket_path).is_ok() {
-                return Err(IpcError::AlreadyRunning {
-                    path: runtime_dir.to_path_buf(),
-                });
-            }
-            // Both checks failed, so this is a stale local runtime left by a dead process.
-            remove_if_exists(lock_path)?;
-            remove_if_exists(socket_path)?;
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(lock_path)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        IpcError::AlreadyRunning {
-                            path: runtime_dir.to_path_buf(),
-                        }
-                    } else {
-                        IpcError::Io(error)
-                    }
-                })
-        }
-        Err(error) => Err(IpcError::Io(error)),
-    }
+/// The exclusive instance lock for one runtime directory.
+///
+/// Backed by an advisory `flock` on `runtime.lock` rather than a PID file, so
+/// ownership is decided by the kernel and released automatically when the
+/// holding process exits — including on a crash. A PID file cannot do this: the
+/// OS recycles PIDs, so a lock left by a dead daemon starts looking owned by
+/// whatever unrelated process inherits that number, and `kill -0` then reports
+/// it as permanently live.
+///
+/// The lock file itself is left in place. Removing it would race a concurrent
+/// acquirer that already opened the same inode: the newcomer would hold a lock
+/// on an unlinked file while a third process created a fresh one, and two
+/// daemons would both believe they own the directory.
+struct InstanceLock {
+    /// Dropping this file closes its descriptor, and the kernel releases the
+    /// `flock` with it. That is the whole unlock protocol: no `Drop` impl is
+    /// needed, and a process that dies without unwinding still releases the lock.
+    _file: std::fs::File,
 }
 
-fn lock_owner_is_alive(lock_path: &Path) -> bool {
-    let Ok(contents) = fs::read_to_string(lock_path) else {
-        return false;
-    };
-    let Ok(pid) = contents.trim().parse::<u32>() else {
-        return false;
-    };
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .is_ok_and(|output| output.status.success())
+impl InstanceLock {
+    /// Takes the lock, or reports that another daemon already holds it.
+    fn acquire(runtime_dir: &Path, lock_path: &Path) -> Result<Self, IpcError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if outcome == 0 {
+            return Ok(Self { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        // `EWOULDBLOCK` is how a held advisory lock reports contention; anything
+        // else is a real failure (a bad descriptor, an unsupported filesystem)
+        // and must not be misreported as "another daemon is running".
+        if matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ) {
+            return Err(IpcError::AlreadyRunning {
+                path: runtime_dir.to_path_buf(),
+            });
+        }
+        Err(IpcError::Io(error))
+    }
 }
 
 impl Drop for Daemon {
