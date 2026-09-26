@@ -56,7 +56,13 @@ export function ThreadSidebar({
           return (
             <div
               key={t.thread_id}
-              onClick={() => !busy && !editingId && onSelect(t.thread_id)}
+              onClick={(e) => {
+                if (busy || editingId) return;
+                // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
+                // 避免对同一 thread 触发两次 onSelect(即两次 thread/resume)。
+                if (e.detail > 1) return;
+                onSelect(t.thread_id);
+              }}
               className={`group flex items-center justify-between gap-1 px-3 py-2 text-sm ${
                 active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
               } ${busy ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
@@ -97,7 +103,8 @@ export function ThreadSidebar({
                       onDelete(t.thread_id);
                     }}
                     title="Delete"
-                    className="hidden shrink-0 rounded px-1 text-neutral-500 hover:text-red-400 group-hover:block disabled:opacity-50"
+                    aria-label="Delete thread"
+                    className="shrink-0 rounded px-1 text-neutral-500 opacity-0 group-hover:opacity-100 hover:text-red-400 focus-visible:opacity-100 disabled:opacity-50"
                   >
                     ×
                   </button>
