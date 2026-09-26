@@ -127,6 +127,11 @@ describe("Session", () => {
       params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2 },
     });
     s.apply({ method: "error", params: { message: "boom" } });
+    s.apply({
+      method: "turn/completed",
+      params: { thread_id: "t", turn_id: "u1", status: "completed" },
+    });
+    expect(s.lastStatus).not.toBeNull();
 
     s.reset();
 
