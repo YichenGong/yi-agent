@@ -15,3 +15,4 @@
 - [ ] subagent 如果一直不停。怎么办。
 - [ ] 当前启动subagent runtime 就会创建worktree。太多了怎么清理。
 - [x] `daemon serve` 用 `state.sqlite`、内嵌 TUI/headless runtime 用 `runtime.sqlite`，同一项目任务历史分裂（修复：`main.rs` `runtime_database_path` 统一为 `runtime.sqlite`）
+- [x] resident lease 释放与 resource coordinator 锁序反转，reconcile 热路径可死锁（修复：`runtime.rs` `release_resident_lease` 不再同时持两把锁）

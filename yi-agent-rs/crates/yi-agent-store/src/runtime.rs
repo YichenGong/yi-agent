@@ -244,12 +244,16 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime resident wait mutex poisoned")
             .remove(task);
-        if let Some(lease_id) = self
+        // Take the lease id out under `resident_leases` alone, then release it
+        // under `resource_coordinator` alone. Holding both at once here would
+        // invert the `resource_coordinator -> resident_*` order used by
+        // `start_worker` and deadlock the reconcile loop.
+        let lease_id = self
             .resident_leases
             .lock()
             .expect("runtime resident lease mutex poisoned")
-            .remove(task)
-        {
+            .remove(task);
+        if let Some(lease_id) = lease_id {
             self.resource_coordinator
                 .lock()
                 .expect("resource coordinator mutex poisoned")
