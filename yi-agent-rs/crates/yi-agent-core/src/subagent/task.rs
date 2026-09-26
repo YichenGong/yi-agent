@@ -433,6 +433,7 @@ impl TaskAttempt {
 
 /// Whether a task owns a writable git worktree or runs in place read-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskWorkspaceMode {
     /// Create a git worktree; the worker may write files and deliver a commit.
     Coding,
@@ -458,6 +459,8 @@ impl TaskWorkspaceMode {
     }
 }
 
+/// Defaults to `ReadOnly`: a child must be explicitly spawned as `Coding`
+/// to receive a writable worktree.
 impl Default for TaskWorkspaceMode {
     fn default() -> Self {
         Self::ReadOnly
@@ -1663,6 +1666,9 @@ mod workspace_mode_tests {
 
     #[test]
     fn workspace_mode_round_trips_through_its_storage_string() {
+        assert_eq!(TaskWorkspaceMode::Coding.as_str(), "coding");
+        assert_eq!(TaskWorkspaceMode::ReadOnly.as_str(), "read_only");
+
         for mode in [TaskWorkspaceMode::Coding, TaskWorkspaceMode::ReadOnly] {
             assert_eq!(TaskWorkspaceMode::parse(mode.as_str()), Some(mode));
         }
