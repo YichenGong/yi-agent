@@ -3933,6 +3933,7 @@ async fn read_only_child_runs_in_place_without_a_workspace_row() {
         .expect("read-only child still receives a workspace");
     assert_eq!(child_workspace.path, root_workspace.path);
     assert!(child_workspace.branch.is_empty());
+    assert_eq!(starts[1].workspace_mode, TaskWorkspaceMode::ReadOnly);
 }
 
 #[tokio::test]

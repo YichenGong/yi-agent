@@ -30,8 +30,9 @@ use yi_agent_core::subagent::task::{
     TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
+    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
+    WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent,
+    WorkerWorkspace,
 };
 
 use crate::repository::{
@@ -62,6 +63,8 @@ pub enum RuntimeCoordinatorError {
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
     Supervisor(String),
+    #[error("coding requires a git repository")]
+    CodingRequiresGitRepository,
     #[error("authority denied: {0}")]
     AuthorityDenied(String),
     #[error(transparent)]
@@ -212,6 +215,16 @@ fn new_application_root_capability() -> String {
 fn digest_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The workspace mode a per-service root should run in. A service that cannot
+/// code forces the root to run in place (`ReadOnly`); a missing service is also
+/// treated as read-only so callers never provision a worktree they cannot own.
+fn root_mode_for(service: Option<&dyn AgentWorkspaceService>) -> TaskWorkspaceMode {
+    match service {
+        Some(service) if service.supports_coding() => TaskWorkspaceMode::Coding,
+        _ => TaskWorkspaceMode::ReadOnly,
+    }
 }
 
 impl RuntimeCoordinator {
@@ -399,12 +412,11 @@ impl RuntimeCoordinator {
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
             } else {
-                // `open` has no `self` yet; the factory's workspace service is
-                // the same fallback `workspace_service_for` uses for a session
-                // without a registered application-root service.
-                let is_git = factory
-                    .workspace_service()
-                    .is_some_and(|service| service.supports_coding());
+                // A recovered root must keep the mode persisted at spawn time:
+                // reattaching an application root early-returns before the
+                // per-root service is consulted, so a factory-global guess would
+                // wrongly promote a non-git root to `Coding`.
+                let root_mode = task.workspace_mode;
                 let mut supervisor = if task.recovery_gated || task.recovery_attested {
                     AgentSupervisor::from_recovered_gated_root(
                         task.session_id.clone(),
@@ -423,14 +435,7 @@ impl RuntimeCoordinator {
                     )
                 };
                 let root_id = supervisor.root_task_id().clone();
-                supervisor.set_workspace_mode(
-                    &root_id,
-                    if is_git {
-                        TaskWorkspaceMode::Coding
-                    } else {
-                        TaskWorkspaceMode::ReadOnly
-                    },
-                );
+                supervisor.set_workspace_mode(&root_id, root_mode);
                 supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
             }
         }
@@ -632,8 +637,10 @@ impl RuntimeCoordinator {
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
-        let supervisor = AgentSupervisor::new_with_objective(session_id.clone(), objective.clone());
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(session_id.clone(), objective.clone());
         let root_id = supervisor.root_task_id().clone();
+        supervisor.set_workspace_mode(&root_id, workspace_mode);
         let root_attempt = supervisor
             .task(&root_id)
             .expect("new root task exists")
@@ -684,11 +691,7 @@ impl RuntimeCoordinator {
                     "application root workspace service is unavailable".into(),
                 )
             })?;
-        let root_mode = if service.supports_coding() {
-            TaskWorkspaceMode::Coding
-        } else {
-            TaskWorkspaceMode::ReadOnly
-        };
+        let root_mode = root_mode_for(Some(service.as_ref()));
         let existing = {
             self.repository
                 .lock()
@@ -746,7 +749,6 @@ impl RuntimeCoordinator {
         let supervisor_handle = self.supervisor(&session_id)?;
         let mut supervisor = supervisor_handle.lock().await;
         let root_task_id = supervisor.root_task_id().clone();
-        supervisor.set_workspace_mode(&root_task_id, root_mode);
         let attempt = supervisor
             .task(&root_task_id)
             .expect("root task exists")
@@ -805,14 +807,10 @@ impl RuntimeCoordinator {
                 attachment.root_session_id.clone(),
             ));
         }
-        let root_mode = if self
-            .workspace_service_for(&attachment.root_session_id)
-            .is_some_and(|service| service.supports_coding())
-        {
-            TaskWorkspaceMode::Coding
-        } else {
-            TaskWorkspaceMode::ReadOnly
-        };
+        let root_mode = root_mode_for(
+            self.workspace_service_for(&attachment.root_session_id)
+                .as_deref(),
+        );
         let mut hydrated_supervisor = None;
         for task in tasks {
             let depth = persisted_depth(task.depth)?;
@@ -1240,10 +1238,11 @@ impl RuntimeCoordinator {
         ) {
             Ok(workspace) => workspace,
             Err(error) => {
-                let reason = if error.to_string().contains("coding_requires_git_repository") {
-                    "coding_requires_git_repository"
-                } else {
-                    "workspace_provision_failed"
+                let reason = match &error {
+                    RuntimeCoordinatorError::CodingRequiresGitRepository => {
+                        "coding_requires_git_repository"
+                    }
+                    _ => "workspace_provision_failed",
                 };
                 let evidence = serde_json::to_string(&serde_json::json!({
                     "reason": reason,
@@ -1601,9 +1600,7 @@ impl RuntimeCoordinator {
             return Ok(Some(workspace));
         }
         if !service.supports_coding() {
-            return Err(RuntimeCoordinatorError::Supervisor(
-                "coding_requires_git_repository".into(),
-            ));
+            return Err(RuntimeCoordinatorError::CodingRequiresGitRepository);
         }
         let task_snapshot = supervisor
             .task(task)
