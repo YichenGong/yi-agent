@@ -164,11 +164,17 @@ impl AgentWorkspaceService for StaticWorkspaceService {
 
 struct GitWorkspaceService {
     repository_root: std::path::PathBuf,
+    accepted: Arc<Mutex<Vec<(WorkerWorkspace, WorkerWorkspace)>>>,
+    cleanup_error: Option<&'static str>,
 }
 
 impl GitWorkspaceService {
     fn new(repository_root: std::path::PathBuf) -> Self {
-        Self { repository_root }
+        Self {
+            repository_root,
+            accepted: Arc::new(Mutex::new(Vec::new())),
+            cleanup_error: None,
+        }
     }
 }
 
@@ -291,6 +297,30 @@ impl AgentWorkspaceService for GitWorkspaceService {
             .current_dir(&workspace.repository_root)
             .status();
         Ok(())
+    }
+
+    fn cleanup_accepted(
+        &self,
+        owner: &WorkerWorkspace,
+        child: &WorkerWorkspace,
+    ) -> Result<(), WorkerError> {
+        self.accepted
+            .lock()
+            .unwrap()
+            .push((owner.clone(), child.clone()));
+        if let Some(error) = self.cleanup_error {
+            return Err(WorkerError::Startup(error.into()));
+        }
+        Ok(())
+    }
+
+    fn contains_commit(&self, owner: &WorkerWorkspace, commit: &str) -> Result<bool, WorkerError> {
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+            .current_dir(&owner.path)
+            .output()
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
+        Ok(output.status.success())
     }
 }
 
@@ -1017,6 +1047,258 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
     assert_eq!(review_actor["initiated_by"]["kind"], "parent_integration");
     let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
     assert_eq!(parent_mailbox.len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_review_recycles_the_child_workspace() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService {
+            repository_root: repository_root.clone(),
+            accepted: Arc::clone(&accepted),
+            cleanup_error: None,
+        })),
+        ..Default::default()
+    });
+    let (coordinator, _session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    coordinator
+        .accept_review(&child, IntegrationValidation::passed("integrated"))
+        .await
+        .unwrap();
+
+    let recorded = accepted.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "cleanup_accepted runs once for the accepted child"
+    );
+    assert_eq!(recorded[0].0.branch, format!("feat/root-{parent}"));
+    assert_eq!(recorded[0].1.branch, format!("feat/child-{child}"));
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&child).unwrap(), "completed");
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_none(),
+        "the child's workspace row is deleted after recycling"
+    );
+    assert!(
+        repository
+            .task_workspace_optional(&parent)
+            .unwrap()
+            .is_some(),
+        "the parent's workspace row survives recycling"
+    );
+    assert!(
+        repository
+            .event_records_for_task_after(&child, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycled),
+        "a recycle-success event is recorded"
+    );
+}
+
+#[tokio::test]
+async fn recycle_failure_does_not_fail_the_accept() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService {
+            repository_root: repository_root.clone(),
+            accepted: Arc::clone(&accepted),
+            cleanup_error: Some("injected recycle failure"),
+        })),
+        ..Default::default()
+    });
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    coordinator
+        .accept_review(&child, IntegrationValidation::passed("integrated"))
+        .await
+        .expect("a recycle failure must not fail the accept");
+
+    assert_eq!(accepted.lock().unwrap().len(), 1);
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&child).unwrap(), "completed");
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_some(),
+        "a failed recycle leaves the child's workspace row for later handling"
+    );
+    let events = repository.event_records_for_task_after(&child, 0).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycleFailed),
+        "a recycle-failure event is recorded"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event != RuntimeEvent::TaskWorkspaceRecycled),
+        "a failed recycle must not record a success event"
+    );
+}
+
+#[tokio::test]
+async fn integrated_delivery_is_accepted_and_recycled_on_reconcile() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService {
+            repository_root: repository_root.clone(),
+            accepted: Arc::clone(&accepted),
+            cleanup_error: None,
+        })),
+        ..Default::default()
+    });
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+    let parent_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    let child_workspace = factory.starts.lock().unwrap()[1].workspace.clone().unwrap();
+
+    // The parent (application root) integrates the child by merging its branch.
+    git_ok(
+        &parent_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &child_workspace.branch,
+            "-m",
+            "integrate",
+        ],
+    )
+    .unwrap();
+
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "completed"
+    );
+    let recorded = accepted.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the sweep triggers exactly one accepted cleanup"
+    );
+    assert_eq!(recorded[0].1.branch, child_workspace.branch);
+    assert_eq!(
+        recorded[0].0.branch, parent_workspace.branch,
+        "the sweep probes and cleans up against the parent (owner) workspace"
+    );
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_none(),
+        "the child's workspace row is deleted after the sweep recycles it"
+    );
+    assert!(
+        repository
+            .event_records_for_task_after(&child, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycled),
+        "a recycle-success event is recorded"
+    );
+
+    // A second reconcile pass must not double-accept an already-recycled child.
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(
+        accepted.lock().unwrap().len(),
+        1,
+        "a second reconcile does not accept the child again"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "completed"
+    );
+}
+
+#[tokio::test]
+async fn unmerged_delivery_stays_awaiting_review_across_reconcile() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService {
+            repository_root: repository_root.clone(),
+            accepted: Arc::clone(&accepted),
+            cleanup_error: None,
+        })),
+        ..Default::default()
+    });
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.task_state(&child).unwrap(),
+        "awaiting_parent_review"
+    );
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        accepted.lock().unwrap().is_empty(),
+        "no cleanup without integration"
+    );
+    assert!(
+        repository
+            .event_records_for_task_after(&child, 0)
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(
+                event.event,
+                RuntimeEvent::TaskWorkspaceRecycled | RuntimeEvent::TaskWorkspaceRecycleFailed
+            )),
+        "no recycle event is recorded without integration"
+    );
 }
 
 #[tokio::test]

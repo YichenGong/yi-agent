@@ -1438,6 +1438,15 @@ mod tests {
         assert!(ensure_stdio_listen("tcp://127.0.0.1:9000").is_err());
     }
 
+    #[test]
+    fn default_system_prompt_requires_parent_integration_of_deliveries() {
+        let prompt = yi_agent_core::AgentConfig::default_system_prompt();
+        assert!(
+            prompt.contains("git merge --no-ff"),
+            "default prompt must instruct parents to merge delivered commits"
+        );
+    }
+
     // --- drain_stream_human tests ---
 
     use futures::stream::{self, BoxStream, StreamExt};

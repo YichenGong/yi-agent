@@ -292,6 +292,27 @@ impl WorktreeService {
         Ok(())
     }
 
+    /// Whether `rev` is already contained in the worktree's current HEAD.
+    ///
+    /// Exit code 0 means ancestor, 1 means not an ancestor, anything else is a
+    /// real git error (for example an unknown revision).
+    pub fn contains_commit(&self, worktree: &Path, rev: &str) -> Result<bool, WorktreeError> {
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", rev, "HEAD"])
+            .current_dir(worktree)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            }),
+        }
+    }
+
     pub fn remove_clean(
         &self,
         owner_worktree: &Path,

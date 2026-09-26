@@ -530,3 +530,38 @@ fn accepted_delivery_cannot_be_merged_twice_and_dirty_cleanup_is_refused() {
     ));
     assert!(child_path.exists());
 }
+
+#[test]
+fn contains_commit_reports_whether_a_revision_is_an_ancestor_of_head() {
+    let (repo, base) = repository();
+    let service = WorktreeService::new();
+    let root_path = repo.path().join(".worktrees/yi-contains");
+    let root = service
+        .create_root(repo.path(), "feat/yi-contains", &root_path)
+        .unwrap();
+
+    assert!(service.contains_commit(&root.path, &base).unwrap());
+
+    let child_path = repo.path().join(".worktrees/yi-contains-child");
+    let child = service
+        .create_child(
+            &root.path,
+            &root.base_commit,
+            "feat/yi-contains-child",
+            &child_path,
+        )
+        .unwrap();
+    std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
+    git(&child.path, &["add", "delivery.txt"]);
+    git(&child.path, &["commit", "-m", "child delivery"]);
+    let child_head = git(&child.path, &["rev-parse", "HEAD"]);
+
+    // The child commit exists but is not yet in the parent's HEAD.
+    assert!(!service.contains_commit(&root.path, &child_head).unwrap());
+
+    git(
+        &root.path,
+        &["merge", "--no-ff", &child_head, "-m", "integrate"],
+    );
+    assert!(service.contains_commit(&root.path, &child_head).unwrap());
+}

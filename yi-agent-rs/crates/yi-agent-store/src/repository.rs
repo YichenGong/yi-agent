@@ -97,6 +97,8 @@ pub enum RuntimeEvent {
     ReviewAccepted,
     ReviewRework,
     ReviewRejected,
+    TaskWorkspaceRecycled,
+    TaskWorkspaceRecycleFailed,
 }
 
 impl RuntimeEvent {
@@ -127,6 +129,8 @@ impl RuntimeEvent {
             Self::ReviewAccepted => "review_accepted",
             Self::ReviewRework => "review_rework",
             Self::ReviewRejected => "review_rejected",
+            Self::TaskWorkspaceRecycled => "task_workspace_recycled",
+            Self::TaskWorkspaceRecycleFailed => "task_workspace_recycle_failed",
         }
     }
 
@@ -157,6 +161,8 @@ impl RuntimeEvent {
             "review_accepted" => Ok(Self::ReviewAccepted),
             "review_rework" => Ok(Self::ReviewRework),
             "review_rejected" => Ok(Self::ReviewRejected),
+            "task_workspace_recycled" => Ok(Self::TaskWorkspaceRecycled),
+            "task_workspace_recycle_failed" => Ok(Self::TaskWorkspaceRecycleFailed),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -3239,6 +3245,16 @@ impl RuntimeRepository {
         }
     }
 
+    /// Deletes a task's workspace assignment row. Idempotent: a missing row is
+    /// not an error, so recycling can be retried safely.
+    pub fn delete_task_workspace(&self, task: &TaskId) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "DELETE FROM task_workspaces WHERE task_id = ?1",
+            params![task.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT state FROM attempts WHERE id = ?1",
@@ -4508,4 +4524,22 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_event_tests {
+    use super::*;
+
+    #[test]
+    fn recycle_events_round_trip_through_name_and_parse() {
+        for event in [
+            RuntimeEvent::TaskWorkspaceRecycled,
+            RuntimeEvent::TaskWorkspaceRecycleFailed,
+        ] {
+            assert_eq!(
+                RuntimeEvent::parse(event.name().to_string()).unwrap(),
+                event
+            );
+        }
+    }
 }
