@@ -245,6 +245,12 @@ impl From<ProviderRequest> for OpenaiRequest {
                     });
                 }
                 Role::Tool => {
+                    // OpenAI tool messages may only carry text, and all tool
+                    // messages for one assistant turn must be contiguous.
+                    // Collect images and emit them afterwards in a single
+                    // user message (the only role that accepts image parts).
+                    let mut image_parts: Vec<OpenaiContentPart> = Vec::new();
+
                     for block in m.content {
                         if let ContentBlock::ToolResult {
                             tool_use_id,
@@ -253,11 +259,22 @@ impl From<ProviderRequest> for OpenaiRequest {
                         } = block
                         {
                             let text = extract_text(&content);
-                            let body = if is_error {
+                            let has_image = content
+                                .iter()
+                                .any(|b| matches!(b, ContentBlock::Image { .. }));
+                            if has_image {
+                                image_parts.extend(content.iter().filter_map(image_part));
+                            }
+
+                            let mut body = if is_error {
                                 format!("error: {}", text)
                             } else {
                                 text
                             };
+                            if has_image {
+                                body.push_str("\n[image attached in the following message]");
+                            }
+
                             messages.push(OpenaiMessage {
                                 role: "tool".to_string(),
                                 name: None,
@@ -266,6 +283,16 @@ impl From<ProviderRequest> for OpenaiRequest {
                                 tool_call_id: Some(tool_use_id),
                             });
                         }
+                    }
+
+                    if !image_parts.is_empty() {
+                        messages.push(OpenaiMessage {
+                            role: "user".to_string(),
+                            name: None,
+                            content: Some(OpenaiContent::Parts(image_parts)),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
                     }
                 }
             }
@@ -571,5 +598,114 @@ mod tests {
         let o: OpenaiRequest = req.into();
         let json = serde_json::to_value(&o).unwrap();
         assert_eq!(json["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn tool_result_with_image_splits_into_tool_then_user() {
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "call_01".into(),
+            content: vec![
+                ContentBlock::Text("viewed logo.png (8x8, image/png)".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAA".into(),
+                    },
+                    detail: ImageDetail::High,
+                },
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "expected tool message + follow-up user message"
+        );
+
+        // 1) tool message: string content, image replaced by placeholder
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "call_01");
+        let body = msgs[0]["content"]
+            .as_str()
+            .expect("tool content must be a string");
+        assert!(body.contains("viewed logo.png"));
+        assert!(body.contains("image attached"));
+
+        // 2) user message: image_url part
+        assert_eq!(msgs[1]["role"], "user");
+        let content = &msgs[1]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,AAA");
+    }
+
+    #[test]
+    fn tool_results_with_images_emit_all_tools_before_user() {
+        // Two tool results, both with images: both tool messages must precede
+        // the single user message, or OpenAI rejects the pairing.
+        let mk = |id: &str, data: &str| ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: vec![
+                ContentBlock::Text("viewed".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: data.into(),
+                    },
+                    detail: ImageDetail::High,
+                },
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![
+                mk("c1", "AAA"),
+                mk("c2", "BBB"),
+            ])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "c1");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "c2");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tool_result_without_image_stays_string() {
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "call_01".into(),
+            content: vec![ContentBlock::Text("ok".into())],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let o: OpenaiRequest = req.into();
+        let json = serde_json::to_value(&o).unwrap();
+        assert_eq!(json["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(json["messages"][0]["content"], "ok");
     }
 }
