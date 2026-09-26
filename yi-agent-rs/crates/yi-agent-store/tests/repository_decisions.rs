@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::{
     AttemptId, DeliveryReport, IntegrationValidation, MessageId, PermissionDecision,
-    PermissionRequestId, RootSessionId, TaskId, WorkspaceLeaseId,
+    PermissionRequestId, RootSessionId, TaskId, TaskWorkspaceMode, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::WorkerWorkspace;
 use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
@@ -893,4 +893,79 @@ fn review_fixture() -> (
         child_attempt,
         delivery,
     )
+}
+
+#[test]
+fn reclaim_candidates_are_deepest_first_and_carry_their_workspace() {
+    let directory = TempDir::new().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let session = RootSessionId::new();
+    let root = TaskId::new();
+    let child = TaskId::new();
+    let root_attempt = AttemptId::new();
+    let child_attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt_and_objective(
+            &root,
+            &session,
+            &root_attempt,
+            1,
+            "completed",
+            "root objective",
+            TaskWorkspaceMode::Coding,
+        )
+        .unwrap();
+    repository
+        .create_child_task_with_attempt(&child, &session, &root, 1, &child_attempt, 1, "completed")
+        .unwrap();
+    repository
+        .record_task_workspace(&root, &root_attempt, &test_workspace(&session, &root))
+        .unwrap();
+    let mut child_workspace = test_workspace(&session, &child);
+    child_workspace.branch = "feat/child".into();
+    repository
+        .record_task_workspace(&child, &child_attempt, &child_workspace)
+        .unwrap();
+
+    let candidates = repository.reclaim_candidates(&session).unwrap();
+
+    assert_eq!(candidates.len(), 2, "both tasks carry a workspace row");
+    assert_eq!(
+        candidates[0].task_id,
+        child.to_string(),
+        "the deeper task is listed first so reclaim runs child before parent"
+    );
+    assert_eq!(candidates[0].depth, 1);
+    assert_eq!(candidates[1].task_id, root.to_string());
+    assert_eq!(candidates[1].depth, 0);
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.workspace.is_some()),
+        "workspace is joined in"
+    );
+}
+
+#[test]
+fn reclaim_candidates_exclude_tasks_without_a_workspace_row() {
+    let directory = TempDir::new().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let session = RootSessionId::new();
+    let task = TaskId::new();
+    repository
+        .create_task_with_attempt_and_objective(
+            &task,
+            &session,
+            &AttemptId::new(),
+            1,
+            "completed",
+            "objective",
+            TaskWorkspaceMode::ReadOnly,
+        )
+        .unwrap();
+
+    assert!(
+        repository.reclaim_candidates(&session).unwrap().is_empty(),
+        "a read-only task owns no worktree and is not a candidate"
+    );
 }
