@@ -16,12 +16,8 @@ pub struct ThreadSession {
     pub model: String,
     /// 当前活跃 turn 的 id;无活跃 turn 时为 None。
     pub active_turn_id: Option<String>,
-    /// 向该 thread 的 driver task 投递 turn(C4b 使用)。
-    // TODO(C4b): driver task 读取该 sender;C4a 仅存储,故暂 allow dead_code。
-    #[allow(dead_code)]
+    /// 向该 thread 的 driver task 投递 turn。
     pub(crate) prompt_tx: mpsc::Sender<TurnPrompt>,
-    /// 请求中断当前 turn(C4b 使用)。
-    // TODO(C4b): driver task 读取该 sender;C4a 仅存储,故暂 allow dead_code。
-    #[allow(dead_code)]
+    /// 请求中断当前 turn。
     pub(crate) interrupt_tx: mpsc::Sender<()>,
 }
