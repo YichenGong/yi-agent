@@ -257,7 +257,7 @@ MSG
                     if result.is_error
                         && result.content.iter().any(|b| matches!(
                             b,
-                            yi_agent_core::ContentBlock::Text(t)
+                            crate::message::ContentBlock::Text(t)
                                 if t.contains("blocked by safety filter: test rule")
                         ))
             )),
@@ -461,7 +461,7 @@ MSG
 
 - [ ] **Step 2: 运行测试确认失败(若断言无效)**
 
-Run: `cargo test -p yi-agent --lib blacklist_deny_is_visible_as_failed_tool_call`
+Run: `cargo test -p yi-agent --bin yi-agent blacklist_deny_is_visible_as_failed_tool_call`
 Expected: 若渲染路径正确,此测试**可能直接通过**。这本身是可接受的结果 —— 它锁定的是 Task 2 建立的事件契约在 TUI 侧确实可见。若失败,失败信息会指出是状态未标记为 `Failed` 还是原因未渲染;按失败信息修正测试或补渲染逻辑。
 
 - [ ] **Step 3: 若上一步失败,修正渲染**
@@ -470,7 +470,7 @@ Expected: 若渲染路径正确,此测试**可能直接通过**。这本身是�
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cargo test -p yi-agent --lib blacklist_deny_is_visible_as_failed_tool_call`
+Run: `cargo test -p yi-agent --bin yi-agent blacklist_deny_is_visible_as_failed_tool_call`
 Expected: PASS。
 
 - [ ] **Step 5: 提交**
@@ -518,12 +518,12 @@ git rebase main
 改为:
 
 ```
-- [x] 在yolo模式下，冒出了授权确认，我明明选择allow once，但是看起来对应的命令还是被sandbox阻拦。（修复：黑名单不再弹确认框、改为硬拒绝，且先发 `ToolCall` 让拒绝可见，见 `crates/yi-agent-core/src/agent.rs` `CheckResult::Blacklisted` 分支；根删除规则拆为三条消除绝对路径误伤，见 `crates/yi-agent-tools/src/shell/blocklist.rs`。验证：`cargo test -p yi-agent-tools --lib blocklist`、`cargo test -p yi-agent-core --lib blacklisted_command_hard_denies_without_confirmation`、`cargo test -p yi-agent --lib blacklist_deny_is_visible_as_failed_tool_call`）
+- [x] 在yolo模式下，冒出了授权确认，我明明选择allow once，但是看起来对应的命令还是被sandbox阻拦。（修复：黑名单不再弹确认框、改为硬拒绝，且先发 `ToolCall` 让拒绝可见，见 `crates/yi-agent-core/src/agent.rs` `CheckResult::Blacklisted` 分支；根删除规则拆为三条消除绝对路径误伤，见 `crates/yi-agent-tools/src/shell/blocklist.rs`。验证：`cargo test -p yi-agent-tools --lib blocklist`、`cargo test -p yi-agent-core --lib blacklisted_command_hard_denies_without_confirmation`、`cargo test -p yi-agent --bin yi-agent blacklist_deny_is_visible_as_failed_tool_call`）
 ```
 
 - [ ] **Step 2: 全量验证**
 
-Run: `cargo test -p yi-agent-tools -p yi-agent-core && cargo test -p yi-agent --lib`
+Run: `cargo test -p yi-agent-tools -p yi-agent-core && cargo test -p yi-agent --bin yi-agent`
 Expected: 全部 PASS,0 failed。特别确认既有 `blocklist`(77+ 例)与 `permission`(52 例)套件无回归。
 
 - [ ] **Step 3: 格式化与 lint**
