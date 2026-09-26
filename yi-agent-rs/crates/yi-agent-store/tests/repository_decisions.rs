@@ -287,6 +287,26 @@ fn task_workspace_rejects_empty_persisted_git_identity_fields() {
 }
 
 #[test]
+fn delete_task_workspace_removes_the_row_and_is_idempotent() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let (session, task, attempt) = persisted_root(&mut repository);
+    let workspace = test_workspace(&session, &task);
+
+    repository
+        .record_task_workspace(&task, &attempt, &workspace)
+        .unwrap();
+    assert!(repository.task_workspace_optional(&task).unwrap().is_some());
+
+    repository.delete_task_workspace(&task).unwrap();
+    assert!(repository.task_workspace_optional(&task).unwrap().is_none());
+
+    // Second delete is a no-op, not an error.
+    repository.delete_task_workspace(&task).unwrap();
+}
+
+#[test]
 fn permission_resolution_is_an_atomic_audited_task_transition() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

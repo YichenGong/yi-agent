@@ -325,6 +325,18 @@ impl AgentSupervisor {
         self.children.get(task_id).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Tasks currently waiting for their direct parent's review.
+    pub fn tasks_awaiting_parent_review(&self) -> Vec<TaskId> {
+        let mut ids = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| matches!(task.state(), TaskState::AwaitingParentReview(_)))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.to_string());
+        ids
+    }
+
     pub fn events(&self) -> &[SupervisorEvent] {
         &self.events
     }
@@ -1835,6 +1847,19 @@ mod provider_turn_priority_tests {
             supervisor.task(&child).unwrap().state(),
             &TaskState::AwaitingParentReview(delivery.id)
         );
+    }
+
+    #[test]
+    fn tasks_awaiting_parent_review_lists_only_review_waiters() {
+        let (supervisor, _parent, child, _delivery) = delivered_child();
+
+        assert_eq!(supervisor.tasks_awaiting_parent_review(), vec![child]);
+    }
+
+    #[test]
+    fn tasks_awaiting_parent_review_is_empty_without_review_waiters() {
+        let supervisor = AgentSupervisor::new(RootSessionId::new());
+        assert!(supervisor.tasks_awaiting_parent_review().is_empty());
     }
 
     #[test]

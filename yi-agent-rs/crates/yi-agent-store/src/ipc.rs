@@ -2029,6 +2029,10 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::ReviewAccepted => "review_accepted",
         crate::repository::RuntimeEvent::ReviewRework => "review_rework",
         crate::repository::RuntimeEvent::ReviewRejected => "review_rejected",
+        crate::repository::RuntimeEvent::TaskWorkspaceRecycled => "task_workspace_recycled",
+        crate::repository::RuntimeEvent::TaskWorkspaceRecycleFailed => {
+            "task_workspace_recycle_failed"
+        }
     }
 }
 

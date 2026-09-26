@@ -278,6 +278,30 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
             )
             .map_err(|error| WorkerError::Startup(format!("Git workspace cleanup error: {error}")))
     }
+
+    fn contains_commit(&self, owner: &WorkerWorkspace, commit: &str) -> Result<bool, WorkerError> {
+        self.service
+            .contains_commit(&owner.path, commit)
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    }
+
+    fn cleanup_accepted(
+        &self,
+        owner: &WorkerWorkspace,
+        child: &WorkerWorkspace,
+    ) -> Result<(), WorkerError> {
+        self.service
+            .remove_accepted_clean(
+                &owner.path,
+                &yi_agent_tools::worktree::ChildWorktree {
+                    path: child.path.clone(),
+                    branch: child.branch.clone(),
+                    parent_branch: child.parent_branch.clone(),
+                    base_commit: child.base_commit.clone(),
+                },
+            )
+            .map_err(|error| WorkerError::Startup(format!("Git workspace cleanup error: {error}")))
+    }
 }
 
 fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {
@@ -1446,6 +1470,75 @@ mod tests {
                     "--verify",
                     "--quiet",
                     &format!("refs/heads/{}", workspace.branch)
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn daemon_workspace_cleanup_accepted_removes_child_worktree_and_branch() {
+        let directory = TempDir::new().unwrap();
+        initialize_git_repository(directory.path());
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let root = service
+            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .unwrap();
+        let child = service
+            .prepare_child(
+                &root,
+                &RootSessionId::new(),
+                &TaskId::new(),
+                &AttemptId::new(),
+            )
+            .unwrap();
+
+        std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
+        for args in [
+            vec!["add", "delivery.txt"],
+            vec!["commit", "-m", "child delivery"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&child.path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        // Not integrated yet: the child head is not an ancestor of the owner,
+        // and refusal is git-level, leaving the worktree in place.
+        assert!(!service.contains_commit(&root, &child.branch).unwrap());
+        let error = service.cleanup_accepted(&root, &child).unwrap_err();
+        assert!(
+            error.to_string().contains("has not been merged"),
+            "unexpected error: {error}"
+        );
+        assert!(child.path.exists());
+
+        assert!(
+            Command::new("git")
+                .args(["merge", "--no-ff", &child.branch, "-m", "integrate"])
+                .current_dir(&root.path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(service.contains_commit(&root, &child.branch).unwrap());
+
+        service.cleanup_accepted(&root, &child).unwrap();
+        assert!(!child.path.exists());
+        assert!(
+            !Command::new("git")
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", child.branch)
                 ])
                 .current_dir(directory.path())
                 .status()

@@ -1448,6 +1448,18 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    fn workspace_service_for(
+        &self,
+        session: &RootSessionId,
+    ) -> Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>> {
+        self.application_root_workspace_services
+            .lock()
+            .expect("runtime application root workspace service mutex poisoned")
+            .get(session)
+            .cloned()
+            .or_else(|| self.workspace_service.clone())
+    }
+
     fn prepare_task_workspace(
         &self,
         supervisor: &mut AgentSupervisor,
@@ -1466,14 +1478,7 @@ impl RuntimeCoordinator {
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             return Ok(Some(existing));
         }
-        let service = self
-            .application_root_workspace_services
-            .lock()
-            .expect("runtime application root workspace service mutex poisoned")
-            .get(session)
-            .cloned()
-            .or_else(|| self.workspace_service.clone());
-        let Some(service) = service else {
+        let Some(service) = self.workspace_service_for(session) else {
             return Ok(None);
         };
         let task_snapshot = supervisor
@@ -1901,7 +1906,81 @@ impl RuntimeCoordinator {
             .map_err(review_persistence_error)?;
         drop(supervisor);
         self.release_resident_lease(task);
+        self.recycle_accepted_delivery(&session, &parent, task)
+            .await;
         Ok(())
+    }
+
+    /// Best-effort recycling after an accepted review is durable. Never fails
+    /// the accept: a recycle failure leaves the worktree in place for later
+    /// handling and records an event. Git runs as a subprocess, so this is
+    /// deliberately called after every lock is released.
+    async fn recycle_accepted_delivery(
+        &self,
+        session: &RootSessionId,
+        owner: &TaskId,
+        child: &TaskId,
+    ) {
+        let Some(service) = self.workspace_service_for(session) else {
+            return;
+        };
+        let (owner_workspace, child_workspace) = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            (
+                repository.task_workspace_optional(owner),
+                repository.task_workspace_optional(child),
+            )
+        };
+        let (owner_workspace, child_workspace) = match (owner_workspace, child_workspace) {
+            (Ok(Some(owner_workspace)), Ok(Some(child_workspace))) => {
+                (owner_workspace, child_workspace)
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
+                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+                return;
+            }
+            // A genuinely absent workspace row is not a recycle failure: nothing to recycle.
+            _ => return,
+        };
+        match service.cleanup_accepted(&owner_workspace, &child_workspace) {
+            Ok(()) => {
+                let deleted = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .delete_task_workspace(child);
+                match deleted {
+                    Ok(()) => {
+                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycled);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "yi-agent: failed to delete recycled workspace row for {child}: {error}"
+                        );
+                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
+                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+            }
+        }
+    }
+
+    fn record_recycle_event(&self, task: &TaskId, event: RuntimeEvent) {
+        if let Err(error) = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .append_event(task, event)
+        {
+            eprintln!("yi-agent: failed to record {event:?} for {task}: {error}");
+        }
     }
 
     /// Captures the current review target and issues a short-lived confirmation
@@ -2572,7 +2651,85 @@ impl RuntimeCoordinator {
             }
             self.release_resident_lease(&task_id);
         }
+        self.reconcile_integrated_deliveries().await;
         Ok(())
+    }
+
+    /// Accepts deliveries whose commit a parent has already integrated.
+    ///
+    /// This is the production entry to `accept_review`. It never parses agent
+    /// text: the ancestry of the child's delivered commit in the parent's
+    /// worktree HEAD is the only proof of integration. It runs on every
+    /// reconcile pass because the application root is not a daemon worker, so
+    /// its merge is only observable through git.
+    ///
+    /// Failures are logged, not propagated: reconcile runs on every IPC request
+    /// and a transient mismatch must not fail unrelated traffic.
+    async fn reconcile_integrated_deliveries(&self) {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .iter()
+            .map(|(session, supervisor)| (session.clone(), Arc::clone(supervisor)))
+            .collect::<Vec<_>>();
+        let mut awaiting: Vec<(RootSessionId, TaskId, TaskId, String)> = Vec::new();
+        for (session, supervisor) in &supervisors {
+            let supervisor = supervisor.lock().await;
+            for child in supervisor.tasks_awaiting_parent_review() {
+                let Some(task) = supervisor.task(&child) else {
+                    continue;
+                };
+                let Some(parent) = task.parent_id.clone() else {
+                    continue;
+                };
+                let Some(commit) = task
+                    .active_attempt()
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.commit.clone())
+                else {
+                    continue;
+                };
+                awaiting.push((session.clone(), child, parent, commit));
+            }
+        }
+        for (session, child, parent, commit) in awaiting {
+            let Some(service) = self.workspace_service_for(&session) else {
+                continue;
+            };
+            let owner_workspace = {
+                let repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                repository.task_workspace_optional(&parent)
+            };
+            let owner_workspace = match owner_workspace {
+                Ok(Some(workspace)) => workspace,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!("yi-agent: integration workspace lookup failed for {child}: {error}");
+                    continue;
+                }
+            };
+            match service.contains_commit(&owner_workspace, &commit) {
+                Ok(true) => {
+                    let integration = IntegrationValidation::passed(format!(
+                        "child commit {commit} is an ancestor of parent {parent} HEAD"
+                    ));
+                    if let Err(error) = self.accept_review(&child, integration).await {
+                        eprintln!(
+                            "yi-agent: integrated delivery accept failed for {child}: {error}"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("yi-agent: integration ancestry check failed for {child}: {error}");
+                }
+            }
+        }
     }
 
     pub async fn worker_cancellation(
