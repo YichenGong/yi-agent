@@ -994,6 +994,7 @@ fn handle_key(
                             input_tx,
                             interrupt_tx,
                             control_tx,
+                            queued,
                         );
                     } else {
                         // No command selected (empty filter) — show error
@@ -1068,6 +1069,7 @@ fn handle_key(
                         input_tx,
                         interrupt_tx,
                         control_tx,
+                        queued,
                     );
                 } else {
                     // Unknown slash command
@@ -1167,12 +1169,14 @@ fn execute_slash_command(
     _input_tx: &tokio::sync::mpsc::Sender<String>,
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
+    queued: &mut crate::tui::queued::PendingQueue,
 ) -> KeyOutcome {
     match cmd {
         SlashCommand::Quit => KeyOutcome::Quit,
         SlashCommand::Clear => {
             // 本地清空 history 显示,TUI 不等 driver 确认。
             // 通过 control channel 通知 driver 重建 agent(空 session)。
+            let dropped = queued.clear();
             history.clear();
             history.push(
                 HistoryCell::Separator {
@@ -1180,6 +1184,15 @@ fn execute_slash_command(
                 },
                 width,
             );
+            if dropped > 0 {
+                // 清空必须可见:否则用户以为排队消息还在。
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some(format!("已丢弃 {dropped} 条排队消息")),
+                    },
+                    width,
+                );
+            }
             let _ = control_tx.blocking_send(crate::ControlCommand::Clear);
             KeyOutcome::None
         }
@@ -6138,6 +6151,42 @@ mod tests {
     // ----- /cost slash command tests -----
 
     #[test]
+    fn clear_command_drops_pending_queue_and_resets_in_flight() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut history = HistoryState::new();
+        let mut queued = crate::tui::queued::PendingQueue::new();
+
+        // One in flight plus two waiting.
+        use crate::tui::queued::SubmitOutcome;
+        assert_eq!(queued.submit("a".into()), SubmitOutcome::Sent);
+        assert_eq!(queued.submit("b".into()), SubmitOutcome::Queued);
+        assert_eq!(queued.submit("c".into()), SubmitOutcome::Queued);
+
+        let outcome = execute_slash_command(
+            SlashCommand::Clear,
+            None,
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &mut queued,
+        );
+
+        assert_eq!(outcome, KeyOutcome::None);
+        assert!(queued.is_empty(), "/clear must drop waiting messages");
+        // in_flight reset: a later submit sends immediately again.
+        assert_eq!(queued.submit("d".into()), SubmitOutcome::Sent);
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(crate::ControlCommand::Clear)
+        ));
+    }
+
+    #[test]
     fn cost_command_renders_tracker() {
         use yi_agent_core::TokenUsage;
         let mut history = HistoryState::new();
@@ -6153,6 +6202,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::PendingQueue::new();
         let outcome = execute_slash_command(
             SlashCommand::Cost,
             None,
@@ -6162,6 +6212,7 @@ mod tests {
             &input_tx,
             &interrupt_tx,
             &control_tx,
+            &mut queued,
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -6187,6 +6238,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::PendingQueue::new();
         let outcome = execute_slash_command(
             SlashCommand::Cost,
             None,
@@ -6196,6 +6248,7 @@ mod tests {
             &input_tx,
             &interrupt_tx,
             &control_tx,
+            &mut queued,
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();

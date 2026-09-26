@@ -16,13 +16,11 @@ pub enum SubmitOutcome {
 ///
 /// 不变量：`in_flight` 为真时队列是**唯一**的待发缓冲区，通道中至多 1 条消息。
 /// 因此底层通道永不满，`try_send` 不会阻塞调用线程。
-#[allow(dead_code)]
 pub struct PendingQueue {
     items: Vec<String>,
     in_flight: bool,
 }
 
-#[allow(dead_code)]
 impl PendingQueue {
     /// 与 `main.rs` 的输入通道容量一致。
     pub const CAPACITY: usize = 16;
