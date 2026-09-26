@@ -62,19 +62,22 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     F: Fn() -> anyhow::Result<yi_agent_core::Agent> + Send + 'static,
 {
-    let (req_tx, mut req_rx) = mpsc::channel::<String>(64);
+    // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
+    // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
+    let (req_tx, mut req_rx) = mpsc::channel::<anyhow::Result<String>>(64);
     tokio::spawn(async move {
         let mut reader = MessageReader::new(reader);
         loop {
             match reader.next_line().await {
                 Ok(Some(line)) => {
-                    if req_tx.send(line).await.is_err() {
+                    if req_tx.send(Ok(line)).await.is_err() {
                         break;
                     }
                 }
-                Ok(None) => break, // EOF
+                Ok(None) => break, // EOF → 丢弃 req_tx → 主循环优雅退出
                 Err(e) => {
                     tracing::error!("app-server read error: {e}");
+                    let _ = req_tx.send(Err(e)).await;
                     break;
                 }
             }
@@ -97,7 +100,23 @@ where
     loop {
         tokio::select! {
             line = req_rx.recv() => {
-                let Some(line) = line else { break }; // EOF → graceful exit
+                let Some(item) = line else { break }; // EOF → graceful exit
+                let line = match item {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // 尽力告知客户端我们为何退出,再把失败向上抛出,
+                        // 避免传输错误被伪装成干净退出。
+                        let _ = write_response(
+                            &writer,
+                            err_response(
+                                RequestId::Num(0),
+                                RpcError::invalid_request(format!("transport error: {e}")),
+                            ),
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                };
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -105,7 +124,9 @@ where
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!("app-server parse error: {e}");
-                        // 畸形帧里没有可用的 id,按 JSON-RPC 惯例用 id 0 回错误。
+                        // 畸形帧里没有可用的 id。JSON-RPC 2.0 要求此时响应
+                        // 的 id 为 `null`,但 `RequestId` 目前没有 Null 变体,
+                        // 故暂以 id 0 代替(见 docs/bug-list.md)。
                         write_response(
                             &writer,
                             err_response(RequestId::Num(0), RpcError::parse_error(e.to_string())),
@@ -361,7 +382,11 @@ mod tests {
                 client_w, handle, ..
             } = self;
             drop(client_w);
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            let res = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("server must shut down within the timeout")
+                .expect("server task must not panic");
+            assert!(res.is_ok(), "run_with should return Ok on EOF: {res:?}");
         }
     }
 
@@ -379,6 +404,7 @@ mod tests {
             .await;
         let v = h.read_value().await;
         assert_eq!(v["id"], 1);
+        assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["result"]["serverInfo"]["name"], "yi-agent-app-server");
         assert_eq!(v["result"]["protocolVersion"], 1);
         assert!(
@@ -481,6 +507,102 @@ mod tests {
         assert!(
             result.is_ok(),
             "run_with should return Ok on EOF: {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_json_returns_parse_error() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send("not json").await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32700, "expected parse error: {v}");
+        assert_eq!(v["id"], 0, "malformed frame must be answered with id 0");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blank_lines_are_ignored() {
+        let mut h = Harness::new();
+        // 先发一个空行,再发合法的 initialize;空行不应产生任何帧。
+        h.send("").await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 1, "blank line must not produce a frame: {v}");
+        assert_eq!(v["result"]["serverInfo"]["name"], "yi-agent-app-server");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_factory_failure_returns_internal_error() {
+        let (mut client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(run_with(server_r, server_w, test_config(), || {
+            Err::<yi_agent_core::Agent, _>(anyhow::anyhow!("boom"))
+        }));
+
+        let mut client_r = BufReader::new(client_r);
+
+        client_w
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        client_w.flush().await.unwrap();
+        let mut buf = String::new();
+        client_r.read_line(&mut buf).await.unwrap();
+        let init: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+        assert_eq!(init["id"], 1);
+
+        client_w
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"thread/start\",\"params\":{}}\n",
+            )
+            .await
+            .unwrap();
+        client_w.flush().await.unwrap();
+        let mut buf = String::new();
+        client_r.read_line(&mut buf).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+        assert_eq!(v["id"], 2);
+        assert_eq!(
+            v["error"]["code"], -32603,
+            "factory failure must map to internal error: {v}"
+        );
+
+        drop(client_w);
+        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("server must shut down within the timeout")
+            .expect("server task must not panic");
+        assert!(res.is_ok(), "run_with should return Ok on EOF: {res:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_frame_returns_err() {
+        let (mut client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, _client_r) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(run_with(
+            server_r,
+            server_w,
+            test_config(),
+            build_test_agent,
+        ));
+
+        let mut frame = vec![b'x'; crate::protocol::MAX_FRAME_BYTES + 16];
+        frame.push(b'\n');
+        // duplex 缓冲小于帧,server 读到超限即报错并退出读端;写侧随后可能
+        // 因 broken pipe 失败,这里忽略写错误——真正断言的是 server 的结果。
+        let _ = client_w.write_all(&frame).await;
+        let _ = client_w.flush().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("server must exit within the timeout")
+            .expect("server task must not panic");
+        assert!(
+            result.is_err(),
+            "oversized frame must surface an error: {result:?}"
         );
     }
 }

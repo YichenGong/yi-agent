@@ -18,3 +18,4 @@
 - [x] resident lease 释放与 resource coordinator 锁序反转，reconcile 热路径可死锁（修复：`runtime.rs` `release_resident_lease` 不再同时持两把锁）
 - [ ] 权限被拒的工具只发 `ToolResult` 无 `ToolCall`，app-server `translate` 层按未知 id 丢弃，UI 看不到该次拒绝（待 C5 处理）
 - [ ] app-server `render_content` 不截断工具输出，超大工具结果可能超过 `MAX_FRAME_BYTES`（1MB）导致客户端拒收该帧
+- [ ] app-server 解析失败/传输错误响应使用 id 0，而 JSON-RPC 2.0 要求 id 为 null；RequestId 需支持 Null 变体
