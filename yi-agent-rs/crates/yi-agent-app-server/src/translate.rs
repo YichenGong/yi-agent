@@ -42,19 +42,29 @@ struct UsageSnapshot {
 
 impl UsageSnapshot {
     /// 字段级合并:仅在事件携带非零值 / `Some` 时覆盖,使拆分事件可拼回完整快照。
+    ///
+    /// `input_tokens > 0` 标识一次新的 provider 调用(`message_start`,或 OpenAI 的
+    /// 单条合并事件):此时整体替换,避免上一次调用的字段残留。同一次调用的后续
+    /// 事件(`message_delta`,只带 output)按字段合并。
     fn merge(&mut self, model: &str, usage: &TokenUsage) {
         self.model = model.to_string();
         if usage.input_tokens > 0 {
+            // 新的一次调用:整体替换,防止上一调用字段残留。
             self.input_tokens = usage.input_tokens;
-        }
-        if usage.output_tokens > 0 {
             self.output_tokens = usage.output_tokens;
-        }
-        if let Some(v) = usage.cache_creation_input_tokens {
-            self.cache_creation_input_tokens = v;
-        }
-        if let Some(v) = usage.cache_read_input_tokens {
-            self.cache_read_input_tokens = v;
+            self.cache_creation_input_tokens = usage.cache_creation_input_tokens.unwrap_or(0);
+            self.cache_read_input_tokens = usage.cache_read_input_tokens.unwrap_or(0);
+        } else {
+            // 同一次调用的后续事件:只覆盖事件携带的字段。
+            if usage.output_tokens > 0 {
+                self.output_tokens = usage.output_tokens;
+            }
+            if let Some(v) = usage.cache_creation_input_tokens {
+                self.cache_creation_input_tokens = v;
+            }
+            if let Some(v) = usage.cache_read_input_tokens {
+                self.cache_read_input_tokens = v;
+            }
         }
     }
 }
@@ -884,6 +894,57 @@ mod tests {
             } => {
                 assert_eq!(*input_tokens, 5);
                 assert_eq!(*output_tokens, 0, "previous turn's output must not leak");
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_new_call_replaces_previous_snapshot() {
+        let mut t = translator();
+        // 第一次调用:input + cache,再补 output。
+        let _ = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_creation_input_tokens: Some(7),
+                cache_read_input_tokens: Some(9),
+            },
+        });
+        let _ = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        });
+        // 第二次调用:新的 input,且 cache 缺省 → 不得残留上一次调用的 output/cache。
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 150,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                ..
+            } => {
+                assert_eq!(*input_tokens, 150);
+                assert_eq!(*output_tokens, 0, "previous call's output must not leak");
+                assert_eq!(
+                    *cache_creation_input_tokens, 0,
+                    "previous call's cache must not leak"
+                );
+                assert_eq!(*cache_read_input_tokens, 0);
             }
             other => panic!("expected TokenUsage, got {other:?}"),
         }
