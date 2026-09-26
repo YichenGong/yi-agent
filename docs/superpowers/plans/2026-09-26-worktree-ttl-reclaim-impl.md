@@ -216,9 +216,11 @@ fn is_ancestor_distinguishes_merged_from_unmerged_branches() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools --test subagent_worktree reclaim_directory reattach_worktree is_ancestor`
+Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools --test subagent_worktree`
 
 Expected: FAIL to compile — `no method named reclaim_directory` / `reattach_worktree` / `is_ancestor`.
+
+Note: `cargo test` accepts at most one positional test filter (`error: unexpected argument ... found` otherwise), so this runs the whole test binary rather than naming the five new tests. Step 4 does the same and asserts the full set passes.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1445,11 +1447,31 @@ git commit -m "feat(store): seed a worktree reclaim when an application root det
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `yi-agent-rs/crates/yi-agent-store/tests/runtime_coordinator.rs`. The tests need to age a task's `updated_at`, which is set by transitions; write it directly through a SQLite connection, as the file already does elsewhere (see the `Connection::open` usage around line 3826).
+Add to `yi-agent-rs/crates/yi-agent-store/tests/runtime_coordinator.rs`.
+
+**Read this before writing the tests.** `reclaim_idle_worktrees` discovers work through `detached_application_roots()`, which selects `root_session_id FROM application_root_attachments WHERE state = 'detached'`. A session made by `create_session()` has **no** attachment row, so a test built on `create_session()` alone would sweep zero sessions and pass vacuously while proving nothing. Both tests below therefore seed a detached attachment row with `record_application_root_attachment` followed by `detach_application_root`. That is exactly the state a real TUI exit leaves behind.
+
+The tests also need to age a task's `updated_at`. Write it directly through a SQLite connection, as the file already does elsewhere (see the `Connection::open` usage around line 3826).
 
 ```rust
+/// Marks a session as a detached application root, which is the state the TTL
+/// sweep discovers its work through.
+fn mark_session_detached(
+    database: &std::path::Path,
+    session: &RootSessionId,
+    root: &yi_agent_core::TaskId,
+) {
+    let mut repository = RuntimeRepository::open(database).unwrap();
+    repository
+        .record_application_root_attachment("ttl-fixture", session, root, "digest", "secret")
+        .unwrap();
+    repository
+        .detach_application_root(session, root)
+        .unwrap();
+}
+
 #[tokio::test]
-async fn a_detached_root_past_the_ttl_is_a_reclaim_candidate() {
+async fn reclaim_idle_sweeps_a_detached_root_past_the_ttl() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let repository_root = directory.path().join("repo");
@@ -1464,6 +1486,7 @@ async fn a_detached_root_past_the_ttl_is_a_reclaim_candidate() {
     let root = coordinator.root_task_id(&session).unwrap();
     coordinator.start_worker(&session, &root).await.unwrap();
     let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    mark_session_detached(&database, &session, &root);
 
     // Age the task past the TTL.
     let aged = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
@@ -1478,12 +1501,12 @@ async fn a_detached_root_past_the_ttl_is_a_reclaim_candidate() {
 
     let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
 
-    assert_eq!(reclaimed, 1, "an idle root is reclaimed");
+    assert_eq!(reclaimed, 1, "an idle detached root is reclaimed");
     assert!(!workspace.path.exists());
 }
 
 #[tokio::test]
-async fn an_awaiting_review_child_is_never_a_reclaim_candidate() {
+async fn reclaim_idle_keeps_a_fresh_detached_root() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let repository_root = directory.path().join("repo");
@@ -1493,7 +1516,35 @@ async fn an_awaiting_review_child_is_never_a_reclaim_candidate() {
         workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
         ..Default::default()
     });
-    let (coordinator, _session, _parent, child, _delivery) =
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    mark_session_detached(&database, &session, &root);
+
+    // No ageing: the row was just written.
+    let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert_eq!(reclaimed, 0, "the TTL has not elapsed");
+    assert!(
+        workspace.path.exists(),
+        "a recently detached root keeps its worktree"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_idle_never_sweeps_an_awaiting_review_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, session, parent, child, _delivery) =
         delivered_child_coordinator(&database, factory.clone()).await;
     let child_workspace = factory.starts.lock().unwrap()[1].workspace.clone().unwrap();
     assert_eq!(
@@ -1503,6 +1554,9 @@ async fn an_awaiting_review_child_is_never_a_reclaim_candidate() {
             .unwrap(),
         "awaiting_parent_review"
     );
+    // The sweep only visits detached sessions, so the session must be detached
+    // for this test to exercise the state filter rather than the session filter.
+    mark_session_detached(&database, &session, &parent);
 
     let aged = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
     let connection = Connection::open(&database).unwrap();
@@ -1522,6 +1576,12 @@ async fn an_awaiting_review_child_is_never_a_reclaim_candidate() {
     );
 }
 ```
+
+Three things about this fixture, each verified against the code:
+
+- `record_application_root_attachment` takes `(idempotency_key, root_session_id, root_task_id, capability_digest, capability_secret)` and writes `state = 'attached'`; `detach_application_root` then flips it to `'detached'`. Both are `&mut self` on `RuntimeRepository`, so they need a mutable binding.
+- `delivered_child_coordinator` returns `(coordinator, session, parent, child, delivery)`. The second `WorkerStart` (`starts[1]`) is the child's, which is why the test indexes `[1]`.
+- The third test detaches the session on purpose: without it the sweep would skip the session for the wrong reason (no attachment row) and the assertion would pass vacuously.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
