@@ -3990,3 +3990,80 @@ async fn coding_child_fails_clearly_without_a_git_repository() {
     let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
     assert_eq!(terminal["reason"], "coding_requires_git_repository");
 }
+
+#[tokio::test]
+async fn non_git_application_root_can_be_reattached() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let application_root = directory.path().join("not-a-repo");
+    std::fs::create_dir(&application_root).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: application_root.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let first = coordinator
+        .attach_application_root("non-git-project", &application_root)
+        .await
+        .unwrap();
+    // Reattaching the same non-git root must stay idempotent even though it
+    // keeps no `task_workspaces` row.
+    let second = coordinator
+        .attach_application_root("non-git-project", &application_root)
+        .await
+        .unwrap();
+
+    assert_eq!(second.session_id, first.session_id);
+    assert_eq!(second.root_task_id, first.root_task_id);
+    assert_eq!(second.workspace.path, application_root);
+    assert!(second.workspace.branch.is_empty());
+}
+
+#[tokio::test]
+async fn read_only_task_cannot_spawn_a_coding_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+
+    let error = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &child,
+            "Write code.".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("read-only tasks cannot spawn coding children"),
+        "unexpected error: {error}"
+    );
+
+    // A read-only child may still delegate further read-only work.
+    coordinator
+        .spawn_child_with_objective(
+            &session,
+            &child,
+            "Read more.".into(),
+            TaskWorkspaceMode::ReadOnly,
+        )
+        .await
+        .unwrap();
+}

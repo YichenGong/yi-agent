@@ -699,20 +699,41 @@ impl RuntimeCoordinator {
                 .application_root_attachment(idempotency_key)?
         };
         if let Some(existing) = existing {
-            let workspace = {
+            let recorded = {
                 self.repository
                     .lock()
                     .expect("runtime repository mutex poisoned")
-                    .task_workspace(&existing.root_task_id)?
+                    .task_workspace_optional(&existing.root_task_id)?
             };
-            if !self
-                .factory
-                .application_root_workspace_matches(requested_workspace, &workspace)
-            {
-                return Err(RuntimeCoordinatorError::Supervisor(
-                    "application root workspace does not match its recorded repository".into(),
-                ));
-            }
+            let workspace = match recorded {
+                Some(workspace) => {
+                    if !self
+                        .factory
+                        .application_root_workspace_matches(requested_workspace, &workspace)
+                    {
+                        return Err(RuntimeCoordinatorError::Supervisor(
+                            "application root workspace does not match its recorded repository"
+                                .into(),
+                        ));
+                    }
+                    workspace
+                }
+                // A read-only application root keeps no `task_workspaces` row: it
+                // runs in place. Reattaching it with a git repository is a
+                // mismatch; otherwise synthesize the in-place workspace from the
+                // requested project.
+                None => {
+                    if service.supports_coding() {
+                        return Err(RuntimeCoordinatorError::Supervisor(
+                            "application root workspace does not match its recorded repository"
+                                .into(),
+                        ));
+                    }
+                    service
+                        .prepare_read_only(None, &existing.root_task_id)
+                        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
+                }
+            };
             if existing.state == "detached" {
                 self.repository
                     .lock()
@@ -1129,6 +1150,21 @@ impl RuntimeCoordinator {
         let supervisor = self.supervisor(session)?;
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
+            // A read-only task owns no worktree, so it cannot integrate a coding
+            // child's delivery: reject the escalation outright. Sessions whose
+            // workspace service cannot code at all (non-git) keep their specific
+            // `CodingRequiresGitRepository` provisioning failure instead.
+            let session_supports_coding = self
+                .workspace_service_for(session)
+                .is_some_and(|service| service.supports_coding());
+            if workspace_mode == TaskWorkspaceMode::Coding
+                && session_supports_coding
+                && supervisor.workspace_mode(parent) == TaskWorkspaceMode::ReadOnly
+            {
+                return Err(RuntimeCoordinatorError::Supervisor(
+                    "read-only tasks cannot spawn coding children".into(),
+                ));
+            }
             let child = supervisor.spawn_with_objective(
                 parent.clone(),
                 objective.clone(),

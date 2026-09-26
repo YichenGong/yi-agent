@@ -97,6 +97,7 @@ enum TaskWorkspaceMode {
   `DelegationContract` 的多维能力模型，替换点集中。
 - **只读是强承诺**：只读 child 物理上写不动文件。若它发现必须改代码，**硬失败**
   并把「需要 coding」写进文本结果，由父重新 `spawn_agent` 一个 coding child。
+  实现上，只读 task 也不能再 `spawn_agent(mode: "coding")`：`RuntimeCoordinator::spawn_child_with_objective` 会以可读 reason 拒绝，避免产生父（无 worktree）无法集成的 coding 交付。
 
 ### 3.2 工作目录与供给流程
 
