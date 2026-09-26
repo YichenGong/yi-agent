@@ -77,9 +77,24 @@ describe("RpcClient", () => {
     expect(seen).toHaveLength(1);
   });
 
-  it("rejects when the transport send fails", async () => {
+  it("rejects and leaves no pending entry when the transport send fails", async () => {
     const { transport } = fakeTransport({ failSend: true });
     const client = new RpcClient(transport);
     await expect(client.request("initialize", {})).rejects.toThrow("sidecar down");
+    // The failed request must not leak its pending entry.
+    const pending = (client as unknown as { pending: Map<unknown, unknown> }).pending;
+    expect(pending.size).toBe(0);
+  });
+
+  it("keeps the buffered response when the send fails", async () => {
+    const { transport, emit } = fakeTransport({ failSend: true });
+    const client = new RpcClient(transport);
+    // Response arrives before any request allocates the id -> buffered.
+    emit({ jsonrpc: "2.0", id: 1, result: "early" });
+    await expect(client.request("initialize", {})).rejects.toThrow("sidecar down");
+    // The buffered entry is dropped only after a successful send, so it must
+    // survive a failed send instead of losing the response.
+    const buffered = (client as unknown as { buffered: Map<unknown, unknown> }).buffered;
+    expect(buffered.size).toBe(1);
   });
 });
