@@ -3681,7 +3681,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "yi-agent-core",
  "yi-agent-runtime",
 ]
