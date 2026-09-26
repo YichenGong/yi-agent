@@ -56,12 +56,15 @@ pub struct LoadedThread {
 /// 纯存储层:不依赖协议/agent 之外的状态。
 pub struct ThreadStore {
     root: PathBuf,
+    /// 串行化 meta 的读-改-写:driver 的 `touch` 与主循环的 `rename` 会并发写同一文件。
+    meta_lock: std::sync::Mutex<()>,
 }
 
 impl ThreadStore {
     pub fn new(workdir: &Path) -> Self {
         Self {
             root: workdir.join(".yi-agent").join("threads"),
+            meta_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -175,53 +178,77 @@ impl ThreadStore {
                 None => eprintln!("[app-server] skipping corrupt meta: {name}"),
             }
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.thread_id.cmp(&b.thread_id))
+        });
         Ok(out)
     }
 
-    /// 只重写 meta 的 `title` + `updated_at`。返回 false 表示 thread 不存在。
-    pub fn rename(&self, id: &str, title: &str) -> io::Result<bool> {
+    /// 在 store 锁内对 meta 做读-改-写。`Ok(None)` 表示 thread 不存在或 meta 不可读。
+    ///
+    /// 锁保证 `touch`(driver)与 `rename`(请求循环)不会互相覆盖对方的改动。
+    fn update_meta<F: FnOnce(&mut ThreadMeta)>(
+        &self,
+        id: &str,
+        f: F,
+    ) -> io::Result<Option<ThreadMeta>> {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
+        let _guard = self
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = self.meta_path(id);
-        let Some(mut meta) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<ThreadMeta>(&t).ok())
-        else {
-            return Ok(false);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                eprintln!("[app-server] failed to read thread meta ({id}): {e}");
+                return Ok(None);
+            }
         };
-        meta.title = Some(title.to_string());
-        meta.updated_at = now_millis();
+        let mut meta = match serde_json::from_str::<ThreadMeta>(&raw) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[app-server] skipping unreadable thread meta ({id}): {e}");
+                return Ok(None);
+            }
+        };
+        f(&mut meta);
         let bytes = serde_json::to_vec_pretty(&meta).map_err(io_err)?;
         write_atomic(&path, &bytes)?;
-        Ok(true)
+        Ok(Some(meta))
+    }
+
+    /// 只重写 meta 的 `title` + `updated_at`。
+    /// 返回 false 表示 thread 不存在或 meta 不可读。
+    pub fn rename(&self, id: &str, title: &str) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| {
+                meta.title = Some(title.to_string());
+                meta.updated_at = now_millis();
+            })?
+            .is_some())
     }
 
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
-    /// `title_hint`(本轮 prompt)填充。thread 不存在时静默返回。
+    /// `title_hint`(本轮 prompt)填充。thread 不存在或 meta 不可读时静默返回。
     pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {
-        if !valid_id(id) {
-            return Err(invalid_id(id));
-        }
-        let path = self.meta_path(id);
-        let Some(mut meta) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<ThreadMeta>(&t).ok())
-        else {
-            return Ok(());
-        };
-        meta.updated_at = now_millis();
-        if meta.title.is_none() {
-            if let Some(hint) = title_hint {
-                let t = title_from(hint);
-                if !t.is_empty() {
-                    meta.title = Some(t);
+        self.update_meta(id, |meta| {
+            meta.updated_at = now_millis();
+            if meta.title.is_none() {
+                if let Some(hint) = title_hint {
+                    let t = title_from(hint);
+                    if !t.is_empty() {
+                        meta.title = Some(t);
+                    }
                 }
             }
-        }
-        let bytes = serde_json::to_vec_pretty(&meta).map_err(io_err)?;
-        write_atomic(&path, &bytes)
+        })
+        .map(|_| ())
     }
 
     /// thread 是否已知(meta 或 log 任一存在)。
@@ -571,5 +598,43 @@ mod tests {
         // meta present too
         s.create(&meta("thread-a")).unwrap();
         assert!(s.exists("thread-a"), "meta+log must exist");
+    }
+
+    #[test]
+    fn rename_touch_delete_reject_invalid_ids() {
+        let (_d, s) = store();
+        for bad in ["../evil", "a/b", "", "a\\b"] {
+            assert!(s.rename(bad, "x").is_err(), "rename must reject {bad:?}");
+            assert!(s.touch(bad, None).is_err(), "touch must reject {bad:?}");
+            assert!(s.delete(bad).is_err(), "delete must reject {bad:?}");
+            assert!(!s.exists(bad), "exists must be false for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn touch_unknown_id_is_silent_noop() {
+        let (_d, s) = store();
+        s.touch("nope", Some("x"))
+            .expect("unknown id must not error");
+    }
+
+    #[test]
+    fn rename_corrupt_meta_returns_false() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(s.meta_path("thread-a"), b"{ not json").unwrap();
+        assert!(!s.rename("thread-a", "x").unwrap());
+    }
+
+    #[test]
+    fn list_tie_break_is_deterministic_by_id() {
+        let (_d, s) = store();
+        for id in ["thread-c", "thread-a", "thread-b"] {
+            let mut m = meta(id);
+            m.updated_at = 5;
+            s.create(&m).unwrap();
+        }
+        let ids: Vec<String> = s.list().unwrap().into_iter().map(|m| m.thread_id).collect();
+        assert_eq!(ids, vec!["thread-a", "thread-b", "thread-c"]);
     }
 }
