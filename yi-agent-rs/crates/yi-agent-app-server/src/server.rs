@@ -213,6 +213,29 @@ where
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
+                    "thread/list" => match store.list() {
+                        Ok(metas) => {
+                            let threads: Vec<serde_json::Value> = metas
+                                .iter()
+                                .map(|m| {
+                                    json!({
+                                        "thread_id": m.thread_id,
+                                        "cwd": m.cwd,
+                                        "model": m.model,
+                                        "created_at": m.created_at,
+                                        "updated_at": m.updated_at,
+                                        "title": m.title,
+                                    })
+                                })
+                                .collect();
+                            write_response(&writer, ok_response(id, json!({ "threads": threads })))
+                                .await?;
+                        }
+                        Err(e) => {
+                            write_response(&writer, err_response(id, RpcError::internal(e.to_string())))
+                                .await?;
+                        }
+                    },
                     "thread/start" => {
                         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
 
@@ -1875,6 +1898,59 @@ mod tests {
         assert!(loaded.meta.title.is_none(), "title starts empty");
         assert!(loaded.items.is_empty(), "no turns yet");
 
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_empty_returns_empty_array() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["threads"], serde_json::json!([]));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_returns_created_threads_newest_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_a = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_b = read_thread_start_response(&mut h, 3).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/list must respond");
+        let threads = v["result"]["threads"].as_array().unwrap();
+        assert_eq!(threads.len(), 2);
+        // 两次 start 可能同毫秒;只断言集合与字段存在。
+        let ids: std::collections::HashSet<&str> = threads
+            .iter()
+            .map(|t| t["thread_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(tid_a.as_str()) && ids.contains(tid_b.as_str()));
+        assert!(threads[0]["created_at"].is_number());
+        assert!(threads[0]["updated_at"].is_number());
         h.shutdown().await;
     }
 
