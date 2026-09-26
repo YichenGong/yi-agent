@@ -26,8 +26,9 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - [x] 服务端 → 客户端通知 `Notification`（`thread/started`、`turn/started`、`item/*`、`turn/completed`、`thread/tokenUsage/updated`、`error`）、`NotificationEnvelope`（补齐 `jsonrpc:"2.0"` 字段）与 `TurnStatus` — `src/protocol.rs:84` / `src/protocol.rs:127` / `src/protocol.rs:144`
 - [x] 会话条目模型 `Item`（`userMessage` / `agentMessage` / `toolCall`）与 `ToolStatus`；`None` 字段序列化时省略 — `src/protocol.rs:152` / `src/protocol.rs:174`
 - [x] stdio JSONL 传输：`MessageReader::next_line`（CRLF 归一、EOF 返回 `None`、内容超过 `MAX_FRAME_BYTES`（不含行终止符）报错）、`MessageWriter::write_value`（序列化失败返回错误，不 panic 不静默丢弃）— `src/transport.rs:29` / `src/transport.rs:67`
-- [ ] thread/turn 状态机 + `AgentEvent` → 通知翻译层
+- [x] `AgentEvent` → 通知翻译层 `translate.rs`（`Translator::on_event`）— `src/translate.rs:36`
+- [ ] thread/turn 状态机 + server 主循环
 - [ ] 权限审批反向请求闭环（服务端 → 客户端请求 / 客户端响应）
 - [ ] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环）
 
-**验证命令：** `cargo test -p yi-agent-app-server`（14 个测试）
+**验证命令：** `cargo test -p yi-agent-app-server`（36 个测试）
