@@ -10,7 +10,9 @@ export function ApprovalDialog({
 }) {
   const { tool_name, tool_input, prefix_suggestion, kind } = request.params;
   const headingId = useId();
-  const primaryRef = useRef<HTMLButtonElement>(null);
+  // Focus starts on the safe action: a reflexive Enter/Space must not approve
+  // arbitrary (possibly destructive) tool execution.
+  const denyRef = useRef<HTMLButtonElement>(null);
   // Ref is the authoritative guard (state updates are async, so a ref is needed
   // to reject two decisions fired in the same tick); state only drives the
   // disabled styling.
@@ -28,12 +30,15 @@ export function ApprovalDialog({
   );
 
   useEffect(() => {
-    primaryRef.current?.focus();
+    denyRef.current?.focus();
   }, []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") decide({ decision: "deny" });
+      if (e.key === "Escape") {
+        e.preventDefault();
+        decide({ decision: "deny" });
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -76,6 +81,7 @@ export function ApprovalDialog({
 
         <div className="flex justify-end gap-2">
           <button
+            ref={denyRef}
             type="button"
             disabled={submitted}
             onClick={() => decide({ decision: "deny" })}
@@ -84,7 +90,6 @@ export function ApprovalDialog({
             Deny
           </button>
           <button
-            ref={primaryRef}
             type="button"
             disabled={submitted}
             onClick={() => decide({ decision: "allow_once" })}

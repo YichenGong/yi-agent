@@ -82,17 +82,23 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen flex-col bg-neutral-950 text-neutral-100">
-      <StatusBar
-        cwd={threadInfo?.cwd ?? null}
-        model={threadInfo?.model ?? null}
-        status={status}
-        usage={session.usage}
-      />
-      <ChatView items={session.items} error={session.lastError} />
-      <MessageInput turnActive={session.turnActive} onSend={send} onInterrupt={interrupt} />
+    <>
+      <div
+        className="flex h-screen flex-col bg-neutral-950 text-neutral-100"
+        inert={approval !== null}
+      >
+        <StatusBar
+          cwd={threadInfo?.cwd ?? null}
+          model={threadInfo?.model ?? null}
+          status={status}
+          usage={session.usage}
+        />
+        <ChatView items={session.items} error={session.lastError} />
+        <MessageInput turnActive={session.turnActive} onSend={send} onInterrupt={interrupt} />
+      </div>
       {approval && (
         <ApprovalDialog
+          key={approval.id}
           request={approval}
           onDecide={async (decision) => {
             try {
@@ -106,6 +112,6 @@ export default function App() {
           }}
         />
       )}
-    </div>
+    </>
   );
 }
