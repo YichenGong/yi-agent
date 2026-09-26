@@ -21,7 +21,7 @@
 - 会话状态机（item upsert、agent 文本 delta 累积、turn 生命周期、token 用量）
 - 聊天 UI（消息列表、自动滚动、错误横幅、输入框、工具调用卡片、状态栏）
 - 权限审批弹窗（Allow once / Always allow tool / Always allow prefix / Deny）
-- 历史侧栏(列表 / 恢复继续对话 / 双击内联重命名 / 删除 / New thread)
+- 历史侧栏（列表 / 恢复继续对话 / 双击内联重命名 / 删除 / New thread）
 
 **不做什么（延后）：**
 - 不做 markdown 富渲染 / 代码高亮
@@ -44,6 +44,6 @@
 - [x] 权限审批弹窗（Allow once / Always allow tool / Always allow prefix / Deny；Esc=Deny；`onDecide` 只触发一次；`inert` 隔离背景）— `desktop/src/components/ApprovalDialog.tsx:24`（`submittedRef` 守卫，同 tick 双决策只放行一次）/ `desktop/src/components/ApprovalDialog.tsx:38`（Esc → `deny`）/ `desktop/src/components/ApprovalDialog.tsx:87`（Deny）/ `desktop/src/components/ApprovalDialog.tsx:95`（Allow once）/ `desktop/src/components/ApprovalDialog.tsx:103`（Always allow tool）/ `desktop/src/components/ApprovalDialog.tsx:113`（Always allow prefix，仅 `prefix_suggestion !== null` 时渲染）；背景隔离 `inert` — `desktop/src/App.tsx:196`
 - [x] macOS 打包产出可启动的 `.app` / `.dmg` 并内嵌 sidecar — 判据：`cd desktop && npm run sidecar:release && npm run tauri build` 产出 `desktop/src-tauri/target/release/bundle/macos/yi-agent.app`（内含 `Contents/MacOS/desktop` 启动器 + `Contents/MacOS/yi-agent` sidecar）与 `desktop/src-tauri/target/release/bundle/dmg/yi-agent_0.1.0_aarch64.dmg`；`open yi-agent.app` 后 `ps` 可见 `desktop` 与子进程 `yi-agent app-server --listen stdio://`
 - [ ] 手动端到端冒烟（原生窗口 / 流式文本 / 工具卡片 / 审批弹窗放行与拒绝 / Stop 中断 / 杀 sidecar 不崩）— 判据：`cd desktop && npm run sidecar && npm run tauri dev` 后人工逐项确认（设计文档 §12 成功判据，`docs/superpowers/plans/2026-09-26-desktop-gui-design.md:354`）；自动化可覆盖部分已验：应用可启动、sidecar 子进程被拉起
-- [x] 会话持久化 + 历史侧栏(列表 / 恢复并继续对话 / 双击内联重命名 / 删除 / New thread / 当前高亮)— `desktop/src/lib/session.ts:29`(`reset`)/ `desktop/src/components/ThreadSidebar.tsx:17` / `desktop/src/App.tsx:44`(`refreshThreads`)/ `desktop/src/App.tsx:55`(`resumeThread` 前置同步 `reset` 防回放竞态)
+- [x] 会话持久化 + 历史侧栏（列表 / 恢复并继续对话 / 双击内联重命名 / 删除 / New thread / 当前高亮）— `desktop/src/lib/session.ts:29`（`reset`）/ `desktop/src/components/ThreadSidebar.tsx:17` / `desktop/src/App.tsx:44`（`refreshThreads`）/ `desktop/src/App.tsx:55`（`resumeThread` 前置同步 `reset` 防回放竞态）
 
 **验证命令：** `cd desktop && npx vitest run`（18 个前端单测，`desktop/src/lib/rpc.test.ts` 7 个 + `desktop/src/lib/session.test.ts` 11 个）+ `cd desktop && npm run build` + `cd desktop/src-tauri && cargo test` + `cd desktop && npm run sidecar:release && npm run tauri build`（产出 `.app` / `.dmg`）
