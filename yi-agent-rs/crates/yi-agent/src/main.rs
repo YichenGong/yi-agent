@@ -508,6 +508,7 @@ fn build_daemon_worker_factory(
     // Skills-only registry: the worker's deliberate contract is to NOT register
     // builtin/process tools here (recovery path adds its own workspace-rooted set).
     let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(&config)?;
+    let catalog = prompt.catalog;
     let mut registry = yi_agent_core::ToolRegistry::new();
     if let Some(skills) = &prompt.skills {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
@@ -521,6 +522,7 @@ fn build_daemon_worker_factory(
             agent_config,
             runtime_socket,
         )
+        .with_catalog(catalog)
         // Recovery must inspect the same worktree ordinary builtin tools use.
         .with_sandbox(config.sandbox, config.sandbox_writable_roots)
         .with_workspace(config.workdir),
