@@ -713,7 +713,9 @@ async fn run_loop(
                         // 因此不走确认流程。这里仍先发 ToolCall,让 TUI 能渲染出
                         // 这次被拒的调用;否则拒绝会变成静默,用户会误以为命令已执行。
                         let reason = match &req.kind {
-                            crate::permission::PermissionKind::Blacklisted(reason) => reason.clone(),
+                            crate::permission::PermissionKind::Blacklisted(reason) => {
+                                reason.clone()
+                            }
                             _ => "blacklisted command".to_string(),
                         };
                         let message = format!("blocked by safety filter: {reason}");

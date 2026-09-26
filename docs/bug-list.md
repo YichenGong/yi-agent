@@ -21,6 +21,6 @@
 - [ ] app-server `render_content` 不截断工具输出，超大工具结果可能超过 `MAX_FRAME_BYTES`（1MB）导致客户端拒收该帧
 - [ ] app-server 解析失败/传输错误响应使用 id 0，而 JSON-RPC 2.0 要求 id 为 null；RequestId 需支持 Null 变体
 - [ ] compaction 的 token 估算把 `ContentBlock::Image` 记为 0 token（`yi-agent-rs/crates/yi-agent-core/src/compact.rs`、`yi-agent-rs/crates/yi-agent-core/src/agent.rs`），图片进入上下文后可能低估用量、延迟 auto-compact 触发
-- [ ] 在yolo模式下，冒出了授权确认，我明明选择allow once，但是看起来对应的命令还是被sandbox阻拦。
+- [x] 在yolo模式下，冒出了授权确认，我明明选择allow once，但是看起来对应的命令还是被sandbox阻拦。（修复：黑名单不再弹确认框、改为硬拒绝，且先发 `ToolCall` 让拒绝可见，见 `yi-agent-rs/crates/yi-agent-core/src/agent.rs` `CheckResult::Blacklisted` 分支；根删除规则拆为三条消除绝对路径误伤，见 `yi-agent-rs/crates/yi-agent-tools/src/shell/blocklist.rs`。验证：`cargo test -p yi-agent-tools --lib blocklist`、`cargo test -p yi-agent-core --lib blacklisted_command_hard_denies_without_confirmation`、`cargo test -p yi-agent --bin yi-agent blacklist_deny_is_visible_as_failed_tool_call`）
 - [ ] 基于superpowers的skill，按道理是先写spec再写plan，最后再去实现。但是当前会遇到先完整实现一遍，确认没问题了之后再去写spec和plan的情况。这个有点本末倒置了。这个应该是模型的问题而不是skill的问题？但是这个问题在相同的模型情况下，claude code里面就没有出现。
 - [ ] 检查 OS 沙箱 状态。
