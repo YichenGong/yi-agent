@@ -154,10 +154,15 @@ id）；新字段需要在 supervisor 里再加一张 per-task 路径表，或�
   供给阶段发现无法建 worktree → 任务以可读 reason 失败（如
   `coding_requires_git_repository`，取代笼统的 `workspace_provision_failed`）。
 - **不引入「非 git 但可写」中间态**：有 git 才谈 coding，没有就只读。
-- **实现方式**：给 `AgentWorkerFactory` 加一个探针方法（如
-  `application_root_is_git_repository(&self, workspace: &Path) -> bool`，默认
-  `true`），生产实现用 `git_output(workspace, ["rev-parse","--show-toplevel"])`
-  判定。`attach_application_root` 据此决定 root 的 mode。**不改**
+- **实现方式**：给 `AgentWorkspaceService` 加探针
+  `supports_coding(&self) -> bool`（默认 `true`）与
+  `prepare_read_only(&self, parent: Option<&WorkerWorkspace>, task_id) -> Result<WorkerWorkspace>`，
+  生产实现 `DaemonWorkspaceService` 在 `new` 时用
+  `git_output(workspace, ["rev-parse","--show-toplevel"])` 判定并缓存
+  `is_git_repository`。`attach_application_root` 据此决定 root 的 mode；
+  `prepare_task_workspace` 在 coding 且 `!supports_coding()` 时报
+  `coding_requires_git_repository`。探针放在 service（coordinator 在 attach 与
+  provisioning 两处都已持有它），无需新增工厂方法。**不改**
   `workspace_service_for_application_root` 的返回类型，也不改
   `AttachedApplicationRoot`。
 
@@ -166,10 +171,14 @@ id）；新字段需要在 supervisor 里再加一张 per-task 路径表，或�
 mode 必须**在 spawn 时落库**，因为 `prepare_task_workspace` 要在 workspace 行
 存在之前就读到它（只读任务永远不会有 workspace 行，无法反推）。
 
-- **schema**：tasks 表加一列 `workspace_mode TEXT NOT NULL DEFAULT 'read_only'`，
-  取值 `'coding' | 'read_only'`。一次迁移。
-- **写入**：`spawn_with_objective`（`supervisor.rs:916-958`）接收 mode，随任务
-  落库。
+- **schema**：tasks 表加一列 `workspace_mode TEXT NOT NULL DEFAULT 'coding'`，
+  取值 `'coding' | 'read_only'`。一次迁移。**默认值取 `'coding'`** 而非
+  `'read_only'`：迁移会把既有行一并回填，而既有 session 都持有 worktree、必须
+  保持 coding 行为；「默认只读」在 **spawn 层**落实（spawn 工具默认
+  `read_only`，且每个 child 插入都显式指定 mode），不依赖 DDL 默认。
+- **写入**：`spawn_with_objective`（`supervisor.rs:916-958`）接收 mode 存入
+  supervisor 的 per-task map（镜像 `objectives`），`spawn_child_with_objective`
+  随任务落库。
 - **读取**：`prepare_task_workspace` 从任务记录读 mode 决定分派。
 - **恢复**：`recovered_tasks()` 带上 mode → `AgentSupervisor::from_recovered_root`
   / `insert_recovered_child`（`runtime.rs:400-410`）恢复它 → 组装 `WorkerStart`
