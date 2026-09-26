@@ -387,23 +387,7 @@ fn inspect_session(socket: &std::path::Path, task_id: &str) -> Result<String> {
 fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
     let ScheduleAction::Add { request, confirm } = action;
     let config = config::load(cli)?;
-    let provider: Arc<dyn Provider> = match config.provider.as_str() {
-        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
-            yi_agent_llm::AnthropicProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
-            yi_agent_llm::OpenaiProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        other => anyhow::bail!("unknown provider '{other}': expected 'anthropic' or 'openai'"),
-    };
+    let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let preview = runtime.block_on(
         schedule_intent::ScheduleIntentParser::new(provider, config.model).preview(request),
@@ -487,43 +471,17 @@ fn build_daemon_worker_factory(
     runtime_socket: std::path::PathBuf,
 ) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
     let config = config::load(cli)?;
-    let provider: Arc<dyn Provider> = match config.provider.as_str() {
-        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
-            yi_agent_llm::AnthropicProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
-            yi_agent_llm::OpenaiProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        other => anyhow::bail!("unknown provider '{other}': expected 'anthropic' or 'openai'"),
-    };
+    let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
 
-    let skills = setup_skills(&config)?;
+    // Skills-only registry: the worker's deliberate contract is to NOT register
+    // builtin/process tools here (recovery path adds its own workspace-rooted set).
+    let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(&config)?;
     let mut registry = yi_agent_core::ToolRegistry::new();
-    if let Some(skills) = &skills {
+    if let Some(skills) = &prompt.skills {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
     }
-    let agent_config = yi_agent_core::AgentConfig {
-        model: config.model,
-        system_prompt: resolve_system_prompt_with_skills(
-            config.system_prompt,
-            &skills,
-            config.skills_catalog_budget,
-            config.skills_catalog_budget_explicit,
-        ),
-        max_turns: Some(config.max_turns),
-        compact_threshold: Some(config.compact_threshold),
-        compact_user_budget_tokens: config.compact_user_budget_tokens,
-        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
-        ..Default::default()
-    };
+    let agent_config =
+        yi_agent_runtime::bootstrap::build_agent_config(&config, prompt.system_prompt);
     Ok(Arc::new(
         subagent_runtime::DaemonAgentWorkerFactory::new(
             provider,
@@ -799,35 +757,19 @@ fn load_permission_checker_for_workdir(
     workdir: std::path::PathBuf,
     config: &config::Config,
 ) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let permissions = rt
-        .block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
-        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?;
-    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
-        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
-    Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
-        permissions,
-        config.yolo,
-        workdir,
-        blocklist_fn,
-    )))
+    yi_agent_runtime::bootstrap::load_permission_checker(&workdir, config.yolo)
 }
 
 async fn load_permission_checker_for_workdir_async(
     workdir: std::path::PathBuf,
     config: &config::Config,
 ) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
-    let permissions = yi_agent_core::permission::PermissionChecker::load(&workdir)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?;
-    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
-        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
-    Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
-        permissions,
-        config.yolo,
-        workdir,
-        blocklist_fn,
-    )))
+    let yolo = config.yolo;
+    tokio::task::spawn_blocking(move || {
+        yi_agent_runtime::bootstrap::load_permission_checker(&workdir, yolo)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("permission loader task failed: {e}"))?
 }
 
 fn run_agent(cli: Cli) -> Result<()> {
@@ -840,44 +782,20 @@ fn run_agent(cli: Cli) -> Result<()> {
     let (decision_tx, decision_rx) =
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
 
-    let provider: Arc<dyn Provider> = match config.provider.as_str() {
-        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
-            yi_agent_llm::AnthropicProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
-            yi_agent_llm::OpenaiProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        other => anyhow::bail!(
-            "unknown provider '{}': expected 'anthropic' or 'openai'",
-            other
-        ),
-    };
+    let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
 
     let mut registry = yi_agent_core::ToolRegistry::new();
 
     // --- Skills system setup ---
-    let skills_service = setup_skills(&config)?;
-
-    let system_prompt = resolve_system_prompt_with_skills(
-        config.system_prompt.clone(),
-        &skills_service,
-        config.skills_catalog_budget,
-        config.skills_catalog_budget_explicit,
-    );
+    let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(&config)?;
 
     // Register Skill tool
-    if let Some(svc) = &skills_service {
+    if let Some(svc) = &prompt.skills {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
+    // `base_registry` MUST stay skills-only: `build_tui_root_tools` clones it
+    // and adds workspace-rooted builtin tools + subagent tools on top.
     let base_registry = registry.clone();
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
@@ -897,15 +815,8 @@ fn run_agent(cli: Cli) -> Result<()> {
 
     let tools = Arc::new(registry);
 
-    let agent_config = yi_agent_core::AgentConfig {
-        model: config.model.clone(),
-        system_prompt,
-        max_turns: Some(config.max_turns),
-        compact_threshold: Some(config.compact_threshold),
-        compact_user_budget_tokens: config.compact_user_budget_tokens,
-        compact_tool_budget_tokens: config.compact_tool_budget_tokens,
-        ..Default::default()
-    };
+    let agent_config =
+        yi_agent_runtime::bootstrap::build_agent_config(&config, prompt.system_prompt);
 
     run_tui_agent(
         provider,
@@ -1033,18 +944,17 @@ async fn drain_stream_json<W: std::io::Write>(
     exit_code
 }
 
-/// Headless 模式的工具 + system prompt 构建结果。
-struct HeadlessSetup {
-    tools: Arc<yi_agent_core::ToolRegistry>,
-    system_prompt: Option<String>,
-}
+// Headless 模式的工具 + system prompt 构建结果。
+//
+// 类型来自共享 crate(`ToolSetup` 两个字段都是 `pub`),`build_headless_root_tools`
+// 直接用 `HeadlessSetup { tools, system_prompt }` 字面量构造仍然成立。
+use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 /// 根据 `naked` flag 构建 headless 模式用的工具集和 system prompt。
 ///
 /// `naked = true`:不注册任何工具,不加载 skills,`system_prompt = None`(裸模型)。
 /// `naked = false`:与 TUI `run_agent` 对齐 — 注册内置工具、加载 skills、
-/// 注册 SkillTool、用 `resolve_system_prompt_with_skills` 拼接默认 prompt +
-/// 当前日期 + skills catalog。
+/// 注册 SkillTool、解析默认 prompt + 当前日期 + skills catalog。
 fn build_headless_setup(config: &config::Config, naked: bool) -> Result<HeadlessSetup> {
     build_headless_setup_for_workspace(config, naked, config.workdir.clone())
 }
@@ -1054,36 +964,7 @@ fn build_headless_setup_for_workspace(
     naked: bool,
     workspace: std::path::PathBuf,
 ) -> Result<HeadlessSetup> {
-    let mut registry = yi_agent_core::ToolRegistry::new();
-
-    if naked {
-        return Ok(HeadlessSetup {
-            tools: Arc::new(registry),
-            system_prompt: None,
-        });
-    }
-
-    yi_agent_tools::register_builtin_tools_with_sandbox(
-        &mut registry,
-        workspace,
-        config.sandbox,
-        config.sandbox_writable_roots.clone(),
-    );
-    let skills_service = setup_skills(config)?;
-    let system_prompt = resolve_system_prompt_with_skills(
-        config.system_prompt.clone(),
-        &skills_service,
-        config.skills_catalog_budget,
-        config.skills_catalog_budget_explicit,
-    );
-    if let Some(svc) = &skills_service {
-        registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
-    }
-
-    Ok(HeadlessSetup {
-        tools: Arc::new(registry),
-        system_prompt,
-    })
+    yi_agent_runtime::bootstrap::build_tool_setup_in(config, naked, &workspace)
 }
 
 /// Run agent non-interactively: drain AgentEvent stream to stdout/stderr.
@@ -1127,46 +1008,14 @@ fn run_headless(
         .map(|runtime| runtime.attached_root.workspace.path.clone())
         .unwrap_or_else(|| config.workdir.clone());
     // Headless mode: auto-allow non-blacklisted tools (yolo behavior)
-    let yolo = true;
-    let permissions = {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(yi_agent_core::permission::PermissionChecker::load(&workdir))
-            .map_err(|e| anyhow::anyhow!("failed to load permissions: {e}"))?
-    };
-    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
-        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
-    let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
-        permissions,
-        yolo,
-        workdir.clone(),
-        blocklist_fn,
-    ));
+    let checker = yi_agent_runtime::bootstrap::load_permission_checker(&workdir, true)?;
     let (decision_tx, decision_rx) =
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
     // Headless mode has no confirmation UI. Closing the sender makes a
     // blacklisted command resolve as Deny instead of waiting forever.
     drop(decision_tx);
 
-    let provider: Arc<dyn Provider> = match config.provider.as_str() {
-        "anthropic" => Arc::new(yi_agent_llm::AnthropicProvider::new(
-            yi_agent_llm::AnthropicProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        "openai" => Arc::new(yi_agent_llm::OpenaiProvider::new(
-            yi_agent_llm::OpenaiProviderOpts {
-                base_url: Some(config.api_url.clone()),
-                api_key: Some(config.api_key.clone()),
-                ..Default::default()
-            },
-        )?),
-        other => anyhow::bail!(
-            "unknown provider '{}': expected 'anthropic' or 'openai'",
-            other
-        ),
-    };
+    let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
 
     let setup = match &headless_runtime {
         Some(runtime) => {
@@ -1176,12 +1025,8 @@ fn run_headless(
     };
     let tools = setup.tools;
 
-    let agent_config = yi_agent_core::AgentConfig {
-        model: config.model.clone(),
-        system_prompt: setup.system_prompt,
-        max_turns: Some(config.max_turns),
-        ..Default::default()
-    };
+    let agent_config =
+        yi_agent_runtime::bootstrap::build_agent_config(&config, setup.system_prompt);
 
     let rt = tokio::runtime::Runtime::new()?;
     let exit_code = rt.block_on(async move {
@@ -1553,192 +1398,9 @@ pub(crate) enum ControlCommand {
     Compact,
 }
 
-/// Resolve the effective system prompt: fall back to the built-in default
-/// when the user did not provide one. The current local date is appended to
-/// the end so the model knows today's date; placed at the tail to avoid
-/// disrupting the cached prefix of the prompt.
-fn resolve_system_prompt(user: Option<String>) -> Option<String> {
-    let mut base = yi_agent_core::AgentConfig::default_system_prompt();
-    if let Some(user) = user {
-        base.push_str("\n\nUser-provided instructions:\n");
-        base.push_str(&user);
-    }
-    let today = chrono::Local::now().format("%Y-%m-%d");
-    Some(format!("{base}\n\nCurrent date: {today}"))
-}
-
-/// Set up the skills service: install bundled system skills, build roots, snapshot.
-/// Returns None on hard failure (and logs a warning); the agent runs without skills.
-fn setup_skills(config: &config::Config) -> Result<Option<Arc<yi_agent_skills::SkillsService>>> {
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("skills: could not determine home directory, skipping");
-        return Ok(None);
-    };
-    let system_root = home.join(".yi-agent/skills/.system");
-
-    // Install bundled skills; failure is non-fatal
-    if let Err(e) = yi_agent_skills::install_system_skills(&system_root) {
-        tracing::warn!("failed to install bundled skills: {e}");
-    }
-
-    let roots = vec![
-        (
-            config.workdir.join(".yi-agent/skills"),
-            yi_agent_skills::SkillScope::Project,
-        ),
-        (
-            home.join(".yi-agent/skills"),
-            yi_agent_skills::SkillScope::User,
-        ),
-        (
-            home.join(".yi-agent/skills/.system"),
-            yi_agent_skills::SkillScope::System,
-        ),
-    ];
-
-    let service = Arc::new(yi_agent_skills::SkillsService::new(roots));
-    match service.snapshot() {
-        Ok(skills) => {
-            tracing::info!("skills: {} discovered", skills.len());
-            Ok(Some(service))
-        }
-        Err(e) => {
-            tracing::warn!("skills discovery failed: {e}");
-            Ok(None)
-        }
-    }
-}
-
-/// Resolve the effective system prompt, appending the skills catalog if available.
-fn resolve_system_prompt_with_skills(
-    user: Option<String>,
-    service: &Option<Arc<yi_agent_skills::SkillsService>>,
-    budget: usize,
-    budget_explicit: bool,
-) -> Option<String> {
-    let base = resolve_system_prompt(user);
-    let Some(svc) = service else {
-        return base;
-    };
-
-    let total = svc.full_catalog_size();
-    let effective_budget = resolve_effective_budget(total, budget, budget_explicit);
-    let catalog = svc.render_catalog(effective_budget);
-
-    if catalog.is_empty() {
-        return base;
-    }
-
-    match base {
-        Some(p) => Some(format!("{p}\n\n{catalog}")),
-        None => Some(catalog),
-    }
-}
-
-fn resolve_effective_budget(total: usize, default: usize, explicit: bool) -> usize {
-    if explicit || total <= default || !is_interactive() {
-        return default;
-    }
-    prompt_catalog_budget(total, default).unwrap_or(default)
-}
-
-fn is_interactive() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal()
-}
-
-fn prompt_catalog_budget(total: usize, default: usize) -> Option<usize> {
-    let total_kb = total / 1024;
-    let default_kb = default / 1024;
-    eprintln!(
-        "Skills catalog is {total_kb} KB, exceeds default {default_kb} KB budget.\n\
-         Include all skills? [Y/n]"
-    );
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
-        return None;
-    }
-    match input.trim().to_lowercase().as_str() {
-        "" | "y" | "yes" => Some(total),
-        _ => Some(default),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_system_prompt_none_uses_default() {
-        let resolved = resolve_system_prompt(None);
-        let default = yi_agent_core::AgentConfig::default_system_prompt();
-        // The resolved prompt should start with the default prompt and have
-        // the current date appended at the end.
-        assert!(
-            resolved.as_deref().is_some_and(|r| r.starts_with(&default)),
-            "resolved should start with default prompt"
-        );
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert!(
-            resolved.as_deref().is_some_and(|r| r.ends_with(&today)),
-            "resolved should end with today's date: {resolved:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_system_prompt_custom_keeps_base_instructions() {
-        let resolved = resolve_system_prompt(Some("custom".into()));
-        let default = yi_agent_core::AgentConfig::default_system_prompt();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert!(
-            resolved.as_deref().is_some_and(|r| r.starts_with(&default)
-                && r.contains("User-provided instructions:\ncustom")
-                && r.ends_with(&today)),
-            "resolved should retain base instructions, append custom prompt, and end with date: {resolved:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_effective_budget_explicit_returns_default() {
-        // When explicit=true, should return default regardless of total.
-        assert_eq!(resolve_effective_budget(100_000, 8192, true), 8192);
-        assert_eq!(resolve_effective_budget(0, 8192, true), 8192);
-        assert_eq!(resolve_effective_budget(8192, 8192, true), 8192);
-    }
-
-    #[test]
-    fn resolve_effective_budget_total_under_default_returns_default() {
-        // When total <= default, should return default.
-        assert_eq!(resolve_effective_budget(4096, 8192, false), 8192);
-        assert_eq!(resolve_effective_budget(8192, 8192, false), 8192);
-        assert_eq!(resolve_effective_budget(0, 8192, false), 8192);
-    }
-
-    #[test]
-    fn resolve_effective_budget_non_interactive_returns_default() {
-        // Tests run non-interactive (stdin is not a TTY), so even when
-        // total > default and explicit=false, should return default without prompting.
-        assert_eq!(resolve_effective_budget(100_000, 8192, false), 8192);
-    }
-
-    #[test]
-    fn resolve_system_prompt_with_skills_no_service_returns_base() {
-        // When service is None, should fall back to base via resolve_system_prompt
-        // (which appends the current date).
-        let resolved = resolve_system_prompt_with_skills(None, &None, 8192, false);
-        let expected = resolve_system_prompt(None);
-        assert_eq!(resolved, expected);
-    }
-
-    #[test]
-    fn resolve_system_prompt_with_skills_empty_catalog_returns_base() {
-        // When service is Some but catalog is empty (no skills discovered),
-        // should return the base prompt unchanged (with current date appended).
-        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
-        let expected = resolve_system_prompt(None);
-        let resolved = resolve_system_prompt_with_skills(None, &Some(svc), 8192, false);
-        assert_eq!(resolved, expected);
-    }
 
     // --- drain_stream_human tests ---
 

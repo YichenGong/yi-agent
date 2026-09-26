@@ -3647,7 +3647,6 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
- "chrono",
  "clap",
  "crossterm",
  "dirs",
@@ -3666,10 +3665,8 @@ dependencies = [
  "unicode-width 0.2.0",
  "uuid",
  "yi-agent-core",
- "yi-agent-llm",
  "yi-agent-mcp",
  "yi-agent-runtime",
- "yi-agent-skills",
  "yi-agent-store",
  "yi-agent-tools",
  "yi-agent-web",

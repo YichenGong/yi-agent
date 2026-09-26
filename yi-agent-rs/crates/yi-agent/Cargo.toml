@@ -14,12 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 yi-agent-core = { workspace = true }
-yi-agent-llm = { workspace = true }
 yi-agent-tools = { workspace = true }
 yi-agent-mcp = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-web = { workspace = true }
-yi-agent-skills = { workspace = true }
 yi-agent-runtime = { workspace = true }
 
 tokio = { workspace = true }
@@ -42,7 +40,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
-chrono = { workspace = true }
 uuid = { workspace = true }
 
 async-trait = "0.1"
