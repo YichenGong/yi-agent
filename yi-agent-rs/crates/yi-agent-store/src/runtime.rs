@@ -987,9 +987,11 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         capability: &str,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective).await
+        self.spawn_child_and_admit(session, parent, objective, workspace_mode)
+            .await
     }
 
     pub fn root_task_id(&self, session: &RootSessionId) -> Result<TaskId, RuntimeCoordinatorError> {
@@ -1174,11 +1176,10 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
-        // Task 6 threads the requested mode through here; until then the
-        // admitted spawn path keeps the pre-existing coding behavior.
         let child = self
-            .spawn_child_with_objective(session, parent, objective, TaskWorkspaceMode::Coding)
+            .spawn_child_with_objective(session, parent, objective, workspace_mode)
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {

@@ -974,7 +974,14 @@ impl Tool for DaemonApplicationSpawnAgentTool {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task": { "type": "string", "description": "Delegated objective." } },
+            "properties": {
+                "task": { "type": "string", "description": "Delegated objective." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["coding", "read_only"],
+                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                }
+            },
             "required": ["task"],
             "additionalProperties": false
         })
@@ -987,6 +994,16 @@ impl Tool for DaemonApplicationSpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
+        let mode = match args.get("mode") {
+            None => "read_only",
+            Some(Value::String(value)) if value == "coding" || value == "read_only" => {
+                value.as_str()
+            }
+            Some(Value::String(_)) => {
+                return ToolResult::error("mode must be 'coding' or 'read_only'");
+            }
+            Some(_) => return ToolResult::error("mode must be a string"),
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
@@ -994,6 +1011,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 parent_task_id: self.caller_task_id.clone(),
                 capability: self.application_capability.clone(),
                 objective: task.to_string(),
+                mode: Some(mode.to_string()),
             },
         );
         match response {
@@ -1069,7 +1087,14 @@ impl Tool for DaemonSpawnAgentTool {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task": { "type": "string", "description": "Delegated objective." } },
+            "properties": {
+                "task": { "type": "string", "description": "Delegated objective." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["coding", "read_only"],
+                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                }
+            },
             "required": ["task"],
             "additionalProperties": false
         })
@@ -1082,12 +1107,23 @@ impl Tool for DaemonSpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
+        let mode = match args.get("mode") {
+            None => "read_only",
+            Some(Value::String(value)) if value == "coding" || value == "read_only" => {
+                value.as_str()
+            }
+            Some(Value::String(_)) => {
+                return ToolResult::error("mode must be 'coding' or 'read_only'");
+            }
+            Some(_) => return ToolResult::error("mode must be a string"),
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
                 session_id: self.session_id.clone(),
                 parent_task_id: self.caller_task_id.clone(),
                 objective: task.to_string(),
+                mode: Some(mode.to_string()),
             },
         );
         match response {
@@ -1934,6 +1970,7 @@ mod tests {
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
+                mode: None,
             },
         )
         .unwrap()
@@ -1980,6 +2017,7 @@ mod tests {
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
+                mode: None,
             },
         )
         .unwrap()

@@ -190,6 +190,24 @@ impl AgentWorkspaceService for ProjectWorkspaceService {
     ) -> Result<WorkerWorkspace, WorkerError> {
         self.prepare_root(root_session_id, task_id, attempt_id)
     }
+
+    fn prepare_read_only(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let path = parent
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| self.repository_root.clone());
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -246,6 +264,22 @@ impl AgentWorkspaceService for StaticWorkspaceService {
             &root_session_id.to_string(),
             &task_id.to_string(),
         ))
+    }
+
+    fn prepare_read_only(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let mut workspace = match parent {
+            Some(parent) => parent.clone(),
+            None => test_workspace_for_ipc("read-only", &task_id.to_string()),
+        };
+        workspace.lease_id = WorkspaceLeaseId::new();
+        workspace.branch = String::new();
+        workspace.parent_branch = String::new();
+        workspace.base_commit = String::new();
+        Ok(workspace)
     }
 }
 
@@ -438,6 +472,7 @@ fn application_roots_use_their_attaching_project_workspace() {
             parent_task_id: root_task_id,
             capability: message_capability,
             objective: "inspect project B".into(),
+            mode: Some("coding".into()),
         },
     )
     .unwrap()
@@ -591,6 +626,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
                 parent_task_id: first_root,
                 capability: second_capability,
                 objective: "inspect the parser".into(),
+                mode: None,
             },
         )
         .unwrap(),
@@ -965,6 +1001,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "child task".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -1027,6 +1064,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "fast child".into(),
+            mode: None,
         },
     )
     .unwrap();
@@ -1037,6 +1075,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             parent_task_id: root_task_id,
             capability: message_capability,
             objective: "slow child".into(),
+            mode: None,
         },
     )
     .unwrap();
@@ -1076,6 +1115,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "fast child".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -1091,6 +1131,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             parent_task_id: root_task_id,
             capability: message_capability,
             objective: "slow child".into(),
+            mode: None,
         },
     )
     .unwrap();
@@ -1142,6 +1183,7 @@ fn application_root_rejects_more_than_four_direct_children() {
                     parent_task_id: root_task_id.clone(),
                     capability: message_capability.clone(),
                     objective: format!("child {index}"),
+                    mode: None,
                 },
             )
             .unwrap(),
@@ -1156,6 +1198,7 @@ fn application_root_rejects_more_than_four_direct_children() {
             parent_task_id: root_task_id,
             capability: message_capability,
             objective: "fifth child".into(),
+            mode: None,
         },
     )
     .unwrap();
@@ -1201,6 +1244,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                     parent_task_id: root_task_id.clone(),
                     capability: message_capability.clone(),
                     objective: format!("historical child {index}"),
+                    mode: None,
                 },
             )
             .unwrap(),
@@ -1231,6 +1275,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                 parent_task_id: root_task_id,
                 capability: message_capability,
                 objective: "new child after historical completions".into(),
+                mode: None,
             },
         )
         .unwrap(),
@@ -1325,6 +1370,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
                 parent_task_id: reattached_root.clone(),
                 capability: reattached_capability,
                 objective: "after paused reattach".into(),
+                mode: None,
             },
         )
         .unwrap(),
@@ -1401,6 +1447,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
                 parent_task_id: root_task_id,
                 capability: reattached_capability,
                 objective: "after reattach".into(),
+                mode: None,
             },
         )
         .unwrap(),
@@ -1468,6 +1515,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
                 parent_task_id: root_task_id,
                 capability: message_capability,
                 objective: "after restart".into(),
+                mode: None,
             },
         )
         .unwrap(),
@@ -2510,6 +2558,7 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect child behavior".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -2559,6 +2608,7 @@ fn daemon_rejects_unbound_agent_message_requests_without_persisting_them() {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect child behavior".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -2651,6 +2701,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "Inspect child behavior".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -2727,6 +2778,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "Inspect child behavior slowly".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -2791,6 +2843,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "finish first".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -2806,6 +2859,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "stay pending".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -2875,6 +2929,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "finish first".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -2890,6 +2945,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "stay pending".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -2957,6 +3013,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "reply quickly".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3030,6 +3087,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability,
             objective: "stay pending".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3087,6 +3145,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "stay pending".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3160,6 +3219,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "Inspect child behavior".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3265,6 +3325,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "Inspect child behavior".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3348,6 +3409,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
             objective: "Inspect child behavior".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -3507,6 +3569,7 @@ fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
             session_id,
             parent_task_id: root_task_id,
             objective: "Inspect child behavior".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3549,6 +3612,7 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect the target".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3592,6 +3656,7 @@ fn inspect_task_includes_the_authoritative_recorded_workspace() {
             session_id: session_id.clone(),
             parent_task_id: root_task_id,
             objective: "Inspect workspace assignment".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3694,6 +3759,7 @@ fn subscription_snapshot_includes_recorded_task_workspace() {
             session_id: session_id.clone(),
             parent_task_id: root_task_id,
             objective: "Publish workspace assignment".into(),
+            mode: None,
         },
     )
     .unwrap() else {
@@ -3749,6 +3815,7 @@ fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
             session_id,
             parent_task_id: root_task_id.clone(),
             objective: "Unrelated task".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -3901,6 +3968,7 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
             session_id,
             parent_task_id: root_task_id.clone(),
             objective: "Child task".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -4116,6 +4184,7 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Implement the parser".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -4467,6 +4536,7 @@ fn delivered_child_over_ipc(
             session_id,
             parent_task_id: root_task_id,
             objective: "Implement the parser".into(),
+            mode: None,
         },
     )
     .unwrap()
@@ -4645,5 +4715,111 @@ fn workspace_mode_is_persisted_and_recovered() {
     assert_eq!(
         repository.task_workspace_mode(&legacy).unwrap(),
         TaskWorkspaceMode::Coding
+    );
+}
+
+#[test]
+fn daemon_spawn_agent_honors_the_coding_mode() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "spawn-mode-coding".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "Change a file".into(),
+            mode: Some("coding".into()),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.task_workspace_mode(&child).unwrap(),
+        TaskWorkspaceMode::Coding
+    );
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_some(),
+        "a coding child must own a recorded worktree workspace"
+    );
+}
+
+#[test]
+fn daemon_spawn_agent_defaults_to_read_only() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "spawn-mode-default".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "Inspect without editing".into(),
+            mode: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.task_workspace_mode(&child).unwrap(),
+        TaskWorkspaceMode::ReadOnly
+    );
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_none(),
+        "a read-only child runs in place and owns no worktree row"
     );
 }
