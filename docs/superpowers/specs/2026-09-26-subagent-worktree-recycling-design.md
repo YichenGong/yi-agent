@@ -89,10 +89,9 @@ The parent agent's system prompt must instruct it, on receiving a delivery notif
 to merge the delivered commit into its own worktree (`git merge --no-ff <commit>`),
 resolve conflicts, run verification, and then finish its turn.
 
-### A2. Runtime completion verification
+### A2. Runtime integration verification
 
-When a parent task's worker reports completion, the runtime verifies each child delivery
-awaiting that parent's review:
+The runtime verifies each child delivery awaiting its parent's review:
 
 ```
 git merge-base --is-ancestor <child.commit> <parent HEAD>
@@ -102,10 +101,25 @@ A pass proves the parent actually integrated that delivery. The runtime then cal
 `RuntimeCoordinator::accept_review(child, IntegrationValidation::passed(...))`
 (`runtime.rs:1859`), which completes the child task.
 
-The hook is `reconcile_worker_events` (`runtime.rs:2447`), in the branch that handles a
-**parent task's** completion event. This is the concrete meaning of "declared in the
-parent's report": the report is the trigger, and the ancestry check is the proof. The
-runtime does not parse agent text.
+The hook is `reconcile_worker_events` (`runtime.rs:2447`), which the daemon already runs
+on every IPC request (`ipc.rs:2043`) and on its periodic tick (`ipc.rs:659-669`). The
+ancestry check is the proof; the runtime does not parse agent text.
+
+**Why the sweep is not keyed to a parent completion event.** The obvious trigger — a
+parent task's completion event — does not exist for the application root. The root is
+not a daemon worker: `attach_application_root` (`runtime.rs:634`) prepares its workspace
+and `activate_application_root` (`runtime.rs:833`) only mutates in-memory state via
+`sync_foreground_root_running` (`runtime.rs:2895`); the root agent runs in-process in the
+TUI / headless `yi-agent run` driver (`main.rs:1189-1198`, `main.rs:1455`). Its turn end
+is an `AgentEvent::Done`, never a `WorkerEvent`, so `reconcile_worker_events` never
+observes it. Keying on parent completion would therefore miss the most common case, a
+root that spawns children directly.
+
+Instead, every reconcile pass sweeps the tasks sitting in `AwaitingParentReview`, and for
+each one checks whether its delivered commit is now an ancestor of its parent's worktree
+HEAD. The check is read-only and idempotent: an accepted child leaves
+`AwaitingParentReview`, so it is not re-checked; an unmerged child simply fails the check
+and stays put. A root's merge is detected at the next daemon interaction or tick.
 
 **Trade-off (accepted):** the ancestry check proves the commit is in the parent's HEAD,
 not that the parent ran tests. The `IntegrationValidation` reason records the ancestor
