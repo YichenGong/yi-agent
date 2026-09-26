@@ -98,7 +98,7 @@ fn control_agents(cli: &Cli, project: Option<std::path::PathBuf>, all: bool) -> 
         anyhow::bail!("project filtering is not available from this daemon version")
     }
     let workdir = config::resolve_workdir(cli)?;
-    let socket = runtime_directory_for(&workdir).join("runtime.sock");
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_directory_for(&workdir))?;
     let mut subscription = yi_agent_store::ipc::subscribe(&socket, 0).map_err(|error| {
         anyhow::anyhow!("runtime daemon is unavailable; run `yi-agent daemon start`: {error}")
     })?;
@@ -118,7 +118,7 @@ fn control_agents(cli: &Cli, project: Option<std::path::PathBuf>, all: bool) -> 
 
 fn control_agent(cli: &Cli, action: AgentAction) -> Result<()> {
     let workdir = config::resolve_workdir(cli)?;
-    let socket = runtime_directory_for(&workdir).join("runtime.sock");
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_directory_for(&workdir))?;
     let request = match action {
         AgentAction::Show { task_id } => yi_agent_store::ipc::IpcRequest::InspectTask { task_id },
         AgentAction::Events { task_id, follow } => {
@@ -431,7 +431,7 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
         );
         return Ok(());
     }
-    let socket = runtime_directory_for(&config.workdir).join("runtime.sock");
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_directory_for(&config.workdir))?;
     match yi_agent_store::ipc::send_request(
         &socket,
         yi_agent_store::ipc::IpcRequest::CreateSchedule {
@@ -456,7 +456,7 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
 fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     let workdir = config::resolve_workdir(cli)?;
     let runtime_dir = runtime_directory_for(&workdir);
-    let runtime = runtime_dir.join("runtime.sock");
+    let runtime = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
     let database = runtime_database_path(&runtime_dir);
     match action {
         DaemonAction::Start => {
@@ -489,7 +489,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
         DaemonAction::Serve => yi_agent_store::ipc::Daemon::start_with_factory(
             &runtime_dir,
             &database,
-            build_daemon_worker_factory(cli, runtime_dir.join("runtime.sock"))?,
+            build_daemon_worker_factory(cli, yi_agent_store::ipc::socket_path_for(&runtime_dir)?)?,
         )
         .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
         .wait()
@@ -618,7 +618,7 @@ fn attach_application_root_request(
 fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
-    let socket_path = runtime_dir.join("runtime.sock");
+    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
         &database,
@@ -692,16 +692,42 @@ fn build_tui_root_tools(
     registry
 }
 
-struct TuiRuntimeSession {
+/// The outcome of trying to attach the TUI to a runtime.
+///
+/// `Unavailable` is not an error: delegation is optional, so a runtime that
+/// cannot start only disables delegation. It still carries the reason, so the
+/// degradation is visible instead of appearing as a mysteriously absent tool.
+enum TuiRuntimeSession {
+    Attached(Box<AttachedTuiRuntime>),
+    Unavailable { reason: String },
+}
+
+struct AttachedTuiRuntime {
     socket_path: std::path::PathBuf,
     attached_root: crate::tui::subagents::AttachedRoot,
     embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
 }
 
+impl TuiRuntimeSession {
+    fn unavailable(reason: String) -> Self {
+        Self::Unavailable { reason }
+    }
+}
+
+/// Explains, in one actionable line, why subagent delegation is unavailable.
+///
+/// Delegation is optional: a runtime that cannot start degrades the session to
+/// no-delegation rather than aborting it. That degradation must still be
+/// visible, because the symptom the user sees is merely a missing tool, which
+/// is impossible to diagnose from the outside.
+fn runtime_unavailable_reason(error: &yi_agent_store::ipc::IpcError) -> String {
+    format!("subagent delegation unavailable: {error}")
+}
+
 fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
-    let socket_path = runtime_dir.join("runtime.sock");
+    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
         &database,
@@ -710,8 +736,9 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
         Ok(daemon) => Some(daemon),
         Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
         Err(error) => {
-            tracing::warn!(error = %error, "subagent runtime unavailable; continuing without delegation");
-            return Ok(None);
+            let reason = runtime_unavailable_reason(&error);
+            tracing::warn!(error = %error, "{reason}");
+            return Ok(Some(TuiRuntimeSession::unavailable(reason)));
         }
     };
     let idempotency_key = format!(
@@ -726,8 +753,9 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
     ) {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(error = %error, "could not attach TUI to subagent runtime");
-            return Ok(None);
+            let reason = format!("could not reach the runtime socket: {error}");
+            tracing::warn!(error = %error, "{reason}");
+            return Ok(Some(TuiRuntimeSession::Unavailable { reason }));
         }
     };
     let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
@@ -737,19 +765,22 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
         workspace,
     } = response
     else {
-        tracing::warn!(response = ?response, "daemon rejected TUI runtime attachment");
-        return Ok(None);
+        let reason = format!("daemon rejected the runtime attachment: {response:?}");
+        tracing::warn!(response = ?response, "{reason}");
+        return Ok(Some(TuiRuntimeSession::Unavailable { reason }));
     };
-    Ok(Some(TuiRuntimeSession {
-        socket_path,
-        attached_root: crate::tui::subagents::AttachedRoot {
-            session_id,
-            task_id: root_task_id,
-            capability: message_capability,
-            workspace,
+    Ok(Some(TuiRuntimeSession::Attached(Box::new(
+        AttachedTuiRuntime {
+            socket_path,
+            attached_root: crate::tui::subagents::AttachedRoot {
+                session_id,
+                task_id: root_task_id,
+                capability: message_capability,
+                workspace,
+            },
+            embedded_daemon,
         },
-        embedded_daemon,
-    }))
+    ))))
 }
 
 fn activate_tui_runtime_root(
@@ -1238,25 +1269,39 @@ fn run_tui_agent(
                     match choice {
                         Some(crate::tui::subagents::RuntimeStartupChoice::Start) => {
                             match attach_tui_runtime(&cli, &config) {
-                                Ok(Some(runtime)) => {
-                                    if runtime.embedded_daemon.is_some() {
+                                Ok(Some(TuiRuntimeSession::Unavailable { reason })) => {
+                                    let _ = agent_tx
+                                        .send(yi_agent_core::AgentEvent::Error(
+                                            yi_agent_core::AgentError::ProviderTurnAdmission(
+                                                reason,
+                                            ),
+                                        ))
+                                        .await;
+                                }
+                                Ok(Some(TuiRuntimeSession::Attached(attached))) => {
+                                    let AttachedTuiRuntime {
+                                        socket_path,
+                                        attached_root,
+                                        embedded_daemon,
+                                    } = *attached;
+                                    if embedded_daemon.is_some() {
                                         tracing::info!("embedded subagent runtime started for TUI");
                                     }
                                     *runtime_detach_for_driver
                                         .lock()
                                         .expect("runtime detach mutex poisoned") = Some((
-                                        runtime.socket_path.clone(),
-                                        runtime.attached_root.clone(),
+                                        socket_path.clone(),
+                                        attached_root.clone(),
                                     ));
                                     crate::tui::subagents::set_current_attached_root(
-                                        runtime.attached_root.clone(),
+                                        attached_root.clone(),
                                     );
-                                    let runtime_workdir = runtime.attached_root.workspace.path.clone();
+                                    let runtime_workdir = attached_root.workspace.path.clone();
                                     let next_tools = Arc::new(build_tui_root_tools(
                                         &base_registry,
                                         &config,
-                                        runtime.socket_path.clone(),
-                                        &runtime.attached_root,
+                                        socket_path.clone(),
+                                        &attached_root,
                                     ));
                                     match load_permission_checker_for_workdir_async(runtime_workdir, &config).await {
                                         Ok(next_checker) => {
@@ -1273,7 +1318,14 @@ fn run_tui_agent(
                                                 Arc::clone(&current_checker),
                                                 Arc::clone(&rebuild_decision_rx),
                                             );
-                                            current_runtime = Some(runtime);
+                                            current_runtime =
+                                                Some(TuiRuntimeSession::Attached(Box::new(
+                                                    AttachedTuiRuntime {
+                                                        socket_path,
+                                                        attached_root,
+                                                        embedded_daemon,
+                                                    },
+                                                )));
                                             root_activated = false;
                                         }
                                         Err(error) => {
@@ -1325,10 +1377,12 @@ fn run_tui_agent(
                 let _ = interrupt_rx.try_recv();
 
                 if !root_activated {
-                    if let Some(runtime) = current_runtime.as_ref() {
+                    if let Some(TuiRuntimeSession::Attached(attached)) =
+                        current_runtime.as_ref()
+                    {
                         if let Err(error) = activate_tui_runtime_root(
-                            &runtime.socket_path,
-                            &runtime.attached_root,
+                            &attached.socket_path,
+                            &attached.attached_root,
                             &text,
                         ) {
                             let _ = agent_tx
@@ -1546,6 +1600,27 @@ mod tests {
         assert!(names.contains(&"send_message".to_string()));
         assert!(names.contains(&"wait_agent".to_string()));
         assert!(!names.contains(&"accept_review".to_string()));
+    }
+
+    /// A runtime that cannot start must say so. Silently continuing left the
+    /// user with no visible reason why `spawn_agent` was missing from the tool
+    /// list, which is exactly how the long-socket-path failure hid for days.
+    #[test]
+    fn a_failed_runtime_attach_reports_an_actionable_reason() {
+        let reason =
+            runtime_unavailable_reason(&yi_agent_store::ipc::IpcError::SocketPathTooLong {
+                path: "/very/long/path/runtime.sock".into(),
+                limit: yi_agent_store::ipc::MAX_SOCKET_PATH_BYTES,
+            });
+
+        assert!(
+            reason.contains("socket"),
+            "the reason must name the failing mechanism, got: {reason}"
+        );
+        assert!(
+            reason.contains("YI_AGENT_RUNTIME_DIR"),
+            "the reason must offer an actionable remedy, got: {reason}"
+        );
     }
 
     #[test]
