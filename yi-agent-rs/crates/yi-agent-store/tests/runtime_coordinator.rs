@@ -1215,6 +1215,10 @@ async fn integrated_delivery_is_accepted_and_recycled_on_reconcile() {
         "the sweep triggers exactly one accepted cleanup"
     );
     assert_eq!(recorded[0].1.branch, child_workspace.branch);
+    assert_eq!(
+        recorded[0].0.branch, parent_workspace.branch,
+        "the sweep probes and cleans up against the parent (owner) workspace"
+    );
     let repository = RuntimeRepository::open(&database).unwrap();
     assert!(
         repository
@@ -1230,6 +1234,21 @@ async fn integrated_delivery_is_accepted_and_recycled_on_reconcile() {
             .iter()
             .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycled),
         "a recycle-success event is recorded"
+    );
+
+    // A second reconcile pass must not double-accept an already-recycled child.
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(
+        accepted.lock().unwrap().len(),
+        1,
+        "a second reconcile does not accept the child again"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "completed"
     );
 }
 

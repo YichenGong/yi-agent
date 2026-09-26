@@ -2697,10 +2697,15 @@ impl RuntimeCoordinator {
                     .repository
                     .lock()
                     .expect("runtime repository mutex poisoned");
-                repository.task_workspace_optional(&parent).ok().flatten()
+                repository.task_workspace_optional(&parent)
             };
-            let Some(owner_workspace) = owner_workspace else {
-                continue;
+            let owner_workspace = match owner_workspace {
+                Ok(Some(workspace)) => workspace,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!("yi-agent: integration workspace lookup failed for {child}: {error}");
+                    continue;
+                }
             };
             match service.contains_commit(&owner_workspace, &commit) {
                 Ok(true) => {
