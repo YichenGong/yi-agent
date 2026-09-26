@@ -254,6 +254,26 @@ impl Translator {
             AgentEvent::Error(e) => {
                 self.finish_turn(TurnStatus::Failed, Some(e.to_string()), &mut out);
             }
+            AgentEvent::ProviderRetry {
+                attempt,
+                max,
+                cause,
+                ..
+            } => {
+                // The desktop client shows this so a stalled stream does not
+                // look like a hang during the backoff window. The cause lets it
+                // word the notice accurately.
+                out.push(Notification::TurnRetry {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    attempt,
+                    max,
+                    cause: match cause {
+                        yi_agent_core::RetryCause::IdleStall => "idle_stall".to_string(),
+                        yi_agent_core::RetryCause::RequestTimeout => "request_timeout".to_string(),
+                    },
+                });
+            }
             // 暂不产生通知的事件。
             //
             // 翻译层有意忽略 `PermissionRequest` / `PermissionResolved`:
@@ -316,6 +336,29 @@ mod tests {
             }) => id.clone(),
             other => panic!("expected ItemStarted AgentMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_retry_becomes_turn_retry_notification() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::ProviderRetry {
+            attempt: 1,
+            max: 3,
+            idle_secs: 60,
+            cause: yi_agent_core::RetryCause::RequestTimeout,
+        });
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Notification::TurnRetry {
+                    attempt: 1,
+                    max: 3,
+                    cause,
+                    ..
+                }] if cause == "request_timeout"
+            ),
+            "expected TurnRetry carrying the cause, got: {out:?}"
+        );
     }
 
     #[test]

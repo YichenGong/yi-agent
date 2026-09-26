@@ -309,7 +309,21 @@ where
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(ProviderError::Network(e.to_string()))));
+                    // Classify while the `reqwest::Error` is still in hand: for a
+                    // deadline its Display is "error decoding response body",
+                    // which carries no "timed out" text. `is_timeout()` walks the
+                    // source chain and is the only reliable signal. Check it
+                    // before `is_decode()`, which also matches this error.
+                    // Only a deadline is retryable, so only it becomes
+                    // `Network`. A connection reset or other transport break
+                    // stays `Stream`, which the agent loop treats as terminal
+                    // (see the design's retryable/not-retryable table).
+                    let error = if e.is_timeout() {
+                        ProviderError::Network(format!("stream error: timed out: {e}"))
+                    } else {
+                        ProviderError::Stream(format!("stream error: {e}"))
+                    };
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
                     let frames = self.line_parser.feed(&chunk);

@@ -11,7 +11,7 @@ pub mod tool;
 // Re-export most-used types at crate root.
 pub use agent::{
     Agent, AgentConfig, AgentError, AgentEvent, DoneReason, ProviderTurnGate, ProviderTurnLease,
-    Session,
+    RetryCause, Session,
 };
 pub use compact::{
     CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
@@ -20,7 +20,7 @@ pub use compact::{
 pub use message::{ContentBlock, ImageDetail, ImageSource, Message, Role};
 pub use provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
-    StopReason, TokenUsage,
+    StopReason, StreamEnd, TokenUsage,
 };
 pub use subagent::task::{
     AgentTask, AttemptId, RootSessionId, TaskDepth, TaskEvent, TaskId, TaskState, TaskWorkspaceMode,

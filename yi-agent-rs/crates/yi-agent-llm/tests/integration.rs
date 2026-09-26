@@ -334,19 +334,17 @@ async fn mid_stream_sse_error_becomes_terminal_stop() {
 
     // First event: the text delta before the error.
     assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "partial"));
-    // Second event: the error converted to a terminal Stop.
+    // Second event: the error, carrying its classification, is terminal.
     match &events[1] {
-        ProviderEvent::Stop {
-            reason: StopReason::Other(msg),
-        } => {
+        ProviderEvent::StreamError(ProviderError::Stream(msg)) => {
             assert!(msg.contains("overloaded"), "unexpected message: {msg}");
         }
         _ => panic!(
-            "expected Stop{{Other}} for mid-stream error, got: {:?}",
+            "expected StreamError for mid-stream error, got: {:?}",
             events[1]
         ),
     }
-    // No further events after the terminal Stop.
+    // No further events after the terminal failure.
     assert_eq!(events.len(), 2, "stream should terminate after Stop");
 }
 
@@ -589,5 +587,73 @@ async fn stop_sequence_stop_reason_end_to_end() {
             assert_eq!(*reason, StopReason::StopSequence, "events: {events:?}");
         }
         _ => unreachable!(),
+    }
+}
+
+/// Proves the request timeout is a **total deadline**, not an idle timeout.
+///
+/// The mock server keeps sending valid SSE events every 300ms for 3s, so the
+/// connection is never idle. The provider's timeout is 1s. If `reqwest`'s
+/// `ClientBuilder::timeout` were an idle/read timeout, the stream would run to
+/// completion. Because it is a total deadline ("from when the request starts
+/// connecting until the response body has finished"), the stream must be cut
+/// off around 1s and surface as a terminal `Stop { Other("stream error: ...") }`.
+#[tokio::test]
+async fn request_timeout_is_a_total_deadline_not_an_idle_timeout() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Server: accept one connection, reply with SSE headers, then trickle a
+    // valid event every 300ms for 3s (never idle for even one timeout window).
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+            .await;
+        for _ in 0..10 {
+            let ev = "event: content_block_delta\n\
+                      data: {\"type\":\"content_block_delta\",\"index\":0,\
+                      \"delta\":{\"type\":\"text_delta\",\"text\":\"tick\"}}\n\n";
+            if socket.write_all(ev.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.flush().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+
+    let provider = AnthropicProvider::new(AnthropicProviderOpts {
+        base_url: Some(format!("http://{addr}")),
+        api_key: Some("test-key".to_string()),
+        api_version: None,
+        timeout: Some(Duration::from_secs(1)),
+    })
+    .expect("provider construction");
+
+    let started = std::time::Instant::now();
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
+    let events = collect_events(stream).await;
+    let elapsed = started.elapsed();
+
+    // Cut off well before the server's 3s of output.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "stream should be cut off by the 1s total deadline, took {elapsed:?}"
+    );
+    let last = events.last().expect("at least one event");
+    match last {
+        // A transport deadline is now a typed failure, not a stringly stop
+        // reason, so the agent loop can classify it without string matching.
+        ProviderEvent::StreamError(ProviderError::Network(msg)) => assert!(
+            msg.contains("timed out"),
+            "a deadline must be classified as a timeout, got: {msg}"
+        ),
+        other => panic!("expected StreamError after timeout, got: {other:?}"),
     }
 }

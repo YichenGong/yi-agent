@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use yi_agent_core::{Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason};
+use yi_agent_core::{Provider, ProviderError, ProviderEvent, ProviderRequest};
 
 use crate::openai::error::map_status_error;
 use crate::openai::stream::OpenaiStream;
@@ -132,13 +132,17 @@ impl Provider for OpenaiProvider {
         let mapped = event_stream
             .map(|item| match item {
                 Ok(event) => event,
-                Err(e) => ProviderEvent::Stop {
-                    reason: StopReason::Other(format!("stream error: {e}")),
-                },
+                Err(e) => ProviderEvent::StreamError(e),
             })
             .scan(Some(()), |state, event| {
                 let yield_event = state.is_some();
-                if matches!(event, ProviderEvent::Stop { .. }) {
+                // Both a natural stop and a transport failure are terminal:
+                // either must latch the guard, or a failed stream would keep
+                // yielding until the server closes (defeating the deadline).
+                if matches!(
+                    event,
+                    ProviderEvent::Stop { .. } | ProviderEvent::StreamError(_)
+                ) {
                     *state = None;
                 }
                 // Usage can arrive after Stop (OpenAI sends it in a final chunk).

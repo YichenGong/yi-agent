@@ -573,6 +573,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                         Some(AgentEvent::ToolRetry { .. }) => {
                                             reporter.report_tool_retry();
                                         }
+                                        Some(AgentEvent::ProviderRetry { .. }) => {
+                                            reporter.report_provider_retry();
+                                        }
                                         Some(AgentEvent::ToolResult { result, .. }) if !result.is_error => {
                                             // A successful tool result is external, durable progress;
                                             // generated text and streamed stdout are intentionally excluded.

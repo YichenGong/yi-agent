@@ -1,8 +1,16 @@
 import { useEffect, useRef } from "react";
-import type { Item } from "../lib/protocol";
+import type { Item, RetryCause } from "../lib/protocol";
 import { ToolCallCard } from "./ToolCallCard";
 
-export function ChatView({ items, error }: { items: Item[]; error?: string | null }) {
+export function ChatView({
+  items,
+  error,
+  retrying,
+}: {
+  items: Item[];
+  error?: string | null;
+  retrying?: { attempt: number; max: number; cause: RetryCause } | null;
+}) {
   const endRef = useRef<HTMLDivElement>(null);
 
   // `items` is `session.items` — the same array instance for the whole session,
@@ -53,6 +61,14 @@ export function ChatView({ items, error }: { items: Item[]; error?: string | nul
           }
         }
       })}
+      {retrying && (
+        <div className="my-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+          {retrying.cause === "request_timeout"
+            ? "Provider request timed out"
+            : "Provider stalled"}{" "}
+          — retrying {retrying.attempt}/{retrying.max}…
+        </div>
+      )}
       {error && (
         <div className="my-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
           {error}

@@ -368,14 +368,12 @@ async fn mid_stream_error_becomes_terminal_stop() {
 
     assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "partial"));
     match &events[1] {
-        ProviderEvent::Stop {
-            reason: StopReason::Other(msg),
-        } => {
+        ProviderEvent::StreamError(ProviderError::Stream(msg)) => {
             assert!(msg.contains("invalid SSE JSON") || msg.contains("stream error"));
         }
-        _ => panic!("expected Stop{{Other}}, got: {:?}", events[1]),
+        _ => panic!("expected StreamError, got: {:?}", events[1]),
     }
-    assert_eq!(events.len(), 2, "stream should terminate after Stop");
+    assert_eq!(events.len(), 2, "stream should terminate after the failure");
 }
 
 #[tokio::test]

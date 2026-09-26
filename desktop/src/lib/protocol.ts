@@ -49,10 +49,23 @@ export type Notification =
       params: { thread_id: string; turn_id: string; status: TurnStatus; error?: string };
     }
   | {
+      method: "turn/retry";
+      params: {
+        thread_id: string;
+        turn_id: string;
+        attempt: number;
+        max: number;
+        cause: "idle_stall" | "request_timeout";
+      };
+    }
+  | {
       method: "thread/tokenUsage/updated";
       params: { thread_id: string; model: string; input_tokens: number; output_tokens: number };
     }
   | { method: "error"; params: { message: string } };
+
+/// Why the turn is being retried, as reported by the server on `turn/retry`.
+export type RetryCause = "idle_stall" | "request_timeout";
 
 export type PermissionKind = "Normal" | { Blacklisted: string };
 
