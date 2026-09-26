@@ -522,9 +522,10 @@ async fn run_thread_driver<W>(
     let mut translator = Translator::new(thread_id.clone());
     while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
         // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
+        // `last_usage` 记录的是本轮**最后一次** provider 调用,而非多步 turn 的累加。
         let mut completed_items: Vec<crate::protocol::Item> = Vec::new();
         let mut last_usage: Option<crate::thread_store::TurnUsage> = None;
-        let prompt_for_title = prompt.clone();
+        let user_prompt = prompt.clone();
         translator.set_turn(turn_id.clone());
 
         let mut stream = match agent.run(prompt).await {
@@ -640,19 +641,20 @@ async fn run_thread_driver<W>(
         let mut items = Vec::with_capacity(completed_items.len() + 1);
         items.push(crate::protocol::Item::UserMessage {
             id: format!("user-{turn_id}"),
-            text: prompt_for_title.clone(),
+            text: user_prompt.clone(),
         });
         items.append(&mut completed_items);
 
         let record = crate::thread_store::TurnLine::Turn {
             items,
-            usage: last_usage.take(),
+            usage: last_usage,
             messages: agent.session().messages().to_vec(),
         };
+        // append 失败则跳过 touch:避免 updated_at/title 被推进却无日志内容,
+        // 留下 `thread/list` 会列出的"幽灵" thread。
         if let Err(e) = store.append_turn(&thread_id, &record) {
             eprintln!("[app-server] failed to persist turn {turn_id} of {thread_id}: {e}");
-        }
-        if let Err(e) = store.touch(&thread_id, Some(prompt_for_title.as_str())) {
+        } else if let Err(e) = store.touch(&thread_id, Some(user_prompt.as_str())) {
             eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
         }
 
