@@ -344,6 +344,30 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
             )
             .map_err(|error| WorkerError::Startup(format!("Git workspace cleanup error: {error}")))
     }
+
+    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        if workspace.branch.is_empty() {
+            // A read-only workspace owns no worktree; its `path` is the parent's
+            // view and must not be removed.
+            return Ok(());
+        }
+        self.service
+            .reclaim_directory(&workspace.repository_root, &workspace.path)
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    }
+
+    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        if workspace.branch.is_empty() {
+            return Ok(());
+        }
+        self.service
+            .reattach_worktree(
+                &workspace.repository_root,
+                &workspace.path,
+                &workspace.branch,
+            )
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    }
 }
 
 fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {
@@ -1758,6 +1782,59 @@ mod tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+    }
+
+    #[test]
+    fn daemon_workspace_reclaim_removes_directory_and_keeps_branch_and_workspace() {
+        let directory = TempDir::new().unwrap();
+        initialize_git_repository(directory.path());
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let root = service
+            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .unwrap();
+        std::fs::write(root.path.join("delivery.txt"), "ready\n").unwrap();
+        Command::new("git")
+            .args(["add", "delivery.txt"])
+            .current_dir(&root.path)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "root delivery"])
+            .current_dir(&root.path)
+            .status()
+            .unwrap();
+        let delivered = git_output(&root.path, &["rev-parse", "HEAD"]).unwrap();
+
+        service.reclaim_worktree(&root).unwrap();
+
+        assert!(!root.path.exists(), "directory is reclaimed");
+        assert!(
+            Command::new("git")
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", root.branch)
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success(),
+            "branch ref survives the reclaim"
+        );
+        assert_eq!(
+            git_output(directory.path(), &["rev-parse", &root.branch]).unwrap(),
+            delivered
+        );
+
+        service.reattach_workspace(&root).unwrap();
+
+        assert!(root.path.exists(), "worktree is rebuilt from the branch");
+        assert_eq!(
+            git_output(&root.path, &["rev-parse", "HEAD"]).unwrap(),
+            delivered,
+            "rebuild restores the delivered tip"
         );
     }
 

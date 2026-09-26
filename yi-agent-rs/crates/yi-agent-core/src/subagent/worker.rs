@@ -491,6 +491,26 @@ pub trait AgentWorkspaceService: Send + Sync {
     ) -> Result<(), WorkerError> {
         Ok(())
     }
+
+    /// Remove a task's worktree directory while keeping its branch ref and its
+    /// `task_workspaces` row. This is the safe automatic reclaim: the branch
+    /// still pins every commit, and the surviving row lets
+    /// [`Self::reattach_workspace`] rebuild the directory on demand.
+    ///
+    /// The default is a no-op for non-git services.
+    fn reclaim_worktree(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    /// Rebuild a reclaimed worktree directory from its surviving branch.
+    ///
+    /// The default cannot run git and therefore reports failure, because a
+    /// caller that reaches this point needs a usable directory.
+    fn reattach_workspace(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        Err(WorkerError::Startup(
+            "workspace service cannot rebuild a reclaimed worktree".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
