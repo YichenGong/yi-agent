@@ -512,11 +512,22 @@ pub trait AgentWorkspaceService: Send + Sync {
         ))
     }
 
-    /// Whether `branch` is already merged into `owner`'s current branch. Used
-    /// to refuse reclaiming a worktree whose work has not been integrated. The
-    /// default cannot inspect git and reports "not merged", which is the safe
+    /// Whether `branch` is already merged into `parent_branch`. Used to refuse
+    /// reclaiming a worktree whose work has not been integrated.
+    ///
+    /// The comparison is against the branch the worktree recorded as its parent,
+    /// never against `owner`'s current `HEAD`: a worker may `git checkout` inside
+    /// the owner worktree, and that must not change whether a child counts as
+    /// integrated. `parent_branch` is passed separately for exactly that reason.
+    ///
+    /// The default cannot inspect git and reports "not merged", which is the safe
     /// answer.
-    fn is_merged_into(&self, _owner: &WorkerWorkspace, _branch: &str) -> Result<bool, WorkerError> {
+    fn is_merged_into(
+        &self,
+        _owner: &WorkerWorkspace,
+        _branch: &str,
+        _parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
         Ok(false)
     }
 }

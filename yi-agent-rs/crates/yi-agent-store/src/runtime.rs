@@ -2149,6 +2149,20 @@ impl RuntimeCoordinator {
     /// Candidates are processed deepest first. A child's merge check runs with
     /// the owner worktree as its working directory, so reclaiming a parent first
     /// would break its children.
+    ///
+    /// # Preconditions
+    ///
+    /// The caller must already have established that no live worker owns these
+    /// directories — in practice by detaching the session first. This method
+    /// does not check task state or worker ownership, and it reclaims a session's
+    /// root with no merge check, because a root's `parent_branch` is the main
+    /// branch and a root branch rarely merges into it. Calling it for a live
+    /// session would delete the directory a running worker is using; the rebuild
+    /// path in `prepare_task_workspace` repairs the directory, but only at the
+    /// next worker start.
+    ///
+    /// It is synchronous and runs `git` subprocesses, so it must not be called
+    /// from a request-handling thread or while holding the repository mutex.
     pub fn reclaim_session_worktrees(&self, session: &RootSessionId) -> usize {
         let candidates = self.reclaim_candidates_in_session(session);
         self.reclaim_candidate_directories(session, candidates)
@@ -2224,7 +2238,20 @@ impl RuntimeCoordinator {
                 None => None,
             };
             if let Some(owner_workspace) = owner_workspace.as_ref() {
-                match service.is_merged_into(owner_workspace, &child_workspace.branch) {
+                // The merge check runs git with the owner worktree as its working
+                // directory. If the owner was already reclaimed (an earlier pass
+                // removed the root, say), the check cannot run at all, so skip
+                // quietly: logging an error every sweep tick would be misleading
+                // and the child becomes reclaimable again once the owner is
+                // rebuilt.
+                if !owner_workspace.path.exists() {
+                    continue;
+                }
+                match service.is_merged_into(
+                    owner_workspace,
+                    &child_workspace.branch,
+                    &child_workspace.parent_branch,
+                ) {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(error) => {
