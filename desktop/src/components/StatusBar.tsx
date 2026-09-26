@@ -1,3 +1,7 @@
+import { useState } from "react";
+import type { Usage } from "../lib/protocol";
+import { UsagePanel } from "./UsagePanel";
+
 export function StatusBar({
   cwd,
   model,
@@ -7,11 +11,12 @@ export function StatusBar({
   cwd: string | null;
   model: string | null;
   status: string;
-  usage: { model: string; input: number; output: number } | null;
+  usage: Usage | null;
 }) {
   const connected = status === "connected";
+  const [showUsage, setShowUsage] = useState(false);
   return (
-    <div className="flex items-center gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2 text-xs text-neutral-400">
+    <div className="relative flex items-center gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2 text-xs text-neutral-400">
       <span
         className={`inline-block h-2 w-2 rounded-full ${connected ? "bg-emerald-500" : "bg-red-500"}`}
         title={status}
@@ -20,10 +25,15 @@ export function StatusBar({
       {cwd && <span className="truncate font-mono">{cwd}</span>}
       {model && <span className="truncate font-mono">{model}</span>}
       {usage && (
-        <span className="ml-auto font-mono">
+        <button
+          type="button"
+          className="ml-auto font-mono hover:text-neutral-200"
+          onClick={() => setShowUsage((v) => !v)}
+        >
           {usage.input} in / {usage.output} out
-        </span>
+        </button>
       )}
+      {usage && showUsage && <UsagePanel usage={usage} />}
     </div>
   );
 }
