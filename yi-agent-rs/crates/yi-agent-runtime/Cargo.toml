@@ -10,6 +10,7 @@ yi-agent-llm = { workspace = true }
 yi-agent-tools = { workspace = true }
 yi-agent-skills = { workspace = true }
 anyhow.workspace = true
+chrono.workspace = true
 dotenvy.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
