@@ -260,10 +260,17 @@ impl ThreadStore {
     }
 
     /// 删除两个文件;文件缺失不算错误。返回删除前是否存在。
+    ///
+    /// 持 `meta_lock`,与 `update_meta` 串行:否则并发的 `touch` 可能在删除后
+    /// 把已读到的 meta 重新写回,留下一个无日志的幽灵 thread。
     pub fn delete(&self, id: &str) -> io::Result<bool> {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
+        let _guard = self
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let meta = self.meta_path(id);
         let log = self.log_path(id);
         let existed = meta.exists() || log.exists();
@@ -636,5 +643,20 @@ mod tests {
         }
         let ids: Vec<String> = s.list().unwrap().into_iter().map(|m| m.thread_id).collect();
         assert_eq!(ids, vec!["thread-a", "thread-b", "thread-c"]);
+    }
+
+    #[test]
+    fn touch_after_delete_does_not_resurrect_meta() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        assert!(s.delete("thread-a").unwrap());
+
+        s.touch("thread-a", Some("ghost"))
+            .expect("touch on a deleted thread must not error");
+        assert!(
+            !s.meta_path("thread-a").exists(),
+            "touch must not recreate a deleted thread"
+        );
+        assert!(!s.exists("thread-a"));
     }
 }
