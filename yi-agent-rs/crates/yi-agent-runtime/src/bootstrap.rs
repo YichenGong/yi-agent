@@ -61,6 +61,10 @@ pub fn build_system_prompt(cfg: &RuntimeConfig) -> String {
 /// 进程工具(`process_start` / `process_kill` 等),与 TUI 路径对齐——app-server
 /// 需要这些工具。Phase B 之后 CLI 的无头路径若改走本函数,也会获得进程工具,
 /// 这是计划明确认可的。
+///
+/// 另注意:非 naked 路径在 skills catalog 预算未显式指定、且 stdin 是 TTY 时,
+/// **可能读取 stdin** 以询问是否纳入完整 catalog。stdin 非 TTY 的调用方(如
+/// app-server sidecar,其 stdin 是管道)永远不会触发该询问。
 pub fn build_tool_setup(cfg: &RuntimeConfig, naked: bool) -> Result<ToolSetup> {
     if naked {
         return Ok(ToolSetup {
@@ -124,7 +128,9 @@ pub type DecisionReceiver = Arc<
 pub struct AgentBootstrap {
     pub agent: yi_agent_core::Agent,
     pub permission: Arc<yi_agent_core::permission::PermissionChecker>,
-    pub decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+    /// 交互模式下由调用方(CLI / app-server)用它回传权限决定;
+    /// AutoAllow 模式下为 `None`(通道已关闭,黑名单命令解析为 Deny)。
+    pub decision_tx: Option<tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>>,
     /// app-server 持有 rx 以接收权限决定;AutoAllow 时返回 None。
     pub decision_rx: Option<DecisionReceiver>,
 }
@@ -161,28 +167,21 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
             Ok(AgentBootstrap {
                 agent,
                 permission: checker,
-                decision_tx,
+                decision_tx: Some(decision_tx),
                 decision_rx: Some(rx_arc),
             })
         }
         PermissionMode::AutoAllow => {
-            // AutoAllow 下没有 UI 读取决定。丢弃真实的 sender 让通道关闭:
-            // agent 侧 `recv()` 会立即返回 `None`,黑名单命令据此解析为 Deny,
-            // 而不是永久阻塞等待一个不会到来的决定。
+            // AutoAllow 下没有 UI 读取决定。丢弃 sender 让通道关闭:agent 侧
+            // `recv()` 会立即返回 `None`,黑名单命令据此解析为 Deny,而不是
+            // 永久阻塞等待一个不会到来的决定。
             drop(decision_tx);
             let agent = yi_agent_core::Agent::new(provider, setup.tools, agent_config)
                 .with_permission(checker.clone(), rx_arc);
-            // 返回一个「receiver 已被丢弃」的 sender:任何 `send`/`try_send` 都会
-            // 立刻失败,调用方无法把这条已关闭的通道重新接活。选择这个方案是因为
-            // `AgentBootstrap::decision_tx` 是非可选字段,而构造一个接收端已消失的
-            // sender 是最简单、且可证明不会阻塞的做法。
-            let (closed_tx, closed_rx) =
-                tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(1);
-            drop(closed_rx);
             Ok(AgentBootstrap {
                 agent,
                 permission: checker,
-                decision_tx: closed_tx,
+                decision_tx: None,
                 decision_rx: None,
             })
         }
@@ -398,6 +397,8 @@ mod tests {
         assert!(b.decision_rx.is_some(), "interactive keeps the receiver");
         assert!(
             b.decision_tx
+                .as_ref()
+                .expect("interactive exposes the sender")
                 .try_send((0, yi_agent_core::permission::Decision::Deny))
                 .is_ok(),
             "interactive sender must stay live"
@@ -409,13 +410,8 @@ mod tests {
         let cfg = sample_config();
         let b = bootstrap_agent(&cfg, PermissionMode::AutoAllow).expect("bootstrap");
         assert!(b.decision_rx.is_none(), "auto-allow exposes no receiver");
-        // A closed channel makes blacklisted commands resolve as Deny instead of
-        // blocking forever waiting for a decision nobody will send.
-        assert!(
-            b.decision_tx
-                .try_send((0, yi_agent_core::permission::Decision::Deny))
-                .is_err(),
-            "auto-allow sender must be closed"
-        );
+        // The sender is dropped inside `bootstrap_agent`, closing the channel so
+        // blacklisted commands resolve as Deny instead of blocking forever.
+        assert!(b.decision_tx.is_none(), "auto-allow exposes no sender");
     }
 }
