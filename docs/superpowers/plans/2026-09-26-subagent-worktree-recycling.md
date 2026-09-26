@@ -282,12 +282,15 @@ fn daemon_workspace_cleanup_accepted_removes_child_worktree_and_branch() {
     run_git(&child.path, &["add", "delivery.txt"]);
     run_git(&child.path, &["commit", "-m", "child delivery"]);
 
-    // Not integrated yet: refusal is git-level and leaves the worktree in place.
-    assert!(service.cleanup_accepted(&root, &child).is_err());
+    // Not integrated yet: the child head is not an ancestor of the owner,
+    // and refusal is git-level, leaving the worktree in place.
+    assert!(!service.contains_commit(&root, &child.branch).unwrap());
+    let error = service.cleanup_accepted(&root, &child).unwrap_err();
+    assert!(error.to_string().contains("has not been merged"), "unexpected error: {error}");
     assert!(child.path.exists());
 
     run_git(&root.path, &["merge", "--no-ff", &child.branch, "-m", "integrate"]);
-    assert!(service.contains_commit(&root, &child.base_commit).unwrap());
+    assert!(service.contains_commit(&root, &child.branch).unwrap());
 
     service.cleanup_accepted(&root, &child).unwrap();
     assert!(!child.path.exists());
