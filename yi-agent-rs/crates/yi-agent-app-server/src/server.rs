@@ -118,8 +118,6 @@ where
 
     let mut initialized = false;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
-    // 主循环用该计数器分配 turn id(`turn-{n}`)。
-    let mut next_turn: u64 = 1;
 
     loop {
         tokio::select! {
@@ -337,7 +335,7 @@ where
                             .and_then(|s| s.active_turn_id.clone())
                         {
                             if let Some(s) = threads.get(&thread_id) {
-                                let _ = s.interrupt_tx.try_send(tid);
+                                let _ = s.interrupt_tx.try_send(tid.clone());
                             }
                             let wait_for_persist = async {
                                 while let Some(TurnEvent::Finished {
@@ -350,7 +348,7 @@ where
                                             s.active_turn_id = None;
                                         }
                                     }
-                                    if done_id == thread_id {
+                                    if done_id == thread_id && done_turn == tid {
                                         break;
                                     }
                                 }
@@ -396,7 +394,11 @@ where
                         };
 
                         let mut session = yi_agent_core::Session::new();
-                        session.replace_messages(loaded.messages.clone());
+                        // 恢复上次用量,使 auto-compact 在 resume 后的首轮即生效。
+                        if let Some(u) = &loaded.usage {
+                            session.set_last_input_tokens(Some(u.input_tokens));
+                        }
+                        session.replace_messages(loaded.messages);
 
                         let BuiltAgent { agent, decision_tx } = match build_agent(Some(session)) {
                             Ok(a) => a,
@@ -508,7 +510,7 @@ where
                             }
                         };
 
-                        let turn_id = format!("turn-{next_turn}");
+                        let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
                         // 内层作用域:让 `&mut threads` 的借用先结束,后续错误
                         // 路径才能再次 `threads.get_mut`。
                         let prompt_tx = {
@@ -528,7 +530,6 @@ where
                                 .await?;
                                 continue;
                             }
-                            next_turn += 1;
                             session.active_turn_id = Some(turn_id.clone());
                             session.prompt_tx.clone()
                         };
@@ -2250,6 +2251,7 @@ mod tests {
         ))
         .await;
         let mut replayed: Vec<String> = Vec::new();
+        let mut item_ids: Vec<String> = Vec::new();
         let mut resumed = false;
         for _ in 0..12 {
             let v = h.read_value().await;
@@ -2257,6 +2259,7 @@ mod tests {
                 Some("thread/started") => {}
                 Some("item/completed") => {
                     replayed.push(v["params"]["item"]["type"].as_str().unwrap().to_string());
+                    item_ids.push(v["params"]["item"]["id"].as_str().unwrap().to_string());
                 }
                 _ => {}
             }
@@ -2276,23 +2279,37 @@ mod tests {
             "replay must include the agent item: {replayed:?}"
         );
 
-        // turn 2:provider 应看到比 turn 1 更多的 message(上下文已恢复)
+        // turn 2:provider 应看到恢复后的完整上下文(user + assistant + 新 user)
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"second"}}]}}}}"#
         ))
         .await;
         loop {
             let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed") {
+                item_ids.push(v["params"]["item"]["id"].as_str().unwrap().to_string());
+            }
             if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
                 break;
             }
         }
 
         let counts = seen.lock().unwrap().clone();
-        assert_eq!(counts.len(), 2, "expected two provider calls: {counts:?}");
-        assert!(
-            counts[1] > counts[0],
-            "resumed turn must carry prior context: {counts:?}"
+        assert_eq!(
+            counts,
+            vec![1, 3],
+            "resumed turn must carry prior context (user + assistant + new user): {counts:?}"
+        );
+
+        // 回归:resume 后新 turn 的 item id 不得与回放的历史 id 冲突,
+        // 否则前端按 id upsert 会覆盖历史。
+        let mut unique = item_ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            item_ids.len(),
+            "item ids must be unique across replay + resumed turn: {item_ids:?}"
         );
 
         h.shutdown().await;

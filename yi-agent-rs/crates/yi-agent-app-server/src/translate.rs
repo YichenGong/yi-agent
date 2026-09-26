@@ -65,7 +65,7 @@ impl Translator {
     }
 
     fn alloc_item_id(&mut self) -> String {
-        let id = format!("item-{}", self.next_item);
+        let id = format!("item-{}-{}", self.turn_id, self.next_item);
         self.next_item += 1;
         id
     }
