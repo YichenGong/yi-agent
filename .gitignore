@@ -25,6 +25,10 @@
 # Logs / runtime
 *.log
 
+# yi-agent runtime state under each project workdir
+# (unix socket, instance lock, runtime.sqlite and its -wal/-shm sidecars)
+.yi-agent/
+
 # Git worktrees (isolated workspaces)
 .worktrees/
 
