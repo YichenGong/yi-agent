@@ -1160,4 +1160,76 @@ mod tests {
         drop(prompt_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
+
+    /// 一个 thread 的 driver 复用同一个 `Translator`,因此 item id 跨 turn 单调
+    /// 递增,不会出现两轮都用 `item-1` 的碰撞(回归 Fix #4)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_uses_unique_item_ids_across_turns() {
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let writer = Arc::new(MessageWriter::new(server_w));
+
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-1".into(),
+            build_test_agent().unwrap(),
+            prompt_rx,
+            interrupt_rx,
+            writer,
+            turn_tx,
+        ));
+
+        let mut client_r = BufReader::new(client_r);
+        // 每轮取第一个 `item/started` 的 item id(agentMessage 的起始项)。
+        let mut item_ids: Vec<String> = Vec::new();
+        for turn in ["turn-1", "turn-2"] {
+            prompt_tx
+                .send(TurnPrompt {
+                    turn_id: turn.into(),
+                    prompt: "hi".into(),
+                })
+                .await
+                .unwrap();
+            loop {
+                let mut buf = String::new();
+                let n = tokio::time::timeout(Duration::from_secs(5), client_r.read_line(&mut buf))
+                    .await
+                    .expect("timed out waiting for a notification")
+                    .unwrap();
+                assert!(n > 0, "unexpected EOF while waiting for turn/completed");
+                let v: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+                let method = v["method"].as_str().unwrap_or("");
+                if method == "item/started" {
+                    if let Some(id) = v["params"]["item"]["id"].as_str() {
+                        item_ids.push(id.to_string());
+                    }
+                }
+                if method == "turn/completed" {
+                    break;
+                }
+            }
+            let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(ev, TurnEvent::Finished { .. }));
+        }
+
+        assert!(
+            item_ids.len() >= 2,
+            "expected items from both turns: {item_ids:?}"
+        );
+        let mut unique = item_ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            item_ids.len(),
+            "item ids must be unique across turns: {item_ids:?}"
+        );
+
+        drop(prompt_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
 }

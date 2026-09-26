@@ -12,7 +12,7 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 **做什么：**
 - JSON-RPC 2.0 信封与 yi-agent 线协议类型（请求/响应/通知/错误码）
 - stdio JSONL 分帧传输（读一行、写一行，帧大小上限保护）
-- 后续：thread/turn 状态机、权限审批反向请求、CLI 子命令
+- 后续：权限审批反向请求、CLI 子命令
 
 **不做什么：**
 - 不做 TUI（由 `yi-agent-tui` 负责）
@@ -32,4 +32,4 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - [ ] 权限审批反向请求闭环（服务端 → 客户端请求 / 客户端响应）
 - [ ] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环）
 
-**验证命令：** `cargo test -p yi-agent-app-server`（62 个测试）
+**验证命令：** `cargo test -p yi-agent-app-server`（63 个测试）
