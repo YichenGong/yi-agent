@@ -9,10 +9,12 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
 use yi_agent_core::subagent::task::{
-    PauseReason, PermissionRequestId, RootSessionId, TaskDepth, TaskState,
+    PauseReason, PermissionRequestId, RootSessionId, TaskDepth, TaskId, TaskState,
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
-use yi_agent_core::{ContentBlock, ProviderTurnGate, ProviderTurnLease, ToolRegistry};
+use yi_agent_core::{
+    ContentBlock, ProviderTurnGate, ProviderTurnLease, TaskWorkspaceMode, ToolRegistry,
+};
 
 #[test]
 fn spawn_enforces_depth_two_and_four_direct_children() {
@@ -72,12 +74,108 @@ fn spawning_with_an_objective_retains_the_worker_instruction() {
     let root = supervisor.root_task_id().clone();
 
     let child = supervisor
-        .spawn_with_objective(root, "Audit the scheduler fairness tests".into())
+        .spawn_with_objective(
+            root,
+            "Audit the scheduler fairness tests".into(),
+            TaskWorkspaceMode::ReadOnly,
+        )
         .unwrap();
 
     assert_eq!(
         supervisor.objective(&child),
         Some("Audit the scheduler fairness tests")
+    );
+}
+
+#[test]
+fn children_default_to_read_only_and_can_be_spawned_as_coding() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+
+    let read_only = supervisor
+        .spawn_with_objective(root.clone(), "audit".into(), TaskWorkspaceMode::ReadOnly)
+        .unwrap();
+    let coding = supervisor
+        .spawn_with_objective(root.clone(), "implement".into(), TaskWorkspaceMode::Coding)
+        .unwrap();
+
+    assert_eq!(
+        supervisor.workspace_mode(&read_only),
+        TaskWorkspaceMode::ReadOnly
+    );
+    assert_eq!(
+        supervisor.workspace_mode(&coding),
+        TaskWorkspaceMode::Coding
+    );
+    // Root with no explicit entry defaults to coding.
+    assert_eq!(supervisor.workspace_mode(&root), TaskWorkspaceMode::Coding);
+}
+
+#[test]
+fn unregistered_task_defaults_to_read_only() {
+    let supervisor = AgentSupervisor::new(RootSessionId::new());
+    assert_eq!(
+        supervisor.workspace_mode(&TaskId::new()),
+        TaskWorkspaceMode::ReadOnly
+    );
+}
+
+fn spawned_child_id(content: &[ContentBlock]) -> TaskId {
+    let text = match &content[0] {
+        ContentBlock::Text(text) => text,
+        other => panic!("expected text result, got {other:?}"),
+    };
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    value["task_id"]
+        .as_str()
+        .expect("spawn response carries a task id")
+        .parse::<TaskId>()
+        .expect("spawn response task id parses")
+}
+
+#[tokio::test]
+async fn spawn_tool_parses_optional_mode_and_rejects_invalid_values() {
+    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
+    let root = supervisor.lock().unwrap().root_task_id().clone();
+    let tools = SupervisorTools::new(supervisor.clone(), root);
+    let spawn = tools.spawn_agent();
+
+    // Omitted mode defaults to read-only.
+    let default_result = spawn.call(json!({ "task": "audit" })).await;
+    assert!(!default_result.is_error);
+    let default_child = spawned_child_id(&default_result.content);
+
+    // An explicit coding request is honored.
+    let coding_result = spawn
+        .call(json!({ "task": "implement", "mode": "coding" }))
+        .await;
+    assert!(!coding_result.is_error);
+    let coding_child = spawned_child_id(&coding_result.content);
+
+    let supervisor = supervisor.lock().unwrap();
+    assert_eq!(
+        supervisor.workspace_mode(&default_child),
+        TaskWorkspaceMode::ReadOnly
+    );
+    assert_eq!(
+        supervisor.workspace_mode(&coding_child),
+        TaskWorkspaceMode::Coding
+    );
+    drop(supervisor);
+
+    // Unknown enum values are rejected rather than defaulted.
+    assert!(
+        spawn
+            .call(json!({ "task": "audit", "mode": "bogus" }))
+            .await
+            .is_error
+    );
+    // A non-string mode is rejected rather than silently defaulted.
+    assert!(
+        spawn
+            .call(json!({ "task": "audit", "mode": 5 }))
+            .await
+            .is_error
     );
 }
 

@@ -15,11 +15,11 @@ use yi_agent_core::subagent::task::{
 use yi_agent_core::subagent::worker::{
     WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerWorkspace,
 };
-use yi_agent_core::{AttemptId, RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 8;
+const LATEST_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -363,6 +363,7 @@ pub struct PersistedRecoveredTask {
     pub objective: String,
     pub recovery_gated: bool,
     pub recovery_attested: bool,
+    pub workspace_mode: TaskWorkspaceMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,9 +893,13 @@ impl RuntimeRepository {
             attempt_number,
             state,
             "Root session objective not specified.",
+            // Root tasks own an isolated session worktree, so this convenience
+            // wrapper keeps the coding mode.
+            TaskWorkspaceMode::Coding,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_task_with_attempt_and_objective(
         &mut self,
         task: &TaskId,
@@ -903,6 +908,7 @@ impl RuntimeRepository {
         attempt_number: u32,
         state: &str,
         objective: &str,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
@@ -911,15 +917,25 @@ impl RuntimeRepository {
             params![root.to_string()],
         )?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
-             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5)",
-            params![task.to_string(), root.to_string(), state, attempt.to_string(), delivery_json],
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode)
+             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6)",
+            params![
+                task.to_string(),
+                root.to_string(),
+                state,
+                attempt.to_string(),
+                delivery_json,
+                workspace_mode.as_str(),
+            ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
         transaction.commit()?;
         Ok(())
     }
 
+    /// Legacy/compat child insert that does not set `workspace_mode`; it
+    /// therefore defaults to `'coding'`. Do not use for subagent children —
+    /// use `create_child_task_with_attempt_and_objective` and pass the mode.
     pub fn create_child_task(
         &mut self,
         task: &TaskId,
@@ -964,6 +980,9 @@ impl RuntimeRepository {
             attempt_number,
             state,
             "Complete the delegated task.",
+            // Legacy compat wrapper used only by tests; callers needing a
+            // read-only child go through `create_child_task_with_attempt_and_objective`.
+            TaskWorkspaceMode::Coding,
         )
     }
 
@@ -978,12 +997,13 @@ impl RuntimeRepository {
         attempt_number: u32,
         state: &str,
         objective: &str,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -992,6 +1012,7 @@ impl RuntimeRepository {
                 state,
                 attempt.to_string(),
                 delivery_json,
+                workspace_mode.as_str(),
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -3245,6 +3266,27 @@ impl RuntimeRepository {
         }
     }
 
+    pub fn task_workspace_mode(&self, task: &TaskId) -> Result<TaskWorkspaceMode, RepositoryError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT workspace_mode FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match value {
+            Some(value) => {
+                TaskWorkspaceMode::parse(&value).ok_or_else(|| RepositoryError::UnknownEventKind {
+                    kind: format!("invalid workspace_mode in store: {value}"),
+                })
+            }
+            None => Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            }),
+        }
+    }
+
     /// Deletes a task's workspace assignment row. Idempotent: a missing row is
     /// not an error, so recycling can be retried safely.
     pub fn delete_task_workspace(&self, task: &TaskId) -> Result<(), RepositoryError> {
@@ -3375,7 +3417,8 @@ impl RuntimeRepository {
                     (SELECT resource_key FROM resource_leases
                      WHERE task_id = tasks.id AND state = 'active' AND resource_key LIKE 'worktree:%'
                      ORDER BY acquired_at DESC, id DESC LIMIT 1),
-                    attempts.checkpoint_json, attempts.usage_json, tasks.state_json, tasks.delivery_json
+                    attempts.checkpoint_json, attempts.usage_json, tasks.state_json, tasks.delivery_json,
+                    tasks.workspace_mode
              FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.state_json IN ('recovery_required', 'recovery_gated', 'recovery_attested')
              ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
@@ -3395,6 +3438,7 @@ impl RuntimeRepository {
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
                 ))
             })?
             .map(|row| {
@@ -3411,6 +3455,7 @@ impl RuntimeRepository {
                     tool_state_json,
                     task_state,
                     delivery_json,
+                    workspace_mode,
                 ) = row?;
                 Ok(PersistedRecoveredTask {
                     session_id: session_id.parse().map_err(|_| {
@@ -3456,6 +3501,11 @@ impl RuntimeRepository {
                         }),
                     recovery_gated: task_state == "recovery_gated",
                     recovery_attested: task_state == "recovery_attested",
+                    workspace_mode: TaskWorkspaceMode::parse(&workspace_mode).ok_or_else(|| {
+                        RepositoryError::UnknownEventKind {
+                            kind: format!("invalid workspace_mode in store: {workspace_mode}"),
+                        }
+                    })?,
                 })
             })
             .collect()
@@ -4521,6 +4571,27 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             )?;
         }
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (8)", [])?;
+        transaction.commit()?;
+    }
+
+    if current_version < 9 {
+        let transaction = connection.unchecked_transaction()?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tasks')
+                WHERE name = 'workspace_mode'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // Existing rows own worktrees, so backfill them as coding. New
+            // inserts always specify the mode explicitly.
+            transaction.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'coding';",
+            )?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])?;
         transaction.commit()?;
     }
     Ok(())

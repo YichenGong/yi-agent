@@ -52,9 +52,22 @@ sandbox 运行，走文本结果收口。非 git 目录下降级为只读原地�
   报错** `"worker workspace assignment is required"`
   （`subagent_runtime.rs:415-421`）。因此
   `prepare_task_workspace` 返回 `Ok(None)`（`runtime.rs:1481-1483`）目前**不等于
-  「原地运行」，而是等于 worker 启动失败**。
+  「原地运行」，而是等于 worker 启动失败**。本设计因此**保留「每个 worker 都有
+  workspace」这一不变量**：只读任务也返回一个 `WorkerWorkspace`（仅 `path`
+  有意义），只是不落 `task_workspaces` 行。
+- `WorkerStart` 由 supervisor 组装（`supervisor.rs:496`），而 supervisor 不知道
+  任何文件系统路径（只有 lease id）；路径是靠 `WorkspaceAssignedFactory`
+  （`runtime.rs:154-199`）在 coordinator 侧注入的。**新增任何「路径」类字段都
+  要另加跨层搬运**，所以执行根复用 `WorkerWorkspace.path`。
+- `attach_application_root` 要求 root **既有 workspace service 又有
+  workspace**（`runtime.rs:649-656`、`717-723`），且
+  `AttachedApplicationRoot.workspace` 是非可选 `WorkerWorkspace`
+  （`runtime.rs:97-102`）。**任何让「只读任务没有 workspace」的设计都会连锁改
+  `AttachedApplicationRoot` / IPC / TUI**，故本设计不这么做。
 - 完成/交付判定在 `subagent_runtime.rs:549-562`：有 `workspace_service` 走
-  `inspect_delivery`，否则走 `report_completed(text)`。这条文本收口分支已存在。
+  `inspect_delivery`，否则走 `report_completed(text)`。这条文本收口分支已存在，
+  但当前判据是「factory 是否配了 workspace_service」（session 级），需改为
+  per-child 的 mode。
 - 基础设施已有：`SandboxMode::ReadOnly`（`yi-agent-tools/src/sandbox.rs:13-18`）、
   `register_builtin_tools_with_sandbox` 按 `allows_writes()` 过滤 `write`/`edit`
   （`yi-agent-tools/src/lib.rs:67`）、per-tool `ToolMetadata.read_only`
@@ -84,64 +97,93 @@ enum TaskWorkspaceMode {
   `DelegationContract` 的多维能力模型，替换点集中。
 - **只读是强承诺**：只读 child 物理上写不动文件。若它发现必须改代码，**硬失败**
   并把「需要 coding」写进文本结果，由父重新 `spawn_agent` 一个 coding child。
+  实现上，只读 task 也不能再 `spawn_agent(mode: "coding")`：`RuntimeCoordinator::spawn_child_with_objective` 会以可读 reason 拒绝，避免产生父（无 worktree）无法集成的 coding 交付。
 
 ### 3.2 工作目录与供给流程
 
-只读 child 没有 worktree，但必须有 cwd。做法是**把「执行根目录」与
-「workspace 分配」分开**：
+只读 child 没有 worktree，但必须有 cwd。做法是**复用现有的 workspace 管道**
+（不新增 `WorkerStart` 字段）：
 
-- `WorkerStart` 新增**总是有值**的 `execution_root: PathBuf`
-  （`worker.rs:27-44`），作为工具注册与 bash 的 cwd 来源。
+- `WorkerStart` 新增 `workspace_mode: TaskWorkspaceMode`（`worker.rs:27-44`），
+  supervisor 组装 `WorkerStart` 时从 per-task map 填入（镜像现有
+  `objectives` map 的写法，`supervisor.rs:80`）。
+- 执行根目录**复用 `WorkerWorkspace.path`**：现有
+  `WorkspaceAssignedFactory`（`runtime.rs:154-199`）本就把整个
+  `WorkerWorkspace`（含 `path`）注入 `WorkerStart`，这条管道不用改。
 - `prepare_task_workspace`（`runtime.rs:1463-1519`）按 mode 分派：
-  - `Coding`：现有逻辑不变（建 worktree、落 `task_workspaces` 行、
-    `workspace = Some`），`execution_root = workspace.path`。
-  - `ReadOnly`：**不建 worktree、不落行**，`workspace = None`，
-    `execution_root =` 最近祖先的 `workspace.path`（沿 `parent_id` 向上找最近
-    的 coding 祖先；root 是 coding，故总能找到）。
-- factory（`subagent_runtime.rs:409-460`）改为：
-  - `workspace = Some` → 用 `workspace.path` 当 root、sandbox 用
-    `WorkspaceWrite`（现状）。
-  - `workspace = None` → 用 `execution_root` 当 root、sandbox 用
-    `SandboxMode::ReadOnly`，**跳过 `git_dir_for_worktree`**（非 git 时它本来
-    就返回 `None`，`subagent_runtime.rs:631`）。
+  - `Coding`：现有逻辑不变（建 worktree、落 `task_workspaces` 行）。
+  - `ReadOnly`：**不建 worktree、不落 `task_workspaces` 行**，但返回一个
+    `WorkerWorkspace`，其 `path` 指向执行根（沿 `parent_id` 向上找最近的
+    coding 祖先的 `workspace.path`；找不到则为应用根目录），
+    `branch`/`base_commit` 留空。该值不持久化，每次供给时重新计算。
+- factory（`subagent_runtime.rs:409-460`）改为**按 `request.workspace_mode`
+  决定**，而不是按「有没有 workspace」：
+  - `Coding` → sandbox 用 `WorkspaceWrite`，`worker_tool_registry` 走
+    `git_dir_for_worktree`（现状）。
+  - `ReadOnly` → sandbox 用 `SandboxMode::ReadOnly`（`lib.rs:67` 不注册
+    `write`/`edit`），**跳过 `git_dir_for_worktree`**。
 - **交付分支**：`subagent_runtime.rs:549-562` 现按「factory 有没有
   `workspace_service`」决定；改为**按 mode 决定**：`ReadOnly` → 直接
   `report_completed(text)`（`else` 分支已存在，`subagent_runtime.rs:560-562`）；
   `Coding` → 现有 `inspect_delivery` 路径。
 
-一句话：**只读 child = 无 workspace 行 + 有 execution_root + ReadOnly sandbox
-+ 文本收口**。
+一句话：**只读 child = 无 workspace 行 + `WorkerWorkspace.path` 当 cwd +
+ReadOnly sandbox + 文本收口**。
+
+**为何不新增 `execution_root` 字段**：`WorkerStart` 由 supervisor 组装
+（`supervisor.rs:496`），而 supervisor 不知道任何文件系统路径（只有 lease
+id）；新字段需要在 supervisor 里再加一张 per-task 路径表，或改
+`start_worker_with_provider_turn_gate` 签名。复用 `WorkerWorkspace.path` 则
+零新增搬运。代价：`WorkerWorkspace` 在只读场景下 `branch`/`base_commit` 为空，
+语义上应读作「工作位置」而非严格「git worktree」。
 
 ### 3.3 非 git 目录降级
 
 - **探测提前并显式化**：在 root session attach 时探测
-  `git rev-parse --show-toplevel`（即 `workspace_service_for_application_root`，
-  `subagent_runtime.rs:355-362`）。是 git repo → 现状不变；不是 → 返回 `None`
-  （表示本 session 无 workspace service）。
-- **`None` 时 root 自动降级为 `ReadOnly`**：`prepare_task_workspace` 因拿不到
-  service 而返回 `None`（`runtime.rs:1481-1483` 已有此分支），root 的
-  `execution_root` 就是 attach 时传入的真实项目目录，root 的 sandbox 也降为
-  `ReadOnly`。**语义后果**：非 git 下 root 也变成只读、不能改代码——因为 coding
-  交付无处落地。这是诚实的降级。
-- **coding child 明确失败**：非 git 下父若 `spawn_agent(mode: "coding")`，供给
-  阶段发现没有 service → 任务以可读 reason 失败（如
+  `git rev-parse --show-toplevel`。是 git repo → 现状不变；不是 → 该 session
+  进入**降级只读原地模式**。
+- **root 降级为 `ReadOnly`**：非 git 时 root 的 `prepare_root` 不再让
+  `git worktree add` 失败，而是返回一个降级的 `WorkerWorkspace`
+  （`path` = 项目目录本身，`branch`/`base_commit` 为空，**不落
+  `task_workspaces` 行**），root 的 mode 为 `ReadOnly`。
+  **这样 `attach_application_root` 的「必须有 workspace」契约与
+  `AttachedApplicationRoot.workspace: WorkerWorkspace`（`runtime.rs:97-102`）
+  都无需改动**，IPC/TUI 消费端也不受影响。
+  **语义后果**：非 git 下 root 也变成只读、不能改代码——因为 coding 交付无处
+  落地。这是诚实的降级。
+- **coding child 明确失败**：非 git 下父若 `spawn_agent(mode: "coding")`，
+  供给阶段发现无法建 worktree → 任务以可读 reason 失败（如
   `coding_requires_git_repository`，取代笼统的 `workspace_provision_failed`）。
 - **不引入「非 git 但可写」中间态**：有 git 才谈 coding，没有就只读。
+- **实现方式**：给 `AgentWorkspaceService` 加探针
+  `supports_coding(&self) -> bool`（默认 `true`）与
+  `prepare_read_only(&self, parent: Option<&WorkerWorkspace>, task_id) -> Result<WorkerWorkspace>`，
+  生产实现 `DaemonWorkspaceService` 在 `new` 时用
+  `git_output(workspace, ["rev-parse","--show-toplevel"])` 判定并缓存
+  `is_git_repository`。`attach_application_root` 据此决定 root 的 mode；
+  `prepare_task_workspace` 在 coding 且 `!supports_coding()` 时报
+  `coding_requires_git_repository`。探针放在 service（coordinator 在 attach 与
+  provisioning 两处都已持有它），无需新增工厂方法。**不改**
+  `workspace_service_for_application_root` 的返回类型，也不改
+  `AttachedApplicationRoot`。
 
 ### 3.4 持久化与恢复
 
 mode 必须**在 spawn 时落库**，因为 `prepare_task_workspace` 要在 workspace 行
 存在之前就读到它（只读任务永远不会有 workspace 行，无法反推）。
 
-- **schema**：tasks 表加一列 `workspace_mode TEXT NOT NULL DEFAULT 'read_only'`，
-  取值 `'coding' | 'read_only'`。一次迁移。
-- **写入**：`spawn_with_objective`（`supervisor.rs:916-958`）接收 mode，随任务
-  落库。
+- **schema**：tasks 表加一列 `workspace_mode TEXT NOT NULL DEFAULT 'coding'`，
+  取值 `'coding' | 'read_only'`。一次迁移。**默认值取 `'coding'`** 而非
+  `'read_only'`：迁移会把既有行一并回填，而既有 session 都持有 worktree、必须
+  保持 coding 行为；「默认只读」在 **spawn 层**落实（spawn 工具默认
+  `read_only`，且每个 child 插入都显式指定 mode），不依赖 DDL 默认。
+- **写入**：`spawn_with_objective`（`supervisor.rs:916-958`）接收 mode 存入
+  supervisor 的 per-task map（镜像 `objectives`），`spawn_child_with_objective`
+  随任务落库。
 - **读取**：`prepare_task_workspace` 从任务记录读 mode 决定分派。
 - **恢复**：`recovered_tasks()` 带上 mode → `AgentSupervisor::from_recovered_root`
-  / `insert_recovered_child`（`runtime.rs:400-410`）恢复它 → 重建 `WorkerStart`
-  （`runtime.rs:1303`）时带上 mode 与 `execution_root`。重启后只读仍是只读、
-  coding 仍是 coding。
+  / `insert_recovered_child`（`runtime.rs:400-410`）恢复它 → 组装 `WorkerStart`
+  （`supervisor.rs:496`）时带上 mode。重启后只读仍是只读、coding 仍是 coding。
 - **与 workspace 行的一致性**：coding 任务恢复时优先复用已有 workspace 行
   （`runtime.rs:1470-1480` 现状不变）；只读任务没有行，也不会凭空建。
 
@@ -160,12 +202,18 @@ mode 必须**在 spawn 时落库**，因为 `prepare_task_workspace` 要在 work
   child 看到父当前的视图。
 - **mode 只放内存、恢复时从 workspace 行反推**：零迁移，覆盖绝大多数场景，但
   「spawn 后未启动就重启的 coding 任务」会漂移成只读。**否决**，改为落库。
+- **新增 `WorkerStart.execution_root: PathBuf` 字段**：语义最干净（执行根 ≠
+  worktree），但 `WorkerStart` 由 supervisor 组装、supervisor 不知路径，需要
+  再加一张 per-task 路径表或改 `start_worker_with_provider_turn_gate` 签名；
+  并且让只读任务「没有 workspace」会连锁改
+  `AttachedApplicationRoot` / IPC / TUI。**否决**，改为复用
+  `WorkerWorkspace.path`（见 3.2）。
 
 ## 5. 范围边界
 
 **做：**
 - child 默认只读、`spawn_agent(mode: "coding")` 显式声明才建 worktree
-- `TaskWorkspaceMode` 类型、`WorkerStart.execution_root`、per-child sandbox
+- `TaskWorkspaceMode` 类型、`WorkerStart.workspace_mode`、per-child sandbox
 - mode 落库与恢复语义
 - 非 git session 降级为只读原地模式
 
@@ -180,14 +228,15 @@ mode 必须**在 spawn 时落库**，因为 `prepare_task_workspace` 要在 work
 按 crate 跑（遵守 `CLAUDE.md`：跑前 `ps aux | grep cargo`，避免 workspace 全量）：
 
 - **core**：`spawn_agent` schema 含可选 `mode`；`TaskWorkspaceMode` 默认值与
-  解析；`WorkerStart.execution_root` 装配。
+  解析；`WorkerStart.workspace_mode` 装配。
   命令：`cargo test -p yi-agent-core --test subagent_supervisor`
 - **store**：只读 child 不建 worktree、不落 `task_workspaces` 行、
-  `execution_root` 指向最近 coding 祖先；coding child 行为不变；mode 落库与
-  恢复后一致；非 git session → root 降级只读、coding child 以明确 reason 失败。
+  `WorkerWorkspace.path` 指向最近 coding 祖先；coding child 行为不变；mode 落库
+  与恢复后一致；非 git session → root 降级只读、coding child 以明确 reason 失败。
   命令：`cargo test -p yi-agent-store --test runtime_coordinator`
-- **app**：factory 在 `workspace = None` 时用 `execution_root` 起 worker、注册
-  只读 registry（无 `write`/`edit`）、走文本收口而非 delivery。
+- **app**：factory 按 `request.workspace_mode` 分支——只读时用
+  `WorkerWorkspace.path` 当 cwd、注册只读 registry（无 `write`/`edit`）、走文本
+  收口而非 delivery。
   命令：`cargo test -p yi-agent --bin yi-agent`
 - **回归**：`subagent-worktree-recycling` 的 9 个任务测试全绿（回收只对 coding
   任务生效）。

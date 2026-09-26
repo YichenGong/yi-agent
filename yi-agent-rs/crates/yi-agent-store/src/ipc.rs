@@ -165,12 +165,16 @@ pub enum IpcRequest {
         session_id: String,
         parent_task_id: String,
         objective: String,
+        #[serde(default)]
+        mode: Option<String>,
     },
     SpawnApplicationChild {
         session_id: String,
         parent_task_id: String,
         capability: String,
         objective: String,
+        #[serde(default)]
+        mode: Option<String>,
     },
     StartWorker {
         session_id: String,
@@ -2148,9 +2152,11 @@ fn respond(
             session_id,
             parent_task_id,
             objective,
+            mode,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            let workspace_mode = parse_workspace_mode(mode)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -2158,6 +2164,7 @@ fn respond(
                 &session_id,
                 &parent_task_id,
                 objective,
+                workspace_mode,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2168,9 +2175,11 @@ fn respond(
             parent_task_id,
             capability,
             objective,
+            mode,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            let workspace_mode = parse_workspace_mode(mode)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -2179,6 +2188,7 @@ fn respond(
                 &parent_task_id,
                 &capability,
                 objective,
+                workspace_mode,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2520,6 +2530,23 @@ where
             "invalid ID",
         ))
     })
+}
+
+/// Resolves the requested workspace mode for a spawn request. An omitted mode
+/// defaults to read-only so an existing client cannot accidentally request a
+/// writable worktree; an explicit but unknown value is rejected.
+fn parse_workspace_mode(
+    mode: Option<String>,
+) -> Result<yi_agent_core::TaskWorkspaceMode, IpcError> {
+    match mode.as_deref() {
+        None => Ok(yi_agent_core::TaskWorkspaceMode::ReadOnly),
+        Some(value) => yi_agent_core::TaskWorkspaceMode::parse(value).ok_or_else(|| {
+            IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mode must be 'coding' or 'read_only', got {value}"),
+            ))
+        }),
+    }
 }
 
 struct UnavailableWorkerFactory;

@@ -439,6 +439,7 @@ fn spawn_child(
             parent_task_id: root_task_id.into(),
             capability: capability.into(),
             objective: objective.into(),
+            mode: Some("coding".into()),
         },
     )
     .unwrap();
@@ -491,6 +492,7 @@ fn delivery_review_survives_restart_without_restarting_worker() {
             parent_task_id: root_task_id,
             capability: message_capability,
             objective: "deliver".into(),
+            mode: Some("coding".into()),
         },
     )
     .unwrap();

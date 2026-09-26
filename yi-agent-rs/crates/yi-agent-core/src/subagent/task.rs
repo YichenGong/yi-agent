@@ -431,6 +431,42 @@ impl TaskAttempt {
     }
 }
 
+/// Whether a task owns a writable git worktree or runs in place read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWorkspaceMode {
+    /// Create a git worktree; the worker may write files and deliver a commit.
+    Coding,
+    /// No worktree; run in the parent's view with a read-only sandbox and
+    /// return a text result.
+    ReadOnly,
+}
+
+impl TaskWorkspaceMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Coding => "coding",
+            Self::ReadOnly => "read_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "coding" => Some(Self::Coding),
+            "read_only" => Some(Self::ReadOnly),
+            _ => None,
+        }
+    }
+}
+
+/// Defaults to `ReadOnly`: a child must be explicitly spawned as `Coding`
+/// to receive a writable worktree.
+impl Default for TaskWorkspaceMode {
+    fn default() -> Self {
+        Self::ReadOnly
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTask {
     pub id: TaskId,
@@ -1621,5 +1657,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.state(), &TaskState::Stalled(evidence));
+    }
+}
+
+#[cfg(test)]
+mod workspace_mode_tests {
+    use super::TaskWorkspaceMode;
+
+    #[test]
+    fn workspace_mode_round_trips_through_its_storage_string() {
+        assert_eq!(TaskWorkspaceMode::Coding.as_str(), "coding");
+        assert_eq!(TaskWorkspaceMode::ReadOnly.as_str(), "read_only");
+
+        for mode in [TaskWorkspaceMode::Coding, TaskWorkspaceMode::ReadOnly] {
+            assert_eq!(TaskWorkspaceMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(TaskWorkspaceMode::parse("writable"), None);
     }
 }

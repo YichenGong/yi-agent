@@ -429,7 +429,7 @@ fn real_subagent_accepts_delivery_into_parent_history() {
     let mut run = start_real_subagent(
         &config,
         &fixture,
-        "Use spawn_agent exactly once. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in its assigned worktree. The child must not delegate. Do not create that file yourself. Do not call wait_agent: a local human reviewer will accept the child delivery and you will then receive its completion report. Do not attempt review or acceptance.",
+        "Use spawn_agent exactly once with mode \"coding\" (pass mode: coding) so the child runs in a writable worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in its assigned worktree. The child must not delegate. Do not create that file yourself. Do not call wait_agent: a local human reviewer will accept the child delivery and you will then receive its completion report. Do not attempt review or acceptance.",
     );
     let socket = fixture.runtime_dir.join("runtime.sock");
     let child_id = await_direct_child(&socket, &mut run);

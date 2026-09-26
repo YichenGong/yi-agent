@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use yi_agent_core::subagent::task::DeliveryReport;
-use yi_agent_core::subagent::task::{AttemptId, RootSessionId, TaskId, WorkspaceLeaseId};
+use yi_agent_core::subagent::task::{
+    AttemptId, RootSessionId, TaskId, TaskWorkspaceMode, WorkspaceLeaseId,
+};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
     WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerRecoveryPreflight,
@@ -87,13 +89,24 @@ impl DaemonAgentWorkerFactory {
         tools
     }
 
-    fn worker_tool_registry(&self, workspace: &WorkerWorkspace) -> ToolRegistry {
+    fn worker_tool_registry(
+        &self,
+        workspace: &WorkerWorkspace,
+        workspace_mode: TaskWorkspaceMode,
+    ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
+        let (sandbox, writable_roots) = match workspace_mode {
+            TaskWorkspaceMode::Coding => (
+                self.sandbox,
+                git_dir_for_worktree(&workspace.path).into_iter().collect(),
+            ),
+            TaskWorkspaceMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
+        };
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
             workspace.path.clone(),
-            self.sandbox,
-            git_dir_for_worktree(&workspace.path).into_iter().collect(),
+            sandbox,
+            writable_roots,
         );
         tools
     }
@@ -163,18 +176,20 @@ impl DaemonAgentWorkerFactory {
 pub struct DaemonWorkspaceService {
     repository_root: PathBuf,
     worktree_root: PathBuf,
+    is_git_repository: bool,
     service: yi_agent_tools::worktree::WorktreeService,
 }
 
 impl DaemonWorkspaceService {
     pub fn new(workspace: PathBuf) -> Self {
-        let repository_root = git_output(&workspace, &["rev-parse", "--show-toplevel"])
-            .map(PathBuf::from)
-            .unwrap_or(workspace);
+        let git_root = git_output(&workspace, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
+        let is_git_repository = git_root.is_some();
+        let repository_root = git_root.unwrap_or(workspace);
         let worktree_root = repository_root.join(".worktrees");
         Self {
             repository_root,
             worktree_root,
+            is_git_repository,
             service: yi_agent_tools::worktree::WorktreeService::new(),
         }
     }
@@ -210,6 +225,28 @@ impl DaemonWorkspaceService {
 }
 
 impl AgentWorkspaceService for DaemonWorkspaceService {
+    fn supports_coding(&self) -> bool {
+        self.is_git_repository
+    }
+
+    fn prepare_read_only(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let path = parent
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| self.repository_root.clone());
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        })
+    }
+
     fn prepare_root(
         &self,
         root_session_id: &RootSessionId,
@@ -270,6 +307,11 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
     }
 
     fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        if workspace.branch.is_empty() {
+            // A read-only workspace owns no worktree or branch; its `path` is
+            // the parent's view and must not be removed.
+            return Ok(());
+        }
         self.service
             .remove_created(
                 &workspace.repository_root,
@@ -419,7 +461,8 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 ))
             });
         };
-        let worker_tools = Arc::new(self.worker_tool_registry(&workspace));
+        let workspace_mode = request.workspace_mode;
+        let worker_tools = Arc::new(self.worker_tool_registry(&workspace, workspace_mode));
         let config = self.config.clone();
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();
@@ -546,16 +589,20 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 assistant_report.clear();
                                                 continue 'run;
                                             }
-                                            if let Some(service) = workspace_service.as_ref() {
-                                                match service.inspect_delivery(&workspace_for_delivery) {
-                                                    Ok(delivery) => reporter.report_delivery(delivery),
-                                                    Err(error)
-                                                        if !assistant_report.trim().is_empty()
-                                                            && is_empty_delivery_error(&error) =>
-                                                    {
-                                                        reporter.report_completed(assistant_report.trim())
+                                            if workspace_mode == TaskWorkspaceMode::Coding {
+                                                if let Some(service) = workspace_service.as_ref() {
+                                                    match service.inspect_delivery(&workspace_for_delivery) {
+                                                        Ok(delivery) => reporter.report_delivery(delivery),
+                                                        Err(error)
+                                                            if !assistant_report.trim().is_empty()
+                                                                && is_empty_delivery_error(&error) =>
+                                                        {
+                                                            reporter.report_completed(assistant_report.trim())
+                                                        }
+                                                        Err(error) => reporter.report_failure(error.to_string()),
                                                     }
-                                                    Err(error) => reporter.report_failure(error.to_string()),
+                                                } else {
+                                                    reporter.report_completed(assistant_report.trim());
                                                 }
                                             } else {
                                                 reporter.report_completed(assistant_report.trim());
@@ -912,6 +959,19 @@ fn format_ipc_rejection(action: &str, response: &yi_agent_store::ipc::IpcRespons
     }
 }
 
+/// Resolves the optional `mode` argument for a daemon `spawn_agent` call via the
+/// canonical [`TaskWorkspaceMode::parse`], so the tool, the core tool, and the
+/// IPC helper agree on the accepted spellings. An omitted mode defaults to
+/// read-only; an explicit unknown or non-string value is rejected.
+fn spawn_mode(args: &Value) -> Result<TaskWorkspaceMode, ToolResult> {
+    match args.get("mode") {
+        None => Ok(TaskWorkspaceMode::ReadOnly),
+        Some(Value::String(value)) => TaskWorkspaceMode::parse(value)
+            .ok_or_else(|| ToolResult::error("mode must be 'coding' or 'read_only'")),
+        Some(_) => Err(ToolResult::error("mode must be a string")),
+    }
+}
+
 struct DaemonSpawnAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
@@ -945,7 +1005,14 @@ impl Tool for DaemonApplicationSpawnAgentTool {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task": { "type": "string", "description": "Delegated objective." } },
+            "properties": {
+                "task": { "type": "string", "description": "Delegated objective." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["coding", "read_only"],
+                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                }
+            },
             "required": ["task"],
             "additionalProperties": false
         })
@@ -958,6 +1025,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
+        let mode = match spawn_mode(&args) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
@@ -965,6 +1036,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 parent_task_id: self.caller_task_id.clone(),
                 capability: self.application_capability.clone(),
                 objective: task.to_string(),
+                mode: Some(mode.as_str().to_string()),
             },
         );
         match response {
@@ -1040,7 +1112,14 @@ impl Tool for DaemonSpawnAgentTool {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task": { "type": "string", "description": "Delegated objective." } },
+            "properties": {
+                "task": { "type": "string", "description": "Delegated objective." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["coding", "read_only"],
+                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                }
+            },
             "required": ["task"],
             "additionalProperties": false
         })
@@ -1053,12 +1132,17 @@ impl Tool for DaemonSpawnAgentTool {
         if task.trim().is_empty() {
             return ToolResult::error("task must not be empty");
         }
+        let mode = match spawn_mode(&args) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
                 session_id: self.session_id.clone(),
                 parent_task_id: self.caller_task_id.clone(),
                 objective: task.to_string(),
+                mode: Some(mode.as_str().to_string()),
             },
         );
         match response {
@@ -1115,6 +1199,38 @@ mod tests {
             format_ipc_rejection("spawn request", &response),
             "daemon rejected spawn request: invalid_state: an agent may have at most four direct children"
         );
+    }
+
+    #[test]
+    fn daemon_spawn_mode_uses_the_canonical_parser() {
+        assert_eq!(
+            spawn_mode(&json!({})).unwrap(),
+            TaskWorkspaceMode::ReadOnly,
+            "an omitted mode defaults to read-only"
+        );
+        assert_eq!(
+            spawn_mode(&json!({ "mode": "coding" })).unwrap(),
+            TaskWorkspaceMode::Coding
+        );
+        assert_eq!(
+            spawn_mode(&json!({ "mode": "read_only" })).unwrap(),
+            TaskWorkspaceMode::ReadOnly
+        );
+
+        let unknown = spawn_mode(&json!({ "mode": "bogus" })).unwrap_err();
+        assert!(unknown.is_error);
+        assert!(matches!(
+            unknown.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("mode must be 'coding' or 'read_only'")
+        ));
+
+        let non_string = spawn_mode(&json!({ "mode": 5 })).unwrap_err();
+        assert!(non_string.is_error);
+        assert!(matches!(
+            non_string.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)] if text.contains("mode must be a string")
+        ));
     }
 
     #[derive(Default)]
@@ -1293,7 +1409,7 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace);
+        let registry = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -1362,6 +1478,51 @@ mod tests {
         .tool_registry_for_workspace(child.path().to_path_buf());
         assert!(read_only.get("write").is_none());
         assert!(read_only.get("edit").is_none());
+    }
+
+    #[test]
+    fn read_only_workers_get_no_write_tools() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: directory.path().to_path_buf(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+
+        let read_only = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::ReadOnly);
+        let read_only_names: Vec<_> = read_only
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        assert!(
+            !read_only_names
+                .iter()
+                .any(|name| name == "write" || name == "edit"),
+            "read-only registry must omit write/edit, got {read_only_names:?}"
+        );
+
+        let coding = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
+        let coding_names: Vec<_> = coding
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        assert!(
+            coding_names.iter().any(|name| name == "write")
+                && coding_names.iter().any(|name| name == "edit"),
+            "coding registry must include write/edit, got {coding_names:?}"
+        );
     }
 
     #[test]
@@ -1476,6 +1637,59 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[test]
+    fn non_git_workspace_service_supports_only_read_only() {
+        let directory = tempfile::TempDir::new().unwrap();
+        if std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(directory.path())
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skip: temp dir is inside a git repository");
+            return;
+        }
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+
+        assert!(!service.supports_coding());
+
+        let workspace = service
+            .prepare_read_only(None, &TaskId::new())
+            .expect("read-only workspace is always available");
+        assert_eq!(workspace.path, directory.path());
+        assert!(workspace.branch.is_empty());
+        assert!(workspace.base_commit.is_empty());
+    }
+
+    #[test]
+    fn git_workspace_service_supports_coding() {
+        let directory = tempfile::TempDir::new().unwrap();
+        initialize_git_repository(directory.path());
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+
+        assert!(service.supports_coding());
+    }
+
+    #[test]
+    fn read_only_workspace_inherits_the_parent_path() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let parent = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: directory.path().join("parent-view"),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+
+        let workspace = service
+            .prepare_read_only(Some(&parent), &TaskId::new())
+            .unwrap();
+        assert_eq!(workspace.path, parent.path);
     }
 
     #[test]
@@ -1678,7 +1892,8 @@ mod tests {
         .with_workspace(directory.path().to_path_buf());
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Return immediately after one clean provider turn.")
-            .with_workspace(workspace.clone());
+            .with_workspace(workspace.clone())
+            .with_workspace_mode(TaskWorkspaceMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let delivery = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1763,7 +1978,8 @@ mod tests {
         };
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Report whether the sub-agent is healthy.")
-            .with_workspace(workspace);
+            .with_workspace(workspace)
+            .with_workspace_mode(TaskWorkspaceMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let report = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1786,6 +2002,59 @@ mod tests {
         })
         .await
         .expect("worker should report text completion");
+
+        assert_eq!(report, "sub-agent 正常完成，结果可读");
+    }
+
+    #[tokio::test]
+    async fn daemon_read_only_worker_reports_text_completion() {
+        let directory = TempDir::new().unwrap();
+        let base_commit = initialize_git_repository(directory.path());
+        let branch = git_output(directory.path(), &["branch", "--show-current"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(TextAnswerProvider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: directory.path().to_path_buf(),
+            branch,
+            parent_branch: "main".into(),
+            base_commit,
+        };
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Report whether the sub-agent is healthy.")
+            .with_workspace(workspace)
+            .with_workspace_mode(TaskWorkspaceMode::ReadOnly);
+        let handle = factory.start(request).await.unwrap();
+
+        let report = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(report) = handle
+                    .take_events()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        WorkerEvent::Completed { report } => Some(report),
+                        WorkerEvent::CompletedWithoutDelivery => {
+                            panic!("read-only completion should carry a report")
+                        }
+                        _ => None,
+                    })
+                {
+                    return report;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("read-only worker should report text completion");
 
         assert_eq!(report, "sub-agent 正常完成，结果可读");
     }
@@ -1852,6 +2121,7 @@ mod tests {
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
+                mode: None,
             },
         )
         .unwrap()
@@ -1898,6 +2168,7 @@ mod tests {
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
+                mode: None,
             },
         )
         .unwrap()

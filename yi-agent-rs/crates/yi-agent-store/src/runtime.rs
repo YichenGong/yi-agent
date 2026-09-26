@@ -26,12 +26,13 @@ use yi_agent_core::subagent::supervisor::{
 use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, DeliveryReport,
     IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
-    RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState, TimeoutKind,
-    WatchdogEvidence as CoreWatchdogEvidence,
+    RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState, TaskWorkspaceMode,
+    TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
+    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
+    WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent,
+    WorkerWorkspace,
 };
 
 use crate::repository::{
@@ -62,6 +63,8 @@ pub enum RuntimeCoordinatorError {
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
     Supervisor(String),
+    #[error("coding requires a git repository")]
+    CodingRequiresGitRepository,
     #[error("authority denied: {0}")]
     AuthorityDenied(String),
     #[error(transparent)]
@@ -212,6 +215,16 @@ fn new_application_root_capability() -> String {
 fn digest_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The workspace mode a per-service root should run in. A service that cannot
+/// code forces the root to run in place (`ReadOnly`); a missing service is also
+/// treated as read-only so callers never provision a worktree they cannot own.
+fn root_mode_for(service: Option<&dyn AgentWorkspaceService>) -> TaskWorkspaceMode {
+    match service {
+        Some(service) if service.supports_coding() => TaskWorkspaceMode::Coding,
+        _ => TaskWorkspaceMode::ReadOnly,
+    }
 }
 
 impl RuntimeCoordinator {
@@ -370,8 +383,9 @@ impl RuntimeCoordinator {
                         )
                     })?;
                     if supervisor.task(&ancestor.task_id).is_none() {
+                        let mode = repository.task_workspace_mode(&ancestor.task_id)?;
                         supervisor
-                            .insert_hydrated_review_child(hydrated, objective)
+                            .insert_hydrated_review_child(hydrated, objective, mode)
                             .map_err(RuntimeCoordinatorError::Supervisor)?;
                         hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                     }
@@ -394,10 +408,16 @@ impl RuntimeCoordinator {
                         task.attempt_number,
                         task.recovery_gated || task.recovery_attested,
                         task.objective,
+                        task.workspace_mode,
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
             } else {
-                let supervisor = if task.recovery_gated || task.recovery_attested {
+                // A recovered root must keep the mode persisted at spawn time:
+                // reattaching an application root early-returns before the
+                // per-root service is consulted, so a factory-global guess would
+                // wrongly promote a non-git root to `Coding`.
+                let root_mode = task.workspace_mode;
+                let mut supervisor = if task.recovery_gated || task.recovery_attested {
                     AgentSupervisor::from_recovered_gated_root(
                         task.session_id.clone(),
                         task.task_id,
@@ -414,6 +434,8 @@ impl RuntimeCoordinator {
                         task.objective,
                     )
                 };
+                let root_id = supervisor.root_task_id().clone();
+                supervisor.set_workspace_mode(&root_id, root_mode);
                 supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
             }
         }
@@ -464,8 +486,9 @@ impl RuntimeCoordinator {
                     .map_err(|_| {
                         RuntimeCoordinatorError::Supervisor("review hydration is busy".into())
                     })?;
+                let mode = repository.task_workspace_mode(&task.task_id)?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective)
+                    .insert_hydrated_review_child(hydrated, objective, mode)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
             }
@@ -601,10 +624,23 @@ impl RuntimeCoordinator {
         &self,
         objective: String,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
+        self.create_session_with_objective_and_mode(objective, TaskWorkspaceMode::Coding)
+    }
+
+    /// Creates an isolated root session with an immutable initial objective and
+    /// an explicit workspace mode. A non-git application root passes
+    /// `ReadOnly` so its root runs in place.
+    pub fn create_session_with_objective_and_mode(
+        &self,
+        objective: String,
+        workspace_mode: TaskWorkspaceMode,
+    ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
-        let supervisor = AgentSupervisor::new_with_objective(session_id.clone(), objective.clone());
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(session_id.clone(), objective.clone());
         let root_id = supervisor.root_task_id().clone();
+        supervisor.set_workspace_mode(&root_id, workspace_mode);
         let root_attempt = supervisor
             .task(&root_id)
             .expect("new root task exists")
@@ -620,6 +656,7 @@ impl RuntimeCoordinator {
                 root_attempt.number,
                 "queued",
                 &objective,
+                workspace_mode,
             )?;
         self.supervisors
             .lock()
@@ -654,6 +691,7 @@ impl RuntimeCoordinator {
                     "application root workspace service is unavailable".into(),
                 )
             })?;
+        let root_mode = root_mode_for(Some(service.as_ref()));
         let existing = {
             self.repository
                 .lock()
@@ -661,20 +699,41 @@ impl RuntimeCoordinator {
                 .application_root_attachment(idempotency_key)?
         };
         if let Some(existing) = existing {
-            let workspace = {
+            let recorded = {
                 self.repository
                     .lock()
                     .expect("runtime repository mutex poisoned")
-                    .task_workspace(&existing.root_task_id)?
+                    .task_workspace_optional(&existing.root_task_id)?
             };
-            if !self
-                .factory
-                .application_root_workspace_matches(requested_workspace, &workspace)
-            {
-                return Err(RuntimeCoordinatorError::Supervisor(
-                    "application root workspace does not match its recorded repository".into(),
-                ));
-            }
+            let workspace = match recorded {
+                Some(workspace) => {
+                    if !self
+                        .factory
+                        .application_root_workspace_matches(requested_workspace, &workspace)
+                    {
+                        return Err(RuntimeCoordinatorError::Supervisor(
+                            "application root workspace does not match its recorded repository"
+                                .into(),
+                        ));
+                    }
+                    workspace
+                }
+                // A read-only application root keeps no `task_workspaces` row: it
+                // runs in place. Reattaching it with a git repository is a
+                // mismatch; otherwise synthesize the in-place workspace from the
+                // requested project.
+                None => {
+                    if service.supports_coding() {
+                        return Err(RuntimeCoordinatorError::Supervisor(
+                            "application root workspace does not match its recorded repository"
+                                .into(),
+                        ));
+                    }
+                    service
+                        .prepare_read_only(None, &existing.root_task_id)
+                        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
+                }
+            };
             if existing.state == "detached" {
                 self.repository
                     .lock()
@@ -700,8 +759,10 @@ impl RuntimeCoordinator {
 
         let capability = new_application_root_capability();
         let capability_digest = digest_hex(&capability);
-        let session_id =
-            self.create_session_with_objective("TUI application root pending activation.".into())?;
+        let session_id = self.create_session_with_objective_and_mode(
+            "TUI application root pending activation.".into(),
+            root_mode,
+        )?;
         self.application_root_workspace_services
             .lock()
             .expect("runtime application root workspace service mutex poisoned")
@@ -715,7 +776,13 @@ impl RuntimeCoordinator {
             .active_attempt_id()
             .clone();
         let workspace = self
-            .prepare_task_workspace(&mut supervisor, &session_id, &root_task_id, &attempt)?
+            .prepare_task_workspace(
+                &mut supervisor,
+                &session_id,
+                &root_task_id,
+                &attempt,
+                root_mode,
+            )?
             .ok_or_else(|| {
                 RuntimeCoordinatorError::Supervisor(
                     "application root workspace service is unavailable".into(),
@@ -761,6 +828,10 @@ impl RuntimeCoordinator {
                 attachment.root_session_id.clone(),
             ));
         }
+        let root_mode = root_mode_for(
+            self.workspace_service_for(&attachment.root_session_id)
+                .as_deref(),
+        );
         let mut hydrated_supervisor = None;
         for task in tasks {
             let depth = persisted_depth(task.depth)?;
@@ -783,16 +854,22 @@ impl RuntimeCoordinator {
             if task.parent_id.is_none() {
                 let mut supervisor =
                     AgentSupervisor::from_hydrated_review_root(hydrated, objective);
+                supervisor.set_workspace_mode(&task_id, root_mode);
                 hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                 hydrated_supervisor = Some(supervisor);
             } else {
+                let mode = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_workspace_mode(&task_id)?;
                 let supervisor = hydrated_supervisor.as_mut().ok_or_else(|| {
                     RuntimeCoordinatorError::Supervisor(
                         "application root child has no hydrated root".into(),
                     )
                 })?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective)
+                    .insert_hydrated_review_child(hydrated, objective, mode)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(supervisor, task_id, completion_report)?;
             }
@@ -931,9 +1008,11 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         capability: &str,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective).await
+        self.spawn_child_and_admit(session, parent, objective, workspace_mode)
+            .await
     }
 
     pub fn root_task_id(&self, session: &RootSessionId) -> Result<TaskId, RuntimeCoordinatorError> {
@@ -1042,8 +1121,13 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
-        self.spawn_child_with_objective(session, parent, "Complete the delegated task.".into())
-            .await
+        self.spawn_child_with_objective(
+            session,
+            parent,
+            "Complete the delegated task.".into(),
+            TaskWorkspaceMode::ReadOnly,
+        )
+        .await
     }
 
     pub async fn spawn_child_with_objective(
@@ -1051,6 +1135,7 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1065,7 +1150,26 @@ impl RuntimeCoordinator {
         let supervisor = self.supervisor(session)?;
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
-            let child = supervisor.spawn_with_objective(parent.clone(), objective.clone())?;
+            // A read-only task owns no worktree, so it cannot integrate a coding
+            // child's delivery: reject the escalation outright. Sessions whose
+            // workspace service cannot code at all (non-git) keep their specific
+            // `CodingRequiresGitRepository` provisioning failure instead.
+            let session_supports_coding = self
+                .workspace_service_for(session)
+                .is_some_and(|service| service.supports_coding());
+            if workspace_mode == TaskWorkspaceMode::Coding
+                && session_supports_coding
+                && supervisor.workspace_mode(parent) == TaskWorkspaceMode::ReadOnly
+            {
+                return Err(RuntimeCoordinatorError::Supervisor(
+                    "read-only tasks cannot spawn coding children".into(),
+                ));
+            }
+            let child = supervisor.spawn_with_objective(
+                parent.clone(),
+                objective.clone(),
+                workspace_mode,
+            )?;
             let depth = match supervisor
                 .task(&child)
                 .expect("newly spawned task exists")
@@ -1094,6 +1198,7 @@ impl RuntimeCoordinator {
                 attempt.number,
                 "queued",
                 &objective,
+                workspace_mode,
             )?;
         Ok(child)
     }
@@ -1107,9 +1212,10 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
         objective: String,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
-            .spawn_child_with_objective(session, parent, objective)
+            .spawn_child_with_objective(session, parent, objective, workspace_mode)
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {
@@ -1159,29 +1265,41 @@ impl RuntimeCoordinator {
             .expect("worker task exists")
             .active_attempt_id()
             .clone();
-        let workspace_assignment =
-            match self.prepare_task_workspace(&mut supervisor, session, task, &attempt) {
-                Ok(workspace) => workspace,
-                Err(error) => {
-                    let evidence = serde_json::to_string(&serde_json::json!({
-                        "reason": "workspace_provision_failed",
-                        "error": error.to_string(),
-                    }))
-                    .expect("workspace failure evidence is serializable");
-                    self.repository
-                        .lock()
-                        .expect("runtime repository mutex poisoned")
-                        .transition_task_and_attempt_with_terminal(
-                            task,
-                            &attempt,
-                            "failed",
-                            RuntimeEvent::TaskFailed,
-                            &evidence,
-                        )?;
-                    let _ = supervisor.fail_task(task, error.to_string());
-                    return Err(RuntimeCoordinatorError::Supervisor(error.to_string()));
-                }
-            };
+        let workspace_mode = supervisor.workspace_mode(task);
+        let workspace_assignment = match self.prepare_task_workspace(
+            &mut supervisor,
+            session,
+            task,
+            &attempt,
+            workspace_mode,
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                let reason = match &error {
+                    RuntimeCoordinatorError::CodingRequiresGitRepository => {
+                        "coding_requires_git_repository"
+                    }
+                    _ => "workspace_provision_failed",
+                };
+                let evidence = serde_json::to_string(&serde_json::json!({
+                    "reason": reason,
+                    "error": error.to_string(),
+                }))
+                .expect("workspace failure evidence is serializable");
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .transition_task_and_attempt_with_terminal(
+                        task,
+                        &attempt,
+                        "failed",
+                        RuntimeEvent::TaskFailed,
+                        &evidence,
+                    )?;
+                let _ = supervisor.fail_task(task, error.to_string());
+                return Err(RuntimeCoordinatorError::Supervisor(error.to_string()));
+            }
+        };
         if is_subagent {
             let parent_id = supervisor
                 .task(task)
@@ -1460,12 +1578,39 @@ impl RuntimeCoordinator {
             .or_else(|| self.workspace_service.clone())
     }
 
+    /// The nearest ancestor task's workspace, if any, walking `parent_id`
+    /// upward. Used as the read-only execution root so a read-only child sees
+    /// its parent's current view rather than a clean baseline.
+    fn nearest_ancestor_workspace(
+        &self,
+        supervisor: &AgentSupervisor,
+        task: &TaskId,
+    ) -> Result<Option<WorkerWorkspace>, RuntimeCoordinatorError> {
+        let mut current = supervisor
+            .task(task)
+            .and_then(|task| task.parent_id.clone());
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        while let Some(ancestor) = current {
+            if let Some(workspace) = repository.task_workspace_optional(&ancestor)? {
+                return Ok(Some(workspace));
+            }
+            current = supervisor
+                .task(&ancestor)
+                .and_then(|task| task.parent_id.clone());
+        }
+        Ok(None)
+    }
+
     fn prepare_task_workspace(
         &self,
         supervisor: &mut AgentSupervisor,
         session: &RootSessionId,
         task: &TaskId,
         attempt: &AttemptId,
+        workspace_mode: TaskWorkspaceMode,
     ) -> Result<Option<WorkerWorkspace>, RuntimeCoordinatorError> {
         let existing = self
             .repository
@@ -1481,6 +1626,19 @@ impl RuntimeCoordinator {
         let Some(service) = self.workspace_service_for(session) else {
             return Ok(None);
         };
+        if workspace_mode == TaskWorkspaceMode::ReadOnly {
+            let parent = self.nearest_ancestor_workspace(supervisor, task)?;
+            let workspace = service
+                .prepare_read_only(parent.as_ref(), task)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+            supervisor
+                .assign_workspace(task, workspace.lease_id.clone())
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            return Ok(Some(workspace));
+        }
+        if !service.supports_coding() {
+            return Err(RuntimeCoordinatorError::CodingRequiresGitRepository);
+        }
         let task_snapshot = supervisor
             .task(task)
             .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?;
