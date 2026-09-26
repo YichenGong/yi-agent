@@ -58,6 +58,12 @@
     #[case::root("rm -rf /", true)]
     #[case::root_star("rm -rf /*", true)]
     #[case::root_dashdash("rm -rf / --", true)]
+    // 仍必须拦:被引号/命令连接符包住的根删除(既有 test_composite 要求)
+    #[case::root_quoted("echo \"rm -rf /\"", true)]
+    #[case::root_chained("git status && rm -rf /", true)]
+    // 仍必须拦:被引号/命令连接符包住的根删除(既有 test_composite 要求)
+    #[case::root_quoted("echo \"rm -rf /\"", true)]
+    #[case::root_chained("git status && rm -rf /", true)]
     // 仍必须拦:.. 爬回根
     #[case::dotdot_root("rm -rf /tmp/../", true)]
     // 不得误伤:.. 之后还有真实段
@@ -112,20 +118,21 @@ Expected: FAIL。`test_root_rule_narrowing` 的 `tmp_dir` / `tmp_file` / `projec
 替换为三条:
 
 ```rust
-            // P1: 目标即根本身。允许 / 之后出现 / . * .. 这类无实义段,并要求词边界,
-            // 因此 /tmp/foo 这类真实路径不会被误伤。
+            // P1: 目标即根本身。允许 / 之后出现 / . * .. 这类无实义段。
+            // 终止条件用"下一个字符不能再延续路径段"表达,而不是只认空白:
+            // 否则 echo "rm -rf /" 这类被引号包住的写法会漏掉(既有测试要求拦住)。
             (
                 Regex::new(
-                    r"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/([/.*]*(\.\.)?[/.*]*)*(\s|$)",
+                    r#"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/([/.*]*(\.\.)?[/.*]*)*([^A-Za-z0-9_./\\-]|$)"#,
                 )
                 .unwrap(),
                 "rm -rf /",
             ),
-            // P2: 通过 .. 爬回根,如 /tmp/../。要求 .. 之后紧跟空白或行尾,
+            // P2: 通过 .. 爬回根,如 /tmp/../。要求 .. 之后不能再延续路径段,
             // 因此 /tmp/../tmp/foo 不会被误伤。
             (
                 Regex::new(
-                    r"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?(/[^/\s]+)+/(\.\.)((/\.\.)*)(/)?(\s|$)",
+                    r#"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?(/[^/\s]+)+/(\.\.)((/\.\.)*)(/)?([^A-Za-z0-9_./\\-]|$)"#,
                 )
                 .unwrap(),
                 "rm -rf / (path resolves to root)",
@@ -133,7 +140,7 @@ Expected: FAIL。`test_root_rule_narrowing` 的 `tmp_dir` / `tmp_file` / `projec
             // P3: 顶层系统目录内容。旧规则曾"顺带"拦住这些目标,收紧后必须显式保留。
             (
                 Regex::new(
-                    r"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/(etc|usr|var|bin|sbin|lib|boot|dev|proc|sys|System|Library)(/[^\s]*)?(\s|$)",
+                    r#"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/(etc|usr|var|bin|sbin|lib|boot|dev|proc|sys|System|Library)(/[^\s]*)?([^A-Za-z0-9_./\\-]|$)"#,
                 )
                 .unwrap(),
                 "rm -rf system directory",

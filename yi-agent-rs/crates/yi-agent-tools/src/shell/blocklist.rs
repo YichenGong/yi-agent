@@ -6,11 +6,32 @@ pub fn is_blocked(cmd: &str) -> Option<&'static str> {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         vec![
-            // rm -rf / — covers -rf, -fr, -Rf, -fR, -r -f, -f -r, with optional --no-preserve-root
+            // P1: 目标即根本身。允许 / 之后出现 / . * .. 这类无实义段。
+            // 终止条件用"下一个字符不能再延续路径段"表达,而不是只认空白:
+            // 否则 echo "rm -rf /" 这类被引号包住的写法会漏掉(既有测试要求拦住)。
             (
-                Regex::new(r"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/")
-                    .unwrap(),
+                Regex::new(
+                    r#"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/([/.*]*(\.\.)?[/.*]*)*([^A-Za-z0-9_./\\-]|$)"#,
+                )
+                .unwrap(),
                 "rm -rf /",
+            ),
+            // P2: 通过 .. 爬回根,如 /tmp/../。要求 .. 之后不能再延续路径段,
+            // 因此 /tmp/../tmp/foo 不会被误伤。
+            (
+                Regex::new(
+                    r#"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?(/[^/\s]+)+/(\.\.)((/\.\.)*)(/)?([^A-Za-z0-9_./\\-]|$)"#,
+                )
+                .unwrap(),
+                "rm -rf / (path resolves to root)",
+            ),
+            // P3: 顶层系统目录内容。旧规则曾"顺带"拦住这些目标,收紧后必须显式保留。
+            (
+                Regex::new(
+                    r#"rm\s+(-[rfRF]+\s+|-r\s+-f\s+|-f\s+-r\s+)(--no-preserve-root\s+)?/(etc|usr|var|bin|sbin|lib|boot|dev|proc|sys|System|Library)(/[^\s]*)?([^A-Za-z0-9_./\\-]|$)"#,
+                )
+                .unwrap(),
+                "rm -rf system directory",
             ),
             // rm -rf ~ and $HOME (all flag orderings)
             (
@@ -295,5 +316,49 @@ mod tests {
     #[case::dotdot("rm -rf /tmp/../", true)]
     fn test_bypass_attempts(#[case] cmd: &str, #[case] blocked: bool) {
         assert_eq!(is_blocked(cmd).is_some(), blocked, "cmd: {cmd}");
+    }
+
+    // ==== 根删除规则收紧:误伤修复 ====
+    #[rstest]
+    // 普通绝对路径不得误伤(本 bug 主体)
+    #[case::tmp_dir("rm -rf /tmp/verify-perm", false)]
+    #[case::tmp_file("rm -f /tmp/verify-perm-dir.txt", false)]
+    #[case::project_abs("rm -rf /Users/x/proj/target", false)]
+    #[case::tmp_star("rm -rf /tmp/*", false)]
+    #[case::tmp_chain("rm -rf /tmp/a && mkdir -p /tmp/a", false)]
+    // 仍必须拦:根本身
+    #[case::root("rm -rf /", true)]
+    #[case::root_star("rm -rf /*", true)]
+    #[case::root_dashdash("rm -rf / --", true)]
+    // 仍必须拦:.. 爬回根
+    #[case::dotdot_root("rm -rf /tmp/../", true)]
+    // 不得误伤:.. 之后还有真实段
+    #[case::dotdot_forward("rm -rf /tmp/../tmp/foo", false)]
+    #[case::dotdot_mid("rm -rf /tmp/x/../y", false)]
+    // 仍必须拦:顶层系统目录
+    #[case::etc_star("rm -rf /etc/*", true)]
+    #[case::usr_star("rm -rf /usr/*", true)]
+    #[case::var_log("rm -rf /var/log", true)]
+    #[case::system_library("rm -rf /System/Library", true)]
+    // 不得误伤:形近名(大小写敏感、前缀安全)
+    #[case::lookalike_users("rm -rf /users", false)]
+    #[case::lookalike_usr2("rm -rf /usr2", false)]
+    #[case::lookalike_lib64("rm -rf /lib64", false)]
+    #[case::nested_usr("rm -rf /home/me/usr", false)]
+    fn test_root_rule_narrowing(#[case] cmd: &str, #[case] blocked: bool) {
+        assert_eq!(is_blocked(cmd).is_some(), blocked, "cmd: {cmd}");
+    }
+
+    #[test]
+    fn root_rule_reasons_are_distinct() {
+        assert_eq!(is_blocked("rm -rf /"), Some("rm -rf /"));
+        assert_eq!(
+            is_blocked("rm -rf /tmp/../"),
+            Some("rm -rf / (path resolves to root)")
+        );
+        assert_eq!(
+            is_blocked("rm -rf /etc/passwd"),
+            Some("rm -rf system directory")
+        );
     }
 }
