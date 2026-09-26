@@ -565,3 +565,182 @@ fn contains_commit_reports_whether_a_revision_is_an_ancestor_of_head() {
     );
     assert!(service.contains_commit(&root.path, &child_head).unwrap());
 }
+
+#[test]
+fn reclaim_directory_removes_only_the_directory_and_keeps_the_branch() {
+    let (repo, _base) = repository();
+    let service = WorktreeService::new();
+    let root_path = repo.path().join(".worktrees/yi-reclaim-root");
+    let child_path = repo.path().join(".worktrees/yi-reclaim-child");
+    let root = service
+        .create_root(repo.path(), "feat/yi-reclaim-root", &root_path)
+        .unwrap();
+    let child = service
+        .create_child(
+            &root.path,
+            &root.base_commit,
+            "feat/yi-reclaim-child",
+            &child_path,
+        )
+        .unwrap();
+    std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
+    git(&child.path, &["add", "delivery.txt"]);
+    git(&child.path, &["commit", "-m", "child delivery"]);
+    let delivered = git(&child.path, &["rev-parse", "HEAD"]);
+
+    service.reclaim_directory(repo.path(), &child.path).unwrap();
+
+    assert!(!child.path.exists(), "directory is gone");
+    assert_eq!(
+        git(repo.path(), &["rev-parse", "feat/yi-reclaim-child"]),
+        delivered,
+        "branch ref still pins the delivered commit"
+    );
+    assert_eq!(
+        git(repo.path(), &["show", "feat/yi-reclaim-child:delivery.txt"]),
+        "ready",
+        "committed content is still recoverable"
+    );
+}
+
+#[test]
+fn reclaim_directory_refuses_a_dirty_worktree() {
+    let (repo, _base) = repository();
+    let service = WorktreeService::new();
+    let root_path = repo.path().join(".worktrees/yi-dirty-root");
+    let child_path = repo.path().join(".worktrees/yi-dirty-child");
+    let root = service
+        .create_root(repo.path(), "feat/yi-dirty-root", &root_path)
+        .unwrap();
+    let child = service
+        .create_child(
+            &root.path,
+            &root.base_commit,
+            "feat/yi-dirty-child",
+            &child_path,
+        )
+        .unwrap();
+    std::fs::write(child.path.join("scratch.txt"), "uncommitted\n").unwrap();
+
+    let error = service
+        .reclaim_directory(repo.path(), &child.path)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorktreeError::DirtyChild { .. }),
+        "unexpected error: {error}"
+    );
+    assert!(child.path.exists(), "dirty worktree is left in place");
+}
+
+#[test]
+fn reattach_worktree_attaches_an_existing_branch() {
+    let (repo, _base) = repository();
+    let service = WorktreeService::new();
+    let root_path = repo.path().join(".worktrees/yi-reattach-root");
+    let child_path = repo.path().join(".worktrees/yi-reattach-child");
+    let root = service
+        .create_root(repo.path(), "feat/yi-reattach-root", &root_path)
+        .unwrap();
+    let child = service
+        .create_child(
+            &root.path,
+            &root.base_commit,
+            "feat/yi-reattach-child",
+            &child_path,
+        )
+        .unwrap();
+    std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
+    git(&child.path, &["add", "delivery.txt"]);
+    git(&child.path, &["commit", "-m", "child delivery"]);
+    let delivered = git(&child.path, &["rev-parse", "HEAD"]);
+
+    service.reclaim_directory(repo.path(), &child.path).unwrap();
+    assert!(!child.path.exists());
+
+    service
+        .reattach_worktree(repo.path(), &child.path, &child.branch)
+        .unwrap();
+
+    assert!(child.path.exists(), "worktree is restored");
+    assert_eq!(
+        git(&child.path, &["rev-parse", "HEAD"]),
+        delivered,
+        "restored tip equals the pre-reclaim tip"
+    );
+    assert_eq!(
+        git(&child.path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        child.branch
+    );
+    assert_eq!(
+        std::fs::read_to_string(child.path.join("delivery.txt")).unwrap(),
+        "ready\n"
+    );
+}
+
+#[test]
+fn reattach_worktree_fails_when_the_branch_is_absent() {
+    let (repo, _base) = repository();
+    let service = WorktreeService::new();
+    let root_path = repo.path().join(".worktrees/yi-nobranch-root");
+    let root = service
+        .create_root(repo.path(), "feat/yi-nobranch-root", &root_path)
+        .unwrap();
+    let missing = repo.path().join(".worktrees/yi-nobranch-child");
+
+    let error = service
+        .reattach_worktree(repo.path(), &missing, "feat/does-not-exist")
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorktreeError::Git { .. }),
+        "unexpected error: {error}"
+    );
+    assert!(!missing.exists());
+    let _ = root;
+}
+
+#[test]
+fn is_ancestor_distinguishes_merged_from_unmerged_branches() {
+    let (repo, base) = repository();
+    let service = WorktreeService::new();
+    let root_path = repo.path().join(".worktrees/yi-ancestor-root");
+    let child_path = repo.path().join(".worktrees/yi-ancestor-child");
+    let root = service
+        .create_root(repo.path(), "feat/yi-ancestor-root", &root_path)
+        .unwrap();
+    let child = service
+        .create_child(
+            &root.path,
+            &root.base_commit,
+            "feat/yi-ancestor-child",
+            &child_path,
+        )
+        .unwrap();
+    std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
+    git(&child.path, &["add", "delivery.txt"]);
+    git(&child.path, &["commit", "-m", "child delivery"]);
+
+    assert!(
+        !service
+            .is_ancestor(&root.path, &child.branch, &root.branch)
+            .unwrap(),
+        "an unmerged child branch is not an ancestor"
+    );
+
+    git(
+        &root.path,
+        &["merge", "--no-ff", &child.branch, "-m", "integrate"],
+    );
+    assert!(
+        service
+            .is_ancestor(&root.path, &child.branch, &root.branch)
+            .unwrap(),
+        "a merged child branch is an ancestor"
+    );
+
+    assert!(
+        service.is_ancestor(&root.path, &base, "HEAD").unwrap(),
+        "the base commit is always an ancestor of HEAD"
+    );
+}

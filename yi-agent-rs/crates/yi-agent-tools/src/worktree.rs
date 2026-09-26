@@ -292,6 +292,101 @@ impl WorktreeService {
         Ok(())
     }
 
+    /// Remove only the worktree directory, leaving its branch ref intact.
+    ///
+    /// This is the safe automatic reclaim: the branch still pins every commit,
+    /// so no work is lost and the worktree can be rebuilt later with
+    /// [`Self::reattach_worktree`]. Git itself refuses a worktree that has
+    /// modified or untracked files, which is the "clean" gate.
+    ///
+    /// `repository_root` is used as the working directory rather than the
+    /// owner worktree, because the owner may itself have been reclaimed.
+    pub fn reclaim_directory(
+        &self,
+        repository_root: &Path,
+        path: &Path,
+    ) -> Result<(), WorktreeError> {
+        let status = git(path, &["status", "--porcelain"])?;
+        if !status.trim().is_empty() {
+            return Err(WorktreeError::DirtyChild {
+                path: path.to_path_buf(),
+            });
+        }
+        let output = Command::new("git")
+            .args(["worktree", "remove"])
+            .arg(path)
+            .current_dir(repository_root)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rebuild a reclaimed worktree from its surviving branch.
+    ///
+    /// `git worktree add -b` cannot be used here: the branch already exists, so
+    /// `-b` fails with "a branch named '<branch>' already exists". Attaching the
+    /// existing branch is the only correct form.
+    pub fn reattach_worktree(
+        &self,
+        repository_root: &Path,
+        path: &Path,
+        branch: &str,
+    ) -> Result<(), WorktreeError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        }
+        let output = Command::new("git")
+            .args(["worktree", "add"])
+            .arg(path)
+            .arg(branch)
+            .current_dir(repository_root)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `ancestor` is contained in `descendant`'s history.
+    ///
+    /// Exit code 0 means ancestor, 1 means not an ancestor, anything else is a
+    /// real git error (for example an unknown revision).
+    pub fn is_ancestor(
+        &self,
+        worktree: &Path,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, WorktreeError> {
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .current_dir(worktree)
+            .output()
+            .map_err(|error| WorktreeError::Git {
+                message: error.to_string(),
+            })?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(WorktreeError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            }),
+        }
+    }
+
     /// Whether `rev` is already contained in the worktree's current HEAD.
     ///
     /// Exit code 0 means ancestor, 1 means not an ancestor, anything else is a
