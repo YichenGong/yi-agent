@@ -50,6 +50,12 @@ pub enum ToolsError {
 
     #[error("BOCHA_API_KEY not set")]
     MissingApiKey,
+
+    #[error("image too large: {size} bytes (max {max})")]
+    ImageTooLarge { size: u64, max: u64 },
+
+    #[error("image decode failed: {0}")]
+    ImageDecode(String),
 }
 
 impl From<ToolsError> for ToolResult {
