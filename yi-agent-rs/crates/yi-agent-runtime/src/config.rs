@@ -101,7 +101,7 @@ pub fn resolve_env_path(overrides: &ConfigOverrides) -> std::path::PathBuf {
 ///
 /// 加载顺序:先 local 后 global。dotenvy 默认不覆盖已存在的环境变量,
 /// 因此真实环境变量 > local > global。
-pub fn load_env_files(local_path: &Path, global_path: Option<&Path>) {
+pub(crate) fn load_env_files(local_path: &Path, global_path: Option<&Path>) {
     load_one_env(local_path);
     if let Some(global) = global_path {
         load_one_env(global);
@@ -442,28 +442,33 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
-    impl RuntimeConfig {
-        /// 便捷构造:供 `redacted_view()` 等后续任务使用(当前任务暂无调用点)。
-        #[allow(dead_code)]
-        pub(crate) fn test_default() -> Self {
-            Self {
-                provider: "anthropic".into(),
-                api_url: "https://api.anthropic.com".into(),
-                api_key: "test-key".into(),
-                model: "claude-sonnet-4-20250514".into(),
-                max_turns: 20,
-                workdir: PathBuf::from("."),
-                system_prompt: None,
-                compact_threshold: 160_000,
-                compact_user_budget_tokens: 20_000,
-                compact_tool_budget_tokens: 12_000,
-                yolo: false,
-                sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
-                sandbox_writable_roots: Vec::new(),
-                skills_catalog_budget: 8192,
-                skills_catalog_budget_explicit: false,
-            }
+    #[test]
+    fn parse_sandbox_mode_covers_all_variants() {
+        use clap::ValueEnum;
+        for variant in yi_agent_tools::SandboxMode::value_variants() {
+            let name = variant.to_possible_value().expect("has possible value");
+            let name = name.get_name();
+            assert_eq!(
+                parse_sandbox_mode(name),
+                Some(*variant),
+                "variant `{name}` must be parseable"
+            );
+            // 大小写不敏感
+            assert_eq!(
+                parse_sandbox_mode(&name.to_ascii_uppercase()),
+                Some(*variant)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_sandbox_mode_rejects_invalid_input() {
+        for value in ["", " ", "  \t", "bogus", "read_only", "workspace_write"] {
+            assert_eq!(
+                parse_sandbox_mode(value),
+                None,
+                "`{value}` must be rejected"
+            );
         }
     }
 
