@@ -32,6 +32,7 @@ export default function App() {
   const [, force] = useState(0);
   const clientRef = useRef<RpcClient | null>(null);
   const inited = useRef(false);
+  const resuming = useRef(false);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [threadInfo, setThreadInfo] = useState<ThreadInfo | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
@@ -53,7 +54,8 @@ export default function App() {
 
   const resumeThread = async (threadId: string) => {
     const c = clientRef.current;
-    if (!c || session.turnActive) return;
+    if (!c || session.turnActive || resuming.current) return;
+    resuming.current = true;
     // 必须同步 reset:回放通知可能先于 resume 响应到达。
     session.reset();
     force((v) => v + 1);
@@ -68,13 +70,18 @@ export default function App() {
       setThreadId(null);
       setThreadInfo(null);
       force((v) => v + 1);
+    } finally {
+      // 回放通知先于响应到达,故响应返回即代表本轮回放已全部应用;
+      // 此时才允许下一次 resume,避免两个 thread 的历史交错合并。
+      resuming.current = false;
     }
     await refreshThreads();
   };
 
   const newThread = async () => {
     const c = clientRef.current;
-    if (!c || session.turnActive) return;
+    if (!c || session.turnActive || resuming.current) return;
+    resuming.current = true;
     session.reset();
     force((v) => v + 1);
     try {
@@ -84,6 +91,8 @@ export default function App() {
     } catch (e) {
       session.lastError = formatError(e);
       force((v) => v + 1);
+    } finally {
+      resuming.current = false;
     }
     await refreshThreads();
   };
