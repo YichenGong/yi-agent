@@ -31,6 +31,8 @@
 - [x] `redacted_view()`（api_key 脱敏，供 GUI `config/read`）— `src/config.rs:326`
 - [x] `build_provider()`（anthropic / openai）— `src/bootstrap.rs:11`
 - [x] `build_tool_setup()` / `build_tools()` / `build_system_prompt()`（内置工具 + 进程工具 + skills + 当前日期；`naked` 返回空 registry + `None` prompt）— `src/bootstrap.rs:68`
-- [x] `bootstrap_agent()` + `PermissionMode` + 权限决定通道（`Interactive` 保留双向通道，`AutoAllow` 关闭通道使黑名单命令解析为 Deny）— `src/bootstrap.rs:139`
+- [x] `bootstrap_agent()` + `PermissionMode` + 权限决定通道（`Interactive` 保留双向通道，`AutoAllow` 关闭通道使黑名单命令解析为 Deny）— `src/bootstrap.rs:182`
+- [x] 装配辅助 API：`build_prompt_setup()`（skills + system prompt）、`build_tool_setup_in()`（指定 workspace 根）、`build_agent_config()`、公开 `load_permission_checker()` — `src/bootstrap.rs:41` / `src/bootstrap.rs:97` / `src/bootstrap.rs:166` / `src/bootstrap.rs:231`
+- [x] CLI 装配迁移到本 crate — `crates/yi-agent/src/main.rs` 的 provider（4 处：`control_schedule` / daemon worker / TUI / headless）、skills + system prompt、工具集、AgentConfig 装配全部委托本 crate，消除重复 — 验证：`cargo test -p yi-agent --bin yi-agent`（350 个测试）
 
-**验证命令：** `cargo test -p yi-agent-runtime`（40 个测试）
+**验证命令：** `cargo test -p yi-agent-runtime`（49 个测试）

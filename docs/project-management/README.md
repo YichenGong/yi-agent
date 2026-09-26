@@ -21,7 +21,7 @@
 | tooling | 3 / 3 | [详情](./tooling.md) |
 | yi-agent-mcp | 0 / 1 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 0 / 1 | [详情](./yi-agent-store.md) |
-| yi-agent-runtime | 7 / 7 | [详情](./yi-agent-runtime.md) |
+| yi-agent-runtime | 9 / 9 | [详情](./yi-agent-runtime.md) |
 | subagent-runtime | 11 / 18 | [详情](./subagent-runtime.md) |
 
 ## 已知问题
