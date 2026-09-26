@@ -1448,6 +1448,18 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    fn workspace_service_for(
+        &self,
+        session: &RootSessionId,
+    ) -> Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>> {
+        self.application_root_workspace_services
+            .lock()
+            .expect("runtime application root workspace service mutex poisoned")
+            .get(session)
+            .cloned()
+            .or_else(|| self.workspace_service.clone())
+    }
+
     fn prepare_task_workspace(
         &self,
         supervisor: &mut AgentSupervisor,
@@ -1466,14 +1478,7 @@ impl RuntimeCoordinator {
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             return Ok(Some(existing));
         }
-        let service = self
-            .application_root_workspace_services
-            .lock()
-            .expect("runtime application root workspace service mutex poisoned")
-            .get(session)
-            .cloned()
-            .or_else(|| self.workspace_service.clone());
-        let Some(service) = service else {
+        let Some(service) = self.workspace_service_for(session) else {
             return Ok(None);
         };
         let task_snapshot = supervisor
@@ -1901,7 +1906,64 @@ impl RuntimeCoordinator {
             .map_err(review_persistence_error)?;
         drop(supervisor);
         self.release_resident_lease(task);
+        self.recycle_accepted_delivery(&session, &parent, task)
+            .await;
         Ok(())
+    }
+
+    /// Best-effort recycling after an accepted review is durable. Never fails
+    /// the accept: a recycle failure leaves the worktree in place for later
+    /// handling and records an event. Git runs as a subprocess, so this is
+    /// deliberately called after every lock is released.
+    async fn recycle_accepted_delivery(
+        &self,
+        session: &RootSessionId,
+        owner: &TaskId,
+        child: &TaskId,
+    ) {
+        let Some(service) = self.workspace_service_for(session) else {
+            return;
+        };
+        let (owner_workspace, child_workspace) = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            (
+                repository.task_workspace_optional(owner).ok().flatten(),
+                repository.task_workspace_optional(child).ok().flatten(),
+            )
+        };
+        let (Some(owner_workspace), Some(child_workspace)) = (owner_workspace, child_workspace)
+        else {
+            return;
+        };
+        match service.cleanup_accepted(&owner_workspace, &child_workspace) {
+            Ok(()) => {
+                let deleted = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .delete_task_workspace(child);
+                if deleted.is_ok() {
+                    self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycled);
+                } else {
+                    self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+                }
+            }
+            Err(error) => {
+                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
+                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
+            }
+        }
+    }
+
+    fn record_recycle_event(&self, task: &TaskId, event: RuntimeEvent) {
+        let _ = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .append_event(task, event);
     }
 
     /// Captures the current review target and issues a short-lived confirmation

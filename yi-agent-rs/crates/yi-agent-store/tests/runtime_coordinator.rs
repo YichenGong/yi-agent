@@ -164,11 +164,17 @@ impl AgentWorkspaceService for StaticWorkspaceService {
 
 struct GitWorkspaceService {
     repository_root: std::path::PathBuf,
+    accepted: Arc<Mutex<Vec<(WorkerWorkspace, WorkerWorkspace)>>>,
+    cleanup_error: Option<&'static str>,
 }
 
 impl GitWorkspaceService {
     fn new(repository_root: std::path::PathBuf) -> Self {
-        Self { repository_root }
+        Self {
+            repository_root,
+            accepted: Arc::new(Mutex::new(Vec::new())),
+            cleanup_error: None,
+        }
     }
 }
 
@@ -290,6 +296,21 @@ impl AgentWorkspaceService for GitWorkspaceService {
             .args(["branch", "-D", &workspace.branch])
             .current_dir(&workspace.repository_root)
             .status();
+        Ok(())
+    }
+
+    fn cleanup_accepted(
+        &self,
+        owner: &WorkerWorkspace,
+        child: &WorkerWorkspace,
+    ) -> Result<(), WorkerError> {
+        self.accepted
+            .lock()
+            .unwrap()
+            .push((owner.clone(), child.clone()));
+        if let Some(error) = self.cleanup_error {
+            return Err(WorkerError::Startup(error.into()));
+        }
         Ok(())
     }
 }
@@ -1017,6 +1038,109 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
     assert_eq!(review_actor["initiated_by"]["kind"], "parent_integration");
     let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
     assert_eq!(parent_mailbox.len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_review_recycles_the_child_workspace() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService {
+            repository_root: repository_root.clone(),
+            accepted: Arc::clone(&accepted),
+            cleanup_error: None,
+        })),
+        ..Default::default()
+    });
+    let (coordinator, _session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    coordinator
+        .accept_review(&child, IntegrationValidation::passed("integrated"))
+        .await
+        .unwrap();
+
+    let recorded = accepted.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "cleanup_accepted runs once for the accepted child"
+    );
+    assert_eq!(recorded[0].0.branch, format!("feat/root-{parent}"));
+    assert_eq!(recorded[0].1.branch, format!("feat/child-{child}"));
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&child).unwrap(), "completed");
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_none(),
+        "the child's workspace row is deleted after recycling"
+    );
+    assert!(
+        repository
+            .task_workspace_optional(&parent)
+            .unwrap()
+            .is_some(),
+        "the parent's workspace row survives recycling"
+    );
+    assert!(
+        repository
+            .event_records_for_task_after(&child, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycled),
+        "a recycle-success event is recorded"
+    );
+}
+
+#[tokio::test]
+async fn recycle_failure_does_not_fail_the_accept() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService {
+            repository_root: repository_root.clone(),
+            accepted: Arc::clone(&accepted),
+            cleanup_error: Some("injected recycle failure"),
+        })),
+        ..Default::default()
+    });
+    let (coordinator, _session, _parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    coordinator
+        .accept_review(&child, IntegrationValidation::passed("integrated"))
+        .await
+        .expect("a recycle failure must not fail the accept");
+
+    assert_eq!(accepted.lock().unwrap().len(), 1);
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&child).unwrap(), "completed");
+    assert!(
+        repository
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_some(),
+        "a failed recycle leaves the child's workspace row for later handling"
+    );
+    assert!(
+        repository
+            .event_records_for_task_after(&child, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycleFailed),
+        "a recycle-failure event is recorded"
+    );
 }
 
 #[tokio::test]
