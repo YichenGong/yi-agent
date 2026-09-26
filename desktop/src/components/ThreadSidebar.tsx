@@ -104,7 +104,7 @@ export function ThreadSidebar({
                     }}
                     title="Delete"
                     aria-label="Delete thread"
-                    className="shrink-0 rounded px-1 text-neutral-500 opacity-0 group-hover:opacity-100 hover:text-red-400 focus-visible:opacity-100 disabled:opacity-50"
+                    className="pointer-events-none shrink-0 rounded px-1 text-neutral-500 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-red-400 focus-visible:pointer-events-auto focus-visible:opacity-100 disabled:opacity-50"
                   >
                     ×
                   </button>
