@@ -55,6 +55,10 @@ pub enum StopReason {
     EndTurn,
     MaxTokens,
     StopSequence,
+    /// No provider event arrived within the configured idle timeout. This is
+    /// synthesized by `accumulate_stream`, never reported by a provider, and is
+    /// the only stop reason the agent loop retries.
+    Stalled,
     Other(String),
 }
 
@@ -88,9 +92,9 @@ pub enum ProviderError {
 ///
 /// If `idle_timeout` is set and no event arrives within that duration, the
 /// stream is considered stalled: the loop breaks and whatever was accumulated
-/// so far is returned with `StopReason::Other("idle timeout")`. This prevents
-/// the agent from hanging forever when the provider connection goes silent
-/// without a proper terminal event.
+/// so far is returned with `StopReason::Stalled`. This prevents the agent from
+/// hanging forever when the provider connection goes silent without a proper
+/// terminal event.
 pub async fn accumulate_stream<F>(
     mut stream: BoxStream<'static, ProviderEvent>,
     mut on_event: F,
@@ -179,7 +183,7 @@ where
             "accumulate_stream: returning due to idle stall"
         );
         // Synthesize a stop reason so callers see a terminal signal.
-        stop_reason = StopReason::Other("idle timeout".to_string());
+        stop_reason = StopReason::Stalled;
     } else if !received_stop {
         stop_reason = StopReason::Other("stream ended without stop".to_string());
         tracing::warn!(
@@ -374,6 +378,23 @@ mod tests {
             stop_reason,
             StopReason::Other("stream ended without stop".into())
         );
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_idle_stall_reports_stalled() {
+        // One delta, then the stream never yields again.
+        let stream = futures::stream::iter(vec![text_event("partial")])
+            .chain(futures::stream::pending())
+            .boxed();
+
+        let (content, stop_reason, _) =
+            accumulate_stream(stream, |_| {}, Some(std::time::Duration::from_millis(50)))
+                .await
+                .unwrap();
+
+        // Partial content is still returned so the caller can decide its fate.
+        assert_eq!(content, vec![ContentBlock::Text("partial".into())]);
+        assert_eq!(stop_reason, StopReason::Stalled);
     }
 
     #[tokio::test]

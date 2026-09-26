@@ -585,6 +585,17 @@ async fn run_loop(
             .push(Message::assistant(content.clone()));
 
         match stop_reason {
+            StopReason::Stalled => {
+                tracing::warn!(turn, "think phase stalled (idle timeout)");
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::Interrupted {
+                            reason: "idle timeout".into(),
+                        },
+                    })
+                    .await;
+                return;
+            }
             StopReason::EndTurn => {}
             StopReason::MaxTokens => {
                 messages.push(Message::user(CONTINUE_AFTER_TRUNCATION));
