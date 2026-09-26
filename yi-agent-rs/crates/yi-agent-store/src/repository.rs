@@ -97,6 +97,8 @@ pub enum RuntimeEvent {
     ReviewAccepted,
     ReviewRework,
     ReviewRejected,
+    TaskWorkspaceRecycled,
+    TaskWorkspaceRecycleFailed,
 }
 
 impl RuntimeEvent {
@@ -127,6 +129,8 @@ impl RuntimeEvent {
             Self::ReviewAccepted => "review_accepted",
             Self::ReviewRework => "review_rework",
             Self::ReviewRejected => "review_rejected",
+            Self::TaskWorkspaceRecycled => "task_workspace_recycled",
+            Self::TaskWorkspaceRecycleFailed => "task_workspace_recycle_failed",
         }
     }
 
@@ -157,6 +161,8 @@ impl RuntimeEvent {
             "review_accepted" => Ok(Self::ReviewAccepted),
             "review_rework" => Ok(Self::ReviewRework),
             "review_rejected" => Ok(Self::ReviewRejected),
+            "task_workspace_recycled" => Ok(Self::TaskWorkspaceRecycled),
+            "task_workspace_recycle_failed" => Ok(Self::TaskWorkspaceRecycleFailed),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -4518,4 +4524,22 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_event_tests {
+    use super::*;
+
+    #[test]
+    fn recycle_events_round_trip_through_name_and_parse() {
+        for event in [
+            RuntimeEvent::TaskWorkspaceRecycled,
+            RuntimeEvent::TaskWorkspaceRecycleFailed,
+        ] {
+            assert_eq!(
+                RuntimeEvent::parse(event.name().to_string()).unwrap(),
+                event
+            );
+        }
+    }
 }
