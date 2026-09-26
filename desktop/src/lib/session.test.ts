@@ -116,4 +116,29 @@ describe("Session", () => {
     s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
     expect(s.lastError).toBeNull();
   });
+
+  it("records a retry notice and clears it when text resumes", () => {
+    const s = new Session();
+    s.apply({
+      method: "turn/retry",
+      params: { thread_id: "t", turn_id: "u1", attempt: 1, max: 3 },
+    });
+    expect(s.retrying).toEqual({ attempt: 1, max: 3 });
+
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "hi" } });
+    expect(s.retrying).toBeNull();
+  });
+
+  it("clears a retry notice when the turn completes", () => {
+    const s = new Session();
+    s.apply({
+      method: "turn/retry",
+      params: { thread_id: "t", turn_id: "u1", attempt: 2, max: 3 },
+    });
+    s.apply({
+      method: "turn/completed",
+      params: { thread_id: "t", turn_id: "u1", status: "completed" },
+    });
+    expect(s.retrying).toBeNull();
+  });
 });

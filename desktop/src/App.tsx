@@ -101,7 +101,11 @@ export default function App() {
           status={status}
           usage={session.usage}
         />
-        <ChatView items={session.items} error={session.lastError} />
+        <ChatView
+          items={session.items}
+          error={session.lastError}
+          retrying={session.retrying}
+        />
         <MessageInput turnActive={session.turnActive} onSend={send} onInterrupt={interrupt} />
       </div>
       {approval && (

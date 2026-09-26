@@ -49,6 +49,10 @@ export type Notification =
       params: { thread_id: string; turn_id: string; status: TurnStatus; error?: string };
     }
   | {
+      method: "turn/retry";
+      params: { thread_id: string; turn_id: string; attempt: number; max: number };
+    }
+  | {
       method: "thread/tokenUsage/updated";
       params: { thread_id: string; model: string; input_tokens: number; output_tokens: number };
     }

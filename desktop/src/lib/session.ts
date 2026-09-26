@@ -17,6 +17,7 @@ export class Session {
   lastStatus: TurnStatus | null = null;
   lastError: string | null = null;
   usage: { model: string; input: number; output: number } | null = null;
+  retrying: { attempt: number; max: number } | null = null;
 
   addUserMessage(text: string): void {
     this.items.push({ type: "userMessage", id: nextLocalId(), text });
@@ -33,6 +34,8 @@ export class Session {
         break;
       }
       case "item/delta": {
+        // Text resumed: the retry succeeded, so the notice has served its purpose.
+        this.retrying = null;
         const { item_id, delta } = notification.params;
         const index = this.items.findIndex((i) => i.id === item_id);
         if (index < 0) {
@@ -51,8 +54,12 @@ export class Session {
         break;
       case "turn/completed":
         this.turnActive = false;
+        this.retrying = null;
         this.lastStatus = notification.params.status;
         this.lastError = notification.params.error ?? null;
+        break;
+      case "turn/retry":
+        this.retrying = { attempt: notification.params.attempt, max: notification.params.max };
         break;
       case "thread/tokenUsage/updated":
         this.usage = {
