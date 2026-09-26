@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use yi_agent_core::{Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason};
+use yi_agent_core::{Provider, ProviderError, ProviderEvent, ProviderRequest};
 
 use crate::anthropic::error::map_status_error;
 use crate::anthropic::stream::AnthropicStream;
@@ -139,24 +139,30 @@ impl Provider for AnthropicProvider {
         let byte_stream = resp.bytes_stream();
         let event_stream = AnthropicStream::new(byte_stream);
         // Map Result<ProviderEvent, ProviderError> → ProviderEvent.
-        // Mid-stream errors become a terminal Stop event with the error message.
+        // A mid-stream error keeps its classification as a terminal
+        // `StreamError`, so the agent loop can tell a retryable timeout from a
+        // non-retryable break without parsing text.
         //
         // `scan` carries a `Some(())` token that is consumed when the first
-        // `Stop` event is seen; once consumed (state becomes `None`), the
+        // terminal event is seen; once consumed (state becomes `None`), the
         // stream yields `None` forever. This guarantees the stream terminates
-        // after the first Stop — whether from `message_delta` or from a
-        // converted mid-stream error — preventing spurious events from
+        // after the first terminal event — whether from `message_delta` or from
+        // a converted mid-stream error — preventing spurious events from
         // arriving after an error or natural termination.
         let mapped = event_stream
             .map(|item| match item {
                 Ok(event) => event,
-                Err(e) => ProviderEvent::Stop {
-                    reason: StopReason::Other(format!("stream error: {e}")),
-                },
+                Err(e) => ProviderEvent::StreamError(e),
             })
             .scan(Some(()), |state, event| {
                 let yield_event = state.is_some();
-                if matches!(event, ProviderEvent::Stop { .. }) {
+                // Both a natural stop and a transport failure are terminal:
+                // either must latch the guard, or a failed stream would keep
+                // yielding until the server closes (defeating the deadline).
+                if matches!(
+                    event,
+                    ProviderEvent::Stop { .. } | ProviderEvent::StreamError(_)
+                ) {
                     *state = None;
                 }
                 std::future::ready(if yield_event { Some(event) } else { None })

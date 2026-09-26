@@ -42,10 +42,23 @@ pub struct TokenUsage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderEvent {
     TextDelta(String),
-    ToolUseStart { id: String, name: String },
-    ToolUseDelta { id: String, partial_json: String },
-    ToolUseEnd { id: String },
-    Stop { reason: StopReason },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    ToolUseDelta {
+        id: String,
+        partial_json: String,
+    },
+    ToolUseEnd {
+        id: String,
+    },
+    Stop {
+        reason: StopReason,
+    },
+    /// A mid-stream transport failure. Carries the classified error so the
+    /// agent loop can decide retryability without string matching.
+    StreamError(ProviderError),
     Usage(TokenUsage),
 }
 
@@ -70,7 +83,7 @@ pub struct ProviderResponse {
 }
 
 /// Errors from a provider.
-#[derive(Debug, Clone, thiserror::Error, Serialize)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize)]
 pub enum ProviderError {
     #[error("network error: {0}")]
     Network(String),
@@ -86,6 +99,16 @@ pub enum ProviderError {
     Stream(String),
 }
 
+/// How a provider stream ended. A transport failure keeps its classified error
+/// so the caller can decide retryability and still keep partial content.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEnd {
+    /// A terminal stop reason, whether provider-reported or synthesized.
+    Stopped(StopReason),
+    /// A mid-stream transport failure (e.g. a request deadline).
+    Failed(ProviderError),
+}
+
 /// Accumulate a provider stream into content blocks, stop reason, and last usage.
 /// `on_event` is called for each provider event (text delta, usage, etc.).
 /// Returns `None` for usage if the stream emitted no `ProviderEvent::Usage`.
@@ -99,7 +122,7 @@ pub async fn accumulate_stream<F>(
     mut stream: BoxStream<'static, ProviderEvent>,
     mut on_event: F,
     idle_timeout: Option<std::time::Duration>,
-) -> Result<(Vec<ContentBlock>, StopReason, Option<TokenUsage>), ProviderError>
+) -> Result<(Vec<ContentBlock>, StreamEnd, Option<TokenUsage>), ProviderError>
 where
     F: FnMut(ProviderEvent),
 {
@@ -107,8 +130,11 @@ where
     let mut current_text = String::new();
     let mut tool_uses: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
-    let mut stop_reason = StopReason::EndTurn;
+    let mut end = StreamEnd::Stopped(StopReason::EndTurn);
     let mut received_stop = false;
+    // A transport failure ends the loop early; it must not be mistaken for an
+    // EOF-without-stop below, which would overwrite the classified error.
+    let mut transport_failed = false;
     let mut last_usage: Option<TokenUsage> = None;
 
     tracing::debug!(
@@ -166,8 +192,16 @@ where
                     stop_reason = ?reason,
                     "accumulate_stream: received Stop event"
                 );
-                stop_reason = reason;
+                end = StreamEnd::Stopped(reason);
                 received_stop = true;
+            }
+            ProviderEvent::StreamError(error) => {
+                // A transport failure is terminal, but any content accumulated
+                // so far is still returned so consumers keep showing it.
+                tracing::warn!(event_count, error = %error, "accumulate_stream: transport failure");
+                end = StreamEnd::Failed(error);
+                transport_failed = true;
+                break false;
             }
             ProviderEvent::Usage(u) => {
                 last_usage = Some(u.clone());
@@ -176,16 +210,18 @@ where
         }
     };
 
-    if stalled {
+    if transport_failed {
+        // `end` already holds the classified failure; keep it as-is.
+    } else if stalled {
         tracing::info!(
             event_count,
             pending_text_len = current_text.len(),
             "accumulate_stream: returning due to idle stall"
         );
         // Synthesize a stop reason so callers see a terminal signal.
-        stop_reason = StopReason::Stalled;
+        end = StreamEnd::Stopped(StopReason::Stalled);
     } else if !received_stop {
-        stop_reason = StopReason::Other("stream ended without stop".to_string());
+        end = StreamEnd::Stopped(StopReason::Other("stream ended without stop".to_string()));
         tracing::warn!(
             event_count,
             "accumulate_stream: stream ended without Stop event"
@@ -193,7 +229,7 @@ where
     } else {
         tracing::info!(
             event_count,
-            stop_reason = ?stop_reason,
+            end = ?end,
             has_usage = last_usage.is_some(),
             "accumulate_stream: stream ended (returned None)"
         );
@@ -201,7 +237,7 @@ where
     if !current_text.is_empty() {
         content.push(ContentBlock::Text(current_text));
     }
-    Ok((content, stop_reason, last_usage))
+    Ok((content, end, last_usage))
 }
 
 /// LLM provider trait.
@@ -216,7 +252,11 @@ pub trait Provider: Send + Sync {
     /// Convenience: accumulate stream into full response.
     async fn call(&self, req: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let stream = self.call_stream(req).await?;
-        let (content, stop_reason, _usage) = accumulate_stream(stream, |_| {}, None).await?;
+        let (content, end, _usage) = accumulate_stream(stream, |_| {}, None).await?;
+        let stop_reason = match end {
+            StreamEnd::Stopped(reason) => reason,
+            StreamEnd::Failed(error) => return Err(error),
+        };
         Ok(ProviderResponse {
             content,
             stop_reason,
@@ -371,12 +411,12 @@ mod tests {
     async fn accumulate_stream_eof_without_stop_is_abnormal() {
         let stream = futures::stream::iter(vec![text_event("partial")]).boxed();
 
-        let (content, stop_reason, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        let (content, end, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
 
         assert_eq!(content, vec![ContentBlock::Text("partial".into())]);
         assert_eq!(
-            stop_reason,
-            StopReason::Other("stream ended without stop".into())
+            end,
+            StreamEnd::Stopped(StopReason::Other("stream ended without stop".into()))
         );
     }
 
@@ -387,14 +427,32 @@ mod tests {
             .chain(futures::stream::pending())
             .boxed();
 
-        let (content, stop_reason, _) =
+        let (content, end, _) =
             accumulate_stream(stream, |_| {}, Some(std::time::Duration::from_millis(50)))
                 .await
                 .unwrap();
 
         // Partial content is still returned so the caller can decide its fate.
         assert_eq!(content, vec![ContentBlock::Text("partial".into())]);
-        assert_eq!(stop_reason, StopReason::Stalled);
+        assert_eq!(end, StreamEnd::Stopped(StopReason::Stalled));
+    }
+
+    #[tokio::test]
+    async fn accumulate_stream_surfaces_transport_failure_with_partial() {
+        let stream = futures::stream::iter(vec![
+            text_event("partial"),
+            ProviderEvent::StreamError(ProviderError::Network("stream error: timed out".into())),
+        ])
+        .boxed();
+
+        let (content, end, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+
+        // Partial text is preserved so consumers can keep showing it.
+        assert_eq!(content, vec![ContentBlock::Text("partial".into())]);
+        assert!(matches!(
+            end,
+            StreamEnd::Failed(ProviderError::Network(msg)) if msg.contains("timed out")
+        ));
     }
 
     #[tokio::test]
@@ -480,7 +538,7 @@ mod tests {
 
         let mut received_text = Vec::new();
         let mut received_usage = Vec::new();
-        let (content, stop, usage) = accumulate_stream(
+        let (content, end, usage) = accumulate_stream(
             stream,
             |ev| match ev {
                 ProviderEvent::TextDelta(s) => received_text.push(s),
@@ -493,7 +551,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(content, vec![ContentBlock::Text("hi".into())]);
-        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(end, StreamEnd::Stopped(StopReason::EndTurn));
         assert_eq!(received_text, vec!["hi".to_string()]);
         assert_eq!(received_usage.len(), 1);
         assert_eq!(received_usage[0].input_tokens, 10);
@@ -733,9 +791,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let (content, stop, usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        let (content, end, usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
         assert!(content.is_empty());
-        assert_eq!(stop, StopReason::Other("stream ended without stop".into()));
+        assert_eq!(
+            end,
+            StreamEnd::Stopped(StopReason::Other("stream ended without stop".into()))
+        );
         assert!(usage.is_none());
     }
 
@@ -758,8 +819,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let (_, stop, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
-        assert_eq!(stop, StopReason::StopSequence);
+        let (_, end, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        assert_eq!(end, StreamEnd::Stopped(StopReason::StopSequence));
     }
 
     #[tokio::test]
@@ -781,8 +842,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let (_, stop, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
-        assert_eq!(stop, StopReason::Other("custom".into()));
+        let (_, end, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        assert_eq!(end, StreamEnd::Stopped(StopReason::Other("custom".into())));
     }
 
     #[test]

@@ -292,7 +292,19 @@ where
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(ProviderError::Network(e.to_string()))));
+                    // See the Anthropic stream for why `is_timeout()` must be
+                    // checked before `is_decode()`: a deadline's Display text is
+                    // "error decoding response body".
+                    // Only a deadline is retryable, so only it becomes
+                    // `Network`. A connection reset or other transport break
+                    // stays `Stream`, which the agent loop treats as terminal
+                    // (see the design's retryable/not-retryable table).
+                    let error = if e.is_timeout() {
+                        ProviderError::Network(format!("stream error: timed out: {e}"))
+                    } else {
+                        ProviderError::Stream(format!("stream error: {e}"))
+                    };
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
                     let frames = self.line_parser.feed(&chunk);

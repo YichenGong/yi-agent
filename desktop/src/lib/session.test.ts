@@ -121,9 +121,16 @@ describe("Session", () => {
     const s = new Session();
     s.apply({
       method: "turn/retry",
-      params: { thread_id: "t", turn_id: "u1", attempt: 1, max: 3 },
+      params: {
+        thread_id: "t",
+        turn_id: "u1",
+        attempt: 1,
+        max: 3,
+        cause: "request_timeout",
+      },
     });
-    expect(s.retrying).toEqual({ attempt: 1, max: 3 });
+    // The cause is carried through so the notice can name the failure mode.
+    expect(s.retrying).toEqual({ attempt: 1, max: 3, cause: "request_timeout" });
 
     s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "hi" } });
     expect(s.retrying).toBeNull();
@@ -133,7 +140,7 @@ describe("Session", () => {
     const s = new Session();
     s.apply({
       method: "turn/retry",
-      params: { thread_id: "t", turn_id: "u1", attempt: 2, max: 3 },
+      params: { thread_id: "t", turn_id: "u1", attempt: 2, max: 3, cause: "idle_stall" },
     });
     s.apply({
       method: "turn/completed",

@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::message::{ContentBlock, Message};
 use crate::provider::{
-    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, TokenUsage,
+    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, StreamEnd,
+    TokenUsage,
 };
 use crate::tool::{ToolEvent, ToolRegistry, ToolResult};
 
@@ -210,14 +211,16 @@ pub enum AgentEvent {
     ToolRetry {
         id: String,
     },
-    /// The THINK stream stalled and is being retried internally. `attempt` is
-    /// the 1-based retry number, `max` the configured retry limit, and
-    /// `idle_secs` how long the stream was silent. Consumers must surface this
-    /// to the user: a silent retry leaves the user staring at a frozen screen.
+    /// The THINK stream failed transiently and is being retried internally.
+    /// `attempt` is the 1-based retry number, `max` the configured retry limit,
+    /// `idle_secs` how long the stream was silent, and `cause` why it retried.
+    /// Consumers must surface this to the user: a silent retry leaves the user
+    /// staring at a frozen screen.
     ProviderRetry {
         attempt: u16,
         max: u16,
         idle_secs: u64,
+        cause: RetryCause,
     },
     ToolOutputDelta {
         id: String,
@@ -273,6 +276,16 @@ pub enum AgentEvent {
         request_id: u64,
         decision: crate::permission::Decision,
     },
+}
+
+/// Why a THINK attempt was retried. Distinguishes the two transient failure
+/// modes so consumers can explain the delay accurately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RetryCause {
+    /// No provider event within the idle timeout.
+    IdleStall,
+    /// The provider request hit its total-deadline timeout.
+    RequestTimeout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -508,11 +521,11 @@ async fn run_loop(
         let prefill_estimate = estimate_prefill_tokens(&req);
         let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
-        // Retry loop for a transiently stalled THINK stream. Each attempt is a
-        // fresh provider turn (own lease); a stalled attempt's partial content
-        // is not committed to the session.
+        // Retry loop for a transiently failed THINK stream (idle stall or
+        // request deadline). Each attempt is a fresh provider turn (own lease);
+        // a failed attempt's partial content is not committed to the session.
         let mut stall_retries: u16 = 0;
-        let (content, stop_reason, last_usage) = loop {
+        let (content, end, last_usage) = loop {
             let provider_turn_lease = match &provider_turn_gate {
                 Some(gate) => match tokio::select! {
                     lease = gate.acquire() => lease,
@@ -583,40 +596,57 @@ async fn run_loop(
             // hold provider capacity.
             drop(provider_turn_lease);
 
-            let stalled = matches!(attempt.1, StopReason::Stalled);
-            if stalled && stall_retries < config.think_stall_retry_limit {
-                stall_retries += 1;
-                let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
-                let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
-                tracing::warn!(
-                    turn,
-                    attempt = stall_retries,
-                    max = config.think_stall_retry_limit,
-                    delay_ms = delay.as_millis() as u64,
-                    "think phase stalled; retrying after backoff"
-                );
-                // Surface the retry: a silent backoff looks like a hang.
-                if tx
-                    .send(AgentEvent::ProviderRetry {
-                        attempt: stall_retries,
-                        max: config.think_stall_retry_limit,
-                        idle_secs,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return; // Receiver dropped, stop the loop
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = cancel_token.cancelled() => {
-                        info!(turn, "agent loop cancelled during stall backoff");
-                        session.lock().unwrap().truncate(session_len);
-                        let _ = tx.send(AgentEvent::Cancelled).await;
-                        return;
+            // Two transient modes are retryable: an idle stall and a request
+            // deadline. Everything else (malformed SSE payloads, connection
+            // resets, auth failures) is terminal.
+            //
+            // `Failed(Network)` is a load-bearing shorthand for "the request
+            // deadline elapsed": the providers only classify a *timeout* as
+            // `Network` here, and keep every other transport break as `Stream`.
+            // Widening that classification would silently start retrying
+            // connection resets, which the design explicitly excludes.
+            let retry_cause = match &attempt.1 {
+                StreamEnd::Stopped(StopReason::Stalled) => Some(RetryCause::IdleStall),
+                StreamEnd::Failed(ProviderError::Network(_)) => Some(RetryCause::RequestTimeout),
+                _ => None,
+            };
+            if let Some(cause) = retry_cause {
+                if stall_retries < config.think_stall_retry_limit {
+                    stall_retries += 1;
+                    let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+                    let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
+                    tracing::warn!(
+                        turn,
+                        attempt = stall_retries,
+                        max = config.think_stall_retry_limit,
+                        delay_ms = delay.as_millis() as u64,
+                        ?cause,
+                        "think phase failed transiently; retrying after backoff"
+                    );
+                    // Surface the retry: a silent backoff looks like a hang.
+                    if tx
+                        .send(AgentEvent::ProviderRetry {
+                            attempt: stall_retries,
+                            max: config.think_stall_retry_limit,
+                            idle_secs,
+                            cause,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return; // Receiver dropped, stop the loop
                     }
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel_token.cancelled() => {
+                            info!(turn, "agent loop cancelled during retry backoff");
+                            session.lock().unwrap().truncate(session_len);
+                            let _ = tx.send(AgentEvent::Cancelled).await;
+                            return;
+                        }
+                    }
+                    continue;
                 }
-                continue;
             }
             break attempt;
         };
@@ -631,30 +661,48 @@ async fn run_loop(
         // Log the full accumulated response content at debug level (never repeats across turns).
         debug!(turn, content = ?content, "think: response");
 
-        // A provider-reported stream error surfaces as a terminal Error. An
-        // idle stall is no longer reported through this string channel: it is
-        // `StopReason::Stalled` and is handled by the retry loop above.
-        if let StopReason::Other(ref s) = stop_reason {
-            if let Some(message) = s.strip_prefix("stream error: ") {
+        // A non-retryable transport failure (malformed SSE payload, connection
+        // reset, ...) is terminal. Retryable timeouts never reach here: they
+        // either succeeded on a later attempt or exhausted the retry budget,
+        // in which case the terminal reason below explains it.
+        if let StreamEnd::Failed(error) = &end {
+            if !matches!(error, ProviderError::Network(_)) {
                 let _ = tx
-                    .send(AgentEvent::Error(AgentError::Provider(
-                        ProviderError::Stream(message.to_string()),
-                    )))
+                    .send(AgentEvent::Error(AgentError::Provider(error.clone())))
                     .await;
                 return;
             }
         }
 
-        // An exhausted stall is terminal and its partial must NOT enter the
-        // session: a stalled stream can end mid-tool-call, leaving an unpaired
-        // `tool_use` that would make the next provider request invalid.
-        if !matches!(stop_reason, StopReason::Stalled) {
+        // An exhausted transient failure is terminal and its partial must NOT
+        // enter the session: a stream can end mid-tool-call, leaving an
+        // unpaired `tool_use` that would make the next provider request
+        // invalid. The same applies to a failed attempt (no valid stop).
+        let exhausted_stall = matches!(end, StreamEnd::Stopped(StopReason::Stalled));
+        let exhausted_timeout = matches!(end, StreamEnd::Failed(ProviderError::Network(_)));
+        if !exhausted_stall && !exhausted_timeout {
             messages.push(Message::assistant(content.clone()));
             session
                 .lock()
                 .unwrap()
                 .push(Message::assistant(content.clone()));
         }
+
+        let stop_reason = match end {
+            StreamEnd::Stopped(reason) => reason,
+            StreamEnd::Failed(ProviderError::Network(_)) => {
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::Interrupted {
+                            reason: format!("request timeout after {stall_retries} retries"),
+                        },
+                    })
+                    .await;
+                return;
+            }
+            // Any other failure was already reported as a terminal Error above.
+            StreamEnd::Failed(_) => return,
+        };
 
         match stop_reason {
             StopReason::Stalled => {
@@ -1083,10 +1131,10 @@ async fn accumulate_provider_stream(
     tx: &mpsc::Sender<AgentEvent>,
     model: &str,
     idle_timeout: Option<std::time::Duration>,
-) -> Result<(Vec<ContentBlock>, StopReason, Option<TokenUsage>), AgentError> {
+) -> Result<(Vec<ContentBlock>, StreamEnd, Option<TokenUsage>), AgentError> {
     let tx = tx.clone();
     let model = model.to_string();
-    let (content, stop_reason, last_usage) = crate::provider::accumulate_stream(
+    let (content, end, last_usage) = crate::provider::accumulate_stream(
         stream,
         move |event| match event {
             ProviderEvent::TextDelta(s) => {
@@ -1106,7 +1154,7 @@ async fn accumulate_provider_stream(
         idle_timeout,
     )
     .await?;
-    Ok((content, stop_reason, last_usage))
+    Ok((content, end, last_usage))
 }
 
 /// Heuristic token estimate: ASCII ~4 chars/token, non-ASCII (CJK etc.) ~1.5 chars/token.
@@ -1499,9 +1547,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_reports_provider_stream_stop_as_error() {
-        let provider = ScriptedProvider::new(vec![vec![ProviderEvent::Stop {
-            reason: StopReason::Other("stream error: invalid SSE payload".into()),
-        }]]);
+        // A malformed SSE payload is a non-retryable transport failure: it must
+        // surface as a terminal Error, never as a retry.
+        let provider = ScriptedProvider::new(vec![vec![ProviderEvent::StreamError(
+            ProviderError::Stream("stream error: invalid SSE payload".into()),
+        )]]);
         let mut agent = Agent::new(
             Arc::new(provider),
             Arc::new(ToolRegistry::new()),
@@ -1518,6 +1568,281 @@ mod tests {
             !events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::Done { .. }))
+        );
+    }
+
+    /// Fails the first call with a request timeout, succeeds afterwards.
+    struct TimeoutOnceThenSucceedProvider {
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl TimeoutOnceThenSucceedProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for TimeoutOnceThenSucceedProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let stream = if *calls == 1 {
+                futures::stream::iter(vec![
+                    ProviderEvent::TextDelta("stale".into()),
+                    ProviderEvent::StreamError(ProviderError::Network(
+                        "stream error: timed out".into(),
+                    )),
+                ])
+                .boxed()
+            } else {
+                futures::stream::iter(vec![
+                    ProviderEvent::TextDelta("fresh".into()),
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                    },
+                ])
+                .boxed()
+            };
+            Ok(stream)
+        }
+    }
+
+    /// Call 1 stalls, call 2 times out, call 3 succeeds. Proves the retry budget
+    /// is shared between the two failure modes rather than granted separately.
+    struct StallThenTimeoutThenSucceedProvider {
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl StallThenTimeoutThenSucceedProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StallThenTimeoutThenSucceedProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let stream = match *calls {
+                1 => futures::stream::iter(vec![ProviderEvent::TextDelta("stale".into())])
+                    .chain(futures::stream::pending())
+                    .boxed(),
+                2 => futures::stream::iter(vec![ProviderEvent::StreamError(
+                    ProviderError::Network("stream error: timed out".into()),
+                )])
+                .boxed(),
+                _ => futures::stream::iter(vec![
+                    ProviderEvent::TextDelta("fresh".into()),
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                    },
+                ])
+                .boxed(),
+            };
+            Ok(stream)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_shares_one_retry_budget_across_stall_and_timeout() {
+        let provider = Arc::new(StallThenTimeoutThenSucceedProvider::new());
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        // One stall + one timeout = 2 of the shared 3-retry budget, then success.
+        assert_eq!(*calls.calls.lock().unwrap(), 3);
+        let causes: Vec<RetryCause> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ProviderRetry { cause, .. } => Some(*cause),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            causes,
+            vec![RetryCause::IdleStall, RetryCause::RequestTimeout],
+            "the budget is shared, and each retry names its own cause: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    /// Every call fails with a request timeout, so retries are always exhausted.
+    struct AlwaysTimeoutProvider {
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl AlwaysTimeoutProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for AlwaysTimeoutProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            *self.calls.lock().unwrap() += 1;
+            let stream = futures::stream::iter(vec![ProviderEvent::StreamError(
+                ProviderError::Network("stream error: timed out".into()),
+            )])
+            .boxed();
+            Ok(stream)
+        }
+    }
+
+    /// A request deadline is transient: the turn must survive it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_retries_a_request_timeout_and_completes() {
+        let provider = Arc::new(TimeoutOnceThenSucceedProvider::new());
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        // The retry is announced, with a cause that names the timeout.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ProviderRetry {
+                    attempt: 1,
+                    max: 3,
+                    cause: RetryCause::RequestTimeout,
+                    ..
+                }
+            )),
+            "expected a RequestTimeout ProviderRetry, got: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Done {
+                    reason: DoneReason::Interrupted { .. }
+                } | AgentEvent::Error(_)
+            )),
+            "a transient timeout must not surface as Interrupted/Error: {events:?}"
+        );
+        // The timed-out partial ("stale") is NOT committed: only "fresh" is kept.
+        let session = agent.session();
+        let assistants: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants, vec!["fresh"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_exhausts_timeout_retries_then_reports_interruption() {
+        let provider = Arc::new(AlwaysTimeoutProvider::new());
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        // 1 initial attempt + 3 retries.
+        assert_eq!(*calls.calls.lock().unwrap(), 4);
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ProviderRetry { .. }))
+            .count();
+        assert_eq!(retries, 3, "expected 3 retries, got: {events:?}");
+        match events.last() {
+            Some(AgentEvent::Done {
+                reason: DoneReason::Interrupted { reason },
+            }) => assert_eq!(reason, "request timeout after 3 retries"),
+            other => panic!("expected Interrupted after retries, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_does_not_retry_a_connection_reset() {
+        // A transport break that is not a deadline stays `Stream` and must be
+        // terminal: only a timeout earns a retry (see the design's table).
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("partial".into()),
+            ProviderEvent::StreamError(ProviderError::Stream(
+                "stream error: connection reset by peer".into(),
+            )),
+        ]]));
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Error(AgentError::Provider(ProviderError::Stream(_)))
+            )),
+            "a non-timeout transport break must be a terminal Error, got: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ProviderRetry { .. })),
+            "a non-timeout transport break must never be retried: {events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_does_not_retry_a_malformed_sse_payload() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::StreamError(ProviderError::Stream("invalid SSE JSON".into())),
+        ]]));
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Error(AgentError::Provider(ProviderError::Stream(m)))
+                    if m.contains("invalid SSE JSON")
+            )),
+            "a malformed payload must be a terminal Error, got: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ProviderRetry { .. })),
+            "a malformed payload must never be retried"
         );
     }
 

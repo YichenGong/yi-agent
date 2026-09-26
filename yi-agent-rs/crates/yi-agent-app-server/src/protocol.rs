@@ -137,6 +137,8 @@ pub enum Notification {
         turn_id: String,
         attempt: u16,
         max: u16,
+        /// Why the turn is being retried: `"idle_stall"` or `"request_timeout"`.
+        cause: String,
     },
     #[serde(rename = "thread/tokenUsage/updated")]
     TokenUsage {

@@ -334,19 +334,17 @@ async fn mid_stream_sse_error_becomes_terminal_stop() {
 
     // First event: the text delta before the error.
     assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "partial"));
-    // Second event: the error converted to a terminal Stop.
+    // Second event: the error, carrying its classification, is terminal.
     match &events[1] {
-        ProviderEvent::Stop {
-            reason: StopReason::Other(msg),
-        } => {
+        ProviderEvent::StreamError(ProviderError::Stream(msg)) => {
             assert!(msg.contains("overloaded"), "unexpected message: {msg}");
         }
         _ => panic!(
-            "expected Stop{{Other}} for mid-stream error, got: {:?}",
+            "expected StreamError for mid-stream error, got: {:?}",
             events[1]
         ),
     }
-    // No further events after the terminal Stop.
+    // No further events after the terminal failure.
     assert_eq!(events.len(), 2, "stream should terminate after Stop");
 }
 
@@ -650,12 +648,12 @@ async fn request_timeout_is_a_total_deadline_not_an_idle_timeout() {
     );
     let last = events.last().expect("at least one event");
     match last {
-        ProviderEvent::Stop {
-            reason: StopReason::Other(msg),
-        } => assert!(
-            msg.contains("stream error"),
-            "expected a stream error terminal stop, got: {msg}"
+        // A transport deadline is now a typed failure, not a stringly stop
+        // reason, so the agent loop can classify it without string matching.
+        ProviderEvent::StreamError(ProviderError::Network(msg)) => assert!(
+            msg.contains("timed out"),
+            "a deadline must be classified as a timeout, got: {msg}"
         ),
-        other => panic!("expected terminal Stop after timeout, got: {other:?}"),
+        other => panic!("expected StreamError after timeout, got: {other:?}"),
     }
 }

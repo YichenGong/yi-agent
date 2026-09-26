@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
 
-use yi_agent_core::{AgentEvent, DoneReason};
+use yi_agent_core::{AgentEvent, DoneReason, RetryCause};
 
 use super::cell::HistoryCell;
 
@@ -368,16 +368,23 @@ impl HistoryState {
                 attempt,
                 max,
                 idle_secs,
+                cause,
             } => {
-                // Make the stall retry visible: the user should know the stream
-                // went quiet and that yi-agent is retrying, rather than watching
-                // a frozen screen during the backoff. The partial text that was
-                // already streamed stays on screen above this line.
-                self.cells.push(HistoryCell::Separator {
-                    label: Some(format!(
+                // Make the retry visible: the user should know the stream failed
+                // and that yi-agent is retrying, rather than watching a frozen
+                // screen during the backoff. The partial text that was already
+                // streamed stays on screen above this line. The label names the
+                // actual cause so a timeout is not misreported as a stall.
+                let label = match cause {
+                    RetryCause::IdleStall => format!(
                         "Provider stalled (no output for {idle_secs}s) — retrying {attempt}/{max}"
-                    )),
-                });
+                    ),
+                    RetryCause::RequestTimeout => {
+                        format!("Provider request timed out — retrying {attempt}/{max}")
+                    }
+                };
+                self.cells
+                    .push(HistoryCell::Separator { label: Some(label) });
             }
             AgentEvent::AssistantText(text) => match self.cells.last_mut() {
                 Some(HistoryCell::AssistantMessage { .. }) => {
@@ -1759,6 +1766,7 @@ mod tests {
                 attempt: 1,
                 max: 3,
                 idle_secs: 60,
+                cause: RetryCause::IdleStall,
             },
             80,
         );
@@ -1774,6 +1782,29 @@ mod tests {
         assert!(matches!(
             &s.cells[0],
             HistoryCell::AssistantMessage { markdown } if markdown == "partial text"
+        ));
+    }
+
+    #[test]
+    fn push_event_provider_retry_labels_a_timeout_distinctly() {
+        let mut s = HistoryState::new();
+
+        s.push_event(
+            AgentEvent::ProviderRetry {
+                attempt: 1,
+                max: 3,
+                idle_secs: 0,
+                cause: RetryCause::RequestTimeout,
+            },
+            80,
+        );
+
+        // A timeout must not be described as a stall: the wording tells the
+        // user which failure mode they hit.
+        assert!(matches!(
+            &s.cells[0],
+            HistoryCell::Separator { label: Some(label) }
+                if label.contains("timed out") && label.contains("retrying 1/3")
         ));
     }
 
@@ -1796,6 +1827,7 @@ mod tests {
                 attempt: 2,
                 max: 3,
                 idle_secs: 60,
+                cause: RetryCause::IdleStall,
             },
             80,
         );
