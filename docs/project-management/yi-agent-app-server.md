@@ -13,7 +13,7 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - JSON-RPC 2.0 信封与 yi-agent 线协议类型（请求/响应/通知/错误码）
 - stdio JSONL 分帧传输（读一行、写一行，帧大小上限保护）
 - 权限审批反向请求（服务端 → 客户端请求 / 客户端响应）
-- 后续：CLI 子命令
+- CLI 子命令 `yi-agent app-server`（装配 runtime 并驱动 stdio 循环）
 
 **不做什么：**
 - 不做 TUI（由 `yi-agent-tui` 负责）
@@ -31,6 +31,6 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - [x] server 主循环 + thread/start（`initialize` / `thread/start` / `config/read` / 错误码 / EOF 退出）— `src/server.rs:46`
 - [x] turn/start + turn/interrupt + 每 thread driver task（`turn-{n}` 编号、`turn/started`→响应→投递顺序、`-32011`/`-32012`/`-32602` 错误码、`Agent::run()` 之后取 cancel token 保证中断有效、中断信号携带目标 turn id 以丢弃残留、写失败也上报 `Finished` 防 `active_turn_id` 卡死）— `src/server.rs:285` / `src/server.rs:355` / `src/server.rs:480`
 - [x] 权限审批反向请求闭环（`AgentEvent::PermissionRequest` → 服务端反向请求 `item/toolCall/requestApproval`（id 取自进程级 `perm_seq` 计数器，跨 thread 全局唯一）→ 客户端响应 `ClientResponse` → `pending` 登记表路由 → `Decision` 回传 agent；审批等待内的中断按目标 turn id 过滤，超时/中断/畸形取值一律按 `Deny` fail-safe）— `src/protocol.rs:42` / `src/protocol.rs:54` / `src/server.rs:116` / `src/server.rs:431` / `src/server.rs:447` / `src/server.rs:480`
-- [ ] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环）
+- [x] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环）— `yi-agent-rs/crates/yi-agent/src/config.rs`（`Command::AppServer` 变体）/ `yi-agent-rs/crates/yi-agent/src/main.rs`（`run_app_server` fn）
 
 **验证命令：** `cargo test -p yi-agent-app-server`（69 个测试）

@@ -61,8 +61,36 @@ fn main() -> Result<()> {
         Some(Command::Agents { ref project, all }) => control_agents(&cli, project.clone(), all),
         Some(Command::Agent { ref action }) => control_agent(&cli, action.clone()),
         Some(Command::Schedule { ref action }) => control_schedule(&cli, action),
+        Some(Command::AppServer { ref listen }) => {
+            let listen = listen.clone();
+            run_app_server(cli, &listen)
+        }
         None => run_agent(cli),
     }
+}
+
+/// Validate the app-server listen transport. Only the stdio transport is
+/// implemented; anything else is rejected before the runtime is assembled.
+fn ensure_stdio_listen(listen: &str) -> Result<()> {
+    if listen != "stdio://" {
+        anyhow::bail!("unsupported app-server transport `{listen}`: only `stdio://` is supported");
+    }
+    Ok(())
+}
+
+/// Run the JSON-RPC 2.0 app-server over stdio for the desktop GUI sidecar.
+///
+/// stdout is the protocol channel and must stay free of log lines; tracing
+/// writes to a file (and to stderr only when `YI_LOG` is set).
+fn run_app_server(cli: Cli, listen: &str) -> Result<()> {
+    ensure_stdio_listen(listen)?;
+    let config = config::load(&cli)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(yi_agent_app_server::run(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        config,
+    ))
 }
 
 fn control_agents(cli: &Cli, project: Option<std::path::PathBuf>, all: bool) -> Result<()> {
@@ -1399,6 +1427,16 @@ pub(crate) enum ControlCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_stdio_listen_accepts_stdio() {
+        assert!(ensure_stdio_listen("stdio://").is_ok());
+    }
+
+    #[test]
+    fn ensure_stdio_listen_rejects_other_transports() {
+        assert!(ensure_stdio_listen("tcp://127.0.0.1:9000").is_err());
+    }
 
     // --- drain_stream_human tests ---
 

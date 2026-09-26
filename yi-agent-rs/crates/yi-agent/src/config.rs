@@ -150,6 +150,12 @@ pub enum Command {
         #[command(subcommand)]
         action: ScheduleAction,
     },
+    /// Run the JSON-RPC app-server (stdio transport). Used by the desktop GUI sidecar.
+    AppServer {
+        /// Listen transport. Only `stdio://` is supported.
+        #[arg(long, default_value = "stdio://")]
+        listen: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -511,6 +517,21 @@ mod tests {
                 assert_eq!(port, 7292);
             }
             other => panic!("expected Web command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_app_server_stdio() {
+        let cli = Cli::parse_from(["yi-agent", "app-server", "--listen", "stdio://"]);
+        assert!(matches!(cli.command, Some(Command::AppServer { .. })));
+    }
+
+    #[test]
+    fn cli_app_server_defaults_to_stdio() {
+        let cli = Cli::parse_from(["yi-agent", "app-server"]);
+        match cli.command {
+            Some(Command::AppServer { listen }) => assert_eq!(listen, "stdio://"),
+            other => panic!("expected AppServer command, got {other:?}"),
         }
     }
 
