@@ -321,6 +321,46 @@ impl RuntimeConfig {
             skills_catalog_budget_explicit,
         })
     }
+
+    /// 返回给 GUI 的安全配置视图:api_key 脱敏,其余字段原样。
+    pub fn redacted_view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "provider": self.provider,
+            "api_url": self.api_url,
+            "api_key": if self.api_key.is_empty() { "" } else { "***" },
+            "model": self.model,
+            "max_turns": self.max_turns,
+            "workdir": self.workdir.display().to_string(),
+            "sandbox": format!("{:?}", self.sandbox),
+            "yolo": self.yolo,
+            "compact_threshold": self.compact_threshold,
+        })
+    }
+}
+
+/// 测试辅助:构造一个字段任意的合法 [`RuntimeConfig`]。
+///
+/// 值可以随便填,仅供只关心个别字段的测试使用;它**不等于** [`RuntimeConfig::load`]
+/// 的默认值,不要用它断言加载语义。
+#[cfg(test)]
+pub(crate) fn sample_config() -> RuntimeConfig {
+    RuntimeConfig {
+        provider: "anthropic".to_string(),
+        api_url: "https://api.anthropic.com".to_string(),
+        api_key: "sk-secret".to_string(),
+        model: "test-model".to_string(),
+        max_turns: 20,
+        workdir: PathBuf::from("/tmp/test-workdir"),
+        system_prompt: None,
+        compact_threshold: 160_000,
+        compact_user_budget_tokens: 20_000,
+        compact_tool_budget_tokens: 12_000,
+        yolo: false,
+        sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
+        sandbox_writable_roots: Vec::new(),
+        skills_catalog_budget: 8192,
+        skills_catalog_budget_explicit: false,
+    }
 }
 
 #[cfg(test)]
@@ -1184,5 +1224,21 @@ mod tests {
         };
         let config = RuntimeConfig::load(&overrides).unwrap();
         assert!(!config.yolo);
+    }
+
+    #[test]
+    fn redacted_view_hides_api_key() {
+        let cfg = sample_config();
+        let view = cfg.redacted_view();
+        assert_eq!(view["api_key"], "***");
+        assert_eq!(view["model"], cfg.model);
+        assert_eq!(view["workdir"], cfg.workdir.display().to_string());
+    }
+
+    #[test]
+    fn redacted_view_empty_key_stays_empty() {
+        let mut cfg = sample_config();
+        cfg.api_key = String::new();
+        assert_eq!(cfg.redacted_view()["api_key"], "");
     }
 }
