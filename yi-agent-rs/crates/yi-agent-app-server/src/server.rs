@@ -322,6 +322,170 @@ where
                         )
                         .await?;
                     }
+                    "thread/resume" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
+                        // 落盘完成。driver 是「先发 turn/completed,后 append/touch」,
+                        // 而 `TurnEvent::Finished` 在落盘之后才发出,故必须等它,
+                        // 否则紧随 turn/completed 的 resume 会读到尚未写入的历史。
+                        if let Some(tid) = threads
+                            .get(&thread_id)
+                            .and_then(|s| s.active_turn_id.clone())
+                        {
+                            if let Some(s) = threads.get(&thread_id) {
+                                let _ = s.interrupt_tx.try_send(tid);
+                            }
+                            let wait_for_persist = async {
+                                while let Some(TurnEvent::Finished {
+                                    thread_id: done_id,
+                                    turn_id: done_turn,
+                                }) = turn_rx.recv().await
+                                {
+                                    if let Some(s) = threads.get_mut(&done_id) {
+                                        if s.active_turn_id.as_deref() == Some(done_turn.as_str()) {
+                                            s.active_turn_id = None;
+                                        }
+                                    }
+                                    if done_id == thread_id {
+                                        break;
+                                    }
+                                }
+                            };
+                            // 有界等待:driver 异常卡死时不至于拖垮整个请求循环。
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                wait_for_persist,
+                            )
+                            .await;
+                        }
+
+                        let loaded = match store.load(&thread_id) {
+                            Ok(Some(l)) => l,
+                            Ok(None) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+
+                        // meta 缺 cwd/model 时(损坏重建)用当前配置兜底。
+                        let cwd = if loaded.meta.cwd.is_empty() {
+                            cfg.workdir.display().to_string()
+                        } else {
+                            loaded.meta.cwd.clone()
+                        };
+                        let model = if loaded.meta.model.is_empty() {
+                            cfg.model.clone()
+                        } else {
+                            loaded.meta.model.clone()
+                        };
+
+                        let mut session = yi_agent_core::Session::new();
+                        session.replace_messages(loaded.messages.clone());
+
+                        let BuiltAgent { agent, decision_tx } = match build_agent(Some(session)) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+
+                        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+                        let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+                        threads.insert(
+                            thread_id.clone(),
+                            ThreadSession {
+                                thread_id: thread_id.clone(),
+                                cwd: cwd.clone(),
+                                model: model.clone(),
+                                active_turn_id: None,
+                                prompt_tx,
+                                interrupt_tx,
+                            },
+                        );
+
+                        let driver_writer = Arc::clone(&writer);
+                        let driver_turn_tx = turn_tx.clone();
+                        let driver_thread_id = thread_id.clone();
+                        tokio::spawn(run_thread_driver(
+                            driver_thread_id,
+                            agent,
+                            prompt_rx,
+                            interrupt_rx,
+                            driver_writer,
+                            driver_turn_tx,
+                            decision_tx,
+                            Arc::clone(&pending),
+                            permission_timeout,
+                            Arc::clone(&perm_seq),
+                            Arc::clone(&store),
+                        ));
+
+                        // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
+                        write_notification(
+                            &writer,
+                            &Notification::ThreadStarted {
+                                thread_id: thread_id.clone(),
+                                cwd: cwd.clone(),
+                                model: model.clone(),
+                            },
+                        )
+                        .await?;
+                        for item in loaded.items {
+                            write_notification(
+                                &writer,
+                                &Notification::ItemCompleted {
+                                    thread_id: thread_id.clone(),
+                                    item,
+                                },
+                            )
+                            .await?;
+                        }
+                        if let Some(u) = loaded.usage {
+                            write_notification(
+                                &writer,
+                                &Notification::TokenUsage {
+                                    thread_id: thread_id.clone(),
+                                    model: u.model,
+                                    input_tokens: u.input_tokens,
+                                    output_tokens: u.output_tokens,
+                                },
+                            )
+                            .await?;
+                        }
+                        write_response(
+                            &writer,
+                            ok_response(
+                                id,
+                                json!({
+                                    "thread_id": thread_id,
+                                    "cwd": cwd,
+                                    "model": model,
+                                }),
+                            ),
+                        )
+                        .await?;
+                    }
                     "turn/start" => {
                         // `id` 后续响应仍需使用,故传 clone。
                         let Some(thread_id) =
@@ -750,6 +914,32 @@ mod tests {
         > {
             let events = vec![
                 yi_agent_core::provider::ProviderEvent::TextDelta("hi".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 记录每次调用收到的 message 数,并回显 `n=<count>` 作为 agent 文本。
+    struct RecordingProvider {
+        seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for RecordingProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            let n = req.messages.len();
+            self.seen.lock().unwrap().push(n);
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta(format!("n={n}")),
                 yi_agent_core::provider::ProviderEvent::Stop {
                     reason: yi_agent_core::provider::StopReason::EndTurn,
                 },
@@ -2014,6 +2204,109 @@ mod tests {
             "missing core message: {text}"
         );
 
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_replays_history_and_restores_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_factory = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>| {
+            Ok(BuiltAgent {
+                agent: apply_session(
+                    yi_agent_core::Agent::new(
+                        Arc::new(RecordingProvider {
+                            seen: Arc::clone(&seen_factory),
+                        }),
+                        Arc::new(yi_agent_core::ToolRegistry::new()),
+                        yi_agent_core::AgentConfig::default(),
+                    ),
+                    session,
+                ),
+                decision_tx: None,
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // turn 1
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"first"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        // resume:期望 thread/started → item/completed(含 user + agent) → 响应
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut replayed: Vec<String> = Vec::new();
+        let mut resumed = false;
+        for _ in 0..12 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("thread/started") => {}
+                Some("item/completed") => {
+                    replayed.push(v["params"]["item"]["type"].as_str().unwrap().to_string());
+                }
+                _ => {}
+            }
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                assert_eq!(v["result"]["thread_id"], tid);
+                resumed = true;
+                break;
+            }
+        }
+        assert!(resumed, "thread/resume must respond");
+        assert!(
+            replayed.contains(&"userMessage".to_string()),
+            "replay must include the user item: {replayed:?}"
+        );
+        assert!(
+            replayed.contains(&"agentMessage".to_string()),
+            "replay must include the agent item: {replayed:?}"
+        );
+
+        // turn 2:provider 应看到比 turn 1 更多的 message(上下文已恢复)
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"second"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        let counts = seen.lock().unwrap().clone();
+        assert_eq!(counts.len(), 2, "expected two provider calls: {counts:?}");
+        assert!(
+            counts[1] > counts[0],
+            "resumed turn must carry prior context: {counts:?}"
+        );
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_unknown_returns_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{"threadId":"nope"}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["error"]["code"], -32011);
         h.shutdown().await;
     }
 }
