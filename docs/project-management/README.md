@@ -9,7 +9,7 @@
 
 | 模块 | 完成 / 总计 | 详情 |
 |---|---|---|
-| yi-agent-core | 15 / 16 | [详情](./yi-agent-core.md) |
+| yi-agent-core | 16 / 17 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 5 / 8 | [详情](./yi-agent-llm.md) |
 | yi-agent-tools | 11 / 11 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 7 / 7 | [详情](./yi-agent-skills.md) |
