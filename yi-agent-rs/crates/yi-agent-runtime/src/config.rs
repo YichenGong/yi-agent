@@ -22,6 +22,10 @@ pub struct RuntimeConfig {
     pub compact_user_budget_tokens: usize,
     pub compact_tool_budget_tokens: usize,
     pub yolo: bool,
+    /// 仅当沙箱既未被显式 / env 指定、且进程启动时 yolo 未打开时为 true,表示运行期
+    /// 切到 yolo 可把沙箱提权到 DangerFullAccess(桌面端运行期切换场景)。
+    /// 由 `load()` 推导。
+    pub sandbox_promotable: bool,
     pub sandbox: yi_agent_tools::SandboxMode,
     pub sandbox_writable_roots: Vec<PathBuf>,
     pub skills_catalog_budget: usize,
@@ -274,16 +278,25 @@ impl RuntimeConfig {
                 .map(|v| v == "true")
                 .unwrap_or(false);
 
-        let sandbox = match overrides.sandbox {
-            Some(mode) => mode,
-            None => match std::env::var("YI_AGENT_SANDBOX") {
-                Ok(value) => parse_sandbox_mode(&value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid YI_AGENT_SANDBOX: expected read-only, workspace-write, or danger-full-access"
-                    )
-                })?,
-                Err(_) if overrides.yolo => yi_agent_tools::SandboxMode::DangerFullAccess,
-                Err(_) => yi_agent_tools::SandboxMode::default(),
+        let env_sandbox = std::env::var("YI_AGENT_SANDBOX").ok();
+        // 显式 / env 指定的沙箱永不被提权。同时 `promotable` 只在「启动时非 yolo」时
+        // 才有意义(桌面端运行期切换场景):若启动时 yolo 已打开(CLI `--yolo`、
+        // `--dangerously-skip-permissions` 或 `YI_AGENT_YOLO`),`sandbox` 已经反映了
+        // 今天的行为,运行期不应再提权。`overrides.yolo` 蕴含 `yolo == true`,故首臂
+        // 的 `!yolo` 恒为 false;两臂统一写 `!yolo` 以免日后漂移。
+        let (sandbox, sandbox_promotable) = match overrides.sandbox {
+            Some(mode) => (mode, false),
+            None => match env_sandbox {
+                Some(value) => (
+                    parse_sandbox_mode(&value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid YI_AGENT_SANDBOX: expected read-only, workspace-write, or danger-full-access"
+                        )
+                    })?,
+                    false,
+                ),
+                None if overrides.yolo => (yi_agent_tools::SandboxMode::DangerFullAccess, !yolo),
+                None => (yi_agent_tools::SandboxMode::default(), !yolo),
             },
         };
 
@@ -315,6 +328,7 @@ impl RuntimeConfig {
             compact_user_budget_tokens,
             compact_tool_budget_tokens,
             yolo,
+            sandbox_promotable,
             sandbox,
             sandbox_writable_roots,
             skills_catalog_budget,
@@ -332,6 +346,7 @@ impl RuntimeConfig {
             "max_turns": self.max_turns,
             "workdir": self.workdir.display().to_string(),
             "sandbox": format!("{:?}", self.sandbox),
+            "sandbox_promotable": self.sandbox_promotable,
             "yolo": self.yolo,
             "compact_threshold": self.compact_threshold,
         })
@@ -356,6 +371,7 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         compact_user_budget_tokens: 20_000,
         compact_tool_budget_tokens: 12_000,
         yolo: false,
+        sandbox_promotable: true,
         sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
         sandbox_writable_roots: Vec::new(),
         skills_catalog_budget: 8192,
@@ -1172,6 +1188,66 @@ mod tests {
             RuntimeConfig::load(&overrides).unwrap().sandbox,
             yi_agent_tools::SandboxMode::ReadOnly
         );
+    }
+
+    #[test]
+    fn sandbox_promotable_false_when_sandbox_explicit() {
+        let mut overrides = test_overrides();
+        overrides.yolo = true;
+        overrides.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
+        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        assert!(!cfg.sandbox_promotable);
+        assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn sandbox_promotable_false_when_sandbox_from_env() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvVarGuard::new(["YI_AGENT_SANDBOX"]);
+        env.set("YI_AGENT_SANDBOX", "read-only");
+        let mut overrides = test_overrides();
+        overrides.yolo = true;
+        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        assert!(!cfg.sandbox_promotable);
+        assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn sandbox_promotable_false_when_skip_permissions() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let mut overrides = test_overrides();
+        overrides.skip_permissions = true;
+        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
+        assert!(!cfg.sandbox_promotable);
+    }
+
+    #[test]
+    fn sandbox_promotable_false_when_yolo_flag() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let mut overrides = test_overrides();
+        overrides.yolo = true;
+        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::DangerFullAccess);
+        assert!(!cfg.sandbox_promotable);
+    }
+
+    #[test]
+    fn sandbox_promotable_true_by_default() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let cfg = RuntimeConfig::load(&test_overrides()).unwrap();
+        assert!(cfg.sandbox_promotable);
     }
 
     #[test]

@@ -3047,7 +3047,7 @@ mod tests {
         let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
         let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
             crate::permission::PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));
@@ -3067,7 +3067,7 @@ mod tests {
         let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
         let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
             crate::permission::PermissionsConfig::default(),
-            true, // yolo: allow all (except blacklist, which is empty)
+            crate::autonomy::YoloSwitch::new(true), // yolo: allow all (except blacklist, which is empty)
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));
@@ -3126,7 +3126,7 @@ mod tests {
         let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
         let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
             crate::permission::PermissionsConfig::default(),
-            false, // not yolo
+            crate::autonomy::YoloSwitch::new(false), // not yolo
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));
@@ -3208,7 +3208,7 @@ mod tests {
         let blocklist: crate::permission::BlocklistFn = std::sync::Arc::new(|_| None);
         let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
             crate::permission::PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));
@@ -3311,7 +3311,7 @@ mod tests {
         });
         let checker = std::sync::Arc::new(crate::permission::PermissionChecker::new(
             crate::permission::PermissionsConfig::default(),
-            true, // yolo
+            crate::autonomy::YoloSwitch::new(true), // yolo
             std::path::PathBuf::from("/tmp"),
             blocklist,
         ));

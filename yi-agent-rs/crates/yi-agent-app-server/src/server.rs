@@ -42,6 +42,8 @@ struct BuiltAgent {
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
     /// 刷新 skills catalog 的句柄;无 skills 服务时为 `None`。
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    /// 该 agent 的运行时 yolo 开关;`ThreadSession` 存它以便 RPC 即时切换。
+    yolo: yi_agent_core::autonomy::YoloSwitch,
 }
 
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
@@ -60,9 +62,10 @@ where
         cfg,
         PERMISSION_TIMEOUT,
         workspaces,
-        move |session, cwd| {
+        move |session, cwd, mode| {
             let mut thread_cfg = cfg_for_factory.clone();
             thread_cfg.workdir = cwd.to_path_buf();
+            thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
             let built = yi_agent_runtime::bootstrap::bootstrap_agent(
                 &thread_cfg,
                 yi_agent_runtime::bootstrap::PermissionMode::Interactive,
@@ -71,6 +74,7 @@ where
                 agent: apply_session(built.agent, session),
                 decision_tx: built.decision_tx,
                 catalog: built.catalog,
+                yolo: built.yolo,
             })
         },
     )
@@ -93,7 +97,13 @@ async fn run_with<R, W, F>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    F: Fn(Option<yi_agent_core::Session>, &Path) -> anyhow::Result<BuiltAgent> + Send + 'static,
+    F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>
+        + Send
+        + 'static,
 {
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -301,6 +311,7 @@ where
                                         "created_at": m.created_at,
                                         "updated_at": m.updated_at,
                                         "title": m.title,
+                                        "permission_mode": m.permission_mode,
                                     })
                                 })
                                 .collect();
@@ -336,6 +347,7 @@ where
                                                 "created_at": m.created_at,
                                                 "updated_at": m.updated_at,
                                                 "title": m.title,
+                                                "permission_mode": m.permission_mode,
                                             })
                                         })
                                         .collect(),
@@ -369,8 +381,12 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
-                        let BuiltAgent { agent, decision_tx, catalog } =
-                            match build_agent(None, Path::new(&cwd)) {
+                        // 新线程一律以 Normal 起步;同一值既用于建 agent,也落盘 meta,
+                        // 抽成局部量避免两处字面量漂移。
+                        let mode = crate::thread_store::ThreadMode::Normal;
+
+                        let BuiltAgent { agent, decision_tx, catalog, yolo } =
+                            match build_agent(None, Path::new(&cwd), mode) {
                                 Ok(a) => a,
                                 Err(e) => {
                                     write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -391,6 +407,7 @@ where
                             created_at: now,
                             updated_at: now,
                             title: None,
+                            permission_mode: mode,
                         };
                         if let Err(e) = thread_store.create(&meta) {
                             // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -415,6 +432,7 @@ where
                                 cwd: cwd.clone(),
                                 model: model.clone(),
                                 active_turn_id: None,
+                                yolo,
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
@@ -518,6 +536,9 @@ where
                             }
                         };
 
+                        // 该 thread 持久化的自主权模式:决定重建 agent 时的 yolo 初值。
+                        let mode = loaded.meta.permission_mode;
+
                         // meta 缺 cwd/model 时(损坏重建)用当前配置兜底。
                         let cwd = if loaded.meta.cwd.is_empty() {
                             cfg.workdir.display().to_string()
@@ -543,8 +564,8 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
-                        let BuiltAgent { agent, decision_tx, catalog } =
-                            match build_agent(Some(session), Path::new(&cwd)) {
+                        let BuiltAgent { agent, decision_tx, catalog, yolo } =
+                            match build_agent(Some(session), Path::new(&cwd), mode) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
@@ -565,6 +586,7 @@ where
                                 cwd: cwd.clone(),
                                 model: model.clone(),
                                 active_turn_id: None,
+                                yolo,
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
@@ -678,6 +700,57 @@ where
                                 .await?;
                             }
                         }
+                    }
+                    "thread/setPermissionMode" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // mode 校验先于 thread 存在性:非法 mode 一律 `-32602`,
+                        // 不因 threadId 未知而改变错误码。
+                        let mode = match req.params.get("mode").and_then(|v| v.as_str()) {
+                            Some("normal") => crate::thread_store::ThreadMode::Normal,
+                            Some("yolo") => crate::thread_store::ThreadMode::Yolo,
+                            _ => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(
+                                            "mode must be \"normal\" or \"yolo\"",
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 仅内存中的活跃线程可切换:UI 的 mode chip 只对当前打开的线程可见,而该
+                        // 线程必先经 thread/start 或 thread/resume 进入内存。冷线程没有运行期
+                        // switch 可翻转(其持久化模式在 resume 时被读取),故此处不为其落盘。
+                        let Some(session) = threads.get(&thread_id) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 运行期开关立即生效:与权限层、沙箱共享同一 `Arc`,故
+                        // 无需重建 agent 本轮即可放行。
+                        session.yolo.set(mode == crate::thread_store::ThreadMode::Yolo);
+                        // 最佳努力落盘:运行期开关已生效,落盘失败不阻断本轮切换。
+                        match session.store.set_permission_mode(&thread_id, mode) {
+                            Ok(true) => {}
+                            Ok(false) => eprintln!(
+                                "[app-server] permission_mode not persisted for {thread_id}: thread meta missing"
+                            ),
+                            Err(e) => eprintln!(
+                                "[app-server] failed to persist permission_mode for {thread_id}: {e}"
+                            ),
+                        }
+                        write_response(&writer, ok_response(id, json!({}))).await?;
                     }
                     "thread/delete" => {
                         let Some(thread_id) =
@@ -1354,6 +1427,7 @@ mod tests {
     fn build_test_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
@@ -1366,12 +1440,14 @@ mod tests {
             ),
             decision_tx: None,
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
     fn build_slow_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
@@ -1384,12 +1460,14 @@ mod tests {
             ),
             decision_tx: None,
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
     fn build_delayed_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
@@ -1402,6 +1480,7 @@ mod tests {
             ),
             decision_tx: None,
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
@@ -1418,6 +1497,7 @@ mod tests {
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
+            sandbox_promotable: true,
             sandbox: yi_agent_tools::SandboxMode::default(),
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
@@ -1442,7 +1522,11 @@ mod tests {
         /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
         fn with_factory<F>(build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+            F: Fn(
+                    Option<yi_agent_core::Session>,
+                    &std::path::Path,
+                    crate::thread_store::ThreadMode,
+                ) -> anyhow::Result<BuiltAgent>
                 + Send
                 + 'static,
         {
@@ -1452,7 +1536,11 @@ mod tests {
         /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
         fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+            F: Fn(
+                    Option<yi_agent_core::Session>,
+                    &std::path::Path,
+                    crate::thread_store::ThreadMode,
+                ) -> anyhow::Result<BuiltAgent>
                 + Send
                 + 'static,
         {
@@ -1805,7 +1893,9 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
-            |_s: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
+            |_s: Option<yi_agent_core::Session>,
+             _cwd: &std::path::Path,
+             _mode: crate::thread_store::ThreadMode| {
                 Err::<BuiltAgent, _>(anyhow::anyhow!("boom"))
             },
         ));
@@ -2048,9 +2138,13 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent(None, std::path::Path::new("/tmp"))
-                .unwrap()
-                .agent,
+            build_delayed_agent(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::thread_store::ThreadMode::Normal,
+            )
+            .unwrap()
+            .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2120,9 +2214,13 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None, std::path::Path::new("/tmp"))
-                .unwrap()
-                .agent,
+            build_test_agent(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::thread_store::ThreadMode::Normal,
+            )
+            .unwrap()
+            .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2168,9 +2266,13 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None, std::path::Path::new("/tmp"))
-                .unwrap()
-                .agent,
+            build_test_agent(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::thread_store::ThreadMode::Normal,
+            )
+            .unwrap()
+            .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2301,6 +2403,7 @@ mod tests {
     fn build_permission_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         let provider = Arc::new(PermissionMockProvider {
             calls: AtomicUsize::new(0),
@@ -2309,7 +2412,7 @@ mod tests {
         registry.register(Arc::new(FakeBash));
         let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
             yi_agent_core::permission::PermissionsConfig::default(),
-            false,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
             std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
             Arc::new(|_cmd: &str| None),
         ));
@@ -2328,6 +2431,7 @@ mod tests {
             agent,
             decision_tx: Some(decision_tx),
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
@@ -2524,7 +2628,12 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
-        let built = build_permission_agent(None, std::path::Path::new("/tmp")).unwrap();
+        let built = build_permission_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             built.agent,
@@ -2679,6 +2788,96 @@ mod tests {
         h.shutdown().await;
     }
 
+    /// Task 11:`thread/list` / `thread/listAll` 的条目必须显式带出
+    /// `permission_mode`(wire 契约与存储解耦,但字段必须存在且为 lowercase)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_exposes_permission_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_normal = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_yolo = read_thread_start_response(&mut h, 3).await;
+
+        // 把第二个线程切成 yolo。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid_yolo}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert!(
+            v.get("error").is_none(),
+            "setPermissionMode must succeed: {v}"
+        );
+
+        // thread/list:每个条目带 lowercase permission_mode。
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/list must respond");
+        let threads = v["result"]["threads"].as_array().unwrap();
+        let mode_of = |tid: &str| -> serde_json::Value {
+            threads
+                .iter()
+                .find(|t| t["thread_id"].as_str() == Some(tid))
+                .unwrap_or_else(|| panic!("thread {tid} missing from thread/list: {v}"))["permission_mode"]
+                .clone()
+        };
+        assert_eq!(mode_of(&tid_normal), serde_json::json!("normal"));
+        assert_eq!(mode_of(&tid_yolo), serde_json::json!("yolo"));
+
+        // thread/listAll:分组内的条目同样带该字段。
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/listAll must respond");
+        let all_threads: Vec<&serde_json::Value> = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .collect();
+        let mode_of_all = |tid: &str| -> serde_json::Value {
+            all_threads
+                .iter()
+                .find(|t| t["thread_id"].as_str() == Some(tid))
+                .unwrap_or_else(|| panic!("thread {tid} missing from thread/listAll: {v}"))["permission_mode"]
+                .clone()
+        };
+        assert_eq!(mode_of_all(&tid_normal), serde_json::json!("normal"));
+        assert_eq!(mode_of_all(&tid_yolo), serde_json::json!("yolo"));
+
+        h.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn thread_start_with_cwd_writes_meta_cwd() {
         // 全局 workdir 与显式 cwd 指向不同目录:用于区分「按 thread 的 cwd 路由」
@@ -2799,9 +2998,11 @@ mod tests {
         let seen: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_factory = Arc::clone(&seen);
-        let build = move |session: Option<yi_agent_core::Session>, cwd: &std::path::Path| {
+        let build = move |session: Option<yi_agent_core::Session>,
+                          cwd: &std::path::Path,
+                          mode: crate::thread_store::ThreadMode| {
             seen_factory.lock().unwrap().push(cwd.to_path_buf());
-            build_test_agent(session, cwd)
+            build_test_agent(session, cwd, mode)
         };
         let mut h = Harness::with_factory(build, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
@@ -3016,7 +3217,9 @@ mod tests {
         cfg.workdir = dir.path().to_path_buf();
         let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_factory = Arc::clone(&seen);
-        let build = move |session: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
             Ok(BuiltAgent {
                 agent: apply_session(
                     yi_agent_core::Agent::new(
@@ -3030,6 +3233,7 @@ mod tests {
                 ),
                 decision_tx: None,
                 catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             })
         };
         let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -3112,6 +3316,277 @@ mod tests {
             unique.len(),
             item_ids.len(),
             "item ids must be unique across replay + resumed turn: {item_ids:?}"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Task 9:resume 必须读取该 thread 持久化的 `permission_mode` 并透传给 agent
+    /// 工厂,使 yolo 线程重开后仍以 yolo 重建。工厂内部 `mode → cfg.yolo → 共享
+    /// YoloSwitch` 的映射由 `bootstrap.rs::interactive_yolo_config_starts_switch_on`
+    /// 钉死;此处只钉死「app-server 侧 resume 读了持久化模式并透传」这一契约
+    /// (server 内存中的 switch 不可从外部观测,故用记录型工厂观察传参)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_passes_persisted_mode_to_factory() {
+        use crate::thread_store::{ThreadMode, ThreadStore};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+
+        let seen: Arc<std::sync::Mutex<Vec<ThreadMode>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          cwd: &std::path::Path,
+                          mode: ThreadMode| {
+            seen_c.lock().unwrap().push(mode);
+            build_test_agent(session, cwd, mode)
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // thread/start 必须走 Normal。
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[ThreadMode::Normal],
+            "thread/start must build with Normal"
+        );
+
+        // 绕过 RPC,直接把该线程持久化的 permission_mode 改成 Yolo。
+        let store = ThreadStore::new(dir.path());
+        assert!(
+            store.set_permission_mode(&tid, ThreadMode::Yolo).unwrap(),
+            "thread meta must exist after thread/start"
+        );
+
+        // resume 应读取持久化的 Yolo 并透传给工厂。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resumed = false;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                assert_eq!(v["result"]["thread_id"], tid);
+                resumed = true;
+                break;
+            }
+        }
+        assert!(resumed, "thread/resume must respond");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.last(),
+            Some(&ThreadMode::Yolo),
+            "resume must pass the persisted mode to the factory: {seen:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// Task 10:`thread/setPermissionMode` 必须实时翻转该线程的 `YoloSwitch`
+    /// (运行期立即生效)并把 `permission_mode` 落盘(resume 后仍读得到)。
+    /// server 内存里的 switch 外部不可观测,故用记录型工厂捕获工厂实际交给
+    /// 该线程的同一个 `YoloSwitch`,以它断言运行期开关被翻转。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_permission_mode_toggles_and_persists() {
+        use crate::thread_store::{ThreadMode, ThreadStore};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+
+        let seen: Arc<std::sync::Mutex<Vec<yi_agent_core::autonomy::YoloSwitch>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          cwd: &std::path::Path,
+                          mode: ThreadMode| {
+            let sw = yi_agent_core::autonomy::YoloSwitch::new(mode == ThreadMode::Yolo);
+            seen_c.lock().unwrap().push(sw.clone());
+            let mut built = build_test_agent(session, cwd, mode)?;
+            built.yolo = sw;
+            Ok(built)
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        let sw = seen.lock().unwrap().last().cloned().unwrap();
+        assert!(!sw.get(), "a freshly started thread must not be in yolo");
+
+        // 切到 yolo:响应成功,运行期开关立即为 true,且已落盘。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert!(
+            v.get("error").is_none(),
+            "setPermissionMode must succeed: {v}"
+        );
+        assert_eq!(v["result"], serde_json::json!({}));
+        assert!(sw.get(), "the thread's YoloSwitch must turn on immediately");
+        let store = ThreadStore::new(dir.path());
+        assert_eq!(
+            store
+                .load(&tid)
+                .unwrap()
+                .expect("thread meta must exist")
+                .meta
+                .permission_mode,
+            ThreadMode::Yolo,
+            "yolo must persist to disk"
+        );
+
+        // 切回 normal:开关关掉,落盘也回到 normal。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"normal"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert!(
+            v.get("error").is_none(),
+            "setPermissionMode must succeed: {v}"
+        );
+        assert!(
+            !sw.get(),
+            "the thread's YoloSwitch must turn off immediately"
+        );
+        assert_eq!(
+            store
+                .load(&tid)
+                .unwrap()
+                .expect("thread meta must exist")
+                .meta
+                .permission_mode,
+            ThreadMode::Normal,
+            "normal must persist to disk"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Task 10:非法 `mode` 报 `-32602`(且优先于 thread 存在性校验);未知
+    /// `threadId` 报 `-32011`。两者分别用独立请求覆盖。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_permission_mode_rejects_bad_mode_and_unknown_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // 非法 mode:即便 thread 真实存在也必须 `-32602`。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"bogus"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "invalid mode must be invalid_params: {v}"
+        );
+
+        // 未知 thread + 合法 mode → `-32011`。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{"threadId":"nope","mode":"yolo"}}"#,
+        )
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32011,
+            "unknown thread must be unknown_thread: {v}"
+        );
+
+        // 非法 mode + 未知 thread → 仍是 `-32602`:证明 mode 校验先于 thread
+        // 存在性,不会因 threadId 未知而退化成 `-32011`。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/setPermissionMode","params":{"threadId":"nope","mode":"bogus"}}"#,
+        )
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "invalid mode must win over thread existence: {v}"
+        );
+
+        // 缺少 threadId → `-32602`(invalid params)。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":6,"method":"thread/setPermissionMode","params":{"mode":"yolo"}}"#,
+        )
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "missing threadId must be invalid_params: {v}"
+        );
+
+        // 非字符串 mode(数字)→ `-32602`:`as_str()` 落空,走 `_` 分支。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":5}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(7)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "non-string mode must be invalid_params: {v}"
         );
 
         h.shutdown().await;

@@ -11,7 +11,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::time;
 
-use crate::sandbox::{SandboxMode, SandboxPolicy};
+use crate::sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 use crate::shell::blocklist;
 
 pub const DEFAULT_STREAM_CAP_BYTES: usize = 256 * 1024;
@@ -249,6 +249,19 @@ impl ProcessManager {
             processes: Arc::new(Mutex::new(HashMap::new())),
             events,
         })
+    }
+
+    /// Build a process manager backed by an externally-owned sandbox controller.
+    ///
+    /// Sharing the controller with the shell tool keeps a live YOLO switch in
+    /// sync across both execution paths.
+    pub fn with_controller(
+        root: PathBuf,
+        controller: SandboxController,
+        extra_writable_roots: Vec<PathBuf>,
+    ) -> Arc<Self> {
+        let sandbox = SandboxPolicy::with_controller(&root, extra_writable_roots, controller);
+        Self::with_sandbox(root, sandbox)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ProcessEvent> {

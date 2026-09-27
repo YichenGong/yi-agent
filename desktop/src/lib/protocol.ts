@@ -13,6 +13,8 @@
  * This module is types only — no runtime logic.
  */
 
+import type { ThreadMode } from "./threadPermissionMode";
+
 export type RequestId = number | string;
 
 export interface RpcError {
@@ -104,6 +106,8 @@ export interface ThreadSummary {
   created_at: number;
   updated_at: number;
   title: string | null;
+  /** Per-thread autonomy mode. 缺省(旧服务端/旧数据)视为 "normal";读取用 `?? "normal"`。 */
+  permission_mode?: ThreadMode;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */

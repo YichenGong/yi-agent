@@ -1,6 +1,7 @@
 //! yi-agent-core: agent loop, session management, and core trait definitions.
 
 pub mod agent;
+pub mod autonomy;
 pub mod compact;
 pub mod message;
 pub mod permission;

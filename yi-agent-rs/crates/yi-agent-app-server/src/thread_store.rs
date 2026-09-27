@@ -12,6 +12,15 @@ use yi_agent_core::{ContentBlock, Message, Role};
 
 use crate::protocol::Item;
 
+/// 线程的自主权模式。持久化到 `.meta.json`,重开 app 后恢复。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadMode {
+    #[default]
+    Normal,
+    Yolo,
+}
+
 /// thread 元数据(`.meta.json` 的内容)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadMeta {
@@ -22,6 +31,9 @@ pub struct ThreadMeta {
     pub created_at: i64,
     pub updated_at: i64,
     pub title: Option<String>,
+    /// 该 thread 的自主权模式;旧 meta 缺失时默认 Normal。
+    #[serde(default)]
+    pub permission_mode: ThreadMode,
 }
 
 /// 一次 turn 的 token 用量。
@@ -240,6 +252,18 @@ impl ThreadStore {
             .is_some())
     }
 
+    /// 只重写 meta 的 `permission_mode`。走同一把 `update_meta` 锁,
+    /// 避免与并发 `rename` / `touch` 互相覆盖。
+    ///
+    /// 有意**不**刷新 `updated_at`:切换自主权模式属于设置变更而非 thread 活动,
+    /// 不应影响按 `updated_at` 排序的列表顺序。
+    /// 返回 false 表示 thread 不存在或 meta 不可读。
+    pub fn set_permission_mode(&self, id: &str, mode: ThreadMode) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| meta.permission_mode = mode)?
+            .is_some())
+    }
+
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
     /// `title_hint`(本轮 prompt)填充。thread 不存在或 meta 不可读时静默返回。
     pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {
@@ -382,6 +406,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         created_at: created,
         updated_at: created,
         title: first_user_text(messages),
+        permission_mode: ThreadMode::Normal,
     }
 }
 
@@ -404,6 +429,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             title: None,
+            permission_mode: ThreadMode::Normal,
         }
     }
 
@@ -814,5 +840,47 @@ mod tests {
         let back: TurnUsage = serde_json::from_str(&s).unwrap();
         assert_eq!(back.cache_creation_input_tokens, 30);
         assert_eq!(back.cache_read_input_tokens, 40);
+    }
+
+    #[test]
+    fn permission_mode_defaults_to_normal_and_roundtrips() {
+        let v: ThreadMeta = serde_json::from_str(
+            r#"{"thread_id":"t","cwd":"/x","model":"m","created_at":0,"updated_at":0,"title":null}"#,
+        )
+        .unwrap();
+        assert_eq!(v.permission_mode, ThreadMode::Normal); // 旧 meta 兼容
+        let mut m = v;
+        m.permission_mode = ThreadMode::Yolo;
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"permission_mode\":\"yolo\""));
+        let back: ThreadMeta = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.permission_mode, ThreadMode::Yolo);
+    }
+
+    #[test]
+    fn set_permission_mode_persists() {
+        let (_d, s) = store();
+        let m = meta("thread-1");
+        s.create(&m).unwrap();
+        assert!(s.set_permission_mode("thread-1", ThreadMode::Yolo).unwrap());
+        let loaded = s.load("thread-1").unwrap().unwrap();
+        assert_eq!(loaded.meta.permission_mode, ThreadMode::Yolo);
+    }
+
+    #[test]
+    fn set_permission_mode_unknown_returns_false() {
+        let (_d, s) = store();
+        assert!(!s.set_permission_mode("nope", ThreadMode::Yolo).unwrap());
+    }
+
+    #[test]
+    fn set_permission_mode_rejects_invalid_ids() {
+        let (_d, s) = store();
+        for bad in ["../evil", "a/b", "", "a\\b"] {
+            assert!(
+                s.set_permission_mode(bad, ThreadMode::Yolo).is_err(),
+                "set_permission_mode must reject {bad:?}"
+            );
+        }
     }
 }
