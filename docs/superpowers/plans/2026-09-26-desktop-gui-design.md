@@ -138,7 +138,8 @@ initialize → initialized → thread/start → turn/start → (item/* 通知) �
 
 | AgentEvent | 协议 |
 |---|---|
-| `AssistantText` / `DecodeDelta` | `agentMessage` + `item/delta` |
+| `AssistantText` | `agentMessage` + `item/delta` |
+| `DecodeDelta` | 忽略(工具入参 JSON 分片,不渲染) |
 | `ToolCall` | `item/started`(toolCall) |
 | `ToolOutputDelta` | `item/delta` |
 | `ToolResult` / `ToolExit` / `ToolTimeout` | `item/completed` |
@@ -146,6 +147,12 @@ initialize → initialized → thread/start → turn/start → (item/* 通知) �
 | `Usage` | `thread/tokenUsage/updated` |
 | `PermissionRequest` | 反向请求 `item/toolCall/requestApproval` |
 | `PermissionResolved` | 通知 |
+
+> 修正(2026-09-28):`DecodeDelta` 携带的是**工具调用入参**的流式 JSON 分片
+> (`agent.rs` 转发 `ProviderEvent::ToolUseDelta.partial_json`),不是助手散文。
+> 早先把它并入 `agentMessage` 会让同一段命令在正文出现一次、又在随后的
+> `toolCall` 卡片出现一次(分片到达时还会显示成半截 JSON)。TUI(`tui/history.rs`)
+> 与 headless drain 都忽略它,translator 亦同。
 
 ### 6.6 错误码
 
