@@ -144,6 +144,24 @@ pub fn build_tool_setup_in(
     naked: bool,
     workspace: &Path,
 ) -> Result<ToolSetup> {
+    build_tool_setup_with_switch(
+        cfg,
+        naked,
+        workspace,
+        yi_agent_core::autonomy::YoloSwitch::new(cfg.yolo),
+    )
+}
+
+/// 同 [`build_tool_setup_in`],但由调用方提供共享的 [`yi_agent_core::autonomy::YoloSwitch`]。
+///
+/// 沙箱层与控制权限的 `PermissionChecker` 由此共用同一份开关:`bootstrap_agent`
+/// 建唯一一份 switch,clone 给沙箱与权限,翻转时两层同时生效。
+pub fn build_tool_setup_with_switch(
+    cfg: &RuntimeConfig,
+    naked: bool,
+    workspace: &Path,
+    switch: yi_agent_core::autonomy::YoloSwitch,
+) -> Result<ToolSetup> {
     if naked {
         return Ok(ToolSetup {
             tools: Arc::new(yi_agent_core::ToolRegistry::new()),
@@ -160,7 +178,6 @@ pub fn build_tool_setup_in(
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
-    let switch = yi_agent_core::autonomy::YoloSwitch::new(cfg.yolo);
     let controller =
         yi_agent_tools::SandboxController::new(switch, cfg.sandbox, cfg.sandbox_promotable);
     yi_agent_tools::register_builtin_tools_with_controller(
@@ -209,6 +226,8 @@ pub struct AgentBootstrap {
     pub decision_rx: Option<DecisionReceiver>,
     /// 刷新 skills catalog 的句柄;无 skills 服务时为 `None`。
     pub catalog: Option<SkillsCatalogHandle>,
+    /// 本次装配的共享 yolo 开关(clone 自沙箱与权限共用的同一 `Arc`)。
+    pub yolo: yi_agent_core::autonomy::YoloSwitch,
 }
 
 /// 由运行时配置构造 [`yi_agent_core::AgentConfig`](集中一处,避免各调用点漂移)。
@@ -230,13 +249,17 @@ pub fn build_agent_config(
 /// 组装 provider + 工具 + 权限通道,返回可运行的 agent。
 pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<AgentBootstrap> {
     let provider = build_provider(cfg)?;
-    let setup = build_tool_setup(cfg, false)?;
 
-    let yolo = match mode {
+    // 唯一一份共享开关:同时交给沙箱与控制权限的 PermissionChecker,并由
+    // AgentBootstrap 暴露出去(供后续 app-server 按线程切换模式)。
+    let yolo_on = match mode {
         PermissionMode::Interactive => cfg.yolo,
         PermissionMode::AutoAllow => true,
     };
-    let checker = load_permission_checker(&cfg.workdir, yolo)?;
+    let switch = yi_agent_core::autonomy::YoloSwitch::new(yolo_on);
+
+    let setup = build_tool_setup_with_switch(cfg, false, &cfg.workdir, switch.clone())?;
+    let checker = load_permission_checker_with_switch(&cfg.workdir, switch.clone())?;
 
     let (decision_tx, decision_rx) =
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -254,6 +277,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 decision_tx: Some(decision_tx),
                 decision_rx: Some(rx_arc),
                 catalog: setup.catalog,
+                yolo: switch.clone(),
             })
         }
         PermissionMode::AutoAllow => {
@@ -269,6 +293,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 decision_tx: None,
                 decision_rx: None,
                 catalog: setup.catalog,
+                yolo: switch.clone(),
             })
         }
     }
@@ -282,6 +307,17 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
 pub fn load_permission_checker(
     workdir: &Path,
     yolo: bool,
+) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
+    load_permission_checker_with_switch(workdir, yi_agent_core::autonomy::YoloSwitch::new(yolo))
+}
+
+/// 加载权限检查器,使用调用方提供的共享 [`yi_agent_core::autonomy::YoloSwitch`]。
+///
+/// 与 [`load_permission_checker`] 的区别仅在于开关由外部传入,便于与沙箱层
+/// (`build_tool_setup_with_switch`)共用同一份 `Arc`。
+pub fn load_permission_checker_with_switch(
+    workdir: &Path,
+    yolo: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
     let permissions = std::thread::scope(|scope| {
         scope
@@ -298,7 +334,7 @@ pub fn load_permission_checker(
         Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
     Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
         permissions,
-        yi_agent_core::autonomy::YoloSwitch::new(yolo),
+        yolo,
         workdir.to_path_buf(),
         blocklist_fn,
     )))
@@ -698,6 +734,39 @@ mod tests {
         let naked = build_tool_setup_in(&cfg, true, workspace).expect("build naked setup");
         assert!(naked.tools.is_empty());
         assert!(naked.system_prompt.is_none());
+    }
+
+    /// 沙箱层与权限层共用**同一个** switch:`build_tool_setup_with_switch` 与
+    /// `load_permission_checker_with_switch` 收到同一份 clone(源自
+    /// `bootstrap_agent` 里的唯一 `YoloSwitch`),因此翻转它时两层同时生效。
+    ///
+    /// 沙箱的实际提权行为由 `yi-agent-tools` 的 sandbox 单测覆盖:此处无法直接
+    /// 观测——`BashTool` / `ProcessManager` 的 sandbox 字段非公开,装配结果只能
+    /// 间接反映到工具集里。
+    ///
+    /// (计划原文测试名为 `bootstrap_returns_shared_switch_that_toggles_sandbox`,
+    /// 但该断言体实际观测不到沙箱,故改为如实描述断言内容的名称。)
+    #[test]
+    fn bootstrap_exposes_switch_shared_with_permission_checker() {
+        let cfg = sample_config();
+        let b = bootstrap_agent(&cfg, PermissionMode::Interactive).expect("bootstrap");
+        // Interactive + cfg.yolo=false → 开关初始关闭
+        assert!(!b.yolo.get());
+        // 打开共享开关:权限检查器必须立即看到(证明两者共享同一 Arc)
+        b.yolo.set(true);
+        assert!(b.yolo.get());
+        assert!(
+            b.permission.is_yolo(),
+            "permission checker must share the switch"
+        );
+    }
+
+    #[test]
+    fn bootstrap_auto_allow_starts_with_switch_on() {
+        let cfg = sample_config();
+        let b = bootstrap_agent(&cfg, PermissionMode::AutoAllow).expect("bootstrap");
+        assert!(b.yolo.get(), "auto-allow starts with yolo on");
+        assert!(b.permission.is_yolo());
     }
 
     #[tokio::test]
