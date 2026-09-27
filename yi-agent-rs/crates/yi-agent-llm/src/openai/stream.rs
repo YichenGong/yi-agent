@@ -163,6 +163,60 @@ where
 
         if let Some(choices) = data.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
+                // Deltas must be emitted before the terminal finish_reason
+                // events for the same chunk. Some OpenAI-compatible gateways
+                // pack the final content delta and finish_reason into one
+                // chunk; emitting Stop first would make downstream guards
+                // (which latch on Stop) discard that delta, producing an empty
+                // reply.
+                if !self.stopped {
+                    if let Some(delta) = choice.get("delta") {
+                        if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                            if !content.is_empty() {
+                                events.push(ProviderEvent::TextDelta(content.to_string()));
+                            }
+                        }
+
+                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array())
+                        {
+                            for tc in tool_calls {
+                                let index =
+                                    tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+                                if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                                    let name = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    self.tool_calls
+                                        .insert(index, (id.to_string(), name.clone()));
+                                    events.push(ProviderEvent::ToolUseStart {
+                                        id: id.to_string(),
+                                        name,
+                                    });
+                                }
+
+                                if let Some(args) = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(Value::as_str)
+                                {
+                                    if !args.is_empty() {
+                                        if let Some((id, _)) = self.tool_calls.get(&index) {
+                                            events.push(ProviderEvent::ToolUseDelta {
+                                                id: id.clone(),
+                                                partial_json: args.to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
                     if self.stopped {
                         continue;
@@ -198,51 +252,6 @@ where
                             events.push(ProviderEvent::Stop {
                                 reason: StopReason::Other(other.to_string()),
                             });
-                        }
-                    }
-                }
-
-                if let Some(delta) = choice.get("delta") {
-                    if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                        if !content.is_empty() {
-                            events.push(ProviderEvent::TextDelta(content.to_string()));
-                        }
-                    }
-
-                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                        for tc in tool_calls {
-                            let index =
-                                tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-
-                            if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                self.tool_calls
-                                    .insert(index, (id.to_string(), name.clone()));
-                                events.push(ProviderEvent::ToolUseStart {
-                                    id: id.to_string(),
-                                    name,
-                                });
-                            }
-
-                            if let Some(args) = tc
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(Value::as_str)
-                            {
-                                if !args.is_empty() {
-                                    if let Some((id, _)) = self.tool_calls.get(&index) {
-                                        events.push(ProviderEvent::ToolUseDelta {
-                                            id: id.clone(),
-                                            partial_json: args.to_string(),
-                                        });
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -349,6 +358,25 @@ mod tests {
         assert!(matches!(&events[1], ProviderEvent::TextDelta(t) if t == " world"));
         assert!(matches!(
             &events[2],
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn emits_text_delta_before_stop_when_finish_reason_shares_chunk() {
+        // Regression: gateways may put the final content delta and
+        // finish_reason in one chunk. Content must be emitted before Stop, or
+        // downstream guards that latch on Stop will drop the text.
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(events.len(), 2, "events: {:?}", events);
+        assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "Hi"));
+        assert!(matches!(
+            &events[1],
             ProviderEvent::Stop {
                 reason: StopReason::EndTurn
             }
