@@ -2044,4 +2044,80 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn box_layout_is_used_down_to_the_minimum_width_then_degrades() {
+        // Three columns need 4*3+1 = 13 cols. At 13 the box still fits (rows
+        // wrap taller); one column narrower it is impossible and the table
+        // must degrade rather than clip.
+        let src = "| a | b | c |\n| --- | --- | --- |\n| alpha | bravo | charlie |\n";
+        for width in [14u16, 13] {
+            let rendered = table_lines(&render_markdown(src, width));
+            assert!(
+                rendered.iter().any(|line| line.contains('│')),
+                "width {width} should still use a box: {rendered:?}"
+            );
+            assert!(
+                rendered
+                    .iter()
+                    .all(|line| UnicodeWidthStr::width(line.as_str()) <= width as usize),
+                "width {width} overflowed: {rendered:?}"
+            );
+        }
+        for width in [12u16, 11] {
+            let rendered = table_lines(&render_markdown(src, width));
+            assert!(
+                !rendered.iter().any(|line| line.contains('│')),
+                "width {width} cannot hold a box; expected vertical records: {rendered:?}"
+            );
+            assert!(
+                rendered
+                    .iter()
+                    .all(|line| UnicodeWidthStr::width(line.as_str()) <= width as usize),
+                "width {width} overflowed: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_with_an_empty_header_cell_still_fits() {
+        // A blank header cell yields a natural column width of 0, which must
+        // not underflow the padding arithmetic.
+        let src = "| a |  | c |\n| --- | --- | --- |\n| x | y | z |\n";
+        for width in [11u16, 13, 20] {
+            for line in table_lines(&render_markdown(src, width)) {
+                let w = UnicodeWidthStr::width(line.as_str());
+                assert!(
+                    w <= width as usize,
+                    "width {width}: line is {w} cols: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_column_table_degrades_below_its_minimum_width() {
+        // One column needs 4*1+1 = 5 cols, so 5 is the last box width.
+        let src = "| H |\n| --- |\n| value |\n";
+        let boxed = table_lines(&render_markdown(src, 5));
+        assert!(
+            boxed.iter().any(|line| line.contains('│')),
+            "width 5 should still fit a box: {boxed:?}"
+        );
+        let degraded = table_lines(&render_markdown(src, 4));
+        assert!(
+            !degraded.iter().any(|line| line.contains('│')),
+            "width 4 cannot hold a box: {degraded:?}"
+        );
+        for width in [4u16, 5] {
+            let rendered = table_lines(&render_markdown(src, width));
+            for line in &rendered {
+                let w = UnicodeWidthStr::width(line.as_str());
+                assert!(
+                    w <= width as usize,
+                    "width {width}: line is {w} cols: {line:?}"
+                );
+            }
+        }
+    }
 }
