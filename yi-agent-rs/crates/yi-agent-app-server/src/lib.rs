@@ -6,5 +6,6 @@ pub mod session;
 pub mod thread_store;
 pub mod translate;
 pub mod transport;
+pub mod workspace_index;
 
 pub use server::run;
