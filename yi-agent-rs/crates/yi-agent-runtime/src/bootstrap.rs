@@ -160,20 +160,20 @@ pub fn build_tool_setup_in(
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
-    yi_agent_tools::register_builtin_tools_with_sandbox(
+    let switch = yi_agent_core::autonomy::YoloSwitch::new(cfg.yolo);
+    let controller =
+        yi_agent_tools::SandboxController::new(switch, cfg.sandbox, cfg.sandbox_promotable);
+    yi_agent_tools::register_builtin_tools_with_controller(
         &mut registry,
         workspace.to_path_buf(),
-        cfg.sandbox,
+        controller.clone(),
         cfg.sandbox_writable_roots.clone(),
     );
 
-    let process_manager = yi_agent_tools::ProcessManager::with_sandbox(
+    let process_manager = yi_agent_tools::ProcessManager::with_controller(
         workspace.to_path_buf(),
-        yi_agent_tools::SandboxPolicy::new(
-            cfg.sandbox,
-            workspace,
-            cfg.sandbox_writable_roots.clone(),
-        ),
+        controller,
+        cfg.sandbox_writable_roots.clone(),
     );
     yi_agent_tools::register_process_tools(&mut registry, process_manager);
 

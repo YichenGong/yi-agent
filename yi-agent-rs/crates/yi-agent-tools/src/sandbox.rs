@@ -33,6 +33,8 @@ pub struct SandboxController {
 
 impl SandboxController {
     pub fn new(switch: YoloSwitch, base: SandboxMode, promotable: bool) -> Self {
+        // read-only 会话不允许被 yolo 提权;这是安全兜底,不可绕过。
+        let promotable = promotable && base != SandboxMode::ReadOnly;
         Self {
             switch,
             base,
@@ -275,6 +277,33 @@ mod tests {
         let sw2 = yi_agent_core::autonomy::YoloSwitch::new(true);
         let ctrl2 = SandboxController::new(sw2, SandboxMode::ReadOnly, false);
         assert_eq!(ctrl2.effective(), SandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_base_is_never_promotable() {
+        let sw = yi_agent_core::autonomy::YoloSwitch::new(true);
+        // 即便传入 promotable=true,base=ReadOnly 也必须被 clamp 成不可提权
+        let ctrl = SandboxController::new(sw, SandboxMode::ReadOnly, true);
+        assert_eq!(ctrl.effective(), SandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn allows_writes_follows_base_not_switch() {
+        let sw = yi_agent_core::autonomy::YoloSwitch::new(false);
+        let ro = SandboxPolicy::with_controller(
+            Path::new("/tmp"),
+            vec![],
+            SandboxController::new(sw.clone(), SandboxMode::ReadOnly, false),
+        );
+        assert!(!ro.allows_writes());
+        let ww = SandboxPolicy::with_controller(
+            Path::new("/tmp"),
+            vec![],
+            SandboxController::new(sw.clone(), SandboxMode::WorkspaceWrite, true),
+        );
+        assert!(ww.allows_writes());
+        sw.set(true);
+        assert!(ww.allows_writes(), "yolo 翻转不得撤销工具面");
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use process::{
     ProcessManager, ProcessReadResult, ProcessReadTool, ProcessSelector, ProcessStartOptions,
     ProcessStartResult, ProcessStartTool, ProcessStatus,
 };
-pub use sandbox::{SandboxMode, SandboxPolicy};
+pub use sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
 pub use skill_tool::SkillTool;
@@ -59,8 +59,27 @@ pub fn register_builtin_tools_with_sandbox(
     sandbox_mode: SandboxMode,
     extra_writable_roots: Vec<PathBuf>,
 ) {
+    let controller = SandboxController::new(
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        sandbox_mode,
+        false,
+    );
+    register_builtin_tools_with_controller(registry, root, controller, extra_writable_roots);
+}
+
+/// Register builtin tools sharing one externally-owned sandbox controller.
+///
+/// The same controller instance backs both the shell tool and any process
+/// manager built alongside it, so a live YOLO switch flips every execution
+/// path at once instead of drifting between independent policies.
+pub fn register_builtin_tools_with_controller(
+    registry: &mut ToolRegistry,
+    root: PathBuf,
+    controller: SandboxController,
+    extra_writable_roots: Vec<PathBuf>,
+) {
     let ctx = Arc::new(ToolsContext::new(root));
-    let sandbox = SandboxPolicy::new(sandbox_mode, ctx.root(), extra_writable_roots);
+    let sandbox = SandboxPolicy::with_controller(ctx.root(), extra_writable_roots, controller);
     // A read-only session has no write/edit tool surface, in addition to the
     // process-level file-write denial enforced for shell commands.
     registry.register(Arc::new(ReadTool::new(ctx.clone())));
@@ -80,4 +99,22 @@ pub fn register_builtin_tools_with_sandbox(
         registry.register(Arc::new(WebSearchTool::new(Arc::new(bocha))));
     }
     // BOCHA_API_KEY not set: WebSearchTool not registered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use yi_agent_core::autonomy::YoloSwitch;
+
+    #[test]
+    fn shared_controller_reaches_bash_and_process_manager() {
+        let sw = YoloSwitch::new(false);
+        let ctrl = SandboxController::new(sw.clone(), SandboxMode::WorkspaceWrite, true);
+        let b = SandboxPolicy::with_controller(Path::new("/tmp"), vec![], ctrl.clone());
+        let p = SandboxPolicy::with_controller(Path::new("/tmp"), vec![], ctrl.clone());
+        sw.set(true);
+        assert_eq!(b.mode(), SandboxMode::DangerFullAccess);
+        assert_eq!(p.mode(), SandboxMode::DangerFullAccess);
+    }
 }
