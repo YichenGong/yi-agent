@@ -104,6 +104,37 @@ async fn streams_text_deltas_correctly() {
 }
 
 #[tokio::test]
+async fn accumulates_content_that_shares_a_chunk_with_finish_reason() {
+    // Regression: some OpenAI-compatible gateways (e.g. reasoning-model proxies)
+    // emit the final text delta in the SAME chunk that carries finish_reason.
+    // The provider must still surface that text; otherwise the agent loop sees
+    // an empty reply and the user gets no feedback.
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
+                data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3424,\"completion_tokens\":2,\"total_tokens\":3426}}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server);
+    let resp: ProviderResponse = provider.call(simple_request()).await.expect("call ok");
+
+    assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    assert_eq!(resp.content.len(), 1, "content: {:?}", resp.content);
+    match &resp.content[0] {
+        ContentBlock::Text(t) => assert_eq!(t, "Hi"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn streams_tool_use_deltas_correctly() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
