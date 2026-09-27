@@ -57,6 +57,17 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 /// - `interrupt_tx`: signals to interrupt the current agent run
 /// - `is_running`: shared flag indicating if agent is currently running
 #[allow(clippy::too_many_arguments)]
+/// Write the "pending messages were dropped" notice, if any.
+///
+/// Split out from `run_tui` so the message and the `> 0` condition are both
+/// testable: `run_tui` needs a real TTY (`enable_raw_mode`), so the notice
+/// itself cannot be exercised through it.
+fn report_dropped_pending<W: io::Write>(out: &mut W, dropped: usize) {
+    if dropped > 0 {
+        let _ = writeln!(out, "已丢弃 {dropped} 条排队消息（未发送）");
+    }
+}
+
 pub fn run_tui(
     mut agent_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::Sender<String>,
@@ -114,9 +125,7 @@ pub fn run_tui(
     // Report the dropped count only after the alternate screen is gone;
     // printing earlier would be erased along with it.
     if let Ok(dropped) = result {
-        if dropped > 0 {
-            eprintln!("已丢弃 {dropped} 条排队消息（未发送）");
-        }
+        report_dropped_pending(&mut io::stderr(), dropped);
     }
 
     match (result, cleanup_error) {
@@ -4530,6 +4539,32 @@ mod tests {
         assert_eq!(
             dropped, 1,
             "the queued-but-never-sent message must be reported as dropped"
+        );
+    }
+
+    /// The quit notice must name the count, and must stay silent when nothing
+    /// was dropped. Covered here rather than through `run_tui`, which needs a
+    /// real TTY (`enable_raw_mode`).
+    #[test]
+    fn report_dropped_pending_writes_the_count_only_when_nonzero() {
+        let mut buf: Vec<u8> = Vec::new();
+        report_dropped_pending(&mut buf, 3);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains('3'),
+            "the notice must name how many were dropped: {text:?}"
+        );
+        assert!(
+            text.contains("已丢弃"),
+            "the notice must be the user-facing message: {text:?}"
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        report_dropped_pending(&mut buf, 0);
+        assert!(
+            buf.is_empty(),
+            "nothing must be printed when no messages were dropped: {:?}",
+            String::from_utf8_lossy(&buf)
         );
     }
 
