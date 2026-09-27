@@ -81,8 +81,12 @@ sidecar 的工作目录**写死为 `$HOME`**（`desktop/src-tauri/src/bridge.rs:
 ### 4.3 关键约束
 
 - 对话的目录归属以 `ThreadMeta.cwd` 为准；`ThreadSession.cwd` 作为内存中的权威索引键。
-- 目录索引与对话数据可各自独立演进：索引为空但目录里有对话 → `thread/listAll` 仍会
-  把该目录的对话列出来（组头来自 `ThreadMeta.cwd`）；反之不影响。
+- 目录索引与对话数据在存储上分离，但 `thread/listAll` **以索引为驱动**：只遍历
+  `workspaces.json` 里的目录（失效目录跳过），不主动扫描磁盘上的其它目录。
+  「索引里没有该目录」即该目录的对话不出现在侧栏——这与 §3「移除仅从列表移除」一致
+  （移除 = 隐藏，不动数据）。副作用：升级安装若 `$HOME/.yi-agent/threads/` 已有对话
+  而未进索引，初始侧栏看不到；缓解（启动时用 `cfg.workdir` 播种索引）见
+  `docs/project-management/desktop.md`「已知限制 / P2 待办」。
 
 ## 5. 协议设计
 
