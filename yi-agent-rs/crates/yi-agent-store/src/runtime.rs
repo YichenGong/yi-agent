@@ -2335,17 +2335,24 @@ impl RuntimeCoordinator {
                 None => None,
             };
             if let Some(owner_workspace) = owner_workspace.as_ref() {
-                // The merge check runs git with the owner worktree as its working
-                // directory. If the owner was already reclaimed (an earlier pass
-                // removed the root, say), the check cannot run at all, so skip
-                // quietly: logging an error every sweep tick would be misleading
-                // and the child becomes reclaimable again once the owner is
-                // rebuilt.
-                if !owner_workspace.path.exists() {
-                    continue;
-                }
+                // The merge check runs git with a working directory. Prefer the
+                // owner's worktree, but it may already have been reclaimed by an
+                // earlier pass (the exit trigger reclaims the root). Skipping the
+                // child then would strand its directory forever: a terminal task
+                // never starts a worker, so the owner is never rebuilt and the
+                // child can never become reclaimable again. `merge-base
+                // --is-ancestor` resolves both branch names from the ref database,
+                // so the repository root answers the same question.
+                let check_workspace = if owner_workspace.path.exists() {
+                    owner_workspace.clone()
+                } else {
+                    WorkerWorkspace {
+                        path: child_workspace.repository_root.clone(),
+                        ..owner_workspace.clone()
+                    }
+                };
                 match service.is_merged_into(
-                    owner_workspace,
+                    &check_workspace,
                     &child_workspace.branch,
                     &child_workspace.parent_branch,
                 ) {

@@ -4406,13 +4406,14 @@ async fn reclaim_uses_the_recorded_parent_branch_not_the_owner_head() {
     );
 }
 
-/// A child whose owner directory is already gone must be skipped before the
-/// merge check runs, not after. The merge check shells out to git with the owner
-/// worktree as its working directory, so running it against a reclaimed owner
-/// fails and logs a misleading "merge check failed ... owner HEAD is detached"
-/// on every sweep tick.
+/// A child whose owner directory is already gone must still be merge-checked.
+/// The check shells out to git with a working directory, and the owner worktree
+/// may already have been reclaimed by an earlier pass, so the check falls back to
+/// the repository root: `merge-base --is-ancestor` resolves both branch names from
+/// the ref database, so any directory inside the repository answers the same
+/// question.
 #[tokio::test]
-async fn reclaim_skips_the_merge_check_when_the_owner_directory_is_gone() {
+async fn reclaim_still_checks_merging_when_the_owner_directory_is_gone() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let repository_root = directory.path().join("repo");
@@ -4464,9 +4465,11 @@ async fn reclaim_skips_the_merge_check_when_the_owner_directory_is_gone() {
     );
     merge_checks.lock().unwrap().clear();
 
-    // Terminal, so the child clears the state gate; the owner-existence guard is
-    // then what decides whether the merge check is attempted, which is what this
-    // test observes through the empty `merge_checks` recorder.
+    // Terminal, so the child clears the state gate. The child committed but was
+    // never merged, so the merge check now runs against the repository root and
+    // answers "not merged": the child must survive, and the check must be visible
+    // in `merge_checks` — that recorder is the only place the attempted check
+    // shows up.
     coordinator
         .cancel_task(&session, &child, false)
         .await
@@ -4476,16 +4479,19 @@ async fn reclaim_skips_the_merge_check_when_the_owner_directory_is_gone() {
 
     assert_eq!(
         reclaimed, 0,
-        "neither the skipped child nor the already-reclaimed root is counted again"
-    );
-    assert!(
-        merge_checks.lock().unwrap().is_empty(),
-        "the merge check is not attempted against a missing owner directory: {:?}",
-        merge_checks.lock().unwrap()
+        "neither the refused child nor the already-reclaimed root is counted again"
     );
     assert!(
         child_workspace.path.exists(),
-        "the child keeps its directory: its integration state is unknown"
+        "the child keeps its directory: its work is not merged"
+    );
+    assert_eq!(
+        merge_checks.lock().unwrap().as_slice(),
+        &[(
+            child_workspace.branch.clone(),
+            child_workspace.parent_branch.clone()
+        )],
+        "the merge check is attempted against the repository root when the owner directory is gone"
     );
 }
 
@@ -4722,5 +4728,93 @@ async fn reclaim_idle_never_sweeps_an_awaiting_review_child() {
     assert!(
         child_workspace.path.exists(),
         "an un-integrated delivery is never reclaimed, however old"
+    );
+}
+
+/// The exit trigger reclaims the root; by the time a child is terminal its owner
+/// worktree is gone. The TTL sweep must still reclaim a MERGED child in that
+/// state, or the child's directory leaks forever (a terminal task never starts a
+/// worker, so the owner is never rebuilt).
+#[tokio::test]
+async fn reclaim_idle_sweeps_a_merged_child_whose_owner_was_already_reclaimed() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    let child_workspace = factory.starts.lock().unwrap()[1].workspace.clone().unwrap();
+
+    // Integrate the child's delivery into the owner branch, so the child counts as
+    // merged: the TTL sweep is the only thing that stands between it and deletion.
+    git_ok(
+        &root_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &child_workspace.branch,
+            "-m",
+            "integrate",
+        ],
+    )
+    .unwrap();
+
+    // The real exit sequence: the application root detaches while the child is
+    // still chasing review, and the detach trigger reclaims the owner worktree.
+    // The child is not terminal yet, so it survives that pass -- and the owner's
+    // directory is gone from here on.
+    mark_session_detached(&database, &session, &parent);
+    coordinator.reclaim_session_worktrees(&session);
+    assert!(
+        !root_workspace.path.exists(),
+        "precondition: the detach trigger reclaimed the owner worktree"
+    );
+    assert!(
+        child_workspace.path.exists(),
+        "precondition: a child still chasing review keeps its directory"
+    );
+
+    // Now the child turns terminal, long after its owner went away.
+    coordinator
+        .cancel_task(&session, &child, false)
+        .await
+        .unwrap();
+
+    // Age both rows past the TTL.
+    let aged = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let connection = Connection::open(&database).unwrap();
+    for task in [&parent, &child] {
+        connection
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![aged, task.to_string()],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert!(
+        !child_workspace.path.exists(),
+        "a merged, terminal, idle child is reclaimed even though its owner worktree is gone"
+    );
+    assert_eq!(
+        reclaimed, 1,
+        "the merged child is the only reclaimable directory: the root's directory is already gone"
+    );
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_some(),
+        "the child's row survives so its worktree can be rebuilt"
     );
 }

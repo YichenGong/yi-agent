@@ -293,6 +293,16 @@ This project has a real precedent for lock-order bugs: `release_resident_lease`
 resident_*` inversion that deadlocked the reconcile loop. Follow the documented order
 rather than inventing one.
 
+Implementation note (added after review): the requirement above is **not implemented**
+as written, and the residual race is recorded as a known limitation for follow-up.
+Neither caller takes the supervisor lock — `reclaim_candidate_directories` is a
+synchronous `fn`, the supervisor guard is a tokio `AsyncMutex`, and both callers (the
+minute tick and the detach arm) run on plain `std::thread`s, so the guard cannot be
+awaited there. Three properties bound the residual TOCTOU window instead: the state
+gate refuses a non-terminal child, reclaim removes only MERGED directories, and
+`prepare_task_workspace` rebuilds any directory it removed, so the worst outcome of
+the race is a needless rebuild rather than a worker starting in a deleted directory.
+
 ### C3. Idempotence
 
 | Step | Behaviour when re-run |
