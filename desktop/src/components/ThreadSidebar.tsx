@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
 
@@ -50,10 +50,10 @@ export function ThreadSidebar({
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [contextWs, setContextWs] = useState<string | null>(null);
 
-  const closeMenus = () => {
+  const closeMenus = useCallback(() => {
     setNewMenuOpen(false);
     setContextWs(null);
-  };
+  }, []);
 
   // Escape closes whichever menu is open, regardless of what inside it (or the
   // trigger) currently has focus.
@@ -64,7 +64,7 @@ export function ThreadSidebar({
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [newMenuOpen, contextWs]);
+  }, [newMenuOpen, contextWs, closeMenus]);
 
   const commit = (id: string) => {
     const title = draft.trim();
@@ -227,6 +227,10 @@ export function ThreadSidebar({
                 }}
                 onKeyDown={(e) => {
                   // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。
+                  // 只处理组头自身获焦的情况——caret 按钮是子元素,其 keydown 会
+                  // 冒泡到此处;若在此 preventDefault 会吞掉 caret 的 Enter/Space 激活,
+                  // 导致键盘无法折叠分组(回归)。
+                  if (e.target !== e.currentTarget) return;
                   if (e.key !== "Enter" && e.key !== " ") return;
                   if (busy) return;
                   e.preventDefault();

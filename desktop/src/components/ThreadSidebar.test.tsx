@@ -122,4 +122,29 @@ describe("ThreadSidebar", () => {
     expect(container.querySelector('[role="menu"]')).toBeNull();
     expect(header.getAttribute("aria-expanded")).toBe("false");
   });
+
+  it("does not open the group menu when Enter/Space bubbles from the collapse caret", () => {
+    const { container } = renderSidebar();
+    const header = container.querySelectorAll<HTMLElement>("div[tabindex]")[0];
+    const caret = header.querySelector<HTMLButtonElement>('button[aria-label="Collapse"]')!;
+
+    // jsdom does not perform Enter/Space button activation, so a keydown on the
+    // caret reproduces exactly the bubble path the header handler must ignore.
+    // Without the `e.target === e.currentTarget` guard the header would open the
+    // group menu here — and in a real webview its preventDefault would also
+    // swallow the caret's Enter activation, leaving no keyboard way to collapse.
+    fireEvent.keyDown(caret, { key: "Enter" });
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.keyDown(caret, { key: " " });
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+
+    // The caret's own activation (what a real Enter/Space would trigger) still
+    // collapses the group.
+    fireEvent.click(caret);
+    expect(container.textContent).not.toContain("alpha-thread");
+    expect(header.querySelector('button[aria-label="Expand"]')).not.toBeNull();
+  });
 });
