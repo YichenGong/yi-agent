@@ -284,8 +284,8 @@ where
                         }
                     }
                     "thread/list" => {
-                        // 单目录列表:仍是 `cfg.workdir` 的 store。跨目录的
-                        // `thread/listAll` 由后续任务补齐。
+                        // 单目录列表:仍是 `cfg.workdir` 的 store。跨目录分组见下方
+                        // `thread/listAll`。
                         let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
                         match store.list() {
                         Ok(metas) => {
@@ -323,21 +323,29 @@ where
                             let path = Path::new(&dir);
                             let exists = path.is_dir();
                             let threads: Vec<serde_json::Value> = if exists {
-                                crate::thread_store::ThreadStore::new(path)
-                                    .list()
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|m| {
-                                        json!({
-                                            "thread_id": m.thread_id,
-                                            "cwd": m.cwd,
-                                            "model": m.model,
-                                            "created_at": m.created_at,
-                                            "updated_at": m.updated_at,
-                                            "title": m.title,
+                                // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
+                                // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
+                                match crate::thread_store::ThreadStore::new(path).list() {
+                                    Ok(metas) => metas
+                                        .into_iter()
+                                        .map(|m| {
+                                            json!({
+                                                "thread_id": m.thread_id,
+                                                "cwd": m.cwd,
+                                                "model": m.model,
+                                                "created_at": m.created_at,
+                                                "updated_at": m.updated_at,
+                                                "title": m.title,
+                                            })
                                         })
-                                    })
-                                    .collect()
+                                        .collect(),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[app-server] thread/listAll failed to list {dir}: {e}"
+                                        );
+                                        Vec::new()
+                                    }
+                                }
                             } else {
                                 Vec::new()
                             };
@@ -2745,6 +2753,19 @@ mod tests {
         let v = resp.expect("thread/listAll response");
         let groups = v["result"]["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 2, "两个目录 → 两个分组: {v}");
+
+        // 索引按「最近使用在前」排序:先 start a 再 start b → 组顺序为 [b, a]。
+        // start 请求串行(读罢 a 的响应才发 b),故 workspace/add 的先后确定。
+        assert_eq!(
+            groups[0]["workspace"],
+            b.as_str(),
+            "most-recent workspace must come first"
+        );
+        assert_eq!(
+            groups[1]["workspace"],
+            a.as_str(),
+            "the earlier workspace must follow"
+        );
 
         for g in groups {
             let ws = g["workspace"].as_str().unwrap();
