@@ -25,12 +25,13 @@
 - agentMessage markdown 富渲染 + 代码高亮（react-markdown + remark-gfm + rehype-highlight）
 - 用量/成本面板（StatusBar 可展开：input / output / cache read / cache write + 估算成本）
 
-**不做什么（延后）：**
-- 不做文件树 / diff 视图
-- 不做多标签页
-- 不做 MCP / 子 agent 任务树
-- 不做 Linux 打包
-- 不做会话 item 上限 / 裁剪（长会话内存无界增长，baseline 接受）
+**不做什么（非目标）：**
+- 会话 item 上限 / 裁剪（长会话内存无界增长，baseline 接受）
+- markdown 中的 LaTeX / 数学公式渲染
+
+**后续路线：** 计划中但尚未交付的能力（reasoning 展示、P1 剩余、P2/P3 路线图、
+打包交付缺口）逐一登记在下方 Features 的 `[ ]` 条目；路线图出处为设计文档 §11
+（`docs/superpowers/plans/2026-09-26-desktop-gui-design.md:344`）。
 
 ## Features
 
@@ -44,8 +45,33 @@
 - [x] 聊天 UI（消息列表 + 自动滚动 + 错误横幅、输入框 Send/Stop + Enter/Shift+Enter、工具调用卡片、状态栏）— `desktop/src/components/ChatView.tsx:25`（自动滚动 `useEffect`）/ `desktop/src/components/ChatView.tsx:70`（错误横幅）/ `desktop/src/components/ChatView.tsx:48`（工具卡片分派）；`desktop/src/components/MessageInput.tsx:34`（Enter 发送 / Shift+Enter 换行）/ `desktop/src/components/MessageInput.tsx:55`（`Stop`/`Send` 标签）/ `desktop/src/components/MessageInput.tsx:47`（按钮点击按 `turnActive` 分流发送或中断）；`desktop/src/components/ToolCallCard.tsx:12`（可折叠卡片）/ `desktop/src/components/ToolCallCard.tsx:6`（`statusStyles` 三态配色）；`desktop/src/components/StatusBar.tsx:1`（状态栏）/ `desktop/src/components/StatusBar.tsx:28`（用量按钮，点击展开 UsagePanel）；`turnActive` 时 Enter 触发中断而非发送
 - [x] 权限审批弹窗（Allow once / Always allow tool / Always allow prefix / Deny；Esc=Deny；`onDecide` 只触发一次；`inert` 隔离背景）— `desktop/src/components/ApprovalDialog.tsx:24`（`submittedRef` 守卫，同 tick 双决策只放行一次）/ `desktop/src/components/ApprovalDialog.tsx:38`（Esc → `deny`）/ `desktop/src/components/ApprovalDialog.tsx:87`（Deny）/ `desktop/src/components/ApprovalDialog.tsx:95`（Allow once）/ `desktop/src/components/ApprovalDialog.tsx:103`（Always allow tool）/ `desktop/src/components/ApprovalDialog.tsx:113`（Always allow prefix，仅 `prefix_suggestion !== null` 时渲染）；背景隔离 `inert` — `desktop/src/App.tsx:196`
 - [x] macOS 打包产出可启动的 `.app` / `.dmg` 并内嵌 sidecar — 判据：`cd desktop && npm run sidecar:release && npm run tauri build` 产出 `desktop/src-tauri/target/release/bundle/macos/yi-agent.app`（内含 `Contents/MacOS/desktop` 启动器 + `Contents/MacOS/yi-agent` sidecar）与 `desktop/src-tauri/target/release/bundle/dmg/yi-agent_0.1.0_aarch64.dmg`；`open yi-agent.app` 后 `ps` 可见 `desktop` 与子进程 `yi-agent app-server --listen stdio://`
-- [ ] 手动端到端冒烟（原生窗口 / 流式文本 / 工具卡片 / 审批弹窗放行与拒绝 / Stop 中断 / 杀 sidecar 不崩）— 判据：`cd desktop && npm run sidecar && npm run tauri dev` 后人工逐项确认（设计文档 §12 成功判据，`docs/superpowers/plans/2026-09-26-desktop-gui-design.md:354`）；自动化可覆盖部分已验：应用可启动、sidecar 子进程被拉起
 - [x] 会话持久化 + 历史侧栏（列表 / 恢复并继续对话 / 双击内联重命名 / 删除 / New thread / 当前高亮）— `desktop/src/lib/session.ts:29`（`reset`）/ `desktop/src/components/ThreadSidebar.tsx:17` / `desktop/src/App.tsx:44`（`refreshThreads`）/ `desktop/src/App.tsx:55`（`resumeThread` 前置同步 `reset` 防回放竞态）
 - [x] agentMessage markdown 富渲染 + 代码高亮 + 用量/成本面板 — `desktop/src/components/MarkdownText.tsx:39`（memo 按 text 记忆 + remark-gfm + rehype-highlight + 外链走 opener）/ `desktop/src/components/ChatView.tsx:42`（接线）/ `desktop/src/lib/pricing.ts:20`（`PRICES` 定价表）/ `desktop/src/lib/pricing.ts:35`（`priceFor`）/ `desktop/src/lib/pricing.ts:46`（`estimateCost`）/ `desktop/src/components/UsagePanel.tsx:5` / `desktop/src/components/StatusBar.tsx:28`（点击展开）
+
+**打包交付缺口：**
+
+- [ ] macOS 代码签名 + 公证（notarization）— 当前 `.app` / `.dmg` 未签名（`desktop/src-tauri/tauri.conf.json` 无 `bundle.macOS.signingIdentity`），他人机器双击会被 Gatekeeper 拦截；判据：`codesign --verify --deep --strict yi-agent.app` 与 `spctl -a -vv yi-agent.app` 通过，且 `xcrun notarytool submit` 返回 `Accepted`
+- [ ] Universal（arm64 + x86_64）打包 — 当前仅产出 `aarch64-apple-darwin` 单架构；判据：`lipo -info yi-agent.app/Contents/MacOS/yi-agent` 同时列出 `arm64` 与 `x86_64`（或分别为两架构产出 bundle）
+- [ ] 手动端到端冒烟（原生窗口 / 流式文本 / 工具卡片 / 审批弹窗放行与拒绝 / Stop 中断 / 杀 sidecar 不崩）— 判据：`cd desktop && npm run sidecar && npm run tauri dev` 后人工逐项确认（设计文档 §12 成功判据，`docs/superpowers/plans/2026-09-26-desktop-gui-design.md:354`）；自动化可覆盖部分已验：应用可启动、sidecar 子进程被拉起
+
+**P1 剩余：**
+
+- [ ] reasoning / thinking 展示 — core `ProviderEvent`（`yi-agent-rs/crates/yi-agent-core/src/provider.rs:43`）与 `AgentEvent`（`yi-agent-rs/crates/yi-agent-core/src/agent.rs:198`）当前无 thinking 变体，provider 未解析 thinking block；需 core + provider + protocol + translate + 前端逐层加支持；判据：发一条触发 extended thinking 的 prompt，GUI 显示 reasoning 内容
+
+**P2 路线图：**
+
+- [ ] 文件树 / 工作区切换 — 判据：侧栏展示当前 workdir 文件树并支持切换工作区
+- [ ] diff 视图 — 需先在协议层新增 `turn/diff/updated` 通知（当前不存在，`grep -rn "turn/diff" yi-agent-rs/crates/yi-agent-app-server/src/` 无结果）；判据：agent 改文件后 GUI 逐 turn 显示 diff
+- [ ] compact 手动控制 — 判据：GUI 提供手动触发上下文压缩的入口
+- [ ] 图片附件输入 — 判据：输入框可附加图片并随 prompt 发送
+- [ ] 多 thread 标签页 — 判据：可同时打开多个 thread 并在标签间切换（当前仅单会话 + 历史侧栏）
+
+**P3 路线图：**
+
+- [ ] MCP 集成 — 后端 `yi-agent-mcp` 已有（见 [yi-agent-mcp](./yi-agent-mcp.md)）；判据：GUI 可查看 / 启停 MCP server
+- [ ] 子 agent 任务树可视化 — 复用现有 daemon IPC（见 [subagent-runtime](./subagent-runtime.md)）；判据：GUI 展示子 agent 任务树
+- [ ] Unix socket / websocket 传输 — 当前仅 stdio（其它一律拒绝，`yi-agent-rs/crates/yi-agent/src/main.rs:74`）；判据：`--listen` 支持 socket/ws 且 GUI 可连
+- [ ] 多窗口共享 daemon — 判据：多个 GUI 窗口连同一 daemon
+- [ ] Linux 打包验证 — 判据：产出并启动 Linux 包
 
 **验证命令：** `cd desktop && npx vitest run`（34 个前端单测，`desktop/src/lib/rpc.test.ts` 7 个 + `desktop/src/lib/session.test.ts` 15 个 + `desktop/src/lib/pricing.test.ts` 7 个 + `desktop/src/components/MarkdownText.test.tsx` 5 个）+ `cd desktop && npm run build` + `cd desktop/src-tauri && cargo test` + `cd desktop && npm run sidecar:release && npm run tauri build`（产出 `.app` / `.dmg`）
