@@ -65,8 +65,9 @@ export default function App() {
       setGroups(r.groups);
       return r.groups;
     } catch {
-      // 列表刷新失败不打断对话;下一次事件会再试。返回 null 表示"未知",
-      // 调用方不得据此把权限模式误判为 normal。
+      // 列表刷新失败不打断对话。返回 null 表示"未知":调用方必须把 null
+      // 当作未知处理,不得回退成 normal。注意权限模式不会因此自动恢复——
+      // 它保持未知,直到下一次切换线程时重新从 listAll 回读。
       return null;
     }
   };

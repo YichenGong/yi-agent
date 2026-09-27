@@ -190,6 +190,10 @@ describe("ModeChip", () => {
     // The unknown state must never masquerade as a real mode.
     expect(el.textContent).not.toContain("Normal");
     expect(el.textContent).not.toContain("YOLO");
+    // …and it must positively advertise the neutral unknown label (the pre-fix
+    // code rendered empty text here, so this pins the new behavior).
+    expect(el.textContent).toBe("Mode");
+    expect(el.getAttribute("aria-label")).toMatch(/unknown/i);
 
     fireEvent.click(el);
     expect(container.querySelector('[role="menu"]')).toBeNull();

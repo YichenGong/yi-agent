@@ -11,6 +11,10 @@ const { clients, state } = vi.hoisted(() => ({
     mode: "normal" as Mode,
     failSet: false,
     failList: false,
+    // When set, `thread/listAll` succeeds for the first `failListAfter` calls
+    // and throws afterwards. Used to fail only the *post-resume* lookup while
+    // letting the mount-time listing succeed.
+    failListAfter: null as number | null,
     // `null` → fall back to a single t1 whose mode follows `state.mode`
     // (keeps the legacy tests terse). Tests that need a second thread or
     // per-thread modes set this explicitly.
@@ -21,6 +25,7 @@ const { clients, state } = vi.hoisted(() => ({
 vi.mock("./lib/rpc", () => ({
   RpcClient: class {
     requests: { method: string; params: unknown }[] = [];
+    listCalls = 0;
     constructor() {
       clients.push(this);
     }
@@ -36,7 +41,11 @@ vi.mock("./lib/rpc", () => ({
     async request(method: string, params: unknown) {
       this.requests.push({ method, params });
       if (method === "thread/listAll") {
+        this.listCalls += 1;
         if (state.failList) throw { code: -1, message: "list failed" };
+        if (state.failListAfter !== null && this.listCalls > state.failListAfter) {
+          throw { code: -1, message: "list failed" };
+        }
         const seeds =
           state.threads ??
           [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
@@ -81,6 +90,7 @@ beforeEach(() => {
   state.mode = "normal";
   state.failSet = false;
   state.failList = false;
+  state.failListAfter = null;
   state.threads = null;
   Element.prototype.scrollIntoView = vi.fn();
 });
@@ -178,6 +188,27 @@ describe("App YOLO wiring", () => {
     // The mount path throws and surfaces an error status.
     await waitFor(() => expect(screen.getByText(/error:/i)).toBeTruthy());
 
+    const chip = modeTrigger() as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    expect(chip.textContent).not.toContain("Normal");
+    expect(chip.textContent).not.toContain("YOLO");
+  });
+
+  it("stays unknown (not Normal) when the post-resume listAll lookup fails", async () => {
+    // Server-side thread is YOLO, but only the mount-time listing succeeds; the
+    // follow-up lookup that resumes triggers fails.
+    state.mode = "yolo";
+    state.failListAfter = 1;
+    render(<App />);
+
+    // Auto-resume still happens, so we reach the failing post-resume lookup.
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThanOrEqual(2),
+    );
+
+    // Must not lie "Normal" — the mode is simply unknown.
     const chip = modeTrigger() as HTMLButtonElement;
     expect(chip.disabled).toBe(true);
     expect(chip.textContent).not.toContain("Normal");
