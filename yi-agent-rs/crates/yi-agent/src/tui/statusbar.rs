@@ -58,13 +58,13 @@ impl StatusBarState {
     /// Advance interpolation + spinner by one tick. Call at ~30hz.
     pub fn tick(&mut self) {
         // Linear interpolation: move ~1/10 of the remaining gap per tick,
-        // with a minimum step of 1 so small targets still converge.
-        let di = self.target_input.saturating_sub(self.display_input);
-        let dd = self.target_output.saturating_sub(self.display_output);
-        let step_i = (di / 10).max(1);
-        let step_o = (dd / 10).max(1);
-        self.display_input = self.display_input.saturating_add(step_i.min(di));
-        self.display_output = self.display_output.saturating_add(step_o.min(dd));
+        // with a minimum step of 1 so small targets still converge. The
+        // display moves toward the target in *both* directions: auto-compaction
+        // lowers the prefill estimate, and the display must follow it down.
+        // It was previously up-only, so it froze at the stale pre-compaction
+        // value until a usage-idle snap happened to fire.
+        self.display_input = interpolate(self.display_input, self.target_input);
+        self.display_output = interpolate(self.display_output, self.target_output);
 
         // Spinner phase: 4° per tick → ~3s per cycle at 30hz.
         self.spinner_phase = (self.spinner_phase + 4) % 360;
@@ -119,6 +119,19 @@ impl StatusBarState {
         let v = 100.0 + 77.5 * (phase.sin() + 1.0); // (sin+1)/2 * 155 + 100 → [100, 255]
         let v = v.round() as u8;
         Color::Rgb(v, v, v)
+    }
+}
+
+/// Move `current` one interpolated step toward `target`: ~1/10 of the gap,
+/// at least 1, never overshooting. Walks in both directions so the displayed
+/// count can fall when the target shrinks (e.g. prefill after auto-compaction).
+fn interpolate(current: u64, target: u64) -> u64 {
+    let gap = current.abs_diff(target);
+    let step = (gap / 10).max(1).min(gap);
+    if current < target {
+        current + step
+    } else {
+        current - step
     }
 }
 
@@ -379,6 +392,40 @@ mod tests {
         s.set_prefill_estimate(500);
         assert_eq!(s.target_input, 500);
         assert_eq!(s.target_output, 0, "decode should reset for new call");
+    }
+
+    /// After auto-compaction the retained context is much smaller, so the
+    /// prefill estimate drops sharply. The display must follow it *down*;
+    /// before the fix it was monotonic (up-only) and stayed at the stale
+    /// pre-compaction value.
+    #[test]
+    fn test_prefill_follows_estimate_down_after_compaction() {
+        let mut s = StatusBarState::default();
+        s.set_prefill_estimate(500); // turn 1 estimate
+        s.set_token_target(160_000, 200); // turn 1 real usage (pre-compaction)
+        for _ in 0..120 {
+            s.tick();
+        }
+        assert!(
+            s.display_input_tokens() > 100_000,
+            "display should have grown to the pre-compaction value, got {}",
+            s.display_input_tokens()
+        );
+
+        // Tool execution runs (resets decode + clears last_usage_time, but
+        // leaves the prefill display untouched), then the next turn compacts
+        // and emits a much smaller estimate.
+        s.on_tool_call_phase();
+        s.set_prefill_estimate(30_000);
+        for _ in 0..120 {
+            s.tick();
+        }
+
+        assert!(
+            s.display_input_tokens() < 40_000,
+            "prefill display must follow the compacted estimate down, got {}",
+            s.display_input_tokens()
+        );
     }
 
     #[test]
