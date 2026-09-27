@@ -44,6 +44,15 @@ impl AgentWorkspaceService for DeliveryFactory {
             "verified",
         ))
     }
+
+    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        // Mirror the production service: the rebuild path exists because a
+        // reclaimed worktree keeps its row but loses its directory, so the
+        // directory is what has to come back.
+        std::fs::create_dir_all(&workspace.path).map_err(|error| {
+            WorkerError::Startup(format!("test workspace rebuild failed: {error}"))
+        })
+    }
 }
 
 fn workspace(root: &yi_agent_core::RootSessionId, task: &yi_agent_core::TaskId) -> WorkerWorkspace {
