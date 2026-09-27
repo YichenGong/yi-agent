@@ -759,6 +759,18 @@ mod tests {
         );
     }
 
+    /// Interactive 模式下 `cfg.yolo=true` 必须把共享开关的初值置为开:这是
+    /// app-server 工厂「mode==Yolo → thread_cfg.yolo=true → Interactive bootstrap」
+    /// 映射的落点(见 `yi-agent-app-server` 的 `resume_passes_persisted_mode_to_factory`)。
+    #[test]
+    fn interactive_yolo_config_starts_switch_on() {
+        let mut cfg = sample_config();
+        cfg.yolo = true;
+        let b = bootstrap_agent(&cfg, PermissionMode::Interactive).expect("bootstrap");
+        assert!(b.yolo.get(), "cfg.yolo=true must seed the shared switch on");
+        assert!(b.permission.is_yolo());
+    }
+
     #[test]
     fn bootstrap_auto_allow_starts_with_switch_on() {
         let cfg = sample_config();

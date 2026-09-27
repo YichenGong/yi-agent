@@ -379,8 +379,12 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
+                        // 新线程一律以 Normal 起步;同一值既用于建 agent,也落盘 meta,
+                        // 抽成局部量避免两处字面量漂移。
+                        let mode = crate::thread_store::ThreadMode::Normal;
+
                         let BuiltAgent { agent, decision_tx, catalog, yolo } =
-                            match build_agent(None, Path::new(&cwd), crate::thread_store::ThreadMode::Normal) {
+                            match build_agent(None, Path::new(&cwd), mode) {
                                 Ok(a) => a,
                                 Err(e) => {
                                     write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -401,7 +405,7 @@ where
                             created_at: now,
                             updated_at: now,
                             title: None,
-                            permission_mode: crate::thread_store::ThreadMode::Normal,
+                            permission_mode: mode,
                         };
                         if let Err(e) = thread_store.create(&meta) {
                             // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -426,7 +430,7 @@ where
                                 cwd: cwd.clone(),
                                 model: model.clone(),
                                 active_turn_id: None,
-                                yolo: yolo.clone(),
+                                yolo,
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
@@ -580,7 +584,7 @@ where
                                 cwd: cwd.clone(),
                                 model: model.clone(),
                                 active_turn_id: None,
-                                yolo: yolo.clone(),
+                                yolo,
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
@@ -3176,9 +3180,9 @@ mod tests {
 
     /// Task 9:resume 必须读取该 thread 持久化的 `permission_mode` 并透传给 agent
     /// 工厂,使 yolo 线程重开后仍以 yolo 重建。工厂内部 `mode → cfg.yolo → 共享
-    /// YoloSwitch` 的映射由 Task 6 的 bootstrap 测试与代码评审覆盖;此处只钉死
-    /// 「app-server 侧 resume 读了持久化模式并透传」这一契约(server 内存中的
-    /// switch 不可从外部观测,故用记录型工厂观察传参)。
+    /// YoloSwitch` 的映射由 `bootstrap.rs::interactive_yolo_config_starts_switch_on`
+    /// 钉死;此处只钉死「app-server 侧 resume 读了持久化模式并透传」这一契约
+    /// (server 内存中的 switch 不可从外部观测,故用记录型工厂观察传参)。
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_passes_persisted_mode_to_factory() {
         use crate::thread_store::{ThreadMode, ThreadStore};
