@@ -100,21 +100,3 @@ pub fn register_builtin_tools_with_controller(
     }
     // BOCHA_API_KEY not set: WebSearchTool not registered
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-    use yi_agent_core::autonomy::YoloSwitch;
-
-    #[test]
-    fn shared_controller_reaches_bash_and_process_manager() {
-        let sw = YoloSwitch::new(false);
-        let ctrl = SandboxController::new(sw.clone(), SandboxMode::WorkspaceWrite, true);
-        let b = SandboxPolicy::with_controller(Path::new("/tmp"), vec![], ctrl.clone());
-        let p = SandboxPolicy::with_controller(Path::new("/tmp"), vec![], ctrl.clone());
-        sw.set(true);
-        assert_eq!(b.mode(), SandboxMode::DangerFullAccess);
-        assert_eq!(p.mode(), SandboxMode::DangerFullAccess);
-    }
-}

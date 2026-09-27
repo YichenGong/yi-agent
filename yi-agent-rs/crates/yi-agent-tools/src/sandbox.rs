@@ -23,7 +23,9 @@ pub enum SandboxMode {
 /// `base` is the mode configured at construction time; `promotable` says
 /// whether a live YOLO switch may escalate the *effective* mode to
 /// [`SandboxMode::DangerFullAccess`]. A shared [`YoloSwitch`] lets callers
-/// flip the effective mode without rebuilding the policy.
+/// flip the effective mode without rebuilding the policy. When `base` is
+/// [`SandboxMode::ReadOnly`], `promotable` is forced to false: read-only is
+/// never escalated (see [`SandboxController::new`]).
 #[derive(Clone, Debug)]
 pub struct SandboxController {
     switch: YoloSwitch,
@@ -304,6 +306,24 @@ mod tests {
         assert!(ww.allows_writes());
         sw.set(true);
         assert!(ww.allows_writes(), "yolo 翻转不得撤销工具面");
+        assert!(
+            !ro.allows_writes(),
+            "只读策略在 yolo 翻转后仍不得有写工具面"
+        );
+    }
+
+    // 该断言验证的是「同一 controller 的 clone 共享 YoloSwitch」这一共享语义,
+    // 也就是 bash 与 process manager 共享开关所依赖的性质。生产接线本身
+    //(bootstrap 把同一 controller 同时交给两者)由 bootstrap 集成路径覆盖。
+    #[test]
+    fn one_controller_clone_backs_two_policies() {
+        let sw = yi_agent_core::autonomy::YoloSwitch::new(false);
+        let ctrl = SandboxController::new(sw.clone(), SandboxMode::WorkspaceWrite, true);
+        let b = SandboxPolicy::with_controller(Path::new("/tmp"), vec![], ctrl.clone());
+        let p = SandboxPolicy::with_controller(Path::new("/tmp"), vec![], ctrl);
+        sw.set(true);
+        assert_eq!(b.mode(), SandboxMode::DangerFullAccess);
+        assert_eq!(p.mode(), SandboxMode::DangerFullAccess);
     }
 
     #[test]
