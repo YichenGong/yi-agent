@@ -6,6 +6,7 @@
 //! 另有 `not_initialized` / `method_not_found` / 解析错误 / stdin EOF 优雅退出。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -24,6 +25,7 @@ use crate::protocol::{
 use crate::session::{ThreadSession, TurnPrompt};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
+use crate::workspace_index::WorkspaceIndex;
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -51,17 +53,25 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let cfg_for_factory = cfg.clone();
-    run_with(reader, writer, cfg, PERMISSION_TIMEOUT, move |session| {
-        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
-            &cfg_for_factory,
-            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
-        )?;
-        Ok(BuiltAgent {
-            agent: apply_session(built.agent, session),
-            decision_tx: built.decision_tx,
-            catalog: built.catalog,
-        })
-    })
+    let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
+    run_with(
+        reader,
+        writer,
+        cfg,
+        PERMISSION_TIMEOUT,
+        workspaces,
+        move |session| {
+            let built = yi_agent_runtime::bootstrap::bootstrap_agent(
+                &cfg_for_factory,
+                yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+            )?;
+            Ok(BuiltAgent {
+                agent: apply_session(built.agent, session),
+                decision_tx: built.decision_tx,
+                catalog: built.catalog,
+            })
+        },
+    )
     .await
 }
 
@@ -75,6 +85,7 @@ async fn run_with<R, W, F>(
     writer: W,
     cfg: RuntimeConfig,
     permission_timeout: Duration,
+    workspaces: Arc<WorkspaceIndex>,
     build_agent: F,
 ) -> anyhow::Result<()>
 where
@@ -213,6 +224,59 @@ where
                     }
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
+                    }
+                    "workspace/list" => {
+                        let list: Vec<serde_json::Value> = workspaces
+                            .list()
+                            .into_iter()
+                            .map(|p| json!({ "path": p, "exists": Path::new(&p).is_dir() }))
+                            .collect();
+                        write_response(&writer, ok_response(id, json!({ "workspaces": list })))
+                            .await?;
+                    }
+                    "workspace/add" => {
+                        let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        match std::fs::canonicalize(raw) {
+                            Ok(p) if p.is_dir() => {
+                                let value = p.to_string_lossy().to_string();
+                                match workspaces.add(&p) {
+                                    Ok(()) => {
+                                        write_response(&writer, ok_response(id, json!({ "path": value })))
+                                            .await?
+                                    }
+                                    Err(e) => {
+                                        write_response(
+                                            &writer,
+                                            err_response(id, RpcError::internal(e.to_string())),
+                                        )
+                                        .await?
+                                    }
+                                }
+                            }
+                            _ => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params("path is not a directory"),
+                                    ),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    "workspace/remove" => {
+                        let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        match workspaces.remove(Path::new(raw)) {
+                            Ok(()) => write_response(&writer, ok_response(id, json!({}))).await?,
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?
+                            }
+                        }
                     }
                     "thread/list" => match store.list() {
                         Ok(metas) => {
@@ -967,6 +1031,29 @@ async fn run_thread_driver<W>(
     }
 }
 
+/// 在全局索引的目录里定位 `thread_id` 所属目录。
+// TODO(task-3): remove allow
+#[allow(dead_code)]
+fn find_thread_dir(workspaces: &WorkspaceIndex, thread_id: &str) -> Option<PathBuf> {
+    workspaces
+        .list()
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|d| crate::thread_store::ThreadStore::new(d).exists(thread_id))
+}
+
+/// 按 thread 定位其 store;索引找不到时回退 `cfg.workdir`。
+// TODO(task-3): remove allow
+#[allow(dead_code)]
+fn store_for(
+    workspaces: &WorkspaceIndex,
+    cfg: &RuntimeConfig,
+    thread_id: &str,
+) -> Arc<crate::thread_store::ThreadStore> {
+    let dir = find_thread_dir(workspaces, thread_id).unwrap_or_else(|| cfg.workdir.clone());
+    Arc::new(crate::thread_store::ThreadStore::new(&dir))
+}
+
 /// 从 params 提取 `threadId`;缺失时写 `-32602` 并返回 `Ok(None)`。
 async fn require_thread_id<W: tokio::io::AsyncWrite + Unpin>(
     writer: &MessageWriter<W>,
@@ -1184,6 +1271,8 @@ mod tests {
         client_w: tokio::io::DuplexStream,
         client_r: BufReader<tokio::io::DuplexStream>,
         handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+        /// 隔离的全局目录索引;持有它保证 tempdir 存活到 harness 结束。
+        _index_dir: tempfile::TempDir,
     }
 
     impl Harness {
@@ -1206,11 +1295,23 @@ mod tests {
         {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-            let handle = tokio::spawn(run_with(server_r, server_w, cfg, permission_timeout, build));
+            let index_dir = tempfile::TempDir::new().unwrap();
+            let workspaces = Arc::new(WorkspaceIndex::new(
+                index_dir.path().join("workspaces.json"),
+            ));
+            let handle = tokio::spawn(run_with(
+                server_r,
+                server_w,
+                cfg,
+                permission_timeout,
+                workspaces,
+                build,
+            ));
             Self {
                 client_w,
                 client_r: BufReader::new(client_r),
                 handle,
+                _index_dir: index_dir,
             }
         }
 
@@ -1357,14 +1458,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_add_list_remove_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["path"], cwd.to_string_lossy().to_string());
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"][0]["path"],
+            cwd.to_string_lossy().to_string()
+        );
+        assert_eq!(v["result"]["workspaces"][0]["exists"], true);
+
+        let rm = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"workspace/remove",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&rm.to_string()).await;
+        let v = h.read_value().await;
+        assert!(v.get("result").is_some());
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_add_rejects_non_directory() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"workspace/add","params":{"path":"/nope/nope"}}"#,
+        )
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32602);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn eof_exits_gracefully() {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, _client_r) = tokio::io::duplex(64 * 1024);
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = Arc::new(WorkspaceIndex::new(
+            index_dir.path().join("workspaces.json"),
+        ));
         let handle = tokio::spawn(run_with(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
+            workspaces,
             build_test_agent,
         ));
 
@@ -1408,11 +1557,16 @@ mod tests {
     async fn agent_factory_failure_returns_internal_error() {
         let (mut client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = Arc::new(WorkspaceIndex::new(
+            index_dir.path().join("workspaces.json"),
+        ));
         let handle = tokio::spawn(run_with(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
+            workspaces,
             |_s: Option<yi_agent_core::Session>| Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
         ));
 
@@ -1456,11 +1610,16 @@ mod tests {
     async fn oversized_frame_returns_err() {
         let (mut client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, _client_r) = tokio::io::duplex(64 * 1024);
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = Arc::new(WorkspaceIndex::new(
+            index_dir.path().join("workspaces.json"),
+        ));
         let handle = tokio::spawn(run_with(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
+            workspaces,
             build_test_agent,
         ));
 
