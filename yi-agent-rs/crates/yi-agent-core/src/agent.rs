@@ -413,7 +413,8 @@ impl Agent {
         let decision_rx = self.decision_rx.clone();
         let provider_turn_gate = self.provider_turn_gate.clone();
 
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tx = EventTx(tx);
         tokio::spawn(async move {
             if tx.send(AgentEvent::Start).await.is_err() {
                 return; // Receiver dropped, stop the loop
@@ -432,7 +433,7 @@ impl Agent {
             .await;
         });
 
-        Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
+        Ok(tokio_stream::wrappers::UnboundedReceiverStream::new(rx).boxed())
     }
 }
 
@@ -444,9 +445,40 @@ fn stall_backoff_delay(base: std::time::Duration, attempt: u16) -> std::time::Du
     scaled.min(std::time::Duration::from_secs(30))
 }
 
+/// Sender half of the agent's event stream.
+///
+/// Backed by an **unbounded** channel so streamed events are never dropped when
+/// the consumer renders more slowly than the provider emits. Previously this
+/// was a bounded `mpsc::Sender` whose streamed-text forwarding used `try_send`,
+/// which silently discarded deltas — including the tail of long messages — as
+/// soon as the buffer filled (see
+/// `lagging_consumer_still_receives_every_text_delta`).
+///
+/// The method shapes mirror `tokio::sync::mpsc::Sender` (`async send` +
+/// `try_send`) so call sites read uniformly. Neither call blocks, and both only
+/// fail once the receiver has been dropped.
+#[derive(Clone)]
+struct EventTx(tokio::sync::mpsc::UnboundedSender<AgentEvent>);
+
+impl EventTx {
+    fn send(
+        &self,
+        event: AgentEvent,
+    ) -> std::future::Ready<Result<(), tokio::sync::mpsc::error::SendError<AgentEvent>>> {
+        std::future::ready(self.0.send(event))
+    }
+
+    fn try_send(
+        &self,
+        event: AgentEvent,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<AgentEvent>> {
+        self.0.send(event)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
-    tx: mpsc::Sender<AgentEvent>,
+    tx: EventTx,
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
     session: Arc<Mutex<Session>>,
@@ -1047,7 +1079,7 @@ async fn wait_for_decision(
 /// Returns Some((id, name, input)) if user allows execution, None if user denies.
 #[allow(clippy::too_many_arguments)]
 async fn handle_confirmation(
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &EventTx,
     checker: &Arc<crate::permission::PermissionChecker>,
     decision_rx: &DecisionRx,
     cancel_token: &tokio_util::sync::CancellationToken,
@@ -1098,7 +1130,7 @@ async fn handle_confirmation(
 }
 
 async fn maybe_auto_compact(
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &EventTx,
     provider: &Arc<dyn Provider>,
     config: &AgentConfig,
     session: &Arc<Mutex<Session>>,
@@ -1137,7 +1169,7 @@ async fn maybe_auto_compact(
 }
 async fn accumulate_provider_stream(
     stream: BoxStream<'static, ProviderEvent>,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &EventTx,
     model: &str,
     idle_timeout: Option<std::time::Duration>,
 ) -> Result<(Vec<ContentBlock>, StreamEnd, Option<TokenUsage>), AgentError> {
@@ -1383,6 +1415,47 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
+    }
+
+    /// A consumer that renders more slowly than the provider streams must still
+    /// observe every text delta. Regression: `accumulate_provider_stream`
+    /// forwarded deltas with a lossy `try_send` into a 64-slot channel, so a
+    /// lagging UI silently lost the tail of long messages.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lagging_consumer_still_receives_every_text_delta() {
+        use futures::StreamExt;
+
+        const TOTAL: usize = 2000;
+        let mut script: Vec<ProviderEvent> = (0..TOTAL)
+            .map(|i| ProviderEvent::TextDelta(format!("{i},")))
+            .collect();
+        script.push(ProviderEvent::Stop {
+            reason: StopReason::EndTurn,
+        });
+        let provider = ScriptedProvider::new(vec![script]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let mut stream = agent.run("hi".into()).await.unwrap();
+        let mut received = String::new();
+        let mut count = 0usize;
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::AssistantText(t) = ev {
+                received.push_str(&t);
+                count += 1;
+                // Model a UI that renders more slowly than the provider emits.
+                if count % 16 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        }
+
+        assert_eq!(
+            count, TOTAL,
+            "every streamed delta must reach the consumer, even when it lags"
+        );
+        let expected: String = (0..TOTAL).map(|i| format!("{i},")).collect();
+        assert_eq!(received, expected);
     }
 
     #[tokio::test(flavor = "multi_thread")]
