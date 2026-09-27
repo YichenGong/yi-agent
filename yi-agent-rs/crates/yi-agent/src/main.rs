@@ -465,6 +465,9 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             {
                 anyhow::bail!("runtime daemon is already running")
             }
+            // A manually started daemon creates the same project-local state
+            // root the embedded runtimes do, so it must self-ignore it too.
+            ignore_project_local_runtime_state(&workdir);
             std::process::Command::new(std::env::current_exe()?)
                 .args(["daemon", "serve"])
                 .stdin(std::process::Stdio::null())
@@ -486,14 +489,23 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             }
             anyhow::bail!("daemon process did not become ready")
         }
-        DaemonAction::Serve => yi_agent_store::ipc::Daemon::start_with_factory(
-            &runtime_dir,
-            &database,
-            build_daemon_worker_factory(cli, yi_agent_store::ipc::socket_path_for(&runtime_dir)?)?,
-        )
-        .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
-        .wait()
-        .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}")),
+        DaemonAction::Serve => {
+            // `daemon start` spawns this subcommand detached; a directly
+            // invoked `serve` must record the same self-ignore so the project
+            // state it creates never dirties the checkout.
+            ignore_project_local_runtime_state(&workdir);
+            yi_agent_store::ipc::Daemon::start_with_factory(
+                &runtime_dir,
+                &database,
+                build_daemon_worker_factory(
+                    cli,
+                    yi_agent_store::ipc::socket_path_for(&runtime_dir)?,
+                )?,
+            )
+            .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
+            .wait()
+            .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}"))
+        }
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
     }
 }
@@ -560,6 +572,38 @@ fn runtime_directory_from(
 /// path here instead of hardcoding a name that can drift apart.
 fn runtime_database_path(runtime_dir: &std::path::Path) -> std::path::PathBuf {
     runtime_dir.join("runtime.sqlite")
+}
+
+/// Keeps the daemon's own project-local state out of the checkout's git status.
+///
+/// The runtime state root is `<workdir>/.yi-agent/` (the daemon's `runtime/`
+/// store plus the TUI's `threads/` logs). Creating it dirties a checkout that
+/// does not already ignore it, and git worktree provisioning then refuses that
+/// dirty parent — so the very first delegation would fail on a clean project.
+/// This records the state root in the shared, untracked `.git/info/exclude`, so
+/// the tool never defeats its own precondition. It is a no-op for a non-git
+/// workdir or a workdir outside any repository. The entry is keyed on
+/// `<workdir>/.yi-agent` even when `YI_AGENT_RUNTIME_DIR` relocates the store:
+/// the TUI's `threads/` logs, the permission cache and the project `.env` still
+/// live under `.yi-agent/`, so ignoring it is what keeps the checkout clean
+/// regardless of the runtime directory. Recording the entry is idempotent and
+/// harmless when the project already ignores the path elsewhere: git tolerates
+/// redundant ignore sources.
+fn ignore_project_local_runtime_state(workdir: &std::path::Path) {
+    let state_root = workdir.join(".yi-agent");
+    let service = yi_agent_tools::worktree::WorktreeService::new();
+    match service.ignore_project_path(&state_root) {
+        Ok(()) => {}
+        Err(error) => {
+            // Degrade to the previous behavior: a non-git or unreadable
+            // workdir must not turn delegation setup into a hard failure.
+            tracing::debug!(
+                error = %error,
+                workdir = %workdir.display(),
+                "could not record the project-local runtime state in git exclude"
+            );
+        }
+    }
 }
 
 fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Result<()> {
@@ -629,6 +673,9 @@ fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<Headles
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
+    // Record the project-local state before the daemon creates it, otherwise
+    // root worktree provisioning sees a checkout dirtied by our own store.
+    ignore_project_local_runtime_state(&config.workdir);
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
         &database,
@@ -658,7 +705,7 @@ fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<Headles
         workspace,
     } = response
     else {
-        anyhow::bail!("daemon rejected headless runtime attachment: {response:?}");
+        anyhow::bail!("{}", runtime_attached_root_rejection(&response));
     };
     Ok(HeadlessRuntimeSession {
         socket_path,
@@ -734,10 +781,39 @@ fn runtime_unavailable_reason(error: &yi_agent_store::ipc::IpcError) -> String {
     format!("subagent delegation unavailable: {error}")
 }
 
+/// Turns a rejected attach response into an actionable, human-readable reason.
+///
+/// A raw `{response:?}` dump buries the real cause (for example a dirty
+/// checkout) behind `Error { code: InvalidState, message: Some(...) }`, which
+/// reads like an internal admission fault rather than a local git state
+/// problem the user can fix.
+fn runtime_attached_root_rejection(response: &yi_agent_store::ipc::IpcResponse) -> String {
+    match response {
+        yi_agent_store::ipc::IpcResponse::Error {
+            code,
+            message: Some(message),
+        } => format!(
+            "daemon rejected the runtime attachment: {code}: {message}; \
+             subagent delegation is disabled for this session"
+        ),
+        yi_agent_store::ipc::IpcResponse::Error {
+            code,
+            message: None,
+        } => format!(
+            "daemon rejected the runtime attachment: {code}; \
+             subagent delegation is disabled for this session"
+        ),
+        other => format!("daemon rejected the runtime attachment: {other:?}"),
+    }
+}
+
 fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
+    // Record the project-local state before the daemon creates it, otherwise
+    // root worktree provisioning sees a checkout dirtied by our own store.
+    ignore_project_local_runtime_state(&config.workdir);
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
         &database,
@@ -775,7 +851,7 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
         workspace,
     } = response
     else {
-        let reason = format!("daemon rejected the runtime attachment: {response:?}");
+        let reason = runtime_attached_root_rejection(&response);
         tracing::warn!(response = ?response, "{reason}");
         return Ok(Some(TuiRuntimeSession::Unavailable { reason }));
     };
@@ -2077,5 +2153,113 @@ mod tests {
         };
 
         assert_eq!(task_event_line(&event), "42 task_progress {\"done\":true}");
+    }
+
+    #[test]
+    fn attach_rejection_reason_surfaces_the_daemon_message_not_a_debug_dump() {
+        let response = yi_agent_store::ipc::IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::InvalidState,
+            message: Some("worker startup failed: Git workspace error: parent worktree is dirty: /tmp/p — a coding root needs a clean checkout; commit or stash the changes first".into()),
+        };
+
+        let reason = runtime_attached_root_rejection(&response);
+
+        assert!(
+            reason.contains("parent worktree is dirty"),
+            "the user must see the real cause, got: {reason}"
+        );
+        assert!(
+            reason.contains("commit or stash"),
+            "the reason must offer an actionable remedy, got: {reason}"
+        );
+        assert!(
+            !reason.contains("Some("),
+            "the reason must not leak a Debug dump, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn attach_rejection_reason_degrades_gracefully_without_a_message() {
+        let response = yi_agent_store::ipc::IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::Internal,
+            message: None,
+        };
+
+        let reason = runtime_attached_root_rejection(&response);
+
+        assert!(reason.contains("internal"), "got: {reason}");
+        assert!(reason.contains("delegation is disabled"), "got: {reason}");
+    }
+
+    #[test]
+    fn ignoring_project_local_runtime_state_keeps_a_clean_checkout_usable() {
+        use std::process::Command;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(directory.path())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "tests@example.com"]);
+        run(&["config", "user.name", "Tests"]);
+        std::fs::write(directory.path().join("README.md"), "base\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-m", "base"]);
+        let porcelain = || {
+            let output = Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(porcelain(), "");
+
+        // The daemon hook runs before the state dir exists.
+        ignore_project_local_runtime_state(directory.path());
+
+        assert_eq!(
+            porcelain(),
+            "",
+            "the hook alone must not dirty the checkout"
+        );
+
+        // Once the daemon creates its store, the checkout must stay clean.
+        std::fs::create_dir_all(directory.path().join(".yi-agent/runtime")).unwrap();
+        std::fs::write(
+            directory.path().join(".yi-agent/runtime/runtime.sqlite"),
+            "state",
+        )
+        .unwrap();
+        std::fs::create_dir_all(directory.path().join(".yi-agent/threads")).unwrap();
+        std::fs::write(
+            directory.path().join(".yi-agent/threads/thread-1.jsonl"),
+            "log",
+        )
+        .unwrap();
+
+        assert_eq!(
+            porcelain(),
+            "",
+            "the daemon's own state must never dirty the checkout"
+        );
+    }
+
+    #[test]
+    fn ignoring_project_local_runtime_state_is_a_no_op_outside_git() {
+        let directory = tempfile::TempDir::new().unwrap();
+
+        // Must not panic or create stray files in a non-git workdir.
+        ignore_project_local_runtime_state(directory.path());
+
+        assert!(!directory.path().join(".git").exists());
     }
 }
