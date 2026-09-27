@@ -228,7 +228,7 @@ impl Translator {
     pub fn on_event(&mut self, ev: AgentEvent) -> Vec<Notification> {
         let mut out = Vec::new();
         match ev {
-            AgentEvent::AssistantText(s) | AgentEvent::DecodeDelta(s) => {
+            AgentEvent::AssistantText(s) => {
                 if !s.is_empty() {
                     self.append_agent_text(s, &mut out);
                 }
@@ -337,12 +337,20 @@ impl Translator {
             // `PermissionRequest` 由 server 的 driver 直接拦截并发出反向请求
             // `item/toolCall/requestApproval`(不走 translator);`PermissionResolved`
             // 在 baseline 中保持 no-op。此处不 panic。
+            //
+            // `DecodeDelta` 是**工具调用入参**的流式 JSON 分片(`agent.rs` 把
+            // `ProviderEvent::ToolUseDelta.partial_json` 原样转发),不是助手散文。
+            // 若当成 agent 正文渲染,同一段命令会在正文里出现一次、又在随后的
+            // `toolCall` 卡片里出现一次(且分片到达时会显示成半截 JSON)。TUI
+            // (`tui/history.rs` 的 `DecodeDelta => 不跟踪`)与 headless drain 都
+            // 有意忽略它,这里同样忽略。
             AgentEvent::Start
             | AgentEvent::ToolRetry { .. }
             | AgentEvent::EstimatedPrefill(_)
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::ManualCompacted { .. }
             | AgentEvent::ManualCompactFailed { .. }
+            | AgentEvent::DecodeDelta(_)
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::PermissionResolved { .. } => {}
         }
@@ -382,17 +390,6 @@ mod tests {
         let mut t = Translator::new("th1".into());
         t.set_turn("turn1".into());
         t
-    }
-
-    /// Extract the item id from a leading `ItemStarted { AgentMessage }`.
-    fn agent_msg_id(ns: &[Notification]) -> String {
-        match ns.first() {
-            Some(Notification::ItemStarted {
-                item: Item::AgentMessage { id, .. },
-                ..
-            }) => id.clone(),
-            other => panic!("expected ItemStarted AgentMessage, got {other:?}"),
-        }
     }
 
     #[test]
@@ -448,24 +445,28 @@ mod tests {
     }
 
     #[test]
-    fn decode_delta_emits_item_delta() {
+    fn decode_delta_is_not_rendered_as_agent_text() {
+        // `DecodeDelta` carries streamed tool-call *arguments* JSON, not
+        // assistant prose. Rendering it as an agentMessage duplicated the
+        // command in the UI (once as text, once in the tool card). The TUI and
+        // the headless drain both ignore it; the translator must too.
         let mut t = translator();
-        let first = t.on_event(AgentEvent::AssistantText("hi".into()));
-        let item_id = agent_msg_id(&first);
+        t.on_event(AgentEvent::AssistantText("hi".into()));
+        let out = t.on_event(AgentEvent::DecodeDelta("{\"command\":\"ls\"}".into()));
+        assert!(
+            out.is_empty(),
+            "decode delta must emit nothing, got {out:?}"
+        );
+    }
 
-        let out = t.on_event(AgentEvent::DecodeDelta(" world".into()));
-        assert_eq!(out.len(), 1, "decode delta should only emit ItemDelta");
-        match &out[0] {
-            Notification::ItemDelta {
-                item_id: got_id,
-                delta,
-                ..
-            } => {
-                assert_eq!(got_id, &item_id, "decode delta must reuse the same item");
-                assert_eq!(delta, " world");
-            }
-            other => panic!("expected ItemDelta, got {other:?}"),
-        }
+    #[test]
+    fn decode_delta_alone_does_not_open_agent_message() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::DecodeDelta("{\"command\":\"ls\"}".into()));
+        assert!(
+            out.is_empty(),
+            "decode delta must not open an agentMessage, got {out:?}"
+        );
     }
 
     #[test]

@@ -896,15 +896,13 @@ fn assistant_text_starts_agent_message() {
     assert!(matches!(out[0], Notification::ItemStarted { .. }));
 }
 
+// `DecodeDelta` 是工具调用入参的流式 JSON 分片,不是助手散文,不产生任何通知。
 #[test]
-fn decode_delta_emits_item_delta() {
+fn decode_delta_is_not_rendered_as_agent_text() {
     let mut t = Translator::new("t1".into());
     t.on_event(AgentEvent::AssistantText("hello".into())); // 先开 item
-    let out = t.on_event(AgentEvent::DecodeDelta(" world".into()));
-    match &out[0] {
-        Notification::ItemDelta { delta, .. } => assert_eq!(delta, " world"),
-        other => panic!("expected ItemDelta, got {other:?}"),
-    }
+    let out = t.on_event(AgentEvent::DecodeDelta("{\"command\":\"ls\"}".into()));
+    assert!(out.is_empty(), "decode delta must emit nothing, got {out:?}");
 }
 
 #[test]
@@ -939,8 +937,10 @@ Expected: FAIL。
 `Translator` 持有当前 agent-message item 的 id 与累积文本,维护 call_id → item_id 映射。
 `on_event(&mut self, ev: AgentEvent) -> Vec<Notification>`(权限事件见 C5 单独处理)。
 
-映射表见设计文档 §6.5。注意 `AssistantText` 与 `DecodeDelta` 都追加到同一个
-agentMessage item(`item/delta`),`Done` 时补一条 `item/completed`。
+映射表见设计文档 §6.5。只有 `AssistantText` 追加到 agentMessage item
+(`item/delta`);`DecodeDelta` 是工具调用入参 JSON 分片,忽略不渲染
+(否则同一段命令会在正文与 `toolCall` 卡片各出现一次)。`Done` 时补一条
+`item/completed`。
 
 **Step 4: 跑测试确认通过**
 
