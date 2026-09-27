@@ -8,6 +8,7 @@ import { StatusBar } from "./components/StatusBar";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ThreadSidebar } from "./components/ThreadSidebar";
 import type { ApprovalRequest, Workspace, WorkspaceGroup } from "./lib/protocol";
+import { threadStartParams } from "./lib/threadStart";
 
 interface ThreadInfo {
   cwd: string;
@@ -99,7 +100,7 @@ export default function App() {
     try {
       const t = await c.request<ThreadInfo & { thread_id: string }>(
         "thread/start",
-        cwd ? { cwd } : {},
+        threadStartParams(cwd),
       );
       setThreadId(t.thread_id);
       setThreadInfo({ cwd: t.cwd, model: t.model });
@@ -121,32 +122,55 @@ export default function App() {
     return typeof picked === "string" ? picked : null;
   };
 
-  const addWorkspace = async (path: string) => {
-    await clientRef.current?.request("workspace/add", { path });
-  };
-
-  const removeWorkspace = async (path: string) => {
-    await clientRef.current?.request("workspace/remove", { path });
-    // 「移除」只是视图操作,不删数据:目录离开索引后 thread/listAll 不再扫描它,
-    // 分组随之从侧栏消失,但 <dir>/.yi-agent/ 下的对话文件仍然保留。
-    await refreshThreads();
-    await refreshWorkspaces();
-  };
-
-  /** 侧栏入口:带 cwd 直接在该目录新建;无 cwd 时侧栏自行决定(列目录或弹选择器)。 */
-  const onNew = async (cwd?: string) => {
-    if (!cwd) return;
-    await newThread(cwd);
-    // thread/start 会顺带把该目录写入最近目录索引。
-    await refreshWorkspaces();
+  const addWorkspace = async (path: string): Promise<boolean> => {
+    try {
+      await clientRef.current?.request("workspace/add", { path });
+      return true;
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+      return false;
+    }
   };
 
   /** 打开原生选择器 → 加入最近目录 → 在该目录新建对话。 */
   const onBrowse = async () => {
-    const dir = await pickDirectory();
-    if (!dir) return;
-    await addWorkspace(dir);
-    await newThread(dir);
+    if (session.turnActive || resuming.current) return;
+    try {
+      const dir = await pickDirectory();
+      if (!dir) return;
+      // add 失败(-32602 等)时不再建对话,错误已写入 lastError。
+      if (!(await addWorkspace(dir))) return;
+      await newThread(dir);
+      await refreshWorkspaces();
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+    }
+  };
+
+  /** 侧栏入口:带 cwd 直接在该目录新建;无 cwd 时退化为弹原生选择器。 */
+  const onNew = async (cwd?: string) => {
+    if (cwd) {
+      await newThread(cwd);
+      // thread/start 会顺带把该目录写入最近目录索引。
+      await refreshWorkspaces();
+    } else {
+      await onBrowse();
+    }
+  };
+
+  const removeWorkspace = async (path: string) => {
+    try {
+      await clientRef.current?.request("workspace/remove", { path });
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+    }
+    // 「移除」只是视图操作,不删数据:目录离开索引后 thread/listAll 不再扫描它,
+    // 分组随之从侧栏消失,但 <dir>/.yi-agent/ 下的对话文件仍然保留。
+    // 失败时也刷新,保证 UI 与服务端状态一致。
+    await refreshThreads();
     await refreshWorkspaces();
   };
 

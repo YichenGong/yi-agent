@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
 
@@ -54,6 +54,17 @@ export function ThreadSidebar({
     setNewMenuOpen(false);
     setContextWs(null);
   };
+
+  // Escape closes whichever menu is open, regardless of what inside it (or the
+  // trigger) currently has focus.
+  useEffect(() => {
+    if (!newMenuOpen && contextWs === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeMenus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [newMenuOpen, contextWs]);
 
   const commit = (id: string) => {
     const title = draft.trim();
@@ -138,6 +149,8 @@ export function ThreadSidebar({
       <div className="relative p-2">
         <button
           type="button"
+          aria-haspopup="menu"
+          aria-expanded={newMenuOpen}
           onClick={() => {
             // No recent dirs to offer: go straight to the native picker.
             if (workspaces.length === 0) {
@@ -155,11 +168,15 @@ export function ThreadSidebar({
         {newMenuOpen && (
           <>
             <div className="fixed inset-0 z-10" onClick={closeMenus} />
-            <div className="absolute right-2 left-2 top-full z-20 -mt-1 rounded-md border border-neutral-700 bg-neutral-800 py-1 shadow-xl">
+            <div
+              role="menu"
+              className="absolute right-2 left-2 top-full z-20 -mt-1 rounded-md border border-neutral-700 bg-neutral-800 py-1 shadow-xl"
+            >
               {workspaces.map((w) => (
                 <button
                   key={w.path}
                   type="button"
+                  role="menuitem"
                   disabled={!w.exists}
                   title={w.path}
                   onClick={() => {
@@ -177,6 +194,7 @@ export function ThreadSidebar({
               ))}
               <button
                 type="button"
+                role="menuitem"
                 onClick={() => {
                   closeMenus();
                   onBrowse();
@@ -198,13 +216,24 @@ export function ThreadSidebar({
           return (
             <div key={g.workspace} className="relative">
               <div
+                tabIndex={0}
+                aria-haspopup="menu"
+                aria-expanded={contextWs === g.workspace}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   if (busy) return;
                   setNewMenuOpen(false);
                   setContextWs(g.workspace);
                 }}
-                className="flex items-center gap-1 px-2 py-1.5 text-xs text-neutral-500 hover:bg-neutral-800/50"
+                onKeyDown={(e) => {
+                  // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。
+                  if (e.key !== "Enter" && e.key !== " ") return;
+                  if (busy) return;
+                  e.preventDefault();
+                  setNewMenuOpen(false);
+                  setContextWs((cur) => (cur === g.workspace ? null : g.workspace));
+                }}
+                className="flex items-center gap-1 px-2 py-1.5 text-xs text-neutral-500 hover:bg-neutral-800/50 focus:bg-neutral-800/50 focus:outline-none"
               >
                 <button
                   type="button"
@@ -228,9 +257,13 @@ export function ThreadSidebar({
               {contextWs === g.workspace && (
                 <>
                   <div className="fixed inset-0 z-10" onClick={closeMenus} />
-                  <div className="absolute top-7 left-4 z-20 rounded-md border border-neutral-700 bg-neutral-800 py-1 shadow-xl">
+                  <div
+                    role="menu"
+                    className="absolute top-7 left-4 z-20 rounded-md border border-neutral-700 bg-neutral-800 py-1 shadow-xl"
+                  >
                     <button
                       type="button"
+                      role="menuitem"
                       disabled={busy}
                       onClick={() => {
                         closeMenus();
@@ -242,6 +275,7 @@ export function ThreadSidebar({
                     </button>
                     <button
                       type="button"
+                      role="menuitem"
                       disabled={busy}
                       onClick={() => {
                         closeMenus();
