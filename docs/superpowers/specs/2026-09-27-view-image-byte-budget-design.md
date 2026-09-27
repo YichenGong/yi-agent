@@ -261,8 +261,29 @@ cargo test -p yi-agent-tools --lib fs::view_image
 
 ## 8. 待登记（本次不修）
 
-- **请求体级预算**：单图有预算，但一个 turn 内多张图（多个 `view_image`
-  调用、或与文本叠加）合计仍可能超网关上限。需要 provider 层或 agent 层的
-  请求体预算，属独立迭代。
+- **请求体级预算，且 compaction 无法兜底**：单图有预算，但一个 turn 内多张图
+  （多个 `view_image` 调用、或与文本叠加）合计仍可能超网关上限。
+  已核实 **compaction 不能作为兜底**，两条独立的机制：
+
+  1. **触发依赖真实 usage，而 413 在 usage 到达前就终止整轮。**
+     `maybe_auto_compact` 用 `snapshot.last_input_tokens()`
+     （`agent.rs:1142`），后者只由真实 API usage 写入（`agent.rs:699`）；
+     启发式 `estimate_prefill_tokens` 与触发无关（仅 UI 事件）。
+     而 413 经 `map_status_error` 落到 `_ => Server(...)`
+     （`openai/error.rs:23`），不在重试白名单内
+     （`agent.rs:650-651` 只重试 `Stalled` / `Network`），随即走终结分支
+     `agent.rs:709-715` 直接 `return` —— 既不记录 usage，也不会再进入下一轮
+     `maybe_auto_compact`。因此超限请求**拿不到新的触发信号**。
+  2. **保留预算把图片记为 0。** `estimate_block_tokens` 的
+     `ContentBlock::Image { .. } => 0`（`compact.rs:88`）使含图的 tool unit
+     在 `compact_tool_budget_tokens`（默认 12,000）下看起来"免费"，加上
+     最近单元按 recency 保留，**触发 413 的那张图会被保留**，
+     compaction 无法把它挤出（旧图可能被挤出并折叠成摘要里的 `[图片]`，
+     `compact.rs:405`，但最新的元凶不会）。
+
+  结论：多图场景的**唯一**补救是 provider/agent 层的请求体预算（或修正该
+  估算），属独立迭代。
 - compaction token 估算把 `ContentBlock::Image` 记为 0 token
   （`compact.rs:88`、`agent.rs:1239`）——已在 `docs/bug-list.md` 登记。
+  注意其中 `agent.rs:1239` 那处**只影响 UI 的 prefill 估算**（不参与 compact
+  触发）；真正有行为后果的是 `compact.rs:88` 的保留预算估算（见上条）。
