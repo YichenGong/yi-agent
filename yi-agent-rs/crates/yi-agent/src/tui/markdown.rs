@@ -3,6 +3,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use super::wrap::wrap_by_display_width;
+
 #[cfg(test)]
 use std::cell::Cell;
 
@@ -734,6 +736,15 @@ impl LineBuilder {
 
     /// Render the accumulated table rows as Unicode box-drawing Lines and push
     /// them to `self.lines`. Resets all table state.
+    ///
+    /// The table is always folded to `self.width`: columns are shrunk until the
+    /// box fits, and any cell that no longer fits its column is hard-wrapped by
+    /// display width across physical lines. When the width cannot even hold
+    /// minimum-width columns (e.g. a six-column table on a 20-col terminal),
+    /// we fall back to vertical `label: value` records, which always fit.
+    /// Without this the rendered line keeps growing past the terminal and
+    /// ratatui truncates its right side permanently (see `Line::render`), so
+    /// the user silently loses cells off the right edge.
     fn flush_table(&mut self) {
         let rows = std::mem::take(&mut self.table_rows);
         let alignments = std::mem::take(&mut self.table_alignments);
@@ -745,21 +756,30 @@ impl LineBuilder {
         if num_cols == 0 {
             return;
         }
-        let mut col_widths = vec![0usize; num_cols];
-        for row in &rows {
-            for (i, cell) in row.iter().enumerate() {
-                let w = UnicodeWidthStr::width(cell.as_str());
-                if w > col_widths[i] {
-                    col_widths[i] = w;
-                }
-            }
+        let natural_widths: Vec<usize> = (0..num_cols)
+            .map(|i| {
+                rows.iter()
+                    .filter_map(|row| row.get(i))
+                    .map(|cell| UnicodeWidthStr::width(cell.as_str()))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        let table_width = self.width as usize;
+        // Smallest drawable box: 1 content column + 2 padding columns per
+        // column, plus one border char per column and one closing border.
+        let min_total = 4 * num_cols + 1;
+        if min_total > table_width {
+            // Cannot draw even a minimal box within the terminal. Vertical
+            // records trade the table shape for content that always fits.
+            self.push_vertical_records(&rows, &alignments);
+            self.in_table = false;
+            self.current_row.clear();
+            self.current_cell.clear();
+            return;
         }
-        // Cap column widths so total table fits in self.width when possible.
-        // Total = sum(col_widths) + 3*num_cols + 1 (borders + padding + final border)
-        // We don't hard-wrap cells here; if the table is wider than the terminal,
-        // we let it overflow (consistent with how `flush_line` handles long words
-        // in non-table text: the wrapping layer above this handles wrapping).
-        let _ = self.width;
+        let col_widths = fit_column_widths(&natural_widths, table_width);
 
         // Helper: build a horizontal border line.
         // `left`, `mid`, `right` are the corner/junction chars; `fill` is ─.
@@ -779,42 +799,39 @@ impl LineBuilder {
             s
         };
 
-        // Helper: build a data row line with the given alignment per column.
-        let data_line = |row: &[String]| -> String {
-            let mut s = String::new();
-            s.push('│');
-            for (i, col_w) in col_widths.iter().enumerate() {
-                let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                let cw = UnicodeWidthStr::width(cell);
-                let pad_total = col_w.saturating_sub(cw);
-                let align = alignments.get(i).copied().unwrap_or(Alignment::None);
-                let (left_pad, right_pad) = match align {
-                    Alignment::Center => {
-                        let l = pad_total / 2;
-                        let r = pad_total - l;
-                        (l, r)
+        // A physical row is one line of every cell's wrapped sub-lines. Cells
+        // shorter than the tallest wrap to blank padding so borders stay aligned.
+        let row_lines = |row: &[String]| -> Vec<String> {
+            let wrapped: Vec<Vec<String>> = (0..num_cols)
+                .map(|i| {
+                    let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                    wrap_cell(cell, col_widths[i])
+                })
+                .collect();
+            let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            (0..height)
+                .map(|line| {
+                    let mut s = String::from("│");
+                    for (i, segments) in wrapped.iter().enumerate() {
+                        let segment = segments.get(line).map(|s| s.as_str()).unwrap_or("");
+                        s.push_str(&pad_cell(
+                            segment,
+                            col_widths[i],
+                            alignments.get(i).copied().unwrap_or(Alignment::None),
+                        ));
+                        s.push('│');
                     }
-                    Alignment::Right => (pad_total, 0),
-                    _ => (0, pad_total), // None and Left both left-align
-                };
-                s.push(' ');
-                for _ in 0..left_pad {
-                    s.push(' ');
-                }
-                s.push_str(cell);
-                for _ in 0..right_pad {
-                    s.push(' ');
-                }
-                s.push(' ');
-                s.push('│');
-            }
-            s
+                    s
+                })
+                .collect()
         };
 
         // Top border: ┌─┬─┐
         self.lines.push(Line::raw(border('┌', '┬', '┐')));
         for (ri, row) in rows.iter().enumerate() {
-            self.lines.push(Line::raw(data_line(row)));
+            for line in row_lines(row) {
+                self.lines.push(Line::raw(line));
+            }
             if ri == 0 {
                 // Header separator after the first (header) row.
                 self.lines.push(Line::raw(border('├', '┼', '┤')));
@@ -827,6 +844,34 @@ impl LineBuilder {
         self.current_cell.clear();
     }
 
+    /// Fallback layout for tables too wide for a box: one `label: value` record
+    /// per row, every record wrapped to `self.width`. Used when the terminal
+    /// cannot hold minimum-width columns, where a box would clip.
+    fn push_vertical_records(&mut self, rows: &[Vec<String>], alignments: &[Alignment]) {
+        let _ = alignments;
+        let width = self.width as usize;
+        let Some(header) = rows.first() else {
+            return;
+        };
+        for (ri, row) in rows.iter().enumerate().skip(1) {
+            if ri > 1 {
+                self.lines.push(Line::raw(""));
+            }
+            for (i, value) in row.iter().enumerate() {
+                let label = header.get(i).map(|s| s.as_str()).unwrap_or("");
+                let label = if label.is_empty() {
+                    format!("col{i}")
+                } else {
+                    label.to_string()
+                };
+                let text = format!("{label}: {value}");
+                for chunk in wrap_by_display_width(&text, width.max(1), "", "  ") {
+                    self.lines.push(Line::raw(chunk));
+                }
+            }
+        }
+    }
+
     fn finish(mut self) -> Vec<Line<'static>> {
         if !self.current_spans.is_empty() {
             self.flush_line();
@@ -837,6 +882,116 @@ impl LineBuilder {
 
 fn render_math(formula: &str) -> String {
     TexRenderer::new(formula).render()
+}
+
+/// Shrink natural column widths until the whole box fits `table_width`.
+///
+/// A column never drops below 1 content column, and the fixed overhead is 2
+/// padding columns per column plus 1 char per border (the leading `│`, each
+/// interior `│`, and the trailing `│`, i.e. `num_cols + 1`). Space is taken
+/// from the widest column first so narrow columns keep their natural size and
+/// the box stays as readable as possible. Assumes the caller already checked
+/// that minimum-width columns fit.
+fn fit_column_widths(natural: &[usize], table_width: usize) -> Vec<usize> {
+    let num_cols = natural.len();
+    let overhead = num_cols * 2 + (num_cols + 1);
+    let mut widths = natural.to_vec();
+    // Space the box may use for content after fixed padding and borders.
+    // Padding and borders already fit (checked by the caller), so this is
+    // never negative and only reports how much content space is left.
+    let budget = table_width.saturating_sub(overhead);
+    loop {
+        let total: usize = widths.iter().sum();
+        if total <= budget {
+            return widths;
+        }
+        // Widest first; ties resolve to the earliest column for determinism.
+        let Some(index) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 1)
+            .max_by_key(|(i, w)| (**w, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+        else {
+            return widths; // Every column is already at the 1-col minimum.
+        };
+        widths[index] -= 1;
+    }
+}
+
+/// Wrap one cell's text into sub-lines of at most `width` display columns.
+///
+/// Words are kept intact when they fit; a word longer than the column is hard
+/// split by display width (CJK and emoji count two columns). Returns a
+/// non-empty vector so callers can index it safely.
+fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for word in text.split(' ') {
+        let word_width = UnicodeWidthStr::width(word);
+        let separator = if current.is_empty() { 0 } else { 1 };
+        if current_width + separator + word_width <= width {
+            if separator == 1 {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(word);
+            current_width += word_width;
+            continue;
+        }
+        if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if word_width <= width {
+            current.push_str(word);
+            current_width = word_width;
+            continue;
+        }
+        // A single word wider than the column: split it by display width.
+        for ch in word.chars() {
+            let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+            if current_width + ch_width > width && !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Pad a wrapped cell segment to `width` display columns inside its 1-space
+/// border padding, applying the column alignment. Wrapped segments are always
+/// padded on the right so the closing `│` lines up across sub-lines.
+fn pad_cell(segment: &str, width: usize, align: Alignment) -> String {
+    let segment_width = UnicodeWidthStr::width(segment);
+    let pad_total = width.saturating_sub(segment_width);
+    let (left_pad, right_pad) = match align {
+        Alignment::Center => {
+            let left = pad_total / 2;
+            (left, pad_total - left)
+        }
+        Alignment::Right => (pad_total, 0),
+        _ => (0, pad_total), // None and Left both left-align
+    };
+    let mut out = String::with_capacity(width + 2);
+    out.push(' ');
+    for _ in 0..left_pad {
+        out.push(' ');
+    }
+    out.push_str(segment);
+    for _ in 0..right_pad {
+        out.push(' ');
+    }
+    out.push(' ');
+    out
 }
 
 const MAX_TEX_NESTING: usize = 32;
@@ -1687,6 +1842,205 @@ mod tests {
             assert!(
                 joined.contains(expected),
                 "missing cell content {expected:?} in: {joined:?}"
+            );
+        }
+    }
+
+    /// Render a markdown table and return one string per display line.
+    fn table_lines(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(spans_text).collect()
+    }
+
+    const BOX_CHARS: [char; 11] = ['─', '│', '┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘'];
+
+    /// Character counts of the rendered table, excluding box-drawing borders
+    /// and all whitespace (wrapping adds padding, so counting characters that
+    /// are not padding is how "no content was dropped" is asserted).
+    fn table_chars(rendered: &[String]) -> std::collections::BTreeMap<char, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for ch in rendered.iter().flat_map(|line| line.chars()) {
+            if ch.is_whitespace() || BOX_CHARS.contains(&ch) {
+                continue;
+            }
+            *counts.entry(ch).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Character counts of the source cells, ignoring the markdown syntax that
+    /// is not part of any cell value.
+    fn source_chars(cells: &[&str]) -> std::collections::BTreeMap<char, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for ch in cells
+            .iter()
+            .flat_map(|cell| cell.chars())
+            .filter(|ch| *ch != ' ')
+        {
+            *counts.entry(ch).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    const WIDE_TABLE_HEADER: [&str; 3] = ["Name", "Description", "Owner"];
+    const WIDE_TABLE_ROW: [&str; 3] = [
+        "alpha-service",
+        "Handles all inbound user authentication and session rotation",
+        "platform-team",
+    ];
+
+    fn wide_table() -> String {
+        format!(
+            "| {} | {} | {} |\n| --- | --- | --- |\n| {} | {} | {} |\n",
+            WIDE_TABLE_HEADER[0],
+            WIDE_TABLE_HEADER[1],
+            WIDE_TABLE_HEADER[2],
+            WIDE_TABLE_ROW[0],
+            WIDE_TABLE_ROW[1],
+            WIDE_TABLE_ROW[2],
+        )
+    }
+
+    #[test]
+    fn table_wider_than_terminal_wraps_to_fit_width() {
+        // The natural width of this table is ~96 columns. At any narrower
+        // terminal every rendered line must fit, instead of being clipped.
+        for width in [40u16, 60, 80] {
+            for line in table_lines(&render_markdown(&wide_table(), width)) {
+                let w = UnicodeWidthStr::width(line.as_str());
+                assert!(
+                    w <= width as usize,
+                    "width {width}: line is {w} cols: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_table_preserves_every_cell_character() {
+        // Wrapping may split a long word across sub-lines, and columns
+        // interleave on each physical row, so contiguity is not guaranteed.
+        // What must hold is that every source character survives exactly once.
+        let rendered = table_lines(&render_markdown(&wide_table(), 40));
+        let source = source_chars(
+            &WIDE_TABLE_HEADER
+                .iter()
+                .chain(WIDE_TABLE_ROW.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            table_chars(&rendered),
+            source,
+            "table content changed while wrapping: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn single_column_table_keeps_words_intact_when_they_fit() {
+        // With one column there is no interleaving, so a word that fits the
+        // column must survive the wrap unbroken.
+        let src = "| Description |\n| --- |\n| Handles all inbound user authentication |\n";
+        let rendered = table_lines(&render_markdown(src, 40));
+        let joined: String = rendered.join("");
+        for word in ["Handles", "all", "inbound", "user", "authentication"] {
+            assert!(joined.contains(word), "lost word {word:?}: {rendered:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_table_rows_keep_aligned_left_and_right_borders() {
+        let rendered = table_lines(&render_markdown(&wide_table(), 40));
+        let widths: Vec<usize> = rendered
+            .iter()
+            .map(|line| UnicodeWidthStr::width(line.as_str()))
+            .collect();
+        let table_width = widths[0];
+        assert!(table_width <= 40, "table too wide: {table_width}");
+        assert!(
+            widths.iter().all(|w| *w == table_width),
+            "wrapped rows are ragged: {widths:?} in {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| matches!(line.chars().next(), Some('│' | '┌' | '├' | '└'))),
+            "row is missing its left border: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| matches!(line.chars().last(), Some('│' | '┐' | '┤' | '┘'))),
+            "row is missing its right border: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn table_too_narrow_for_columns_renders_vertical_records() {
+        // Six columns need 3*6+1 = 19 cols of borders and padding alone, so a
+        // 20-col terminal cannot hold a box table. It must not clip.
+        let src = "| Model | input | output | cache_create | cache_read | calls |\n\
+             | --- | ---: | ---: | ---: | ---: | ---: |\n\
+             | claude-sonnet-4-5 | 1,000 | 200 | 30 | 40 | 5 |\n";
+        let rendered = table_lines(&render_markdown(src, 20));
+        for line in &rendered {
+            let w = UnicodeWidthStr::width(line.as_str());
+            assert!(w <= 20, "vertical record is {w} cols: {line:?}");
+        }
+        let joined = rendered.join("\n");
+        assert!(
+            !joined.contains('│'),
+            "no box table at this width: {joined:?}"
+        );
+        for label in ["Model:", "input:", "output:", "cache_create:", "calls:"] {
+            assert!(
+                joined.contains(label),
+                "expected the {label:?} record label: {joined:?}"
+            );
+        }
+        assert!(joined.contains("1,000"), "lost a value: {joined:?}");
+    }
+
+    #[test]
+    fn table_that_fits_keeps_box_borders_and_column_alignment() {
+        let src = "| Name | Age |\n| --- | ---: |\n| Alice | 30 |\n";
+        let rendered = table_lines(&render_markdown(src, 40));
+        assert!(
+            rendered
+                .iter()
+                .all(|l| UnicodeWidthStr::width(l.as_str()) <= 40),
+            "a fitting table must not wrap: {rendered:?}"
+        );
+        let data_row = rendered
+            .iter()
+            .find(|l| l.contains("Alice"))
+            .expect("missing data row");
+        assert!(data_row.ends_with('│'), "lost right border: {data_row:?}");
+        assert!(data_row.contains("30"), "lost value: {data_row:?}");
+    }
+
+    #[test]
+    fn narrow_table_with_cjk_wraps_at_display_width() {
+        let src = "| 姓名 | 描述 |\n| --- | --- |\n\
+             | 张三丰 | 这是一个很长的中文描述文本用于测试折行 |\n";
+        let expected = source_chars(&[
+            "姓名",
+            "描述",
+            "张三丰",
+            "这是一个很长的中文描述文本用于测试折行",
+        ]);
+        for width in [16u16, 24] {
+            let rendered = table_lines(&render_markdown(src, width));
+            for line in &rendered {
+                let w = UnicodeWidthStr::width(line.as_str());
+                assert!(
+                    w <= width as usize,
+                    "width {width}: line is {w} cols: {line:?}"
+                );
+            }
+            assert_eq!(
+                table_chars(&rendered),
+                expected,
+                "CJK content changed while wrapping at width {width}: {rendered:?}"
             );
         }
     }
