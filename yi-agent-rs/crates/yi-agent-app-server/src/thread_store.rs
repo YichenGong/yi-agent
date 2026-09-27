@@ -12,6 +12,15 @@ use yi_agent_core::{ContentBlock, Message, Role};
 
 use crate::protocol::Item;
 
+/// 线程的自主权模式。持久化到 `.meta.json`,重开 app 后恢复。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadMode {
+    #[default]
+    Normal,
+    Yolo,
+}
+
 /// thread 元数据(`.meta.json` 的内容)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadMeta {
@@ -22,6 +31,9 @@ pub struct ThreadMeta {
     pub created_at: i64,
     pub updated_at: i64,
     pub title: Option<String>,
+    /// 该 thread 的自主权模式;旧 meta 缺失时默认 Normal。
+    #[serde(default)]
+    pub permission_mode: ThreadMode,
 }
 
 /// 一次 turn 的 token 用量。
@@ -382,6 +394,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         created_at: created,
         updated_at: created,
         title: first_user_text(messages),
+        permission_mode: ThreadMode::Normal,
     }
 }
 
@@ -404,6 +417,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             title: None,
+            permission_mode: ThreadMode::Normal,
         }
     }
 
@@ -814,5 +828,18 @@ mod tests {
         let back: TurnUsage = serde_json::from_str(&s).unwrap();
         assert_eq!(back.cache_creation_input_tokens, 30);
         assert_eq!(back.cache_read_input_tokens, 40);
+    }
+
+    #[test]
+    fn permission_mode_defaults_to_normal_and_roundtrips() {
+        let v: ThreadMeta = serde_json::from_str(
+            r#"{"thread_id":"t","cwd":"/x","model":"m","created_at":0,"updated_at":0,"title":null}"#,
+        )
+        .unwrap();
+        assert_eq!(v.permission_mode, ThreadMode::Normal); // 旧 meta 兼容
+        let mut m = v;
+        m.permission_mode = ThreadMode::Yolo;
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"permission_mode\":\"yolo\""));
     }
 }

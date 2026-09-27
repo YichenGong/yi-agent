@@ -391,6 +391,7 @@ where
                             created_at: now,
                             updated_at: now,
                             title: None,
+                            permission_mode: crate::thread_store::ThreadMode::Normal,
                         };
                         if let Err(e) = thread_store.create(&meta) {
                             // 持久化是尽力而为:写失败不阻断 thread 创建。
