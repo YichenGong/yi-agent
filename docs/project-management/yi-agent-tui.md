@@ -44,7 +44,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] `/cost` 命令 — `tui/cost.rs::CostTracker` 按模型累计 token + 调用次数 — [设计](../plans/2026-07-26-tui-cost-command-design.md)
 - [x] `/yolo` `/model` `/compact` `/clear` `/help` `/exit` slash 命令 — `tui/slash.rs` + `tui/app.rs` 路由
 - [x] 压缩状态闭环 — `/compact` 的 pending 行由 `ManualCompacted` / `ManualCompactFailed` 原地更新，`AutoCompacting` 追加完成行；验证：`cargo test -p yi-agent --bin yi-agent tui::history::tests::manual_compaction_` 和 `cargo test -p yi-agent --bin yi-agent tui::history::tests::auto_compaction_appends_completed_status`
-- [x] Markdown 表格渲染 — commit `2e9da9e` 用 Unicode box drawing 修复
+- [x] Markdown 表格渲染 — commit `2e9da9e` 用 Unicode box drawing 修复；`tui/markdown.rs` `flush_table()` 现按终端宽度收缩列宽并折行单元格（对齐保持），放不下最小盒子时退化为竖排记录，消除右侧永久裁剪 — [设计](../superpowers/specs/2026-09-27-tui-table-width-design.md)
 - [x] 终端原生复制与 bracketed paste — `tui/app.rs` 不启用 mouse capture，并路由 `Event::Paste`; 验证：`cargo test -p yi-agent tui::app::tests::paste_`
 - [x] 对话历史滚动与滚动条 — `tui/history.rs` 的 `HistoryState` / `HistoryView` 处理当前宽度重排、锚点位置保持和右侧滚动条；`tui/app.rs` 路由键盘与鼠标滚动及本地插入后的最终宽度锚点恢复；未修饰 `Up` / `Down` 每次滚动 3 行，适配终端将触控板滚动转换为方向键的行为；验证：`cargo test -p yi-agent --bin yi-agent tui::app::tests::history_anchor_survives_local_user_insertion_at_scrollbar_width`、`cargo test -p yi-agent --bin yi-agent tui::app::tests`、`cargo test -p yi-agent --bin yi-agent tui::history::tests`、`cargo test -p yi-agent --bin yi-agent tui::app::tests::normal_navigation_keys_route_to_history_without_affecting_shift_selection`
 - [x] 语义化对话留白 — `tui/history.rs` 在用户输入后、工具结果后的首段模型回复前各保留一行空白，工具调用/结果连续显示；验证：`cargo test -p yi-agent --bin yi-agent tui::history::tests`
