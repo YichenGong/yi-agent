@@ -7,8 +7,14 @@
 **状态：** 设计已确认，待转实现计划。
 
 **范围：** 只改 `view_image` 工具内部（`crates/yi-agent-tools`）。
-**不做** provider 层改动、不做请求体级别的全局预算、不改 compaction 的图片
-token 估算（见 §8）。
+**不做** provider 层改动、不做请求体级别的全局预算。
+compaction 的图片 token 估算（借鉴点 b）**单独成篇**，见
+`2026-09-27-compaction-image-token-estimate-design.md`。
+
+**借鉴自 codex**（`codex-rs`，逐条源码核实）：源格式保留 + JPEG 固定 q85
+（`utils/image/src/lib.rs:155-186`、`:351`）；超限替换为**占位文字**而非报错
+（`core/src/image_preparation.rs:78-102`）；图片 token **显式估值**而非 0
+（`core/src/context_manager/history.rs:526-530`、`:656`）。详见 §9。
 
 ---
 
@@ -63,7 +69,8 @@ token 估算（见 §8）。
 - 不改 provider（`openai/types.rs`、`anthropic/types.rs`）序列化。
 - 不做**整个请求体**的预算（一个 turn 内多张图叠加可能仍超）；登记为后续项。
 - 不改 compaction 把 `ContentBlock::Image` 记为 0 token（`compact.rs:88`、
-  `agent.rs:1239`）——独立 bug，已登记。
+  `agent.rs:1239`）——该改动落在 `yi-agent-core`，另立一篇 spec
+  （`2026-09-27-compaction-image-token-estimate-design.md`）。
 - 不做图片数量配额、不做用户侧图片入口（TUI 粘贴）。
 
 ## 3. 设计
@@ -107,9 +114,11 @@ effective_dim_cap = detail 对应上限（high=2048 / original=6000）
   且 base64(源字节).len() <= 预算
   → 直接返回源字节 + 源 MIME（当前行为，无损零重编码）
 
-步骤 1（无损 PNG）
-  在 effective_dim_cap 下 encode PNG（不缩放）
-  若 base64 PNG <= 预算 → 返回 image/png
+步骤 1（按源格式无损重编码）
+  源格式可无损表示时，在 effective_dim_cap 下按源格式 encode（不缩放）：
+    PNG 源 → PNG；WebP 源 → WebP(lossless)
+  若 base64 <= 预算 → 返回该格式
+  源格式为 JPEG/GIF（无可用的无损路径）时**跳过本步**，直接进入步骤 2
 
 步骤 2（JPEG 质量阶梯）
   依次取 q = [85, 70, 55, 40]
@@ -122,13 +131,16 @@ effective_dim_cap = detail 对应上限（high=2048 / original=6000）
   否则重复步骤 1-2（在 512 这一档也要完整试一次）
 
 步骤 4（仍超预算）
-  返回 ToolsError（复用现有变体，见 §3.5），错误文本只含数字，绝不回传图片字节
+  返回**占位文字**（非报错），见 §3.5
 ```
 
 设计要点：
 
-- **先试无损再试有损**：截图类图片在第 1 步就达标（0.10 MiB），完全不会走
-  到 JPEG；只有大照片才会落到质量阶梯。
+- **先试无损再试有损，且保留源格式**（借鉴 codex，`utils/image/src/lib.rs:155-186`）：
+  PNG/WebP 源先按源格式无损重编码，截图类图片在第 1 步就达标（PNG 0.10 MiB），
+  完全不会走到 JPEG；JPEG 源跳过步骤 1 直接进质量阶梯（实测 6000x4000 照片：
+  PNG 53 MiB vs JPEG q85 6.68 MiB，对 JPEG 源试 PNG 纯属浪费）。这是当前
+  spec 旧稿“一律先试 PNG”的修正。
 - **先降质量再降分辨率**：照片降 quality 的收益远大于降分辨率（6.68 → 1.96
   只需降质量），而分辨率是截图的刚需；因此质量阶梯排在分辨率阶梯之前。
 - **FILTER 选择**：沿用现有 `FilterType::Triangle`（`:199`），保持与既有
@@ -138,10 +150,14 @@ effective_dim_cap = detail 对应上限（high=2048 / original=6000）
   `JpegEncoder::new_with_quality(w, quality)` 指定
   （`codecs/jpeg/encoder.rs:398`，默认质量 75 见 `:392`）。写出走
   `DynamicImage::write_with_encoder(encoder)`（`images/dynimage.rs:1383`）。
-- **PNG→JPEG 需去 alpha**：JPEG 不支持透明通道，编码前统一
+  顶端质量取 codex 同款 **q85**（`utils/image/src/lib.rs:351`）。
+- **WebP 无损编码 API（已核实）**：`image::codecs::webp::WebPEncoder::new_lossless`
+  （`codecs/webp/encoder.rs:34`）在本 crate 的 `webp` feature 下可用
+  （`Cargo.toml` 已列 `webp`）。仅用于步骤 1 的 WebP 源保留分支。
+- **去 alpha**：JPEG 不支持透明通道，编 JPEG 前统一
   `DynamicImage::to_rgb8()`（`images/dynimage.rs:277`）。对本身是 RGB 的照片
   无影响；对带透明通道的图，透明区域会变黑/白（取 `to_rgb8` 的丢弃语义），
-  **仅在第 1 步无损 PNG 也超预算时才会发生**，属于可接受的最后手段。
+  **仅在无损重编码也超预算、必须降到 JPEG 时才会发生**，属可接受的最后手段。
 
 ### 3.3 返回值与 label
 
@@ -175,13 +191,31 @@ viewed {path} ({w}x{h}, {media_type}, {note})                // 有降级
 这是对"预算优先"的明确表态：`original` 表示"允许到 6000px，但受预算约束"，
 而不是"无论如何都必须 6000px"。
 
-### 3.5 错误
+### 3.5 超预算时的行为：占位文字（非报错）
 
-复用现有 `ToolsError::ImageTooLarge { size, max }`（`error.rs:54`），在
-所有阶梯耗尽时抛出，`size` = 最后一个候选的 base64 长度，`max` = 预算。
-不新增变体，减少改动面；语义（"图太大"）与新场景吻合。
+借鉴 codex（`core/src/image_preparation.rs:78-102`：无法处理的图片被替换成
+一句文字，而不是让整个请求失败）。当阶梯全部耗尽时：
 
-错误文本只包含数字，**绝不回传二进制或图片字节**（沿用原 spec §4.4）。
+- **不返回 `ToolsError`**，改为返回一个 `ToolResult`（`is_error = false`），
+  内容只含一行文字，例如：
+  `viewed {path} (image omitted: still {size} bytes after downscaling to {w}x{h}, budget {max})`
+- 文字**只含数字**，绝不回传 base64 或图片字节。
+- 图被省略时**不附带 `ContentBlock::Image`**（与 codex 的 InputText 占位一致）。
+
+**为什么不直接报错：** 报错会让模型以为工具失败、可能重试或放弃整条路径；
+占位文字让它知道“图存在但没给出来”，可继续用路径/文字完成任务。
+
+**代价（必须可见）：** 模型会收到“viewed …”字样却看不到图，所以文字里必须
+明确写 “image omitted” 及原因，避免制造“已看图”的错觉。
+
+实现上 `LoadedImage.data` 改为 `enum { Base64(String), Omitted { note: String } }`
+（或等价的 `Option<String>` + `note`），`call()` 据此决定是否附带 Image 块。
+
+### 3.5.1 现有错误变体
+
+保留 `ToolsError::ImageTooLarge { size, max }`（`error.rs:54`）用于**读盘闸门**
+（`MAX_IMAGE_BYTES` 超限，`:152`）——那是真正的“拒绝服务”场景，语义未变。
+本节的编码后预算耗尽**不走**这个变体。
 
 ### 3.6 依赖
 
@@ -196,13 +230,13 @@ viewed {path} ({w}x{h}, {media_type}, {note})                // 有降级
 - **GIF 动图**：直通路径（步骤 0）保留原始字节 → 动画保留。一旦需要重编码
   （步骤 1+），`image` 只解码首帧 → **动画丢失**为静态图。这是既有行为
   （当前超维度的 GIF 也一样），本次不新增损失，但在 label 的 `note` 里对
-  GIF 降级标注 `gif→png` / `gif→jpeg`，使损失可见。
+  GIF 降级标注 `gif→jpeg`，使损失可见。（源格式感知后 GIF 不再走 PNG 分支。）
 - **预算粒度是单图**：一个 turn 内多张图/多个 tool result 叠加进同一请求体
   仍可能超网关上限。登记为后续项（§8）。
-- **每张图最多尝试**：`(1 PNG + 4 JPEG) × 分辨率级数`（已含最低 512 档）次
-  编码。下限 512、步长 0.75，从 6000 起最多约 10 级，最坏约 50 次编码。
-  每次编码在大图上开销可观，但分辨率逐级下降使总成本有上界；实现时只解码
-  一次，后续仅做 encode。
+- **每张图最多尝试**：`(1 无损 + 4 JPEG) × 分辨率级数`（已含最低 512 档）次
+  编码；JPEG 源跳过无损步故更少。下限 512、步长 0.75，从 6000 起最多约 10
+  级，最坏约 50 次编码。每次编码在大图上开销可观，但分辨率逐级下降使总成本
+  有上界；实现时只解码一次，后续仅做 encode。
 
 ## 5. 测试
 
@@ -231,8 +265,9 @@ KB，永远触不到预算（实测：现有测试用的 `Rgb([x%256, y%256, 128
    直接验证 `resolve_budget()`：设置 env 后断言解析出该值；env 非法时回退
    默认值。**不改进程 env 去跑 `call()`**，避免并发不确定（§3.1 已把预算改为
    构造期注入）。
-6. `view_image_falls_back_to_error_when_budget_unreachable`
-   极小预算（如 1 KiB）。断言：`is_error`，且错误文本不含 base64 数据。
+6. `view_image_omits_image_with_note_when_budget_unreachable`
+   极小预算（如 1 KiB）。断言：**成功**（`is_error == false`）、内容里没有
+   `ContentBlock::Image`、有文字含 `image omitted`、且文字不含 base64 数据。
 7. 既有 10 个测试保持通过（回归）：尤其
    `view_image_original_detail_keeps_more_resolution`（3000x1000 渐变图，
    体积远低于默认预算 → 仍应保持 3000px 不缩放）与
@@ -243,11 +278,13 @@ KB，永远触不到预算（实测：现有测试用的 `Rgb([x%256, y%256, 128
 
 ## 6. 改动文件
 
-- `crates/yi-agent-tools/src/fs/view_image.rs`（阶梯 + label + 测试）
+- `crates/yi-agent-tools/src/fs/view_image.rs`（阶梯 + 源格式保留 + 占位文字 + label + 测试）
+- `crates/yi-agent-tools/src/error.rs`（仅在需要时：读盘闸门错误保留；编码后预算走占位文字故不改）
 - `docs/project-management/yi-agent-tools.md`（feature 行补充预算行为）
 - `docs/bug-list.md`（把 413 那条从"待办"改为已修，附验证命令）
 
-**不改**：`yi-agent-llm`、`yi-agent-core`、provider 层。
+**不改**：`yi-agent-llm`、provider 层；`yi-agent-core` 的 compaction 估算由
+另立 spec 处理。
 
 ## 7. 验收
 
@@ -255,9 +292,15 @@ KB，永远触不到预算（实测：现有测试用的 `Rgb([x%256, y%256, 128
 cargo test -p yi-agent-tools --lib fs::view_image
 ```
 
-全部通过（既有 10 个 + 新增约 6 个），且新增测试能证明：
+全部通过（既有 10 个 + 新增约 7 个），且新增测试能证明：
 (a) 超限照片被降进预算；(b) 能无损时不做有损；(c) 截图不被无谓转 JPEG；
-(d) 降级在 label 里可见；(e) 预算不可达时报错且不回传字节。
+(d) 降级在 label 里可见；(e) 预算不可达时返回占位文字且不回传字节；
+(f) JPEG 源不被无谓地先试 PNG；WebP 源在步骤 1 走 WebP 无损。
+
+```bash
+# 另立 spec 的借鉴点 (b) 独立验证（在 yi-agent-core）：
+cargo test -p yi-agent-core --lib compact
+```
 
 ## 8. 待登记（本次不修）
 
@@ -305,3 +348,31 @@ cargo test -p yi-agent-tools --lib fs::view_image
   （`compact.rs:88`、`agent.rs:1239`）——已在 `docs/bug-list.md` 登记。
   注意其中 `agent.rs:1239` 那处**只影响 UI 的 prefill 估算**（不参与 compact
   触发）；真正有行为后果的是 `compact.rs:88` 的保留预算估算。
+  **处理方式：** 已另立 `2026-09-27-compaction-image-token-estimate-design.md`
+  （借鉴 codex 的显式估值），与本篇解耦，故此处仅登记。
+
+## 9. 借鉴自 codex 的取舍
+
+对照 `codex-rs`（HEAD `56395bddaf`）后，本次采纳/不采纳如下：
+
+**采纳**
+
+- **保留源格式，JPEG 固定 q85**（`utils/image/src/lib.rs:155-186`、`:351`）：
+  见 §3.2 步骤 1。修正旧稿“一律先试 PNG”。
+- **超限替换为占位文字而非报错**（`core/src/image_preparation.rs:78-102`）：
+  见 §3.5。
+- **图片 token 显式估值而非 0**（`core/src/context_manager/history.rs:526-530`、
+  `:656`）：**本次不做**，另立
+  `2026-09-27-compaction-image-token-estimate-design.md`（见 §8 末条）。
+
+**不采纳（并说明理由）**
+
+- **codex 的维度/patch 预算**（`image_preparation.rs:19-26`）与本设计的字节预算
+  正交，本 design 已有的 `HIGH/ORIGINAL_MAX_DIMENSION` 已覆盖，不叠加。
+- **codex 没有编码后字节预算**：其唯一“字节阈值”是 1 GiB 的 sanity guard
+  （`utils/image/src/lib.rs:31`，注释明确“not a protocol requirement or target
+  upload size”）和音频的 50 MiB 上限（`audio_preparation.rs:19-20`）。本 design
+  的“编码后字节预算 + 质量/分辨率阶梯”比 codex 更严，故不照搬。
+- **codex 的 413 可重试**（`protocol/src/error.rs:200-210` 把 `UnexpectedStatus`
+  视为可重试）：属 provider/agent 层，超出本 design 范围；但印证了 §8 的
+  “请求体预算”方向值得做。
