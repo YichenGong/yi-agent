@@ -10,8 +10,8 @@ Two triggers:
 
 1. **On TUI exit** (double Ctrl+C): reclaim the session's worktree directories.
 2. **On a 7-day TTL sweep**: reclaim directories for tasks that have been idle.
-3. **On demand** (`yi-agent daemon gc`): the manual surface for everything the
-   automatic paths refuse to touch.
+3. **On demand** (`yi-agent daemon gc`): the manual surface over the same
+   reclaim scope, run explicitly and behind a preview.
 
 ## Problem
 
@@ -88,7 +88,7 @@ the same session with its full task history intact.**
 | Root worktree | Reclaimed when clean and the session is detached | The root's `parent_branch` is `main`, which it rarely merges into |
 | Reclaim timing | `detach` returns immediately; a background thread does the work | Quit latency must not scale with worktree count |
 | TTL | 7 days | Conservative default; reclaim is cheap and reversible |
-| Manual surface | `yi-agent daemon gc` | The only exit for unmerged or dirty worktrees |
+| Manual surface | `yi-agent daemon gc` | Runs the same reclaim scope on demand, with a preview |
 
 ## "Merged" Is Verifiable, Not Assumed
 
@@ -120,8 +120,9 @@ its own ancestry check — the same one `remove_accepted_clean` performs
 git merge-base --is-ancestor <branch> <parent_branch>
 ```
 
-`git branch -d`'s self-certification is what protects the branch deletions that
-`daemon gc` (Part E) performs, and only those.
+`git branch -d`'s self-certification would protect branch deletions, but this design
+never deletes branches (see Part C3), so it protects nothing here. It is recorded
+only to explain why the automatic path must run its own ancestry check.
 
 Note the asymmetry this produces, which is intended:
 
@@ -248,6 +249,17 @@ Running them explicitly means a refusal is attributable — a dirty worktree and
 unmerged branch produce different log lines and different `daemon gc` listings
 rather than one opaque git error.
 
+Step 4's ancestry check runs git with a working directory. Prefer the owner
+worktree, but it may already have been reclaimed by an earlier pass — most notably
+the exit trigger reclaims the root directory, and a terminal task never starts a
+worker, so the owner is never rebuilt and the child could never become reclaimable
+again. The check therefore falls back to the child workspace's `repository_root` when
+the owner path no longer exists: `git merge-base --is-ancestor` resolves both branch
+names from the ref database, so the repository root answers the same question. Do not
+"simplify" this back to the owner path alone — that would make the check error out
+whenever the owner is gone, and a git error is indistinguishable from a genuine "not
+merged", silently leaking the child.
+
 Step 4 is skipped for the root worktree: the root qualifies via the detached clause,
 and its `parent_branch` is `main`, against which its branch is normally unmerged by
 design.
@@ -258,6 +270,13 @@ design.
 (`worktree.rs:254-286`). Verified: removing a parent worktree first makes a child's
 check fail with `exit 128: cannot change to '.worktrees/root': No such file or
 directory`. Ordering Leaf(2) → Child(1) → Root(0) avoids this.
+
+The reclaim's own check is more forgiving than `remove_accepted_clean`'s: it falls
+back to the child's `repository_root` when the owner path is gone (see Part C step 4),
+so removing a parent first no longer makes the child's check fail outright. Deepest
+first is still the right order — it keeps the common case running git in the owner
+worktree, and it avoids redundant work — but it is no longer load-bearing for
+correctness.
 
 ### C2. Lock discipline
 
@@ -349,8 +368,7 @@ command because the branch is still there.
 
 ## Part E — `yi-agent daemon gc`
 
-The only surface that can act on worktrees the automatic paths refuse: dirty
-worktrees, unmerged branches, and orphaned rows.
+The manual surface that runs the automatic reclaim scope explicitly, with a preview.
 
 Add a `Gc` variant to `DaemonAction` (`yi-agent-rs/crates/yi-agent/src/config.rs:256-266`,
 currently `Start` / `Status` / `Stop` / `Serve`).
@@ -361,6 +379,11 @@ currently `Start` / `Status` / `Stop` / `Serve`).
 - merged into `parent_branch`: yes/no
 - dirty: yes/no
 
+The `merged` column answers the same question the reclaim answers — ancestry against
+the worktree's recorded `parent_branch`, not the owner's current HEAD — so the preview
+and the action cannot disagree. The `dirty` column is informational: a dirty worktree
+is listed so the user knows it exists and why it is retained, and is never reclaimed.
+
 Destructive actions require explicit confirmation, reusing the existing
 `PreviewCancel` / `ConfirmCancel` token pattern (`ipc.rs:188-196` plus
 `ConfirmationStore`): a one-shot token with a TTL, validated against the task id and
@@ -368,14 +391,22 @@ scope on consume.
 
 Scope of what `gc` may delete:
 
-- directories (same as automatic paths, but including dirty ones with confirmation)
-- branch refs (`git branch -D`, explicitly confirmed)
-- `task_workspaces` rows — **this is the only operation that forfeits reattachment**,
-  and it must be labelled as such in the confirmation prompt
+- worktree directories that satisfy the same gates as the automatic paths — clean and
+  (for a child) merged into its `parent_branch`; dirty or unmerged worktrees are listed
+  but retained
+
+Nothing else. Deleting branch refs (`git branch -D`) and `task_workspaces` rows is
+**deliberately not implemented**: the row is the only thing whose deletion forfeits
+reattachment (see Part A1), so keeping both the branch and the row is what makes a
+reclaimed directory rebuildable and a detached session resumable. Those operations
+remain a possible future extension, and if added they must be explicitly confirmed and
+labelled as forfeiting reattachment — but this design does not ship them.
 
 ## Non-Goals
 
 - Reclaiming worktrees for tasks that are still running or awaiting review.
+- Reclaiming a dirty or unmerged worktree, by any trigger, automatically or via `gc`.
+- Deleting branch refs or `task_workspaces` rows.
 - Merging anything. This design never creates a merge commit.
 - Changing `detach_application_root`'s three durable writes.
 - Deleting the root worktree's branch on exit.
@@ -429,4 +460,6 @@ Deterministic, no API key:
 Update `docs/project-management/subagent-runtime.md` with the new capability and its
 verification command in the same change, and reconcile the
 `docs/bug-list.md` entry for worktree accumulation, noting that exit-time and TTL
-reclaim land while dirty/unmerged worktrees remain a `daemon gc` concern.
+reclaim land for clean, merged worktrees while dirty or unmerged worktrees are
+surfaced by `yi-agent daemon gc` but deliberately retained (branch refs and rows are
+never deleted, so reattachment keeps working).
