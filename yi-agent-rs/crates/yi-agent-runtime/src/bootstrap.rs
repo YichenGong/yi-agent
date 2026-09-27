@@ -298,7 +298,7 @@ pub fn load_permission_checker(
         Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
     Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
         permissions,
-        yolo,
+        yi_agent_core::autonomy::YoloSwitch::new(yolo),
         workdir.to_path_buf(),
         blocklist_fn,
     )))

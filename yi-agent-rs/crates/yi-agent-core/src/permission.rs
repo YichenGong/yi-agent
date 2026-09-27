@@ -83,7 +83,7 @@ pub type BlocklistFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 pub struct PermissionChecker {
     config: Mutex<PermissionsConfig>,
-    yolo: bool,
+    yolo: crate::autonomy::YoloSwitch,
     workdir: std::path::PathBuf,
     blocklist_fn: BlocklistFn,
     next_request_id: AtomicU64,
@@ -92,7 +92,7 @@ pub struct PermissionChecker {
 impl PermissionChecker {
     pub fn new(
         config: PermissionsConfig,
-        yolo: bool,
+        yolo: crate::autonomy::YoloSwitch,
         workdir: std::path::PathBuf,
         blocklist_fn: BlocklistFn,
     ) -> Self {
@@ -105,6 +105,11 @@ impl PermissionChecker {
         }
     }
 
+    /// 当前 yolo 开关值;供上层读取以展示/持久化运行时模式。
+    pub fn is_yolo(&self) -> bool {
+        self.yolo.get()
+    }
+
     pub fn check(&self, tool_name: &str, tool_input: &serde_json::Value) -> CheckResult {
         // 只对会产生副作用的工具做权限检查,其他工具直接放行
         if !matches!(
@@ -115,7 +120,7 @@ impl PermissionChecker {
         }
 
         // yolo 模式:工具类型层视为全开,但黑名单仍检查
-        if self.yolo {
+        if self.yolo.get() {
             return self.check_blacklist_then_allow(tool_name, tool_input);
         }
 
@@ -416,7 +421,12 @@ bash = true
                 None
             }
         });
-        PermissionChecker::new(config, yolo, std::path::PathBuf::from("/tmp"), blocklist)
+        PermissionChecker::new(
+            config,
+            crate::autonomy::YoloSwitch::new(yolo),
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        )
     }
 
     fn bash_input(cmd: &str) -> serde_json::Value {
@@ -545,6 +555,31 @@ bash = true
     }
 
     #[test]
+    fn yolo_switch_flips_decision_at_runtime() {
+        let switch = crate::autonomy::YoloSwitch::new(false);
+        let checker = PermissionChecker::new(
+            PermissionsConfig::default(),
+            switch.clone(),
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(|_| None),
+        );
+        assert!(matches!(
+            checker.check("bash", &serde_json::json!({"command": "echo hi"})),
+            CheckResult::NeedConfirm(_)
+        ));
+        switch.set(true);
+        assert!(matches!(
+            checker.check("bash", &serde_json::json!({"command": "echo hi"})),
+            CheckResult::Allow
+        ));
+        switch.set(false);
+        assert!(matches!(
+            checker.check("bash", &serde_json::json!({"command": "echo hi"})),
+            CheckResult::NeedConfirm(_)
+        ));
+    }
+
+    #[test]
     fn check_write_path_glob_allow() {
         let config = PermissionsConfig {
             prefix_level: PrefixLevelConfig {
@@ -651,7 +686,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -674,7 +709,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -703,7 +738,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -726,7 +761,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -748,7 +783,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -771,7 +806,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -796,7 +831,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -820,7 +855,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -851,7 +886,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -875,7 +910,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -892,7 +927,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -931,7 +966,12 @@ bash = true
             ..Default::default()
         };
         let blocklist: BlocklistFn = Arc::new(|_| None);
-        let checker = PermissionChecker::new(config, false, workdir.clone(), blocklist);
+        let checker = PermissionChecker::new(
+            config,
+            crate::autonomy::YoloSwitch::new(false),
+            workdir.clone(),
+            blocklist,
+        );
 
         // Apply same prefix again
         checker
@@ -958,7 +998,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             workdir.clone(),
             blocklist,
         );
@@ -1020,7 +1060,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             std::path::PathBuf::from("/tmp"),
             blocklist,
         );
@@ -1037,7 +1077,7 @@ bash = true
         let blocklist: BlocklistFn = Arc::new(|_| None);
         let checker = PermissionChecker::new(
             PermissionsConfig::default(),
-            false,
+            crate::autonomy::YoloSwitch::new(false),
             std::path::PathBuf::from("/tmp"),
             blocklist,
         );

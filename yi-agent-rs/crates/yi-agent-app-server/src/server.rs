@@ -2309,7 +2309,7 @@ mod tests {
         registry.register(Arc::new(FakeBash));
         let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
             yi_agent_core::permission::PermissionsConfig::default(),
-            false,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
             std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
             Arc::new(|_cmd: &str| None),
         ));
