@@ -4630,7 +4630,19 @@ async fn reclaim_idle_keeps_a_fresh_detached_root() {
     let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
     mark_session_detached(&database, &session, &root);
 
-    // No ageing: the row was just written.
+    // No ageing: the row keeps the timestamp SQLite wrote. Production rows get
+    // `updated_at` from `DEFAULT CURRENT_TIMESTAMP`, whose 'YYYY-MM-DD HH:MM:SS'
+    // shape differs from RFC3339, so assert the clock is parseable before trusting
+    // a `None`-means-not-idle result below. Without this the test would pass even
+    // if the SQLite-format parse branch were missing, and TTL reclaim would be
+    // silently dead in production.
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        repository.task_updated_at(&root).unwrap().is_some(),
+        "the idle clock parses the timestamp SQLite's CURRENT_TIMESTAMP writes"
+    );
+    drop(repository);
+
     let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
 
     assert_eq!(reclaimed, 0, "the TTL has not elapsed");
