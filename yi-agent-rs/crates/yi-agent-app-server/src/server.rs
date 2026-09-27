@@ -60,9 +60,11 @@ where
         cfg,
         PERMISSION_TIMEOUT,
         workspaces,
-        move |session| {
+        move |session, cwd| {
+            let mut thread_cfg = cfg_for_factory.clone();
+            thread_cfg.workdir = cwd.to_path_buf();
             let built = yi_agent_runtime::bootstrap::bootstrap_agent(
-                &cfg_for_factory,
+                &thread_cfg,
                 yi_agent_runtime::bootstrap::PermissionMode::Interactive,
             )?;
             Ok(BuiltAgent {
@@ -91,7 +93,7 @@ async fn run_with<R, W, F>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+    F: Fn(Option<yi_agent_core::Session>, &Path) -> anyhow::Result<BuiltAgent> + Send + 'static,
 {
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -117,7 +119,6 @@ where
     });
 
     let writer = Arc::new(MessageWriter::new(writer));
-    let store = Arc::new(crate::thread_store::ThreadStore::new(&cfg.workdir));
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
@@ -282,7 +283,11 @@ where
                             }
                         }
                     }
-                    "thread/list" => match store.list() {
+                    "thread/list" => {
+                        // 单目录列表:仍是 `cfg.workdir` 的 store。跨目录的
+                        // `thread/listAll` 由后续任务补齐。
+                        let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+                        match store.list() {
                         Ok(metas) => {
                             // 显式映射而非直接序列化 ThreadMeta:wire 契约与存储结构解耦,
                             // 存储字段重命名不会悄悄改变 RPC 输出。
@@ -306,22 +311,31 @@ where
                             write_response(&writer, err_response(id, RpcError::internal(e.to_string())))
                                 .await?;
                         }
-                    },
+                        }
+                    }
                     "thread/start" => {
                         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
 
-                        let BuiltAgent { agent, decision_tx, catalog } = match build_agent(None) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
-                                continue;
-                            }
+                        // 目录决定 agent / store / 权限 / 沙箱 / skills 的根。
+                        let cwd = match resolve_thread_cwd(&req.params, &cfg, &writer, id.clone()).await? {
+                            Some(c) => c,
+                            None => continue,
                         };
+                        let thread_store =
+                            Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
+
+                        let BuiltAgent { agent, decision_tx, catalog } =
+                            match build_agent(None, Path::new(&cwd)) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
+                                    continue;
+                                }
+                            };
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
 
-                        let cwd = cfg.workdir.display().to_string();
                         let model = cfg.model.clone();
 
                         let now = crate::thread_store::now_millis();
@@ -333,9 +347,13 @@ where
                             updated_at: now,
                             title: None,
                         };
-                        if let Err(e) = store.create(&meta) {
+                        if let Err(e) = thread_store.create(&meta) {
                             // 持久化是尽力而为:写失败不阻断 thread 创建。
                             eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
+                        }
+                        // 记录到全局「最近目录」索引,供 thread/listAll 与侧栏复用。
+                        if let Err(e) = workspaces.add(Path::new(&cwd)) {
+                            eprintln!("[app-server] failed to record workspace {cwd}: {e}");
                         }
 
                         threads.insert(
@@ -367,7 +385,7 @@ where
                             permission_timeout,
                             Arc::clone(&perm_seq),
                             catalog,
-                            Arc::clone(&store),
+                            Arc::clone(&thread_store),
                         ));
 
                         write_notification(
@@ -398,12 +416,15 @@ where
                         else {
                             continue;
                         };
+                        // 先按全局索引定位该 thread 所属目录的 store(索引没有则
+                        // 回退 cfg.workdir),再从中载入历史。
+                        let thread_store = store_for(&workspaces, &cfg, &thread_id);
                         // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
                         // 落盘完成,否则紧随 turn/completed 的 resume 会读到尚未写入
                         // 的历史。详见 `interrupt_and_wait_for_persist`。
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
 
-                        let loaded = match store.load(&thread_id) {
+                        let loaded = match thread_store.load(&thread_id) {
                             Ok(Some(l)) => l,
                             Ok(None) => {
                                 write_response(
@@ -442,7 +463,14 @@ where
                         }
                         session.replace_messages(loaded.messages);
 
-                        let BuiltAgent { agent, decision_tx, catalog } = match build_agent(Some(session)) {
+                        // 按 cwd(`meta.cwd`,损坏时用 cfg.workdir 兜底)重建本 thread
+                        // 的 store,让 agent 与 driver 都跑在对话真实目录,而非全局
+                        // cfg.workdir——这正是此前 resume 的隐患所在。
+                        let thread_store =
+                            Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
+
+                        let BuiltAgent { agent, decision_tx, catalog } =
+                            match build_agent(Some(session), Path::new(&cwd)) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
@@ -483,7 +511,7 @@ where
                             permission_timeout,
                             Arc::clone(&perm_seq),
                             catalog,
-                            Arc::clone(&store),
+                            Arc::clone(&thread_store),
                         ));
 
                         // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
@@ -554,7 +582,7 @@ where
                             .await?;
                             continue;
                         }
-                        match store.rename(&thread_id, &title) {
+                        match store_for(&workspaces, &cfg, &thread_id).rename(&thread_id, &title) {
                             Ok(true) => {
                                 write_response(&writer, ok_response(id, json!({}))).await?;
                             }
@@ -580,8 +608,11 @@ where
                         else {
                             continue;
                         };
+                        // 按全局索引定位该 thread 所属目录的 store(索引没有则回退
+                        // cfg.workdir),存在性与删除都作用在正确目录上。
+                        let thread_store = store_for(&workspaces, &cfg, &thread_id);
                         let in_memory = threads.contains_key(&thread_id);
-                        let on_disk = store.exists(&thread_id);
+                        let on_disk = thread_store.exists(&thread_id);
                         if !in_memory && !on_disk {
                             write_response(
                                 &writer,
@@ -598,7 +629,7 @@ where
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
-                        if let Err(e) = store.delete(&thread_id) {
+                        if let Err(e) = thread_store.delete(&thread_id) {
                             eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
@@ -1036,8 +1067,6 @@ async fn run_thread_driver<W>(
 }
 
 /// 在全局索引的目录里定位 `thread_id` 所属目录。
-// TODO(task-3/4): helpers 首次被 task-3 使用;用后移除 allow
-#[allow(dead_code)]
 fn find_thread_dir(workspaces: &WorkspaceIndex, thread_id: &str) -> Option<PathBuf> {
     workspaces
         .list()
@@ -1047,8 +1076,6 @@ fn find_thread_dir(workspaces: &WorkspaceIndex, thread_id: &str) -> Option<PathB
 }
 
 /// 按 thread 定位其 store;索引找不到时回退 `cfg.workdir`。
-// TODO(task-3/4): helpers 首次被 task-3 使用;用后移除 allow
-#[allow(dead_code)]
 fn store_for(
     workspaces: &WorkspaceIndex,
     cfg: &RuntimeConfig,
@@ -1056,6 +1083,33 @@ fn store_for(
 ) -> Arc<crate::thread_store::ThreadStore> {
     let dir = find_thread_dir(workspaces, thread_id).unwrap_or_else(|| cfg.workdir.clone());
     Arc::new(crate::thread_store::ThreadStore::new(&dir))
+}
+
+/// 解析 `thread/start` 的目标目录:显式 `params.cwd` 优先,缺省用 `cfg.workdir`。
+///
+/// 显式 `cwd` canonicalize + 校验是目录;失败写 `-32602` 并返回 `Ok(None)`
+/// (调用方 continue)。缺省时沿用 `cfg.workdir` 原样,不 canonicalize:保持旧的
+/// 单目录行为,避免 macOS `/var` → `/private/var` 之类改写破坏既有路径语义。
+async fn resolve_thread_cwd<W: tokio::io::AsyncWrite + Unpin>(
+    params: &serde_json::Value,
+    cfg: &RuntimeConfig,
+    writer: &MessageWriter<W>,
+    id: RequestId,
+) -> anyhow::Result<Option<String>> {
+    match params.get("cwd").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => match std::fs::canonicalize(s) {
+            Ok(p) if p.is_dir() => Ok(Some(p.to_string_lossy().to_string())),
+            _ => {
+                write_response(
+                    writer,
+                    err_response(id, RpcError::invalid_params("cwd is not a valid directory")),
+                )
+                .await?;
+                Ok(None)
+            }
+        },
+        _ => Ok(Some(cfg.workdir.display().to_string())),
+    }
 }
 
 /// 从 params 提取 `threadId`;缺失时写 `-32602` 并返回 `Ok(None)`。
@@ -1205,7 +1259,10 @@ mod tests {
         }
     }
 
-    fn build_test_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
+    fn build_test_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+    ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
@@ -1220,7 +1277,10 @@ mod tests {
         })
     }
 
-    fn build_slow_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
+    fn build_slow_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+    ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
@@ -1235,7 +1295,10 @@ mod tests {
         })
     }
 
-    fn build_delayed_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
+    fn build_delayed_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+    ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
@@ -1287,7 +1350,9 @@ mod tests {
         /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
         fn with_factory<F>(build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+                + Send
+                + 'static,
         {
             Self::with_config(test_config(), build, permission_timeout)
         }
@@ -1295,7 +1360,9 @@ mod tests {
         /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
         fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+                + Send
+                + 'static,
         {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
@@ -1646,7 +1713,9 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
-            |_s: Option<yi_agent_core::Session>| Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
+            |_s: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
+                Err::<BuiltAgent, _>(anyhow::anyhow!("boom"))
+            },
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1887,7 +1956,9 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent(None).unwrap().agent,
+            build_delayed_agent(None, std::path::Path::new("/tmp"))
+                .unwrap()
+                .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1957,7 +2028,9 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None).unwrap().agent,
+            build_test_agent(None, std::path::Path::new("/tmp"))
+                .unwrap()
+                .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2003,7 +2076,9 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None).unwrap().agent,
+            build_test_agent(None, std::path::Path::new("/tmp"))
+                .unwrap()
+                .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2133,6 +2208,7 @@ mod tests {
     /// 构造一个会触发 bash 审批的 agent,并把决定通道交给 driver。
     fn build_permission_agent(
         session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
     ) -> anyhow::Result<BuiltAgent> {
         let provider = Arc::new(PermissionMockProvider {
             calls: AtomicUsize::new(0),
@@ -2356,7 +2432,7 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
-        let built = build_permission_agent(None).unwrap();
+        let built = build_permission_agent(None, std::path::Path::new("/tmp")).unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             built.agent,
@@ -2576,7 +2652,7 @@ mod tests {
         cfg.workdir = dir.path().to_path_buf();
         let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_factory = Arc::clone(&seen);
-        let build = move |session: Option<yi_agent_core::Session>| {
+        let build = move |session: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
             Ok(BuiltAgent {
                 agent: apply_session(
                     yi_agent_core::Agent::new(
