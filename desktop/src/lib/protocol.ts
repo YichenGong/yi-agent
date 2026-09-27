@@ -114,3 +114,16 @@ export interface Usage {
   cacheRead: number;
   cacheWrite: number;
 }
+
+/** `workspace/list` 的单项。 */
+export interface Workspace {
+  path: string;
+  exists: boolean;
+}
+
+/** `thread/listAll` 的一个目录分组。 */
+export interface WorkspaceGroup {
+  workspace: string;
+  exists: boolean;
+  threads: ThreadSummary[];
+}
