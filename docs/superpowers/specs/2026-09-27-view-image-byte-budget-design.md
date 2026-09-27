@@ -283,11 +283,12 @@ cargo test -p yi-agent-tools --lib fs::view_image
      （`openai/error.rs:23`），不在重试白名单内（`agent.rs:650-651` 只重试
      `Stalled` / `Network`），随即走终结分支 `agent.rs:709-715` 直接 `return`
      —— 既不记录 usage，也不会再进入下一轮 `maybe_auto_compact`。
-  2. **字节超限不必然伴随 token 超阈值。** `compact_threshold` 是 **token**
-     数（`agent.rs:1140`，运行时算作 `effective_context_length * ratio / 100`，
-     `runtime/config.rs:247`）。图片是 MB 级字节但 token 很少；本次请求的
-     实际量级与其文本/工具历史对比，说明**字节与 token 是两个正交维度**，
-     所以"字节超限"不会自动反映到 token 阈值上。
+  2. **触发阈值是 token，不是字节。** `compact_threshold` 是 **token** 数
+     （`agent.rs:1140`，运行时算作 `effective_context_length * ratio / 100`，
+     `runtime/config.rs:247`，默认 200,000 × 80/100 = 160,000）。图片按字节
+     计数（MB 级）却只占很少 token，**字节与 token 是两个正交维度**，所以
+     "请求体字节超限"不会自动反映到 token 阈值上。（本次 trace 未记录
+     usage/usage 数值，故此处是机制论证而非实测数值。）
   3. **保留预算把图片记为 0。** `estimate_block_tokens` 的
      `ContentBlock::Image { .. } => 0`（`compact.rs:88`）使含图的 tool unit
      在 `compact_tool_budget_tokens`（默认 12,000）下看起来"免费"，加上
