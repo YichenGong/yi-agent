@@ -669,6 +669,12 @@ impl Daemon {
                     .and_then(|value| value.with_nanosecond(0));
                 if minute != last_schedule_minute {
                     let _ = coordinator.evaluate_schedules(now);
+                    // Reclaim runs on its own thread: git is slow and this loop
+                    // must stay responsive to accept().
+                    let reclaim_coordinator = Arc::clone(&coordinator);
+                    std::thread::spawn(move || {
+                        reclaim_coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+                    });
                     last_schedule_minute = minute;
                 }
                 match listener.accept() {

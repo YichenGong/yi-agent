@@ -43,6 +43,13 @@ use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 
 const REVIEW_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 
+/// How long a task must be idle before its worktree directory is reclaimed.
+///
+/// Conservative by default: reclaim removes only the directory, keeps the branch
+/// and the workspace row, and is therefore reversible via
+/// `prepare_task_workspace`'s rebuild path.
+pub const WORKTREE_RECLAIM_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
     #[error(transparent)]
@@ -2173,6 +2180,76 @@ impl RuntimeCoordinator {
     pub fn reclaim_session_worktrees(&self, session: &RootSessionId) -> usize {
         let candidates = self.reclaim_candidates_in_session(session);
         self.reclaim_candidate_directories(session, candidates)
+    }
+
+    /// Reclaims directories for tasks that have been idle past the TTL.
+    ///
+    /// Two candidate sources, because a terminal-only sweep would miss the most
+    /// common leak:
+    ///
+    /// 1. terminal tasks whose `updated_at` is older than the TTL
+    /// 2. the root of a detached session, which sits in `paused` — not a terminal
+    ///    state — and therefore never enters a terminal-only sweep
+    ///
+    /// A task in `awaiting_parent_review` is not terminal and its session is not
+    /// detached, so an un-integrated delivery is never reclaimed.
+    ///
+    /// It is synchronous and runs `git` subprocesses, so it must not be called
+    /// from a request-handling thread or while holding the repository mutex.
+    pub fn reclaim_idle_worktrees(&self, now: DateTime<Utc>) -> usize {
+        let cutoff = now
+            - chrono::Duration::from_std(WORKTREE_RECLAIM_TTL)
+                .unwrap_or_else(|_| chrono::Duration::days(7));
+        let sessions = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            match repository.detached_application_roots() {
+                Ok(roots) => roots,
+                Err(error) => {
+                    eprintln!("yi-agent: detached root lookup failed: {error}");
+                    Vec::new()
+                }
+            }
+        };
+        let mut reclaimed = 0;
+        for session in sessions {
+            reclaimed += self.reclaim_idle_session(&session, cutoff);
+        }
+        reclaimed
+    }
+
+    /// Reclaims the idle, reclaimable directories of one session.
+    fn reclaim_idle_session(&self, session: &RootSessionId, cutoff: DateTime<Utc>) -> usize {
+        let candidates = self.reclaim_candidates_in_session(session);
+        let idle = candidates
+            .into_iter()
+            .filter(|candidate| {
+                let is_root = candidate.parent_task_id.is_none();
+                // A terminal child is idle-sweepable; a non-terminal child is not.
+                // The root qualifies through the detached-session clause instead,
+                // because a detached root sits in `paused`, which is not terminal.
+                if !is_root && !task_state_is_terminal(&candidate.state) {
+                    return false;
+                }
+                let updated = {
+                    let repository = self
+                        .repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned");
+                    let parsed = candidate.task_id.parse::<TaskId>().ok();
+                    match parsed {
+                        Some(parsed) => repository.task_updated_at(&parsed).ok().flatten(),
+                        None => None,
+                    }
+                };
+                matches!(updated, Some(updated) if updated < cutoff)
+            })
+            .collect::<Vec<_>>();
+        // Hand the filtered set to the shared reclaim so the merge gate,
+        // deepest-first ordering, and event recording stay in one place.
+        self.reclaim_candidate_directories(session, idle)
     }
 
     /// Reads the session's reclaim candidates under a short repository lock.

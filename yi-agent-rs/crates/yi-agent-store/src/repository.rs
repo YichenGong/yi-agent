@@ -2877,6 +2877,32 @@ impl RuntimeRepository {
         )?)
     }
 
+    /// A task's last transition time, used as the idle clock for reclaim.
+    ///
+    /// Returns `None` for a task with no row, which callers treat as "not idle
+    /// enough to sweep" rather than as an error.
+    pub fn task_updated_at(&self, task: &TaskId) -> Result<Option<DateTime<Utc>>, RepositoryError> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT updated_at FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .ok()
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .or_else(|| {
+                    // SQLite's CURRENT_TIMESTAMP is 'YYYY-MM-DD HH:MM:SS' in UTC.
+                    chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
+                        .ok()
+                        .map(|naive| naive.and_utc())
+                })
+        }))
+    }
+
     pub fn active_attempt_id(&self, task: &TaskId) -> Result<AttemptId, RepositoryError> {
         let value = self
             .connection

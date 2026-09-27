@@ -4562,3 +4562,153 @@ async fn reclaim_session_worktrees_keeps_a_running_childs_directory() {
         "only the detached root is reclaimed; the running child is refused"
     );
 }
+
+/// Marks a session as a detached application root, which is the state the TTL
+/// sweep discovers its work through.
+fn mark_session_detached(
+    database: &std::path::Path,
+    session: &RootSessionId,
+    root: &yi_agent_core::TaskId,
+) {
+    let mut repository = RuntimeRepository::open(database).unwrap();
+    repository
+        .record_application_root_attachment("ttl-fixture", session, root, "digest", "secret")
+        .unwrap();
+    repository.detach_application_root(session, root).unwrap();
+}
+
+#[tokio::test]
+async fn reclaim_idle_sweeps_a_detached_root_past_the_ttl() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    mark_session_detached(&database, &session, &root);
+
+    // Age the task past the TTL.
+    let aged = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![aged, root.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert_eq!(reclaimed, 1, "an idle detached root is reclaimed");
+    assert!(!workspace.path.exists());
+}
+
+#[tokio::test]
+async fn reclaim_idle_keeps_a_fresh_detached_root() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    mark_session_detached(&database, &session, &root);
+
+    // No ageing: the row was just written.
+    let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert_eq!(reclaimed, 0, "the TTL has not elapsed");
+    assert!(
+        workspace.path.exists(),
+        "a recently detached root keeps its worktree"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_idle_never_sweeps_an_awaiting_review_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let parent_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    let child_workspace = factory.starts.lock().unwrap()[1].workspace.clone().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+    // Integrate the child's commits into the owner branch without recording an
+    // acceptance: the merge gate now answers "merged", so the non-terminal state
+    // is the only thing standing between this delivery and deletion. Without this
+    // the merge gate would refuse the child too and the test would pass whether or
+    // not the state gate worked.
+    git_ok(
+        &parent_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &child_workspace.branch,
+            "-m",
+            "integrate unreviewed delivery",
+        ],
+    )
+    .unwrap();
+    assert!(
+        git_ok(
+            &parent_workspace.path,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &child_workspace.branch,
+                &child_workspace.parent_branch,
+            ],
+        )
+        .is_ok(),
+        "precondition: the delivery is reachable from the owner branch"
+    );
+    // The sweep only visits detached sessions, so the session must be detached
+    // for this test to exercise the state filter rather than the session filter.
+    mark_session_detached(&database, &session, &parent);
+
+    let aged = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![aged, child.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert!(
+        child_workspace.path.exists(),
+        "an un-integrated delivery is never reclaimed, however old"
+    );
+}
