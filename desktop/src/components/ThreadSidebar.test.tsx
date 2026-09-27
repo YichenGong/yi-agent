@@ -1,0 +1,150 @@
+/** @vitest-environment jsdom */
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, fireEvent, cleanup } from "@testing-library/react";
+import type { ComponentProps } from "react";
+import { ThreadSidebar } from "./ThreadSidebar";
+import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+
+afterEach(cleanup);
+
+function thread(id: string, title: string, cwd: string): ThreadSummary {
+  return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title };
+}
+
+const groups: WorkspaceGroup[] = [
+  {
+    workspace: "/work/projA",
+    exists: true,
+    threads: [thread("1", "alpha-thread", "/work/projA")],
+  },
+  {
+    workspace: "/work/projB",
+    exists: false,
+    threads: [thread("2", "beta-thread", "/work/projB")],
+  },
+];
+
+function renderSidebar(overrides: Partial<ComponentProps<typeof ThreadSidebar>> = {}) {
+  const props: ComponentProps<typeof ThreadSidebar> = {
+    groups,
+    workspaces: [],
+    currentId: null,
+    busy: false,
+    onSelect: vi.fn(),
+    onRename: vi.fn(),
+    onDelete: vi.fn(),
+    onNew: vi.fn(),
+    onRemoveWorkspace: vi.fn(),
+    onBrowse: vi.fn(),
+    ...overrides,
+  };
+  return render(<ThreadSidebar {...props} />);
+}
+
+const newThreadTrigger = (container: HTMLElement) =>
+  container.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
+
+describe("ThreadSidebar", () => {
+  it("renders each group's basename and its thread rows", () => {
+    const { container } = renderSidebar();
+    expect(container.textContent).toContain("projA");
+    expect(container.textContent).toContain("projB");
+    expect(container.textContent).toContain("alpha-thread");
+    expect(container.textContent).toContain("beta-thread");
+  });
+
+  it("marks a missing workspace while keeping its full path in the title", () => {
+    const { container } = renderSidebar();
+    const missing = container.querySelector('[title="/work/projB"]');
+    expect(missing).not.toBeNull();
+    expect(missing!.textContent).toContain("(missing)");
+
+    const present = container.querySelector('[title="/work/projA"]');
+    expect(present).not.toBeNull();
+    expect(present!.textContent).not.toContain("(missing)");
+  });
+
+  it("hides a group's thread rows when collapsed and restores them on expand", () => {
+    const { container } = renderSidebar();
+    fireEvent.click(container.querySelector('[aria-label="Collapse"]')!);
+    expect(container.textContent).not.toContain("alpha-thread");
+    expect(container.textContent).toContain("beta-thread");
+
+    fireEvent.click(container.querySelector('[aria-label="Expand"]')!);
+    expect(container.textContent).toContain("alpha-thread");
+  });
+
+  it("lists recent workspaces in the New-thread dropdown and disables missing ones", () => {
+    const onNew = vi.fn();
+    const workspaces: Workspace[] = [
+      { path: "/a/alpha", exists: true },
+      { path: "/b/beta", exists: false },
+    ];
+    const { container } = renderSidebar({ workspaces, onNew });
+
+    fireEvent.click(newThreadTrigger(container));
+    const menu = container.querySelector('[role="menu"]');
+    expect(menu).not.toBeNull();
+    expect(menu!.textContent).toContain("alpha");
+    expect(menu!.textContent).toContain("beta");
+    expect(menu!.textContent).toContain("Browse…");
+
+    const items = Array.from(menu!.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+    const alpha = items.find((el) => el.textContent === "alpha")!;
+    const beta = items.find((el) => el.textContent === "beta")!;
+    expect(alpha.disabled).toBe(false);
+    expect(beta.disabled).toBe(true);
+
+    fireEvent.click(alpha);
+    expect(onNew).toHaveBeenCalledWith("/a/alpha");
+  });
+
+  it("calls onBrowse directly when there are no recent workspaces", () => {
+    const onBrowse = vi.fn();
+    const { container } = renderSidebar({ workspaces: [], onBrowse });
+    fireEvent.click(newThreadTrigger(container));
+    expect(onBrowse).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a group's context menu with the keyboard and closes it on Escape", () => {
+    const { container } = renderSidebar();
+    const header = container.querySelectorAll<HTMLElement>("div[tabindex]")[0];
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.keyDown(header, { key: "Enter" });
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    const menu = container.querySelector('[role="menu"]');
+    expect(menu).not.toBeNull();
+    expect(menu!.textContent).toContain("New thread here");
+    expect(menu!.textContent).toContain("Remove from list");
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("does not open the group menu when Enter/Space bubbles from the collapse caret", () => {
+    const { container } = renderSidebar();
+    const header = container.querySelectorAll<HTMLElement>("div[tabindex]")[0];
+    const caret = header.querySelector<HTMLButtonElement>('button[aria-label="Collapse"]')!;
+
+    // jsdom does not perform Enter/Space button activation, so a keydown on the
+    // caret reproduces exactly the bubble path the header handler must ignore.
+    // Without the `e.target === e.currentTarget` guard the header would open the
+    // group menu here — and in a real webview its preventDefault would also
+    // swallow the caret's Enter activation, leaving no keyboard way to collapse.
+    fireEvent.keyDown(caret, { key: "Enter" });
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.keyDown(caret, { key: " " });
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+
+    // The caret's own activation (what a real Enter/Space would trigger) still
+    // collapses the group.
+    fireEvent.click(caret);
+    expect(container.textContent).not.toContain("alpha-thread");
+    expect(header.querySelector('button[aria-label="Expand"]')).not.toBeNull();
+  });
+});

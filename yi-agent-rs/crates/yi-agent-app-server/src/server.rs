@@ -6,6 +6,7 @@
 //! 另有 `not_initialized` / `method_not_found` / 解析错误 / stdin EOF 优雅退出。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -24,6 +25,7 @@ use crate::protocol::{
 use crate::session::{ThreadSession, TurnPrompt};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
+use crate::workspace_index::WorkspaceIndex;
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -51,17 +53,27 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let cfg_for_factory = cfg.clone();
-    run_with(reader, writer, cfg, PERMISSION_TIMEOUT, move |session| {
-        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
-            &cfg_for_factory,
-            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
-        )?;
-        Ok(BuiltAgent {
-            agent: apply_session(built.agent, session),
-            decision_tx: built.decision_tx,
-            catalog: built.catalog,
-        })
-    })
+    let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
+    run_with(
+        reader,
+        writer,
+        cfg,
+        PERMISSION_TIMEOUT,
+        workspaces,
+        move |session, cwd| {
+            let mut thread_cfg = cfg_for_factory.clone();
+            thread_cfg.workdir = cwd.to_path_buf();
+            let built = yi_agent_runtime::bootstrap::bootstrap_agent(
+                &thread_cfg,
+                yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+            )?;
+            Ok(BuiltAgent {
+                agent: apply_session(built.agent, session),
+                decision_tx: built.decision_tx,
+                catalog: built.catalog,
+            })
+        },
+    )
     .await
 }
 
@@ -75,12 +87,13 @@ async fn run_with<R, W, F>(
     writer: W,
     cfg: RuntimeConfig,
     permission_timeout: Duration,
+    workspaces: Arc<WorkspaceIndex>,
     build_agent: F,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+    F: Fn(Option<yi_agent_core::Session>, &Path) -> anyhow::Result<BuiltAgent> + Send + 'static,
 {
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -106,7 +119,6 @@ where
     });
 
     let writer = Arc::new(MessageWriter::new(writer));
-    let store = Arc::new(crate::thread_store::ThreadStore::new(&cfg.workdir));
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
@@ -214,7 +226,68 @@ where
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
-                    "thread/list" => match store.list() {
+                    "workspace/list" => {
+                        let list: Vec<serde_json::Value> = workspaces
+                            .list()
+                            .into_iter()
+                            .map(|p| json!({ "path": p, "exists": Path::new(&p).is_dir() }))
+                            .collect();
+                        write_response(&writer, ok_response(id, json!({ "workspaces": list })))
+                            .await?;
+                    }
+                    "workspace/add" => {
+                        let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        match std::fs::canonicalize(raw) {
+                            Ok(p) if p.is_dir() => {
+                                let value = p.to_string_lossy().to_string();
+                                match workspaces.add(&p) {
+                                    Ok(()) => {
+                                        write_response(&writer, ok_response(id, json!({ "path": value })))
+                                            .await?
+                                    }
+                                    Err(e) => {
+                                        write_response(
+                                            &writer,
+                                            err_response(id, RpcError::internal(e.to_string())),
+                                        )
+                                        .await?
+                                    }
+                                }
+                            }
+                            _ => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params("path is not a directory"),
+                                    ),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    "workspace/remove" => {
+                        let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        // add 存的是 canonical 路径;remove 也必须规范化,否则
+                        // 符号链接 / 相对路径 / 尾斜杠会静默 no-op 却仍回成功。
+                        // canonicalize 失败(路径已不存在)时回退原始串,保持幂等。
+                        let key = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
+                        match workspaces.remove(&key) {
+                            Ok(()) => write_response(&writer, ok_response(id, json!({}))).await?,
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    "thread/list" => {
+                        // 单目录列表:仍是 `cfg.workdir` 的 store。跨目录分组见下方
+                        // `thread/listAll`。
+                        let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+                        match store.list() {
                         Ok(metas) => {
                             // 显式映射而非直接序列化 ThreadMeta:wire 契约与存储结构解耦,
                             // 存储字段重命名不会悄悄改变 RPC 输出。
@@ -238,22 +311,76 @@ where
                             write_response(&writer, err_response(id, RpcError::internal(e.to_string())))
                                 .await?;
                         }
-                    },
+                        }
+                    }
+                    "thread/listAll" => {
+                        // 跨目录汇总:按索引顺序(最近的在前)遍历每个 workspace,
+                        // 组内是该目录 store 的 thread(updated_at 降序)。
+                        // 失效目录先 stat 跳过,不做深扫,但仍报表该组(exists:false),
+                        // 供侧栏置灰展示。
+                        let mut groups: Vec<serde_json::Value> = Vec::new();
+                        for dir in workspaces.list() {
+                            let path = Path::new(&dir);
+                            let exists = path.is_dir();
+                            let threads: Vec<serde_json::Value> = if exists {
+                                // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
+                                // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
+                                match crate::thread_store::ThreadStore::new(path).list() {
+                                    Ok(metas) => metas
+                                        .into_iter()
+                                        .map(|m| {
+                                            json!({
+                                                "thread_id": m.thread_id,
+                                                "cwd": m.cwd,
+                                                "model": m.model,
+                                                "created_at": m.created_at,
+                                                "updated_at": m.updated_at,
+                                                "title": m.title,
+                                            })
+                                        })
+                                        .collect(),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[app-server] thread/listAll failed to list {dir}: {e}"
+                                        );
+                                        Vec::new()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            groups.push(json!({
+                                "workspace": dir,
+                                "exists": exists,
+                                "threads": threads,
+                            }));
+                        }
+                        write_response(&writer, ok_response(id, json!({ "groups": groups })))
+                            .await?;
+                    }
                     "thread/start" => {
                         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
 
-                        let BuiltAgent { agent, decision_tx, catalog } = match build_agent(None) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
-                                continue;
-                            }
+                        // 目录决定 agent / store / 权限 / 沙箱 / skills 的根。
+                        let cwd = match resolve_thread_cwd(&req.params, &cfg, &writer, id.clone()).await? {
+                            Some(c) => c,
+                            None => continue,
                         };
+                        let thread_store =
+                            Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
+
+                        let BuiltAgent { agent, decision_tx, catalog } =
+                            match build_agent(None, Path::new(&cwd)) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
+                                    continue;
+                                }
+                            };
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
 
-                        let cwd = cfg.workdir.display().to_string();
                         let model = cfg.model.clone();
 
                         let now = crate::thread_store::now_millis();
@@ -265,9 +392,20 @@ where
                             updated_at: now,
                             title: None,
                         };
-                        if let Err(e) = store.create(&meta) {
+                        if let Err(e) = thread_store.create(&meta) {
                             // 持久化是尽力而为:写失败不阻断 thread 创建。
                             eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
+                        }
+                        // 记录到全局「最近目录」索引,供 thread/listAll 与侧栏复用。
+                        // 索引键统一为 canonical,与 workspace/remove 的规范化对齐;
+                        // thread 的 cwd / meta 仍保持 `resolve_thread_cwd` 的原样。
+                        let index_path =
+                            std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(&cwd));
+                        if let Err(e) = workspaces.add(&index_path) {
+                            eprintln!(
+                                "[app-server] failed to record workspace {}: {e}",
+                                index_path.display()
+                            );
                         }
 
                         threads.insert(
@@ -279,6 +417,7 @@ where
                                 active_turn_id: None,
                                 prompt_tx,
                                 interrupt_tx,
+                                store: Arc::clone(&thread_store),
                             },
                         );
 
@@ -299,7 +438,7 @@ where
                             permission_timeout,
                             Arc::clone(&perm_seq),
                             catalog,
-                            Arc::clone(&store),
+                            Arc::clone(&thread_store),
                         ));
 
                         write_notification(
@@ -330,12 +469,36 @@ where
                         else {
                             continue;
                         };
+                        // Design §8:内存中的 thread 知道其权威 cwd,若目标目录已被删除,
+                        // 必须明确报错,而不是经 store_lookup 回退到 cfg.workdir(那会让
+                        // 后续 load 落空,退化成含混的 -32011,甚至悄悄换到别的目录)。
+                        // 冷 thread 的 meta 存在 workspace 目录内,删目录后本就不可读,
+                        // 仍走下方的 -32011,不在此覆盖。
+                        if let Some(session) = threads.get(&thread_id) {
+                            if !Path::new(&session.cwd).is_dir() {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id.clone(),
+                                        RpcError::invalid_params(format!(
+                                            "working directory no longer exists: {}",
+                                            session.cwd
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                        // 优先用内存中该 thread 的权威 store(与其 driver 共享 lock),
+                        // 冷 thread 才按全局索引 / cfg.workdir 定位,再从中载入历史。
+                        let thread_store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
                         // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
                         // 落盘完成,否则紧随 turn/completed 的 resume 会读到尚未写入
                         // 的历史。详见 `interrupt_and_wait_for_persist`。
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
 
-                        let loaded = match store.load(&thread_id) {
+                        let loaded = match thread_store.load(&thread_id) {
                             Ok(Some(l)) => l,
                             Ok(None) => {
                                 write_response(
@@ -374,7 +537,14 @@ where
                         }
                         session.replace_messages(loaded.messages);
 
-                        let BuiltAgent { agent, decision_tx, catalog } = match build_agent(Some(session)) {
+                        // 按 cwd(`meta.cwd`,损坏时用 cfg.workdir 兜底)重建本 thread
+                        // 的 store,让 agent 与 driver 都跑在对话真实目录,而非全局
+                        // cfg.workdir——这正是此前 resume 的隐患所在。
+                        let thread_store =
+                            Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
+
+                        let BuiltAgent { agent, decision_tx, catalog } =
+                            match build_agent(Some(session), Path::new(&cwd)) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
@@ -397,6 +567,7 @@ where
                                 active_turn_id: None,
                                 prompt_tx,
                                 interrupt_tx,
+                                store: Arc::clone(&thread_store),
                             },
                         );
 
@@ -415,7 +586,7 @@ where
                             permission_timeout,
                             Arc::clone(&perm_seq),
                             catalog,
-                            Arc::clone(&store),
+                            Arc::clone(&thread_store),
                         ));
 
                         // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
@@ -486,7 +657,9 @@ where
                             .await?;
                             continue;
                         }
-                        match store.rename(&thread_id, &title) {
+                        match store_lookup(&threads, &workspaces, &cfg, &thread_id)
+                            .rename(&thread_id, &title)
+                        {
                             Ok(true) => {
                                 write_response(&writer, ok_response(id, json!({}))).await?;
                             }
@@ -512,8 +685,12 @@ where
                         else {
                             continue;
                         };
+                        // 优先用内存中该 thread 的权威 store(与其 driver 共享 lock),
+                        // 冷 thread 才按全局索引 / cfg.workdir 定位;存在性与删除都
+                        // 作用在该 thread 的真实目录上。
+                        let thread_store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
                         let in_memory = threads.contains_key(&thread_id);
-                        let on_disk = store.exists(&thread_id);
+                        let on_disk = thread_store.exists(&thread_id);
                         if !in_memory && !on_disk {
                             write_response(
                                 &writer,
@@ -530,7 +707,7 @@ where
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
-                        if let Err(e) = store.delete(&thread_id) {
+                        if let Err(e) = thread_store.delete(&thread_id) {
                             eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
@@ -967,6 +1144,66 @@ async fn run_thread_driver<W>(
     }
 }
 
+/// 在全局索引的目录里定位 `thread_id` 所属目录。
+fn find_thread_dir(workspaces: &WorkspaceIndex, thread_id: &str) -> Option<PathBuf> {
+    workspaces
+        .list()
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|d| crate::thread_store::ThreadStore::new(d).exists(thread_id))
+}
+
+/// 按 thread 定位其 store;索引找不到时回退 `cfg.workdir`。
+fn store_for(
+    workspaces: &WorkspaceIndex,
+    cfg: &RuntimeConfig,
+    thread_id: &str,
+) -> Arc<crate::thread_store::ThreadStore> {
+    let dir = find_thread_dir(workspaces, thread_id).unwrap_or_else(|| cfg.workdir.clone());
+    Arc::new(crate::thread_store::ThreadStore::new(&dir))
+}
+
+/// 取 thread 的 store:内存中的 thread 用其权威实例(与 driver 共享 lock);
+/// 冷 thread 按全局索引定位,索引找不到再回退 `cfg.workdir`。
+fn store_lookup(
+    threads: &HashMap<String, ThreadSession>,
+    workspaces: &WorkspaceIndex,
+    cfg: &RuntimeConfig,
+    thread_id: &str,
+) -> Arc<crate::thread_store::ThreadStore> {
+    match threads.get(thread_id) {
+        Some(s) => Arc::clone(&s.store),
+        None => store_for(workspaces, cfg, thread_id),
+    }
+}
+
+/// 解析 `thread/start` 的目标目录:显式 `params.cwd` 优先,缺省用 `cfg.workdir`。
+///
+/// 显式 `cwd` canonicalize + 校验是目录;失败写 `-32602` 并返回 `Ok(None)`
+/// (调用方 continue)。缺省时沿用 `cfg.workdir` 原样,不 canonicalize:保持旧的
+/// 单目录行为,避免 macOS `/var` → `/private/var` 之类改写破坏既有路径语义。
+async fn resolve_thread_cwd<W: tokio::io::AsyncWrite + Unpin>(
+    params: &serde_json::Value,
+    cfg: &RuntimeConfig,
+    writer: &MessageWriter<W>,
+    id: RequestId,
+) -> anyhow::Result<Option<String>> {
+    match params.get("cwd").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => match std::fs::canonicalize(s) {
+            Ok(p) if p.is_dir() => Ok(Some(p.to_string_lossy().to_string())),
+            _ => {
+                write_response(
+                    writer,
+                    err_response(id, RpcError::invalid_params("cwd is not a valid directory")),
+                )
+                .await?;
+                Ok(None)
+            }
+        },
+        _ => Ok(Some(cfg.workdir.display().to_string())),
+    }
+}
+
 /// 从 params 提取 `threadId`;缺失时写 `-32602` 并返回 `Ok(None)`。
 async fn require_thread_id<W: tokio::io::AsyncWrite + Unpin>(
     writer: &MessageWriter<W>,
@@ -1114,7 +1351,10 @@ mod tests {
         }
     }
 
-    fn build_test_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
+    fn build_test_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+    ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
@@ -1129,7 +1369,10 @@ mod tests {
         })
     }
 
-    fn build_slow_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
+    fn build_slow_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+    ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
@@ -1144,7 +1387,10 @@ mod tests {
         })
     }
 
-    fn build_delayed_agent(session: Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> {
+    fn build_delayed_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+    ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
@@ -1184,6 +1430,8 @@ mod tests {
         client_w: tokio::io::DuplexStream,
         client_r: BufReader<tokio::io::DuplexStream>,
         handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+        /// 隔离的全局目录索引;持有它保证 tempdir 存活到 harness 结束。
+        _index_dir: tempfile::TempDir,
     }
 
     impl Harness {
@@ -1194,7 +1442,9 @@ mod tests {
         /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
         fn with_factory<F>(build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+                + Send
+                + 'static,
         {
             Self::with_config(test_config(), build, permission_timeout)
         }
@@ -1202,15 +1452,29 @@ mod tests {
         /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
         fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>) -> anyhow::Result<BuiltAgent> + Send + 'static,
+            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+                + Send
+                + 'static,
         {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-            let handle = tokio::spawn(run_with(server_r, server_w, cfg, permission_timeout, build));
+            let index_dir = tempfile::TempDir::new().unwrap();
+            let workspaces = Arc::new(WorkspaceIndex::new(
+                index_dir.path().join("workspaces.json"),
+            ));
+            let handle = tokio::spawn(run_with(
+                server_r,
+                server_w,
+                cfg,
+                permission_timeout,
+                workspaces,
+                build,
+            ));
             Self {
                 client_w,
                 client_r: BufReader::new(client_r),
                 handle,
+                _index_dir: index_dir,
             }
         }
 
@@ -1357,14 +1621,137 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_add_list_remove_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["path"], cwd.to_string_lossy().to_string());
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"][0]["path"],
+            cwd.to_string_lossy().to_string()
+        );
+        assert_eq!(v["result"]["workspaces"][0]["exists"], true);
+
+        let rm = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"workspace/remove",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&rm.to_string()).await;
+        let v = h.read_value().await;
+        assert!(v.get("result").is_some());
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"].as_array().unwrap().len(),
+            0,
+            "removed workspace must be gone from the index: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_list_marks_missing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["path"], cwd.to_string_lossy().to_string());
+
+        // 目录在磁盘上消失后,索引仍保留该条目,但 list 必须标记 exists=false。
+        std::fs::remove_dir_all(&cwd).unwrap();
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"][0]["path"],
+            cwd.to_string_lossy().to_string()
+        );
+        assert_eq!(
+            v["result"]["workspaces"][0]["exists"], false,
+            "missing directory must be flagged as not existing: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_remove_accepts_alternate_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["path"], cwd.to_string_lossy().to_string());
+
+        // 用与存储值不同、但 canonicalize 后等价的路径 remove,必须命中同一条目。
+        // `dir.path()` 是非 canonical 前缀(如 macOS 的 /var → /private/var),
+        // 末尾再缀 `/.`,因此字符串与 canonical 存储值不同、解析后却相同。
+        let alternate = dir.path().join(".").to_string_lossy().to_string();
+        assert_ne!(alternate, cwd.to_string_lossy().to_string());
+
+        let rm = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"workspace/remove",
+            "params":{"path": alternate}});
+        h.send(&rm.to_string()).await;
+        let v = h.read_value().await;
+        assert!(v.get("result").is_some(), "remove must succeed: {v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"].as_array().unwrap().len(),
+            0,
+            "alternate path must remove the canonicalized entry: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_add_rejects_non_directory() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"workspace/add","params":{"path":"/nope/nope"}}"#,
+        )
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32602);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn eof_exits_gracefully() {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, _client_r) = tokio::io::duplex(64 * 1024);
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = Arc::new(WorkspaceIndex::new(
+            index_dir.path().join("workspaces.json"),
+        ));
         let handle = tokio::spawn(run_with(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
+            workspaces,
             build_test_agent,
         ));
 
@@ -1408,12 +1795,19 @@ mod tests {
     async fn agent_factory_failure_returns_internal_error() {
         let (mut client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = Arc::new(WorkspaceIndex::new(
+            index_dir.path().join("workspaces.json"),
+        ));
         let handle = tokio::spawn(run_with(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
-            |_s: Option<yi_agent_core::Session>| Err::<BuiltAgent, _>(anyhow::anyhow!("boom")),
+            workspaces,
+            |_s: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
+                Err::<BuiltAgent, _>(anyhow::anyhow!("boom"))
+            },
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -1456,11 +1850,16 @@ mod tests {
     async fn oversized_frame_returns_err() {
         let (mut client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, _client_r) = tokio::io::duplex(64 * 1024);
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = Arc::new(WorkspaceIndex::new(
+            index_dir.path().join("workspaces.json"),
+        ));
         let handle = tokio::spawn(run_with(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
+            workspaces,
             build_test_agent,
         ));
 
@@ -1649,7 +2048,9 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent(None).unwrap().agent,
+            build_delayed_agent(None, std::path::Path::new("/tmp"))
+                .unwrap()
+                .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1719,7 +2120,9 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None).unwrap().agent,
+            build_test_agent(None, std::path::Path::new("/tmp"))
+                .unwrap()
+                .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1765,7 +2168,9 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None).unwrap().agent,
+            build_test_agent(None, std::path::Path::new("/tmp"))
+                .unwrap()
+                .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -1895,6 +2300,7 @@ mod tests {
     /// 构造一个会触发 bash 审批的 agent,并把决定通道交给 driver。
     fn build_permission_agent(
         session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
     ) -> anyhow::Result<BuiltAgent> {
         let provider = Arc::new(PermissionMockProvider {
             calls: AtomicUsize::new(0),
@@ -2118,7 +2524,7 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
-        let built = build_permission_agent(None).unwrap();
+        let built = build_permission_agent(None, std::path::Path::new("/tmp")).unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             built.agent,
@@ -2274,6 +2680,278 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_with_cwd_writes_meta_cwd() {
+        // 全局 workdir 与显式 cwd 指向不同目录:用于区分「按 thread 的 cwd 路由」
+        // 与旧的「一律写全局 workdir」行为。
+        let global = tempfile::TempDir::new().unwrap();
+        let target = tempfile::TempDir::new().unwrap();
+        let w = global.path().canonicalize().unwrap();
+        let c = target.path().canonicalize().unwrap();
+
+        let mut cfg = test_config();
+        cfg.workdir = w.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": c.to_string_lossy() }});
+        h.send(&req.to_string()).await;
+
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("thread/start response");
+        assert_eq!(
+            resp["result"]["cwd"].as_str().unwrap(),
+            c.to_string_lossy().to_string()
+        );
+        let thread_id = resp["result"]["thread_id"].as_str().unwrap().to_string();
+
+        let store = crate::thread_store::ThreadStore::new(&c);
+        let metas = store.list().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].cwd, c.to_string_lossy().to_string());
+        assert!(
+            !crate::thread_store::ThreadStore::new(&w).exists(&thread_id),
+            "thread must not leak into the global workdir store"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_with_bad_cwd_returns_invalid_params() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": "/nonexistent/definitely/not/here" }});
+        h.send(&req.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32602);
+        h.shutdown().await;
+    }
+
+    /// 索引键必须规范化为 canonical,与 `workspace/remove` 的规范化对齐:否则符号
+    /// 链接形式的缺省 cwd 会以非 canonical 形式进索引,后续 remove 静默 no-op。
+    /// 用符号链接制造 `canonical != raw`,确保本测试确实覆盖该回归面。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_default_cwd_indexes_canonical_path() {
+        let real = tempfile::TempDir::new().unwrap();
+        let link_parent = tempfile::TempDir::new().unwrap();
+        let link = link_parent.path().join("linked");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let raw = link.to_string_lossy().to_string();
+        let canonical = link.canonicalize().unwrap();
+        assert_ne!(
+            raw,
+            canonical.to_string_lossy().to_string(),
+            "symlink must be non-canonical for this test to be meaningful"
+        );
+
+        let mut cfg = test_config();
+        cfg.workdir = link.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // 不带 cwd → 走缺省 cfg.workdir(即符号链接路径)。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let _tid = read_thread_start_response(&mut h, 2).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("workspace/list must respond");
+        let path = v["result"]["workspaces"][0]["path"]
+            .as_str()
+            .expect("index must contain the default cwd");
+        let recanon = Path::new(path)
+            .canonicalize()
+            .expect("indexed path must be canonicalizable");
+        assert_eq!(
+            recanon.to_string_lossy(),
+            path,
+            "index entry must already be canonical: {path}"
+        );
+        h.shutdown().await;
+    }
+
+    /// Design §11 的头号风险是「cwd 传递正确」:agent 工厂必须拿到该 thread 的 cwd,
+    /// 而非全局 workdir。用记录型工厂把实参钉死。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_factory_receives_thread_cwd() {
+        let target = tempfile::TempDir::new().unwrap();
+        let c = target.path().canonicalize().unwrap();
+
+        let seen: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_factory = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>, cwd: &std::path::Path| {
+            seen_factory.lock().unwrap().push(cwd.to_path_buf());
+            build_test_agent(session, cwd)
+        };
+        let mut h = Harness::with_factory(build, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": c.to_string_lossy() }});
+        h.send(&req.to_string()).await;
+        let _tid = read_thread_start_response(&mut h, 2).await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![c.clone()],
+            "agent factory must receive the thread's canonical cwd"
+        );
+        h.shutdown().await;
+    }
+
+    /// 两个目录各起一个 thread:`thread/listAll` 必须按 workspace 分成两组,每组
+    /// 恰好含该目录的 thread(cwd 与 group.workspace 一致,thread_id 与 start 响应一致)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_all_groups_by_workspace() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let a = dir_a
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let b = dir_b
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        // workspace 路径 → 在该目录 start 出的 thread_id。
+        let mut expected: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (id, path) in [(2u64, &a), (3u64, &b)] {
+            let req = serde_json::json!({"jsonrpc":"2.0","id":id,"method":"thread/start",
+                "params":{"cwd": path}});
+            h.send(&req.to_string()).await;
+            let tid = read_thread_start_response(&mut h, id).await;
+            expected.insert(path.clone(), tid);
+        }
+
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("thread/listAll response");
+        let groups = v["result"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "两个目录 → 两个分组: {v}");
+
+        // 索引按「最近使用在前」排序:先 start a 再 start b → 组顺序为 [b, a]。
+        // start 请求串行(读罢 a 的响应才发 b),故 workspace/add 的先后确定。
+        assert_eq!(
+            groups[0]["workspace"],
+            b.as_str(),
+            "most-recent workspace must come first"
+        );
+        assert_eq!(
+            groups[1]["workspace"],
+            a.as_str(),
+            "the earlier workspace must follow"
+        );
+
+        for g in groups {
+            let ws = g["workspace"].as_str().unwrap();
+            assert!(
+                ws == a.as_str() || ws == b.as_str(),
+                "unexpected workspace {ws}"
+            );
+            assert_eq!(g["exists"], true, "canonical tempdir must exist: {g}");
+            let threads = g["threads"].as_array().unwrap();
+            assert_eq!(
+                threads.len(),
+                1,
+                "each workspace holds exactly one thread: {g}"
+            );
+            assert_eq!(
+                threads[0]["cwd"].as_str().unwrap(),
+                ws,
+                "thread cwd must match its group workspace"
+            );
+            assert_eq!(
+                threads[0]["thread_id"].as_str().unwrap(),
+                expected[ws].as_str(),
+                "group must carry the thread started in that workspace"
+            );
+        }
+        h.shutdown().await;
+    }
+
+    /// 失效目录(索引里有、磁盘上已删)仍必须出现为一个组:`exists:false` 且
+    /// `threads` 为空(不深扫)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_all_includes_missing_dir_with_empty_threads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        // 先让目录存在时写入索引,再从磁盘删除。
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": path_str}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 2);
+        assert!(v.get("error").is_none(), "workspace/add must succeed: {v}");
+        std::fs::remove_dir_all(&path).unwrap();
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("thread/listAll response");
+        let groups = v["result"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "索引里恰有一个目录: {v}");
+        let g = &groups[0];
+        assert_eq!(g["workspace"].as_str().unwrap(), path_str);
+        assert_eq!(g["exists"], false, "失效目录必须报 exists:false: {g}");
+        assert_eq!(
+            g["threads"].as_array().unwrap().len(),
+            0,
+            "失效目录不深扫,threads 必须为空: {g}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn turn_completion_persists_items_and_messages() {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = {
@@ -2338,7 +3016,7 @@ mod tests {
         cfg.workdir = dir.path().to_path_buf();
         let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_factory = Arc::clone(&seen);
-        let build = move |session: Option<yi_agent_core::Session>| {
+        let build = move |session: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
             Ok(BuiltAgent {
                 agent: apply_session(
                     yi_agent_core::Agent::new(
@@ -2448,6 +3126,131 @@ mod tests {
         let v = h.read_value().await;
         assert_eq!(v["id"], 2);
         assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    /// Design §8:resume 的目标目录已不存在时必须明确报错,不得静默回退 `$HOME`。
+    /// 对内存中的 thread,其权威 cwd 已知(见 `ThreadSession`),故这是可达且必须
+    /// 报错的路径。冷 thread 的元数据本就存在 workspace 目录内,目录删除后不可读,
+    /// 那种情况仍走 `-32011`,不在此覆盖。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_missing_cwd_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let mut cfg = test_config();
+        cfg.workdir = cwd.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": cwd.to_string_lossy() }});
+        h.send(&req.to_string()).await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        // 目录从磁盘消失:thread 仍在内存,但 cwd 已不可用。
+        std::fs::remove_dir_all(&cwd).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("thread/resume must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "resume into a vanished cwd must be invalid_params, not a silent fallback: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_ops_target_thread_cwd_not_global_workdir() {
+        // 两个不同目录:thread 建在 `d`,全局 workdir 在 `w`。用于锁住
+        // rename/delete 走 thread 自身 cwd,而不是全局 workdir / 索引回退。
+        let w = tempfile::TempDir::new().unwrap();
+        let d = tempfile::TempDir::new().unwrap();
+        let w_dir = w.path().canonicalize().unwrap();
+        let d_dir = d.path().canonicalize().unwrap();
+
+        let mut cfg = test_config();
+        cfg.workdir = w_dir.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let start = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "thread/start",
+            "params": { "cwd": d_dir.to_string_lossy() },
+        });
+        h.send(&start.to_string()).await;
+        let mut tid = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                assert!(v.get("error").is_none(), "thread/start must succeed: {v}");
+                tid = Some(v["result"]["thread_id"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        let tid = tid.expect("no thread/start response");
+
+        // 把 `d` 从全局索引移除。此后只有「内存中该 thread 的权威 store」还能
+        // 指向 `d`;若 rename/delete 退化成 store_for(索引 → cfg.workdir),
+        // 就会落到全局 workdir `w` 上,从而暴露路由回归。
+        let remove = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/remove",
+            "params": { "path": d_dir.to_string_lossy() },
+        });
+        h.send(&remove.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 3);
+        assert!(
+            v.get("error").is_none(),
+            "workspace/remove must succeed: {v}"
+        );
+
+        // rename 必须落在 `d`,而不是全局 workdir `w`。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/rename","params":{{"threadId":"{tid}","title":"scoped"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 4);
+        assert!(v.get("error").is_none(), "rename must succeed: {v}");
+
+        let in_d = crate::thread_store::ThreadStore::new(&d_dir)
+            .load(&tid)
+            .expect("load in d must not fail")
+            .expect("thread must live in d");
+        assert_eq!(in_d.meta.title.as_deref(), Some("scoped"));
+        assert!(
+            !crate::thread_store::ThreadStore::new(&w_dir).exists(&tid),
+            "nothing must leak into the global workdir"
+        );
+
+        // delete 同样必须作用在 `d`。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 5);
+        assert!(v.get("error").is_none(), "delete must succeed: {v}");
+        assert!(
+            !crate::thread_store::ThreadStore::new(&d_dir).exists(&tid),
+            "thread must be actually deleted in d"
+        );
         h.shutdown().await;
     }
 

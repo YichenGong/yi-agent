@@ -7,7 +7,8 @@ import { MessageInput } from "./components/MessageInput";
 import { StatusBar } from "./components/StatusBar";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ThreadSidebar } from "./components/ThreadSidebar";
-import type { ApprovalRequest, ThreadSummary } from "./lib/protocol";
+import type { ApprovalRequest, Workspace, WorkspaceGroup } from "./lib/protocol";
+import { threadStartParams } from "./lib/threadStart";
 
 interface ThreadInfo {
   cwd: string;
@@ -37,7 +38,8 @@ export default function App() {
   const [threadInfo, setThreadInfo] = useState<ThreadInfo | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [status, setStatus] = useState<string>("connecting");
-  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
 
   const busy = session.turnActive;
 
@@ -45,10 +47,21 @@ export default function App() {
     const c = clientRef.current;
     if (!c) return;
     try {
-      const r = await c.request<{ threads: ThreadSummary[] }>("thread/list", {});
-      setThreads(r.threads);
+      const r = await c.request<{ groups: WorkspaceGroup[] }>("thread/listAll", {});
+      setGroups(r.groups);
     } catch {
       // 列表刷新失败不打断对话;下一次事件会再试。
+    }
+  };
+
+  const refreshWorkspaces = async () => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      const r = await c.request<{ workspaces: Workspace[] }>("workspace/list", {});
+      setWorkspaces(r.workspaces);
+    } catch {
+      // 最近目录刷新失败不影响当前对话。
     }
   };
 
@@ -78,14 +91,17 @@ export default function App() {
     await refreshThreads();
   };
 
-  const newThread = async () => {
+  const newThread = async (cwd?: string) => {
     const c = clientRef.current;
     if (!c || session.turnActive || resuming.current) return;
     resuming.current = true;
     session.reset();
     force((v) => v + 1);
     try {
-      const t = await c.request<ThreadInfo & { thread_id: string }>("thread/start", {});
+      const t = await c.request<ThreadInfo & { thread_id: string }>(
+        "thread/start",
+        threadStartParams(cwd),
+      );
       setThreadId(t.thread_id);
       setThreadInfo({ cwd: t.cwd, model: t.model });
     } catch (e) {
@@ -99,15 +115,71 @@ export default function App() {
     await refreshThreads();
   };
 
+  /** 打开原生文件夹选择器,返回选中的绝对路径(取消则 null)。 */
+  const pickDirectory = async (): Promise<string | null> => {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({ directory: true, multiple: false });
+    return typeof picked === "string" ? picked : null;
+  };
+
+  const addWorkspace = async (path: string): Promise<boolean> => {
+    try {
+      await clientRef.current?.request("workspace/add", { path });
+      return true;
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+      return false;
+    }
+  };
+
+  /** 打开原生选择器 → 加入最近目录 → 在该目录新建对话。 */
+  const onBrowse = async () => {
+    if (session.turnActive || resuming.current) return;
+    try {
+      const dir = await pickDirectory();
+      if (!dir) return;
+      // add 失败(-32602 等)时不再建对话,错误已写入 lastError。
+      if (!(await addWorkspace(dir))) return;
+      await newThread(dir);
+      await refreshWorkspaces();
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+    }
+  };
+
+  /** 侧栏入口:带 cwd 直接在该目录新建;无 cwd 时退化为弹原生选择器。 */
+  const onNew = async (cwd?: string) => {
+    if (cwd) {
+      await newThread(cwd);
+      // thread/start 会顺带把该目录写入最近目录索引。
+      await refreshWorkspaces();
+    } else {
+      await onBrowse();
+    }
+  };
+
+  const removeWorkspace = async (path: string) => {
+    try {
+      await clientRef.current?.request("workspace/remove", { path });
+    } catch (e) {
+      session.lastError = formatError(e);
+      force((v) => v + 1);
+    }
+    // 「移除」只是视图操作,不删数据:目录离开索引后 thread/listAll 不再扫描它,
+    // 分组随之从侧栏消失,但 <dir>/.yi-agent/ 下的对话文件仍然保留。
+    // 失败时也刷新,保证 UI 与服务端状态一致。
+    await refreshThreads();
+    await refreshWorkspaces();
+  };
+
   const renameThread = async (id: string, title: string) => {
     const c = clientRef.current;
     if (!c || resuming.current) return;
-    const prev = threads;
-    setThreads((ts) => ts.map((t) => (t.thread_id === id ? { ...t, title } : t)));
     try {
       await c.request("thread/rename", { threadId: id, title });
     } catch (e) {
-      setThreads(prev);
       session.lastError = formatError(e);
       force((v) => v + 1);
     }
@@ -147,13 +219,14 @@ export default function App() {
     client.onStatus((s) => setStatus(s.state));
     (async () => {
       await client.request("initialize", {});
-      const list = await client.request<{ threads: ThreadSummary[] }>("thread/list", {});
-      setThreads(list.threads);
-      if (list.threads.length > 0) {
-        await resumeThread(list.threads[0].thread_id);
-      } else {
-        await newThread();
+      await refreshWorkspaces();
+      const list = await client.request<{ groups: WorkspaceGroup[] }>("thread/listAll", {});
+      setGroups(list.groups);
+      const first = list.groups.flatMap((g) => g.threads)[0];
+      if (first) {
+        await resumeThread(first.thread_id);
       }
+      // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
       setStatus("connected");
     })().catch((e) => {
       const msg = formatError(e);
@@ -198,13 +271,16 @@ export default function App() {
         inert={approval !== null}
       >
         <ThreadSidebar
-          threads={threads}
+          groups={groups}
+          workspaces={workspaces}
           currentId={threadId}
           busy={busy}
           onSelect={resumeThread}
           onRename={renameThread}
           onDelete={deleteThread}
-          onNew={newThread}
+          onNew={onNew}
+          onRemoveWorkspace={removeWorkspace}
+          onBrowse={onBrowse}
         />
         <div className="flex min-w-0 flex-1 flex-col">
           <StatusBar

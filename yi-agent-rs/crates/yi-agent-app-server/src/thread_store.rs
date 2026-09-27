@@ -326,7 +326,7 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 ///
 /// 临时名带 pid + 进程内递增序号:同一文件可能有多个写者(driver 的 touch 与
 /// 主循环的 rename),固定名会互相截断。
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(format!(".tmp.{}.{}", std::process::id(), seq));
