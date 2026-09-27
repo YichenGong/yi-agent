@@ -87,9 +87,50 @@ describe("Session", () => {
     const s = new Session();
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 10, output_tokens: 3 },
+      params: {
+        thread_id: "t",
+        model: "m",
+        input_tokens: 10,
+        output_tokens: 3,
+        cache_creation_input_tokens: 100,
+        cache_read_input_tokens: 200,
+      },
     });
-    expect(s.usage).toEqual({ model: "m", input: 10, output: 3 });
+    expect(s.usage).toEqual({
+      model: "m",
+      input: 10,
+      output: 3,
+      cacheWrite: 100,
+      cacheRead: 200,
+    });
+  });
+
+  it("defaults cache tokens to zero when absent", () => {
+    const s = new Session();
+    s.apply({
+      method: "thread/tokenUsage/updated",
+      params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2 },
+    });
+    expect(s.usage).toEqual({
+      model: "m",
+      input: 1,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+  });
+
+  it("keeps the latest cumulative usage snapshot", () => {
+    const s = new Session();
+    s.apply({
+      method: "thread/tokenUsage/updated",
+      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 0, cache_read_input_tokens: 9 },
+    });
+    s.apply({
+      method: "thread/tokenUsage/updated",
+      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 42, cache_read_input_tokens: 9 },
+    });
+    expect(s.usage).toEqual({ model: "m", input: 100, output: 42, cacheRead: 9, cacheWrite: 0 });
   });
 
   it("records an error notification", () => {

@@ -140,12 +140,19 @@ pub enum Notification {
         /// Why the turn is being retried: `"idle_stall"` or `"request_timeout"`.
         cause: String,
     },
+    /// 用量更新通知。
+    ///
+    /// 携带的是**本轮累积快照**,而非单条原始 provider 事件:Anthropic 把一次
+    /// 调用的用量拆成 `message_start`(input/cache)与 `message_delta`(output)
+    /// 两个事件,翻译层按字段合并后发出,故每条通知都是迄今完整的本轮用量。
     #[serde(rename = "thread/tokenUsage/updated")]
     TokenUsage {
         thread_id: String,
         model: String,
         input_tokens: u32,
         output_tokens: u32,
+        cache_creation_input_tokens: u32,
+        cache_read_input_tokens: u32,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -318,5 +325,23 @@ mod tests {
         let v: Value = serde_json::to_value(&n).unwrap();
         assert_eq!(v["params"]["status"], "completed");
         assert!(v["params"].get("error").is_none());
+    }
+
+    #[test]
+    fn token_usage_notification_includes_cache_fields() {
+        let n = Notification::TokenUsage {
+            thread_id: "t1".into(),
+            model: "m".into(),
+            input_tokens: 10,
+            output_tokens: 3,
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 200,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/tokenUsage/updated");
+        assert_eq!(v["params"]["input_tokens"], 10);
+        assert_eq!(v["params"]["output_tokens"], 3);
+        assert_eq!(v["params"]["cache_creation_input_tokens"], 100);
+        assert_eq!(v["params"]["cache_read_input_tokens"], 200);
     }
 }

@@ -446,6 +446,8 @@ where
                                     model: u.model,
                                     input_tokens: u.input_tokens,
                                     output_tokens: u.output_tokens,
+                                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                                    cache_read_input_tokens: u.cache_read_input_tokens,
                                 },
                             )
                             .await?;
@@ -805,7 +807,8 @@ async fn run_thread_driver<W>(
     let mut translator = Translator::new(thread_id.clone());
     while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
         // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
-        // `last_usage` 记录的是本轮**最后一次** provider 调用,而非多步 turn 的累加。
+        // `last_usage` 记录的是本轮**最后一次** provider 调用的完整快照
+        // (input 来自 `message_start`、output 来自 `message_delta`,由 Translator 合并)。
         let mut completed_items: Vec<crate::protocol::Item> = Vec::new();
         let mut last_usage: Option<crate::thread_store::TurnUsage> = None;
         let user_prompt = prompt.clone();
@@ -894,16 +897,27 @@ async fn run_thread_driver<W>(
                             }
                         }
                         Some(e) => {
-                            if let yi_agent_core::AgentEvent::Usage { model, usage } = &e {
-                                last_usage = Some(crate::thread_store::TurnUsage {
-                                    model: model.clone(),
-                                    input_tokens: usage.input_tokens,
-                                    output_tokens: usage.output_tokens,
-                                });
-                            }
                             for n in translator.on_event(e) {
                                 if let crate::protocol::Notification::ItemCompleted { item, .. } = &n {
                                     completed_items.push(item.clone());
+                                }
+                                // 用量通知携带本轮累积快照(见 Translator::on_event),最后一条即落盘用的完整用量。
+                                if let crate::protocol::Notification::TokenUsage {
+                                    model,
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_creation_input_tokens,
+                                    cache_read_input_tokens,
+                                    ..
+                                } = &n
+                                {
+                                    last_usage = Some(crate::thread_store::TurnUsage {
+                                        model: model.clone(),
+                                        input_tokens: *input_tokens,
+                                        output_tokens: *output_tokens,
+                                        cache_creation_input_tokens: *cache_creation_input_tokens,
+                                        cache_read_input_tokens: *cache_read_input_tokens,
+                                    });
                                 }
                                 if write_notification(&writer, &n).await.is_err() {
                                     // 客户端可能已断开;先上报 Finished,

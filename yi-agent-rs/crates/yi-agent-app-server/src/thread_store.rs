@@ -30,6 +30,12 @@ pub struct TurnUsage {
     pub model: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// 写入 prompt cache 的 token(Anthropic cache write);旧日志缺失按 0。
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    /// 命中 prompt cache 读取的 token;旧日志缺失按 0。
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 /// `.jsonl` 里的一行。用带 tag 的枚举,便于日后扩展其它行类型。
@@ -780,5 +786,33 @@ mod tests {
 
         let ids: Vec<String> = s.list().unwrap().into_iter().map(|m| m.thread_id).collect();
         assert_eq!(ids, vec!["thread-a"]);
+    }
+
+    #[test]
+    fn turn_usage_loads_without_cache_fields() {
+        // 旧格式:没有 cache 字段的 usage 行仍须能加载,缺失字段按 0。
+        let line = r#"{"type":"turn","items":[],"usage":{"model":"m","input_tokens":7,"output_tokens":2}}"#;
+        let parsed: TurnLine = serde_json::from_str(line).unwrap();
+        let TurnLine::Turn { usage, .. } = parsed;
+        let u = usage.unwrap();
+        assert_eq!(u.input_tokens, 7);
+        assert_eq!(u.output_tokens, 2);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn turn_usage_round_trips_cache_fields() {
+        let u = TurnUsage {
+            model: "m".into(),
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_input_tokens: 30,
+            cache_read_input_tokens: 40,
+        };
+        let s = serde_json::to_string(&u).unwrap();
+        let back: TurnUsage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.cache_creation_input_tokens, 30);
+        assert_eq!(back.cache_read_input_tokens, 40);
     }
 }

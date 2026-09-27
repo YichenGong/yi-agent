@@ -97,9 +97,15 @@ desktop/
 
 ## Verification status
 
-Frontend unit tests (`npm test`, 18 tests), the frontend production build
+Frontend unit tests (`npm test`, 34 tests), the frontend production build
 (`npm run build`), and the Rust backend tests (`cd src-tauri && cargo test`) are
 green.
+
+Agent messages are rendered as GitHub-flavored Markdown with syntax-highlighted
+code blocks (`react-markdown` + `remark-gfm` + `rehype-highlight`); raw HTML in
+messages is not rendered (XSS guard). Clicking an http(s) link opens it in the
+system browser. The status bar's usage area expands into a panel showing input /
+output / cache-read / cache-write tokens and an estimated cost.
 
 The native bundle is built and verified: `npm run sidecar:release && npm run
 tauri build` produces `src-tauri/target/release/bundle/macos/yi-agent.app` (with

@@ -60,7 +60,15 @@ export type Notification =
     }
   | {
       method: "thread/tokenUsage/updated";
-      params: { thread_id: string; model: string; input_tokens: number; output_tokens: number };
+      params: {
+        thread_id: string;
+        model: string;
+        input_tokens: number;
+        output_tokens: number;
+        /** 缺省(旧服务端)按 0 处理。 */
+        cache_creation_input_tokens?: number;
+        cache_read_input_tokens?: number;
+      };
     }
   | { method: "error"; params: { message: string } };
 
@@ -96,4 +104,13 @@ export interface ThreadSummary {
   created_at: number;
   updated_at: number;
   title: string | null;
+}
+
+/** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */
+export interface Usage {
+  model: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
 }
