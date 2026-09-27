@@ -2159,13 +2159,14 @@ impl RuntimeCoordinator {
     /// # Preconditions
     ///
     /// The caller must already have established that no live worker owns these
-    /// directories — in practice by detaching the session first. This method
-    /// does not check task state or worker ownership, and it reclaims a session's
-    /// root with no merge check, because a root's `parent_branch` is the main
-    /// branch and a root branch rarely merges into it. Calling it for a live
-    /// session would delete the directory a running worker is using; the rebuild
-    /// path in `prepare_task_workspace` repairs the directory, but only at the
-    /// next worker start.
+    /// directories — in practice by detaching the session first. It must call this
+    /// off-thread. A non-terminal child is refused: the state rule is enforced one
+    /// call down in [`Self::reclaim_candidate_directories`]. The session root is
+    /// exempt from that rule, and it is reclaimed with no merge check, because a
+    /// root's `parent_branch` is the main branch, a root branch rarely merges into
+    /// it, and a detached root sits in `paused` rather than a terminal state. The
+    /// rebuild path in `prepare_task_workspace` repairs a reclaimed directory, but
+    /// only at the next worker start.
     ///
     /// It is synchronous and runs `git` subprocesses, so it must not be called
     /// from a request-handling thread or while holding the repository mutex.
@@ -2197,10 +2198,13 @@ impl RuntimeCoordinator {
 
     /// Reclaims the directories of an already-selected candidate set.
     ///
-    /// The caller chooses which candidates are eligible; this function enforces
-    /// the merge check and the directory removal. Splitting the two means the
-    /// "reclaim everything" path and the "reclaim only idle tasks" path share
-    /// one implementation of ordering, the merge gate, and event recording.
+    /// This function enforces the state-eligibility rule — a child whose task is
+    /// not terminal is refused, while the root is exempt — in addition to the
+    /// merge check and the directory removal. A caller may narrow the set further
+    /// (the TTL sweep adds the seven-day idle clock) but cannot widen it past the
+    /// state rule. Splitting selection from reclaim means the "reclaim everything"
+    /// path and the "reclaim only idle tasks" path share one implementation of
+    /// ordering, the state gate, the merge gate, and event recording.
     fn reclaim_candidate_directories(
         &self,
         session: &RootSessionId,

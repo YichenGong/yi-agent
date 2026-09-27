@@ -4257,6 +4257,14 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
         .await
         .unwrap();
 
+    // Send the unmerged child terminal too, so it clears the state gate and the
+    // merge gate is what decides its fate. Without this the state gate refuses a
+    // running child first and this test stops discriminating a broken merge check.
+    coordinator
+        .cancel_task(&session, &unmerged, false)
+        .await
+        .unwrap();
+
     let reclaimed = coordinator.reclaim_session_worktrees(&session);
 
     assert!(
@@ -4455,6 +4463,14 @@ async fn reclaim_skips_the_merge_check_when_the_owner_directory_is_gone() {
         "precondition: the owner directory is gone while its row survives"
     );
     merge_checks.lock().unwrap().clear();
+
+    // Terminal, so the child clears the state gate; the owner-existence guard is
+    // then what decides whether the merge check is attempted, which is what this
+    // test observes through the empty `merge_checks` recorder.
+    coordinator
+        .cancel_task(&session, &child, false)
+        .await
+        .unwrap();
 
     let reclaimed = coordinator.reclaim_session_worktrees(&session);
 
