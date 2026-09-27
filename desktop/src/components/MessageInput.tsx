@@ -1,13 +1,19 @@
 import { useState } from "react";
+import { ModeChip } from "./ModeChip";
+import type { ThreadMode } from "../lib/threadPermissionMode";
 
 export function MessageInput({
   turnActive,
   onSend,
   onInterrupt,
+  mode,
+  onModeChange,
 }: {
   turnActive: boolean;
   onSend: (text: string) => Promise<boolean>;
   onInterrupt: () => void;
+  mode: ThreadMode;
+  onModeChange: (mode: ThreadMode) => void;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -42,6 +48,7 @@ export function MessageInput({
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
         className="flex-1 resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-500 focus:outline-none disabled:opacity-50"
       />
+      <ModeChip mode={mode} onChange={onModeChange} />
       <button
         type="button"
         onClick={turnActive ? onInterrupt : () => void handleSend()}
