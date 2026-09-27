@@ -4503,14 +4503,29 @@ mod tests {
         // so the delivery order is pushed in reverse.
         let mut delivery: Vec<Event> = Vec::new();
         for ch in "first".chars() {
-            delivery.push(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)));
+            delivery.push(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
         }
-        delivery.push(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        delivery.push(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
         for ch in "second".chars() {
-            delivery.push(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)));
+            delivery.push(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
         }
-        delivery.push(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        delivery.push(Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        delivery.push(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        delivery.push(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
         delivery.reverse();
 
         let source = ScriptedEvents {
