@@ -267,7 +267,11 @@ where
                     }
                     "workspace/remove" => {
                         let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        match workspaces.remove(Path::new(raw)) {
+                        // add 存的是 canonical 路径;remove 也必须规范化,否则
+                        // 符号链接 / 相对路径 / 尾斜杠会静默 no-op 却仍回成功。
+                        // canonicalize 失败(路径已不存在)时回退原始串,保持幂等。
+                        let key = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
+                        match workspaces.remove(&key) {
                             Ok(()) => write_response(&writer, ok_response(id, json!({}))).await?,
                             Err(e) => {
                                 write_response(
@@ -1032,7 +1036,7 @@ async fn run_thread_driver<W>(
 }
 
 /// 在全局索引的目录里定位 `thread_id` 所属目录。
-// TODO(task-3): remove allow
+// TODO(task-3/4): helpers 首次被 task-3 使用;用后移除 allow
 #[allow(dead_code)]
 fn find_thread_dir(workspaces: &WorkspaceIndex, thread_id: &str) -> Option<PathBuf> {
     workspaces
@@ -1043,7 +1047,7 @@ fn find_thread_dir(workspaces: &WorkspaceIndex, thread_id: &str) -> Option<PathB
 }
 
 /// 按 thread 定位其 store;索引找不到时回退 `cfg.workdir`。
-// TODO(task-3): remove allow
+// TODO(task-3/4): helpers 首次被 task-3 使用;用后移除 allow
 #[allow(dead_code)]
 fn store_for(
     workspaces: &WorkspaceIndex,
@@ -1484,6 +1488,81 @@ mod tests {
         h.send(&rm.to_string()).await;
         let v = h.read_value().await;
         assert!(v.get("result").is_some());
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"].as_array().unwrap().len(),
+            0,
+            "removed workspace must be gone from the index: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_list_marks_missing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["path"], cwd.to_string_lossy().to_string());
+
+        // 目录在磁盘上消失后,索引仍保留该条目,但 list 必须标记 exists=false。
+        std::fs::remove_dir_all(&cwd).unwrap();
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"][0]["path"],
+            cwd.to_string_lossy().to_string()
+        );
+        assert_eq!(
+            v["result"]["workspaces"][0]["exists"], false,
+            "missing directory must be flagged as not existing: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_remove_accepts_alternate_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": cwd.to_string_lossy()}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["path"], cwd.to_string_lossy().to_string());
+
+        // 用与存储值不同、但 canonicalize 后等价的路径 remove,必须命中同一条目。
+        // `dir.path()` 是非 canonical 前缀(如 macOS 的 /var → /private/var),
+        // 末尾再缀 `/.`,因此字符串与 canonical 存储值不同、解析后却相同。
+        let alternate = dir.path().join(".").to_string_lossy().to_string();
+        assert_ne!(alternate, cwd.to_string_lossy().to_string());
+
+        let rm = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"workspace/remove",
+            "params":{"path": alternate}});
+        h.send(&rm.to_string()).await;
+        let v = h.read_value().await;
+        assert!(v.get("result").is_some(), "remove must succeed: {v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(
+            v["result"]["workspaces"].as_array().unwrap().len(),
+            0,
+            "alternate path must remove the canonicalized entry: {v}"
+        );
         h.shutdown().await;
     }
 
