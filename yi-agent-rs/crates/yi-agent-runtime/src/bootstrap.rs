@@ -154,8 +154,11 @@ pub fn build_tool_setup_in(
 
 /// 同 [`build_tool_setup_in`],但由调用方提供共享的 [`yi_agent_core::autonomy::YoloSwitch`]。
 ///
-/// 沙箱层与控制权限的 `PermissionChecker` 由此共用同一份开关:`bootstrap_agent`
-/// 建唯一一份 switch,clone 给沙箱与权限,翻转时两层同时生效。
+/// 本函数把传入的 `switch` 绑到沙箱 controller;与权限层(控制权限的
+/// `PermissionChecker`)共用同一 switch 的**接线**发生在 [`bootstrap_agent`]
+/// ——它建唯一一份 switch,clone 给沙箱与权限,翻转时两层同时生效。
+///
+/// `naked = true` 时忽略 `switch`(直接返回空工具集)。
 pub fn build_tool_setup_with_switch(
     cfg: &RuntimeConfig,
     naked: bool,
@@ -254,6 +257,9 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
     // AgentBootstrap 暴露出去(供后续 app-server 按线程切换模式)。
     let yolo_on = match mode {
         PermissionMode::Interactive => cfg.yolo,
+        // AutoAllow 使该 switch 初值为 true,因此沙箱(若 `sandbox_promotable`)也会被
+        // 提权到 `DangerFullAccess`——符合 design「yolo 即两层全开」;`ReadOnly` base
+        // 由 `SandboxController::new` 兜底,不可提权。
         PermissionMode::AutoAllow => true,
     };
     let switch = yi_agent_core::autonomy::YoloSwitch::new(yolo_on);
@@ -317,7 +323,7 @@ pub fn load_permission_checker(
 /// (`build_tool_setup_with_switch`)共用同一份 `Arc`。
 pub fn load_permission_checker_with_switch(
     workdir: &Path,
-    yolo: yi_agent_core::autonomy::YoloSwitch,
+    switch: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
     let permissions = std::thread::scope(|scope| {
         scope
@@ -334,7 +340,7 @@ pub fn load_permission_checker_with_switch(
         Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
     Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
         permissions,
-        yolo,
+        switch,
         workdir.to_path_buf(),
         blocklist_fn,
     )))
@@ -736,16 +742,8 @@ mod tests {
         assert!(naked.system_prompt.is_none());
     }
 
-    /// 沙箱层与权限层共用**同一个** switch:`build_tool_setup_with_switch` 与
-    /// `load_permission_checker_with_switch` 收到同一份 clone(源自
-    /// `bootstrap_agent` 里的唯一 `YoloSwitch`),因此翻转它时两层同时生效。
-    ///
-    /// 沙箱的实际提权行为由 `yi-agent-tools` 的 sandbox 单测覆盖:此处无法直接
-    /// 观测——`BashTool` / `ProcessManager` 的 sandbox 字段非公开,装配结果只能
-    /// 间接反映到工具集里。
-    ///
-    /// (计划原文测试名为 `bootstrap_returns_shared_switch_that_toggles_sandbox`,
-    /// 但该断言体实际观测不到沙箱,故改为如实描述断言内容的名称。)
+    /// 本测试只覆盖 switch↔权限共享;沙箱路径由 tools 的 sandbox 单测覆盖,
+    /// `BashTool`/`ProcessManager` 的 sandbox 字段非公开,此处无法直接观测。
     #[test]
     fn bootstrap_exposes_switch_shared_with_permission_checker() {
         let cfg = sample_config();
