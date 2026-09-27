@@ -42,6 +42,8 @@ struct BuiltAgent {
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
     /// 刷新 skills catalog 的句柄;无 skills 服务时为 `None`。
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    /// 该 agent 的运行时 yolo 开关;`ThreadSession` 存它以便 RPC 即时切换。
+    yolo: yi_agent_core::autonomy::YoloSwitch,
 }
 
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
@@ -60,9 +62,10 @@ where
         cfg,
         PERMISSION_TIMEOUT,
         workspaces,
-        move |session, cwd| {
+        move |session, cwd, mode| {
             let mut thread_cfg = cfg_for_factory.clone();
             thread_cfg.workdir = cwd.to_path_buf();
+            thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
             let built = yi_agent_runtime::bootstrap::bootstrap_agent(
                 &thread_cfg,
                 yi_agent_runtime::bootstrap::PermissionMode::Interactive,
@@ -71,6 +74,7 @@ where
                 agent: apply_session(built.agent, session),
                 decision_tx: built.decision_tx,
                 catalog: built.catalog,
+                yolo: built.yolo,
             })
         },
     )
@@ -93,7 +97,13 @@ async fn run_with<R, W, F>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    F: Fn(Option<yi_agent_core::Session>, &Path) -> anyhow::Result<BuiltAgent> + Send + 'static,
+    F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>
+        + Send
+        + 'static,
 {
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -369,8 +379,8 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
-                        let BuiltAgent { agent, decision_tx, catalog } =
-                            match build_agent(None, Path::new(&cwd)) {
+                        let BuiltAgent { agent, decision_tx, catalog, yolo } =
+                            match build_agent(None, Path::new(&cwd), crate::thread_store::ThreadMode::Normal) {
                                 Ok(a) => a,
                                 Err(e) => {
                                     write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -416,6 +426,7 @@ where
                                 cwd: cwd.clone(),
                                 model: model.clone(),
                                 active_turn_id: None,
+                                yolo: yolo.clone(),
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
@@ -519,6 +530,9 @@ where
                             }
                         };
 
+                        // 该 thread 持久化的自主权模式:决定重建 agent 时的 yolo 初值。
+                        let mode = loaded.meta.permission_mode;
+
                         // meta 缺 cwd/model 时(损坏重建)用当前配置兜底。
                         let cwd = if loaded.meta.cwd.is_empty() {
                             cfg.workdir.display().to_string()
@@ -544,8 +558,8 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
-                        let BuiltAgent { agent, decision_tx, catalog } =
-                            match build_agent(Some(session), Path::new(&cwd)) {
+                        let BuiltAgent { agent, decision_tx, catalog, yolo } =
+                            match build_agent(Some(session), Path::new(&cwd), mode) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
@@ -566,6 +580,7 @@ where
                                 cwd: cwd.clone(),
                                 model: model.clone(),
                                 active_turn_id: None,
+                                yolo: yolo.clone(),
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
@@ -1355,6 +1370,7 @@ mod tests {
     fn build_test_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
@@ -1367,12 +1383,14 @@ mod tests {
             ),
             decision_tx: None,
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
     fn build_slow_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
@@ -1385,12 +1403,14 @@ mod tests {
             ),
             decision_tx: None,
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
     fn build_delayed_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         Ok(BuiltAgent {
             agent: apply_session(
@@ -1403,6 +1423,7 @@ mod tests {
             ),
             decision_tx: None,
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
@@ -1444,7 +1465,11 @@ mod tests {
         /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
         fn with_factory<F>(build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+            F: Fn(
+                    Option<yi_agent_core::Session>,
+                    &std::path::Path,
+                    crate::thread_store::ThreadMode,
+                ) -> anyhow::Result<BuiltAgent>
                 + Send
                 + 'static,
         {
@@ -1454,7 +1479,11 @@ mod tests {
         /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
         fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
         where
-            F: Fn(Option<yi_agent_core::Session>, &std::path::Path) -> anyhow::Result<BuiltAgent>
+            F: Fn(
+                    Option<yi_agent_core::Session>,
+                    &std::path::Path,
+                    crate::thread_store::ThreadMode,
+                ) -> anyhow::Result<BuiltAgent>
                 + Send
                 + 'static,
         {
@@ -1807,7 +1836,9 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
-            |_s: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
+            |_s: Option<yi_agent_core::Session>,
+             _cwd: &std::path::Path,
+             _mode: crate::thread_store::ThreadMode| {
                 Err::<BuiltAgent, _>(anyhow::anyhow!("boom"))
             },
         ));
@@ -2050,9 +2081,13 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent(None, std::path::Path::new("/tmp"))
-                .unwrap()
-                .agent,
+            build_delayed_agent(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::thread_store::ThreadMode::Normal,
+            )
+            .unwrap()
+            .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2122,9 +2157,13 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None, std::path::Path::new("/tmp"))
-                .unwrap()
-                .agent,
+            build_test_agent(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::thread_store::ThreadMode::Normal,
+            )
+            .unwrap()
+            .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2170,9 +2209,13 @@ mod tests {
 
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(None, std::path::Path::new("/tmp"))
-                .unwrap()
-                .agent,
+            build_test_agent(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::thread_store::ThreadMode::Normal,
+            )
+            .unwrap()
+            .agent,
             prompt_rx,
             interrupt_rx,
             writer,
@@ -2303,6 +2346,7 @@ mod tests {
     fn build_permission_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         let provider = Arc::new(PermissionMockProvider {
             calls: AtomicUsize::new(0),
@@ -2330,6 +2374,7 @@ mod tests {
             agent,
             decision_tx: Some(decision_tx),
             catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
     }
 
@@ -2526,7 +2571,12 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
-        let built = build_permission_agent(None, std::path::Path::new("/tmp")).unwrap();
+        let built = build_permission_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
             built.agent,
@@ -2801,9 +2851,11 @@ mod tests {
         let seen: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_factory = Arc::clone(&seen);
-        let build = move |session: Option<yi_agent_core::Session>, cwd: &std::path::Path| {
+        let build = move |session: Option<yi_agent_core::Session>,
+                          cwd: &std::path::Path,
+                          mode: crate::thread_store::ThreadMode| {
             seen_factory.lock().unwrap().push(cwd.to_path_buf());
-            build_test_agent(session, cwd)
+            build_test_agent(session, cwd, mode)
         };
         let mut h = Harness::with_factory(build, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
@@ -3018,7 +3070,9 @@ mod tests {
         cfg.workdir = dir.path().to_path_buf();
         let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_factory = Arc::clone(&seen);
-        let build = move |session: Option<yi_agent_core::Session>, _cwd: &std::path::Path| {
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
             Ok(BuiltAgent {
                 agent: apply_session(
                     yi_agent_core::Agent::new(
@@ -3032,6 +3086,7 @@ mod tests {
                 ),
                 decision_tx: None,
                 catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             })
         };
         let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -3116,6 +3171,70 @@ mod tests {
             "item ids must be unique across replay + resumed turn: {item_ids:?}"
         );
 
+        h.shutdown().await;
+    }
+
+    /// Task 9:resume 必须读取该 thread 持久化的 `permission_mode` 并透传给 agent
+    /// 工厂,使 yolo 线程重开后仍以 yolo 重建。工厂内部 `mode → cfg.yolo → 共享
+    /// YoloSwitch` 的映射由 Task 6 的 bootstrap 测试与代码评审覆盖;此处只钉死
+    /// 「app-server 侧 resume 读了持久化模式并透传」这一契约(server 内存中的
+    /// switch 不可从外部观测,故用记录型工厂观察传参)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_passes_persisted_mode_to_factory() {
+        use crate::thread_store::{ThreadMode, ThreadStore};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+
+        let seen: Arc<std::sync::Mutex<Vec<ThreadMode>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          cwd: &std::path::Path,
+                          mode: ThreadMode| {
+            seen_c.lock().unwrap().push(mode);
+            build_test_agent(session, cwd, mode)
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // thread/start 必须走 Normal。
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[ThreadMode::Normal],
+            "thread/start must build with Normal"
+        );
+
+        // 绕过 RPC,直接把该线程持久化的 permission_mode 改成 Yolo。
+        let store = ThreadStore::new(dir.path());
+        assert!(
+            store.set_permission_mode(&tid, ThreadMode::Yolo).unwrap(),
+            "thread meta must exist after thread/start"
+        );
+
+        // resume 应读取持久化的 Yolo 并透传给工厂。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resumed = false;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                assert_eq!(v["result"]["thread_id"], tid);
+                resumed = true;
+                break;
+            }
+        }
+        assert!(resumed, "thread/resume must respond");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.last(),
+            Some(&ThreadMode::Yolo),
+            "resume must pass the persisted mode to the factory: {seen:?}"
+        );
         h.shutdown().await;
     }
 
