@@ -215,32 +215,31 @@ KB，永远触不到预算（实测：现有测试用的 `Rgb([x%256, y%256, 128
 辅助函数，用确定性伪随机填充（如 xorshift）生成不可压缩图。
 
 1. `view_image_shrinks_oversize_photo_to_fit_budget`
-   写 3000x2000 噪声 PNG，`detail: original`。断言：成功、返回的 base64
-   `data.len() <= MAX_ENCODED_BASE64_BYTES`、且解码后是合法图片。
+   写 3000x2000 噪声 PNG，调用时传一个较小的显式预算（如 256 KiB）。断言：
+   成功、返回的 base64 `data.len() <= budget`、且解码后是合法图片。
 2. `view_image_keeps_lossless_png_when_it_fits`
-   小尺寸噪声 PNG。断言：`media_type == "image/png"` 且字节与源文件一致
-   （直通，无重编码）。
+   小尺寸噪声 PNG，预算充足。断言：`media_type == "image/png"` 且字节与源文件
+   一致（直通，无重编码）。
 3. `view_image_prefers_png_for_screenshots_over_jpeg`
-   大片纯色 + 少量线条的 4000x3000 PNG（截图层级）。断言：
-   `media_type == "image/png"`（不得因为超维度就盲目转 JPEG）。
+   大片纯色 + 少量线条的 4000x3000 PNG（截图层级），预算设在"PNG 能过、但
+   若先转 JPEG 会因体积暴涨而更差"的区间。断言：`media_type == "image/png"`
+   （不得因为超维度就盲目转 JPEG）。
 4. `view_image_label_notes_degradation`
    触发降级的场景。断言：`content[0]`（Text label）包含降级标记
    （如 `jpeg` 与/或 `downscaled`）。
 5. `view_image_budget_env_override_is_honored`
-   设一个很小的 `YI_AGENT_VIEW_IMAGE_MAX_BASE64_BYTES`，断言图片被降到该
-   预算内。（注意：env 是进程级，测试需序列化或用一个注入式的预算参数；
-   优先在实现里让预算**可注入**（如 `load_image(path, detail, budget)` 或
-   测试内构造），避免 `std::env::set_var` 的测试并发问题。）
+   直接验证 `resolve_budget()`：设置 env 后断言解析出该值；env 非法时回退
+   默认值。**不改进程 env 去跑 `call()`**，避免并发不确定（§3.1 已把预算改为
+   构造期注入）。
 6. `view_image_falls_back_to_error_when_budget_unreachable`
    极小预算（如 1 KiB）。断言：`is_error`，且错误文本不含 base64 数据。
 7. 既有 10 个测试保持通过（回归）：尤其
    `view_image_original_detail_keeps_more_resolution`（3000x1000 渐变图，
-   体积远低于预算 → 仍应保持 3000px 不缩放）与
+   体积远低于默认预算 → 仍应保持 3000px 不缩放）与
    `view_image_resizes_large_image`（high 档 2048）。
 
-**关于趋于可注入的预算**：为了让测试确定且不依赖进程级 env，实现应把预算作为
-参数（默认从常量/env 解析一次），测试直接传值。这也是 §3.1 env 解析放在**工具
-构造期**而非每次调用的原因。
+**预算可注入**：实现把预算作为参数（默认值由构造期解析的常量/env 决定），
+测试直接传值，从而完全绕开进程级 env 的不确定性（见 §3.1）。
 
 ## 6. 改动文件
 
