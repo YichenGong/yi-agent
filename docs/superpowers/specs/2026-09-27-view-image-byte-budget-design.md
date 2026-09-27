@@ -229,8 +229,10 @@ viewed {path} ({w}x{h}, {media_type}, {note})                // 有降级
 
 - **GIF 动图**：直通路径（步骤 0）保留原始字节 → 动画保留。一旦需要重编码
   （步骤 1+），`image` 只解码首帧 → **动画丢失**为静态图。这是既有行为
-  （当前超维度的 GIF 也一样），本次不新增损失，但在 label 的 `note` 里对
-  GIF 降级标注 `gif→jpeg`，使损失可见。（源格式感知后 GIF 不再走 PNG 分支。）
+  （当前超维度的 GIF 也一样），本次不新增损失。源格式感知后 GIF 无可用的无损
+  路径（`lossless_target` 返回 `None`），会直接落到 JPEG 阶梯；"发生了格式转换"
+  由 label 的 `{media_type}`（会显示为 `image/jpeg`）可见，故 `note` 不再单独
+  写 `gif→jpeg`（与 §3.3 的 note 格式保持一致，避免双份信息）。
 - **预算粒度是单图**：一个 turn 内多张图/多个 tool result 叠加进同一请求体
   仍可能超网关上限。登记为后续项（§8）。
 - **每张图最多尝试**：`(1 无损 + 4 JPEG) × 分辨率级数`（已含最低 512 档）次
@@ -261,10 +263,10 @@ KB，永远触不到预算（实测：现有测试用的 `Rgb([x%256, y%256, 128
 4. `view_image_label_notes_degradation`
    触发降级的场景。断言：`content[0]`（Text label）包含降级标记
    （如 `jpeg` 与/或 `downscaled`）。
-5. `view_image_budget_env_override_is_honored`
-   直接验证 `resolve_budget()`：设置 env 后断言解析出该值；env 非法时回退
-   默认值。**不改进程 env 去跑 `call()`**，避免并发不确定（§3.1 已把预算改为
-   构造期注入）。
+5. `parse_budget`（纯函数）覆盖 env 解析逻辑：给值即用、`None`/非法/`0` 回退默认。
+   **不**用 `std::env::set_var` 跑 `resolve_budget()`/`call()`（进程级 env 会与并行
+   测试互相干扰）；`resolve_budget()` 只是"读 env → `parse_budget` → 转发"的薄壳，
+   其逻辑由 `parse_budget` 覆盖。测试主体直接对 `encode_within_budget` 传显式预算。
 6. `view_image_omits_image_with_note_when_budget_unreachable`
    极小预算（如 1 KiB）。断言：**成功**（`is_error == false`）、内容里没有
    `ContentBlock::Image`、有文字含 `image omitted`、且文字不含 base64 数据。
