@@ -311,6 +311,7 @@ where
                                         "created_at": m.created_at,
                                         "updated_at": m.updated_at,
                                         "title": m.title,
+                                        "permission_mode": m.permission_mode,
                                     })
                                 })
                                 .collect();
@@ -346,6 +347,7 @@ where
                                                 "created_at": m.created_at,
                                                 "updated_at": m.updated_at,
                                                 "title": m.title,
+                                                "permission_mode": m.permission_mode,
                                             })
                                         })
                                         .collect(),
@@ -2776,6 +2778,96 @@ mod tests {
             assert!(t["created_at"].is_number());
             assert!(t["updated_at"].is_number());
         }
+        h.shutdown().await;
+    }
+
+    /// Task 11:`thread/list` / `thread/listAll` 的条目必须显式带出
+    /// `permission_mode`(wire 契约与存储解耦,但字段必须存在且为 lowercase)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_exposes_permission_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_normal = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_yolo = read_thread_start_response(&mut h, 3).await;
+
+        // 把第二个线程切成 yolo。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid_yolo}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert!(
+            v.get("error").is_none(),
+            "setPermissionMode must succeed: {v}"
+        );
+
+        // thread/list:每个条目带 lowercase permission_mode。
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/list must respond");
+        let threads = v["result"]["threads"].as_array().unwrap();
+        let mode_of = |tid: &str| -> serde_json::Value {
+            threads
+                .iter()
+                .find(|t| t["thread_id"].as_str() == Some(tid))
+                .unwrap_or_else(|| panic!("thread {tid} missing from thread/list: {v}"))["permission_mode"]
+                .clone()
+        };
+        assert_eq!(mode_of(&tid_normal), serde_json::json!("normal"));
+        assert_eq!(mode_of(&tid_yolo), serde_json::json!("yolo"));
+
+        // thread/listAll:分组内的条目同样带该字段。
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/listAll must respond");
+        let all_threads: Vec<&serde_json::Value> = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .collect();
+        let mode_of_all = |tid: &str| -> serde_json::Value {
+            all_threads
+                .iter()
+                .find(|t| t["thread_id"].as_str() == Some(tid))
+                .unwrap_or_else(|| panic!("thread {tid} missing from thread/listAll: {v}"))["permission_mode"]
+                .clone()
+        };
+        assert_eq!(mode_of_all(&tid_normal), serde_json::json!("normal"));
+        assert_eq!(mode_of_all(&tid_yolo), serde_json::json!("yolo"));
+
         h.shutdown().await;
     }
 
