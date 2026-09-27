@@ -57,6 +57,17 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 /// - `interrupt_tx`: signals to interrupt the current agent run
 /// - `is_running`: shared flag indicating if agent is currently running
 #[allow(clippy::too_many_arguments)]
+/// Write the "pending messages were dropped" notice, if any.
+///
+/// Split out from `run_tui` so the message and the `> 0` condition are both
+/// testable: `run_tui` needs a real TTY (`enable_raw_mode`), so the notice
+/// itself cannot be exercised through it.
+fn report_dropped_pending<W: io::Write>(out: &mut W, dropped: usize) {
+    if dropped > 0 {
+        let _ = writeln!(out, "已丢弃 {dropped} 条排队消息（未发送）");
+    }
+}
+
 pub fn run_tui(
     mut agent_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::Sender<String>,
@@ -111,10 +122,16 @@ pub fn run_tui(
         cleanup_error.get_or_insert(error);
     }
 
+    // Report the dropped count only after the alternate screen is gone;
+    // printing earlier would be erased along with it.
+    if let Ok(dropped) = result {
+        report_dropped_pending(&mut io::stderr(), dropped);
+    }
+
     match (result, cleanup_error) {
         (Err(error), _) => Err(error),
-        (Ok(()), Some(error)) => Err(error),
-        (Ok(()), None) => Ok(()),
+        (Ok(_), Some(error)) => Err(error),
+        (Ok(_), None) => Ok(()),
     }
 }
 
@@ -171,6 +188,7 @@ pub fn run_tui_with_backend<B: Backend>(
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         workdir.to_path_buf(),
     )
+    .map(|_dropped| ())
 }
 
 /// Testable variant: accepts a custom EventSource for injecting fake key events.
@@ -205,6 +223,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         std::env::temp_dir(),
     )
+    .map(|_dropped| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,7 +245,7 @@ fn run_loop<B: Backend, E: EventSource>(
     >,
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
     workdir: std::path::PathBuf,
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
     let mut queued = crate::tui::queued::PendingQueue::new();
@@ -544,7 +563,10 @@ fn run_loop<B: Backend, E: EventSource>(
         }
     }
 
-    Ok(())
+    // Messages submitted during the last turn never got their chance to run.
+    // Return the count so the caller can report the loss after the terminal is
+    // restored (anything printed while the alternate screen is up is erased).
+    Ok(queued.len())
 }
 
 /// Top-level runtime popup: a Bash-tasks tab and a managed-processes tab,
@@ -1344,6 +1366,9 @@ fn handle_key(
                         );
                     } else {
                         // No command selected (empty filter) — show error
+                        // Not routed through `PendingQueue`: this text never
+                        // reaches the agent, so queuing it would make it look
+                        // like a pending prompt.
                         let text = input.take_submitted();
                         *popup = None;
                         history.push(
@@ -1420,6 +1445,8 @@ fn handle_key(
                     );
                 } else {
                     // Unknown slash command
+                    // Not routed through `PendingQueue`: a slash command is a
+                    // local action, not a prompt for the agent.
                     *popup = None;
                     history.push(
                         HistoryCell::Separator {
@@ -4454,6 +4481,90 @@ mod tests {
             result.is_ok(),
             "two Ctrl+C should quit cleanly, got: {:?}",
             result
+        );
+    }
+
+    /// Quitting with messages still waiting must report how many were dropped,
+    /// so the loss is visible instead of silent.
+    #[test]
+    fn quitting_reports_pending_messages_that_were_dropped() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Delivery order: type "first" + Enter (sent), type "second" + Enter
+        // (queued behind it), then Ctrl+Q. `ScriptedEvents` pops from the end,
+        // so the delivery order is pushed in reverse.
+        let mut delivery: Vec<Event> = Vec::new();
+        for ch in "first".chars() {
+            delivery.push(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)));
+        }
+        delivery.push(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        for ch in "second".chars() {
+            delivery.push(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)));
+        }
+        delivery.push(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        delivery.push(Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        delivery.reverse();
+
+        let source = ScriptedEvents {
+            events: Rc::new(RefCell::new(delivery)),
+        };
+
+        let dropped = run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            dropped, 1,
+            "the queued-but-never-sent message must be reported as dropped"
+        );
+    }
+
+    /// The quit notice must name the count, and must stay silent when nothing
+    /// was dropped. Covered here rather than through `run_tui`, which needs a
+    /// real TTY (`enable_raw_mode`).
+    #[test]
+    fn report_dropped_pending_writes_the_count_only_when_nonzero() {
+        let mut buf: Vec<u8> = Vec::new();
+        report_dropped_pending(&mut buf, 3);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains('3'),
+            "the notice must name how many were dropped: {text:?}"
+        );
+        assert!(
+            text.contains("已丢弃"),
+            "the notice must be the user-facing message: {text:?}"
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        report_dropped_pending(&mut buf, 0);
+        assert!(
+            buf.is_empty(),
+            "nothing must be printed when no messages were dropped: {:?}",
+            String::from_utf8_lossy(&buf)
         );
     }
 
