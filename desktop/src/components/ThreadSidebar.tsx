@@ -1,5 +1,6 @@
 import { useState } from "react";
-import type { ThreadSummary } from "../lib/protocol";
+import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+import { basename, groupCount } from "../lib/workspaceGroups";
 
 /** Compact relative time, e.g. "3m", "2h", "5d". */
 function relativeTime(ms: number): string {
@@ -15,24 +16,44 @@ function relativeTime(ms: number): string {
 }
 
 export function ThreadSidebar({
-  threads,
+  groups,
+  workspaces,
   currentId,
   busy,
   onSelect,
   onRename,
   onDelete,
   onNew,
+  onRemoveWorkspace,
+  onBrowse,
 }: {
-  threads: ThreadSummary[];
+  groups: WorkspaceGroup[];
+  /** Recent dirs for the New-thread dropdown. */
+  workspaces: Workspace[];
   currentId: string | null;
   busy: boolean;
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
-  onNew: () => void;
+  /** No cwd → App opens the picker; with cwd → create in that dir. */
+  onNew: (cwd?: string) => void;
+  onRemoveWorkspace: (cwd: string) => void;
+  /** Open the native folder picker (App adds the dir + creates a thread). */
+  onBrowse: () => void;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // Self-drawn menus: the top "New thread" dropdown and the per-group context
+  // menu. A fixed transparent backdrop (rendered with each menu) closes them on
+  // an outside click; the two are mutually exclusive.
+  const [newMenuOpen, setNewMenuOpen] = useState(false);
+  const [contextWs, setContextWs] = useState<string | null>(null);
+
+  const closeMenus = () => {
+    setNewMenuOpen(false);
+    setContextWs(null);
+  };
 
   const commit = (id: string) => {
     const title = draft.trim();
@@ -40,82 +61,203 @@ export function ThreadSidebar({
     setEditingId(null);
   };
 
+  const toggleCollapse = (ws: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(ws)) next.delete(ws);
+      else next.add(ws);
+      return next;
+    });
+  };
+
+  const renderThread = (t: ThreadSummary) => {
+    const active = t.thread_id === currentId;
+    return (
+      <div
+        key={t.thread_id}
+        onClick={(e) => {
+          if (busy || editingId) return;
+          // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
+          // 避免对同一 thread 触发两次 onSelect(即两次 thread/resume)。
+          if (e.detail > 1) return;
+          onSelect(t.thread_id);
+        }}
+        className={`group flex items-center justify-between gap-1 px-3 py-2 text-sm ${
+          active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
+        } ${busy ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
+      >
+        {editingId === t.thread_id ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={() => commit(t.thread_id)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit(t.thread_id);
+              if (e.key === "Escape") setEditingId(null);
+            }}
+            className="w-full rounded bg-neutral-950 px-1 py-0.5 text-sm text-neutral-100 outline-none"
+          />
+        ) : (
+          <>
+            <div className="min-w-0 flex-1">
+              <div
+                className="truncate"
+                title={t.title ?? t.thread_id}
+                onDoubleClick={() => {
+                  if (busy) return;
+                  setEditingId(t.thread_id);
+                  setDraft(t.title ?? "");
+                }}
+              >
+                {t.title ?? "(untitled)"}
+              </div>
+              <div className="text-xs text-neutral-600">{relativeTime(t.updated_at)}</div>
+            </div>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete(t.thread_id);
+              }}
+              title="Delete"
+              aria-label="Delete thread"
+              className="pointer-events-none shrink-0 rounded px-1 text-neutral-500 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-red-400 focus-visible:pointer-events-auto focus-visible:opacity-100 disabled:opacity-50"
+            >
+              ×
+            </button>
+          </>
+        )}
+      </div>
+    );
+  };
+
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800 bg-neutral-900">
-      <button
-        type="button"
-        onClick={onNew}
-        disabled={busy}
-        className="m-2 rounded-md bg-neutral-800 px-3 py-2 text-left text-sm text-neutral-100 hover:bg-neutral-700 disabled:opacity-50"
-      >
-        + New thread
-      </button>
-      <div className="flex-1 overflow-y-auto">
-        {threads.map((t) => {
-          const active = t.thread_id === currentId;
-          return (
-            <div
-              key={t.thread_id}
-              onClick={(e) => {
-                if (busy || editingId) return;
-                // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
-                // 避免对同一 thread 触发两次 onSelect(即两次 thread/resume)。
-                if (e.detail > 1) return;
-                onSelect(t.thread_id);
-              }}
-              className={`group flex items-center justify-between gap-1 px-3 py-2 text-sm ${
-                active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
-              } ${busy ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
-            >
-              {editingId === t.thread_id ? (
-                <input
-                  autoFocus
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onBlur={() => commit(t.thread_id)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") commit(t.thread_id);
-                    if (e.key === "Escape") setEditingId(null);
+      <div className="relative p-2">
+        <button
+          type="button"
+          onClick={() => {
+            // No recent dirs to offer: go straight to the native picker.
+            if (workspaces.length === 0) {
+              onBrowse();
+              return;
+            }
+            setContextWs(null);
+            setNewMenuOpen((v) => !v);
+          }}
+          disabled={busy}
+          className="w-full rounded-md bg-neutral-800 px-3 py-2 text-left text-sm text-neutral-100 hover:bg-neutral-700 disabled:opacity-50"
+        >
+          + New thread
+        </button>
+        {newMenuOpen && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={closeMenus} />
+            <div className="absolute right-2 left-2 top-full z-20 -mt-1 rounded-md border border-neutral-700 bg-neutral-800 py-1 shadow-xl">
+              {workspaces.map((w) => (
+                <button
+                  key={w.path}
+                  type="button"
+                  disabled={!w.exists}
+                  title={w.path}
+                  onClick={() => {
+                    closeMenus();
+                    onNew(w.path);
                   }}
-                  className="w-full rounded bg-neutral-950 px-1 py-0.5 text-sm text-neutral-100 outline-none"
-                />
-              ) : (
+                  className={`block w-full truncate px-3 py-1.5 text-left text-xs ${
+                    w.exists
+                      ? "text-neutral-200 hover:bg-neutral-700"
+                      : "cursor-not-allowed text-neutral-600"
+                  }`}
+                >
+                  {basename(w.path)}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => {
+                  closeMenus();
+                  onBrowse();
+                }}
+                className="block w-full px-3 py-1.5 text-left text-xs text-neutral-300 hover:bg-neutral-700"
+              >
+                Browse…
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {groupCount(groups) === 0 && (
+          <p className="px-3 py-2 text-xs text-neutral-600">选择一个目录开始</p>
+        )}
+        {groups.map((g) => {
+          const isCollapsed = collapsed.has(g.workspace);
+          return (
+            <div key={g.workspace} className="relative">
+              <div
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  if (busy) return;
+                  setNewMenuOpen(false);
+                  setContextWs(g.workspace);
+                }}
+                className="flex items-center gap-1 px-2 py-1.5 text-xs text-neutral-500 hover:bg-neutral-800/50"
+              >
+                <button
+                  type="button"
+                  onClick={() => toggleCollapse(g.workspace)}
+                  aria-label={isCollapsed ? "Expand" : "Collapse"}
+                  title={isCollapsed ? "Expand" : "Collapse"}
+                  className="shrink-0 px-0.5 text-neutral-500 hover:text-neutral-300"
+                >
+                  {isCollapsed ? "▸" : "▾"}
+                </button>
+                <div
+                  className={`min-w-0 flex-1 truncate ${
+                    g.exists ? "text-neutral-400" : "text-neutral-600"
+                  }`}
+                  title={g.workspace}
+                >
+                  {basename(g.workspace)}
+                  {!g.exists && " (missing)"}
+                </div>
+              </div>
+              {contextWs === g.workspace && (
                 <>
-                  <div className="min-w-0 flex-1">
-                    <div
-                      className="truncate"
-                      title={t.title ?? t.thread_id}
-                      onDoubleClick={() => {
-                        if (busy) return;
-                        setEditingId(t.thread_id);
-                        setDraft(t.title ?? "");
+                  <div className="fixed inset-0 z-10" onClick={closeMenus} />
+                  <div className="absolute top-7 left-4 z-20 rounded-md border border-neutral-700 bg-neutral-800 py-1 shadow-xl">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => {
+                        closeMenus();
+                        onNew(g.workspace);
                       }}
+                      className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700 disabled:opacity-50"
                     >
-                      {t.title ?? "(untitled)"}
-                    </div>
-                    <div className="text-xs text-neutral-600">{relativeTime(t.updated_at)}</div>
+                      New thread here
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => {
+                        closeMenus();
+                        onRemoveWorkspace(g.workspace);
+                      }}
+                      className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700 disabled:opacity-50"
+                    >
+                      Remove from list
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDelete(t.thread_id);
-                    }}
-                    title="Delete"
-                    aria-label="Delete thread"
-                    className="pointer-events-none shrink-0 rounded px-1 text-neutral-500 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-red-400 focus-visible:pointer-events-auto focus-visible:opacity-100 disabled:opacity-50"
-                  >
-                    ×
-                  </button>
                 </>
               )}
+              {!isCollapsed && g.threads.map(renderThread)}
             </div>
           );
         })}
-        {threads.length === 0 && (
-          <p className="px-3 py-2 text-xs text-neutral-600">No history yet.</p>
-        )}
       </div>
     </aside>
   );
