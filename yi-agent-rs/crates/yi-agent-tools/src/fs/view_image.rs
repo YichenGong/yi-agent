@@ -13,6 +13,10 @@ use yi_agent_core::{
 
 /// Largest image file we will read from disk (guards memory before decode).
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// base64 编码后的字节上限（真正上 wire 的体积；≈3 MiB 原始字节）。
+const MAX_ENCODED_BASE64_BYTES: usize = 4 * 1024 * 1024;
+/// 覆盖 `MAX_ENCODED_BASE64_BYTES` 的环境变量名。
+const MAX_ENCODED_ENV: &str = "YI_AGENT_VIEW_IMAGE_MAX_BASE64_BYTES";
 /// Longest-edge cap for `detail: high`.
 const HIGH_MAX_DIMENSION: u32 = 2048;
 /// Longest-edge cap for `detail: original`.
@@ -20,11 +24,41 @@ const ORIGINAL_MAX_DIMENSION: u32 = 6000;
 
 pub struct ViewImageTool {
     ctx: Arc<ToolsContext>,
+    budget: usize,
 }
 
 impl ViewImageTool {
     pub fn new(ctx: Arc<ToolsContext>) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            budget: resolve_budget(),
+        }
+    }
+}
+
+/// 解析预算。`None` / 非法 / 0 一律回退默认值。
+fn parse_budget(raw: Option<&str>) -> usize {
+    match raw.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(value) if value > 0 => value,
+        _ => MAX_ENCODED_BASE64_BYTES,
+    }
+}
+
+/// 从环境变量解析预算；非法值记一条 warn。
+fn resolve_budget() -> usize {
+    match std::env::var(MAX_ENCODED_ENV) {
+        Ok(raw) => {
+            let budget = parse_budget(Some(&raw));
+            if budget == MAX_ENCODED_BASE64_BYTES && raw.trim().parse::<usize>().is_err() {
+                tracing::warn!(
+                    env = MAX_ENCODED_ENV,
+                    value = %raw,
+                    "invalid view_image byte budget; using default"
+                );
+            }
+            budget
+        }
+        Err(_) => MAX_ENCODED_BASE64_BYTES,
     }
 }
 
@@ -102,7 +136,7 @@ impl Tool for ViewImageTool {
 
         let detail: ImageDetail = args.detail.into();
 
-        match load_image(&resolved, detail) {
+        match load_image(&resolved, detail, self.budget) {
             Ok(img) => {
                 let label = format!(
                     "viewed {} ({}x{}, {})",
@@ -133,7 +167,8 @@ impl Tool for ViewImageTool {
     }
 }
 
-fn load_image(path: &Path, detail: ImageDetail) -> Result<LoadedImage, ToolsError> {
+fn load_image(path: &Path, detail: ImageDetail, budget: usize) -> Result<LoadedImage, ToolsError> {
+    let _ = budget; // 由 Task 2 的阶梯消费
     let metadata = std::fs::metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ToolsError::NotFound(path.to_path_buf())
@@ -375,5 +410,18 @@ mod tests {
             }
             _ => panic!("expected leading text label"),
         }
+    }
+
+    #[test]
+    fn parse_budget_uses_value_when_present() {
+        assert_eq!(parse_budget(Some("1048576")), 1_048_576);
+    }
+
+    #[test]
+    fn parse_budget_falls_back_on_missing_or_invalid() {
+        assert_eq!(parse_budget(None), MAX_ENCODED_BASE64_BYTES);
+        assert_eq!(parse_budget(Some("not-a-number")), MAX_ENCODED_BASE64_BYTES);
+        assert_eq!(parse_budget(Some("")), MAX_ENCODED_BASE64_BYTES);
+        assert_eq!(parse_budget(Some("0")), MAX_ENCODED_BASE64_BYTES);
     }
 }
