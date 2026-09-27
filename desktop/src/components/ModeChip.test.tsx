@@ -6,6 +6,9 @@ import { ModeChip } from "./ModeChip";
 afterEach(cleanup);
 
 const trigger = () => screen.getByRole("button", { name: /mode/i });
+const normalItem = () => screen.getByRole("menuitemradio", { name: /normal/i });
+const yoloItem = () => screen.getByRole("menuitemradio", { name: /yolo/i });
+const cancelButton = () => screen.getByRole("button", { name: /cancel/i });
 
 describe("ModeChip", () => {
   it("renders a chip whose trigger is reachable by its mode aria-label", () => {
@@ -21,19 +24,15 @@ describe("ModeChip", () => {
     expect(menu.textContent).toContain("Normal");
     expect(menu.textContent).toContain("YOLO");
 
-    expect(
-      screen.getByRole("menuitemradio", { name: /normal/i }).getAttribute("aria-checked"),
-    ).toBe("true");
-    expect(
-      screen.getByRole("menuitemradio", { name: /yolo/i }).getAttribute("aria-checked"),
-    ).toBe("false");
+    expect(normalItem().getAttribute("aria-checked")).toBe("true");
+    expect(yoloItem().getAttribute("aria-checked")).toBe("false");
   });
 
   it("opens a confirmation when selecting YOLO instead of changing immediately", () => {
     const onChange = vi.fn();
     render(<ModeChip mode="normal" onChange={onChange} />);
     fireEvent.click(trigger());
-    fireEvent.click(screen.getByText("YOLO"));
+    fireEvent.click(yoloItem());
 
     expect(onChange).not.toHaveBeenCalled();
     const dialog = screen.getByRole("dialog");
@@ -44,9 +43,9 @@ describe("ModeChip", () => {
     const onChange = vi.fn();
     render(<ModeChip mode="normal" onChange={onChange} />);
     fireEvent.click(trigger());
-    fireEvent.click(screen.getByText("YOLO"));
+    fireEvent.click(yoloItem());
 
-    fireEvent.click(screen.getByRole("button", { name: /cancel|取消/i }));
+    fireEvent.click(cancelButton());
 
     expect(onChange).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -56,8 +55,8 @@ describe("ModeChip", () => {
     const onChange = vi.fn();
     render(<ModeChip mode="normal" onChange={onChange} />);
     fireEvent.click(trigger());
-    fireEvent.click(screen.getByText("YOLO"));
-    fireEvent.click(screen.getByRole("button", { name: /confirm|确认/i }));
+    fireEvent.click(yoloItem());
+    fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
 
     expect(onChange).toHaveBeenCalledWith("yolo");
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -74,7 +73,7 @@ describe("ModeChip", () => {
     const onChange = vi.fn();
     render(<ModeChip mode="yolo" onChange={onChange} />);
     fireEvent.click(trigger());
-    fireEvent.click(screen.getByText("Normal"));
+    fireEvent.click(normalItem());
 
     expect(onChange).toHaveBeenCalledWith("normal");
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -87,5 +86,98 @@ describe("ModeChip", () => {
 
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("closes the confirm dialog on Escape without calling back", () => {
+    const onChange = vi.fn();
+    render(<ModeChip mode="normal" onChange={onChange} />);
+    fireEvent.click(trigger());
+    fireEvent.click(yoloItem());
+    expect(screen.getByRole("dialog")).not.toBeNull();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("does not open the menu when the trigger is disabled", () => {
+    const { container } = render(
+      <ModeChip mode="normal" onChange={vi.fn()} disabled />,
+    );
+    fireEvent.click(trigger());
+
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it("reopens after a cancel and confirms exactly once", () => {
+    const onChange = vi.fn();
+    render(<ModeChip mode="normal" onChange={onChange} />);
+
+    fireEvent.click(trigger());
+    fireEvent.click(yoloItem());
+    fireEvent.click(cancelButton());
+
+    fireEvent.click(trigger());
+    expect(screen.getByRole("menu")).not.toBeNull();
+    fireEvent.click(yoloItem());
+    fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith("yolo");
+  });
+
+  it("does nothing when YOLO is selected while already in yolo mode", () => {
+    const onChange = vi.fn();
+    render(<ModeChip mode="yolo" onChange={onChange} />);
+    fireEvent.click(trigger());
+    fireEvent.click(yoloItem());
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("navigates the menu with arrow keys and confirms via the focused item", () => {
+    render(<ModeChip mode="normal" onChange={vi.fn()} />);
+    fireEvent.click(trigger());
+
+    // Focus starts on the currently selected item (Normal).
+    expect(document.activeElement).toBe(normalItem());
+
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowDown" });
+    expect(document.activeElement).toBe(yoloItem());
+
+    // Enter/Space activation is native to the button; click mirrors that here.
+    fireEvent.click(yoloItem());
+    expect(screen.getByRole("dialog")).not.toBeNull();
+  });
+
+  it("wraps focus with ArrowUp from the first item", () => {
+    render(<ModeChip mode="normal" onChange={vi.fn()} />);
+    fireEvent.click(trigger());
+    expect(document.activeElement).toBe(normalItem());
+
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowUp" });
+    expect(document.activeElement).toBe(yoloItem());
+  });
+
+  it("moves focus onto the safe Cancel action and back to the trigger", () => {
+    render(<ModeChip mode="normal" onChange={vi.fn()} />);
+    fireEvent.click(trigger());
+    fireEvent.click(yoloItem());
+
+    expect(document.activeElement).toBe(cancelButton());
+
+    fireEvent.click(cancelButton());
+    expect(document.activeElement).toBe(trigger());
+  });
+
+  it("restores focus to the trigger when Escape dismisses the dialog", () => {
+    render(<ModeChip mode="normal" onChange={vi.fn()} />);
+    fireEvent.click(trigger());
+    fireEvent.click(yoloItem());
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(document.activeElement).toBe(trigger());
   });
 });
