@@ -699,6 +699,50 @@ where
                             }
                         }
                     }
+                    "thread/setPermissionMode" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // mode 校验先于 thread 存在性:非法 mode 一律 `-32602`,
+                        // 不因 threadId 未知而改变错误码。
+                        let mode = match req.params.get("mode").and_then(|v| v.as_str()) {
+                            Some("normal") => crate::thread_store::ThreadMode::Normal,
+                            Some("yolo") => crate::thread_store::ThreadMode::Yolo,
+                            _ => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(
+                                            "mode must be \"normal\" or \"yolo\"",
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        let Some(session) = threads.get(&thread_id) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 运行期开关立即生效:与权限层、沙箱共享同一 `Arc`,故
+                        // 无需重建 agent 本轮即可放行。
+                        session.yolo.set(mode == crate::thread_store::ThreadMode::Yolo);
+                        // 最佳努力落盘:运行期开关已生效,落盘失败不阻断本轮切换。
+                        if let Err(e) = session.store.set_permission_mode(&thread_id, mode) {
+                            eprintln!(
+                                "[app-server] failed to persist permission_mode for {thread_id}: {e}"
+                            );
+                        }
+                        write_response(&writer, ok_response(id, json!({}))).await?;
+                    }
                     "thread/delete" => {
                         let Some(thread_id) =
                             require_thread_id(&writer, &req.params, id.clone()).await?
@@ -3239,6 +3283,155 @@ mod tests {
             Some(&ThreadMode::Yolo),
             "resume must pass the persisted mode to the factory: {seen:?}"
         );
+        h.shutdown().await;
+    }
+
+    /// Task 10:`thread/setPermissionMode` 必须实时翻转该线程的 `YoloSwitch`
+    /// (运行期立即生效)并把 `permission_mode` 落盘(resume 后仍读得到)。
+    /// server 内存里的 switch 外部不可观测,故用记录型工厂捕获工厂实际交给
+    /// 该线程的同一个 `YoloSwitch`,以它断言运行期开关被翻转。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_permission_mode_toggles_and_persists() {
+        use crate::thread_store::{ThreadMode, ThreadStore};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+
+        let seen: Arc<std::sync::Mutex<Vec<yi_agent_core::autonomy::YoloSwitch>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          cwd: &std::path::Path,
+                          mode: ThreadMode| {
+            let sw = yi_agent_core::autonomy::YoloSwitch::new(mode == ThreadMode::Yolo);
+            seen_c.lock().unwrap().push(sw.clone());
+            let mut built = build_test_agent(session, cwd, mode)?;
+            built.yolo = sw;
+            Ok(built)
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        let sw = seen.lock().unwrap().last().cloned().unwrap();
+        assert!(!sw.get(), "a freshly started thread must not be in yolo");
+
+        // 切到 yolo:响应成功,运行期开关立即为 true,且已落盘。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert!(
+            v.get("error").is_none(),
+            "setPermissionMode must succeed: {v}"
+        );
+        assert_eq!(v["result"], serde_json::json!({}));
+        assert!(sw.get(), "the thread's YoloSwitch must turn on immediately");
+        let store = ThreadStore::new(dir.path());
+        assert_eq!(
+            store
+                .load(&tid)
+                .unwrap()
+                .expect("thread meta must exist")
+                .meta
+                .permission_mode,
+            ThreadMode::Yolo,
+            "yolo must persist to disk"
+        );
+
+        // 切回 normal:开关关掉,落盘也回到 normal。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"normal"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert!(
+            v.get("error").is_none(),
+            "setPermissionMode must succeed: {v}"
+        );
+        assert!(
+            !sw.get(),
+            "the thread's YoloSwitch must turn off immediately"
+        );
+        assert_eq!(
+            store
+                .load(&tid)
+                .unwrap()
+                .expect("thread meta must exist")
+                .meta
+                .permission_mode,
+            ThreadMode::Normal,
+            "normal must persist to disk"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Task 10:非法 `mode` 报 `-32602`(且优先于 thread 存在性校验);未知
+    /// `threadId` 报 `-32011`。两者分别用独立请求覆盖。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_permission_mode_rejects_bad_mode_and_unknown_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // 非法 mode:即便 thread 真实存在也必须 `-32602`。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"bogus"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "invalid mode must be invalid_params: {v}"
+        );
+
+        // 未知 thread + 合法 mode → `-32011`。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{"threadId":"nope","mode":"yolo"}}"#,
+        )
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32011,
+            "unknown thread must be unknown_thread: {v}"
+        );
+
         h.shutdown().await;
     }
 
