@@ -988,17 +988,23 @@ impl RuntimeCoordinator {
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             attempt
         };
-        let mut repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
-        repository.transition_task_and_attempt(
-            root_task,
-            &attempt,
-            "paused",
-            RuntimeEvent::TaskPaused,
-        )?;
-        repository.detach_application_root(session, root_task)?;
+        {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.transition_task_and_attempt(
+                root_task,
+                &attempt,
+                "paused",
+                RuntimeEvent::TaskPaused,
+            )?;
+            repository.detach_application_root(session, root_task)?;
+        }
+        // The attachment is durably `detached` here, so a reclaimed root worktree
+        // can never be observed as attached. The reclaim itself is seeded by the
+        // IPC caller (see `ipc.rs`), because this method takes `&self` and cannot
+        // clone the `Arc<RuntimeCoordinator>` a background thread needs.
         Ok(())
     }
 

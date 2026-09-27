@@ -265,9 +265,60 @@ impl AgentWorkspaceService for StaticWorkspaceService {
     }
 }
 
+/// A workspace service that records every reclaim instead of running git.
+///
+/// It mirrors the production service in the one respect the reclaim path
+/// depends on: `prepare_root` and `prepare_child` really create the worktree
+/// directory, so the caller's `path.exists()` gate is satisfied.
+#[derive(Clone, Default)]
+struct ReclaimRecordingWorkspaceService {
+    reclaimed: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl AgentWorkspaceService for ReclaimRecordingWorkspaceService {
+    fn prepare_root(
+        &self,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        self.reclaimed.lock().unwrap().push(workspace.path.clone());
+        Ok(())
+    }
+
+    fn is_merged_into(
+        &self,
+        _owner: &WorkerWorkspace,
+        _branch: &str,
+        _parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
+        Ok(true)
+    }
+}
+
 #[derive(Clone)]
 struct ApplicationRootFactory {
-    workspace_service: Arc<StaticWorkspaceService>,
+    workspace_service: Arc<dyn AgentWorkspaceService>,
     starts: Arc<Mutex<Vec<WorkerStart>>>,
 }
 
@@ -952,6 +1003,88 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
             .unwrap()
             .state,
         "detached"
+    );
+}
+
+#[test]
+fn detaching_an_application_root_seeds_a_worktree_reclaim() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let reclaimed = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(ReclaimRecordingWorkspaceService {
+        reclaimed: Arc::clone(&reclaimed),
+    });
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: service,
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-reclaim".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: "first prompt".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::StartWorker {
+            session_id: session_id.clone(),
+            task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id,
+                root_task_id,
+                capability: message_capability,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached,
+        "detach still answers with the same response"
+    );
+
+    // The reclaim runs on a background thread, so poll rather than assert once.
+    for _ in 0..100 {
+        if !reclaimed.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        !reclaimed.lock().unwrap().is_empty(),
+        "detach seeded a background reclaim"
     );
 }
 

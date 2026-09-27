@@ -2042,7 +2042,7 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
 
 fn respond(
     database_path: &Path,
-    coordinator: &RuntimeCoordinator,
+    coordinator: &Arc<RuntimeCoordinator>,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2113,6 +2113,16 @@ fn respond(
                 &root_task_id,
                 &capability,
             ))?;
+            // Reclaim on a background thread: git is a synchronous subprocess and
+            // the client's `send_request` sets no read timeout, so doing this
+            // inline would make the TUI wait for the full duration. Detached is
+            // safe because the reclaim is idempotent and re-runnable, and
+            // `prepare_task_workspace` rebuilds any directory it removes.
+            let reclaim_coordinator = Arc::clone(coordinator);
+            let reclaim_session = session_id.clone();
+            std::thread::spawn(move || {
+                reclaim_coordinator.reclaim_session_worktrees(&reclaim_session);
+            });
             Ok(IpcResponse::ApplicationRootDetached)
         }
         IpcRequest::CreateSchedule { cron, objective } => {
