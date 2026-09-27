@@ -252,6 +252,15 @@ impl ThreadStore {
             .is_some())
     }
 
+    /// 只重写 meta 的 `permission_mode`。走同一把 `update_meta` 锁,
+    /// 避免与并发 `rename` / `touch` 互相覆盖。
+    /// 返回 false 表示 thread 不存在或 meta 不可读。
+    pub fn set_permission_mode(&self, id: &str, mode: ThreadMode) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| meta.permission_mode = mode)?
+            .is_some())
+    }
+
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
     /// `title_hint`(本轮 prompt)填充。thread 不存在或 meta 不可读时静默返回。
     pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {
@@ -841,5 +850,16 @@ mod tests {
         m.permission_mode = ThreadMode::Yolo;
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"permission_mode\":\"yolo\""));
+    }
+
+    #[test]
+    fn set_permission_mode_persists() {
+        let (_d, s) = store();
+        let mut m = meta("thread-1");
+        m.permission_mode = ThreadMode::Normal;
+        s.create(&m).unwrap();
+        assert!(s.set_permission_mode("thread-1", ThreadMode::Yolo).unwrap());
+        let loaded = s.load("thread-1").unwrap().unwrap();
+        assert_eq!(loaded.meta.permission_mode, ThreadMode::Yolo);
     }
 }
