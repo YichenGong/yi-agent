@@ -1418,6 +1418,7 @@ mod tests {
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
+            sandbox_promotable: true,
             sandbox: yi_agent_tools::SandboxMode::default(),
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
