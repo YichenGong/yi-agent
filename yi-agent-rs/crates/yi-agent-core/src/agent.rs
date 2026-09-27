@@ -1236,7 +1236,9 @@ fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
                         }
                     }
                 }
-                crate::message::ContentBlock::Image { .. } => {}
+                crate::message::ContentBlock::Image { .. } => {
+                    total += crate::compact::IMAGE_TOKEN_ESTIMATE as u32;
+                }
             }
         }
     }
@@ -3987,5 +3989,29 @@ mod tests {
     #[test]
     fn estimate_tokens_empty() {
         assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn prefill_estimate_counts_image_tokens() {
+        let req = crate::provider::ProviderRequest {
+            model: "test-model".into(),
+            system: None,
+            messages: vec![crate::message::Message {
+                role: crate::message::Role::User,
+                content: vec![crate::message::ContentBlock::Image {
+                    source: crate::message::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                    detail: crate::message::ImageDetail::High,
+                }],
+            }],
+            tools: Vec::new(),
+            params: crate::provider::GenParams::default(),
+        };
+        assert_eq!(
+            estimate_prefill_tokens(&req),
+            crate::compact::IMAGE_TOKEN_ESTIMATE as u32
+        );
     }
 }
