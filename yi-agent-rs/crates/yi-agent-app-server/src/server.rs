@@ -365,6 +365,7 @@ where
                                 active_turn_id: None,
                                 prompt_tx,
                                 interrupt_tx,
+                                store: Arc::clone(&thread_store),
                             },
                         );
 
@@ -416,9 +417,9 @@ where
                         else {
                             continue;
                         };
-                        // 先按全局索引定位该 thread 所属目录的 store(索引没有则
-                        // 回退 cfg.workdir),再从中载入历史。
-                        let thread_store = store_for(&workspaces, &cfg, &thread_id);
+                        // 优先用内存中该 thread 的权威 store(与其 driver 共享 lock),
+                        // 冷 thread 才按全局索引 / cfg.workdir 定位,再从中载入历史。
+                        let thread_store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
                         // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
                         // 落盘完成,否则紧随 turn/completed 的 resume 会读到尚未写入
                         // 的历史。详见 `interrupt_and_wait_for_persist`。
@@ -493,6 +494,7 @@ where
                                 active_turn_id: None,
                                 prompt_tx,
                                 interrupt_tx,
+                                store: Arc::clone(&thread_store),
                             },
                         );
 
@@ -582,7 +584,9 @@ where
                             .await?;
                             continue;
                         }
-                        match store_for(&workspaces, &cfg, &thread_id).rename(&thread_id, &title) {
+                        match store_lookup(&threads, &workspaces, &cfg, &thread_id)
+                            .rename(&thread_id, &title)
+                        {
                             Ok(true) => {
                                 write_response(&writer, ok_response(id, json!({}))).await?;
                             }
@@ -608,9 +612,10 @@ where
                         else {
                             continue;
                         };
-                        // 按全局索引定位该 thread 所属目录的 store(索引没有则回退
-                        // cfg.workdir),存在性与删除都作用在正确目录上。
-                        let thread_store = store_for(&workspaces, &cfg, &thread_id);
+                        // 优先用内存中该 thread 的权威 store(与其 driver 共享 lock),
+                        // 冷 thread 才按全局索引 / cfg.workdir 定位;存在性与删除都
+                        // 作用在该 thread 的真实目录上。
+                        let thread_store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
                         let in_memory = threads.contains_key(&thread_id);
                         let on_disk = thread_store.exists(&thread_id);
                         if !in_memory && !on_disk {
@@ -1083,6 +1088,20 @@ fn store_for(
 ) -> Arc<crate::thread_store::ThreadStore> {
     let dir = find_thread_dir(workspaces, thread_id).unwrap_or_else(|| cfg.workdir.clone());
     Arc::new(crate::thread_store::ThreadStore::new(&dir))
+}
+
+/// 取 thread 的 store:内存中的 thread 用其权威实例(与 driver 共享 lock);
+/// 冷 thread 按全局索引定位,索引找不到再回退 `cfg.workdir`。
+fn store_lookup(
+    threads: &HashMap<String, ThreadSession>,
+    workspaces: &WorkspaceIndex,
+    cfg: &RuntimeConfig,
+    thread_id: &str,
+) -> Arc<crate::thread_store::ThreadStore> {
+    match threads.get(thread_id) {
+        Some(s) => Arc::clone(&s.store),
+        None => store_for(workspaces, cfg, thread_id),
+    }
 }
 
 /// 解析 `thread/start` 的目标目录:显式 `params.cwd` 优先,缺省用 `cfg.workdir`。
@@ -2762,6 +2781,72 @@ mod tests {
         let v = h.read_value().await;
         assert_eq!(v["id"], 2);
         assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_ops_target_thread_cwd_not_global_workdir() {
+        // 两个不同目录:thread 建在 `d`,全局 workdir 在 `w`。用于锁住
+        // rename/delete 走 thread 自身 cwd,而不是全局 workdir / 索引回退。
+        let w = tempfile::TempDir::new().unwrap();
+        let d = tempfile::TempDir::new().unwrap();
+        let w_dir = w.path().canonicalize().unwrap();
+        let d_dir = d.path().canonicalize().unwrap();
+
+        let mut cfg = test_config();
+        cfg.workdir = w_dir.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let start = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "thread/start",
+            "params": { "cwd": d_dir.to_string_lossy() },
+        });
+        h.send(&start.to_string()).await;
+        let mut tid = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                assert!(v.get("error").is_none(), "thread/start must succeed: {v}");
+                tid = Some(v["result"]["thread_id"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        let tid = tid.expect("no thread/start response");
+
+        // rename 必须落在 `d`,而不是全局 workdir `w`。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/rename","params":{{"threadId":"{tid}","title":"scoped"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 3);
+        assert!(v.get("error").is_none(), "rename must succeed: {v}");
+
+        let in_d = crate::thread_store::ThreadStore::new(&d_dir)
+            .load(&tid)
+            .expect("load in d must not fail")
+            .expect("thread must live in d");
+        assert_eq!(in_d.meta.title.as_deref(), Some("scoped"));
+        assert!(
+            !crate::thread_store::ThreadStore::new(&w_dir).exists(&tid),
+            "nothing must leak into the global workdir"
+        );
+
+        // delete 同样必须作用在 `d`。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 4);
+        assert!(v.get("error").is_none(), "delete must succeed: {v}");
+        assert!(
+            !crate::thread_store::ThreadStore::new(&d_dir).exists(&tid),
+            "thread must be actually deleted in d"
+        );
         h.shutdown().await;
     }
 
