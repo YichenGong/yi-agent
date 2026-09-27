@@ -313,6 +313,43 @@ where
                         }
                         }
                     }
+                    "thread/listAll" => {
+                        // 跨目录汇总:按索引顺序(最近的在前)遍历每个 workspace,
+                        // 组内是该目录 store 的 thread(updated_at 降序)。
+                        // 失效目录先 stat 跳过,不做深扫,但仍报表该组(exists:false),
+                        // 供侧栏置灰展示。
+                        let mut groups: Vec<serde_json::Value> = Vec::new();
+                        for dir in workspaces.list() {
+                            let path = Path::new(&dir);
+                            let exists = path.is_dir();
+                            let threads: Vec<serde_json::Value> = if exists {
+                                crate::thread_store::ThreadStore::new(path)
+                                    .list()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|m| {
+                                        json!({
+                                            "thread_id": m.thread_id,
+                                            "cwd": m.cwd,
+                                            "model": m.model,
+                                            "created_at": m.created_at,
+                                            "updated_at": m.updated_at,
+                                            "title": m.title,
+                                        })
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            groups.push(json!({
+                                "workspace": dir,
+                                "exists": exists,
+                                "threads": threads,
+                            }));
+                        }
+                        write_response(&writer, ok_response(id, json!({ "groups": groups })))
+                            .await?;
+                    }
                     "thread/start" => {
                         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
 
@@ -2603,6 +2640,180 @@ mod tests {
             assert!(t["created_at"].is_number());
             assert!(t["updated_at"].is_number());
         }
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_with_cwd_writes_meta_cwd() {
+        // 全局 workdir 与显式 cwd 指向不同目录:用于区分「按 thread 的 cwd 路由」
+        // 与旧的「一律写全局 workdir」行为。
+        let global = tempfile::TempDir::new().unwrap();
+        let target = tempfile::TempDir::new().unwrap();
+        let w = global.path().canonicalize().unwrap();
+        let c = target.path().canonicalize().unwrap();
+
+        let mut cfg = test_config();
+        cfg.workdir = w.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": c.to_string_lossy() }});
+        h.send(&req.to_string()).await;
+
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("thread/start response");
+        assert_eq!(
+            resp["result"]["cwd"].as_str().unwrap(),
+            c.to_string_lossy().to_string()
+        );
+        let thread_id = resp["result"]["thread_id"].as_str().unwrap().to_string();
+
+        let store = crate::thread_store::ThreadStore::new(&c);
+        let metas = store.list().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].cwd, c.to_string_lossy().to_string());
+        assert!(
+            !crate::thread_store::ThreadStore::new(&w).exists(&thread_id),
+            "thread must not leak into the global workdir store"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_with_bad_cwd_returns_invalid_params() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": "/nonexistent/definitely/not/here" }});
+        h.send(&req.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32602);
+        h.shutdown().await;
+    }
+
+    /// 两个目录各起一个 thread:`thread/listAll` 必须按 workspace 分成两组,每组
+    /// 恰好含该目录的 thread(cwd 与 group.workspace 一致,thread_id 与 start 响应一致)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_all_groups_by_workspace() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let a = dir_a
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let b = dir_b
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        // workspace 路径 → 在该目录 start 出的 thread_id。
+        let mut expected: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (id, path) in [(2u64, &a), (3u64, &b)] {
+            let req = serde_json::json!({"jsonrpc":"2.0","id":id,"method":"thread/start",
+                "params":{"cwd": path}});
+            h.send(&req.to_string()).await;
+            let tid = read_thread_start_response(&mut h, id).await;
+            expected.insert(path.clone(), tid);
+        }
+
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("thread/listAll response");
+        let groups = v["result"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "两个目录 → 两个分组: {v}");
+
+        for g in groups {
+            let ws = g["workspace"].as_str().unwrap();
+            assert!(
+                ws == a.as_str() || ws == b.as_str(),
+                "unexpected workspace {ws}"
+            );
+            assert_eq!(g["exists"], true, "canonical tempdir must exist: {g}");
+            let threads = g["threads"].as_array().unwrap();
+            assert_eq!(
+                threads.len(),
+                1,
+                "each workspace holds exactly one thread: {g}"
+            );
+            assert_eq!(
+                threads[0]["cwd"].as_str().unwrap(),
+                ws,
+                "thread cwd must match its group workspace"
+            );
+            assert_eq!(
+                threads[0]["thread_id"].as_str().unwrap(),
+                expected[ws].as_str(),
+                "group must carry the thread started in that workspace"
+            );
+        }
+        h.shutdown().await;
+    }
+
+    /// 失效目录(索引里有、磁盘上已删)仍必须出现为一个组:`exists:false` 且
+    /// `threads` 为空(不深扫)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_all_includes_missing_dir_with_empty_threads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        // 先让目录存在时写入索引,再从磁盘删除。
+        let add = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"workspace/add",
+            "params":{"path": path_str}});
+        h.send(&add.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 2);
+        assert!(v.get("error").is_none(), "workspace/add must succeed: {v}");
+        std::fs::remove_dir_all(&path).unwrap();
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("thread/listAll response");
+        let groups = v["result"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "索引里恰有一个目录: {v}");
+        let g = &groups[0];
+        assert_eq!(g["workspace"].as_str().unwrap(), path_str);
+        assert_eq!(g["exists"], false, "失效目录必须报 exists:false: {g}");
+        assert_eq!(
+            g["threads"].as_array().unwrap().len(),
+            0,
+            "失效目录不深扫,threads 必须为空: {g}"
+        );
         h.shutdown().await;
     }
 
