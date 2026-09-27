@@ -491,6 +491,45 @@ pub trait AgentWorkspaceService: Send + Sync {
     ) -> Result<(), WorkerError> {
         Ok(())
     }
+
+    /// Remove a task's worktree directory while keeping its branch ref and its
+    /// `task_workspaces` row. This is the safe automatic reclaim: the branch
+    /// still pins every commit, and the surviving row lets
+    /// [`Self::reattach_workspace`] rebuild the directory on demand.
+    ///
+    /// The default is a no-op for non-git services.
+    fn reclaim_worktree(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    /// Rebuild a reclaimed worktree directory from its surviving branch.
+    ///
+    /// The default cannot run git and therefore reports failure, because a
+    /// caller that reaches this point needs a usable directory.
+    fn reattach_workspace(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        Err(WorkerError::Startup(
+            "workspace service cannot rebuild a reclaimed worktree".into(),
+        ))
+    }
+
+    /// Whether `branch` is already merged into `parent_branch`. Used to refuse
+    /// reclaiming a worktree whose work has not been integrated.
+    ///
+    /// The comparison is against the branch the worktree recorded as its parent,
+    /// never against `owner`'s current `HEAD`: a worker may `git checkout` inside
+    /// the owner worktree, and that must not change whether a child counts as
+    /// integrated. `parent_branch` is passed separately for exactly that reason.
+    ///
+    /// The default cannot inspect git and reports "not merged", which is the safe
+    /// answer.
+    fn is_merged_into(
+        &self,
+        _owner: &WorkerWorkspace,
+        _branch: &str,
+        _parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Default)]

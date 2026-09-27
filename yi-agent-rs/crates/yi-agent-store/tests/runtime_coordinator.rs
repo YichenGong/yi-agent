@@ -166,6 +166,10 @@ struct GitWorkspaceService {
     repository_root: std::path::PathBuf,
     accepted: Arc<Mutex<Vec<(WorkerWorkspace, WorkerWorkspace)>>>,
     cleanup_error: Option<&'static str>,
+    /// Every `is_merged_into` call, as `(child branch, parent branch)`. Lets a
+    /// test prove that a merge check was *not* attempted, which is otherwise
+    /// invisible.
+    merge_checks: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl GitWorkspaceService {
@@ -174,7 +178,12 @@ impl GitWorkspaceService {
             repository_root,
             accepted: Arc::new(Mutex::new(Vec::new())),
             cleanup_error: None,
+            merge_checks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn merge_checks(&self) -> Arc<Mutex<Vec<(String, String)>>> {
+        Arc::clone(&self.merge_checks)
     }
 }
 
@@ -330,6 +339,49 @@ impl AgentWorkspaceService for GitWorkspaceService {
             return Err(WorkerError::Startup(error.into()));
         }
         Ok(())
+    }
+
+    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        let _ = Command::new("git")
+            .args(["worktree", "remove", workspace.path.to_str().unwrap()])
+            .current_dir(&workspace.repository_root)
+            .status();
+        Ok(())
+    }
+
+    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        Command::new("git")
+            .args(["worktree", "add"])
+            .arg(&workspace.path)
+            .arg(&workspace.branch)
+            .current_dir(&workspace.repository_root)
+            .status()
+            .map_err(|error| WorkerError::Startup(format!("git worktree add failed: {error}")))?;
+        Ok(())
+    }
+
+    fn is_merged_into(
+        &self,
+        owner: &WorkerWorkspace,
+        branch: &str,
+        parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
+        self.merge_checks
+            .lock()
+            .unwrap()
+            .push((branch.to_owned(), parent_branch.to_owned()));
+        if branch.is_empty() || parent_branch.is_empty() {
+            return Ok(false);
+        }
+        // Ancestry is tested against the recorded parent branch, never the
+        // owner's current HEAD, so a `git checkout` in the owner cannot change
+        // the answer.
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", branch, parent_branch])
+            .current_dir(&owner.path)
+            .status()
+            .map_err(|error| WorkerError::Startup(format!("git merge-base failed: {error}")))?;
+        Ok(output.success())
     }
 
     fn contains_commit(&self, owner: &WorkerWorkspace, commit: &str) -> Result<bool, WorkerError> {
@@ -1151,6 +1203,7 @@ async fn accepted_review_recycles_the_child_workspace() {
             repository_root: repository_root.clone(),
             accepted: Arc::clone(&accepted),
             cleanup_error: None,
+            merge_checks: Arc::new(Mutex::new(Vec::new())),
         })),
         ..Default::default()
     });
@@ -1210,6 +1263,7 @@ async fn recycle_failure_does_not_fail_the_accept() {
             repository_root: repository_root.clone(),
             accepted: Arc::clone(&accepted),
             cleanup_error: Some("injected recycle failure"),
+            merge_checks: Arc::new(Mutex::new(Vec::new())),
         })),
         ..Default::default()
     });
@@ -1259,6 +1313,7 @@ async fn integrated_delivery_is_accepted_and_recycled_on_reconcile() {
             repository_root: repository_root.clone(),
             accepted: Arc::clone(&accepted),
             cleanup_error: None,
+            merge_checks: Arc::new(Mutex::new(Vec::new())),
         })),
         ..Default::default()
     });
@@ -1354,6 +1409,7 @@ async fn unmerged_delivery_stays_awaiting_review_across_reconcile() {
             repository_root: repository_root.clone(),
             accepted: Arc::clone(&accepted),
             cleanup_error: None,
+            merge_checks: Arc::new(Mutex::new(Vec::new())),
         })),
         ..Default::default()
     });
@@ -4068,4 +4124,699 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_reclaimed_worktree_is_rebuilt_before_a_worker_starts() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    let service = factory.workspace_service.clone().unwrap();
+    service.reclaim_worktree(&workspace).unwrap();
+    assert!(
+        !workspace.path.exists(),
+        "precondition: the directory is reclaimed while the row survives"
+    );
+
+    // Make the task terminal so retry is legal, then retry. The retry restarts
+    // the worker, which must rebuild the directory before handing it over.
+    coordinator
+        .cancel_task(&session, &root, false)
+        .await
+        .unwrap();
+    coordinator.retry_task(&session, &root).await.unwrap();
+
+    assert!(
+        workspace.path.exists(),
+        "the rebuild path restored the directory before the worker started"
+    );
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_workspace_optional(&root)
+            .unwrap()
+            .is_some(),
+        "the workspace row is untouched"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_ones() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+
+    let merged = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "merged child".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &merged).await.unwrap();
+    let merged_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+    std::fs::write(merged_workspace.path.join("merged.txt"), "ready\n").unwrap();
+    git_ok(&merged_workspace.path, &["add", "merged.txt"]).unwrap();
+    git_ok(&merged_workspace.path, &["commit", "-m", "merged delivery"]).unwrap();
+    git_ok(
+        &root_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &merged_workspace.branch,
+            "-m",
+            "integrate",
+        ],
+    )
+    .unwrap();
+
+    let unmerged = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "unmerged child".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &unmerged).await.unwrap();
+    let unmerged_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+    std::fs::write(unmerged_workspace.path.join("pending.txt"), "wip\n").unwrap();
+    git_ok(&unmerged_workspace.path, &["add", "pending.txt"]).unwrap();
+    git_ok(
+        &unmerged_workspace.path,
+        &["commit", "-m", "unmerged delivery"],
+    )
+    .unwrap();
+
+    // A merged child is terminal in production (its delivery was accepted). Drive
+    // it to a terminal state so this test exercises the merge gate rather than the
+    // state gate: a non-terminal child is refused outright now, which is what
+    // keeps a live worker's directory from being deleted.
+    coordinator
+        .cancel_task(&session, &merged, false)
+        .await
+        .unwrap();
+
+    // Send the unmerged child terminal too, so it clears the state gate and the
+    // merge gate is what decides its fate. Without this the state gate refuses a
+    // running child first and this test stops discriminating a broken merge check.
+    coordinator
+        .cancel_task(&session, &unmerged, false)
+        .await
+        .unwrap();
+
+    let reclaimed = coordinator.reclaim_session_worktrees(&session);
+
+    assert!(
+        !merged_workspace.path.exists(),
+        "a merged child's directory is reclaimed"
+    );
+    assert!(
+        unmerged_workspace.path.exists(),
+        "an unmerged child's directory is left alone"
+    );
+    assert!(
+        !root_workspace.path.exists(),
+        "the root is reclaimed without a merge check"
+    );
+    // Two directories: the merged child and the root. The root owns a row
+    // because a worker was started for it, and a root has no parent to merge
+    // into, so it is reclaimed unconditionally. The unmerged child is skipped.
+    assert_eq!(reclaimed, 2, "the merged child and the root are reclaimed");
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_workspace_optional(&merged)
+            .unwrap()
+            .is_some(),
+        "the row survives so the worktree can be rebuilt"
+    );
+}
+
+/// The merge check must be relative to the child's recorded `parent_branch`, not
+/// to the owner worktree's current `HEAD`. A worker that runs `git checkout`
+/// inside the owner worktree must not make an integrated child look unmerged.
+#[tokio::test]
+async fn reclaim_uses_the_recorded_parent_branch_not_the_owner_head() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+
+    let merged = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "merged child".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &merged).await.unwrap();
+    let merged_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+    std::fs::write(merged_workspace.path.join("merged.txt"), "ready\n").unwrap();
+    git_ok(&merged_workspace.path, &["add", "merged.txt"]).unwrap();
+    git_ok(&merged_workspace.path, &["commit", "-m", "merged delivery"]).unwrap();
+    git_ok(
+        &root_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &merged_workspace.branch,
+            "-m",
+            "integrate",
+        ],
+    )
+    .unwrap();
+
+    // Move the owner worktree off its own branch, onto a branch that predates the
+    // merge. A HEAD-relative merge check now answers "not merged" for a child that
+    // was in fact integrated.
+    let owner_side_track = "owner-side-track";
+    git_ok(
+        &root_workspace.path,
+        &[
+            "checkout",
+            "-b",
+            owner_side_track,
+            &root_workspace.base_commit,
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        git_output(&root_workspace.path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap()
+            .trim(),
+        owner_side_track,
+        "precondition: the owner is no longer on the child's parent branch"
+    );
+    // Guard the fixture's discriminating power: the side-track branch must NOT
+    // contain the merged child's commit, or this test could pass either way.
+    assert!(
+        !Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &merged_workspace.branch,
+                owner_side_track,
+            ])
+            .current_dir(&root_workspace.path)
+            .status()
+            .unwrap()
+            .success(),
+        "precondition: the side-track branch does not contain the merged delivery"
+    );
+
+    // A merged child is terminal in production (its delivery was accepted). Drive
+    // it to a terminal state so this test exercises the merge gate rather than the
+    // state gate: a non-terminal child is refused outright now, which is what
+    // keeps a live worker's directory from being deleted.
+    coordinator
+        .cancel_task(&session, &merged, false)
+        .await
+        .unwrap();
+
+    let reclaimed = coordinator.reclaim_session_worktrees(&session);
+
+    assert!(
+        !merged_workspace.path.exists(),
+        "an integrated child is reclaimed even though the owner HEAD moved"
+    );
+    assert_eq!(
+        reclaimed, 2,
+        "the merged child and the root are reclaimed regardless of the owner HEAD"
+    );
+}
+
+/// A child whose owner directory is already gone must still be merge-checked.
+/// The check shells out to git with a working directory, and the owner worktree
+/// may already have been reclaimed by an earlier pass, so the check falls back to
+/// the repository root: `merge-base --is-ancestor` resolves both branch names from
+/// the ref database, so any directory inside the repository answers the same
+/// question.
+#[tokio::test]
+async fn reclaim_still_checks_merging_when_the_owner_directory_is_gone() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    // Keep a concrete handle so the test can observe and drive the service; the
+    // factory stores it as a trait object.
+    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
+    let merge_checks = service.merge_checks();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::clone(&service) as Arc<dyn AgentWorkspaceService>),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "child with a vanished owner".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    let child_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+    std::fs::write(child_workspace.path.join("pending.txt"), "wip\n").unwrap();
+    git_ok(&child_workspace.path, &["add", "pending.txt"]).unwrap();
+    git_ok(&child_workspace.path, &["commit", "-m", "pending delivery"]).unwrap();
+
+    // Simulate the owner having been reclaimed by an earlier pass: remove the
+    // owner directory but keep its row, exactly as a previous reclaim leaves it.
+    service.reclaim_worktree(&root_workspace).unwrap();
+    assert!(
+        !root_workspace.path.exists(),
+        "precondition: the owner directory is gone while its row survives"
+    );
+    merge_checks.lock().unwrap().clear();
+
+    // Terminal, so the child clears the state gate. The child committed but was
+    // never merged, so the merge check now runs against the repository root and
+    // answers "not merged": the child must survive, and the check must be visible
+    // in `merge_checks` — that recorder is the only place the attempted check
+    // shows up.
+    coordinator
+        .cancel_task(&session, &child, false)
+        .await
+        .unwrap();
+
+    let reclaimed = coordinator.reclaim_session_worktrees(&session);
+
+    assert_eq!(
+        reclaimed, 0,
+        "neither the refused child nor the already-reclaimed root is counted again"
+    );
+    assert!(
+        child_workspace.path.exists(),
+        "the child keeps its directory: its work is not merged"
+    );
+    assert_eq!(
+        merge_checks.lock().unwrap().as_slice(),
+        &[(
+            child_workspace.branch.clone(),
+            child_workspace.parent_branch.clone()
+        )],
+        "the merge check is attempted against the repository root when the owner directory is gone"
+    );
+}
+
+/// A freshly created child worktree shares its parent's tip, so the ancestry
+/// check reports "merged" for a child that has not committed anything. The state
+/// gate must refuse it anyway: a running child's directory is live, and deleting
+/// it breaks the worker mid-turn (the design's Non-Goals forbid reclaiming a task
+/// that is still running).
+#[tokio::test]
+async fn reclaim_session_worktrees_keeps_a_running_childs_directory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "still working".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    let child_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+
+    // Precondition: the child has committed nothing, so its branch equals its
+    // parent's tip and the merge check would answer "merged". This is what makes
+    // the state gate load-bearing.
+    assert_eq!(
+        git_output(&child_workspace.path, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        git_output(&root_workspace.path, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        "precondition: an untouched child shares its parent's tip"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "running"
+    );
+
+    let reclaimed = coordinator.reclaim_session_worktrees(&session);
+
+    assert!(
+        child_workspace.path.exists(),
+        "a running child keeps its directory: a live worker still owns it"
+    );
+    assert_eq!(
+        reclaimed, 1,
+        "only the detached root is reclaimed; the running child is refused"
+    );
+}
+
+/// Marks a session as a detached application root, which is the state the TTL
+/// sweep discovers its work through.
+fn mark_session_detached(
+    database: &std::path::Path,
+    session: &RootSessionId,
+    root: &yi_agent_core::TaskId,
+) {
+    let mut repository = RuntimeRepository::open(database).unwrap();
+    repository
+        .record_application_root_attachment("ttl-fixture", session, root, "digest", "secret")
+        .unwrap();
+    repository.detach_application_root(session, root).unwrap();
+}
+
+#[tokio::test]
+async fn reclaim_idle_sweeps_a_detached_root_past_the_ttl() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    mark_session_detached(&database, &session, &root);
+
+    // Age the task past the TTL.
+    let aged = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![aged, root.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert_eq!(reclaimed, 1, "an idle detached root is reclaimed");
+    assert!(!workspace.path.exists());
+}
+
+#[tokio::test]
+async fn reclaim_idle_keeps_a_fresh_detached_root() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    mark_session_detached(&database, &session, &root);
+
+    // No ageing: the row keeps the timestamp SQLite wrote. Production rows get
+    // `updated_at` from `DEFAULT CURRENT_TIMESTAMP`, whose 'YYYY-MM-DD HH:MM:SS'
+    // shape differs from RFC3339, so assert the clock is parseable before trusting
+    // a `None`-means-not-idle result below. Without this the test would pass even
+    // if the SQLite-format parse branch were missing, and TTL reclaim would be
+    // silently dead in production.
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        repository.task_updated_at(&root).unwrap().is_some(),
+        "the idle clock parses the timestamp SQLite's CURRENT_TIMESTAMP writes"
+    );
+    drop(repository);
+
+    let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert_eq!(reclaimed, 0, "the TTL has not elapsed");
+    assert!(
+        workspace.path.exists(),
+        "a recently detached root keeps its worktree"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_idle_never_sweeps_an_awaiting_review_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let parent_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    let child_workspace = factory.starts.lock().unwrap()[1].workspace.clone().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+    // Integrate the child's commits into the owner branch without recording an
+    // acceptance: the merge gate now answers "merged", so the non-terminal state
+    // is the only thing standing between this delivery and deletion. Without this
+    // the merge gate would refuse the child too and the test would pass whether or
+    // not the state gate worked.
+    git_ok(
+        &parent_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &child_workspace.branch,
+            "-m",
+            "integrate unreviewed delivery",
+        ],
+    )
+    .unwrap();
+    assert!(
+        git_ok(
+            &parent_workspace.path,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &child_workspace.branch,
+                &child_workspace.parent_branch,
+            ],
+        )
+        .is_ok(),
+        "precondition: the delivery is reachable from the owner branch"
+    );
+    // The sweep only visits detached sessions, so the session must be detached
+    // for this test to exercise the state filter rather than the session filter.
+    mark_session_detached(&database, &session, &parent);
+
+    let aged = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![aged, child.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert!(
+        child_workspace.path.exists(),
+        "an un-integrated delivery is never reclaimed, however old"
+    );
+}
+
+/// The exit trigger reclaims the root; by the time a child is terminal its owner
+/// worktree is gone. The TTL sweep must still reclaim a MERGED child in that
+/// state, or the child's directory leaks forever (a terminal task never starts a
+/// worker, so the owner is never rebuilt).
+#[tokio::test]
+async fn reclaim_idle_sweeps_a_merged_child_whose_owner_was_already_reclaimed() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+    let child_workspace = factory.starts.lock().unwrap()[1].workspace.clone().unwrap();
+
+    // Integrate the child's delivery into the owner branch, so the child counts as
+    // merged: the TTL sweep is the only thing that stands between it and deletion.
+    git_ok(
+        &root_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &child_workspace.branch,
+            "-m",
+            "integrate",
+        ],
+    )
+    .unwrap();
+
+    // The real exit sequence: the application root detaches while the child is
+    // still chasing review, and the detach trigger reclaims the owner worktree.
+    // The child is not terminal yet, so it survives that pass -- and the owner's
+    // directory is gone from here on.
+    mark_session_detached(&database, &session, &parent);
+    coordinator.reclaim_session_worktrees(&session);
+    assert!(
+        !root_workspace.path.exists(),
+        "precondition: the detach trigger reclaimed the owner worktree"
+    );
+    assert!(
+        child_workspace.path.exists(),
+        "precondition: a child still chasing review keeps its directory"
+    );
+
+    // Now the child turns terminal, long after its owner went away.
+    coordinator
+        .cancel_task(&session, &child, false)
+        .await
+        .unwrap();
+
+    // Age both rows past the TTL.
+    let aged = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let connection = Connection::open(&database).unwrap();
+    for task in [&parent, &child] {
+        connection
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![aged, task.to_string()],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let reclaimed = coordinator.reclaim_idle_worktrees(chrono::Utc::now());
+
+    assert!(
+        !child_workspace.path.exists(),
+        "a merged, terminal, idle child is reclaimed even though its owner worktree is gone"
+    );
+    assert_eq!(
+        reclaimed, 1,
+        "the merged child is the only reclaimable directory: the root's directory is already gone"
+    );
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_workspace_optional(&child)
+            .unwrap()
+            .is_some(),
+        "the child's row survives so its worktree can be rebuilt"
+    );
 }

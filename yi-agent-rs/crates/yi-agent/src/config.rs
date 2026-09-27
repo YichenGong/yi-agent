@@ -260,6 +260,8 @@ pub enum DaemonAction {
     Status,
     /// Request an orderly daemon stop.
     Stop,
+    /// List reclaimable worktrees and, with confirmation, remove them.
+    Gc,
     /// Internal long-running daemon worker.
     #[command(hide = true)]
     Serve,

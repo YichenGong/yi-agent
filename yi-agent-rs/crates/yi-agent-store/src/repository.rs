@@ -2877,6 +2877,32 @@ impl RuntimeRepository {
         )?)
     }
 
+    /// A task's last transition time, used as the idle clock for reclaim.
+    ///
+    /// Returns `None` for a task with no row, which callers treat as "not idle
+    /// enough to sweep" rather than as an error.
+    pub fn task_updated_at(&self, task: &TaskId) -> Result<Option<DateTime<Utc>>, RepositoryError> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT updated_at FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .ok()
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .or_else(|| {
+                    // SQLite's CURRENT_TIMESTAMP is 'YYYY-MM-DD HH:MM:SS' in UTC.
+                    chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
+                        .ok()
+                        .map(|naive| naive.and_utc())
+                })
+        }))
+    }
+
     pub fn active_attempt_id(&self, task: &TaskId) -> Result<AttemptId, RepositoryError> {
         let value = self
             .connection
@@ -3264,6 +3290,87 @@ impl RuntimeRepository {
                 task: task.to_string(),
             })
         }
+    }
+
+    /// Every task in a session that owns a worktree, deepest first.
+    ///
+    /// Ordering by `depth DESC` matters: a child's ancestry check runs with the
+    /// owner worktree as its working directory, so the parent must be reclaimed
+    /// after its children, never before.
+    pub fn reclaim_candidates(
+        &self,
+        root_session_id: &RootSessionId,
+    ) -> Result<Vec<PersistedTaskDetail>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tasks.id, tasks.root_session_id, tasks.parent_id, tasks.depth,
+                    tasks.state_json, tasks.delivery_json, attempts.terminal_json,
+                    task_workspaces.lease_id, task_workspaces.repository_root,
+                    task_workspaces.path, task_workspaces.branch,
+                    task_workspaces.parent_branch, task_workspaces.base_commit
+             FROM tasks
+             JOIN task_workspaces ON task_workspaces.task_id = tasks.id
+             LEFT JOIN attempts ON attempts.id = tasks.active_attempt_id
+             WHERE tasks.root_session_id = ?1
+             ORDER BY tasks.depth DESC, tasks.created_at, tasks.id",
+        )?;
+        let rows = statement
+            .query_map(params![root_session_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, u8>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PersistedTaskDetail {
+                task_id: row.0,
+                session_id: row.1,
+                parent_task_id: row.2,
+                depth: row.3,
+                state: row.4,
+                delivery_json: row.5,
+                terminal_json: row.6,
+                workspace: Some(WorkerWorkspace {
+                    lease_id: row.7.parse().unwrap_or_else(|_| WorkspaceLeaseId::new()),
+                    repository_root: PathBuf::from(row.8),
+                    path: PathBuf::from(row.9),
+                    branch: row.10,
+                    parent_branch: row.11,
+                    base_commit: row.12,
+                }),
+            })
+            .collect())
+    }
+
+    /// Sessions whose application root attachment is currently detached.
+    ///
+    /// A detached root sits in `paused`, which is not a terminal state, so it
+    /// would never enter a terminal-only sweep. This is the clause that makes a
+    /// root worktree reclaimable at all.
+    pub fn detached_application_roots(&self) -> Result<Vec<RootSessionId>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT root_session_id FROM application_root_attachments
+             WHERE state = 'detached'",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|value| value.parse().ok())
+            .collect())
     }
 
     pub fn task_workspace_mode(&self, task: &TaskId) -> Result<TaskWorkspaceMode, RepositoryError> {

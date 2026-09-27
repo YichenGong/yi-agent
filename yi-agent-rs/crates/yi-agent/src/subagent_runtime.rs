@@ -355,6 +355,47 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
             )
             .map_err(|error| WorkerError::Startup(format!("Git workspace cleanup error: {error}")))
     }
+
+    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        if workspace.branch.is_empty() {
+            // A read-only workspace owns no worktree; its `path` is the parent's
+            // view and must not be removed.
+            return Ok(());
+        }
+        self.service
+            .reclaim_directory(&workspace.repository_root, &workspace.path)
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    }
+
+    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        if workspace.branch.is_empty() {
+            return Ok(());
+        }
+        self.service
+            .reattach_worktree(
+                &workspace.repository_root,
+                &workspace.path,
+                &workspace.branch,
+            )
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    }
+
+    fn is_merged_into(
+        &self,
+        owner: &WorkerWorkspace,
+        branch: &str,
+        parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
+        if branch.is_empty() || parent_branch.is_empty() {
+            return Ok(false);
+        }
+        // Test ancestry against the recorded parent branch, not the owner's
+        // current HEAD: a worker that ran `git checkout` inside the owner
+        // worktree must not change whether a child counts as integrated.
+        self.service
+            .is_ancestor(&owner.path, branch, parent_branch)
+            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    }
 }
 
 fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {
@@ -1799,6 +1840,163 @@ mod tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+    }
+
+    #[test]
+    fn daemon_workspace_reclaim_removes_directory_and_keeps_branch_and_workspace() {
+        let directory = TempDir::new().unwrap();
+        initialize_git_repository(directory.path());
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let root = service
+            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .unwrap();
+        std::fs::write(root.path.join("delivery.txt"), "ready\n").unwrap();
+        Command::new("git")
+            .args(["add", "delivery.txt"])
+            .current_dir(&root.path)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "root delivery"])
+            .current_dir(&root.path)
+            .status()
+            .unwrap();
+        let delivered = git_output(&root.path, &["rev-parse", "HEAD"]).unwrap();
+
+        service.reclaim_worktree(&root).unwrap();
+
+        assert!(!root.path.exists(), "directory is reclaimed");
+        assert!(
+            Command::new("git")
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", root.branch)
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success(),
+            "branch ref survives the reclaim"
+        );
+        assert_eq!(
+            git_output(directory.path(), &["rev-parse", &root.branch]).unwrap(),
+            delivered
+        );
+
+        service.reattach_workspace(&root).unwrap();
+
+        assert!(root.path.exists(), "worktree is rebuilt from the branch");
+        assert_eq!(
+            git_output(&root.path, &["rev-parse", "HEAD"]).unwrap(),
+            delivered,
+            "rebuild restores the delivered tip"
+        );
+    }
+
+    /// The production merge check must answer from the recorded `parent_branch`,
+    /// not from the owner worktree's current `HEAD`. This is the daemon-level
+    /// counterpart of the coordinator's
+    /// `reclaim_uses_the_recorded_parent_branch_not_the_owner_head`, which
+    /// exercises a test double rather than this implementation.
+    #[test]
+    fn daemon_merge_check_uses_the_recorded_parent_branch_not_the_owner_head() {
+        let directory = TempDir::new().unwrap();
+        initialize_git_repository(directory.path());
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let root = service
+            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .unwrap();
+        let child = service
+            .prepare_child(
+                &root,
+                &RootSessionId::new(),
+                &TaskId::new(),
+                &AttemptId::new(),
+            )
+            .unwrap();
+
+        std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
+        for args in [
+            vec!["add", "delivery.txt"],
+            vec!["commit", "-m", "child delivery"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&child.path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        // A child with its own unmerged commit is not yet integrated. (A freshly
+        // created child branch points at the parent's HEAD and is trivially an
+        // ancestor, so the commit is what makes this assertion meaningful.)
+        assert!(
+            !service
+                .is_merged_into(&root, &child.branch, &child.parent_branch)
+                .unwrap(),
+            "an unmerged child is not reported as merged"
+        );
+
+        assert!(
+            Command::new("git")
+                .args([
+                    "merge",
+                    "--no-ff",
+                    &child.branch,
+                    "-m",
+                    "integrate the child",
+                ])
+                .current_dir(&root.path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(
+            service
+                .is_merged_into(&root, &child.branch, &child.parent_branch)
+                .unwrap(),
+            "a merged child is reported as merged"
+        );
+
+        // Move the owner off its own branch, onto a commit that predates the
+        // merge. A HEAD-relative check would now answer "not merged"; the
+        // parent_branch-relative check must still answer "merged".
+        let side_track = "owner-side-track";
+        assert!(
+            Command::new("git")
+                .args(["checkout", "-b", side_track, &root.base_commit])
+                .current_dir(&root.path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            git_output(&root.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            side_track
+        );
+        assert!(
+            service
+                .is_merged_into(&root, &child.branch, &child.parent_branch)
+                .unwrap(),
+            "the answer does not depend on the owner's current HEAD"
+        );
+
+        // Empty inputs never authorize a reclaim.
+        assert!(
+            !service
+                .is_merged_into(&root, "", &child.parent_branch)
+                .unwrap(),
+            "an empty child branch is never merged"
+        );
+        assert!(
+            !service.is_merged_into(&root, &child.branch, "").unwrap(),
+            "an empty parent branch is never merged"
         );
     }
 

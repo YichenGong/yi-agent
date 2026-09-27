@@ -97,6 +97,37 @@ fn test_workspace_for_ipc(session: &str, task: &str) -> WorkerWorkspace {
     }
 }
 
+/// Runs a git command, asserting success. `output()` captures stderr so a
+/// deliberate failure cannot leak git's chatter into the suite log.
+fn git_ok(directory: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        directory.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(directory: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        directory.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 #[derive(Clone, Default)]
 struct StartCountingFactory {
     starts: Arc<Mutex<usize>>,
@@ -265,9 +296,60 @@ impl AgentWorkspaceService for StaticWorkspaceService {
     }
 }
 
+/// A workspace service that records every reclaim instead of running git.
+///
+/// It mirrors the production service in the one respect the reclaim path
+/// depends on: `prepare_root` and `prepare_child` really create the worktree
+/// directory, so the caller's `path.exists()` gate is satisfied.
+#[derive(Clone, Default)]
+struct ReclaimRecordingWorkspaceService {
+    reclaimed: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl AgentWorkspaceService for ReclaimRecordingWorkspaceService {
+    fn prepare_root(
+        &self,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        self.reclaimed.lock().unwrap().push(workspace.path.clone());
+        Ok(())
+    }
+
+    fn is_merged_into(
+        &self,
+        _owner: &WorkerWorkspace,
+        _branch: &str,
+        _parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
+        Ok(true)
+    }
+}
+
 #[derive(Clone)]
 struct ApplicationRootFactory {
-    workspace_service: Arc<StaticWorkspaceService>,
+    workspace_service: Arc<dyn AgentWorkspaceService>,
     starts: Arc<Mutex<Vec<WorkerStart>>>,
 }
 
@@ -956,6 +1038,88 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
 }
 
 #[test]
+fn detaching_an_application_root_seeds_a_worktree_reclaim() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let reclaimed = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(ReclaimRecordingWorkspaceService {
+        reclaimed: Arc::clone(&reclaimed),
+    });
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: service,
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-reclaim".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: "first prompt".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::StartWorker {
+            session_id: session_id.clone(),
+            task_id: root_task_id.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id,
+                root_task_id,
+                capability: message_capability,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached,
+        "detach still answers with the same response"
+    );
+
+    // The reclaim runs on a background thread, so poll rather than assert once.
+    for _ in 0..100 {
+        if !reclaimed.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        !reclaimed.lock().unwrap().is_empty(),
+        "detach seeded a background reclaim"
+    );
+}
+
+#[test]
 fn application_root_can_spawn_and_send_message_to_its_child() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -1503,6 +1667,571 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
         .unwrap(),
         IpcResponse::TaskSpawned { .. }
     ));
+}
+
+#[test]
+fn gc_rejects_a_bogus_confirmation_token() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    // A preview issues a real token; the raw status response is deliberately not
+    // one. The confirm call must reject anything the store did not issue, because
+    // that check is the only thing separating a client from removing worktrees.
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert!(entries.is_empty(), "a fresh store has nothing to reclaim");
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc {
+            confirmation_token: "not-a-token".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            response,
+            IpcResponse::Error {
+                code: yi_agent_store::ipc::IpcErrorCode::Validation,
+                ..
+            }
+        ),
+        "a token the store never issued must be rejected, got {response:?}"
+    );
+}
+
+#[test]
+fn gc_rejects_a_token_that_a_cancel_preview_issued() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::CancelPreview {
+        confirmation_token, ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PreviewCancel {
+            task_id: root_task_id.clone(),
+            recursive: false,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a cancel preview");
+    };
+
+    // Scopes are disjoint: a cancel token carries a task id and a cancellation
+    // scope, a gc token carries neither, so one must never satisfy the other.
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc { confirmation_token },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::Error { .. }),
+        "a cancel token must not authorize a gc reclaim, got {response:?}"
+    );
+}
+
+#[test]
+fn gc_confirm_consumes_its_token_exactly_once() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let IpcResponse::GcPreview {
+        confirmation_token, ..
+    } = send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ConfirmGc {
+                confirmation_token: confirmation_token.clone(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::GcCompleted { .. }
+    ));
+    let replay = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc { confirmation_token },
+    )
+    .unwrap();
+    assert!(
+        matches!(replay, IpcResponse::Error { .. }),
+        "a gc token is one-shot and must not be replayable, got {replay:?}"
+    );
+}
+
+#[test]
+fn gc_preview_lists_a_detached_sessions_reclaimable_worktree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    // The recording service creates the worktree directory in `prepare_root`, the
+    // way the production service really does. The listing reports a candidate only
+    // while its directory exists, so a fixture that never creates one would not be
+    // listable and this test would prove nothing.
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(ReclaimRecordingWorkspaceService::default()),
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "gc-listing".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-gc-listing"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    // While attached, the session is not detached, so it is not a gc candidate.
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert!(
+        entries.is_empty(),
+        "an attached root is not reclaimable yet"
+    );
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id,
+                root_task_id: root_task_id.clone(),
+                capability: message_capability,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    );
+
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert_eq!(entries.len(), 1, "the detached root is now listable");
+    let entry = &entries[0];
+    assert_eq!(entry.task_id, root_task_id);
+    assert_eq!(entry.branch, workspace.branch);
+    assert_eq!(entry.path, workspace.path.display().to_string());
+    assert!(entry.state.starts_with("paused"), "got {entry:?}");
+    // The listing must not have removed anything: the row survives reattachment.
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        repository
+            .task_workspace_optional(&root_task_id.parse().unwrap())
+            .unwrap()
+            .is_some(),
+        "listing a worktree must never delete its workspace row"
+    );
+}
+
+#[test]
+fn gc_preview_merged_and_dirty_match_the_reclaim_semantics() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir_all(&repository_root).unwrap();
+    git_ok(&repository_root, &["init", "-b", "main"]);
+    git_ok(
+        &repository_root,
+        &["config", "user.email", "tests@example.com"],
+    );
+    git_ok(&repository_root, &["config", "user.name", "Runtime Tests"]);
+    std::fs::write(repository_root.join("README.md"), "base\n").unwrap();
+    git_ok(&repository_root, &["add", "README.md"]);
+    git_ok(&repository_root, &["commit", "-m", "base"]);
+
+    let root_task = TaskId::new();
+    let session = RootSessionId::new();
+    let root_attempt = AttemptId::new();
+    let merged_child = TaskId::new();
+    let merged_child_attempt = AttemptId::new();
+    let dirty_child = TaskId::new();
+    let dirty_child_attempt = AttemptId::new();
+
+    let root_branch = format!("feat/root-{root_task}");
+    let root_worktree = directory.path().join("wt-root");
+    let merged_branch = format!("feat/merged-{merged_child}");
+    let merged_worktree = directory.path().join("wt-merged");
+    let dirty_branch = format!("feat/dirty-{dirty_child}");
+    let dirty_worktree = directory.path().join("wt-dirty");
+
+    // The root worktree gets its own branch with one commit on top of main.
+    git_ok(
+        &repository_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &root_branch,
+            root_worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::write(root_worktree.join("root.txt"), "root\n").unwrap();
+    git_ok(&root_worktree, &["add", "root.txt"]);
+    git_ok(&root_worktree, &["commit", "-m", "root work"]);
+
+    // A child on its own branch, committed and then merged into the root branch.
+    git_ok(
+        &repository_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &merged_branch,
+            merged_worktree.to_str().unwrap(),
+            &root_branch,
+        ],
+    );
+    std::fs::write(merged_worktree.join("merged.txt"), "merged\n").unwrap();
+    git_ok(&merged_worktree, &["add", "merged.txt"]);
+    git_ok(&merged_worktree, &["commit", "-m", "merged work"]);
+    git_ok(&root_worktree, &["merge", "--no-edit", &merged_branch]);
+
+    // A second child, merged the same way but left with an uncommitted edit.
+    git_ok(
+        &repository_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &dirty_branch,
+            dirty_worktree.to_str().unwrap(),
+            &root_branch,
+        ],
+    );
+    std::fs::write(dirty_worktree.join("dirty.txt"), "dirty\n").unwrap();
+    git_ok(&dirty_worktree, &["add", "dirty.txt"]);
+    git_ok(&dirty_worktree, &["commit", "-m", "dirty work"]);
+    git_ok(&root_worktree, &["merge", "--no-edit", &dirty_branch]);
+    std::fs::write(dirty_worktree.join("dirty.txt"), "dirty\nuncommitted\n").unwrap();
+
+    // Move the OWNER worktree's HEAD onto a branch that predates both merges. A
+    // listing that judged merged-ness against this HEAD (the pre-fix behaviour)
+    // would call both children unmerged, while the confirm — which compares
+    // against `parent_branch` — still reclaims them.
+    git_ok(&root_worktree, &["checkout", "-b", "stale-root", "main"]);
+
+    let base_commit = git_stdout(&repository_root, &["rev-parse", "main"]);
+    {
+        let mut repository = RuntimeRepository::open(&database).unwrap();
+        repository
+            .create_task_with_attempt_and_objective(
+                &root_task,
+                &session,
+                &root_attempt,
+                1,
+                "paused",
+                "root",
+                TaskWorkspaceMode::Coding,
+            )
+            .unwrap();
+        for (task, attempt, state, objective) in [
+            (
+                &merged_child,
+                &merged_child_attempt,
+                "cancelled",
+                "merged child",
+            ),
+            (
+                &dirty_child,
+                &dirty_child_attempt,
+                "cancelled",
+                "dirty child",
+            ),
+        ] {
+            repository
+                .create_child_task_with_attempt_and_objective(
+                    task,
+                    &session,
+                    &root_task,
+                    1,
+                    attempt,
+                    1,
+                    state,
+                    objective,
+                    TaskWorkspaceMode::Coding,
+                )
+                .unwrap();
+        }
+        for (task, attempt, path, branch, parent_branch) in [
+            (
+                &root_task,
+                &root_attempt,
+                &root_worktree,
+                &root_branch,
+                "main",
+            ),
+            (
+                &merged_child,
+                &merged_child_attempt,
+                &merged_worktree,
+                &merged_branch,
+                root_branch.as_str(),
+            ),
+            (
+                &dirty_child,
+                &dirty_child_attempt,
+                &dirty_worktree,
+                &dirty_branch,
+                root_branch.as_str(),
+            ),
+        ] {
+            repository
+                .record_task_workspace(
+                    task,
+                    attempt,
+                    &WorkerWorkspace {
+                        lease_id: WorkspaceLeaseId::new(),
+                        repository_root: repository_root.clone(),
+                        path: path.clone(),
+                        branch: branch.clone(),
+                        parent_branch: parent_branch.to_owned(),
+                        base_commit: base_commit.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        repository
+            .record_application_root_attachment(
+                "gc-fields",
+                &session,
+                &root_task,
+                "digest",
+                "secret",
+            )
+            .unwrap();
+        repository
+            .detach_application_root(&session, &root_task)
+            .unwrap();
+    }
+
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let preview = |socket: &std::path::Path| {
+        let IpcResponse::GcPreview { entries, .. } =
+            send_request(socket, IpcRequest::PreviewGc).unwrap()
+        else {
+            panic!("expected a gc preview");
+        };
+        entries
+    };
+    let entry = |entries: &[yi_agent_store::ipc::IpcGcEntry], task: &TaskId| {
+        entries
+            .iter()
+            .find(|entry| entry.task_id == task.to_string())
+            .unwrap_or_else(|| panic!("{task} is not listed"))
+            .clone()
+    };
+
+    let entries = preview(daemon.socket_path());
+    assert_eq!(entries.len(), 3, "root plus two children: {entries:?}");
+    // The root branch is not an ancestor of main; the root worktree is clean.
+    let root_entry = entry(&entries, &root_task);
+    assert!(!root_entry.merged, "{root_entry:?}");
+    assert!(!root_entry.dirty, "{root_entry:?}");
+    // Both children are merged into their recorded `parent_branch`, and this must
+    // hold even though the owner worktree's HEAD has moved off that branch.
+    let merged_entry = entry(&entries, &merged_child);
+    assert!(
+        merged_entry.merged,
+        "a merged child must report merged despite the moved owner HEAD: {merged_entry:?}"
+    );
+    assert!(!merged_entry.dirty, "{merged_entry:?}");
+    let dirty_entry = entry(&entries, &dirty_child);
+    assert!(dirty_entry.merged, "{dirty_entry:?}");
+    assert!(
+        dirty_entry.dirty,
+        "an uncommitted edit must report dirty: {dirty_entry:?}"
+    );
+
+    // The preview removes nothing.
+    assert!(root_worktree.exists() && merged_worktree.exists() && dirty_worktree.exists());
+
+    // A candidate whose directory is gone is not reclaimable, so it must not be
+    // listed; the surviving children keep their answer via the repository-root
+    // fallback even though the owner worktree is now gone.
+    std::fs::remove_dir_all(&root_worktree).unwrap();
+    let entries = preview(daemon.socket_path());
+    assert_eq!(entries.len(), 2, "a directory-less root is not listable");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.task_id == root_task.to_string()),
+        "the reclaimed root must drop out of the listing"
+    );
+    assert!(
+        entry(&entries, &merged_child).merged,
+        "the fallback cwd must still answer the merge question"
+    );
+    assert!(entry(&entries, &dirty_child).dirty);
+}
+
+#[test]
+fn gc_token_gates_the_reclaim_call_not_just_the_response() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let reclaimed = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(ReclaimRecordingWorkspaceService {
+        reclaimed: Arc::clone(&reclaimed),
+    });
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: service,
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "gc-token-gate".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-gc-token-gate"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: "first prompt".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+    // Activation already drives the foreground root to `running`; a `StartWorker`
+    // here would be an illegal Running -> Running transition. The root's workspace
+    // row and directory exist from activation, which is all a reclaim needs.
+    let root_path = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_workspace_optional(&root_task_id.parse().unwrap())
+        .unwrap()
+        .expect("the activated root owns a workspace row")
+        .path;
+    assert!(
+        reclaimed.lock().unwrap().is_empty(),
+        "starting a worker must not reclaim anything"
+    );
+
+    // Get the directory out of the way for the detach, so the background reclaim
+    // that detach seeds finds nothing. The recorded list then starts empty, which
+    // is what makes the token's effect on the reclaim call observable.
+    std::fs::remove_dir_all(&root_path).unwrap();
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    );
+    // The detach seeds an asynchronous reclaim; give it a moment so it cannot
+    // land mid-assertion below and be mistaken for the confirm's work.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    reclaimed.lock().unwrap().clear();
+
+    // Restore the directory: the row survived the detach, so the session is a gc
+    // candidate again.
+    std::fs::create_dir_all(&root_path).unwrap();
+
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert_eq!(entries.len(), 1, "the detached root is listable again");
+
+    // A token the store never issued must not reach `reclaim_worktree` at all.
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc {
+            confirmation_token: "forged".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::Error { .. }),
+        "a forged token is rejected, got {response:?}"
+    );
+    assert!(
+        reclaimed.lock().unwrap().is_empty(),
+        "a rejected confirm must not reclaim anything, got {:?}",
+        reclaimed.lock().unwrap()
+    );
+    assert!(
+        root_path.exists(),
+        "a rejected confirm must leave the directory in place"
+    );
+
+    // The real token does reach it. Same request, same daemon; only the token
+    // differs, so the token is what gates the reclaim call.
+    let IpcResponse::GcPreview {
+        confirmation_token, ..
+    } = send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ConfirmGc { confirmation_token },
+        )
+        .unwrap(),
+        IpcResponse::GcCompleted { removed: 1 }
+    );
+    assert_eq!(
+        reclaimed.lock().unwrap().as_slice(),
+        &[root_path],
+        "an accepted confirm reclaims exactly the listed worktree"
+    );
 }
 
 #[test]
