@@ -2217,6 +2217,16 @@ impl RuntimeCoordinator {
             let Some(task_id) = candidate.task_id.parse::<TaskId>().ok() else {
                 continue;
             };
+            // Never reclaim a directory a live worker may still own. The design's
+            // Non-Goals exclude tasks that are still running, and a running child
+            // is not meaningfully "merged": a freshly created child worktree
+            // shares its parent's tip, so the ancestry check further down would
+            // report "merged" for a child that has done no work yet. The session
+            // root is the deliberate exception: it sits in `paused` (not a
+            // terminal state) and is reclaimed on detach by design.
+            if candidate.parent_task_id.is_some() && !task_state_is_terminal(&candidate.state) {
+                continue;
+            }
             // The owner is the parent's workspace when there is a parent, and the
             // repository root otherwise. A root's `parent_branch` is the main
             // branch, which a root branch rarely merges into, so the root is
@@ -3348,6 +3358,29 @@ fn review_persistence_error(
         ReviewPersistenceError::Supervisor(error) => RuntimeCoordinatorError::Supervisor(error),
         ReviewPersistenceError::Persistence(error) => error.into(),
     }
+}
+
+/// Whether a persisted task state is one the state machine calls terminal.
+///
+/// The labels are exactly the ones `task_state_label` writes
+/// (`yi-agent-core/src/subagent/supervisor.rs`), which is what lands in
+/// `tasks.state_json`. `paused` and `awaiting_parent_review` are deliberately
+/// absent: a detached root sits in `paused` and an un-integrated delivery sits
+/// in `awaiting_parent_review`, and neither may be reclaimed out from under its
+/// owner.
+fn task_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "completed"
+            | "completed_no_changes"
+            | "blocked"
+            | "stalled"
+            | "timed_out"
+            | "budget_exhausted"
+            | "failed"
+            | "cancelled"
+            | "recovery_required"
+    )
 }
 
 fn persisted_depth(depth: u8) -> Result<yi_agent_core::TaskDepth, RuntimeCoordinatorError> {

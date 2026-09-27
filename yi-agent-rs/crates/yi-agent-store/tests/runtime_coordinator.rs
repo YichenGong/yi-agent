@@ -4248,6 +4248,15 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
     )
     .unwrap();
 
+    // A merged child is terminal in production (its delivery was accepted). Drive
+    // it to a terminal state so this test exercises the merge gate rather than the
+    // state gate: a non-terminal child is refused outright now, which is what
+    // keeps a live worker's directory from being deleted.
+    coordinator
+        .cancel_task(&session, &merged, false)
+        .await
+        .unwrap();
+
     let reclaimed = coordinator.reclaim_session_worktrees(&session);
 
     assert!(
@@ -4368,6 +4377,15 @@ async fn reclaim_uses_the_recorded_parent_branch_not_the_owner_head() {
         "precondition: the side-track branch does not contain the merged delivery"
     );
 
+    // A merged child is terminal in production (its delivery was accepted). Drive
+    // it to a terminal state so this test exercises the merge gate rather than the
+    // state gate: a non-terminal child is refused outright now, which is what
+    // keeps a live worker's directory from being deleted.
+    coordinator
+        .cancel_task(&session, &merged, false)
+        .await
+        .unwrap();
+
     let reclaimed = coordinator.reclaim_session_worktrees(&session);
 
     assert!(
@@ -4452,5 +4470,79 @@ async fn reclaim_skips_the_merge_check_when_the_owner_directory_is_gone() {
     assert!(
         child_workspace.path.exists(),
         "the child keeps its directory: its integration state is unknown"
+    );
+}
+
+/// A freshly created child worktree shares its parent's tip, so the ancestry
+/// check reports "merged" for a child that has not committed anything. The state
+/// gate must refuse it anyway: a running child's directory is live, and deleting
+/// it breaks the worker mid-turn (the design's Non-Goals forbid reclaiming a task
+/// that is still running).
+#[tokio::test]
+async fn reclaim_session_worktrees_keeps_a_running_childs_directory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let root_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "still working".into(),
+            TaskWorkspaceMode::Coding,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    let child_workspace = factory
+        .starts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .workspace
+        .clone()
+        .unwrap();
+
+    // Precondition: the child has committed nothing, so its branch equals its
+    // parent's tip and the merge check would answer "merged". This is what makes
+    // the state gate load-bearing.
+    assert_eq!(
+        git_output(&child_workspace.path, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        git_output(&root_workspace.path, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        "precondition: an untouched child shares its parent's tip"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "running"
+    );
+
+    let reclaimed = coordinator.reclaim_session_worktrees(&session);
+
+    assert!(
+        child_workspace.path.exists(),
+        "a running child keeps its directory: a live worker still owns it"
+    );
+    assert_eq!(
+        reclaimed, 1,
+        "only the detached root is reclaimed; the running child is refused"
     );
 }
