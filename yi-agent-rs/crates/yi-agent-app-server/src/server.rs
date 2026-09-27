@@ -397,8 +397,15 @@ where
                             eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
                         }
                         // 记录到全局「最近目录」索引,供 thread/listAll 与侧栏复用。
-                        if let Err(e) = workspaces.add(Path::new(&cwd)) {
-                            eprintln!("[app-server] failed to record workspace {cwd}: {e}");
+                        // 索引键统一为 canonical,与 workspace/remove 的规范化对齐;
+                        // thread 的 cwd / meta 仍保持 `resolve_thread_cwd` 的原样。
+                        let index_path =
+                            std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(&cwd));
+                        if let Err(e) = workspaces.add(&index_path) {
+                            eprintln!(
+                                "[app-server] failed to record workspace {}: {e}",
+                                index_path.display()
+                            );
                         }
 
                         threads.insert(
@@ -462,6 +469,27 @@ where
                         else {
                             continue;
                         };
+                        // Design §8:内存中的 thread 知道其权威 cwd,若目标目录已被删除,
+                        // 必须明确报错,而不是经 store_lookup 回退到 cfg.workdir(那会让
+                        // 后续 load 落空,退化成含混的 -32011,甚至悄悄换到别的目录)。
+                        // 冷 thread 的 meta 存在 workspace 目录内,删目录后本就不可读,
+                        // 仍走下方的 -32011,不在此覆盖。
+                        if let Some(session) = threads.get(&thread_id) {
+                            if !Path::new(&session.cwd).is_dir() {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id.clone(),
+                                        RpcError::invalid_params(format!(
+                                            "working directory no longer exists: {}",
+                                            session.cwd
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
                         // 优先用内存中该 thread 的权威 store(与其 driver 共享 lock),
                         // 冷 thread 才按全局索引 / cfg.workdir 定位,再从中载入历史。
                         let thread_store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
@@ -2707,6 +2735,91 @@ mod tests {
         h.shutdown().await;
     }
 
+    /// 索引键必须规范化为 canonical,与 `workspace/remove` 的规范化对齐:否则符号
+    /// 链接形式的缺省 cwd 会以非 canonical 形式进索引,后续 remove 静默 no-op。
+    /// 用符号链接制造 `canonical != raw`,确保本测试确实覆盖该回归面。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_default_cwd_indexes_canonical_path() {
+        let real = tempfile::TempDir::new().unwrap();
+        let link_parent = tempfile::TempDir::new().unwrap();
+        let link = link_parent.path().join("linked");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let raw = link.to_string_lossy().to_string();
+        let canonical = link.canonicalize().unwrap();
+        assert_ne!(
+            raw,
+            canonical.to_string_lossy().to_string(),
+            "symlink must be non-canonical for this test to be meaningful"
+        );
+
+        let mut cfg = test_config();
+        cfg.workdir = link.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // 不带 cwd → 走缺省 cfg.workdir(即符号链接路径)。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let _tid = read_thread_start_response(&mut h, 2).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("workspace/list must respond");
+        let path = v["result"]["workspaces"][0]["path"]
+            .as_str()
+            .expect("index must contain the default cwd");
+        let recanon = Path::new(path)
+            .canonicalize()
+            .expect("indexed path must be canonicalizable");
+        assert_eq!(
+            recanon.to_string_lossy(),
+            path,
+            "index entry must already be canonical: {path}"
+        );
+        h.shutdown().await;
+    }
+
+    /// Design §11 的头号风险是「cwd 传递正确」:agent 工厂必须拿到该 thread 的 cwd,
+    /// 而非全局 workdir。用记录型工厂把实参钉死。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_factory_receives_thread_cwd() {
+        let target = tempfile::TempDir::new().unwrap();
+        let c = target.path().canonicalize().unwrap();
+
+        let seen: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_factory = Arc::clone(&seen);
+        let build = move |session: Option<yi_agent_core::Session>, cwd: &std::path::Path| {
+            seen_factory.lock().unwrap().push(cwd.to_path_buf());
+            build_test_agent(session, cwd)
+        };
+        let mut h = Harness::with_factory(build, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": c.to_string_lossy() }});
+        h.send(&req.to_string()).await;
+        let _tid = read_thread_start_response(&mut h, 2).await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![c.clone()],
+            "agent factory must receive the thread's canonical cwd"
+        );
+        h.shutdown().await;
+    }
+
     /// 两个目录各起一个 thread:`thread/listAll` 必须按 workspace 分成两组,每组
     /// 恰好含该目录的 thread(cwd 与 group.workspace 一致,thread_id 与 start 响应一致)。
     #[tokio::test(flavor = "multi_thread")]
@@ -3013,6 +3126,48 @@ mod tests {
         let v = h.read_value().await;
         assert_eq!(v["id"], 2);
         assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    /// Design §8:resume 的目标目录已不存在时必须明确报错,不得静默回退 `$HOME`。
+    /// 对内存中的 thread,其权威 cwd 已知(见 `ThreadSession`),故这是可达且必须
+    /// 报错的路径。冷 thread 的元数据本就存在 workspace 目录内,目录删除后不可读,
+    /// 那种情况仍走 `-32011`,不在此覆盖。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_missing_cwd_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let mut cfg = test_config();
+        cfg.workdir = cwd.clone();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{ "cwd": cwd.to_string_lossy() }});
+        h.send(&req.to_string()).await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        // 目录从磁盘消失:thread 仍在内存,但 cwd 已不可用。
+        std::fs::remove_dir_all(&cwd).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("thread/resume must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "resume into a vanished cwd must be invalid_params, not a silent fallback: {v}"
+        );
         h.shutdown().await;
     }
 
