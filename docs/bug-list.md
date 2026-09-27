@@ -46,3 +46,5 @@
   修复：view_image 编码后字节预算 + 阶梯降级 + 占位兜底（`crates/yi-agent-tools/src/fs/view_image.rs`）；验证：`cargo test -p yi-agent-tools --lib fs::view_image`。另注：实测（trace）auto-compact 不会触发（413 在 usage 到达前即 `return`），但手动 `/compact` 能解卡；compaction 图片 token 估算已从 0 改为显式 1844（`crates/yi-agent-core/src/compact.rs`）。
 - [ ] 如果遇到 entry too big问题。当前没有办法维持上下文，也不能compact（因为compact依赖合理上下文长度）。遇到这个情况只能丢弃session重来。
 - [ ] `compact_tool_budget_tokens` 默认值不一致：`agent.rs:118` 与 `runtime/config.rs:357` 为 `12_000`，但 `yi-agent/src/main.rs:1568` 覆写为 `4096`。非阻塞，但属潜在意外，需确认哪一个是期望默认。
+- [ ] 一个新问题。如何在desktop app里面，开启yolo模式。
+- [ ] 一个问题，如果一个对话前后过长，terminal会变得比较卡顿。TUI里面显示的上下文可以有舍弃。
