@@ -9,7 +9,7 @@
 
 | 模块 | 完成 / 总计 | 详情 |
 |---|---|---|
-| yi-agent-core | 18 / 18 | [详情](./yi-agent-core.md) |
+| yi-agent-core | 18 / 19 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 6 / 9 | [详情](./yi-agent-llm.md) |
 | yi-agent-tools | 12 / 12 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 8 / 8 | [详情](./yi-agent-skills.md) |
@@ -24,7 +24,7 @@
 | yi-agent-runtime | 10 / 10 | [详情](./yi-agent-runtime.md) |
 | yi-agent-app-server | 14 / 14 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 15 / 22 | [详情](./subagent-runtime.md) |
-| desktop | 14 / 28 | [详情](./desktop.md) |
+| desktop | 14 / 29 | [详情](./desktop.md) |
 
 ## 已知问题
 
