@@ -723,14 +723,24 @@ impl LineBuilder {
         }
     }
 
+    /// Push `text` as one or more lines, each folded into `self.width` display
+    /// columns. Unlike `flush_line` this never re-flows or trims whitespace: it
+    /// is for text that must survive verbatim (code blocks). Without it, a long
+    /// source line becomes a single over-wide `Line`, and ratatui truncates its
+    /// right side instead of wrapping it, silently losing content.
+    fn push_wrapped(&mut self, text: &str, style: Style, prefix: &str) {
+        let cont_prefix = " ".repeat(UnicodeWidthStr::width(prefix));
+        for chunk in wrap_by_display_width(text, (self.width as usize).max(1), prefix, &cont_prefix)
+        {
+            self.lines.push(Line::styled(chunk, style));
+        }
+    }
+
     fn flush_code_block(&mut self) {
-        let lang = self.code_block_lang.as_deref().unwrap_or("");
-        let _ = lang;
-        for code_line in self.code_block_buffer.lines() {
-            self.lines.push(Line::styled(
-                format!("  {code_line}"),
-                Style::new().fg(Color::Yellow),
-            ));
+        let style = Style::new().fg(Color::Yellow);
+        let buffer = std::mem::take(&mut self.code_block_buffer);
+        for code_line in buffer.lines() {
+            self.push_wrapped(code_line, style, "  ");
         }
     }
 
@@ -1574,6 +1584,61 @@ mod tests {
                 .iter()
                 .all(|line| { UnicodeWidthStr::width(spans_text(line).as_str()) <= 8 })
         );
+    }
+
+    /// Every rendered line must fit the requested width: a `Line` wider than the
+    /// terminal is truncated on the right by ratatui, silently losing content.
+    fn assert_lines_fit(lines: &[Line<'static>], width: u16, what: &str) {
+        for (i, line) in lines.iter().enumerate() {
+            let w = UnicodeWidthStr::width(spans_text(line).as_str());
+            assert!(
+                w <= width as usize,
+                "{what}: line {i} is {w} cols, width is {width}: {:?}",
+                spans_text(line)
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_lines_fold_to_width() {
+        // A single very long code line used to be emitted verbatim and clipped.
+        let src = "```rust\nfn main() { println!(\"a very long line of rust code that goes past eighty columns for sure\"); }\n```\n";
+        for width in [40u16, 60, 80] {
+            let lines = render_markdown(src, width);
+            assert_lines_fit(&lines, width, "code block");
+        }
+        // Folding must not lose characters: the code text survives intact.
+        let rendered: String = render_markdown(src, 40)
+            .iter()
+            .map(spans_text)
+            .collect::<Vec<_>>()
+            .join("");
+        let squashed: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+        let expected: String = "fn main() { println!(\"a very long line of rust code that goes past eighty columns for sure\"); }"
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            squashed.contains(&expected),
+            "code text was lost while folding: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn indented_code_block_folds_to_width() {
+        let src = "Example:\n\n    let x = some_function(argument_one, argument_two, argument_three, argument_four);\n";
+        for width in [40u16, 60, 80] {
+            assert_lines_fit(&render_markdown(src, width), width, "indented code");
+        }
+    }
+
+    #[test]
+    fn code_block_preserves_cjk_and_wraps_by_display_width() {
+        let src =
+            "```\n这是一条很长的中文代码注释内容需要按显示宽度折行否则右侧会被截断掉看不见\n```\n";
+        for width in [20u16, 40] {
+            assert_lines_fit(&render_markdown(src, width), width, "cjk code block");
+        }
     }
 
     #[test]

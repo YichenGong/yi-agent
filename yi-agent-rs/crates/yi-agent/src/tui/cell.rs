@@ -89,7 +89,7 @@ impl HistoryCell {
                 is_error,
                 expanded,
             } => render_tool_result(result_text, *is_error, *expanded, width),
-            Self::Separator { label } => vec![render_separator(label.as_deref(), width)],
+            Self::Separator { label } => render_separator(label.as_deref(), width),
             Self::PermissionRequest {
                 tool_name,
                 summary,
@@ -158,25 +158,42 @@ fn render_tool_call(
     input: &Value,
     state: CallState,
     expanded: bool,
-    _width: u16,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let (bullet, bullet_color) = match state {
         CallState::Running => ("●", Color::Yellow),
         CallState::Success => ("●", Color::Green),
         CallState::Failed => ("●", Color::Red),
     };
-    let input_summary = summarize_json(input, 60);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            bullet,
-            Style::new().fg(bullet_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(" {name}({input_summary})")),
-    ])];
+    let w = width.max(1) as usize;
+    let bullet_style = Style::new().fg(bullet_color).add_modifier(Modifier::BOLD);
+    // Fold by display width instead of truncating by character count: a
+    // character-based 60 "char" cut is 120 columns for CJK, and the tail of a
+    // clipped `Line` is dropped by ratatui rather than wrapped.
+    let summary = summarize_json(input, w.saturating_sub(3 + name.chars().count()));
+    let mut lines: Vec<Line<'static>> =
+        wrap_by_display_width(&format!(" {name}({summary})"), w, "●", "  ")
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                if i == 0 {
+                    Line::from(vec![
+                        Span::styled(bullet, bullet_style),
+                        Span::raw(chunk.strip_prefix('●').unwrap_or(&chunk).to_string()),
+                    ])
+                } else {
+                    Line::styled(chunk, Style::new().fg(Color::DarkGray))
+                }
+            })
+            .collect();
     if expanded {
         let full = format!("{input:#}");
         for line in full.lines() {
-            lines.push(Line::from(format!("  └ {line}")).style(Style::new().fg(Color::DarkGray)));
+            lines.extend(
+                wrap_by_display_width(line, w, "  └ ", "    ")
+                    .into_iter()
+                    .map(|chunk| Line::styled(chunk, Style::new().fg(Color::DarkGray))),
+            );
         }
     }
     lines
@@ -186,36 +203,61 @@ fn render_tool_result(
     text: &str,
     is_error: bool,
     expanded: bool,
-    _width: u16,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let arrow_color = if is_error { Color::Red } else { Color::Green };
-    let summary = truncate(text, 80);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "  └ ",
-            Style::new().fg(arrow_color).add_modifier(Modifier::DIM),
-        ),
-        Span::styled(summary, Style::new().add_modifier(Modifier::DIM)),
-    ])];
+    let w = width.max(1) as usize;
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let summary_style = Style::new().fg(arrow_color).add_modifier(Modifier::DIM);
+    // Only the first physical line is previewed when folded; the full text is
+    // available via [e]. Fold it by display width so a multi-byte preview is
+    // neither over-wide nor silently cut.
+    let summary = text.lines().next().unwrap_or("");
+    let mut lines: Vec<Line<'static>> = wrap_by_display_width(summary, w, "  └ ", "    ")
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            if i == 0 {
+                Line::styled(chunk, summary_style)
+            } else {
+                Line::styled(chunk, dim)
+            }
+        })
+        .collect();
     if expanded {
         for line in text.lines() {
-            lines.push(
-                Line::from(format!("    {line}")).style(Style::new().add_modifier(Modifier::DIM)),
+            lines.extend(
+                wrap_by_display_width(line, w, "    ", "    ")
+                    .into_iter()
+                    .map(|chunk| Line::styled(chunk, dim)),
             );
         }
     }
     lines
 }
 
-fn render_separator(label: Option<&str>, width: u16) -> Line<'static> {
-    let w = width as usize;
+/// A separator is always exactly `width` columns wide when it has no label.
+/// With a label the text is folded to `width` (a long provider error used to
+/// become one over-wide `Line` whose tail was clipped), and the last physical
+/// line is padded with `─` so the separator still reads as a full-width rule.
+fn render_separator(label: Option<&str>, width: u16) -> Vec<Line<'static>> {
+    let w = width.max(1) as usize;
+    let dim = Style::new().add_modifier(Modifier::DIM);
     match label {
-        None => Line::from("─".repeat(w)).style(Style::new().add_modifier(Modifier::DIM)),
+        None => vec![Line::from("─".repeat(w)).style(dim)],
         Some(l) => {
-            let prefix = format!("─ {l} ");
-            let remaining = w.saturating_sub(prefix.chars().count());
-            Line::from(format!("{prefix}{}", "─".repeat(remaining)))
-                .style(Style::new().add_modifier(Modifier::DIM))
+            let mut wrapped = wrap_by_display_width(l, w, "─ ", "  ");
+            let last = wrapped.len().saturating_sub(1);
+            for (i, chunk) in wrapped.iter_mut().enumerate() {
+                if i == last {
+                    let used = UnicodeWidthStr::width(chunk.as_str());
+                    chunk.push_str(&"─".repeat(w.saturating_sub(used)));
+                }
+            }
+            wrapped
+                .into_iter()
+                .map(|chunk| Line::styled(chunk, dim))
+                .collect()
         }
     }
 }
@@ -344,17 +386,23 @@ fn render_permission_resolved(
 
 // --- Helpers ---
 
-fn summarize_json(v: &Value, max_len: usize) -> String {
+/// One-line summary of a tool input, capped at `max_width` display columns.
+///
+/// Capped by display width (not character count) so a CJK payload cannot reach
+/// twice the intended width; `wrap_by_display_width` still folds the assembled
+/// `name(...)` header if a long tool name leaves no room.
+fn summarize_json(v: &Value, max_width: usize) -> String {
     let s = v.to_string();
-    truncate(&s, max_len)
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
+    let truncated = crate::tui::wrap::truncate_to_width(&s, max_width);
+    if truncated == s {
+        s
     } else {
-        let cut: String = s.chars().take(max_len.saturating_sub(3)).collect();
-        format!("{cut}...")
+        // truncate_to_width appends '…'; match the previous "..." marker look.
+        let cut = truncated.chars().count();
+        format!(
+            "{}...",
+            s.chars().take(cut.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
@@ -365,6 +413,14 @@ fn wrap_with_prefix(
     cont_prefix: &str,
 ) -> Vec<Line<'static>> {
     let max_w = width as usize;
+    // A terminal narrower than the two-column prefix cannot show it; drop the
+    // prefix entirely so the content still fits the line it is rendered into.
+    let (first_prefix, cont_prefix): (Span<'static>, &str) =
+        if max_w <= UnicodeWidthStr::width(first_prefix.content.as_ref()) {
+            (Span::raw(""), "")
+        } else {
+            (first_prefix, cont_prefix)
+        };
     // 段内自动换行的辅助函数：按显示宽度把单词拼到 current 里。
     // 单个"词"超过行宽时（CJK 无空格文本常见），按字符拆分。
     let wrap_segment = |seg: &str, out: &mut Vec<String>| {
@@ -537,7 +593,7 @@ mod tests {
             label: Some("Worked for 2m".into()),
         };
         let lines = cell.lines(40);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 1, "a short label must stay on one line");
         let s: String = lines[0]
             .spans
             .iter()
@@ -644,6 +700,20 @@ mod tests {
                     .map(|s| s.content.to_string())
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[test]
+    fn user_message_wraps_long_unbroken_token_at_terminal_boundaries() {
+        // A path or command with no spaces is a single "word" here; the wrapper
+        // splits it only when it exceeds the whole line, so its head and tail
+        // used to be emitted on one over-wide line and clipped on the right.
+        let path = "/Users/someone/Documents/TechnicalStuff/projects/personalProjects/yi-agent/yi-agent-rs/crates/yi-agent/src/tui/cell.rs";
+        for width in [20u16, 40] {
+            let cell = HistoryCell::UserMessage {
+                text: path.to_string(),
+            };
+            assert_cell_fits(&cell, width, "long user path");
         }
     }
 
@@ -825,6 +895,93 @@ mod tests {
                 "width {width}: CJK line too wide: {widths:?}"
             );
         }
+    }
+
+    fn assert_cell_fits(cell: &HistoryCell, width: u16, what: &str) {
+        for (i, line) in cell.lines(width).iter().enumerate() {
+            let w = UnicodeWidthStr::width(joined_text(std::slice::from_ref(line)).as_str());
+            assert!(
+                w <= width as usize,
+                "{what}: line {i} is {w} cols, width is {width}: {:?}",
+                joined_text(std::slice::from_ref(line))
+            );
+        }
+    }
+
+    const LONG_CJK: &str =
+        "这是一条很长的中文内容需要按显示宽度折行否则右侧会被截断掉看不见真的看不见";
+
+    #[test]
+    fn tool_call_summary_and_expansion_never_exceed_width() {
+        let input = serde_json::json!({
+            "command": LONG_CJK,
+            "note": "a plain ascii payload that is also long enough to overflow a narrow terminal for sure"
+        });
+        for expanded in [false, true] {
+            for width in [20u16, 40, 60] {
+                let cell = HistoryCell::ToolCall {
+                    id: "1".into(),
+                    name: "bash".into(),
+                    input: input.clone(),
+                    state: CallState::Success,
+                    expanded,
+                };
+                assert_cell_fits(&cell, width, "tool call");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_summary_and_expansion_never_exceed_width() {
+        let text = format!(
+            "{LONG_CJK}\n\nsecond line that is also quite long and will overflow a narrow terminal"
+        );
+        for expanded in [false, true] {
+            for width in [20u16, 40, 60] {
+                let cell = HistoryCell::ToolResult {
+                    id: "1".into(),
+                    result_text: text.clone(),
+                    is_error: false,
+                    expanded,
+                };
+                assert_cell_fits(&cell, width, "tool result");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_cannot_be_hidden_by_character_count_truncation() {
+        // Character-count truncation kept 40 CJK chars, which are 80 display
+        // columns: the "shortened" summary was still twice the width.
+        let cell = HistoryCell::ToolResult {
+            id: "1".into(),
+            result_text: LONG_CJK.into(),
+            is_error: false,
+            expanded: false,
+        };
+        assert_cell_fits(&cell, 40, "cjk tool result");
+    }
+
+    #[test]
+    fn separator_label_folds_long_error_text() {
+        let label = format!("Error: {LONG_CJK}");
+        for width in [20u16, 40, 80] {
+            assert_cell_fits(
+                &HistoryCell::Separator {
+                    label: Some(label.clone()),
+                },
+                width,
+                "separator with label",
+            );
+        }
+    }
+
+    #[test]
+    fn separator_without_label_still_spans_the_width() {
+        let cell = HistoryCell::Separator { label: None };
+        let lines = cell.lines(40);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(UnicodeWidthStr::width(joined_text(&lines).as_str()), 40);
     }
 
     #[test]

@@ -15,7 +15,6 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use unicode_width::UnicodeWidthStr;
 
 use yi_agent_core::AgentEvent;
 
@@ -394,6 +393,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 &task_registry,
                 active_process_count,
                 model,
+                chunks[2].width,
             );
             f.render_widget(statusbar_line, chunks[2]);
 
@@ -2484,14 +2484,12 @@ fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) 
     if pending_quit {
         return 1;
     }
-    const PREFIX_LEN: usize = 2;
-    let avail = (area_width as usize).saturating_sub(PREFIX_LEN).max(1);
-    let total_width = UnicodeWidthStr::width(input.buffer.as_str());
-    if total_width == 0 {
-        return 1;
-    }
-    let lines = total_width.div_ceil(avail);
-    lines.max(1) as u16
+    // Derive the height from the exact same wrapping the renderer uses. The
+    // previous `div_ceil(width)` estimate was wrong for explicit newlines and
+    // for per-character wrapping, and a too-small height silently hides the
+    // overflow rows (the terminal only reserves `height` rows for the input).
+    let prefix = Span::raw("> ");
+    wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width).len() as u16
 }
 
 /// Pre-computed screen layout, shared between the draw closure and the mouse
@@ -2557,9 +2555,8 @@ fn wrap_input_buffer(
     // character at the cursor byte offset if it falls within this chunk.
     // Returns a Vec of spans (without prefix — caller adds prefix).
     let build_spans = |text: &str, chunk_start: usize| -> Vec<Span<'static>> {
-        if text.is_empty() {
-            return vec![Span::raw(String::new())];
-        }
+        // Note: an empty chunk still needs the cursor render below, so a blank
+        // line (or the position after a trailing '\n') can show it.
         // Find if cursor is within this chunk
         // Cursor byte offset relative to chunk start
         let cursor_rel = cursor.checked_sub(chunk_start);
@@ -2599,46 +2596,51 @@ fn wrap_input_buffer(
         }
     };
 
-    // Compute the display width of the buffer.
+    // Empty buffer: show the cursor at position 0 as a styled space.
     if buffer.is_empty() {
-        // Empty buffer: show cursor at position 0 (a space with cursor style)
         return vec![Line::from(vec![
             prefix.clone(),
             Span::styled(" ", cursor_style),
         ])];
     }
-    if UnicodeWidthStr::width(buffer) <= avail {
-        let spans = build_spans(buffer, 0);
-        let mut all_spans = vec![prefix.clone()];
-        all_spans.extend(spans);
-        return vec![Line::from(all_spans)];
+
+    // Split by explicit newlines first: a pasted multi-line block used to be
+    // one span holding raw '\n's, which renders as a single over-wide (and
+    // mis-shaped) line whose tail ratatui drops. Byte offsets are tracked so
+    // the reverse-video cursor still lands on the right character.
+    let mut raw_lines: Vec<(usize, String)> = Vec::new();
+    let mut segment_start = 0usize;
+    for segment in buffer.split('\n') {
+        raw_lines.push((segment_start, segment.to_string()));
+        segment_start += segment.len() + 1; // +1 for the consumed '\n'
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-    let mut chunk_start = 0usize;
+    for (seg_start, segment) in raw_lines {
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        let mut chunk_start = seg_start;
 
-    for ch in buffer.chars() {
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width + ch_width > avail && !current.is_empty() {
-            // Flush current line
-            let chunk = std::mem::take(&mut current);
-            let spans = build_spans(&chunk, chunk_start);
-            let mut all_spans = if lines.is_empty() {
-                vec![prefix.clone()]
-            } else {
-                vec![Span::raw("  ")]
-            };
-            all_spans.extend(spans);
-            lines.push(Line::from(all_spans));
-            chunk_start += chunk.len();
-            current_width = 0;
+        for ch in segment.chars() {
+            let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width + ch_width > avail && !current.is_empty() {
+                let chunk = std::mem::take(&mut current);
+                let spans = build_spans(&chunk, chunk_start);
+                let mut all_spans = if lines.is_empty() {
+                    vec![prefix.clone()]
+                } else {
+                    vec![Span::raw("  ")]
+                };
+                all_spans.extend(spans);
+                lines.push(Line::from(all_spans));
+                chunk_start += chunk.len();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
         }
-        current.push(ch);
-        current_width += ch_width;
-    }
-    if !current.is_empty() {
+        // Push the segment's final chunk, even when empty, so blank lines and
+        // the trailing cursor position survive.
         let spans = build_spans(&current, chunk_start);
         let mut all_spans = if lines.is_empty() {
             vec![prefix.clone()]
@@ -2648,6 +2650,7 @@ fn wrap_input_buffer(
         all_spans.extend(spans);
         lines.push(Line::from(all_spans));
     }
+
     if lines.is_empty() {
         let all_spans = vec![prefix.clone(), Span::styled(" ", cursor_style)];
         lines.push(Line::from(all_spans));
@@ -2659,6 +2662,86 @@ fn wrap_input_buffer(
 mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn multiline_paste_respects_newlines_and_width() {
+        // A paste with explicit newlines was pushed through as raw text: the
+        // '\n's stayed inside one span and the line overflowed the terminal.
+        let prefix = Span::raw("> ");
+        let text = "first line\n\nsecond line that is long enough to wrap\nthird";
+        let mut inp = InputLine::new();
+        inp.buffer = text.into();
+        let width = 40u16;
+        let lines = wrap_input_buffer(&inp.buffer, inp.cursor, &prefix, width);
+        for (i, line) in lines.iter().enumerate() {
+            let t: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+            assert!(
+                !t.contains('\n'),
+                "input line {i} still holds a raw newline: {t:?}"
+            );
+            let w = UnicodeWidthStr::width(t.as_str());
+            assert!(w <= width as usize, "input line {i} is {w} cols: {t:?}");
+        }
+        assert_eq!(
+            compute_input_height(&inp, false, width) as usize,
+            lines.len(),
+            "height must equal the wrapped line count"
+        );
+    }
+
+    #[test]
+    fn pasted_long_line_is_wrapped_not_clipped() {
+        // A bracketed paste arrives as one chunk with no newlines. The wrapper
+        // used to split only on '\n' and emit a single over-wide line, whose
+        // tail ratatui silently dropped.
+        let pasted = "x".repeat(300) + &"中".repeat(60) + "TAIL";
+        let width = 40u16;
+        let lines = wrap_input_buffer(&pasted, 0, &Span::raw("> "), width);
+        for (i, line) in lines.iter().enumerate() {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(
+                w <= width as usize,
+                "input line {i} is {w} cols, width is {width}"
+            );
+        }
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            rendered.contains("TAIL"),
+            "pasted tail was dropped: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn input_height_matches_the_wrapped_line_count() {
+        // The height must come from the same wrapping the renderer uses;
+        // counting `div_ceil(width)` mis-sized CJK input and hid lines.
+        let prefix = Span::raw("> ");
+        for width in [20u16, 33, 40] {
+            for text in [
+                "a".repeat(200),
+                "中".repeat(120),
+                "mixed 中文 and ascii ".repeat(20),
+                String::new(),
+            ] {
+                let mut inp = InputLine::new();
+                inp.buffer = text.clone();
+                let expected = wrap_input_buffer(&inp.buffer, inp.cursor, &prefix, width).len();
+                assert_eq!(
+                    compute_input_height(&inp, false, width) as usize,
+                    expected,
+                    "width {width} text {text:?}"
+                );
+            }
+        }
+    }
 
     /// The TUI's slash commands must talk to the same daemon the CLI does.
     /// They used to fall back to `~/.yi-agent/runtime`, while the daemon listens

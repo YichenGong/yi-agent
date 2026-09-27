@@ -599,6 +599,22 @@ impl<'a> Widget for HistoryView<'a> {
             if is_selected {
                 line = line.style(Style::new().add_modifier(Modifier::REVERSED));
             }
+            // ratatui truncates an over-wide `Line` on the right instead of
+            // wrapping it (see `Line::render_with_alignment`), and this rect is
+            // one row tall, so any overflow is permanently invisible. Every
+            // producer is expected to fold to `text_width`; catch a new one
+            // immediately rather than letting the user lose text.
+            // A zero-width viewport renders nothing (ratatui ignores an empty
+            // rect), so there is no width to satisfy.
+            debug_assert!(
+                text_width == 0 || line.width() <= text_width as usize,
+                "history line wider than the viewport: {} > {text_width}: {:?}",
+                line.width(),
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            );
             line.render(
                 Rect {
                     x,
@@ -642,6 +658,109 @@ mod tests {
             ],
             selected: None,
             scroll_offset: 0,
+        }
+    }
+
+    /// The render layer asserts every line fits `text_width`, because ratatui
+    /// clips (never wraps) an over-wide `Line` inside its one-row rect. Feed it
+    /// one cell of every kind, including over-wide ones, and prove nothing is
+    /// lost off the right edge.
+    #[test]
+    fn rendered_history_never_exceeds_terminal_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        let cjk = "这是一条很长的中文内容需要按显示宽度折行否则右侧会被截断掉看不见";
+        let mut state = HistoryState::new();
+        let width = 40u16;
+        state.push_event(AgentEvent::AssistantText("reply:\n\n".into()), width);
+        state.push_event(
+            AgentEvent::AssistantText(format!("```\n{cjk}{cjk}\n```\n")),
+            width,
+        );
+        state.push_event(
+            AgentEvent::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": cjk}),
+            },
+            width,
+        );
+        state.push_event(tool_result("1", false), width);
+        state.push_event(
+            AgentEvent::Error(yi_agent_core::AgentError::ProviderTurnAdmission(
+                cjk.to_string(),
+            )),
+            width,
+        );
+        state.push(
+            HistoryCell::Separator {
+                label: Some(cjk.into()),
+            },
+            width,
+        );
+        state.push(HistoryCell::UserMessage { text: cjk.into() }, width);
+        state.push(
+            HistoryCell::AssistantMessage {
+                markdown: format!("{cjk}\n\n{cjk}"),
+            },
+            width,
+        );
+        // Widen an expandable cell so the expanded path is covered too.
+        state.push_event(
+            AgentEvent::ToolResult {
+                id: "2".into(),
+                result: yi_agent_core::ToolResult::text(cjk),
+            },
+            width,
+        );
+
+        let (w, _) = (width, ());
+        for (cell_index, cell) in state.cells.iter().enumerate() {
+            let mut expanded = cell.clone();
+            if expanded.is_foldable() {
+                expanded.toggle_fold();
+            }
+            for (variant, cell) in [("folded", cell.clone()), ("toggled", expanded)] {
+                for (i, line) in cell.lines(w).iter().enumerate() {
+                    let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+                    assert!(
+                        !text.contains('\n'),
+                        "cell {cell_index} ({variant}) line {i} holds a raw newline"
+                    );
+                    let lw = UnicodeWidthStr::width(text.as_str());
+                    assert!(
+                        lw <= w as usize,
+                        "cell {cell_index} ({variant}) line {i} is {lw} cols > {w}: {text:?}"
+                    );
+                }
+            }
+        }
+
+        // And render for real: ratatui must never have to clip.
+        let backend = TestBackend::new(width, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    HistoryView {
+                        state: &state,
+                        width: area.width,
+                    },
+                    area,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text_width = state.text_width(width, 24);
+        for y in 0..24u16 {
+            for x in text_width..width {
+                let sym = buffer[(x, y)].symbol();
+                assert!(
+                    sym == " " || sym == "█" || sym == "▲" || sym == "▼",
+                    "column {x} (>= text_width {text_width}) row {y} holds {sym:?}:                      a line was right-clipped into the scrollbar column"
+                );
+            }
         }
     }
 
