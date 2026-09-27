@@ -49,3 +49,4 @@
 - [ ] `compact_tool_budget_tokens` 默认值不一致：`agent.rs:118` 与 `runtime/config.rs:357` 为 `12_000`，但 `yi-agent/src/main.rs:1568` 覆写为 `4096`。非阻塞，但属潜在意外，需确认哪一个是期望默认。
 - [ ] 一个新问题。如何在desktop app里面，开启yolo模式。
 - [ ] 一个问题，如果一个对话前后过长，terminal会变得比较卡顿。TUI里面显示的上下文可以有舍弃。
+- [ ] app目前不支持后台进程。如果一个进程在跑，就没办法检查其他的进程的状态了。
