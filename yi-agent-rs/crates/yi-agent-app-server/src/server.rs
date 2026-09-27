@@ -2816,13 +2816,30 @@ mod tests {
         }
         let tid = tid.expect("no thread/start response");
 
+        // 把 `d` 从全局索引移除。此后只有「内存中该 thread 的权威 store」还能
+        // 指向 `d`;若 rename/delete 退化成 store_for(索引 → cfg.workdir),
+        // 就会落到全局 workdir `w` 上,从而暴露路由回归。
+        let remove = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/remove",
+            "params": { "path": d_dir.to_string_lossy() },
+        });
+        h.send(&remove.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 3);
+        assert!(
+            v.get("error").is_none(),
+            "workspace/remove must succeed: {v}"
+        );
+
         // rename 必须落在 `d`,而不是全局 workdir `w`。
         h.send(&format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/rename","params":{{"threadId":"{tid}","title":"scoped"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/rename","params":{{"threadId":"{tid}","title":"scoped"}}}}"#
         ))
         .await;
         let v = h.read_value().await;
-        assert_eq!(v["id"], 3);
+        assert_eq!(v["id"], 4);
         assert!(v.get("error").is_none(), "rename must succeed: {v}");
 
         let in_d = crate::thread_store::ThreadStore::new(&d_dir)
@@ -2837,11 +2854,11 @@ mod tests {
 
         // delete 同样必须作用在 `d`。
         h.send(&format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
         ))
         .await;
         let v = h.read_value().await;
-        assert_eq!(v["id"], 4);
+        assert_eq!(v["id"], 5);
         assert!(v.get("error").is_none(), "delete must succeed: {v}");
         assert!(
             !crate::thread_store::ThreadStore::new(&d_dir).exists(&tid),
