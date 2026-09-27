@@ -30,15 +30,15 @@ function formatError(e: unknown): string {
 }
 
 /**
- * `thread/resume` does not carry the permission mode, so it is read back from
- * the `thread/listAll` groups. Old servers / old threads omit the field.
+ * Read the persisted permission mode for a thread from the `thread/listAll`
+ * groups. `thread/resume`/`thread/start` responses do not carry the mode, so it
+ * is read back from the listing. Returns `null` when the thread is absent from
+ * the listing (so callers never mistake "unknown" for "normal"); a present
+ * thread with an omitted `permission_mode` (legacy) is treated as "normal".
  */
-function modeForThread(groups: WorkspaceGroup[], id: string): ThreadMode {
-  return (
-    groups
-      .flatMap((g) => g.threads)
-      .find((t) => t.thread_id === id)?.permission_mode ?? "normal"
-  );
+function modeForThread(groups: WorkspaceGroup[], id: string): ThreadMode | null {
+  const t = groups.flatMap((g) => g.threads).find((th) => th.thread_id === id);
+  return t ? (t.permission_mode ?? "normal") : null;
 }
 
 export default function App() {
@@ -53,20 +53,21 @@ export default function App() {
   const [status, setStatus] = useState<string>("connecting");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [mode, setMode] = useState<ThreadMode>("normal");
+  const [mode, setMode] = useState<ThreadMode | null>(null);
 
   const busy = session.turnActive;
 
-  const refreshThreads = async (): Promise<WorkspaceGroup[]> => {
+  const refreshThreads = async (): Promise<WorkspaceGroup[] | null> => {
     const c = clientRef.current;
-    if (!c) return [];
+    if (!c) return null;
     try {
       const r = await c.request<{ groups: WorkspaceGroup[] }>("thread/listAll", {});
       setGroups(r.groups);
       return r.groups;
     } catch {
-      // 列表刷新失败不打断对话;下一次事件会再试。
-      return [];
+      // 列表刷新失败不打断对话;下一次事件会再试。返回 null 表示"未知",
+      // 调用方不得据此把权限模式误判为 normal。
+      return null;
     }
   };
 
@@ -87,29 +88,30 @@ export default function App() {
     resuming.current = true;
     // 必须同步 reset:回放通知可能先于 resume 响应到达。
     session.reset();
+    // 切换即进入"未知":在解析出新线程模式前,不得继续沿用上一线程的标签。
+    setMode(null);
     force((v) => v + 1);
-    let resumedId: string | null = null;
     try {
       const t = await c.request<ThreadInfo & { thread_id: string }>("thread/resume", {
         threadId,
       });
-      resumedId = t.thread_id;
       setThreadId(t.thread_id);
       setThreadInfo({ cwd: t.cwd, model: t.model });
+      // thread/resume 响应不带权限模式,从 listAll 回读后再应用。回读发生在
+      // resuming 期间,使第二个 resume 无法并发覆盖本轮的 setMode。
+      const gs = await refreshThreads();
+      if (gs !== null) setMode(modeForThread(gs, t.thread_id));
     } catch (e) {
       session.lastError = formatError(e);
       setThreadId(null);
       setThreadInfo(null);
-      setMode("normal");
+      setMode(null);
       force((v) => v + 1);
     } finally {
-      // 回放通知先于响应到达,故响应返回即代表本轮回放已全部应用;
-      // 此时才允许下一次 resume,避免两个 thread 的历史交错合并。
+      // 回放通知先于响应到达,故响应返回即代表本轮回放已全部应用;此时才允许
+      // 下一次 resume,避免两个 thread 的历史交错合并。
       resuming.current = false;
     }
-    // thread/resume 响应不带权限模式,从 listAll 回读后再应用到 chip。
-    const gs = await refreshThreads();
-    if (resumedId !== null) setMode(modeForThread(gs, resumedId));
   };
 
   const newThread = async (cwd?: string) => {
@@ -117,28 +119,27 @@ export default function App() {
     if (!c || session.turnActive || resuming.current) return;
     resuming.current = true;
     session.reset();
+    setMode(null);
     force((v) => v + 1);
-    let startedId: string | null = null;
     try {
       const t = await c.request<ThreadInfo & { thread_id: string }>(
         "thread/start",
         threadStartParams(cwd),
       );
-      startedId = t.thread_id;
       setThreadId(t.thread_id);
       setThreadInfo({ cwd: t.cwd, model: t.model });
+      // 新对话默认 normal;仍从 listAll 回读以与服务端保持一致。
+      const gs = await refreshThreads();
+      if (gs !== null) setMode(modeForThread(gs, t.thread_id));
     } catch (e) {
       session.lastError = formatError(e);
       setThreadId(null);
       setThreadInfo(null);
-      setMode("normal");
+      setMode(null);
       force((v) => v + 1);
     } finally {
       resuming.current = false;
     }
-    // 新对话默认 normal;仍从 listAll 回读以与服务端保持一致。
-    const gs = await refreshThreads();
-    if (startedId !== null) setMode(modeForThread(gs, startedId));
   };
 
   /** 打开原生文件夹选择器,返回选中的绝对路径(取消则 null)。 */
@@ -226,7 +227,7 @@ export default function App() {
       session.reset();
       setThreadId(null);
       setThreadInfo(null);
-      setMode("normal");
+      setMode(null);
       force((v) => v + 1);
     }
     await refreshThreads();

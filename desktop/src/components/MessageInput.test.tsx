@@ -26,6 +26,11 @@ describe("MessageInput", () => {
     expect(modeTrigger().textContent).toContain("YOLO");
   });
 
+  it("disables the chip when the mode is unknown (null)", () => {
+    renderInput({ mode: null });
+    expect((modeTrigger() as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("forwards YOLO (after confirm) and Normal (immediately) to onModeChange", () => {
     const enable = vi.fn();
     const { unmount } = renderInput({ mode: "normal", onModeChange: enable });

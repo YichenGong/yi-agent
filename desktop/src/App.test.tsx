@@ -2,9 +2,20 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 
+type Mode = "normal" | "yolo";
+type ThreadSeed = { thread_id: string; title: string | null; permission_mode: Mode };
+
 const { clients, state } = vi.hoisted(() => ({
   clients: [] as Array<{ requests: { method: string; params: unknown }[] }>,
-  state: { mode: "normal" as "normal" | "yolo", failSet: false },
+  state: {
+    mode: "normal" as Mode,
+    failSet: false,
+    failList: false,
+    // `null` → fall back to a single t1 whose mode follows `state.mode`
+    // (keeps the legacy tests terse). Tests that need a second thread or
+    // per-thread modes set this explicitly.
+    threads: null as ThreadSeed[] | null,
+  },
 }));
 
 vi.mock("./lib/rpc", () => ({
@@ -24,28 +35,34 @@ vi.mock("./lib/rpc", () => ({
     }
     async request(method: string, params: unknown) {
       this.requests.push({ method, params });
-      if (method === "thread/listAll")
+      if (method === "thread/listAll") {
+        if (state.failList) throw { code: -1, message: "list failed" };
+        const seeds =
+          state.threads ??
+          [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
         return {
           groups: [
             {
               workspace: "/w",
               exists: true,
-              threads: [
-                {
-                  thread_id: "t1",
-                  cwd: "/w",
-                  model: "m",
-                  created_at: 0,
-                  updated_at: 0,
-                  title: null,
-                  permission_mode: state.mode,
-                },
-              ],
+              threads: seeds.map((t) => ({
+                thread_id: t.thread_id,
+                cwd: "/w",
+                model: "m",
+                created_at: 0,
+                updated_at: 0,
+                title: t.title,
+                permission_mode: t.permission_mode,
+              })),
             },
           ],
         };
+      }
       if (method === "workspace/list") return { workspaces: [] };
-      if (method === "thread/resume") return { thread_id: "t1", cwd: "/w", model: "m" };
+      if (method === "thread/resume") {
+        const { threadId } = params as { threadId: string };
+        return { thread_id: threadId, cwd: "/w", model: "m" };
+      }
       if (method === "thread/setPermissionMode") {
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
         return {};
@@ -63,6 +80,8 @@ beforeEach(() => {
   clients.length = 0;
   state.mode = "normal";
   state.failSet = false;
+  state.failList = false;
+  state.threads = null;
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -129,5 +148,39 @@ describe("App YOLO wiring", () => {
     state.mode = "yolo";
     render(<App />);
     await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+  });
+
+  it("reflects the new thread's mode when switching threads", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "yolo" },
+    ];
+    render(<App />);
+    // Auto-resumes the first thread → Normal.
+    await waitFor(() => expect(modeTrigger().textContent).toContain("Normal"));
+
+    // Clicking the sidebar row bubbles to its onSelect handler.
+    fireEvent.click(screen.getByText("two"));
+
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/resume",
+        params: { threadId: "t2" },
+      }),
+    );
+  });
+
+  it("does not falsely claim Normal when thread/listAll fails", async () => {
+    state.failList = true;
+    render(<App />);
+
+    // The mount path throws and surfaces an error status.
+    await waitFor(() => expect(screen.getByText(/error:/i)).toBeTruthy());
+
+    const chip = modeTrigger() as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    expect(chip.textContent).not.toContain("Normal");
+    expect(chip.textContent).not.toContain("YOLO");
   });
 });

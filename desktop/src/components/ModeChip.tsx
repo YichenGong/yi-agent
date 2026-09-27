@@ -18,7 +18,7 @@ export function ModeChip({
   onChange,
   disabled,
 }: {
-  mode: ThreadMode;
+  mode: ThreadMode | null;
   onChange: (mode: ThreadMode) => void;
   disabled?: boolean;
 }) {
@@ -54,7 +54,7 @@ export function ModeChip({
   // Move focus into whichever surface just opened.
   useEffect(() => {
     if (!open) return;
-    const idx = OPTIONS.indexOf(mode);
+    const idx = mode === null ? 0 : OPTIONS.indexOf(mode);
     itemRefs.current[idx]?.focus();
   }, [open, mode]);
 
@@ -63,6 +63,8 @@ export function ModeChip({
   }, [confirming]);
 
   const isYolo = mode === "yolo";
+  // An unknown mode (no thread / failed lookup) must not masquerade as "Normal".
+  const label = mode === null ? "Mode" : LABEL[mode];
 
   const choose = (next: ThreadMode) => {
     if (next === mode) {
@@ -109,7 +111,7 @@ export function ModeChip({
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={`Permission mode: ${LABEL[mode]}`}
+        aria-label={`Permission mode: ${mode === null ? "unknown" : LABEL[mode]}`}
         disabled={disabled}
         onClick={() => {
           if (!confirming) setOpen((v) => !v);
@@ -120,7 +122,7 @@ export function ModeChip({
             : "border-neutral-700 text-neutral-400 hover:bg-neutral-800"
         }`}
       >
-        {LABEL[mode]}
+        {label}
       </button>
 
       {open && !confirming && (

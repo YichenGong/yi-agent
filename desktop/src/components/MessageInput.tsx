@@ -12,7 +12,7 @@ export function MessageInput({
   turnActive: boolean;
   onSend: (text: string) => Promise<boolean>;
   onInterrupt: () => void;
-  mode: ThreadMode;
+  mode: ThreadMode | null;
   onModeChange: (mode: ThreadMode) => void;
 }) {
   const [text, setText] = useState("");
@@ -48,7 +48,7 @@ export function MessageInput({
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
         className="flex-1 resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-500 focus:outline-none disabled:opacity-50"
       />
-      <ModeChip mode={mode} onChange={onModeChange} />
+      <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
       <button
         type="button"
         onClick={turnActive ? onInterrupt : () => void handleSend()}

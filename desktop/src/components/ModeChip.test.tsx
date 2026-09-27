@@ -180,4 +180,18 @@ describe("ModeChip", () => {
     fireEvent.keyDown(document, { key: "Escape" });
     expect(document.activeElement).toBe(trigger());
   });
+
+  it("renders a neutral, disabled trigger when the mode is unknown (null)", () => {
+    const { container } = render(
+      <ModeChip mode={null} onChange={vi.fn()} disabled />,
+    );
+    const el = trigger() as HTMLButtonElement;
+    expect(el.disabled).toBe(true);
+    // The unknown state must never masquerade as a real mode.
+    expect(el.textContent).not.toContain("Normal");
+    expect(el.textContent).not.toContain("YOLO");
+
+    fireEvent.click(el);
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+  });
 });
