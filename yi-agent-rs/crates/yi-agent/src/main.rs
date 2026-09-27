@@ -494,6 +494,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
         .wait()
         .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}")),
+        DaemonAction::Gc => gc_daemon_client(&runtime),
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
     }
 }
@@ -554,7 +555,9 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
     let request = match action {
         DaemonAction::Status => yi_agent_store::ipc::IpcRequest::Status,
         DaemonAction::Stop => yi_agent_store::ipc::IpcRequest::Stop,
-        DaemonAction::Start | DaemonAction::Serve => unreachable!("handled by launcher"),
+        DaemonAction::Gc | DaemonAction::Start | DaemonAction::Serve => {
+            unreachable!("handled by its own arm")
+        }
     };
     let response = yi_agent_store::ipc::send_request(runtime, request)
         .map_err(|error| anyhow::anyhow!("runtime daemon is unavailable: {error}"))?;
@@ -569,6 +572,67 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
         yi_agent_store::ipc::IpcResponse::Error { code, message } => {
             anyhow::bail!(
                 "runtime daemon rejected request: {}",
+                format_ipc_error(code, message)
+            )
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Lists reclaimable worktrees, then reclaims the automatic scope.
+///
+/// Two round trips: the preview issues a one-shot token, and the confirm consumes
+/// it. The listing is printed before the destructive call so the user sees exactly
+/// what was acted on; the token plus the two-request shape is what makes the
+/// destructive step deliberate rather than incidental.
+fn gc_daemon_client(runtime: &std::path::Path) -> Result<()> {
+    let request = yi_agent_store::ipc::IpcRequest::PreviewGc;
+    let response = yi_agent_store::ipc::send_request(runtime, request)
+        .map_err(|error| anyhow::anyhow!("runtime daemon is unavailable: {error}"))?;
+    let (entries, confirmation_token) = match response {
+        yi_agent_store::ipc::IpcResponse::GcPreview {
+            entries,
+            confirmation_token,
+            ..
+        } => (entries, confirmation_token),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected gc preview: {}",
+                format_ipc_error(code, message)
+            )
+        }
+        other => anyhow::bail!("unexpected runtime daemon response: {other:?}"),
+    };
+    if entries.is_empty() {
+        println!("no reclaimable worktrees");
+        return Ok(());
+    }
+    for entry in &entries {
+        println!(
+            "{}  branch={}  merged={}  dirty={}  state={}\n    {}",
+            entry.task_id, entry.branch, entry.merged, entry.dirty, entry.state, entry.path
+        );
+    }
+    println!(
+        "\nRemoving directories is reversible; deleting branches and workspace rows is NOT \
+         and forfeits session reattachment."
+    );
+    let request = yi_agent_store::ipc::IpcRequest::ConfirmGc { confirmation_token };
+    let response = yi_agent_store::ipc::send_request(runtime, request)
+        .map_err(|error| anyhow::anyhow!("runtime daemon is unavailable: {error}"))?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::GcCompleted { removed } => {
+            let noun = if removed == 1 {
+                "worktree directory"
+            } else {
+                "worktree directories"
+            };
+            println!("reclaimed {removed} {noun}");
+        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!(
+                "runtime daemon rejected gc: {}",
                 format_ipc_error(code, message)
             )
         }
@@ -1882,6 +1946,21 @@ mod tests {
         assert_eq!(
             daemon_database,
             std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime/runtime.sqlite"),
+        );
+    }
+
+    #[test]
+    fn daemon_action_exposes_gc() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["yi-agent", "daemon", "gc"]).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Some(crate::config::Command::Daemon {
+                    action: crate::config::DaemonAction::Gc
+                })
+            ),
+            "daemon gc must parse"
         );
     }
 

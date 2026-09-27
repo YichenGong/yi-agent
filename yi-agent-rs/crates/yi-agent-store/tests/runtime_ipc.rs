@@ -1639,6 +1639,317 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
 }
 
 #[test]
+fn gc_rejects_a_bogus_confirmation_token() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    // A preview issues a real token; the raw status response is deliberately not
+    // one. The confirm call must reject anything the store did not issue, because
+    // that check is the only thing separating a client from removing worktrees.
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert!(entries.is_empty(), "a fresh store has nothing to reclaim");
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc {
+            confirmation_token: "not-a-token".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            response,
+            IpcResponse::Error {
+                code: yi_agent_store::ipc::IpcErrorCode::Validation,
+                ..
+            }
+        ),
+        "a token the store never issued must be rejected, got {response:?}"
+    );
+}
+
+#[test]
+fn gc_rejects_a_token_that_a_cancel_preview_issued() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let IpcResponse::SessionCreated { root_task_id, .. } =
+        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+    let IpcResponse::CancelPreview {
+        confirmation_token, ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PreviewCancel {
+            task_id: root_task_id.clone(),
+            recursive: false,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a cancel preview");
+    };
+
+    // Scopes are disjoint: a cancel token carries a task id and a cancellation
+    // scope, a gc token carries neither, so one must never satisfy the other.
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc { confirmation_token },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::Error { .. }),
+        "a cancel token must not authorize a gc reclaim, got {response:?}"
+    );
+}
+
+#[test]
+fn gc_confirm_consumes_its_token_exactly_once() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let IpcResponse::GcPreview {
+        confirmation_token, ..
+    } = send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ConfirmGc {
+                confirmation_token: confirmation_token.clone(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::GcCompleted { .. }
+    ));
+    let replay = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc { confirmation_token },
+    )
+    .unwrap();
+    assert!(
+        matches!(replay, IpcResponse::Error { .. }),
+        "a gc token is one-shot and must not be replayable, got {replay:?}"
+    );
+}
+
+#[test]
+fn gc_preview_lists_a_detached_sessions_reclaimable_worktree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = application_root_daemon(&directory, &database).0;
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "gc-listing".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-gc-listing"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    // While attached, the session is not detached, so it is not a gc candidate.
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert!(
+        entries.is_empty(),
+        "an attached root is not reclaimable yet"
+    );
+
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id,
+                root_task_id: root_task_id.clone(),
+                capability: message_capability,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    );
+
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert_eq!(entries.len(), 1, "the detached root is now listable");
+    let entry = &entries[0];
+    assert_eq!(entry.task_id, root_task_id);
+    assert_eq!(entry.branch, workspace.branch);
+    assert_eq!(entry.path, workspace.path.display().to_string());
+    assert!(entry.state.starts_with("paused"), "got {entry:?}");
+    // The listing must not have removed anything: the row survives reattachment.
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(
+        repository
+            .task_workspace_optional(&root_task_id.parse().unwrap())
+            .unwrap()
+            .is_some(),
+        "listing a worktree must never delete its workspace row"
+    );
+}
+
+#[test]
+fn gc_token_gates_the_reclaim_call_not_just_the_response() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let reclaimed = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(ReclaimRecordingWorkspaceService {
+        reclaimed: Arc::clone(&reclaimed),
+    });
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: service,
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "gc-token-gate".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-gc-token-gate"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ActivateApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: "first prompt".into(),
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootActivated
+    );
+    // Activation already drives the foreground root to `running`; a `StartWorker`
+    // here would be an illegal Running -> Running transition. The root's workspace
+    // row and directory exist from activation, which is all a reclaim needs.
+    let root_path = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_workspace_optional(&root_task_id.parse().unwrap())
+        .unwrap()
+        .expect("the activated root owns a workspace row")
+        .path;
+    assert!(
+        reclaimed.lock().unwrap().is_empty(),
+        "starting a worker must not reclaim anything"
+    );
+
+    // Get the directory out of the way for the detach, so the background reclaim
+    // that detach seeds finds nothing. The recorded list then starts empty, which
+    // is what makes the token's effect on the reclaim call observable.
+    std::fs::remove_dir_all(&root_path).unwrap();
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id: session_id.clone(),
+                root_task_id: root_task_id.clone(),
+                capability: message_capability,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    );
+    // The detach seeds an asynchronous reclaim; give it a moment so it cannot
+    // land mid-assertion below and be mistaken for the confirm's work.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    reclaimed.lock().unwrap().clear();
+
+    // Restore the directory: the row survived the detach, so the session is a gc
+    // candidate again.
+    std::fs::create_dir_all(&root_path).unwrap();
+
+    let IpcResponse::GcPreview { entries, .. } =
+        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert_eq!(entries.len(), 1, "the detached root is listable again");
+
+    // A token the store never issued must not reach `reclaim_worktree` at all.
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ConfirmGc {
+            confirmation_token: "forged".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::Error { .. }),
+        "a forged token is rejected, got {response:?}"
+    );
+    assert!(
+        reclaimed.lock().unwrap().is_empty(),
+        "a rejected confirm must not reclaim anything, got {:?}",
+        reclaimed.lock().unwrap()
+    );
+    assert!(
+        root_path.exists(),
+        "a rejected confirm must leave the directory in place"
+    );
+
+    // The real token does reach it. Same request, same daemon; only the token
+    // differs, so the token is what gates the reclaim call.
+    let IpcResponse::GcPreview {
+        confirmation_token, ..
+    } = send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
+    else {
+        panic!("expected a gc preview");
+    };
+    assert_eq!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::ConfirmGc { confirmation_token },
+        )
+        .unwrap(),
+        IpcResponse::GcCompleted { removed: 1 }
+    );
+    assert_eq!(
+        reclaimed.lock().unwrap().as_slice(),
+        &[root_path],
+        "an accepted confirm reclaims exactly the listed worktree"
+    );
+}
+
+#[test]
 fn schedule_ipc_validates_creates_lists_and_deletes() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");

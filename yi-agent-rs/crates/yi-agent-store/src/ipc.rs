@@ -53,6 +53,17 @@ struct CancelScope {
     unmerged_deliveries: Vec<IpcCancelDelivery>,
 }
 
+impl CancelScope {
+    /// The scope of an operation that is not tied to any task or lease.
+    fn empty() -> Self {
+        Self {
+            task_ids: Vec::new(),
+            active_leases: Vec::new(),
+            unmerged_deliveries: Vec::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ConfirmationStore {
     pending: Mutex<HashMap<String, PendingConfirmation>>,
@@ -89,6 +100,20 @@ impl ConfirmationStore {
             && pending.task_id == task_id
             && pending.recursive == recursive
             && pending.scope == *scope
+    }
+
+    /// Issues the one-shot token that gates the destructive gc reclaim.
+    ///
+    /// `gc` has no task id and no cancellation scope of its own, so it rides the
+    /// existing store with the literal id `"gc"` and an empty scope. That keeps a
+    /// gc token indistinguishable-in-shape from a cancel token while making it
+    /// impossible for one to satisfy the other's `consume` call.
+    fn issue_gc(&self) -> String {
+        self.issue("gc".into(), false, CancelScope::empty())
+    }
+
+    fn consume_gc(&self, token: &str) -> bool {
+        self.consume(token, "gc", false, &CancelScope::empty())
     }
 }
 
@@ -152,6 +177,12 @@ pub enum IpcRequest {
         session_id: String,
         root_task_id: String,
         capability: String,
+    },
+    /// Lists reclaimable worktrees without removing anything.
+    PreviewGc,
+    /// Removes the reclaimable-directory scope after an explicit confirmation.
+    ConfirmGc {
+        confirmation_token: String,
     },
     CreateSchedule {
         cron: String,
@@ -310,6 +341,14 @@ pub enum IpcResponse {
     },
     ApplicationRootActivated,
     ApplicationRootDetached,
+    GcPreview {
+        entries: Vec<IpcGcEntry>,
+        confirmation_token: String,
+        expires_in_secs: u64,
+    },
+    GcCompleted {
+        removed: usize,
+    },
     ScheduleCreated {
         schedule_id: String,
     },
@@ -484,6 +523,19 @@ pub struct IpcTaskSummary {
     pub task_id: String,
     pub state: String,
     pub is_root: bool,
+}
+
+/// One reclaimable worktree, as reported by `daemon gc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcGcEntry {
+    pub task_id: String,
+    pub branch: String,
+    pub path: String,
+    pub state: String,
+    /// Whether `branch` is already contained in its parent's HEAD.
+    pub merged: bool,
+    /// Whether the worktree has modified or untracked files.
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -977,6 +1029,19 @@ fn handle_client(
                 Ok(response) => response,
                 Err(error) => error_response(&error),
             },
+            IpcRequest::PreviewGc => match preview_gc(database_path, confirmations) {
+                Ok(response) => response,
+                Err(error) => error_response(&error),
+            },
+            IpcRequest::ConfirmGc { confirmation_token } => match confirm_gc(
+                database_path,
+                coordinator,
+                confirmations,
+                confirmation_token,
+            ) {
+                Ok(response) => response,
+                Err(error) => error_response(&error),
+            },
             request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
                 Err(error) => error_response(&error),
@@ -1137,6 +1202,139 @@ fn confirm_cancel(
         .build()?;
     runtime.block_on(coordinator.cancel_task(&session, &task, recursive))?;
     Ok(IpcResponse::TaskCancelled)
+}
+
+/// Lists reclaimable worktrees and issues the token that authorizes removing them.
+///
+/// Read-only: the listing shells out to git and removes nothing, so it is safe to
+/// call while worktrees are dirty or unmerged.
+fn preview_gc(
+    database_path: &Path,
+    confirmations: &ConfirmationStore,
+) -> Result<IpcResponse, IpcError> {
+    let repository = RuntimeRepository::open(database_path)?;
+    let entries = gc_entries(&repository)?;
+    Ok(IpcResponse::GcPreview {
+        entries,
+        confirmation_token: confirmations.issue_gc(),
+        expires_in_secs: CONFIRMATION_TTL.as_secs(),
+    })
+}
+
+/// Reclaims the automatic-scope directories after consuming a gc token.
+///
+/// Scope is deliberately narrow: this removes worktree DIRECTORIES only. It never
+/// deletes a branch ref and never deletes a `task_workspaces` row, because the row
+/// surviving is what keeps reattachment working. Operations that forfeit
+/// reattachment need their own, separately confirmed surface.
+///
+/// [`RuntimeCoordinator::reclaim_session_worktrees`] is synchronous, takes only
+/// short internal repository locks, and never holds one across git, so it is called
+/// directly rather than through an async runtime.
+fn confirm_gc(
+    database_path: &Path,
+    coordinator: &RuntimeCoordinator,
+    confirmations: &ConfirmationStore,
+    confirmation_token: String,
+) -> Result<IpcResponse, IpcError> {
+    if !confirmations.consume_gc(&confirmation_token) {
+        return Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "gc confirmation token is invalid or expired",
+        )));
+    }
+    let sessions = {
+        let repository = RuntimeRepository::open(database_path)?;
+        let mut sessions = repository.detached_application_roots()?;
+        // No ORDER BY on the query, so duplicates need not be adjacent. `dedup`
+        // alone would miss non-adjacent repeats, so key the sort on the id's
+        // string form (`RootSessionId` is not `Ord` itself).
+        sessions.sort_unstable_by_key(|session| session.to_string());
+        sessions.dedup();
+        sessions
+    };
+    let mut removed = 0;
+    for session in sessions {
+        removed += coordinator.reclaim_session_worktrees(&session);
+    }
+    Ok(IpcResponse::GcCompleted { removed })
+}
+
+/// Lists the reclaimable-but-not-reclaimed worktrees of every detached session.
+///
+/// It reads rows and runs `git status` / `git merge-base` with the relevant
+/// worktree as the working directory. It removes nothing, so a dirty or unmerged
+/// worktree can be reported safely.
+///
+/// The merge probe compares the candidate branch against the OWNER worktree's
+/// current branch. That diverges from `is_merged_into`, which compares against the
+/// recorded `parent_branch` on purpose: a worker that checks out another branch in
+/// the owner worktree must not change the automatic reclaim decision. This listing
+/// mirrors the brief's form rather than that stricter rule, so the two can disagree
+/// when an owner's HEAD has moved; treat `merged` here as advisory only.
+fn gc_entries(repository: &RuntimeRepository) -> Result<Vec<IpcGcEntry>, IpcError> {
+    let mut entries = Vec::new();
+    let mut sessions = repository.detached_application_roots()?;
+    sessions.sort_unstable_by_key(|session| session.to_string());
+    sessions.dedup();
+    for session in sessions {
+        for candidate in repository.reclaim_candidates(&session)? {
+            let Some(workspace) = candidate.workspace.clone() else {
+                continue;
+            };
+            let dirty = Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&workspace.path)
+                .output()
+                .map(|output| !output.stdout.is_empty())
+                .unwrap_or(false);
+            let merged = match candidate.parent_task_id.as_ref() {
+                Some(parent) => {
+                    let owner = match parent.parse::<TaskId>().ok() {
+                        Some(parsed) => repository.task_workspace_optional(&parsed).ok().flatten(),
+                        None => None,
+                    };
+                    match owner {
+                        Some(owner) => {
+                            let owner_branch = Command::new("git")
+                                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                                .current_dir(&owner.path)
+                                .output()
+                                .ok()
+                                .map(|output| {
+                                    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+                                });
+                            match owner_branch {
+                                Some(owner_branch) => Command::new("git")
+                                    .args([
+                                        "merge-base",
+                                        "--is-ancestor",
+                                        &workspace.branch,
+                                        &owner_branch,
+                                    ])
+                                    .current_dir(&owner.path)
+                                    .status()
+                                    .map(|status| status.success())
+                                    .unwrap_or(false),
+                                None => false,
+                            }
+                        }
+                        None => false,
+                    }
+                }
+                None => false,
+            };
+            entries.push(IpcGcEntry {
+                task_id: candidate.task_id.clone(),
+                branch: workspace.branch.clone(),
+                path: workspace.path.display().to_string(),
+                state: candidate.state.clone(),
+                merged,
+                dirty,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 fn prepare_coordinator_for_stop(coordinator: &RuntimeCoordinator) -> Result<(), IpcError> {
@@ -2227,6 +2425,12 @@ fn respond(
             message: None,
         }),
         IpcRequest::PreviewCancel { .. } | IpcRequest::ConfirmCancel { .. } => {
+            Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "confirmation requests require daemon state",
+            )))
+        }
+        IpcRequest::PreviewGc | IpcRequest::ConfirmGc { .. } => {
             Err(IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "confirmation requests require daemon state",
