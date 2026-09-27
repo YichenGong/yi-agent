@@ -1505,6 +1505,69 @@ mod tests {
     }
 
     #[test]
+    fn wide_markdown_table_is_not_clipped_off_the_right_edge() {
+        // Regression: a table wider than the terminal used to be rendered as
+        // one over-wide Line per row, which ratatui truncates on the right, so
+        // the closing border and trailing cells were silently lost.
+        let mut state = HistoryState::new();
+        state.push(
+            HistoryCell::Markdown {
+                text: "| Name | Description | Owner |\n| --- | --- | --- |\n\
+                       | alpha-service | Handles all inbound user authentication | platform-team |\n"
+                    .to_string(),
+            },
+            40,
+        );
+
+        let area_width = 40u16;
+        let area_height = 20u16;
+        let backend = TestBackend::new(area_width, area_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    HistoryView {
+                        state: &state,
+                        width: area.width,
+                    },
+                    area,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let text_width = state.text_width(area_width, area_height);
+        let rows: Vec<String> = (0..area_height)
+            .map(|y| (0..text_width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let rendered = rows.join("\n");
+
+        // The top-left corner proves the table reached the screen at all.
+        assert!(rendered.contains('┌'), "table never rendered: {rendered:?}");
+        // The closing border must be visible: this is what clipping destroyed.
+        assert!(
+            rows.iter().any(|row| row.ends_with('┐')),
+            "the table's right border was clipped off: {rendered:?}"
+        );
+        assert!(
+            rendered.contains('┘'),
+            "the bottom-right corner was clipped off: {rendered:?}"
+        );
+        // Every rendered row must end with a box border or be blank padding.
+        for (y, row) in rows.iter().enumerate() {
+            assert!(
+                row.trim_end().is_empty() || row.ends_with(['│', '┐', '┤', '┘']),
+                "row {y} lost its right border: {row:?}"
+            );
+        }
+        assert!(
+            rendered.contains("Description") || rendered.contains("Descriptio"),
+            "the wide column content was lost: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn scrollbar_uses_top_origin_while_history_offset_uses_bottom_origin() {
         let mut state = HistoryState::new();
         for row in 0..10 {
