@@ -1266,12 +1266,30 @@ fn confirm_gc(
 /// worktree as the working directory. It removes nothing, so a dirty or unmerged
 /// worktree can be reported safely.
 ///
-/// The merge probe compares the candidate branch against the OWNER worktree's
-/// current branch. That diverges from `is_merged_into`, which compares against the
-/// recorded `parent_branch` on purpose: a worker that checks out another branch in
-/// the owner worktree must not change the automatic reclaim decision. This listing
-/// mirrors the brief's form rather than that stricter rule, so the two can disagree
-/// when an owner's HEAD has moved; treat `merged` here as advisory only.
+/// Both columns answer the SAME question the reclaim answers, because a preview
+/// that disagrees with the action is worse than no preview on a destructive path:
+///
+/// * `dirty` is `git status --porcelain`, the probe `reclaim_directory` gates on.
+/// * `merged` is `merge-base --is-ancestor <branch> <parent_branch>` against the
+///   recorded `parent_branch`, matching `DaemonWorkspaceService::is_merged_into`.
+///   Judging it against the owner worktree's CURRENT branch would let a worker
+///   that ran `git checkout` in the owner change the answer, and would let the
+///   preview print `merged = false` for a directory the confirm then reclaims.
+///
+/// The probe needs a working directory that exists: the owner worktree when it is
+/// still there, otherwise the repository root. That fallback is deliberate — an
+/// owner reclaimed by an earlier pass makes `git` fail to `chdir`, and
+/// `merge-base --is-ancestor` resolves both refs from the ref database, so any
+/// directory inside the repository answers identically. Do not "simplify" it back
+/// to the owner path alone; that would silently restore a false `merged`.
+///
+/// A candidate whose directory is already gone is skipped: the confirm removes
+/// directories, so listing a directory-less row would promise work it cannot do.
+///
+/// A root is reported with whatever the same probe yields (`parent_branch` is the
+/// main branch). The reclaim applies no merge gate to a root, so the listing does
+/// not pretend a gate ran; it reports the probe rather than inventing a value the
+/// confirm would not honour.
 fn gc_entries(repository: &RuntimeRepository) -> Result<Vec<IpcGcEntry>, IpcError> {
     let mut entries = Vec::new();
     let mut sessions = repository.detached_application_roots()?;
@@ -1282,47 +1300,41 @@ fn gc_entries(repository: &RuntimeRepository) -> Result<Vec<IpcGcEntry>, IpcErro
             let Some(workspace) = candidate.workspace.clone() else {
                 continue;
             };
+            // The confirm removes a directory, so a row whose directory is gone
+            // must not be advertised as reclaimable.
+            if !workspace.path.exists() {
+                continue;
+            }
             let dirty = Command::new("git")
                 .args(["status", "--porcelain"])
                 .current_dir(&workspace.path)
                 .output()
                 .map(|output| !output.stdout.is_empty())
                 .unwrap_or(false);
-            let merged = match candidate.parent_task_id.as_ref() {
-                Some(parent) => {
-                    let owner = match parent.parse::<TaskId>().ok() {
-                        Some(parsed) => repository.task_workspace_optional(&parsed).ok().flatten(),
-                        None => None,
-                    };
-                    match owner {
-                        Some(owner) => {
-                            let owner_branch = Command::new("git")
-                                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                                .current_dir(&owner.path)
-                                .output()
-                                .ok()
-                                .map(|output| {
-                                    String::from_utf8_lossy(&output.stdout).trim().to_owned()
-                                });
-                            match owner_branch {
-                                Some(owner_branch) => Command::new("git")
-                                    .args([
-                                        "merge-base",
-                                        "--is-ancestor",
-                                        &workspace.branch,
-                                        &owner_branch,
-                                    ])
-                                    .current_dir(&owner.path)
-                                    .status()
-                                    .map(|status| status.success())
-                                    .unwrap_or(false),
-                                None => false,
-                            }
-                        }
-                        None => false,
-                    }
-                }
-                None => false,
+            let merged = if workspace.branch.is_empty() || workspace.parent_branch.is_empty() {
+                false
+            } else {
+                // Prefer the owner worktree, but it may already have been
+                // reclaimed; fall back to the repository root (see doc comment).
+                let probe_directory = candidate
+                    .parent_task_id
+                    .as_ref()
+                    .and_then(|parent| parent.parse::<TaskId>().ok())
+                    .and_then(|parent| repository.task_workspace_optional(&parent).ok().flatten())
+                    .map(|owner| owner.path)
+                    .filter(|path| path.exists())
+                    .unwrap_or_else(|| workspace.repository_root.clone());
+                Command::new("git")
+                    .args([
+                        "merge-base",
+                        "--is-ancestor",
+                        &workspace.branch,
+                        &workspace.parent_branch,
+                    ])
+                    .current_dir(&probe_directory)
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false)
             };
             entries.push(IpcGcEntry {
                 task_id: candidate.task_id.clone(),

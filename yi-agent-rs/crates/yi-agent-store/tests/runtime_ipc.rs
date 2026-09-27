@@ -97,6 +97,37 @@ fn test_workspace_for_ipc(session: &str, task: &str) -> WorkerWorkspace {
     }
 }
 
+/// Runs a git command, asserting success. `output()` captures stderr so a
+/// deliberate failure cannot leak git's chatter into the suite log.
+fn git_ok(directory: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        directory.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(directory: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        directory.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 #[derive(Clone, Default)]
 struct StartCountingFactory {
     starts: Arc<Mutex<usize>>,
@@ -1748,7 +1779,19 @@ fn gc_confirm_consumes_its_token_exactly_once() {
 fn gc_preview_lists_a_detached_sessions_reclaimable_worktree() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
-    let daemon = application_root_daemon(&directory, &database).0;
+    // The recording service creates the worktree directory in `prepare_root`, the
+    // way the production service really does. The listing reports a candidate only
+    // while its directory exists, so a fixture that never creates one would not be
+    // listable and this test would prove nothing.
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(ReclaimRecordingWorkspaceService::default()),
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
     let IpcResponse::ApplicationRootAttached {
         session_id,
         root_task_id,
@@ -1810,6 +1853,248 @@ fn gc_preview_lists_a_detached_sessions_reclaimable_worktree() {
             .is_some(),
         "listing a worktree must never delete its workspace row"
     );
+}
+
+#[test]
+fn gc_preview_merged_and_dirty_match_the_reclaim_semantics() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir_all(&repository_root).unwrap();
+    git_ok(&repository_root, &["init", "-b", "main"]);
+    git_ok(
+        &repository_root,
+        &["config", "user.email", "tests@example.com"],
+    );
+    git_ok(&repository_root, &["config", "user.name", "Runtime Tests"]);
+    std::fs::write(repository_root.join("README.md"), "base\n").unwrap();
+    git_ok(&repository_root, &["add", "README.md"]);
+    git_ok(&repository_root, &["commit", "-m", "base"]);
+
+    let root_task = TaskId::new();
+    let session = RootSessionId::new();
+    let root_attempt = AttemptId::new();
+    let merged_child = TaskId::new();
+    let merged_child_attempt = AttemptId::new();
+    let dirty_child = TaskId::new();
+    let dirty_child_attempt = AttemptId::new();
+
+    let root_branch = format!("feat/root-{root_task}");
+    let root_worktree = directory.path().join("wt-root");
+    let merged_branch = format!("feat/merged-{merged_child}");
+    let merged_worktree = directory.path().join("wt-merged");
+    let dirty_branch = format!("feat/dirty-{dirty_child}");
+    let dirty_worktree = directory.path().join("wt-dirty");
+
+    // The root worktree gets its own branch with one commit on top of main.
+    git_ok(
+        &repository_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &root_branch,
+            root_worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::write(root_worktree.join("root.txt"), "root\n").unwrap();
+    git_ok(&root_worktree, &["add", "root.txt"]);
+    git_ok(&root_worktree, &["commit", "-m", "root work"]);
+
+    // A child on its own branch, committed and then merged into the root branch.
+    git_ok(
+        &repository_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &merged_branch,
+            merged_worktree.to_str().unwrap(),
+            &root_branch,
+        ],
+    );
+    std::fs::write(merged_worktree.join("merged.txt"), "merged\n").unwrap();
+    git_ok(&merged_worktree, &["add", "merged.txt"]);
+    git_ok(&merged_worktree, &["commit", "-m", "merged work"]);
+    git_ok(&root_worktree, &["merge", "--no-edit", &merged_branch]);
+
+    // A second child, merged the same way but left with an uncommitted edit.
+    git_ok(
+        &repository_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &dirty_branch,
+            dirty_worktree.to_str().unwrap(),
+            &root_branch,
+        ],
+    );
+    std::fs::write(dirty_worktree.join("dirty.txt"), "dirty\n").unwrap();
+    git_ok(&dirty_worktree, &["add", "dirty.txt"]);
+    git_ok(&dirty_worktree, &["commit", "-m", "dirty work"]);
+    git_ok(&root_worktree, &["merge", "--no-edit", &dirty_branch]);
+    std::fs::write(dirty_worktree.join("dirty.txt"), "dirty\nuncommitted\n").unwrap();
+
+    // Move the OWNER worktree's HEAD onto a branch that predates both merges. A
+    // listing that judged merged-ness against this HEAD (the pre-fix behaviour)
+    // would call both children unmerged, while the confirm — which compares
+    // against `parent_branch` — still reclaims them.
+    git_ok(&root_worktree, &["checkout", "-b", "stale-root", "main"]);
+
+    let base_commit = git_stdout(&repository_root, &["rev-parse", "main"]);
+    {
+        let mut repository = RuntimeRepository::open(&database).unwrap();
+        repository
+            .create_task_with_attempt_and_objective(
+                &root_task,
+                &session,
+                &root_attempt,
+                1,
+                "paused",
+                "root",
+                TaskWorkspaceMode::Coding,
+            )
+            .unwrap();
+        for (task, attempt, state, objective) in [
+            (
+                &merged_child,
+                &merged_child_attempt,
+                "cancelled",
+                "merged child",
+            ),
+            (
+                &dirty_child,
+                &dirty_child_attempt,
+                "cancelled",
+                "dirty child",
+            ),
+        ] {
+            repository
+                .create_child_task_with_attempt_and_objective(
+                    task,
+                    &session,
+                    &root_task,
+                    1,
+                    attempt,
+                    1,
+                    state,
+                    objective,
+                    TaskWorkspaceMode::Coding,
+                )
+                .unwrap();
+        }
+        for (task, attempt, path, branch, parent_branch) in [
+            (
+                &root_task,
+                &root_attempt,
+                &root_worktree,
+                &root_branch,
+                "main",
+            ),
+            (
+                &merged_child,
+                &merged_child_attempt,
+                &merged_worktree,
+                &merged_branch,
+                root_branch.as_str(),
+            ),
+            (
+                &dirty_child,
+                &dirty_child_attempt,
+                &dirty_worktree,
+                &dirty_branch,
+                root_branch.as_str(),
+            ),
+        ] {
+            repository
+                .record_task_workspace(
+                    task,
+                    attempt,
+                    &WorkerWorkspace {
+                        lease_id: WorkspaceLeaseId::new(),
+                        repository_root: repository_root.clone(),
+                        path: path.clone(),
+                        branch: branch.clone(),
+                        parent_branch: parent_branch.to_owned(),
+                        base_commit: base_commit.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        repository
+            .record_application_root_attachment(
+                "gc-fields",
+                &session,
+                &root_task,
+                "digest",
+                "secret",
+            )
+            .unwrap();
+        repository
+            .detach_application_root(&session, &root_task)
+            .unwrap();
+    }
+
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let preview = |socket: &std::path::Path| {
+        let IpcResponse::GcPreview { entries, .. } =
+            send_request(socket, IpcRequest::PreviewGc).unwrap()
+        else {
+            panic!("expected a gc preview");
+        };
+        entries
+    };
+    let entry = |entries: &[yi_agent_store::ipc::IpcGcEntry], task: &TaskId| {
+        entries
+            .iter()
+            .find(|entry| entry.task_id == task.to_string())
+            .unwrap_or_else(|| panic!("{task} is not listed"))
+            .clone()
+    };
+
+    let entries = preview(daemon.socket_path());
+    assert_eq!(entries.len(), 3, "root plus two children: {entries:?}");
+    // The root branch is not an ancestor of main; the root worktree is clean.
+    let root_entry = entry(&entries, &root_task);
+    assert!(!root_entry.merged, "{root_entry:?}");
+    assert!(!root_entry.dirty, "{root_entry:?}");
+    // Both children are merged into their recorded `parent_branch`, and this must
+    // hold even though the owner worktree's HEAD has moved off that branch.
+    let merged_entry = entry(&entries, &merged_child);
+    assert!(
+        merged_entry.merged,
+        "a merged child must report merged despite the moved owner HEAD: {merged_entry:?}"
+    );
+    assert!(!merged_entry.dirty, "{merged_entry:?}");
+    let dirty_entry = entry(&entries, &dirty_child);
+    assert!(dirty_entry.merged, "{dirty_entry:?}");
+    assert!(
+        dirty_entry.dirty,
+        "an uncommitted edit must report dirty: {dirty_entry:?}"
+    );
+
+    // The preview removes nothing.
+    assert!(root_worktree.exists() && merged_worktree.exists() && dirty_worktree.exists());
+
+    // A candidate whose directory is gone is not reclaimable, so it must not be
+    // listed; the surviving children keep their answer via the repository-root
+    // fallback even though the owner worktree is now gone.
+    std::fs::remove_dir_all(&root_worktree).unwrap();
+    let entries = preview(daemon.socket_path());
+    assert_eq!(entries.len(), 2, "a directory-less root is not listable");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.task_id == root_task.to_string()),
+        "the reclaimed root must drop out of the listing"
+    );
+    assert!(
+        entry(&entries, &merged_child).merged,
+        "the fallback cwd must still answer the merge question"
+    );
+    assert!(entry(&entries, &dirty_child).dirty);
 }
 
 #[test]
