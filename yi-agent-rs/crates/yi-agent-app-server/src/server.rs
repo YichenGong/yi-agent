@@ -726,6 +726,9 @@ where
                                 continue;
                             }
                         };
+                        // 仅内存中的活跃线程可切换:UI 的 mode chip 只对当前打开的线程可见,而该
+                        // 线程必先经 thread/start 或 thread/resume 进入内存。冷线程没有运行期
+                        // switch 可翻转(其持久化模式在 resume 时被读取),故此处不为其落盘。
                         let Some(session) = threads.get(&thread_id) else {
                             write_response(
                                 &writer,
@@ -738,10 +741,14 @@ where
                         // 无需重建 agent 本轮即可放行。
                         session.yolo.set(mode == crate::thread_store::ThreadMode::Yolo);
                         // 最佳努力落盘:运行期开关已生效,落盘失败不阻断本轮切换。
-                        if let Err(e) = session.store.set_permission_mode(&thread_id, mode) {
-                            eprintln!(
+                        match session.store.set_permission_mode(&thread_id, mode) {
+                            Ok(true) => {}
+                            Ok(false) => eprintln!(
+                                "[app-server] permission_mode not persisted for {thread_id}: thread meta missing"
+                            ),
+                            Err(e) => eprintln!(
                                 "[app-server] failed to persist permission_mode for {thread_id}: {e}"
-                            );
+                            ),
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
                     }
@@ -3522,6 +3529,64 @@ mod tests {
         assert_eq!(
             v["error"]["code"], -32011,
             "unknown thread must be unknown_thread: {v}"
+        );
+
+        // 非法 mode + 未知 thread → 仍是 `-32602`:证明 mode 校验先于 thread
+        // 存在性,不会因 threadId 未知而退化成 `-32011`。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/setPermissionMode","params":{"threadId":"nope","mode":"bogus"}}"#,
+        )
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "invalid mode must win over thread existence: {v}"
+        );
+
+        // 缺少 threadId → `-32602`(invalid params)。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":6,"method":"thread/setPermissionMode","params":{"mode":"yolo"}}"#,
+        )
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "missing threadId must be invalid_params: {v}"
+        );
+
+        // 非字符串 mode(数字)→ `-32602`:`as_str()` 落空,走 `_` 分支。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":5}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(7)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("setPermissionMode must respond");
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "non-string mode must be invalid_params: {v}"
         );
 
         h.shutdown().await;
