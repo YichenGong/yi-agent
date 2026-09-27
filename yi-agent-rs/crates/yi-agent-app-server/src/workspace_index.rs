@@ -60,11 +60,22 @@ impl WorkspaceIndex {
     }
 
     fn read(&self) -> WorkspacesFile {
-        let Ok(raw) = std::fs::read_to_string(&self.path) else {
-            return WorkspacesFile::default();
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                // NotFound 是正常空态;其它 IO 错误无法补救,只记日志后按空处理。
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[app-server] cannot read workspaces index: {e}");
+                }
+                return WorkspacesFile::default();
+            }
         };
         serde_json::from_str(&raw).unwrap_or_else(|e| {
             eprintln!("[app-server] ignoring corrupt workspaces index: {e}");
+            // 解析失败时把原文件挪到 .bak,避免随后的 add/remove 覆盖丢失内容。
+            let mut bak = self.path.as_os_str().to_owned();
+            bak.push(".bak");
+            let _ = std::fs::rename(&self.path, PathBuf::from(bak));
             WorkspacesFile::default()
         })
     }
@@ -75,11 +86,7 @@ impl WorkspaceIndex {
         }
         let bytes = serde_json::to_vec_pretty(file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.path)
+        crate::thread_store::write_atomic(&self.path, &bytes)
     }
 }
 
@@ -139,5 +146,35 @@ mod tests {
         std::fs::write(&path, b"{not json").unwrap();
         let idx = WorkspaceIndex::new(path);
         assert!(idx.list().is_empty());
+    }
+
+    #[test]
+    fn persists_dirs_json_shape() {
+        let (d, idx) = index();
+        idx.add(Path::new("/tmp/a")).unwrap();
+        let raw = std::fs::read_to_string(d.path().join("workspaces.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value, serde_json::json!({ "dirs": ["/tmp/a"] }));
+    }
+
+    #[test]
+    fn creates_nested_parent_dir() {
+        let dir = TempDir::new().unwrap();
+        let idx = WorkspaceIndex::new(dir.path().join("nested/deep/workspaces.json"));
+        idx.add(Path::new("/tmp/a")).unwrap();
+        assert_eq!(idx.list(), vec!["/tmp/a".to_string()]);
+    }
+
+    #[test]
+    fn corrupt_file_is_backed_up() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("workspaces.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let idx = WorkspaceIndex::new(path.clone());
+        idx.add(Path::new("/tmp/a")).unwrap();
+        assert_eq!(idx.list(), vec!["/tmp/a".to_string()]);
+        let mut bak = path.as_os_str().to_owned();
+        bak.push(".bak");
+        assert!(PathBuf::from(bak).exists());
     }
 }
