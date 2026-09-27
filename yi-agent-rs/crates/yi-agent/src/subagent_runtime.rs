@@ -1355,6 +1355,28 @@ mod tests {
         }
     }
 
+    /// Polls `condition` until it holds, then returns; panics after `timeout`.
+    ///
+    /// Work handed to a worker thread completes on its own schedule, so a test
+    /// that needs to observe that work must wait for the observable effect (a
+    /// recorded request, a queued event) rather than sleeping for a guessed
+    /// duration. A guessed delay races whenever the machine is loaded, which is
+    /// exactly how these tests flaked under parallel execution.
+    async fn wait_until(condition: impl Fn() -> bool, description: &str) {
+        let timeout = Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for {description}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn initialize_git_repository(directory: &std::path::Path) -> String {
         for args in [
             vec!["init"],
@@ -1806,6 +1828,17 @@ mod tests {
             .await
             .unwrap();
 
+        // The worker runs on its own thread, so `start_worker` returning says
+        // nothing about whether it has reached the provider yet. Cancel only
+        // after the first turn is recorded: cancelling earlier can land before
+        // the worker ever issues its request, and then `requests[0]` is never
+        // written and the assertion below can never be satisfied.
+        wait_until(
+            || !provider.requests.lock().unwrap().is_empty(),
+            "the first worker to issue its provider request",
+        )
+        .await;
+
         RuntimeRepository::open(&database)
             .unwrap()
             .recover_inflight_tasks()
@@ -1815,16 +1848,11 @@ mod tests {
         let restarted = RuntimeCoordinator::open(&database, factory).unwrap();
         restarted.resume_task(&session, &task).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if provider.requests.lock().unwrap().len() == 2 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("resumed daemon worker should begin only after recovery attestation");
+        wait_until(
+            || provider.requests.lock().unwrap().len() == 2,
+            "the resumed worker to issue its provider request",
+        )
+        .await;
 
         let requests = provider.requests.lock().unwrap();
         let resumed_prompt = match &requests[1].messages[0].content[..] {
