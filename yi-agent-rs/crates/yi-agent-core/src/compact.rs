@@ -30,6 +30,13 @@ pub const DEFAULT_COMPACT_USER_BUDGET_TOKENS: usize = 20_000;
 /// Default amount of complete raw tool context retained by compaction.
 pub const DEFAULT_COMPACT_TOOL_BUDGET_TOKENS: usize = 12_000;
 
+/// 单张图片的模型可见 token 估值。
+///
+/// 来源：codex `RESIZED_IMAGE_BYTES_ESTIMATE = 7373` 字节
+/// （`codex-rs core/src/context_manager/history.rs:526-530`），
+/// 按 4 bytes/token 上取整得 1844。
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1844;
+
 #[derive(Debug, Clone)]
 struct ToolInteractionUnit {
     messages: Vec<Message>,
@@ -85,7 +92,7 @@ fn estimate_block_tokens(block: &ContentBlock) -> usize {
             estimate_text_tokens(name) + estimate_text_tokens(&input.to_string())
         }
         ContentBlock::ToolResult { content, .. } => content.iter().map(estimate_block_tokens).sum(),
-        ContentBlock::Image { .. } => 0,
+        ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
     }
 }
 
@@ -835,5 +842,63 @@ mod tests {
 
         let result = compact_session(&provider, &config, &session).await;
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn image_block_estimates_nonzero_tokens() {
+        let img = ContentBlock::Image {
+            source: crate::message::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            },
+            detail: crate::message::ImageDetail::High,
+        };
+        assert!(IMAGE_TOKEN_ESTIMATE > 0);
+        assert_eq!(estimate_block_tokens(&img), IMAGE_TOKEN_ESTIMATE);
+    }
+
+    #[test]
+    fn older_image_unit_is_summarized_when_image_cost_counted() {
+        // 最新单元总被保留；本测试锁定"较旧含图单元会在计入图片成本后被挤出"。
+        let image_result = |id: &str| {
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: vec![ContentBlock::Image {
+                    source: crate::message::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                    detail: crate::message::ImageDetail::High,
+                }],
+                is_error: false,
+            }])
+        };
+        let mut messages = vec![Message::user("task")];
+        // old：纯文本，约 200 tokens。
+        messages.push(Message::assistant(vec![planned_tool_use("old")]));
+        messages.push(Message::tool_results(vec![planned_tool_result(
+            "old",
+            "x".repeat(800),
+        )]));
+        // new：仅一张图。
+        messages.push(Message::assistant(vec![planned_tool_use("new")]));
+        messages.push(image_result("new"));
+
+        // 预算 2000：new 估 1844 保留；old(≈200) 会因 1844+200 > 2000 被挤出。
+        let compacted = build_compacted_messages(
+            &plan_compaction(&messages, 20_000, 2_000).expect("must compact"),
+            "summary",
+        )
+        .unwrap();
+
+        let retained_ids = compacted
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained_ids, vec!["new"]);
     }
 }
