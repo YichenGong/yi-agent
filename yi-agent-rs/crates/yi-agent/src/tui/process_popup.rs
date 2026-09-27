@@ -200,11 +200,19 @@ pub fn process_detail_scroll(
 pub fn process_detail_lines(
     process: &ManagedProcessSnapshot,
     output: Option<&ProcessReadResult>,
-    _width: u16,
+    width: u16,
 ) -> Vec<Line<'static>> {
+    let w = width.max(1) as usize;
     let mut lines = Vec::new();
     let name = process.name.as_deref().unwrap_or("-");
-    lines.push(Line::styled(
+    // Every line is folded to the popup width: raw `Line::raw` here used to
+    // overflow and get right-clipped by ratatui.
+    let fold = |text: String, style: Style, lines: &mut Vec<Line<'static>>| {
+        for chunk in crate::tui::wrap::wrap_by_display_width(&text, w, "", "") {
+            lines.push(Line::styled(chunk, style));
+        }
+    };
+    fold(
         format!(
             " process {} name={} pid={:?} status={} ready={} elapsed={:.1}s exit_code={:?}",
             process.process_id,
@@ -216,27 +224,45 @@ pub fn process_detail_lines(
             process.exit_code
         ),
         Style::new().fg(status_color(&process.status)),
-    ));
-    lines.push(Line::raw(format!(" cwd: {}", process.cwd)));
-    lines.push(Line::raw(format!(" cmd: {}", process.command)));
-    lines.push(Line::raw(format!(" on_exit: {:?}", process.on_exit)));
+        &mut lines,
+    );
+    fold(format!(" cwd: {}", process.cwd), Style::new(), &mut lines);
+    fold(
+        format!(" cmd: {}", process.command),
+        Style::new(),
+        &mut lines,
+    );
+    fold(
+        format!(" on_exit: {:?}", process.on_exit),
+        Style::new(),
+        &mut lines,
+    );
     lines.push(Line::raw(""));
     lines.push(Line::styled("stdout:", Style::new().fg(Color::DarkGray)));
     match output.map(|o| o.stdout.as_str()).filter(|s| !s.is_empty()) {
-        Some(stdout) => lines.extend(stdout.lines().map(|line| Line::raw(line.to_string()))),
+        Some(stdout) => {
+            for line in stdout.lines() {
+                fold(line.to_string(), Style::new(), &mut lines);
+            }
+        }
         None => lines.push(Line::styled("(empty)", Style::new().fg(Color::DarkGray))),
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled("stderr:", Style::new().fg(Color::DarkGray)));
     match output.map(|o| o.stderr.as_str()).filter(|s| !s.is_empty()) {
-        Some(stderr) => lines.extend(stderr.lines().map(|line| Line::raw(line.to_string()))),
+        Some(stderr) => {
+            for line in stderr.lines() {
+                fold(line.to_string(), Style::new(), &mut lines);
+            }
+        }
         None => lines.push(Line::styled("(empty)", Style::new().fg(Color::DarkGray))),
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " [q] back  [k] kill  [Up/Down] scroll  [f] follow  [Tab] switch",
+    fold(
+        " [q] back  [k] kill  [Up/Down] scroll  [f] follow  [Tab] switch".to_string(),
         Style::new().fg(Color::DarkGray),
-    ));
+        &mut lines,
+    );
     lines
 }
 
@@ -285,6 +311,71 @@ mod tests {
         assert!(text.contains("dev"));
         assert!(text.contains("ready"));
         assert!(text.contains("1234"));
+    }
+
+    fn assert_lines_fit(lines: &[Line<'static>], width: u16, what: &str) {
+        for (i, line) in lines.iter().enumerate() {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(
+                w <= width as usize,
+                "{what}: line {i} is {w} cols, width is {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_lines_fold_long_command_and_output_to_width() {
+        let cjk = "这是一条很长的中文进程命令需要按显示宽度折行否则右侧会被截断掉看不见";
+        let mut process = snapshot("proc_1", Some("dev"), ProcessStatus::Running);
+        process.command = format!("python -c '{cjk}' --with-a-really-long-argument-value");
+        process.cwd = format!("/Users/someone/{cjk}");
+        let output = ProcessReadResult {
+            process_id: "proc_1".into(),
+            name: Some("dev".into()),
+            stdout: format!("{cjk}\n{cjk}\n"),
+            stderr: format!("warning: {cjk}\n"),
+            next_cursor: 10,
+            truncated: false,
+            status: ProcessStatus::Running,
+            ready: true,
+        };
+
+        for width in [20u16, 40, 80] {
+            assert_lines_fit(
+                &process_detail_lines(&process, Some(&output), width),
+                width,
+                "process detail",
+            );
+        }
+    }
+
+    #[test]
+    fn process_detail_long_output_is_folded_not_clipped() {
+        let cjk = "这是一条很长的中文进程输出内容需要按显示宽度折行否则右侧会被截断掉看不见";
+        let process = snapshot("proc_1", Some("dev"), ProcessStatus::Running);
+        let output = ProcessReadResult {
+            process_id: "proc_1".into(),
+            name: Some("dev".into()),
+            stdout: format!("{cjk}\n"),
+            stderr: String::new(),
+            next_cursor: 10,
+            truncated: false,
+            status: ProcessStatus::Running,
+            ready: true,
+        };
+
+        let rendered: String = process_detail_lines(&process, Some(&output), 40)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        let squashed: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+        for ch in cjk.chars().filter(|c| !c.is_whitespace()) {
+            assert!(squashed.contains(ch), "detail output lost {ch:?}");
+        }
     }
 
     #[test]

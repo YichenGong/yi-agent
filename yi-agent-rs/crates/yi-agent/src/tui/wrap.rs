@@ -85,6 +85,31 @@ pub fn wrap_by_display_width(
 /// screen in a 24-row terminal, where the history area is 21 rows.
 pub(crate) const MAX_COLLAPSED_LINES: usize = 4;
 
+/// Truncate `text` to at most `width` display columns, appending `…` when
+/// characters had to be dropped.
+///
+/// Needed wherever a value is embedded in a fixed-shape single line (status
+/// bar, popup list rows): truncating by `chars().count()` keeps CJK strings at
+/// twice the intended width, and ratatui then clips the rest of the line.
+pub(crate) fn truncate_to_width(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_w > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_w;
+    }
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +191,28 @@ mod tests {
         let out = wrap_by_display_width("abcdefgh", 6, "> ", "  ");
         assert_eq!(out[0], "> abcd");
         assert_eq!(out[1], "  efgh");
+    }
+
+    #[test]
+    fn truncate_to_width_keeps_cjk_within_budget() {
+        // 40 CJK chars are 80 display columns; the old `chars().count()` cut
+        // kept them all and the terminal clipped the rest of the line.
+        let text = "中".repeat(40);
+        for width in [10usize, 20, 40] {
+            let out = truncate_to_width(&text, width);
+            assert!(
+                UnicodeWidthStr::width(out.as_str()) <= width,
+                "width {width}: {out:?} is {} cols",
+                UnicodeWidthStr::width(out.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_to_width_leaves_fitting_text_untouched() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+        assert_eq!(truncate_to_width("", 0), "");
     }
 
     #[test]

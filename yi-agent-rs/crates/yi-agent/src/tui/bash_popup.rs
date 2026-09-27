@@ -96,8 +96,12 @@ pub struct ConfirmKill {
 pub fn render_list_popup<'a>(
     popup: &'a ListPopup,
     tasks: &'a RunningTaskRegistry,
-    _area: Rect,
+    area: Rect,
 ) -> Paragraph<'a> {
+    // `area.width` is the real budget (the block borders take 2 columns).
+    // Rows are padded/truncated to it: a wider `Line` is right-clipped by
+    // ratatui, hiding the status column on a narrow terminal.
+    let row_width = (area.width as usize).saturating_sub(2);
     let items: Vec<Line> = popup
         .task_ids
         .iter()
@@ -105,7 +109,12 @@ pub fn render_list_popup<'a>(
         .map(|(i, id)| {
             let t = match tasks.get(id) {
                 Some(t) => t,
-                None => return Line::raw(format!("  ? {}", id)),
+                None => {
+                    return Line::raw(crate::tui::wrap::truncate_to_width(
+                        &format!("  ? {}", id),
+                        row_width,
+                    ));
+                }
             };
             let (sym, color) = match t.status {
                 TaskStatus::Running => ("●", Color::Yellow),
@@ -128,13 +137,16 @@ pub fn render_list_popup<'a>(
                 TaskStatus::Aborted => "aborted",
             };
             Line::styled(
-                format!(
-                    " {} {:<8} {:<24} {:>6.1}s {}",
-                    sym,
-                    t.tool_name,
-                    truncate_str(&t.command, 24),
-                    secs,
-                    status_str
+                crate::tui::wrap::truncate_to_width(
+                    &format!(
+                        " {} {:<8} {:<24} {:>6.1}s {}",
+                        sym,
+                        t.tool_name,
+                        truncate_str(&t.command, 24),
+                        secs,
+                        status_str
+                    ),
+                    row_width,
                 ),
                 style,
             )

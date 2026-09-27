@@ -7,6 +7,7 @@
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::state::{RunningTaskRegistry, TaskStatus};
 
@@ -174,8 +175,22 @@ pub fn render_statusbar<'a>(
     tasks: &'a RunningTaskRegistry,
     active_process_count: usize,
     model: &'a str,
+    width: u16,
 ) -> Line<'a> {
     let mut spans: Vec<Span<'a>> = Vec::new();
+    // The status row is exactly one terminal row tall, so the assembled line
+    // must never exceed `width`; an over-wide line is right-clipped by ratatui
+    // (the model name is the first casualty). Track the columns spent and stop
+    // appending segments once the budget is gone.
+    let budget = width as usize;
+    let mut used = 0usize;
+    let push = |spans: &mut Vec<Span<'a>>, span: Span<'a>, used: &mut usize| {
+        let w = UnicodeWidthStr::width(span.content.as_ref());
+        if *used + w <= budget {
+            *used += w;
+            spans.push(span);
+        }
+    };
 
     let running: Vec<&crate::tui::state::TaskState> = tasks
         .list()
@@ -196,27 +211,48 @@ pub fn render_statusbar<'a>(
         } else {
             format!(" {}({}) {:.1}s", running[0].tool_name, count, secs)
         };
-        spans.push(dot);
-        spans.push(Span::raw(label));
-        spans.push(Span::raw("  "));
+        push(&mut spans, dot, &mut used);
+        push(&mut spans, Span::raw(label), &mut used);
+        push(&mut spans, Span::raw("  "), &mut used);
     }
 
     if active_process_count > 0 {
-        spans.push(Span::raw(format!("{active_process_count} proc running  ")));
+        push(
+            &mut spans,
+            Span::raw(format!("{active_process_count} proc running  ")),
+            &mut used,
+        );
     }
 
-    spans.push(Span::raw("prefill "));
-    spans.push(Span::styled(
-        format_thousands(state.display_input_tokens()),
-        Style::new().fg(Color::Gray),
-    ));
-    spans.push(Span::raw("  decode "));
-    spans.push(Span::styled(
-        format_thousands(state.display_output_tokens()),
-        Style::new().fg(Color::Gray),
-    ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(model, Style::new().fg(Color::DarkGray)));
+    push(&mut spans, Span::raw("prefill "), &mut used);
+    push(
+        &mut spans,
+        Span::styled(
+            format_thousands(state.display_input_tokens()),
+            Style::new().fg(Color::Gray),
+        ),
+        &mut used,
+    );
+    push(&mut spans, Span::raw("  decode "), &mut used);
+    push(
+        &mut spans,
+        Span::styled(
+            format_thousands(state.display_output_tokens()),
+            Style::new().fg(Color::Gray),
+        ),
+        &mut used,
+    );
+    push(&mut spans, Span::raw("  "), &mut used);
+    // The model name is truncated (not dropped) so the closing segment still
+    // shows which model is in use on a narrow terminal.
+    push(
+        &mut spans,
+        Span::styled(
+            crate::tui::wrap::truncate_to_width(model, budget.saturating_sub(used)),
+            Style::new().fg(Color::DarkGray),
+        ),
+        &mut used,
+    );
 
     Line::from(spans)
 }
@@ -280,6 +316,33 @@ mod tests {
     }
 
     #[test]
+    fn statusbar_fits_the_terminal_width() {
+        // The status row is one line tall: anything wider is clipped on the
+        // right, and the model name is the first thing to disappear.
+        let mut state = StatusBarState::default();
+        state.set_token_target(123_456, 7_890);
+        let tasks = RunningTaskRegistry::new();
+        for width in [20u16, 40, 80] {
+            let line = render_statusbar(&state, &tasks, 0, "claude-opus-4-with-a-long-name", width);
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(w <= width as usize, "width {width}: status bar is {w} cols");
+        }
+    }
+
+    #[test]
+    fn statusbar_keeps_the_model_name_when_it_fits() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::new();
+        let line = render_statusbar(&state, &tasks, 0, "model", 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("model"), "model name was dropped: {text:?}");
+    }
+
+    #[test]
     fn test_format_thousands() {
         assert_eq!(format_thousands(0), "0");
         assert_eq!(format_thousands(999), "999");
@@ -292,7 +355,7 @@ mod tests {
     fn test_render_statusbar_empty_state() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, 0, "claude-opus-4");
+        let line = render_statusbar(&state, &tasks, 0, "claude-opus-4", 80);
         let text: String = line
             .spans
             .iter()
@@ -310,7 +373,7 @@ mod tests {
         let mut tasks = RunningTaskRegistry::new();
         tasks.on_tool_call("t1", "bash", "ls", 120);
         let state = StatusBarState::default();
-        let line = render_statusbar(&state, &tasks, 0, "model");
+        let line = render_statusbar(&state, &tasks, 0, "model", 80);
         let text: String = line
             .spans
             .iter()
@@ -324,7 +387,7 @@ mod tests {
     fn test_render_statusbar_omits_inactive_managed_processes() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, 0, "model");
+        let line = render_statusbar(&state, &tasks, 0, "model", 80);
         let text: String = line
             .spans
             .iter()
@@ -340,7 +403,7 @@ mod tests {
     fn test_render_statusbar_shows_managed_process_count_without_duration() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, 2, "model");
+        let line = render_statusbar(&state, &tasks, 2, "model", 80);
         let text: String = line
             .spans
             .iter()
@@ -361,7 +424,7 @@ mod tests {
         let mut tasks = RunningTaskRegistry::new();
         tasks.on_tool_call("bash-1", "bash", "sleep 10", 120);
         let state = StatusBarState::default();
-        let line = render_statusbar(&state, &tasks, 1, "model");
+        let line = render_statusbar(&state, &tasks, 1, "model", 80);
         let text: String = line
             .spans
             .iter()

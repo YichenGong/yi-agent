@@ -1,5 +1,8 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use super::wrap::wrap_by_display_width;
 
 /// 提交结果：调用方必须处理三态，避免"拒收"被静默忽略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,17 +98,20 @@ impl Default for PendingQueue {
 /// - 标题行:`⌛ 排队中 (N)`,dim,N = 总数
 /// - 每条消息:`  ↳ ` 前缀,dim + italic
 /// - 最多显示 3 行,超出显示 `… 还有 X 条` 计数行
-pub fn render_queued_preview(items: &[String], _width: u16) -> Vec<Line<'static>> {
+pub fn render_queued_preview(items: &[String], width: u16) -> Vec<Line<'static>> {
     if items.is_empty() {
         return Vec::new();
     }
 
+    let w = width.max(1) as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
     let dim_italic = Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC);
 
     let mut lines = Vec::new();
+    // Each preview line is folded to the terminal width: a long queued message
+    // is otherwise one over-wide `Line`, whose right side ratatui drops.
     lines.push(Line::from(vec![Span::styled(
-        format!("⌛ 排队中 ({})", items.len()),
+        fold_to_width(&format!("⌛ 排队中 ({})", items.len()), w),
         dim,
     )]));
 
@@ -113,10 +119,9 @@ pub fn render_queued_preview(items: &[String], _width: u16) -> Vec<Line<'static>
     let total = items.len();
     let show = total.min(visible_count);
     for text in items.iter().take(show) {
-        lines.push(Line::from(vec![
-            Span::styled("  ↳ ", dim),
-            Span::styled(text.clone(), dim_italic),
-        ]));
+        for chunk in wrap_by_display_width(text, w, "  ↳ ", "    ") {
+            lines.push(Line::styled(chunk, dim_italic));
+        }
     }
     if total > visible_count {
         let remaining = total - visible_count;
@@ -129,11 +134,70 @@ pub fn render_queued_preview(items: &[String], _width: u16) -> Vec<Line<'static>
     lines
 }
 
+/// Truncate `text` to `width` display columns, appending an ellipsis when it
+/// does not fit. Used for the fixed-shape count header.
+fn fold_to_width(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_w > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_w;
+    }
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     use super::{PendingQueue, SubmitOutcome};
+
+    #[test]
+    fn queued_preview_folds_long_messages_to_width() {
+        // The preview used to take `_width` and ignore it, so a long queued
+        // message rendered wider than the terminal and was clipped.
+        let long = "这是一条很长的排队消息需要按显示宽度折行否则右侧会被截断掉看不见真的看不见";
+        let items = vec![long.to_string(), "short".to_string()];
+        for width in [20u16, 40, 80] {
+            for (i, line) in render_queued_preview(&items, width).iter().enumerate() {
+                let w: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                assert!(
+                    w <= width as usize,
+                    "width {width}: queued line {i} is {w} cols: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_preview_keeps_full_message_text_when_folding() {
+        let long = "这是一条很长的排队消息需要按显示宽度折行否则右侧会被截断掉看不见";
+        let items = vec![long.to_string()];
+        let rendered: String = render_queued_preview(&items, 20)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        for ch in long.chars() {
+            assert!(
+                rendered.contains(ch),
+                "queued preview lost {ch:?}: {rendered:?}"
+            );
+        }
+    }
 
     #[test]
     fn idle_submit_sends_immediately_and_leaves_queue_empty() {
