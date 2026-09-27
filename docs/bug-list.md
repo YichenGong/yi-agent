@@ -10,7 +10,7 @@
 - [x] 确认是否支持图片读取。（修复：新增 `view_image` 工具读取 png/jpeg/gif/webp 并返回 `ContentBlock::Image`；Anthropic/OpenAI 两个 provider 均可序列化，OpenAI 侧把 tool 结果里的图片拆到紧随的 user 消息。见 `yi-agent-rs/crates/yi-agent-tools/src/fs/view_image.rs`、`yi-agent-rs/crates/yi-agent-llm/src/openai/types.rs`；验证：`cargo test -p yi-agent-tools --lib fs::view_image`、`cargo test -p yi-agent-llm --lib openai::types`）
 - [ ] 如果输入框输入的是一个路径开始的内容。系统会把他当成slash command，然后会反馈说“未知命令”
 - [ ] 当遇到一系列的待确认项的时候，最好有进度条。
-- [ ] 自动压缩后，Prefill的数字好像不会自动更新了。
+- [x] 自动压缩后，Prefill的数字好像不会自动更新了。（修复：状态栏 token 插值原为单向——`tick()` 用 `saturating_sub` + `min`，`display_input` 只能上升，压缩后估算值骤降时显示值卡在压缩前的旧值；且唯一向下路径（1s 空闲 snap）被 `set_prefill_estimate` / `on_tool_call_phase` 清空 `last_usage_time` 而失效。改为 `tick()` 经 `interpolate()` 双向收敛到 target，压缩后随估算值下降。见 `yi-agent-rs/crates/yi-agent/src/tui/statusbar.rs` `tick` / `interpolate`。验证：`cargo test -p yi-agent --bin yi-agent tui::statusbar::tests::test_prefill_follows_estimate_down_after_compaction`（修复前显示值停在 160000））
 - [ ] 出现多次连续自动压缩的情况
 - [ ] subagent 如果一直不停。怎么办。
 - [ ] 当前启动subagent runtime 就会创建worktree。太多了怎么清理。（大幅缓解：subagent 现默认只读、不建 worktree，只有显式 `mode: "coding"` 的 child 才建；已集成 delivery 验收后自动回收 worktree/branch/workspace 行，见 `runtime.rs` `recycle_accepted_delivery`。剩余：coding child 已交付但父未集成/未 merge，以及失败/取消/驳回的 coding 任务仍不回收）
