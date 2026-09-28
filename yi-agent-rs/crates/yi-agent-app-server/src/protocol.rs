@@ -113,6 +113,11 @@ pub enum Notification {
     },
     #[serde(rename = "turn/started")]
     TurnStarted { thread_id: String, turn_id: String },
+    #[serde(rename = "thread/status/updated")]
+    ThreadStatusUpdated {
+        thread_id: String,
+        status: ThreadStatus,
+    },
     #[serde(rename = "item/started")]
     ItemStarted { thread_id: String, item: Item },
     #[serde(rename = "item/delta")]
@@ -184,6 +189,16 @@ pub enum TurnStatus {
     Completed,
     Interrupted,
     Failed,
+}
+
+/// thread 级实时状态。`failed` 刻意缺席：失败是事件不是状态，失败后 thread
+/// 立刻回 `Idle`；"失败未读"由前端从 `turn/completed.params.status` 自行表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStatus {
+    Idle,
+    Running,
+    AwaitingApproval,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,5 +358,33 @@ mod tests {
         assert_eq!(v["params"]["output_tokens"], 3);
         assert_eq!(v["params"]["cache_creation_input_tokens"], 100);
         assert_eq!(v["params"]["cache_read_input_tokens"], 200);
+    }
+
+    #[test]
+    fn thread_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ThreadStatus::Idle).unwrap(),
+            serde_json::json!("idle")
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadStatus::Running).unwrap(),
+            serde_json::json!("running")
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadStatus::AwaitingApproval).unwrap(),
+            serde_json::json!("awaiting_approval")
+        );
+    }
+
+    #[test]
+    fn thread_status_notification_serializes_with_method_tag() {
+        let n = Notification::ThreadStatusUpdated {
+            thread_id: "t1".into(),
+            status: ThreadStatus::AwaitingApproval,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/status/updated");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["status"], "awaiting_approval");
     }
 }
