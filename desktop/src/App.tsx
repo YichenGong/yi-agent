@@ -57,7 +57,6 @@ export default function App() {
   const [status, setStatus] = useState<string>("connecting");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [mode, setMode] = useState<ThreadMode | null>(null);
 
   const current = currentId ? store.view(currentId) : null;
 
@@ -112,11 +111,14 @@ export default function App() {
       await c.request("thread/resume", { threadId: id });
       // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
       // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
-      if (!store.peek(id)) return;
+      const view = store.peek(id);
+      if (!view) return;
       warm.current.add(id);
-      // thread/resume 响应不带权限模式,从 listAll 回读后再应用。
+      // thread/resume 响应不带权限模式,从 listAll 回读后写回该 view。
+      // 按 thread 存储,切回 warm thread 时 chip 自动反映各自模式。
       const gs = await refreshThreads();
-      if (gs !== null && id === store.currentId) setMode(modeForThread(gs, id));
+      if (gs !== null) view.mode = modeForThread(gs, id);
+      force((v) => v + 1);
     } catch (e) {
       // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
       // drop 的 ThreadView(无界泄漏 + 残留 warm 条目)。
@@ -138,13 +140,16 @@ export default function App() {
       );
       warm.current.add(t.thread_id);
       store.view(t.thread_id).info = { cwd: t.cwd, model: t.model };
+      // 新对话默认 normal;仍从 listAll 回读以与服务端保持一致。
+      store.view(t.thread_id).mode = "normal";
       store.select(t.thread_id);
       setCurrentId(t.thread_id);
       force((v) => v + 1);
-      // 新对话默认 normal;仍从 listAll 回读以与服务端保持一致。
       const gs = await refreshThreads();
-      if (gs !== null && t.thread_id === store.currentId)
-        setMode(modeForThread(gs, t.thread_id));
+      if (gs !== null) {
+        store.view(t.thread_id).mode = modeForThread(gs, t.thread_id);
+        force((v) => v + 1);
+      }
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);
@@ -237,10 +242,7 @@ export default function App() {
     if (v?.approval) dismissedApprovals.current.delete(v.approval.id);
     store.drop(id);
     warm.current.delete(id);
-    if (id === currentId) {
-      setCurrentId(null);
-      setMode(null);
-    }
+    if (id === currentId) setCurrentId(null);
     force((v) => v + 1);
     await refreshThreads();
   };
@@ -252,7 +254,8 @@ export default function App() {
     if (!c || !id) return;
     try {
       await c.request("thread/setPermissionMode", setPermissionModeParams(id, next));
-      setMode(next);
+      store.view(id).mode = next;
+      force((v) => v + 1);
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);
@@ -362,7 +365,7 @@ export default function App() {
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
         />
-        <div className="flex min-w-0 flex-1 flex-col">
+        <div className="relative flex min-w-0 flex-1 flex-col">
           <ApprovalBanner
             items={bannerItems}
             onJump={(id) => void selectThread(id)}
@@ -386,28 +389,28 @@ export default function App() {
             turnActive={current?.session.turnActive ?? false}
             onSend={send}
             onInterrupt={interrupt}
-            mode={mode}
+            mode={current?.mode ?? null}
             onModeChange={setThreadMode}
           />
+          {approval && (
+            <ApprovalDialog
+              key={approval.id}
+              request={approval}
+              onDecide={async (decision) => {
+                try {
+                  await clientRef.current?.respond(approval.id, decision);
+                } catch (e) {
+                  const s = store.peek(approval.params.thread_id)?.session;
+                  if (s) s.lastError = formatError(e);
+                } finally {
+                  store.clearApproval(approval.params.thread_id);
+                  force((v) => v + 1);
+                }
+              }}
+            />
+          )}
         </div>
       </div>
-      {approval && (
-        <ApprovalDialog
-          key={approval.id}
-          request={approval}
-          onDecide={async (decision) => {
-            try {
-              await clientRef.current?.respond(approval.id, decision);
-            } catch (e) {
-              const s = store.peek(approval.params.thread_id)?.session;
-              if (s) s.lastError = formatError(e);
-            } finally {
-              store.clearApproval(approval.params.thread_id);
-              force((v) => v + 1);
-            }
-          }}
-        />
-      )}
     </>
   );
 }

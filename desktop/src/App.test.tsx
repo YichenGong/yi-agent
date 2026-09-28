@@ -245,6 +245,26 @@ describe("App parallel threads", () => {
     expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2);
   });
 
+  it("re-derives the chip on a warm switch (per-thread mode)", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "yolo" },
+    ];
+    render(<App />);
+    // Auto-resumes t1 → Normal.
+    await waitFor(() => expect(modeTrigger().textContent).toContain("Normal"));
+
+    fireEvent.click(screen.getByText("two")); // 冷 → resume → YOLO
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+
+    // 切回已 resume 过的 t1（warm，不再 resume）——chip 必须回到 Normal,
+    // 而不是停留在 t2 的 YOLO。
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() => expect(modeTrigger().textContent).toContain("Normal"));
+    expect(modeTrigger().textContent).not.toContain("YOLO");
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2);
+  });
+
   it("does not lose a background thread's timeline when switching", async () => {
     state.threads = [
       { thread_id: "t1", title: "one", permission_mode: "normal" },

@@ -47,10 +47,9 @@ export function ApprovalDialog({
   const blacklisted = kind !== "Normal" ? kind.Blacklisted : null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
       <div
         role="dialog"
-        aria-modal="true"
         aria-labelledby={headingId}
         className="w-full max-w-lg rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl"
       >

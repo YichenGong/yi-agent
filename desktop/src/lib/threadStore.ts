@@ -1,5 +1,6 @@
 import { Session } from "./session";
 import type { ApprovalRequest, Notification, ThreadStatus, ThreadSummary } from "./protocol";
+import type { ThreadMode } from "./threadPermissionMode";
 
 /** 单个 thread 的客户端视图：会话 + 服务端权威状态 + 未读 + 待处理审批。 */
 export interface ThreadView {
@@ -9,6 +10,8 @@ export interface ThreadView {
   unread: boolean;
   approval: ApprovalRequest | null;
   info: { cwd: string; model: string } | null;
+  /** 服务端权威权限模式；null = 未知,勿当作 normal。 */
+  mode: ThreadMode | null;
 }
 
 /**
@@ -22,7 +25,14 @@ export class ThreadStore {
   currentId: string | null = null;
 
   private create(): ThreadView {
-    return { session: new Session(), status: "idle", unread: false, approval: null, info: null };
+    return {
+      session: new Session(),
+      status: "idle",
+      unread: false,
+      approval: null,
+      info: null,
+      mode: null,
+    };
   }
 
   /** 取（必要时创建）某 thread 的视图。 */
