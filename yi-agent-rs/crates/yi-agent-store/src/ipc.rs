@@ -133,6 +133,10 @@ pub enum IpcError {
     AlreadyRunning { path: PathBuf },
     #[error("IPC frame exceeds {MAX_FRAME_BYTES} bytes")]
     FrameTooLarge,
+    #[error("IPC response frame is truncated after {received} bytes (the peer closed mid-frame)")]
+    TruncatedFrame { received: usize },
+    #[error("timed out writing response frame after {written} of {total} bytes")]
+    FrameWriteTimeout { written: usize, total: usize },
     #[error("daemon listener thread panicked during shutdown")]
     ListenerPanicked,
     #[error(
@@ -2028,6 +2032,65 @@ mod subscription_queue_tests {
     }
 
     #[test]
+    fn a_truncated_response_is_reported_as_truncated_not_as_oversized() {
+        // A peer that closes mid-frame yields a frame without its terminator.
+        // That is a *transport* failure, not a size violation; conflating the two
+        // sends operators chasing a payload-size limit that was never hit.
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"{\"partial\":").unwrap();
+        writer.shutdown(Shutdown::Write).unwrap();
+
+        let mut reader = BufReader::new(reader);
+        let error = read_limited_frame(&mut reader).unwrap_err();
+
+        assert!(
+            matches!(error, IpcError::TruncatedFrame { .. }),
+            "a closed mid-frame response must be TruncatedFrame, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_over_the_cap_is_reported_as_too_large_not_truncated() {
+        // The genuine size violation keeps its own distinct error.
+        //
+        // The payload is larger than the socket buffer, so it has to be written
+        // from its own thread: a same-thread write fills the buffer and blocks
+        // before this thread ever reaches read_limited_frame, hanging the test
+        // instead of exercising the error path.
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let pump = std::thread::spawn(move || {
+            let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+            writer.write_all(&oversized).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        });
+
+        let mut reader = BufReader::new(reader);
+        let error = read_limited_frame(&mut reader).unwrap_err();
+
+        assert!(
+            matches!(error, IpcError::FrameTooLarge),
+            "a frame past the cap must stay FrameTooLarge, got: {error:?}"
+        );
+        pump.join().unwrap();
+    }
+
+    #[test]
+    fn truncation_and_write_timeout_map_to_validation_not_internal() {
+        assert_eq!(
+            ipc_error_code(&IpcError::TruncatedFrame { received: 12 }),
+            IpcErrorCode::Validation
+        );
+        assert_eq!(
+            ipc_error_code(&IpcError::FrameWriteTimeout {
+                written: 8192,
+                total: 26000,
+            }),
+            IpcErrorCode::Validation
+        );
+    }
+
+    #[test]
     fn subscription_failure_after_initial_frame_does_not_append_an_error_frame() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(br#"{"partial":"#).unwrap();
@@ -2180,7 +2243,13 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             IpcErrorCode::Validation
         }
-        IpcError::Json(_) | IpcError::FrameTooLarge => IpcErrorCode::Validation,
+        // Transport-layer failures stay Validation: a truncated or timed-out
+        // response is not a daemon fault, and reporting it as Internal sends
+        // operators hunting for a crashed daemon that is running fine.
+        IpcError::Json(_)
+        | IpcError::FrameTooLarge
+        | IpcError::TruncatedFrame { .. }
+        | IpcError::FrameWriteTimeout { .. } => IpcErrorCode::Validation,
         _ => IpcErrorCode::Internal,
     }
 }
@@ -2261,8 +2330,13 @@ fn read_limited_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, Ipc
     if read == 0 {
         return Ok(None);
     }
-    if frame.len() > MAX_FRAME_BYTES || !frame.ends_with(b"\n") {
+    if frame.len() > MAX_FRAME_BYTES {
         return Err(IpcError::FrameTooLarge);
+    }
+    if !frame.ends_with(b"\n") {
+        return Err(IpcError::TruncatedFrame {
+            received: frame.len(),
+        });
     }
     frame.pop();
     Ok(Some(frame))
