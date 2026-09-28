@@ -759,7 +759,9 @@ mod tests {
     }
 
     /// Install a connector that serves `EchoServer` over a fresh duplex stream
-    /// per call. `calls` counts `tools/call` invocations across all instances.
+    /// per call. `calls` deliberately counts `tools/call` invocations across
+    /// BOTH the probe connection and the later call connection, so a silent
+    /// reconnect (a third `tools/call`) would be caught by `assert_eq!(calls, 1)`.
     fn install_echo_connector(calls: Arc<AtomicUsize>) {
         use rmcp::ServiceExt;
         let factory: TestConnector = Arc::new(move || {
@@ -778,8 +780,18 @@ mod tests {
         *TEST_CONNECTOR.lock().unwrap() = Some(factory);
     }
 
+    /// Clears the process-global `TEST_CONNECTOR` on drop, including on panic,
+    /// so a failed assertion cannot leak the seam into other tests.
+    struct SeamGuard;
+    impl Drop for SeamGuard {
+        fn drop(&mut self) {
+            *TEST_CONNECTOR.lock().unwrap() = None;
+        }
+    }
+
     #[tokio::test]
     async fn probe_then_call_over_duplex() {
+        let _seam = SeamGuard;
         let calls = Arc::new(AtomicUsize::new(0));
         install_echo_connector(Arc::clone(&calls));
 
@@ -829,7 +841,6 @@ mod tests {
         assert!(mgr.enabled_tools().is_empty());
 
         mgr.shutdown().await;
-        *TEST_CONNECTOR.lock().unwrap() = None;
     }
 }
 
