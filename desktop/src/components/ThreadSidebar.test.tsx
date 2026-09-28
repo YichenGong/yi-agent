@@ -4,8 +4,12 @@ import { render, fireEvent, cleanup } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+import { DEFAULT_SIDEBAR_WIDTH, SIDEBAR_WIDTH_STORAGE_KEY } from "../lib/sidebarWidth";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 function thread(id: string, title: string, cwd: string): ThreadSummary {
   return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title };
@@ -146,5 +150,27 @@ describe("ThreadSidebar", () => {
     fireEvent.click(caret);
     expect(container.textContent).not.toContain("alpha-thread");
     expect(header.querySelector('button[aria-label="Expand"]')).not.toBeNull();
+  });
+});
+
+const aside = (container: HTMLElement) => container.querySelector("aside")!;
+
+describe("ThreadSidebar width", () => {
+  it("renders the drag handle with separator semantics", () => {
+    const { container } = renderSidebar();
+    const handle = container.querySelector('[role="separator"]')!;
+    expect(handle).not.toBeNull();
+    expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+  });
+
+  it("defaults to the default width", () => {
+    const { container } = renderSidebar();
+    expect(aside(container).style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH}px`);
+  });
+
+  it("restores the persisted width on mount", () => {
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, "320");
+    const { container } = renderSidebar();
+    expect(aside(container).style.width).toBe("320px");
   });
 });

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
+import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 
 /** Compact relative time, e.g. "3m", "2h", "5d". */
 function relativeTime(ms: number): string {
@@ -49,6 +50,9 @@ export function ThreadSidebar({
   // an outside click; the two are mutually exclusive.
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [contextWs, setContextWs] = useState<string | null>(null);
+  const [width, setWidth] = useState(loadSidebarWidth);
+  const widthRef = useRef(width);
+  const cleanupDrag = useRef<(() => void) | null>(null);
 
   const closeMenus = useCallback(() => {
     setNewMenuOpen(false);
@@ -145,7 +149,10 @@ export function ThreadSidebar({
   };
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800 bg-neutral-900">
+    <aside
+      className="relative flex shrink-0 flex-col border-r border-neutral-800 bg-neutral-900"
+      style={{ width }}
+    >
       <div className="relative p-2">
         <button
           type="button"
@@ -297,6 +304,12 @@ export function ThreadSidebar({
           );
         })}
       </div>
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        className="absolute inset-y-0 right-0 z-30 w-1.5 cursor-col-resize hover:bg-neutral-700/50"
+      />
     </aside>
   );
 }
