@@ -71,7 +71,7 @@
 
 **P3 路线图：**
 
-- [ ] MCP 集成 — 后端 `yi-agent-mcp` 已有（见 [yi-agent-mcp](./yi-agent-mcp.md)）；判据：GUI 可查看 / 启停 MCP server
+- [ ] MCP 集成 — 后端 `yi-agent-mcp` 已完成（配置/懒连接/调用/`/mcp` 开关，见 [yi-agent-mcp](./yi-agent-mcp.md)）；判据：GUI 可查看 / 启停 MCP server
 - [ ] 子 agent 任务树可视化 — 复用现有 daemon IPC（见 [subagent-runtime](./subagent-runtime.md)）；判据：GUI 展示子 agent 任务树
 - [ ] Unix socket / websocket 传输 — 当前仅 stdio（其它一律拒绝，`yi-agent-rs/crates/yi-agent/src/main.rs:74`）；判据：`--listen` 支持 socket/ws 且 GUI 可连
 - [ ] 多窗口共享 daemon — 判据：多个 GUI 窗口连同一 daemon

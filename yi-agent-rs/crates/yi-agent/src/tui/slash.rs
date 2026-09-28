@@ -33,6 +33,7 @@ pub enum SlashCommand {
     Reject,
     Budget,
     Daemon,
+    Mcp,
 }
 
 impl SlashCommand {
@@ -57,6 +58,7 @@ impl SlashCommand {
             Self::Reject => ControlCommand::Reject,
             Self::Budget => ControlCommand::Budget,
             Self::Daemon => ControlCommand::Daemon,
+            Self::Mcp => ControlCommand::Mcp,
             Self::Help => ControlCommand::Help,
             Self::Quit | Self::Clear | Self::Model | Self::Cost | Self::Compact | Self::Config => {
                 return None;
@@ -97,6 +99,7 @@ impl SlashCommand {
             SlashCommand::Reject => "reject",
             SlashCommand::Budget => "budget",
             SlashCommand::Daemon => "daemon",
+            SlashCommand::Mcp => "mcp",
         }
     }
 
@@ -132,6 +135,7 @@ impl SlashCommand {
             SlashCommand::Reject => "拒绝子任务 delivery",
             SlashCommand::Budget => "查看或收窄任务预算",
             SlashCommand::Daemon => "管理本地 runtime daemon",
+            SlashCommand::Mcp => "管理 MCP server 开关",
         }
     }
 
@@ -194,6 +198,7 @@ impl SlashCommand {
             SlashCommand::Reject,
             SlashCommand::Budget,
             SlashCommand::Daemon,
+            SlashCommand::Mcp,
         ]
     }
 
@@ -241,6 +246,47 @@ pub fn help_text(target: Option<&str>) -> String {
             text
         }
     }
+}
+
+/// A parsed `/mcp` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpAction {
+    /// List configured servers and their effective on/off state.
+    Status,
+    /// Toggle the session-wide master switch.
+    Master(bool),
+    /// Toggle one server.
+    Server { name: String, on: bool },
+}
+
+/// Parse `/mcp` arguments. Returns a user-facing usage error on bad input.
+pub fn parse_mcp_args(args: &str) -> Result<McpAction, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] | ["status"] => Ok(McpAction::Status),
+        ["on"] => Ok(McpAction::Master(true)),
+        ["off"] => Ok(McpAction::Master(false)),
+        ["enable", name] => Ok(McpAction::Server {
+            name: (*name).into(),
+            on: true,
+        }),
+        ["disable", name] => Ok(McpAction::Server {
+            name: (*name).into(),
+            on: false,
+        }),
+        _ => Err("用法: /mcp [on|off|enable <server>|disable <server>|status]".into()),
+    }
+}
+
+/// Render `/mcp status` output. Pure so it is unit-testable without a manager.
+pub fn render_mcp_status(master: bool, servers: &[(String, bool)]) -> String {
+    if servers.is_empty() {
+        return "未配置 MCP server".to_string();
+    }
+    let mut out = format!("MCP master: {}\n", if master { "on" } else { "off" });
+    for (name, on) in servers {
+        out.push_str(&format!("  {name}: {}\n", if *on { "on" } else { "off" }));
+    }
+    out
 }
 
 /// State for the slash command popup shown above the input area.
@@ -451,5 +497,70 @@ mod tests {
         let names: Vec<&str> = SlashCommand::all().iter().map(|c| c.name()).collect();
         let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
         assert_eq!(names.len(), unique.len(), "duplicate command names");
+    }
+
+    #[test]
+    fn mcp_command_is_registered_with_usage() {
+        assert_eq!(SlashCommand::from_name("mcp"), Some(SlashCommand::Mcp));
+        assert_eq!(
+            SlashCommand::Mcp.argument_usage(),
+            Some("[on|off|enable <server>|disable <server>|status]")
+        );
+        assert!(SlashCommand::all().contains(&SlashCommand::Mcp));
+    }
+
+    #[test]
+    fn parse_mcp_args_empty_and_status_mean_status() {
+        assert_eq!(parse_mcp_args(""), Ok(McpAction::Status));
+        assert_eq!(parse_mcp_args("status"), Ok(McpAction::Status));
+    }
+
+    #[test]
+    fn parse_mcp_args_on_and_off_toggle_master() {
+        assert_eq!(parse_mcp_args("on"), Ok(McpAction::Master(true)));
+        assert_eq!(parse_mcp_args("off"), Ok(McpAction::Master(false)));
+    }
+
+    #[test]
+    fn parse_mcp_args_enable_disable_toggle_one_server() {
+        assert_eq!(
+            parse_mcp_args("enable fs"),
+            Ok(McpAction::Server {
+                name: "fs".into(),
+                on: true
+            })
+        );
+        assert_eq!(
+            parse_mcp_args("disable fs"),
+            Ok(McpAction::Server {
+                name: "fs".into(),
+                on: false
+            })
+        );
+    }
+
+    #[test]
+    fn parse_mcp_args_rejects_bad_input_with_usage_message() {
+        assert_eq!(
+            parse_mcp_args("bogus"),
+            Err("用法: /mcp [on|off|enable <server>|disable <server>|status]".into())
+        );
+        assert_eq!(
+            parse_mcp_args("enable"),
+            Err("用法: /mcp [on|off|enable <server>|disable <server>|status]".into())
+        );
+    }
+
+    #[test]
+    fn render_mcp_status_without_servers_says_unconfigured() {
+        assert_eq!(render_mcp_status(true, &[]), "未配置 MCP server");
+    }
+
+    #[test]
+    fn render_mcp_status_lists_master_and_each_server() {
+        assert_eq!(
+            render_mcp_status(true, &[("fs".into(), true), ("gh".into(), false)]),
+            "MCP master: on\n  fs: on\n  gh: off\n"
+        );
     }
 }

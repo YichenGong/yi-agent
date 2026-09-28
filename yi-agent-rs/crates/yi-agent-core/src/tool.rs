@@ -139,6 +139,16 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Remove a tool by name, returning it if present.
+    pub fn remove(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.remove(name)
+    }
+
+    /// Names of all registered tools.
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }
@@ -265,6 +275,15 @@ mod tests {
         let reg = ToolRegistry::new();
         assert!(reg.is_empty());
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn registry_remove_by_name() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        assert!(reg.remove("echo").is_some());
+        assert!(reg.get("echo").is_none());
+        assert!(reg.remove("echo").is_none());
     }
 
     #[test]

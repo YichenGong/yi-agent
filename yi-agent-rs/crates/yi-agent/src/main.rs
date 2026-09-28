@@ -17,8 +17,8 @@ use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
 // Headless 模式的工具 + system prompt 构建结果。类型来自共享 crate
-// (`ToolSetup` 三个字段都是 `pub`),`build_headless_root_tools` 直接用
-// `HeadlessSetup { tools, catalog, system_prompt }` 字面量构造仍然成立。
+// (`ToolSetup` 的字段都是 `pub`),`build_headless_root_tools` 直接用
+// `HeadlessSetup { tools, catalog, system_prompt, mcp }` 字面量构造仍然成立。
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
@@ -714,6 +714,7 @@ fn build_headless_root_tools(
         tools: Arc::new(registry),
         catalog: setup.catalog,
         system_prompt: setup.system_prompt,
+        mcp: setup.mcp,
     })
 }
 
@@ -1029,6 +1030,18 @@ fn run_agent(cli: Cli) -> Result<()> {
     );
     yi_agent_tools::register_process_tools(&mut registry, process_manager.clone());
 
+    // Register MCP tools and keep the manager so the TUI can toggle servers and
+    // the driver can refresh the registry at runtime. A bad MCP config must never
+    // block the agent: warn and continue with an empty manager.
+    let mcp = match yi_agent_mcp::register_mcp_tools(&mut registry, &config.workdir) {
+        Ok(Some(manager)) => manager,
+        Ok(None) => yi_agent_mcp::McpManager::empty(),
+        Err(err) => {
+            tracing::warn!("MCP disabled: {err:#}");
+            yi_agent_mcp::McpManager::empty()
+        }
+    };
+
     let tools = Arc::new(registry);
 
     let agent_config =
@@ -1047,6 +1060,7 @@ fn run_agent(cli: Cli) -> Result<()> {
         base_registry,
         process_manager,
         prompt.catalog,
+        mcp,
     )
 }
 
@@ -1255,6 +1269,7 @@ fn run_headless(
 
     let agent_config =
         yi_agent_runtime::bootstrap::build_agent_config(&config, setup.system_prompt);
+    let mcp = setup.mcp;
 
     let rt = tokio::runtime::Runtime::new()?;
     let exit_code = rt.block_on(async move {
@@ -1281,6 +1296,13 @@ fn run_headless(
         }
     });
 
+    // Close MCP server connections on a running reactor so the child processes
+    // are reaped; `std::process::exit` below would skip destructors. Done after
+    // `block_on` so it also covers the early-error exit path.
+    if let Some(manager) = &mcp {
+        rt.block_on(manager.shutdown());
+    }
+
     if let Some(runtime) = &headless_runtime {
         detach_headless_runtime_root(runtime);
         let _embedded_daemon = runtime.embedded_daemon.as_ref();
@@ -1304,6 +1326,7 @@ fn run_tui_agent(
     base_registry: yi_agent_core::ToolRegistry,
     process_manager: Arc<yi_agent_tools::ProcessManager>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -1341,6 +1364,8 @@ fn run_tui_agent(
         let rebuild_config = agent_config.clone();
         let rebuild_decision_rx = Arc::clone(&decision_rx);
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
+        let mcp_for_driver = Arc::clone(&mcp);
+        let mcp_for_teardown = Arc::clone(&mcp);
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -1411,6 +1436,22 @@ fn run_tui_agent(
                                 }
                             }
                         }
+                        ControlCommand::McpRefresh => {
+                            let mut refreshed = (*current_tools).clone();
+                            mcp_for_driver.refresh_registry(&mut refreshed);
+                            current_tools = Arc::new(refreshed);
+                            agent = yi_agent_core::Agent::new(
+                                Arc::clone(&rebuild_provider),
+                                Arc::clone(&current_tools),
+                                rebuild_config.clone(),
+                            )
+                            .with_session(agent.session())
+                            .with_permission(
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                            );
+                            tracing::info!("MCP tool registry refreshed");
+                        }
                     }
                     continue;
                 }
@@ -1447,12 +1488,14 @@ fn run_tui_agent(
                                         attached_root.clone(),
                                     );
                                     let runtime_workdir = attached_root.workspace.path.clone();
-                                    let next_tools = Arc::new(build_tui_root_tools(
+                                    let mut next_registry = build_tui_root_tools(
                                         &base_registry,
                                         &config,
                                         socket_path.clone(),
                                         &attached_root,
-                                    ));
+                                    );
+                                    mcp_for_driver.refresh_registry(&mut next_registry);
+                                    let next_tools = Arc::new(next_registry);
                                     match load_permission_checker_for_workdir_async(runtime_workdir, &config).await {
                                         Ok(next_checker) => {
                                             let session = agent.session();
@@ -1617,6 +1660,7 @@ fn run_tui_agent(
                 Some(runtime_choice_tx),
                 process_manager,
                 workdir.clone(),
+                mcp,
             )
         });
 
@@ -1637,6 +1681,15 @@ fn run_tui_agent(
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
+        // Await the aborted handle so the driver future — and any `Arc<Client>`
+        // clone it held mid-call — is dropped before shutdown. Otherwise
+        // `shutdown`'s `Arc::try_unwrap` fails and the child is not reaped
+        // deterministically. `await` on an aborted handle resolves promptly.
+        let _ = driver.await;
+
+        // Close MCP server connections while the reactor is still running so the
+        // child processes are reaped before the runtime is dropped.
+        mcp_for_teardown.shutdown().await;
 
         result
     });
@@ -1655,6 +1708,9 @@ pub(crate) enum ControlCommand {
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
+    /// Rebuild the agent so its tool registry matches the MCP switches the TUI
+    /// already applied directly to the shared `McpManager`.
+    McpRefresh,
 }
 
 #[cfg(test)]
