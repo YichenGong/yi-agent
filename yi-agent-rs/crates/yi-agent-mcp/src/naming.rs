@@ -23,8 +23,6 @@ fn sanitize(part: &str) -> String {
 /// 构造 `mcp__{server}__{tool}`,先按 provider 字符集清洗,再截断到 64 字节。
 ///
 /// 清洗后只剩 ASCII,因此按字节截断不会破坏 UTF-8 边界。
-// TODO: 后续任务(McpTool 适配器)接入后移除 `allow(dead_code)`。
-#[allow(dead_code)]
 pub fn qualified_name(server: &str, tool: &str) -> String {
     let base = format!("{PREFIX}{}__{}", sanitize(server), sanitize(tool));
     if base.len() <= MAX_LEN {

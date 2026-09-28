@@ -4,6 +4,11 @@
 //! configured-but-unused server never spawns a child process. The master switch
 //! and per-server switches are plain atomics, letting the UI toggle them from a
 //! different task without locking.
+//!
+//! The connect handshake is bounded by `CONNECT_TIMEOUT` and each call by
+//! `CALL_TIMEOUT`. Calls do not hold the per-server lock, so concurrent calls to
+//! one server are not serialized; if a call fails at the transport layer the
+//! connection is dropped and the call is retried once on a fresh connection.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,16 +28,22 @@ use crate::tool::McpTool;
 /// Upper bound on a single remote tool call.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Upper bound on spawning a server and completing the MCP `initialize`
+/// handshake. Bounds a server that starts but never finishes handshaking.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A live client connection to one MCP server.
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 /// One configured server: its config, switch state, advertised tools, and the
-/// lazily-established connection (guarded so only one connect races through).
+/// lazily-established connection. The `Arc` lets a call clone the client and
+/// release the lock before awaiting the (long) network call; the lock is held
+/// only to (re)connect and to swap the cached handle.
 struct ServerEntry {
     config: ServerConfig,
     enabled: AtomicBool,
     tools: Vec<CachedTool>,
-    client: Mutex<Option<Client>>,
+    client: Mutex<Option<Arc<Client>>>,
 }
 
 /// Owns configured MCP servers and their connections.
@@ -138,6 +149,12 @@ impl McpManager {
     ///
     /// Never returns `Err`: transport and protocol failures are reported as an
     /// error `ToolResult` so the model sees the failure and can react.
+    ///
+    /// A call does not hold the per-server lock, so calls to the same server
+    /// run concurrently. If a call fails at the transport layer (the server
+    /// died), the cached connection is dropped and the call is retried once on
+    /// a fresh connection; a tool-level error or a call timeout is returned
+    /// as-is without touching the connection.
     pub async fn call_tool(&self, server: &str, remote_name: &str, args: Value) -> ToolResult {
         let Some(entry) = self.servers.get(server) else {
             return ToolResult::error(format!("unknown MCP server: {server}"));
@@ -146,25 +163,39 @@ impl McpManager {
             return ToolResult::error(format!("MCP server '{server}' is disabled"));
         }
 
-        let mut guard = entry.client.lock().await;
-        if guard.is_none() {
-            match connect(&entry.config).await {
-                Ok(c) => {
-                    info!(server, "connected to MCP server");
-                    *guard = Some(c);
-                }
-                Err(e) => return ToolResult::error(format!("connect to '{server}' failed: {e}")),
-            }
-        }
-        let client = guard.as_ref().expect("just connected");
+        let client = match acquire_client(server, entry).await {
+            Ok(client) => client,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
 
         let params = rmcp::model::CallToolRequestParams::new(remote_name.to_string())
             .with_arguments(args.as_object().cloned().unwrap_or_default());
 
-        match tokio::time::timeout(CALL_TIMEOUT, client.call_tool(params)).await {
-            Ok(Ok(result)) => map_result(result),
-            Ok(Err(e)) => ToolResult::error(format!("MCP call failed: {e}")),
-            Err(_) => ToolResult::error(format!("MCP call timed out after {CALL_TIMEOUT:?}")),
+        match call_once(&client, params.clone()).await {
+            CallOutcome::Result(result) => map_result(result),
+            CallOutcome::Timeout => {
+                ToolResult::error(format!("MCP call timed out after {CALL_TIMEOUT:?}"))
+            }
+            CallOutcome::Transport(e) => {
+                // The connection may be dead: drop the cached handle so the
+                // next call reconnects, then retry exactly once inline.
+                tracing::debug!(server, error = %e, "MCP call failed; reconnecting once");
+                drop_client_if_same(entry, &client).await;
+                let retry = match acquire_client(server, entry).await {
+                    Ok(client) => client,
+                    Err(e) => return ToolResult::error(e.to_string()),
+                };
+                match call_once(&retry, params).await {
+                    CallOutcome::Result(result) => map_result(result),
+                    CallOutcome::Timeout => {
+                        ToolResult::error(format!("MCP call timed out after {CALL_TIMEOUT:?}"))
+                    }
+                    CallOutcome::Transport(e) => {
+                        drop_client_if_same(entry, &retry).await;
+                        ToolResult::error(format!("MCP call failed: {e} (after reconnect)"))
+                    }
+                }
+            }
         }
     }
 
@@ -172,9 +203,16 @@ impl McpManager {
     /// dropping a child transport only kills the process on a running reactor.
     pub async fn shutdown(&self) {
         for (name, entry) in &self.servers {
-            let mut guard = entry.client.lock().await;
-            if let Some(client) = guard.take() {
-                let _ = client.cancel().await;
+            // Take the handle and release the lock before awaiting.
+            let client = entry.client.lock().await.take();
+            if let Some(client) = client {
+                // With no in-flight call holding a clone, close the service
+                // loop and reap the child explicitly. If a clone is still out,
+                // dropping our last-but-one handle lets `RunningService::drop`
+                // close the loop once that call finishes.
+                if let Ok(client) = Arc::try_unwrap(client) {
+                    let _ = client.cancel().await;
+                }
                 info!(server = name, "MCP server connection closed");
             }
         }
@@ -240,6 +278,54 @@ async fn connect(cfg: &ServerConfig) -> Result<Client> {
     let transport = TokioChildProcess::new(command)?;
     let client = ().serve(transport).await?;
     Ok(client)
+}
+
+/// Return a live client for `server`, connecting (bounded by `CONNECT_TIMEOUT`)
+/// if none is cached. The lock is held only across the connect and the clone,
+/// never across a tool call.
+async fn acquire_client(server: &str, entry: &ServerEntry) -> Result<Arc<Client>> {
+    let mut guard = entry.client.lock().await;
+    if let Some(client) = guard.as_ref() {
+        return Ok(Arc::clone(client));
+    }
+    let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&entry.config)).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => return Err(anyhow!("connect to '{server}' failed: {e}")),
+        Err(_) => return Err(anyhow!("connect to '{server}' timed out")),
+    };
+    let client = Arc::new(client);
+    *guard = Some(Arc::clone(&client));
+    info!(server, "connected to MCP server");
+    Ok(client)
+}
+
+/// Clear the cached client only if it is still the exact `Arc` that failed, so
+/// concurrent calls that fail together do not clobber a fresh connection.
+async fn drop_client_if_same(entry: &ServerEntry, failed: &Arc<Client>) {
+    let mut guard = entry.client.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, failed))
+    {
+        guard.take();
+    }
+}
+
+/// Result of one `tools/call`: a tool result, a call timeout, or a transport
+/// failure (which may mean the connection is dead).
+enum CallOutcome {
+    Result(rmcp::model::CallToolResult),
+    Timeout,
+    Transport(rmcp::ServiceError),
+}
+
+/// Issue one bounded `tools/call` on an already-resolved client.
+async fn call_once(client: &Client, params: rmcp::model::CallToolRequestParams) -> CallOutcome {
+    match tokio::time::timeout(CALL_TIMEOUT, client.call_tool(params)).await {
+        Ok(Ok(result)) => CallOutcome::Result(result),
+        Ok(Err(e)) => CallOutcome::Transport(e),
+        Err(_) => CallOutcome::Timeout,
+    }
 }
 
 /// Translate an MCP tool result into the core `ToolResult`, flattening
@@ -336,5 +422,82 @@ mod tests {
         let m = McpManager::new_for_test(true);
         let res = rt.block_on(m.call_tool("nope", "x", serde_json::json!({})));
         assert!(res.is_error);
+    }
+}
+
+#[cfg(test)]
+mod map_result_tests {
+    use super::*;
+    use rmcp::model::{CallToolResult, ContentBlock as McpContent};
+    use yi_agent_core::message::{ContentBlock, ImageDetail, ImageSource};
+
+    #[test]
+    fn text_block_maps_to_one_text_block() {
+        let out = map_result(CallToolResult::success(vec![McpContent::text("hello")]));
+        assert!(!out.is_error);
+        assert_eq!(out.content, vec![ContentBlock::Text("hello".into())]);
+    }
+
+    #[test]
+    fn image_block_maps_to_base64_image_with_high_detail() {
+        let out = map_result(CallToolResult::success(vec![McpContent::image(
+            "ZGF0YQ==",
+            "image/png",
+        )]));
+        assert_eq!(
+            out.content,
+            vec![ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "ZGF0YQ==".into(),
+                },
+                detail: ImageDetail::High,
+            }]
+        );
+    }
+
+    #[test]
+    fn non_text_block_maps_to_json_text() {
+        let out = map_result(CallToolResult::success(vec![McpContent::embedded_text(
+            "file:///x",
+            "contents",
+        )]));
+        assert_eq!(out.content.len(), 1);
+        match &out.content[0] {
+            ContentBlock::Text(t) => {
+                assert!(t.contains("resource"), "expected resource JSON, got {t}");
+                assert!(t.contains("file:///x"), "expected uri JSON, got {t}");
+            }
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_level_error_flag_is_preserved() {
+        let out = map_result(CallToolResult::error(vec![McpContent::text("boom")]));
+        assert!(out.is_error);
+        assert_eq!(out.content, vec![ContentBlock::Text("boom".into())]);
+    }
+
+    #[test]
+    fn empty_content_with_structured_content_yields_structured_text() {
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [],
+            "structuredContent": {"answer": 42}
+        }))
+        .unwrap();
+        let out = map_result(result);
+        assert_eq!(
+            out.content,
+            vec![ContentBlock::Text("{\"answer\":42}".into())]
+        );
+    }
+
+    #[test]
+    fn empty_content_without_structured_content_yields_empty_text() {
+        let result: CallToolResult =
+            serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+        let out = map_result(result);
+        assert_eq!(out.content, vec![ContentBlock::Text(String::new())]);
     }
 }
