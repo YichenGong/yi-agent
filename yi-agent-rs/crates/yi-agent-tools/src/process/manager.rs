@@ -11,6 +11,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::time;
 
+use crate::process_group::{configure_process_group, signal_process_group};
 use crate::sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 use crate::shell::blocklist;
 
@@ -452,7 +453,7 @@ impl ProcessManager {
             (pid, true)
         };
         if let Some(pid) = pid {
-            kill_process_group(pid);
+            signal_process_group(pid, libc::SIGTERM);
         }
         if killed {
             self.emit(ProcessEvent::Killed { process_id });
@@ -787,35 +788,10 @@ fn process_id_sort_key(process_id: &str) -> (u64, String) {
 
 fn terminate_child(mut child: Child, pid: Option<u32>) {
     if let Some(pid) = pid {
-        kill_process_group(pid);
+        signal_process_group(pid, libc::SIGTERM);
     }
     let _ = child.start_kill();
 }
-
-#[cfg(unix)]
-fn configure_process_group(cmd: &mut Command) {
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_process_group(_cmd: &mut Command) {}
-
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {

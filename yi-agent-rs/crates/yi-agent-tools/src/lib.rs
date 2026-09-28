@@ -7,6 +7,7 @@ mod context;
 mod error;
 mod fs;
 mod process;
+mod process_group;
 mod sandbox;
 mod shell;
 mod skill_tool;
