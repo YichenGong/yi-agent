@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 
@@ -16,11 +16,18 @@ function relativeTime(ms: number): string {
   return `${day}d`;
 }
 
+function unreadDotClass(status: TurnStatus): string {
+  if (status === "failed") return "bg-red-400";
+  if (status === "interrupted") return "bg-neutral-400";
+  return "bg-blue-400";
+}
+
 export function ThreadSidebar({
   groups,
   workspaces,
   currentId,
-  busy,
+  statuses,
+  unread,
   onSelect,
   onRename,
   onDelete,
@@ -32,7 +39,9 @@ export function ThreadSidebar({
   /** Recent dirs for the New-thread dropdown. */
   workspaces: Workspace[];
   currentId: string | null;
-  busy: boolean;
+  statuses: Map<string, ThreadStatus>;
+  /** thread_id → 最近一轮结束状态；含 key 即有未读点。 */
+  unread: Map<string, TurnStatus>;
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
@@ -133,11 +142,13 @@ export function ThreadSidebar({
 
   const renderThread = (t: ThreadSummary) => {
     const active = t.thread_id === currentId;
+    const st = statuses.get(t.thread_id) ?? "idle";
+    const un = unread.get(t.thread_id);
     return (
       <div
         key={t.thread_id}
         onClick={(e) => {
-          if (busy || editingId) return;
+          if (editingId) return;
           // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
           // 避免对同一 thread 触发两次 onSelect(即两次 thread/resume)。
           if (e.detail > 1) return;
@@ -145,7 +156,7 @@ export function ThreadSidebar({
         }}
         className={`group flex items-center justify-between gap-1 px-3 py-2 text-sm ${
           active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
-        } ${busy ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
+        } cursor-pointer`}
       >
         {editingId === t.thread_id ? (
           <input
@@ -162,22 +173,41 @@ export function ThreadSidebar({
         ) : (
           <>
             <div className="min-w-0 flex-1">
-              <div
-                className="truncate"
-                title={t.title ?? t.thread_id}
-                onDoubleClick={() => {
-                  if (busy) return;
-                  setEditingId(t.thread_id);
-                  setDraft(t.title ?? "");
-                }}
-              >
-                {t.title ?? "(untitled)"}
+              <div className="flex items-center gap-1.5">
+                {st === "running" && (
+                  <span
+                    aria-label="Running"
+                    className="size-3 shrink-0 animate-spin rounded-full border-2 border-neutral-600 border-t-neutral-300"
+                  />
+                )}
+                {st === "awaiting_approval" && (
+                  <span
+                    aria-label="Awaiting approval"
+                    className="size-2 shrink-0 rounded-full bg-amber-400"
+                  />
+                )}
+                <div
+                  className="truncate"
+                  title={t.title ?? t.thread_id}
+                  onDoubleClick={() => {
+                    setEditingId(t.thread_id);
+                    setDraft(t.title ?? "");
+                  }}
+                >
+                  {t.title ?? "(untitled)"}
+                </div>
               </div>
               <div className="text-xs text-neutral-600">{relativeTime(t.updated_at)}</div>
             </div>
+            {un && !active && (
+              <span
+                aria-label="Unread"
+                title="Unread result"
+                className={`size-2 shrink-0 rounded-full ${unreadDotClass(un)}`}
+              />
+            )}
             <button
               type="button"
-              disabled={busy}
               onClick={(e) => {
                 e.stopPropagation();
                 onDelete(t.thread_id);
@@ -213,7 +243,6 @@ export function ThreadSidebar({
             setContextWs(null);
             setNewMenuOpen((v) => !v);
           }}
-          disabled={busy}
           className="w-full rounded-md bg-neutral-800 px-3 py-2 text-left text-sm text-neutral-100 hover:bg-neutral-700 disabled:opacity-50"
         >
           + New thread
@@ -274,7 +303,6 @@ export function ThreadSidebar({
                 aria-expanded={contextWs === g.workspace}
                 onContextMenu={(e) => {
                   e.preventDefault();
-                  if (busy) return;
                   setNewMenuOpen(false);
                   setContextWs(g.workspace);
                 }}
@@ -285,7 +313,6 @@ export function ThreadSidebar({
                   // 导致键盘无法折叠分组(回归)。
                   if (e.target !== e.currentTarget) return;
                   if (e.key !== "Enter" && e.key !== " ") return;
-                  if (busy) return;
                   e.preventDefault();
                   setNewMenuOpen(false);
                   setContextWs((cur) => (cur === g.workspace ? null : g.workspace));
@@ -321,7 +348,6 @@ export function ThreadSidebar({
                     <button
                       type="button"
                       role="menuitem"
-                      disabled={busy}
                       onClick={() => {
                         closeMenus();
                         onNew(g.workspace);
@@ -333,7 +359,6 @@ export function ThreadSidebar({
                     <button
                       type="button"
                       role="menuitem"
-                      disabled={busy}
                       onClick={() => {
                         closeMenus();
                         onRemoveWorkspace(g.workspace);
