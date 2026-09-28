@@ -216,3 +216,30 @@ describe("ThreadSidebar drag-resize", () => {
     expect(aside(container).style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH + 50}px`);
   });
 });
+
+describe("ThreadSidebar persistence", () => {
+  it("saves the clamped width on mouseup", () => {
+    const { container } = renderSidebar();
+    drag(container, 10000); // clamps to MAX
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(String(MAX_SIDEBAR_WIDTH));
+  });
+
+  it("does not write during the drag (only on release)", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    fireEvent.mouseMove(document, { clientX: 80 });
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBeNull();
+    fireEvent.mouseUp(document);
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(
+      String(DEFAULT_SIDEBAR_WIDTH + 80),
+    );
+  });
+
+  it("restores a width dragged to MIN on the next mount", () => {
+    const first = renderSidebar();
+    drag(first.container, -10000);
+    first.unmount();
+    const second = renderSidebar();
+    expect(aside(second.container).style.width).toBe(`${MIN_SIDEBAR_WIDTH}px`);
+  });
+});
