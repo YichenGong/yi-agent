@@ -101,14 +101,18 @@ pub struct ToolSetup {
     pub tools: Arc<yi_agent_core::ToolRegistry>,
     pub catalog: Option<SkillsCatalogHandle>,
     pub system_prompt: Option<String>,
-    /// MCP 管理器;无 `.yi-agent/mcp.json` 时为 `None`。调用方需持有它以便
-    /// 退出时关闭 stdio 子进程(见 [`yi_agent_mcp::McpManager::shutdown`])。
+    /// MCP 管理器;配置缺失/不可用或注册失败时为 `None`。返回它以便**负责生命
+    /// 周期的调用方**(headless / TUI)在退出前调用 `shutdown()` 关闭 stdio 子
+    /// 进程;不负责生命周期的调用方可以丢弃它。
     pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
 
 /// 注册内置工具(含 sandbox 配置)。
 ///
-/// 等价于 [`build_tool_setup`] 的非 naked 路径,只取工具集。
+/// 等价于 [`build_tool_setup`] 的非 naked 路径,只取工具集。注意:它同时会加载
+/// `.yi-agent/mcp.json` 并注册 MCP 工具(触发一次懒探测),但**丢弃**返回的
+/// [`yi_agent_mcp::McpManager`]——需要管理 MCP 生命周期的调用方应改用
+/// [`build_tool_setup`] 并自行 `shutdown()`。
 pub fn build_tools(cfg: &RuntimeConfig) -> Result<Arc<yi_agent_core::ToolRegistry>> {
     Ok(build_tool_setup(cfg, false)?.tools)
 }
@@ -140,8 +144,9 @@ pub fn build_tool_setup(cfg: &RuntimeConfig, naked: bool) -> Result<ToolSetup> {
 
 /// 同 [`build_tool_setup`],但内置工具以 `workspace` 为根(子 agent 的 worktree 场景)。
 ///
-/// 注意 `workspace` 只影响内置工具与进程工具的根;skills 的项目根仍取
-/// `cfg.workdir`——这一不对称是有意保留的,与无头路径的历史行为一致。
+/// 注意 `workspace` 只影响内置工具与进程工具的根;skills 与 MCP 配置
+/// (`.yi-agent/mcp.json`)的项目根仍取 `cfg.workdir`——这一不对称是有意保留的,
+/// 与无头路径的历史行为一致。
 pub fn build_tool_setup_in(
     cfg: &RuntimeConfig,
     naked: bool,
@@ -201,9 +206,19 @@ pub fn build_tool_setup_with_switch(
     );
     yi_agent_tools::register_process_tools(&mut registry, process_manager);
 
-    // MCP 工具的根取 `workspace`(与内置工具一致);无 `.yi-agent/mcp.json`
-    // 时返回 `None`,单个 server 出错只会告警而不中断装配。
-    let mcp = yi_agent_mcp::register_mcp_tools(&mut registry, workspace)?;
+    // MCP 配置是项目级文件(`.yi-agent/mcp.json`,被 gitignore),固定在项目根
+    // `cfg.workdir` 下读取——与 skills 的项目根一致,而非子 agent 的 worktree
+    // `workspace`(新 worktree 里没有该文件,用它会让子 agent 静默丢失 MCP 工具)。
+    //
+    // MCP 是可选子系统:配置缺失/损坏或探测初始化失败都不应阻断 agent 启动
+    // (单个 server 的问题已在 yi-agent-mcp 内部 warn 并跳过)。
+    let mcp = match yi_agent_mcp::register_mcp_tools(&mut registry, &cfg.workdir) {
+        Ok(manager) => manager,
+        Err(err) => {
+            tracing::warn!("MCP disabled: {err:#}");
+            None
+        }
+    };
 
     Ok(ToolSetup {
         tools: Arc::new(registry),
@@ -766,6 +781,34 @@ mod tests {
 
         let naked = build_tool_setup(&cfg, true).expect("build naked setup");
         assert!(naked.mcp.is_none(), "naked setup never has a manager");
+    }
+
+    /// 与上一条互补的正向用例:`.yi-agent/mcp.json` 存在时必须返回 `Some(manager)`,
+    /// 证明接线是活的且读的是 `cfg.workdir`(接线被删除或根取错目录都会得到 `None`)。
+    ///
+    /// server 的 `command` 故意指向不存在的路径:探测失败只 warn 并跳过该 server,
+    /// `register_mcp_tools` 仍返回 manager。此处不断言具体工具名——制造 cache hit
+    /// 需复刻 yi-agent-mcp 私有的 SHA-256 指纹格式,过于脆弱,该路径已由
+    /// `crates/yi-agent-mcp/src/lib.rs` 的测试覆盖。
+    #[test]
+    fn build_tool_setup_returns_manager_when_mcp_config_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = sample_config();
+        cfg.workdir = tmp.path().to_path_buf();
+
+        let agent_dir = tmp.path().join(".yi-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"/nonexistent/definitely-not-here"}}}"#,
+        )
+        .unwrap();
+
+        let setup = build_tool_setup(&cfg, false).expect("build setup");
+        assert!(
+            setup.mcp.is_some(),
+            "config under cfg.workdir must yield a manager"
+        );
     }
 
     /// 本测试只覆盖 switch↔权限共享;沙箱路径由 tools 的 sandbox 单测覆盖,
