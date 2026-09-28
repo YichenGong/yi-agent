@@ -22,9 +22,9 @@
 | yi-agent-mcp | 1 / 1 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 0 / 1 | [详情](./yi-agent-store.md) |
 | yi-agent-runtime | 10 / 10 | [详情](./yi-agent-runtime.md) |
-| yi-agent-app-server | 14 / 14 | [详情](./yi-agent-app-server.md) |
+| yi-agent-app-server | 15 / 15 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 20 / 27 | [详情](./subagent-runtime.md) |
-| desktop | 15 / 30 | [详情](./desktop.md) |
+| desktop | 17 / 31 | [详情](./desktop.md) |
 
 ## 已知问题
 

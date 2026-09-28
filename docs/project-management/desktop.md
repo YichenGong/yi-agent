@@ -9,7 +9,7 @@
 （`desktop/src/lib/protocol.ts`），从不依赖 Rust 类型。
 
 `desktop/` **不是** `yi-agent-rs/` cargo workspace 的成员，独立构建。Rust workspace
-不受本模块影响：`cargo test -p yi-agent-app-server`（141 个测试）与
+不受本模块影响：`cargo test -p yi-agent-app-server`（148 个测试）与
 `cargo test -p yi-agent-runtime`（全绿）仍全绿。
 
 ## 范围边界
@@ -50,6 +50,7 @@
 - [x] 工作目录选择（原生文件夹选择器 + 最近目录下拉 + 侧栏按目录分组可折叠）— `desktop/src/App.tsx:118`（`newThread(cwd?)`）/ `desktop/src/App.tsx:60`（`refreshThreads` 走 `thread/listAll`）/ `desktop/src/App.tsx:75`（`refreshWorkspaces` 走 `workspace/list`）/ `desktop/src/App.tsx:147`（`pickDirectory` 走 `@tauri-apps/plugin-dialog`）/ `desktop/src/App.tsx:165`（`onBrowse`）/ `desktop/src/App.tsx:153`（`addWorkspace`）/ `desktop/src/App.tsx:191`（`removeWorkspace`）；侧栏分组 + 折叠 + 组头右键/键盘菜单 — `desktop/src/components/ThreadSidebar.tsx:18`；协议类型 `desktop/src/lib/protocol.ts:119` / `desktop/src/lib/protocol.ts:125`；纯函数 `desktop/src/lib/workspaceGroups.ts:3` / `desktop/src/lib/workspaceGroups.ts:7`；请求参数 `desktop/src/lib/threadStart.ts:2`；dialog 权限 `desktop/src-tauri/capabilities/default.json`（`dialog:allow-open`）；验证 `cd desktop && npx tsc --noEmit && npm test`
 - [x] 输入框权限模式 chip（按线程 Normal / YOLO，启用 YOLO 前确认，模式未知时禁用）— `desktop/src/components/ModeChip.tsx:16`（灰 Normal / 红 YOLO；`role="menu"` 下拉 + 启用 YOLO 弹 `role="dialog"` 确认框 `:159`，含「跳过审批 / 沙箱放开完全访问 / 黑名单仍拒」）；接入 `desktop/src/components/MessageInput.tsx`（`mode` / `onModeChange`，`disabled={mode === null}`）；`desktop/src/App.tsx:56`（`mode: ThreadMode | null`，`null` = 尚未解析）/ `modeForThread` `:39`（从 `thread/listAll` 回读，线程缺失→unknown，绝不回退 `normal`）/ `setThreadMode` `:238`（RPC 成功才更新本地状态）；协议类型 `desktop/src/lib/protocol.ts:110`（`permission_mode?`）+ helper `desktop/src/lib/threadPermissionMode.ts:2`；验证：`cd desktop && npx vitest run src/components/ModeChip.test.tsx src/components/MessageInput.test.tsx src/App.test.tsx`
 - [x] 可拖拽侧边栏宽度（拖动右侧分隔条调宽、夹到 [200, 480]、`localStorage` 持久化、重启恢复、漏 mouseup/窗口失焦不残留监听）— `desktop/src/lib/sidebarWidth.ts:11`（`clampSidebarWidth`）/ `desktop/src/lib/sidebarWidth.ts:17`（`loadSidebarWidth`）/ `desktop/src/lib/sidebarWidth.ts:29`（`saveSidebarWidth`）/ `desktop/src/components/ThreadSidebar.tsx:57`（`onHandleDown`）/ `desktop/src/components/ThreadSidebar.tsx:200`（`style={{ width }}`）/ `desktop/src/components/ThreadSidebar.tsx:354`（`role="separator"` 拖拽手柄）；显示名统一为 `Yi-Agent` — `desktop/index.html:7` / `desktop/src-tauri/tauri.conf.json:15`；验证 `cd desktop && npx vitest run && npx tsc --noEmit && npm run build`
+- [x] 每 thread 状态徽标 + 未读注意力点 + 逐 thread 审批横幅 — `desktop/src/lib/threadStore.ts:5`（`ThreadView` = session / status / unread / approval / info；按 `thread_id` 路由通知，离开 `awaiting_approval` 清审批 `desktop/src/lib/threadStore.ts:78`，非当前 thread 的 `turn/completed` 置 unread `desktop/src/lib/threadStore.ts:90`）/ `desktop/src/components/ApprovalBanner.tsx:10`（顶部可关闭横幅 + 逐 thread「Jump · <tool>」按钮）；判据：`desktop/src/components/ThreadSidebar.tsx:180` 渲染 `aria-label="Running"`、`desktop/src/components/ThreadSidebar.tsx:187` 渲染 `aria-label="Awaiting approval"`、`desktop/src/components/ThreadSidebar.tsx:206` 渲染 `aria-label="Unread"`；验证 `cd desktop && npx vitest run src/lib/threadStore.test.ts src/components/ApprovalBanner.test.tsx src/components/ThreadSidebar.test.tsx`
 
 **打包交付缺口：**
 
@@ -68,7 +69,7 @@
 - [ ] diff 视图 — 需先在协议层新增 `turn/diff/updated` 通知（当前不存在，`grep -rn "turn/diff" yi-agent-rs/crates/yi-agent-app-server/src/` 无结果）；判据：agent 改文件后 GUI 逐 turn 显示 diff
 - [ ] compact 手动控制 — 判据：GUI 提供手动触发上下文压缩的入口
 - [ ] 图片附件输入 — 判据：输入框可附加图片并随 prompt 发送
-- [ ] 多 thread 标签页 — 判据：可同时打开多个 thread 并在标签间切换（当前仅单会话 + 历史侧栏）
+- [x] 多 thread 标签页 — 可同时运行多个 thread 并在 Sidebar 间自由切换（切换已打开的 warm thread 只换视图、不再 `thread/resume`，`desktop/src/App.tsx:103` `selectThread` + `warm` 集合 `desktop/src/App.tsx:50`；全局 `busy` 门禁已移除，`turnActive` 期间仍可切换/删除）；判据：起两个 turn 后两 thread 状态徽标同时为 running。
 
 **P3 路线图：**
 
@@ -80,4 +81,4 @@
 
 **已知限制：** 「最近目录」索引只由用户在 UI 里打开/添加的目录产生。升级安装（`$HOME/.yi-agent/threads/` 已有历史对话）时索引为空，`thread/listAll` 只遍历索引，故侧栏初始可能看不到旧的 `$HOME` 对话；需在 UI 里打开 `$HOME`（或对应目录）才会重新出现。`thread/start` 缺省 cwd 仍回退 `cfg.workdir`（`$HOME`），未种子化索引；修复（启动时用 `cfg.workdir` 播种索引）见 P2 `[ ]` 条目。
 
-**验证命令：** `cd desktop && npx vitest run`（103 个前端单测：`desktop/src/lib/rpc.test.ts` 7 + `desktop/src/lib/session.test.ts` 15 + `desktop/src/lib/pricing.test.ts` 7 + `desktop/src/lib/protocol.test.ts` 2 + `desktop/src/lib/workspaceGroups.test.ts` 4 + `desktop/src/lib/threadStart.test.ts` 2 + `desktop/src/lib/threadPermissionMode.test.ts` 2 + `desktop/src/lib/sidebarWidth.test.ts` 9 + `desktop/src/components/MarkdownText.test.tsx` 5 + `desktop/src/components/ThreadSidebar.test.tsx` 21 + `desktop/src/components/MessageInput.test.tsx` 5 + `desktop/src/components/ModeChip.test.tsx` 17 + `desktop/src/App.test.tsx` 7）+ `cd desktop && npx tsc --noEmit` + `cd desktop && npm run build` + `cd desktop/src-tauri && cargo test` + `cd desktop && npm run sidecar:release && npm run tauri build`（产出 `.app` / `.dmg`）
+**验证命令：** `cd desktop && npx vitest run`（124 个前端单测：`desktop/src/lib/rpc.test.ts` 7 + `desktop/src/lib/session.test.ts` 15 + `desktop/src/lib/pricing.test.ts` 7 + `desktop/src/lib/protocol.test.ts` 2 + `desktop/src/lib/workspaceGroups.test.ts` 4 + `desktop/src/lib/threadStart.test.ts` 2 + `desktop/src/lib/threadPermissionMode.test.ts` 2 + `desktop/src/lib/sidebarWidth.test.ts` 9 + `desktop/src/lib/threadStore.test.ts` 8 + `desktop/src/components/MarkdownText.test.tsx` 5 + `desktop/src/components/ThreadSidebar.test.tsx` 27 + `desktop/src/components/MessageInput.test.tsx` 5 + `desktop/src/components/ApprovalBanner.test.tsx` 4 + `desktop/src/components/ModeChip.test.tsx` 17 + `desktop/src/App.test.tsx` 10）+ `cd desktop && npx tsc --noEmit` + `cd desktop && npm run build` + `cd desktop/src-tauri && cargo test` + `cd desktop && npm run sidecar:release && npm run tauri build`（产出 `.app` / `.dmg`）
