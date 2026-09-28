@@ -358,8 +358,36 @@ impl McpManager {
     }
 }
 
+/// Test seam: when set, `connect` serves this future instead of spawning a
+/// stdio child, letting an in-process test drive the real protocol over a
+/// duplex transport. Production builds compile it out.
+#[cfg(test)]
+pub(crate) type TestConnector = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Client>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+pub(crate) static TEST_CONNECTOR: std::sync::Mutex<Option<TestConnector>> =
+    std::sync::Mutex::new(None);
+
+/// Clone the installed test connector, dropping the lock guard before the
+/// caller awaits (a `std::sync::MutexGuard` is not `Send`).
+#[cfg(test)]
+fn test_connector() -> Option<TestConnector> {
+    TEST_CONNECTOR.lock().unwrap().clone()
+}
+
 /// Spawn the MCP server as a child process and complete the MCP handshake.
 async fn connect(cfg: &ServerConfig) -> Result<Client> {
+    #[cfg(test)]
+    {
+        if let Some(factory) = test_connector() {
+            return factory().await;
+        }
+    }
+
     use rmcp::ServiceExt;
     use rmcp::transport::TokioChildProcess;
 
@@ -686,6 +714,122 @@ mod tests {
         // And a second refresh must not drop it either.
         m.refresh_registry(&mut registry);
         assert!(registry.get("local_tool").is_some());
+    }
+
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct EchoServer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for EchoServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .build(),
+            )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+            Ok(rmcp::model::ListToolsResult::with_all_items(vec![
+                rmcp::model::Tool::new("echo", "Echoes its arguments", serde_json::Map::new()),
+            ]))
+        }
+
+        async fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                    format!("echo:{:?}", request.arguments),
+                )])
+                .into(),
+            )
+        }
+    }
+
+    /// Install a connector that serves `EchoServer` over a fresh duplex stream
+    /// per call. `calls` counts `tools/call` invocations across all instances.
+    fn install_echo_connector(calls: Arc<AtomicUsize>) {
+        use rmcp::ServiceExt;
+        let factory: TestConnector = Arc::new(move || {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    if let Ok(running) = (EchoServer { calls }).serve(server_io).await {
+                        let _ = running.waiting().await;
+                    }
+                });
+                let client: Client = ().serve(client_io).await?;
+                Ok(client)
+            })
+        });
+        *TEST_CONNECTOR.lock().unwrap() = Some(factory);
+    }
+
+    #[tokio::test]
+    async fn probe_then_call_over_duplex() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_echo_connector(Arc::clone(&calls));
+
+        let dir = tempfile::tempdir().unwrap();
+        let sc = ServerConfig {
+            command: "echo".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+            enabled: true,
+        };
+        let mut servers = BTreeMap::new();
+        servers.insert("s".to_string(), sc.clone());
+        let cfg = McpConfig {
+            enabled: true,
+            mcp_servers: servers,
+        };
+
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+
+        // Probe listed the tool and persisted the schema cache, but issued no tools/call.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "probe must not call any tool"
+        );
+        let cached = McpCache::load(dir.path());
+        let hit = cached.get_for("s", &sc).expect("cache hit after probe");
+        assert_eq!(hit.len(), 1, "probe should list exactly one tool");
+        assert_eq!(hit[0].name, "echo");
+        assert_eq!(mgr.enabled_tools().len(), 1);
+
+        // First call connects lazily and round-trips the arguments.
+        let res = mgr
+            .call_tool("s", "echo", serde_json::json!({"x": 1}))
+            .await;
+        assert!(!res.is_error, "echo should succeed: {res:?}");
+        match &res.content[0] {
+            yi_agent_core::message::ContentBlock::Text(t) => {
+                assert!(t.starts_with("echo:"), "unexpected text: {t}")
+            }
+            other => panic!("expected a text block, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one tools/call");
+
+        // Toggling the server off removes its tools.
+        mgr.set_server("s", false).unwrap();
+        assert!(mgr.enabled_tools().is_empty());
+
+        mgr.shutdown().await;
+        *TEST_CONNECTOR.lock().unwrap() = None;
     }
 }
 
