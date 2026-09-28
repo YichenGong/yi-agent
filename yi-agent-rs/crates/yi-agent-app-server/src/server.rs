@@ -3978,4 +3978,167 @@ mod tests {
         }
         h.shutdown().await;
     }
+
+    /// 读到下一个指定 method 的通知(忽略其它帧)。
+    async fn read_until_method(h: &mut Harness, method: &str) -> serde_json::Value {
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some(method) {
+                return v;
+            }
+        }
+        panic!("expected a {method} notification");
+    }
+
+    /// 正常一轮结束后,状态序列为 running → idle。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_emits_running_then_idle_status() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        let running = read_until_method(&mut h, "thread/status/updated").await;
+        assert_eq!(running["params"]["thread_id"], tid);
+        assert_eq!(running["params"]["status"], "running");
+
+        let idle = loop {
+            let v = read_until_method(&mut h, "thread/status/updated").await;
+            if v["params"]["status"] == "idle" {
+                break v;
+            }
+        };
+        assert_eq!(idle["params"]["thread_id"], tid);
+        h.shutdown().await;
+    }
+
+    /// 两个 thread 的 turn 可同时在跑:各自的 listAll 状态同为 running。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_threads_run_turns_concurrently() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let a = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/start","params":{}}"#)
+            .await;
+        let b = read_thread_start_response(&mut h, 4).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{a}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{b}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        // 两个 turn/started 都应到达(无跨 thread 的 -32012)。
+        let mut started = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/started") {
+                started.insert(v["params"]["thread_id"].as_str().unwrap().to_string());
+            }
+            if started.contains(&a) && started.contains(&b) {
+                break;
+            }
+        }
+        assert!(
+            started.contains(&a) && started.contains(&b),
+            "both turns must start: {started:?}"
+        );
+
+        // 此刻 listAll 里两个 thread 都是 running。
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let all = loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                break v;
+            }
+        };
+        let status_of = |id: &str| -> String {
+            all["result"]["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["threads"].as_array().unwrap())
+                .find(|t| t["thread_id"] == id)
+                .map(|t| t["status"].as_str().unwrap().to_string())
+                .expect("thread must be listed")
+        };
+        assert_eq!(status_of(&a), "running");
+        assert_eq!(status_of(&b), "running");
+
+        // 收尾:中断两个 turn 以便优雅退出。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"turn/interrupt","params":{{"threadId":"{a}"}}}}"#
+        ))
+        .await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"turn/interrupt","params":{{"threadId":"{b}"}}}}"#
+        ))
+        .await;
+        h.shutdown().await;
+    }
+
+    /// 审批超时后状态必须离开 awaiting_approval(前端据此清掉残留审批框)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approval_timeout_leaves_awaiting_status() {
+        let mut h = Harness::with_factory(build_permission_agent, Duration::from_millis(150));
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        // 应先看到 awaiting_approval。
+        let mut saw_awaiting = false;
+        // 之后必须离开 awaiting_approval(超时 → 回 running → idle)。
+        let mut left_awaiting = false;
+        for _ in 0..60 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("thread/status/updated") {
+                match v["params"]["status"].as_str().unwrap() {
+                    "awaiting_approval" => saw_awaiting = true,
+                    _ if saw_awaiting => {
+                        left_awaiting = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_awaiting, "must enter awaiting_approval");
+        assert!(left_awaiting, "must leave awaiting_approval after timeout");
+        h.shutdown().await;
+    }
+
+    /// cold thread（未 resume）在 listAll 里状态为 idle。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cold_thread_reports_idle() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await; // 已 start，但未 resume、未起 turn
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let all = loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                break v;
+            }
+        };
+        let listed = all["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap())
+            .find(|t| t["thread_id"] == tid.as_str())
+            .expect("thread must be listed");
+        assert_eq!(listed["status"], "idle");
+        h.shutdown().await;
+    }
 }
