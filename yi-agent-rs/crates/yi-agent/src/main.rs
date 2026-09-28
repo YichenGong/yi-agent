@@ -1681,6 +1681,11 @@ fn run_tui_agent(
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
+        // Await the aborted handle so the driver future — and any `Arc<Client>`
+        // clone it held mid-call — is dropped before shutdown. Otherwise
+        // `shutdown`'s `Arc::try_unwrap` fails and the child is not reaped
+        // deterministically. `await` on an aborted handle resolves promptly.
+        let _ = driver.await;
 
         // Close MCP server connections while the reactor is still running so the
         // child processes are reaped before the runtime is dropped.

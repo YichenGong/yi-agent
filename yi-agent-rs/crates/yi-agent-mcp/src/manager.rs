@@ -281,6 +281,8 @@ impl McpManager {
 
     /// Drop all live connections. Must be awaited inside a tokio runtime:
     /// dropping a child transport only kills the process on a running reactor.
+    /// Each connection close is bounded by `REAP_TIMEOUT`; a wedged server falls
+    /// back to the `RunningService` drop path.
     pub async fn shutdown(&self) {
         for (name, entry) in &self.servers {
             // Take the handle and release the lock before awaiting.
@@ -291,7 +293,18 @@ impl McpManager {
                 // dropping our last-but-one handle lets `RunningService::drop`
                 // close the loop once that call finishes.
                 if let Ok(client) = Arc::try_unwrap(client) {
-                    let _ = client.cancel().await;
+                    // Bound the close so a wedged server cannot stall teardown;
+                    // on elapse, fall back to `RunningService`'s drop path, which
+                    // cancels the connection when the service loop is dropped.
+                    if tokio::time::timeout(REAP_TIMEOUT, client.cancel())
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            server = name,
+                            "MCP shutdown timed out; falling back to drop"
+                        );
+                    }
                 }
                 info!(server = name, "MCP server connection closed");
             }
