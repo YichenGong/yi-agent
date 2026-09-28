@@ -20,7 +20,7 @@ use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
-    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError,
+    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, ThreadStatus,
 };
 use crate::session::{ThreadSession, TurnPrompt};
 use crate::translate::Translator;
@@ -312,6 +312,7 @@ where
                                         "updated_at": m.updated_at,
                                         "title": m.title,
                                         "permission_mode": m.permission_mode,
+                                        "status": thread_status(&threads, &m.thread_id),
                                     })
                                 })
                                 .collect();
@@ -348,6 +349,7 @@ where
                                                 "updated_at": m.updated_at,
                                                 "title": m.title,
                                                 "permission_mode": m.permission_mode,
+                                                "status": thread_status(&threads, &m.thread_id),
                                             })
                                         })
                                         .collect(),
@@ -425,6 +427,9 @@ where
                             );
                         }
 
+                        // 先建句柄:同一 `Arc` 既存进 session 供 `thread/list` 读,
+                        // 也交给 driver 供其推送 `thread/status/updated`。
+                        let store_status = ThreadSession::new_status();
                         threads.insert(
                             thread_id.clone(),
                             ThreadSession {
@@ -436,6 +441,7 @@ where
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
+                                status: Arc::clone(&store_status),
                             },
                         );
 
@@ -457,6 +463,7 @@ where
                             Arc::clone(&perm_seq),
                             catalog,
                             Arc::clone(&thread_store),
+                            Arc::clone(&store_status),
                         ));
 
                         write_notification(
@@ -579,6 +586,9 @@ where
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+                        // 同一 `Arc` 句柄:session 存一份供 `thread/list` 读,
+                        // driver 拿一份用于推送 `thread/status/updated`。
+                        let store_status = ThreadSession::new_status();
                         threads.insert(
                             thread_id.clone(),
                             ThreadSession {
@@ -590,6 +600,7 @@ where
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
+                                status: Arc::clone(&store_status),
                             },
                         );
 
@@ -609,6 +620,7 @@ where
                             Arc::clone(&perm_seq),
                             catalog,
                             Arc::clone(&thread_store),
+                            Arc::clone(&store_status),
                         ));
 
                         // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
@@ -810,7 +822,7 @@ where
                         let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
                         // 内层作用域:让 `&mut threads` 的借用先结束,后续错误
                         // 路径才能再次 `threads.get_mut`。
-                        let prompt_tx = {
+                        let (prompt_tx, status_handle) = {
                             let Some(session) = threads.get_mut(&thread_id) else {
                                 write_response(
                                     &writer,
@@ -828,10 +840,11 @@ where
                                 continue;
                             }
                             session.active_turn_id = Some(turn_id.clone());
-                            session.prompt_tx.clone()
+                            (session.prompt_tx.clone(), Arc::clone(&session.status))
                         };
 
-                        // 顺序确定:先 turn/started 通知,再响应,最后投递 prompt。
+                        // 顺序确定:先 turn/started 通知,再推 Running 状态,再响应,
+                        // 最后投递 prompt。
                         write_notification(
                             &writer,
                             &Notification::TurnStarted {
@@ -840,6 +853,8 @@ where
                             },
                         )
                         .await?;
+                        update_status(&writer, &status_handle, &thread_id, ThreadStatus::Running)
+                            .await?;
                         write_response(
                             &writer,
                             ok_response(id, json!({ "turn_id": turn_id.clone() })),
@@ -938,6 +953,36 @@ async fn write_notification<W: tokio::io::AsyncWrite + Unpin>(
     n: &Notification,
 ) -> anyhow::Result<()> {
     writer.write_value(&NotificationEnvelope::new(n)).await
+}
+
+/// 更新共享状态句柄并推送 `thread/status/updated`。
+///
+/// 加锁是同步的、不跨 `.await`；锁在写通知前即释放。锁中毒时沿用
+/// `workspace_index.rs` 的恢复约定：取回内部值而非 panic(状态只是 UI 提示,
+/// 不应因一次 panic 永久失效)。
+async fn update_status<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &MessageWriter<W>,
+    handle: &std::sync::Mutex<ThreadStatus>,
+    thread_id: &str,
+    next: ThreadStatus,
+) -> anyhow::Result<()> {
+    *handle.lock().unwrap_or_else(|p| p.into_inner()) = next;
+    write_notification(
+        writer,
+        &Notification::ThreadStatusUpdated {
+            thread_id: thread_id.to_string(),
+            status: next,
+        },
+    )
+    .await
+}
+
+/// 读某 thread 的当前状态;不在内存(cold thread)一律 `Idle`。
+fn thread_status(threads: &HashMap<String, ThreadSession>, thread_id: &str) -> ThreadStatus {
+    threads
+        .get(thread_id)
+        .map(|s| *s.status.lock().unwrap_or_else(|p| p.into_inner()))
+        .unwrap_or(ThreadStatus::Idle)
 }
 
 /// 把客户端对反向请求的响应路由到等待中的 driver。
@@ -1049,6 +1094,9 @@ async fn run_thread_driver<W>(
     perm_seq: Arc<AtomicU64>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
     store: Arc<crate::thread_store::ThreadStore>,
+    // 该 thread 的共享状态句柄;driver 在各转换点更新并推送
+    // `thread/status/updated`(与写进 `ThreadSession.status` 的是同一 `Arc`)。
+    status: Arc<std::sync::Mutex<ThreadStatus>>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1080,6 +1128,8 @@ async fn run_thread_driver<W>(
                     let _ = write_notification(&writer, &n).await;
                 }
                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                // run() 失败即本轮结束:thread 立刻回 Idle(失败是事件不是状态)。
+                let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Idle).await;
                 continue;
             }
         };
@@ -1118,6 +1168,14 @@ async fn run_thread_driver<W>(
                                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                                 return;
                             }
+                            // 反向请求已写出:进入等待审批状态。
+                            let _ = update_status(
+                                &writer,
+                                &status,
+                                &thread_id,
+                                ThreadStatus::AwaitingApproval,
+                            )
+                            .await;
 
                             // 等客户端决定;超时或中断按 Deny 处理。只接受针对当前 turn 的中断,
                             // 其它 turn 的残留信号忽略后继续等待(deadline 不重置)。
@@ -1141,6 +1199,11 @@ async fn run_thread_driver<W>(
                                     }
                                 }
                             };
+
+                            // 决定已到(或超时/中断按 Deny):恢复为 Running,
+                            // 继续消费本轮 stream。
+                            let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Running)
+                                .await;
 
                             if let Some(tx) = &decision_tx {
                                 let _ = tx.send((request_id, decision)).await;
@@ -1213,6 +1276,8 @@ async fn run_thread_driver<W>(
             eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
         }
 
+        // 本轮已落盘:回 Idle 后再上报 Finished。
+        let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Idle).await;
         let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
     }
 }
@@ -1982,10 +2047,14 @@ mod tests {
         let mut methods: Vec<String> = Vec::new();
         let mut resp_turn_id: Option<String> = None;
         let mut completed: Option<serde_json::Value> = None;
+        let mut running_status: Option<String> = None;
         for _ in 0..12 {
             let v = h.read_value().await;
             if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
                 methods.push(m.to_string());
+                if m == "thread/status/updated" {
+                    running_status = v["params"]["status"].as_str().map(|s| s.to_string());
+                }
                 if m == "turn/completed" {
                     completed = Some(v);
                     break;
@@ -1999,6 +2068,8 @@ mod tests {
             methods,
             vec![
                 "turn/started",
+                // turn/start 在 turn/started 之后立刻推 Running 状态,先于 turn 正文。
+                "thread/status/updated",
                 "item/started",
                 "item/delta",
                 // `Done` 会先 finalize 打开的 agentMessage,故 turn/completed
@@ -2007,6 +2078,11 @@ mod tests {
                 "turn/completed"
             ],
             "unexpected notification sequence"
+        );
+        assert_eq!(
+            running_status.as_deref(),
+            Some("running"),
+            "the status frame preceding the turn body must report `running`"
         );
         let resp_turn_id = resp_turn_id.expect("turn/start response must carry turn_id");
         assert!(!resp_turn_id.is_empty(), "turn_id must be non-empty");
@@ -2155,6 +2231,7 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             None,
             store,
+            ThreadSession::new_status(),
         ));
 
         // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -2231,6 +2308,7 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             None,
             store,
+            ThreadSession::new_status(),
         ));
 
         prompt_tx
@@ -2283,6 +2361,7 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             None,
             store,
+            ThreadSession::new_status(),
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -2647,6 +2726,7 @@ mod tests {
             Arc::clone(&perm_seq),
             None,
             store,
+            ThreadSession::new_status(),
         ));
 
         prompt_tx
@@ -3896,6 +3976,169 @@ mod tests {
                 break;
             }
         }
+        h.shutdown().await;
+    }
+
+    /// 读到下一个指定 method 的通知(忽略其它帧)。
+    async fn read_until_method(h: &mut Harness, method: &str) -> serde_json::Value {
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some(method) {
+                return v;
+            }
+        }
+        panic!("expected a {method} notification");
+    }
+
+    /// 正常一轮结束后,状态序列为 running → idle。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_emits_running_then_idle_status() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        let running = read_until_method(&mut h, "thread/status/updated").await;
+        assert_eq!(running["params"]["thread_id"], tid);
+        assert_eq!(running["params"]["status"], "running");
+
+        let idle = loop {
+            let v = read_until_method(&mut h, "thread/status/updated").await;
+            if v["params"]["status"] == "idle" {
+                break v;
+            }
+        };
+        assert_eq!(idle["params"]["thread_id"], tid);
+        h.shutdown().await;
+    }
+
+    /// 两个 thread 的 turn 可同时在跑:各自的 listAll 状态同为 running。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_threads_run_turns_concurrently() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let a = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/start","params":{}}"#)
+            .await;
+        let b = read_thread_start_response(&mut h, 4).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{a}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{{"threadId":"{b}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        // 两个 turn/started 都应到达(无跨 thread 的 -32012)。
+        let mut started = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/started") {
+                started.insert(v["params"]["thread_id"].as_str().unwrap().to_string());
+            }
+            if started.contains(&a) && started.contains(&b) {
+                break;
+            }
+        }
+        assert!(
+            started.contains(&a) && started.contains(&b),
+            "both turns must start: {started:?}"
+        );
+
+        // 此刻 listAll 里两个 thread 都是 running。
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let all = loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(6)) {
+                break v;
+            }
+        };
+        let status_of = |id: &str| -> String {
+            all["result"]["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["threads"].as_array().unwrap())
+                .find(|t| t["thread_id"] == id)
+                .map(|t| t["status"].as_str().unwrap().to_string())
+                .expect("thread must be listed")
+        };
+        assert_eq!(status_of(&a), "running");
+        assert_eq!(status_of(&b), "running");
+
+        // 收尾:中断两个 turn 以便优雅退出。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"turn/interrupt","params":{{"threadId":"{a}"}}}}"#
+        ))
+        .await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"turn/interrupt","params":{{"threadId":"{b}"}}}}"#
+        ))
+        .await;
+        h.shutdown().await;
+    }
+
+    /// 审批超时后状态必须离开 awaiting_approval(前端据此清掉残留审批框)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approval_timeout_leaves_awaiting_status() {
+        let mut h = Harness::with_factory(build_permission_agent, Duration::from_millis(150));
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        // 应先看到 awaiting_approval。
+        let mut saw_awaiting = false;
+        // 之后必须离开 awaiting_approval(超时 → 回 running → idle)。
+        let mut left_awaiting = false;
+        for _ in 0..60 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("thread/status/updated") {
+                match v["params"]["status"].as_str().unwrap() {
+                    "awaiting_approval" => saw_awaiting = true,
+                    _ if saw_awaiting => {
+                        left_awaiting = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_awaiting, "must enter awaiting_approval");
+        assert!(left_awaiting, "must leave awaiting_approval after timeout");
+        h.shutdown().await;
+    }
+
+    /// cold thread（未 resume）在 listAll 里状态为 idle。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cold_thread_reports_idle() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await; // 已 start，但未 resume、未起 turn
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let all = loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                break v;
+            }
+        };
+        let listed = all["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap())
+            .find(|t| t["thread_id"] == tid.as_str())
+            .expect("thread must be listed");
+        assert_eq!(listed["status"], "idle");
         h.shutdown().await;
     }
 }

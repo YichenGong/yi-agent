@@ -1,0 +1,126 @@
+import { Session } from "./session";
+import type { ApprovalRequest, Notification, ThreadStatus, ThreadSummary } from "./protocol";
+import type { ThreadMode } from "./threadPermissionMode";
+
+/** 单个 thread 的客户端视图：会话 + 服务端权威状态 + 未读 + 待处理审批。 */
+export interface ThreadView {
+  session: Session;
+  status: ThreadStatus;
+  /** 未被查看时收到过 turn/completed → true；打开即清除。 */
+  unread: boolean;
+  approval: ApprovalRequest | null;
+  info: { cwd: string; model: string } | null;
+  /** 服务端权威权限模式；null = 未知,勿当作 normal。 */
+  mode: ThreadMode | null;
+}
+
+/**
+ * 按 thread 隔离的客户端状态机。通知按 `params.thread_id` 路由到各自的
+ * `Session`，因此后台 thread 的流式输出照常累积，切回去即最新。
+ *
+ * 可变实例：调用方在每次变更后自行触发重渲染（沿用 `App.tsx` 的 `force` 模式）。
+ */
+export class ThreadStore {
+  private views = new Map<string, ThreadView>();
+  currentId: string | null = null;
+
+  private create(): ThreadView {
+    return {
+      session: new Session(),
+      status: "idle",
+      unread: false,
+      approval: null,
+      info: null,
+      mode: null,
+    };
+  }
+
+  /** 取（必要时创建）某 thread 的视图。 */
+  view(id: string): ThreadView {
+    let v = this.views.get(id);
+    if (!v) {
+      v = this.create();
+      this.views.set(id, v);
+    }
+    return v;
+  }
+
+  /** 只读查询，不创建。 */
+  peek(id: string): ThreadView | undefined {
+    return this.views.get(id);
+  }
+
+  current(): ThreadView | null {
+    return this.currentId ? this.view(this.currentId) : null;
+  }
+
+  /** 切到某 thread 并清除其未读。 */
+  select(id: string): void {
+    this.currentId = id;
+    this.view(id).unread = false;
+  }
+
+  /** 返回当前 thread 的 id 列表（供侧栏派生状态用）。 */
+  ids(): string[] {
+    return [...this.views.keys()];
+  }
+
+  /**
+   * 用 `thread/listAll` 快照播种状态与 cwd/model。**不改动会话内容**——
+   * 会话只由通知累积。快照覆盖状态是安全的：服务端既是快照也是实时流的权威，
+   * 且每次 `turn/completed` 后都会重新拉取快照。
+   */
+  seed(threads: ThreadSummary[]): void {
+    for (const t of threads) {
+      const v = this.view(t.thread_id);
+      v.status = t.status ?? "idle";
+      v.info = { cwd: t.cwd, model: t.model };
+    }
+  }
+
+  /** 按 `thread_id` 路由一条通知。 */
+  applyNotification(n: Notification): void {
+    if (n.method === "thread/status/updated") {
+      const v = this.view(n.params.thread_id);
+      v.status = n.params.status;
+      // 离开 awaiting_approval（决定 / 超时 / 中断）即清掉可能残留的审批框，
+      // 否则超时后前端会留下一个点不掉的模态。
+      if (n.params.status !== "awaiting_approval") v.approval = null;
+      return;
+    }
+    if (n.method === "error") {
+      // 无 thread 归属的全局错误归当前 thread。
+      this.current()?.session.apply(n);
+      return;
+    }
+    const id = n.params.thread_id;
+    const v = this.view(id);
+    v.session.apply(n);
+    if (n.method === "thread/started") v.info = { cwd: n.params.cwd, model: n.params.model };
+    if (n.method === "turn/completed" && id !== this.currentId) v.unread = true;
+  }
+
+  setApproval(r: ApprovalRequest): void {
+    this.view(r.params.thread_id).approval = r;
+  }
+
+  clearApproval(threadId: string): void {
+    const v = this.views.get(threadId);
+    if (v) v.approval = null;
+  }
+
+  /** 待确认、且不是当前查看的 thread（供全局横幅）。 */
+  pendingApprovalsElsewhere(): ApprovalRequest[] {
+    const out: ApprovalRequest[] = [];
+    for (const [id, v] of this.views) {
+      if (v.approval && id !== this.currentId) out.push(v.approval);
+    }
+    return out;
+  }
+
+  /** 删除某 thread 的全部客户端状态。 */
+  drop(id: string): void {
+    this.views.delete(id);
+    if (this.currentId === id) this.currentId = null;
+  }
+}

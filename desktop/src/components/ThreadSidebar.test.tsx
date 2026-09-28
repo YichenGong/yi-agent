@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, fireEvent, cleanup } from "@testing-library/react";
+import { render, fireEvent, cleanup, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
@@ -38,7 +38,8 @@ function renderSidebar(overrides: Partial<ComponentProps<typeof ThreadSidebar>> 
     groups,
     workspaces: [],
     currentId: null,
-    busy: false,
+    statuses: new Map(),
+    unread: new Map(),
     onSelect: vi.fn(),
     onRename: vi.fn(),
     onDelete: vi.fn(),
@@ -289,5 +290,67 @@ describe("ThreadSidebar drag hygiene", () => {
     expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(
       String(DEFAULT_SIDEBAR_WIDTH + 80),
     );
+  });
+});
+
+describe("ThreadSidebar status", () => {
+  it("shows a spinner for a running thread", () => {
+    const { container } = renderSidebar({ statuses: new Map([["1", "running"]]) });
+    expect(container.querySelector('[aria-label="Running"]')).not.toBeNull();
+  });
+
+  it("shows an awaiting-approval badge", () => {
+    const { container } = renderSidebar({ statuses: new Map([["1", "awaiting_approval"]]) });
+    expect(container.querySelector('[aria-label="Awaiting approval"]')).not.toBeNull();
+  });
+
+  it("shows an unread dot and clears it when the thread is current", () => {
+    const { container } = renderSidebar({
+      unread: new Map([["1", "completed"]]),
+      currentId: null,
+    });
+    expect(container.querySelector('[aria-label="Unread"]')).not.toBeNull();
+
+    const shown = renderSidebar({ unread: new Map([["1", "completed"]]), currentId: "1" });
+    expect(shown.container.querySelector('[aria-label="Unread"]')).toBeNull();
+  });
+
+  it("allows selecting a thread while another one is running", () => {
+    const onSelect = vi.fn();
+    renderSidebar({
+      statuses: new Map([["1", "running"]]),
+      onSelect,
+    });
+    fireEvent.click(screen.getByText("beta-thread"));
+    expect(onSelect).toHaveBeenCalledWith("2");
+  });
+
+  it("colors the unread dot by the turn outcome", () => {
+    const completed = renderSidebar({
+      unread: new Map([["1", "completed"]]),
+      currentId: null,
+    });
+    expect(completed.container.querySelector('[aria-label="Unread"]')!.className).toContain(
+      "bg-blue-400",
+    );
+
+    const failed = renderSidebar({ unread: new Map([["1", "failed"]]), currentId: null });
+    expect(failed.container.querySelector('[aria-label="Unread"]')!.className).toContain(
+      "bg-red-400",
+    );
+
+    const interrupted = renderSidebar({
+      unread: new Map([["1", "interrupted"]]),
+      currentId: null,
+    });
+    expect(interrupted.container.querySelector('[aria-label="Unread"]')!.className).toContain(
+      "bg-neutral-400",
+    );
+  });
+
+  it("renders no status badge for an idle thread", () => {
+    const { container } = renderSidebar({ statuses: new Map([["1", "idle"]]) });
+    expect(container.querySelector('[aria-label="Running"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Awaiting approval"]')).toBeNull();
   });
 });

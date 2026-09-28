@@ -206,8 +206,13 @@ build_agent(workdir, model, session: Option<Session>)
 - **回放通知可能先于 `thread/resume` 响应到达**。因此必须**在发出 resume 请求之前同步调用
   `session.reset()`**，否则回放先应用、再被 reset 清掉（或留下旧 thread 残留）。
 - 若 resume 失败（`-32011`）：会话已清空 —— 接受，并显示错误横幅。
-- **`turnActive` 期间禁用侧栏切换/删除**，避免旧 thread 的流式通知串进新 thread。
-- 切换 thread 不并发（一次一个）。
+- **`turnActive` 期间禁用侧栏切换/删除**、**切换 thread 不并发（一次一个）** —— **已废弃**：
+  此两条约束属于本设计（P1 单会话）的权宜之计；已由后续「并行多 thread + 每 thread 状态」特性
+  取代——每 thread 各自持有 session / status，通知按 `thread_id` 路由到对应
+  `ThreadView`（`desktop/src/lib/threadStore.ts`），切换 thread 不再打断后台 turn、允许并行
+  turn。详见设计 `docs/plans/2026-09-28-parallel-threads-status-design.md`、模块文档
+  `docs/project-management/desktop.md`（「多 thread 标签页」「每 thread 状态徽标」）
+  与 `docs/project-management/yi-agent-app-server.md`（「每 thread 实时状态」）。
 
 ### 7.3 交互细节
 
