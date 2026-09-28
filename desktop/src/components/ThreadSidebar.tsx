@@ -54,6 +54,42 @@ export function ThreadSidebar({
   const widthRef = useRef(width);
   const cleanupDrag = useRef<(() => void) | null>(null);
 
+  const onHandleDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = widthRef.current;
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+
+    const onMove = (ev: MouseEvent) => {
+      const next = clampSidebarWidth(startWidth + (ev.clientX - startX));
+      widthRef.current = next;
+      setWidth(next);
+    };
+
+    const cleanup = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      cleanupDrag.current = null;
+    };
+
+    const onUp = () => {
+      cleanup();
+      saveSidebarWidth(widthRef.current);
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    cleanupDrag.current = cleanup;
+  };
+
+  // Remove any lingering document listeners if we unmount mid-drag.
+  useEffect(() => () => cleanupDrag.current?.(), []);
+
   const closeMenus = useCallback(() => {
     setNewMenuOpen(false);
     setContextWs(null);
@@ -308,6 +344,7 @@ export function ThreadSidebar({
         role="separator"
         aria-orientation="vertical"
         aria-label="Resize sidebar"
+        onMouseDown={onHandleDown}
         className="absolute inset-y-0 right-0 z-30 w-1.5 cursor-col-resize hover:bg-neutral-700/50"
       />
     </aside>

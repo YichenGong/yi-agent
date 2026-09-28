@@ -5,6 +5,7 @@ import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { DEFAULT_SIDEBAR_WIDTH, SIDEBAR_WIDTH_STORAGE_KEY } from "../lib/sidebarWidth";
+import { MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH } from "../lib/sidebarWidth";
 
 afterEach(() => {
   cleanup();
@@ -172,5 +173,46 @@ describe("ThreadSidebar width", () => {
     localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, "320");
     const { container } = renderSidebar();
     expect(aside(container).style.width).toBe("320px");
+  });
+});
+
+const handle = (container: HTMLElement) =>
+  container.querySelector<HTMLElement>('[role="separator"]')!;
+
+function drag(container: HTMLElement, toClientX: number, fromClientX = 0) {
+  fireEvent.mouseDown(handle(container), { clientX: fromClientX });
+  fireEvent.mouseMove(document, { clientX: toClientX });
+  fireEvent.mouseUp(document);
+}
+
+describe("ThreadSidebar drag-resize", () => {
+  afterEach(() => {
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  });
+
+  it("grows the sidebar when dragging right", () => {
+    const { container } = renderSidebar();
+    drag(container, 100);
+    expect(aside(container).style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH + 100}px`);
+  });
+
+  it("clamps to MIN when dragging far left", () => {
+    const { container } = renderSidebar();
+    drag(container, -10000);
+    expect(aside(container).style.width).toBe(`${MIN_SIDEBAR_WIDTH}px`);
+  });
+
+  it("clamps to MAX when dragging far right", () => {
+    const { container } = renderSidebar();
+    drag(container, 10000);
+    expect(aside(container).style.width).toBe(`${MAX_SIDEBAR_WIDTH}px`);
+  });
+
+  it("stops resizing after mouseup", () => {
+    const { container } = renderSidebar();
+    drag(container, 50);
+    fireEvent.mouseMove(document, { clientX: 400 });
+    expect(aside(container).style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH + 50}px`);
   });
 });
