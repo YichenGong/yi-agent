@@ -263,3 +263,23 @@ CI 只跑 mock / 本地假 server，不依赖外部网络或真实 MCP server。
 - 不做 resources / prompts / sampling / elicitation
 - 不做 server 进程的健康检查 / 自动重启（失败即报错，重连一次封顶）
 - 不做 GUI 集成（desktop 路线图的 P3 另议）
+
+## 10. 实现偏差（as-built notes）
+
+以下与上文设计不同，以实现为准：
+
+- **§4.1 slash 语法**：`/mcp enable all` / `/mcp disable all` 未实现。master 批量
+  已由 `/mcp on` / `/mcp off` 覆盖，故不再单列；单 server 用
+  `/mcp enable <server>` / `/mcp disable <server>`。见
+  `yi-agent-rs/crates/yi-agent/src/tui/slash.rs` 的 `parse_mcp_args`。
+- **§6.3 运行时开关**：未新增 `McpSetMaster(bool)` / `McpSetServer { server, enabled }`
+  两个 `ControlCommand`。TUI 直接持有共享 `Arc<McpManager>`，就地改原子开关并发一个
+  **无字段** 的 `ControlCommand::McpRefresh`，driver 收到后对 `current_tools` 做
+  `refresh_registry` 并重建 agent（保持 `ControlCommand: Copy`）。
+- **§6.4 Teardown**：`McpManager` **没有** `impl Drop`；改用显式
+  `shutdown().await`，对每个连接 `Arc::try_unwrap` + 有界 `cancel()`（`REAP_TIMEOUT`），
+  失败时回落到 `RunningService` 的 drop 路径。headless/TUI 两条路径都在 runtime
+  存活时调用 `shutdown()`。
+- **§7.2 集成测试**：用 `tokio::io::duplex` 进程内往返（`#[cfg(test)]` 连接器 seam），
+  不 spawn 子进程；测试为 `manager::tests::probe_then_call_over_duplex`。
+

@@ -1451,6 +1451,15 @@ git commit -m "feat(tui): add /mcp slash command"
 
 ## Task 11: Handle `/mcp` in the TUI dispatch and the agent driver
 
+> **实现偏差（as-built）**：未新增 `McpToggle` / `mcp_tx` 通道。TUI 改为直接持有共享
+> 的 `Arc<McpManager>`，就地改原子开关（`set_master` / `set_server`）并渲染
+> `/mcp status`，再向 driver 发一个**无字段**的 `ControlCommand::McpRefresh`，driver
+> 收到后对 `current_tools` 调 `refresh_registry` 并重建 agent。原因：`AgentEvent`
+> 没有通用的信息型文本变体可回传状态；TUI 侧渲染符合既有 `/agents` 的模式；无字段
+> 变体可保持 `ControlCommand: Copy`。详见 `tui/slash.rs::parse_mcp_args`、
+> `tui/app.rs` 的 `SlashCommand::Mcp` 分支、`main.rs` 的 `McpRefresh` arm，以及
+> `manager.rs::refresh_registry`。以下 Step 1–2 保留为原始设计意图。
+
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent/src/tui/app.rs` (`execute_slash_command`, ~line 1537)
 - Modify: `yi-agent-rs/crates/yi-agent/src/control_commands.rs` (add a payload variant)
