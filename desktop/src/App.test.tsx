@@ -19,6 +19,8 @@ const { clients, state } = vi.hoisted(() => ({
     // (keeps the legacy tests terse). Tests that need a second thread or
     // per-thread modes set this explicitly.
     threads: null as ThreadSeed[] | null,
+    notifHandlers: [] as Array<(n: unknown) => void>,
+    approvalHandlers: [] as Array<(r: unknown) => void>,
   },
 }));
 
@@ -29,10 +31,12 @@ vi.mock("./lib/rpc", () => ({
     constructor() {
       clients.push(this);
     }
-    onNotification() {
+    onNotification(cb: (n: unknown) => void) {
+      state.notifHandlers.push(cb);
       return () => {};
     }
-    onApproval() {
+    onApproval(cb: (r: unknown) => void) {
+      state.approvalHandlers.push(cb);
       return () => {};
     }
     onStatus() {
@@ -62,6 +66,7 @@ vi.mock("./lib/rpc", () => ({
                 updated_at: 0,
                 title: t.title,
                 permission_mode: t.permission_mode,
+                status: "idle",
               })),
             },
           ],
@@ -71,6 +76,10 @@ vi.mock("./lib/rpc", () => ({
       if (method === "thread/resume") {
         const { threadId } = params as { threadId: string };
         return { thread_id: threadId, cwd: "/w", model: "m" };
+      }
+      if (method === "thread/start") {
+        const id = `new-${this.requests.length}`;
+        return { thread_id: id, cwd: "/w", model: "m" };
       }
       if (method === "thread/setPermissionMode") {
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
@@ -92,6 +101,8 @@ beforeEach(() => {
   state.failList = false;
   state.failListAfter = null;
   state.threads = null;
+  state.notifHandlers.length = 0;
+  state.approvalHandlers.length = 0;
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -213,5 +224,75 @@ describe("App YOLO wiring", () => {
     expect(chip.disabled).toBe(true);
     expect(chip.textContent).not.toContain("Normal");
     expect(chip.textContent).not.toContain("YOLO");
+  });
+});
+
+describe("App parallel threads", () => {
+  it("does not re-resume a warm thread when switching back to it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+
+    fireEvent.click(screen.getByText("two")); // 冷 thread → resume 一次
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2),
+    );
+    fireEvent.click(screen.getByText("one")); // warm → 不再 resume
+    await new Promise((r) => setTimeout(r, 0));
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2);
+  });
+
+  it("does not lose a background thread's timeline when switching", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2),
+    );
+
+    // 后台 t1 流式输出（当前看的是 t2）。
+    const notify = state.notifHandlers[0];
+    notify({ method: "item/delta", params: { thread_id: "t1", item_id: "a1", delta: "bg" } });
+
+    fireEvent.click(screen.getByText("one")); // 切回 t1（warm，不 resume）
+    await waitFor(() => expect(screen.getByText("bg")).toBeTruthy());
+  });
+
+  it("shows a banner for a background approval and jumps on click", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    fireEvent.click(screen.getByText("two")); // 当前 = t2
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2),
+    );
+
+    state.approvalHandlers[0]({
+      id: "perm-1",
+      params: {
+        thread_id: "t1",
+        turn_id: "u1",
+        request_id: 1,
+        tool_name: "bash",
+        tool_input: {},
+        prefix_suggestion: null,
+        kind: "Normal",
+      },
+    });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /jump/i })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /jump/i }));
+    // 跳到 t1 后显示其审批模态。
+    await waitFor(() => expect(screen.getByText(/bash/)).toBeTruthy());
   });
 });
