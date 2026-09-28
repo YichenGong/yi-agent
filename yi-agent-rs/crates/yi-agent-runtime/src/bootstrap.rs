@@ -102,7 +102,7 @@ pub struct ToolSetup {
     pub catalog: Option<SkillsCatalogHandle>,
     pub system_prompt: Option<String>,
     /// MCP 管理器;配置缺失/不可用或注册失败时为 `None`。返回它以便**负责生命
-    /// 周期的调用方**(headless / TUI)在退出前调用 `shutdown()` 关闭 stdio 子
+    /// 周期的调用方**(headless / TUI)在退出前应调用 `shutdown()` 关闭 stdio 子
     /// 进程;不负责生命周期的调用方可以丢弃它。
     pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
@@ -110,9 +110,9 @@ pub struct ToolSetup {
 /// 注册内置工具(含 sandbox 配置)。
 ///
 /// 等价于 [`build_tool_setup`] 的非 naked 路径,只取工具集。注意:它同时会加载
-/// `.yi-agent/mcp.json` 并注册 MCP 工具(触发一次懒探测),但**丢弃**返回的
-/// [`yi_agent_mcp::McpManager`]——需要管理 MCP 生命周期的调用方应改用
-/// [`build_tool_setup`] 并自行 `shutdown()`。
+/// `.yi-agent/mcp.json` 并注册 MCP 工具(cold-cache 时触发一次启动期探测),但
+/// **丢弃**返回的 [`yi_agent_mcp::McpManager`]——需要管理 MCP 生命周期的调用方
+/// 应改用 [`build_tool_setup`] 并自行 `shutdown()`。
 pub fn build_tools(cfg: &RuntimeConfig) -> Result<Arc<yi_agent_core::ToolRegistry>> {
     Ok(build_tool_setup(cfg, false)?.tools)
 }
@@ -770,7 +770,12 @@ mod tests {
     /// 锁定「未配置 MCP 不影响既有工具集」,并覆盖 naked 分支。
     #[test]
     fn build_tool_setup_without_mcp_config_has_no_manager() {
-        let cfg = sample_config();
+        // 用全新 TempDir 而非 `sample_config()` 的固定 `/tmp/test-workdir`:后者若
+        // 意外存在 `.yi-agent/mcp.json`(如被其他测试遗落)会让本测试失真。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = sample_config();
+        cfg.workdir = tmp.path().to_path_buf();
+
         let setup = build_tool_setup(&cfg, false).expect("build setup");
         assert!(setup.mcp.is_none(), "no mcp.json => no manager");
         assert!(
@@ -783,8 +788,10 @@ mod tests {
         assert!(naked.mcp.is_none(), "naked setup never has a manager");
     }
 
-    /// 与上一条互补的正向用例:`.yi-agent/mcp.json` 存在时必须返回 `Some(manager)`,
-    /// 证明接线是活的且读的是 `cfg.workdir`(接线被删除或根取错目录都会得到 `None`)。
+    /// 与上一条互补的正向用例:`.yi-agent/mcp.json` 存在时必须返回 `Some(manager)`。
+    /// 同时覆盖顶层路径(`workspace == cfg.workdir`)与子 agent 路径
+    /// (`workspace != cfg.workdir`)——后者正是 Fix 1 存在的场景:若把 MCP 根
+    /// 退回 `workspace`,子 agent 会找不到配置而返回 `None`,本测试据此守住回归。
     ///
     /// server 的 `command` 故意指向不存在的路径:探测失败只 warn 并跳过该 server,
     /// `register_mcp_tools` 仍返回 manager。此处不断言具体工具名——制造 cache hit
@@ -792,22 +799,31 @@ mod tests {
     /// `crates/yi-agent-mcp/src/lib.rs` 的测试覆盖。
     #[test]
     fn build_tool_setup_returns_manager_when_mcp_config_present() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut cfg = sample_config();
-        cfg.workdir = tmp.path().to_path_buf();
-
-        let agent_dir = tmp.path().join(".yi-agent");
-        std::fs::create_dir_all(&agent_dir).unwrap();
+        // cfg.workdir 放项目级 mcp.json;另一个 worktree(子 agent 场景)必须仍从
+        // cfg.workdir 解析 MCP 配置,而不是从 `workspace`。
+        let project = tempfile::TempDir::new().unwrap();
+        let worktree = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".yi-agent")).unwrap();
         std::fs::write(
-            agent_dir.join("mcp.json"),
+            project.path().join(".yi-agent/mcp.json"),
             r#"{"mcpServers":{"fs":{"command":"/nonexistent/definitely-not-here"}}}"#,
         )
         .unwrap();
 
-        let setup = build_tool_setup(&cfg, false).expect("build setup");
+        let mut cfg = sample_config();
+        cfg.workdir = project.path().to_path_buf();
+
+        // 顶层路径(workspace == cfg.workdir)。
+        let top = build_tool_setup(&cfg, false).expect("build setup");
+        assert!(top.mcp.is_some(), "MCP config present -> manager returned");
+
+        // 子 agent 路径:workspace 与 cfg.workdir 不同。把 MCP 根退回 `workspace`
+        // 会在此处找不到配置并返回 None。
+        let sub =
+            build_tool_setup_in(&cfg, false, worktree.path()).expect("build setup in worktree");
         assert!(
-            setup.mcp.is_some(),
-            "config under cfg.workdir must yield a manager"
+            sub.mcp.is_some(),
+            "MCP root must be cfg.workdir, not workspace"
         );
     }
 
