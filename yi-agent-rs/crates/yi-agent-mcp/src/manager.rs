@@ -524,6 +524,29 @@ mod tests {
         Arc::new(m)
     }
 
+    /// A minimal non-MCP tool, used to prove `refresh_registry` leaves tools it
+    /// does not own alone. The name is deliberately outside the `mcp__` set.
+    struct LocalTool;
+
+    #[async_trait::async_trait]
+    impl Tool for LocalTool {
+        fn name(&self) -> &str {
+            "local_tool"
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn description(&self) -> &str {
+            "a local, non-MCP tool"
+        }
+
+        async fn call(&self, _args: Value) -> ToolResult {
+            ToolResult::text("local")
+        }
+    }
+
     #[test]
     fn effective_state_combines_master_and_server() {
         let mut m = McpManager::new_for_test(true);
@@ -627,6 +650,29 @@ mod tests {
             "double refresh must not duplicate the tool; got {:?}",
             registry.names()
         );
+    }
+
+    /// `refresh_registry` must only touch MCP tools: an unrelated tool already in
+    /// the registry must survive a refresh (it is not in `all_tool_names`).
+    #[test]
+    fn refresh_registry_preserves_unrelated_tools() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(LocalTool));
+        m.refresh_registry(&mut registry);
+        assert!(
+            registry.get("local_tool").is_some(),
+            "unrelated tool must survive; got {:?}",
+            registry.names()
+        );
+        assert!(
+            registry.get("mcp__fs__read").is_some(),
+            "effective MCP tool must be registered; got {:?}",
+            registry.names()
+        );
+        // And a second refresh must not drop it either.
+        m.refresh_registry(&mut registry);
+        assert!(registry.get("local_tool").is_some());
     }
 }
 
