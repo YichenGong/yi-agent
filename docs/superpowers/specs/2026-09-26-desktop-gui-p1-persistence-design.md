@@ -210,7 +210,8 @@ build_agent(workdir, model, session: Option<Session>)
   此两条约束属于本设计（P1 单会话）的权宜之计；已由后续「并行多 thread + 每 thread 状态」特性
   取代——每 thread 各自持有 session / status，通知按 `thread_id` 路由到对应
   `ThreadView`（`desktop/src/lib/threadStore.ts`），切换 thread 不再打断后台 turn、允许并行
-  turn。详见 `docs/project-management/desktop.md`（「多 thread 标签页」「每 thread 状态徽标」）
+  turn。详见设计 `docs/plans/2026-09-28-parallel-threads-status-design.md`、模块文档
+  `docs/project-management/desktop.md`（「多 thread 标签页」「每 thread 状态徽标」）
   与 `docs/project-management/yi-agent-app-server.md`（「每 thread 实时状态」）。
 
 ### 7.3 交互细节
