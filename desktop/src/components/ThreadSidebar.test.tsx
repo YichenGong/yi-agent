@@ -4,8 +4,12 @@ import { render, fireEvent, cleanup } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
-import { DEFAULT_SIDEBAR_WIDTH, SIDEBAR_WIDTH_STORAGE_KEY } from "../lib/sidebarWidth";
-import { MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH } from "../lib/sidebarWidth";
+import {
+  DEFAULT_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  SIDEBAR_WIDTH_STORAGE_KEY,
+} from "../lib/sidebarWidth";
 
 afterEach(() => {
   cleanup();
@@ -241,5 +245,49 @@ describe("ThreadSidebar persistence", () => {
     first.unmount();
     const second = renderSidebar();
     expect(aside(second.container).style.width).toBe(`${MIN_SIDEBAR_WIDTH}px`);
+  });
+});
+
+describe("ThreadSidebar drag hygiene", () => {
+  afterEach(() => {
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  });
+
+  it("sets the body cursor during a drag and restores it on release", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    expect(document.body.style.cursor).toBe("col-resize");
+    fireEvent.mouseUp(document);
+    expect(document.body.style.cursor).toBe("");
+  });
+
+  it("cleans up listeners and cursor when unmounted mid-drag", () => {
+    const { container, unmount } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    unmount();
+    expect(document.body.style.cursor).toBe("");
+    // A stray move after unmount must not throw or resurrect the drag.
+    expect(() => fireEvent.mouseMove(document, { clientX: 9999 })).not.toThrow();
+    expect(document.body.style.cursor).toBe("");
+  });
+
+  it("does not leave the cursor stuck after a second mousedown mid-drag", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    fireEvent.mouseDown(handle(container), { clientX: 10 });
+    fireEvent.mouseUp(document);
+    expect(document.body.style.cursor).toBe("");
+  });
+
+  it("ends the drag and persists the width when the window blurs", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    fireEvent.mouseMove(document, { clientX: 80 });
+    fireEvent.blur(window);
+    expect(document.body.style.cursor).toBe("");
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(
+      String(DEFAULT_SIDEBAR_WIDTH + 80),
+    );
   });
 });

@@ -56,6 +56,9 @@ export function ThreadSidebar({
 
   const onHandleDown = (e: React.MouseEvent) => {
     e.preventDefault();
+    // A prior drag may have missed its mouseup (e.g. released outside the window);
+    // unwind it before starting a new one so listeners/body styles can't stack.
+    cleanupDrag.current?.();
     const startX = e.clientX;
     const startWidth = widthRef.current;
     const prevCursor = document.body.style.cursor;
@@ -70,6 +73,7 @@ export function ThreadSidebar({
     const cleanup = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+      window.removeEventListener("blur", onBlur);
       document.body.style.cursor = prevCursor;
       document.body.style.userSelect = prevUserSelect;
       cleanupDrag.current = null;
@@ -80,10 +84,16 @@ export function ThreadSidebar({
       saveSidebarWidth(widthRef.current);
     };
 
+    const onBlur = () => {
+      cleanup();
+      saveSidebarWidth(widthRef.current);
+    };
+
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
+    window.addEventListener("blur", onBlur);
     cleanupDrag.current = cleanup;
   };
 
