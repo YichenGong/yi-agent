@@ -33,6 +33,7 @@ pub enum SlashCommand {
     Reject,
     Budget,
     Daemon,
+    Mcp,
 }
 
 impl SlashCommand {
@@ -57,6 +58,7 @@ impl SlashCommand {
             Self::Reject => ControlCommand::Reject,
             Self::Budget => ControlCommand::Budget,
             Self::Daemon => ControlCommand::Daemon,
+            Self::Mcp => ControlCommand::Mcp,
             Self::Help => ControlCommand::Help,
             Self::Quit | Self::Clear | Self::Model | Self::Cost | Self::Compact | Self::Config => {
                 return None;
@@ -97,6 +99,7 @@ impl SlashCommand {
             SlashCommand::Reject => "reject",
             SlashCommand::Budget => "budget",
             SlashCommand::Daemon => "daemon",
+            SlashCommand::Mcp => "mcp",
         }
     }
 
@@ -132,6 +135,7 @@ impl SlashCommand {
             SlashCommand::Reject => "拒绝子任务 delivery",
             SlashCommand::Budget => "查看或收窄任务预算",
             SlashCommand::Daemon => "管理本地 runtime daemon",
+            SlashCommand::Mcp => "管理 MCP server 开关",
         }
     }
 
@@ -194,6 +198,7 @@ impl SlashCommand {
             SlashCommand::Reject,
             SlashCommand::Budget,
             SlashCommand::Daemon,
+            SlashCommand::Mcp,
         ]
     }
 
@@ -451,5 +456,15 @@ mod tests {
         let names: Vec<&str> = SlashCommand::all().iter().map(|c| c.name()).collect();
         let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
         assert_eq!(names.len(), unique.len(), "duplicate command names");
+    }
+
+    #[test]
+    fn mcp_command_is_registered_with_usage() {
+        assert_eq!(SlashCommand::from_name("mcp"), Some(SlashCommand::Mcp));
+        assert_eq!(
+            SlashCommand::Mcp.argument_usage(),
+            Some("[on|off|enable <server>|disable <server>|status]")
+        );
+        assert!(SlashCommand::all().contains(&SlashCommand::Mcp));
     }
 }

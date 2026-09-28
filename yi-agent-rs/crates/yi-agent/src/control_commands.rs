@@ -25,6 +25,7 @@ pub enum ControlCommand {
     Budget,
     Daemon,
     Help,
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,7 @@ impl ControlCommand {
             Self::Budget,
             Self::Daemon,
             Self::Help,
+            Self::Mcp,
         ]
     }
 
@@ -126,6 +128,13 @@ impl ControlCommand {
             Self::Budget => spec(self, "budget", "<task-id> ...", "查看或收窄任务预算", false),
             Self::Daemon => spec(self, "daemon", "status", "管理本地 runtime daemon", false),
             Self::Help => spec(self, "help", "[command]", "显示控制命令帮助", false),
+            Self::Mcp => spec(
+                self,
+                "mcp",
+                "[on|off|enable <server>|disable <server>|status]",
+                "管理 MCP server 开关",
+                false,
+            ),
         }
     }
 }

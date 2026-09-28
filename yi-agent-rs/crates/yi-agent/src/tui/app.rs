@@ -1659,6 +1659,17 @@ fn execute_slash_command(
             );
             KeyOutcome::None
         }
+        SlashCommand::Mcp => {
+            // 真正的开关切换在 Task 11 通过 mcp_tx 接入;此处先占位,
+            // 保证 match 穷尽且 /mcp 在 TUI 中可见。
+            history.push(
+                HistoryCell::Separator {
+                    label: Some("MCP server 管理 (暂未实现)".to_string()),
+                },
+                width,
+            );
+            KeyOutcome::None
+        }
         SlashCommand::Review => {
             let label = match parse_review_args(args.as_deref()) {
                 Ok(task_id) => match daemon_review(workdir, task_id) {
