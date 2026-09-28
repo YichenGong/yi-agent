@@ -1,8 +1,11 @@
 //! thread 级状态:app-server 内存中的 thread 会话。
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use tokio::sync::mpsc;
+
+use crate::protocol::ThreadStatus;
 
 /// 一次 turn 的输入(由 driver task 消费)。
 #[derive(Debug)]
@@ -27,4 +30,15 @@ pub struct ThreadSession {
     /// 该 thread 的 store;driver 与主循环的 rename/delete 共用同一实例,
     /// 以共享 `ThreadStore.meta_lock`(否则并发 touch/rename 会丢更新)。
     pub store: Arc<crate::thread_store::ThreadStore>,
+    /// 该 thread 的实时状态。driver 与主循环共享同一句柄：driver 更新并推送
+    /// `thread/status/updated`，主循环在 `thread/list(:All)` 里读取。用共享句柄
+    /// 而非 `TurnEvent`，避免扰动 `interrupt_and_wait_for_persist` 的收事件循环。
+    pub status: Arc<Mutex<ThreadStatus>>,
+}
+
+impl ThreadSession {
+    /// 新建一个共享状态句柄（初值 `Idle`）。
+    pub fn new_status() -> Arc<Mutex<ThreadStatus>> {
+        Arc::new(Mutex::new(ThreadStatus::Idle))
+    }
 }

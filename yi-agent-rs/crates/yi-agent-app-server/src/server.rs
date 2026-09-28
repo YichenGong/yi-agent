@@ -436,6 +436,7 @@ where
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
+                                status: ThreadSession::new_status(),
                             },
                         );
 
@@ -590,6 +591,7 @@ where
                                 prompt_tx,
                                 interrupt_tx,
                                 store: Arc::clone(&thread_store),
+                                status: ThreadSession::new_status(),
                             },
                         );
 
