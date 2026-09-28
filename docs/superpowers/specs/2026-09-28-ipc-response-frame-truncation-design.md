@@ -90,8 +90,9 @@ if frame.len() > MAX_FRAME_BYTES || !frame.ends_with(b"\n") {
    不继承。CI 跑在 `ubuntu-latest`（`.github/workflows/ci.yml:10`），**CI 永远绿，
    macOS 用户永远坏**。
 2. **单元测试绕过了 `accept`**：`normal_oversized_response_uses_a_typed_error_not_subscription_resync`
-   （`ipc.rs:1999`）等 7 处用 `UnixStream::pair()`（main 原有 5 处，本设计新增 2 处）——`pair()` 是阻塞的，不继承
-   `O_NONBLOCK`，所以恒过。
+   （`ipc.rs:1999`）等 7 处用 `UnixStream::pair()`（`main` 原有 5 处，本设计新增的 2 条
+   red 测试 +2 处）——`pair()` 是阻塞的，不继承 `O_NONBLOCK`，所以恒过。这正是
+   §3.3 C1 必须补「走真实 `accept`」集成测试的原因。
 
 ### 2.3 关键观察：仓库里已有正确范式，只是命令路径没用它
 
@@ -159,7 +160,9 @@ fn write_frame_until(
 
 ### 3.2 修复 B：拆分错误语义
 
-`IpcError`（`ipc.rs:123`）新增变体，并把 `read_limited_frame` 的两个条件拆开：
+`IpcError`（`ipc.rs:123`）新增**两个**变体，并把 `read_limited_frame` 的两个条件拆开。
+
+**新增变体一：`TruncatedFrame`（读方向）。** 表示「对端在帧中途关闭」，属传输失败：
 
 ```rust
 if frame.len() > MAX_FRAME_BYTES {
@@ -169,6 +172,25 @@ if !frame.ends_with(b"\n") {
     return Err(IpcError::TruncatedFrame { received: frame.len() });
 }
 ```
+
+**新增变体二：`FrameWriteTimeout`（写方向）。** 由 §3.1 A1 的 `write_frame_until`
+在 deadline 耗尽且帧未写完时返回，携带已写进度便于排障：
+
+```rust
+#[error("timed out writing response frame after {written} of {total} bytes")]
+FrameWriteTimeout { written: usize, total: usize },
+```
+
+**两者都要在 `ipc_error_code`（`ipc.rs:2219`）中显式映射**，不能落入 `_ => Internal`：
+
+| 变体 | 映射 | 理由 |
+|---|---|---|
+| `FrameTooLarge` | `Validation`（保持现状） | 请求方/响应确实超限，属输入契约问题 |
+| `TruncatedFrame` | `Validation` | 传输失败；对端中途关闭，不是 daemon 故障 |
+| `FrameWriteTimeout` | `Validation` | 传输失败；写出超时，不是 daemon 故障 |
+
+三者都是**传输层**失败，一律映射 `Validation`，避免被误报为「daemon 故障」——这正是
+本次要消除的那类误导。实现时须为每个变体各加一条断言，防止将来回落到 `_` 分支。
 
 文案必须指向真正的原因，例如：
 
@@ -213,6 +235,7 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
 | 层级 | 验证 |
 |---|---|
 | 单元 | 已有两条 red 测试转绿：截断→`TruncatedFrame`，超限→`FrameTooLarge` |
+| 单元 | 新增断言：`ipc_error_code(TruncatedFrame)` 不落入 `Internal`（防误报为 daemon 故障） |
 | 集成（关键） | 新增 `a_response_payload_larger_than_the_socket_send_buffer_arrives_intact`，**修复前必定失败、修复后通过** |
 | 手工复现 | 对运行中 daemon 发 `InspectTask`，11 KB 报告的响应应完整（>8192 B 且以换行结尾） |
 | 回归 | `cargo test -p yi-agent-store`、`just fmt-check` |
@@ -237,5 +260,19 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
 改动集中在 `yi-agent-rs/crates/yi-agent-store/src/ipc.rs`（写路径 + 错误枚举 + 读帧
 判定）与 `yi-agent-rs/crates/yi-agent-store/tests/runtime_ipc.rs`（集成测试）。
 受影响命令的行为**不变**（仍是完整帧），变化的是它们**不再被静默截断**。
-`FrameTooLarge` 的语义收窄为「真的超过 1 MiB」，故依赖它的既有断言需同步更新
-（`ipc.rs:2000` 一处）——这是预期的契约变更。
+`FrameTooLarge` 的语义收窄为「真的超过 1 MiB」。**经核实，既有断言无需同步更新**：
+`normal_oversized_response_uses_a_typed_error_not_subscription_resync`（`ipc.rs:1999`）
+构造 `delivery_json = "x".repeat(MAX_FRAME_BYTES)`，在**服务端** `encode_envelope`
+即因超限降级为一个微小的 `Error` 帧，客户端读到的是**小而完整**的帧，从不进入
+读帧的截断分支。故拆分条件不影响该测试。
+
+**但有一处 spec 初稿遗漏、必须一并处理**：`ipc_error_code`（`ipc.rs:2219`）目前是
+
+```rust
+IpcError::Json(_) | IpcError::FrameTooLarge => IpcErrorCode::Validation,
+_ => IpcErrorCode::Internal,
+```
+
+新增的 `TruncatedFrame` 若不显式映射，会落入 `_` 分支被报成 `Internal`（"daemon
+故障"），而它的真实性质是**传输失败**，应与 `Validation` 语义区分。该映射需在实现
+中一并补齐并加断言。
