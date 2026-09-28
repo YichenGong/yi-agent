@@ -379,7 +379,13 @@ async fn bash_normal_exit_keeps_background_process_alive() {
         marker.display()
     );
     let result = tool
-        .call(serde_json::json!({ "command": cmd, "timeout": 5 }))
+        // 显式给出 expected_timeout_sec：正常结束时后台进程仍攥着管道，
+        // reader_wait 需等到 idle_limit 才放弃；不设则默认 180s，测试会久等。
+        .call(serde_json::json!({
+            "command": cmd,
+            "timeout": 5,
+            "expected_timeout_sec": 3
+        }))
         .await;
     assert!(!result.is_error, "normal exit expected: {:?}", result.content);
 
@@ -433,7 +439,8 @@ async fn bash_self_kill_by_process_group_does_not_kill_the_caller() {
         std::time::Duration::from_secs(8),
         tool.call(serde_json::json!({
             "command": "PGID=$(ps -o pgid= -p $$ | tr -d ' '); kill -TERM -$PGID; echo survived",
-            "timeout": 5
+            "timeout": 5,
+            "expected_timeout_sec": 2
         })),
     )
     .await;
