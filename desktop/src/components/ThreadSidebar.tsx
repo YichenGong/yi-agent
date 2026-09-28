@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
+import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 
 /** Compact relative time, e.g. "3m", "2h", "5d". */
 function relativeTime(ms: number): string {
@@ -49,6 +50,55 @@ export function ThreadSidebar({
   // an outside click; the two are mutually exclusive.
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [contextWs, setContextWs] = useState<string | null>(null);
+  const [width, setWidth] = useState(loadSidebarWidth);
+  const widthRef = useRef(width);
+  const cleanupDrag = useRef<(() => void) | null>(null);
+
+  const onHandleDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    // A prior drag may have missed its mouseup (e.g. released outside the window);
+    // unwind it before starting a new one so listeners/body styles can't stack.
+    cleanupDrag.current?.();
+    const startX = e.clientX;
+    const startWidth = widthRef.current;
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+
+    const onMove = (ev: MouseEvent) => {
+      const next = clampSidebarWidth(startWidth + (ev.clientX - startX));
+      widthRef.current = next;
+      setWidth(next);
+    };
+
+    const cleanup = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      window.removeEventListener("blur", onBlur);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      cleanupDrag.current = null;
+    };
+
+    const onUp = () => {
+      cleanup();
+      saveSidebarWidth(widthRef.current);
+    };
+
+    const onBlur = () => {
+      cleanup();
+      saveSidebarWidth(widthRef.current);
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    window.addEventListener("blur", onBlur);
+    cleanupDrag.current = cleanup;
+  };
+
+  // Remove any lingering document listeners if we unmount mid-drag.
+  useEffect(() => () => cleanupDrag.current?.(), []);
 
   const closeMenus = useCallback(() => {
     setNewMenuOpen(false);
@@ -145,7 +195,10 @@ export function ThreadSidebar({
   };
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800 bg-neutral-900">
+    <aside
+      className="relative flex shrink-0 flex-col border-r border-neutral-800 bg-neutral-900"
+      style={{ width }}
+    >
       <div className="relative p-2">
         <button
           type="button"
@@ -297,6 +350,13 @@ export function ThreadSidebar({
           );
         })}
       </div>
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        onMouseDown={onHandleDown}
+        className="absolute inset-y-0 right-0 z-30 w-1.5 cursor-col-resize hover:bg-neutral-700/50"
+      />
     </aside>
   );
 }

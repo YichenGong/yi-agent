@@ -4,8 +4,17 @@ import { render, fireEvent, cleanup } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+import {
+  DEFAULT_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  SIDEBAR_WIDTH_STORAGE_KEY,
+} from "../lib/sidebarWidth";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 function thread(id: string, title: string, cwd: string): ThreadSummary {
   return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title };
@@ -146,5 +155,139 @@ describe("ThreadSidebar", () => {
     fireEvent.click(caret);
     expect(container.textContent).not.toContain("alpha-thread");
     expect(header.querySelector('button[aria-label="Expand"]')).not.toBeNull();
+  });
+});
+
+const aside = (container: HTMLElement) => container.querySelector("aside")!;
+
+describe("ThreadSidebar width", () => {
+  it("renders the drag handle with separator semantics", () => {
+    const { container } = renderSidebar();
+    const handle = container.querySelector('[role="separator"]')!;
+    expect(handle).not.toBeNull();
+    expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+  });
+
+  it("defaults to the default width", () => {
+    const { container } = renderSidebar();
+    expect(aside(container).style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH}px`);
+  });
+
+  it("restores the persisted width on mount", () => {
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, "320");
+    const { container } = renderSidebar();
+    expect(aside(container).style.width).toBe("320px");
+  });
+});
+
+const handle = (container: HTMLElement) =>
+  container.querySelector<HTMLElement>('[role="separator"]')!;
+
+function drag(container: HTMLElement, toClientX: number, fromClientX = 0) {
+  fireEvent.mouseDown(handle(container), { clientX: fromClientX });
+  fireEvent.mouseMove(document, { clientX: toClientX });
+  fireEvent.mouseUp(document);
+}
+
+describe("ThreadSidebar drag-resize", () => {
+  afterEach(() => {
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  });
+
+  it("grows the sidebar when dragging right", () => {
+    const { container } = renderSidebar();
+    drag(container, 100);
+    expect(aside(container).style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH + 100}px`);
+  });
+
+  it("clamps to MIN when dragging far left", () => {
+    const { container } = renderSidebar();
+    drag(container, -10000);
+    expect(aside(container).style.width).toBe(`${MIN_SIDEBAR_WIDTH}px`);
+  });
+
+  it("clamps to MAX when dragging far right", () => {
+    const { container } = renderSidebar();
+    drag(container, 10000);
+    expect(aside(container).style.width).toBe(`${MAX_SIDEBAR_WIDTH}px`);
+  });
+
+  it("stops resizing after mouseup", () => {
+    const { container } = renderSidebar();
+    drag(container, 50);
+    fireEvent.mouseMove(document, { clientX: 400 });
+    expect(aside(container).style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH + 50}px`);
+  });
+});
+
+describe("ThreadSidebar persistence", () => {
+  it("saves the clamped width on mouseup", () => {
+    const { container } = renderSidebar();
+    drag(container, 10000); // clamps to MAX
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(String(MAX_SIDEBAR_WIDTH));
+  });
+
+  it("does not write during the drag (only on release)", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    fireEvent.mouseMove(document, { clientX: 80 });
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBeNull();
+    fireEvent.mouseUp(document);
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(
+      String(DEFAULT_SIDEBAR_WIDTH + 80),
+    );
+  });
+
+  it("restores a width dragged to MIN on the next mount", () => {
+    const first = renderSidebar();
+    drag(first.container, -10000);
+    first.unmount();
+    const second = renderSidebar();
+    expect(aside(second.container).style.width).toBe(`${MIN_SIDEBAR_WIDTH}px`);
+  });
+});
+
+describe("ThreadSidebar drag hygiene", () => {
+  afterEach(() => {
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  });
+
+  it("sets the body cursor during a drag and restores it on release", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    expect(document.body.style.cursor).toBe("col-resize");
+    fireEvent.mouseUp(document);
+    expect(document.body.style.cursor).toBe("");
+  });
+
+  it("cleans up listeners and cursor when unmounted mid-drag", () => {
+    const { container, unmount } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    unmount();
+    expect(document.body.style.cursor).toBe("");
+    // A stray move after unmount must not throw or resurrect the drag.
+    expect(() => fireEvent.mouseMove(document, { clientX: 9999 })).not.toThrow();
+    expect(document.body.style.cursor).toBe("");
+  });
+
+  it("does not leave the cursor stuck after a second mousedown mid-drag", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    fireEvent.mouseDown(handle(container), { clientX: 10 });
+    fireEvent.mouseUp(document);
+    expect(document.body.style.cursor).toBe("");
+  });
+
+  it("ends the drag and persists the width when the window blurs", () => {
+    const { container } = renderSidebar();
+    fireEvent.mouseDown(handle(container), { clientX: 0 });
+    fireEvent.mouseMove(document, { clientX: 80 });
+    fireEvent.blur(window);
+    expect(document.body.style.cursor).toBe("");
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(
+      String(DEFAULT_SIDEBAR_WIDTH + 80),
+    );
   });
 });

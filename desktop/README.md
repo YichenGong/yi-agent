@@ -97,7 +97,7 @@ desktop/
 
 ## Verification status
 
-Frontend unit tests (`npm test`, 34 tests), the frontend production build
+Frontend unit tests (`npm test`, 103 tests), the frontend production build
 (`npm run build`), and the Rust backend tests (`cd src-tauri && cargo test`) are
 green.
 
