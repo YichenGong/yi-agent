@@ -78,9 +78,9 @@ impl McpManager {
     /// loop, so a partially-probed run does not leave the cache half-written.
     ///
     /// Servers are probed sequentially, so worst-case startup is
-    /// `N * (CONNECT_TIMEOUT + PROBE_TIMEOUT)`. Concurrent probing is a possible
-    /// future improvement; it is intentionally not done here to keep startup
-    /// simple and bounded.
+    /// `N * (CONNECT_TIMEOUT + PROBE_TIMEOUT + REAP_TIMEOUT)` (about `N * 55s`).
+    /// Concurrent probing is a possible future improvement; it is intentionally
+    /// not done here to keep startup simple and bounded.
     ///
     /// The returned `Result` only errors on runtime/setup failure, never on an
     /// individual server's probe.
@@ -358,6 +358,10 @@ async fn probe_tools(cfg: &ServerConfig) -> Result<Vec<CachedTool>> {
     let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect(cfg)).await {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => return Err(e),
+        // `connect` already spawned the child (`TokioChildProcess::new`) before
+        // the handshake, so on a handshake timeout there is no `RunningService`
+        // to `cancel()`; reaping falls back to rmcp's `Drop` (a spawned kill
+        // task), which may be aborted when the probe runtime is torn down.
         Err(_) => return Err(anyhow!("MCP connect timed out after {CONNECT_TIMEOUT:?}")),
     };
 

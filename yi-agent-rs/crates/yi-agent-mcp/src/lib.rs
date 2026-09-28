@@ -9,13 +9,11 @@ mod manager;
 mod naming;
 mod tool;
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use tracing::warn;
 use yi_agent_core::ToolRegistry;
 
 pub use cache::CachedTool;
@@ -38,25 +36,10 @@ pub fn register_mcp_tools(
         return Ok(None);
     };
 
-    // Capture what was intentionally enabled before `cfg` moves into the probe
-    // runtime, so we only warn about servers the user actually wanted on.
-    let file_master = cfg.enabled;
-    let file_enabled: HashSet<String> = cfg
-        .mcp_servers
-        .iter()
-        .filter(|(_, sc)| sc.enabled)
-        .map(|(name, _)| name.clone())
-        .collect();
-
     let manager = run_blocking(move || McpManager::load_and_probe(cfg, workdir))?;
 
     for tool in manager.enabled_tools() {
         registry.register(tool);
-    }
-    for (name, ok) in manager.status() {
-        if !ok && file_master && file_enabled.contains(&name) {
-            warn!(server = %name, "MCP server not active");
-        }
     }
     Ok(Some(manager))
 }
