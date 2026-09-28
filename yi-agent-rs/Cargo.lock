@@ -4085,6 +4085,7 @@ dependencies = [
  "tracing",
  "yi-agent-core",
  "yi-agent-llm",
+ "yi-agent-mcp",
  "yi-agent-skills",
  "yi-agent-tools",
 ]

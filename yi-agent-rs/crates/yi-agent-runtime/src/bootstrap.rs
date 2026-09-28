@@ -101,6 +101,9 @@ pub struct ToolSetup {
     pub tools: Arc<yi_agent_core::ToolRegistry>,
     pub catalog: Option<SkillsCatalogHandle>,
     pub system_prompt: Option<String>,
+    /// MCP 管理器;无 `.yi-agent/mcp.json` 时为 `None`。调用方需持有它以便
+    /// 退出时关闭 stdio 子进程(见 [`yi_agent_mcp::McpManager::shutdown`])。
+    pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
 
 /// 注册内置工具(含 sandbox 配置)。
@@ -170,6 +173,7 @@ pub fn build_tool_setup_with_switch(
             tools: Arc::new(yi_agent_core::ToolRegistry::new()),
             catalog: None,
             system_prompt: None,
+            mcp: None,
         });
     }
 
@@ -197,10 +201,15 @@ pub fn build_tool_setup_with_switch(
     );
     yi_agent_tools::register_process_tools(&mut registry, process_manager);
 
+    // MCP 工具的根取 `workspace`(与内置工具一致);无 `.yi-agent/mcp.json`
+    // 时返回 `None`,单个 server 出错只会告警而不中断装配。
+    let mcp = yi_agent_mcp::register_mcp_tools(&mut registry, workspace)?;
+
     Ok(ToolSetup {
         tools: Arc::new(registry),
         catalog: prompt.catalog,
         system_prompt: prompt.system_prompt,
+        mcp,
     })
 }
 
@@ -740,6 +749,23 @@ mod tests {
         let naked = build_tool_setup_in(&cfg, true, workspace).expect("build naked setup");
         assert!(naked.tools.is_empty());
         assert!(naked.system_prompt.is_none());
+    }
+
+    /// 无 `.yi-agent/mcp.json` 时 MCP 装配应返回 `None`,且不注册任何 MCP 工具。
+    /// 锁定「未配置 MCP 不影响既有工具集」,并覆盖 naked 分支。
+    #[test]
+    fn build_tool_setup_without_mcp_config_has_no_manager() {
+        let cfg = sample_config();
+        let setup = build_tool_setup(&cfg, false).expect("build setup");
+        assert!(setup.mcp.is_none(), "no mcp.json => no manager");
+        assert!(
+            setup.tools.names().iter().all(|n| !n.starts_with("mcp__")),
+            "no MCP tools should be registered without config; got {:?}",
+            setup.tools.names()
+        );
+
+        let naked = build_tool_setup(&cfg, true).expect("build naked setup");
+        assert!(naked.mcp.is_none(), "naked setup never has a manager");
     }
 
     /// 本测试只覆盖 switch↔权限共享;沙箱路径由 tools 的 sandbox 单测覆盖,

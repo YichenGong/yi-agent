@@ -17,8 +17,8 @@ use anyhow::Result;
 use clap::Parser;
 use yi_agent_core::Provider;
 // Headless 模式的工具 + system prompt 构建结果。类型来自共享 crate
-// (`ToolSetup` 三个字段都是 `pub`),`build_headless_root_tools` 直接用
-// `HeadlessSetup { tools, catalog, system_prompt }` 字面量构造仍然成立。
+// (`ToolSetup` 的字段都是 `pub`),`build_headless_root_tools` 直接用
+// `HeadlessSetup { tools, catalog, system_prompt, mcp }` 字面量构造仍然成立。
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
@@ -714,6 +714,7 @@ fn build_headless_root_tools(
         tools: Arc::new(registry),
         catalog: setup.catalog,
         system_prompt: setup.system_prompt,
+        mcp: setup.mcp,
     })
 }
 
