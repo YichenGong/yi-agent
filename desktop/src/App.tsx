@@ -110,12 +110,18 @@ export default function App() {
     inFlightResume.current.add(id);
     try {
       await c.request("thread/resume", { threadId: id });
+      // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
+      // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
+      if (!store.peek(id)) return;
       warm.current.add(id);
       // thread/resume 响应不带权限模式,从 listAll 回读后再应用。
       const gs = await refreshThreads();
       if (gs !== null && id === store.currentId) setMode(modeForThread(gs, id));
     } catch (e) {
-      store.view(id).session.lastError = formatError(e);
+      // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
+      // drop 的 ThreadView(无界泄漏 + 残留 warm 条目)。
+      const view = store.peek(id);
+      if (view) view.session.lastError = formatError(e);
       force((v) => v + 1);
     } finally {
       inFlightResume.current.delete(id);
@@ -137,7 +143,8 @@ export default function App() {
       force((v) => v + 1);
       // 新对话默认 normal;仍从 listAll 回读以与服务端保持一致。
       const gs = await refreshThreads();
-      if (gs !== null) setMode(modeForThread(gs, t.thread_id));
+      if (gs !== null && t.thread_id === store.currentId)
+        setMode(modeForThread(gs, t.thread_id));
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);
@@ -224,9 +231,12 @@ export default function App() {
       force((v) => v + 1);
       return;
     }
+    // dismissedApprovals 以 approval id 为键;删除 thread 前先摘掉它名下那条
+    // 审批,否则按 thread id delete 是 no-op 且会留下永不过期的条目。
+    const v = store.peek(id);
+    if (v?.approval) dismissedApprovals.current.delete(v.approval.id);
     store.drop(id);
     warm.current.delete(id);
-    dismissedApprovals.current.delete(id);
     if (id === currentId) {
       setCurrentId(null);
       setMode(null);
