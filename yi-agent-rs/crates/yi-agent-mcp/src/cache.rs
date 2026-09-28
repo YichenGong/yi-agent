@@ -15,8 +15,6 @@ use sha2::{Digest, Sha256};
 use crate::config::ServerConfig;
 
 /// 一个被缓存的远端工具。
-// TODO(Task 8): register_mcp_tools 接入后移除 `allow(dead_code)`。
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedTool {
     pub name: String,
@@ -34,8 +32,6 @@ struct CachedServer {
 }
 
 /// 整个缓存文件。
-// TODO(Task 8): 缓存读写接入后移除 `allow(dead_code)`。
-#[allow(dead_code)]
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct McpCache {
     #[serde(default)]
@@ -65,8 +61,6 @@ fn fingerprint(cfg: &ServerConfig) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// TODO(Task 8): 缓存读写接入后移除 `allow(dead_code)`。
-#[allow(dead_code)]
 impl McpCache {
     /// 加载缓存;文件缺失或损坏时返回空缓存。
     ///

@@ -33,9 +33,13 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// handshake. Bounds a server that starts but never finishes handshaking.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on a cold cache probe (connect + `tools/list` + disconnect).
-/// Bounds startup so a hung server cannot stall it.
+/// Upper bound on the `tools/list` half of a cold cache probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Upper bound on reaping a probed server's child process. A wedged `cancel()`
+/// must not stall startup; if it fires we fall back to `RunningService`'s drop
+/// path, which cancels the connection.
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A live client connection to one MCP server.
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
@@ -72,6 +76,14 @@ impl McpManager {
     ///
     /// Successful probes are written back to the on-disk cache once, after the
     /// loop, so a partially-probed run does not leave the cache half-written.
+    ///
+    /// Servers are probed sequentially, so worst-case startup is
+    /// `N * (CONNECT_TIMEOUT + PROBE_TIMEOUT)`. Concurrent probing is a possible
+    /// future improvement; it is intentionally not done here to keep startup
+    /// simple and bounded.
+    ///
+    /// The returned `Result` only errors on runtime/setup failure, never on an
+    /// individual server's probe.
     pub async fn load_and_probe(cfg: McpConfig, workdir: &Path) -> Result<Arc<Self>> {
         let mut cache = McpCache::load(workdir);
         let mut servers = HashMap::new();
@@ -336,32 +348,46 @@ async fn connect(cfg: &ServerConfig) -> Result<Client> {
 
 /// Connect once, list every tool, convert to cache entries, then disconnect.
 ///
-/// The whole probe is bounded by `PROBE_TIMEOUT` so a server that hangs during
-/// startup cannot stall registration. The client is cancelled explicitly so the
-/// child process is reaped before the probe returns.
+/// The connect is bounded by `CONNECT_TIMEOUT` and the `tools/list` by
+/// `PROBE_TIMEOUT`. A created client is always explicitly cancelled — on the
+/// success path, the list-error path, and the list-timeout path — so the child
+/// process is reaped deterministically instead of relying on `RunningService`'s
+/// drop path (which spawns a kill task that can be cancelled when a temporary
+/// probe runtime is torn down, orphaning the child).
 async fn probe_tools(cfg: &ServerConfig) -> Result<Vec<CachedTool>> {
-    tokio::time::timeout(PROBE_TIMEOUT, async {
-        let client = connect(cfg).await?;
-        let tools = client.list_all_tools().await?;
-        let mut out = Vec::new();
-        for t in tools {
-            let read_only = t
-                .annotations
-                .as_ref()
-                .and_then(|a| a.read_only_hint)
-                .unwrap_or(false);
-            out.push(CachedTool {
-                name: t.name.to_string(),
-                description: t.description.as_ref().map(|d| d.to_string()),
-                input_schema: t.schema_as_json_value(),
-                read_only,
-            });
-        }
-        let _ = client.cancel().await;
-        Ok(out)
-    })
-    .await
-    .map_err(|_| anyhow!("MCP probe timed out after {PROBE_TIMEOUT:?}"))?
+    let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect(cfg)).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(anyhow!("MCP connect timed out after {CONNECT_TIMEOUT:?}")),
+    };
+
+    // Borrow the client for the listing, then release it so `cancel` can consume.
+    let listed = tokio::time::timeout(PROBE_TIMEOUT, client.list_all_tools()).await;
+
+    // Always attempt to reap the child, even if listing failed or timed out.
+    let _ = tokio::time::timeout(REAP_TIMEOUT, client.cancel()).await;
+
+    let tools = match listed {
+        Ok(Ok(tools)) => tools,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow!("MCP list tools timed out after {PROBE_TIMEOUT:?}")),
+    };
+
+    let mut out = Vec::new();
+    for t in tools {
+        let read_only = t
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false);
+        out.push(CachedTool {
+            name: t.name.to_string(),
+            description: t.description.as_ref().map(|d| d.to_string()),
+            input_schema: t.schema_as_json_value(),
+            read_only,
+        });
+    }
+    Ok(out)
 }
 
 /// Return a live client for `server`, connecting (bounded by `CONNECT_TIMEOUT`)

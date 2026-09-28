@@ -9,11 +9,12 @@ mod manager;
 mod naming;
 mod tool;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tracing::warn;
 use yi_agent_core::ToolRegistry;
 
@@ -37,13 +38,23 @@ pub fn register_mcp_tools(
         return Ok(None);
     };
 
+    // Capture what was intentionally enabled before `cfg` moves into the probe
+    // runtime, so we only warn about servers the user actually wanted on.
+    let file_master = cfg.enabled;
+    let file_enabled: HashSet<String> = cfg
+        .mcp_servers
+        .iter()
+        .filter(|(_, sc)| sc.enabled)
+        .map(|(name, _)| name.clone())
+        .collect();
+
     let manager = run_blocking(move || McpManager::load_and_probe(cfg, workdir))?;
 
     for tool in manager.enabled_tools() {
         registry.register(tool);
     }
     for (name, ok) in manager.status() {
-        if !ok {
+        if !ok && file_master && file_enabled.contains(&name) {
             warn!(server = %name, "MCP server not active");
         }
     }
@@ -74,11 +85,66 @@ where
                     rt.block_on(f())
                 })
                 .join()
-                .expect("MCP probe thread panicked")
+                .map_err(|_| anyhow!("MCP probe thread panicked"))?
         }),
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(f())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{CachedTool, McpCache};
+    use crate::config::ServerConfig;
+    use std::collections::BTreeMap;
+
+    /// A cache hit must register the cached tools without spawning a process.
+    /// The configured command does not exist, so any probe attempt would fail
+    /// and register nothing; a passing assertion therefore proves the cache was
+    /// consulted. Regression guard for the cache-probe wiring.
+    #[test]
+    fn cache_hit_registers_tools_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join(".yi-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        let command = "/nonexistent/definitely-not-here";
+        let sc = ServerConfig {
+            command: command.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            enabled: true,
+        };
+
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "read_file".into(),
+                description: Some("reads a file".into()),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+        );
+        cache.save(dir.path()).unwrap();
+
+        std::fs::write(
+            agent_dir.join("mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"/nonexistent/definitely-not-here"}}}"#,
+        )
+        .unwrap();
+
+        let mut reg = ToolRegistry::new();
+        let mgr = register_mcp_tools(&mut reg, dir.path()).unwrap();
+        assert!(mgr.is_some());
+        assert!(
+            reg.get("mcp__fs__read_file").is_some(),
+            "cached tool should be registered without probing; got {:?}",
+            reg.names()
+        );
     }
 }
