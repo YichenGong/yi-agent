@@ -11,6 +11,7 @@
 //! connection is dropped and the call is retried once on a fresh connection.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -18,11 +19,11 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 use yi_agent_core::{Tool, ToolResult};
 
-use crate::cache::CachedTool;
-use crate::config::ServerConfig;
+use crate::cache::{CachedTool, McpCache};
+use crate::config::{McpConfig, ServerConfig};
 use crate::tool::McpTool;
 
 /// Upper bound on a single remote tool call.
@@ -31,6 +32,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Upper bound on spawning a server and completing the MCP `initialize`
 /// handshake. Bounds a server that starts but never finishes handshaking.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on a cold cache probe (connect + `tools/list` + disconnect).
+/// Bounds startup so a hung server cannot stall it.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A live client connection to one MCP server.
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
@@ -59,6 +64,55 @@ impl McpManager {
             servers: HashMap::new(),
             master_enabled: AtomicBool::new(false),
         })
+    }
+
+    /// Build a manager from config, probing servers whose schema cache is
+    /// missing or stale. Never fails on a single server: a probe failure is
+    /// logged and that server's tool list is left empty.
+    ///
+    /// Successful probes are written back to the on-disk cache once, after the
+    /// loop, so a partially-probed run does not leave the cache half-written.
+    pub async fn load_and_probe(cfg: McpConfig, workdir: &Path) -> Result<Arc<Self>> {
+        let mut cache = McpCache::load(workdir);
+        let mut servers = HashMap::new();
+        let mut cache_dirty = false;
+
+        for (name, sc) in &cfg.mcp_servers {
+            let tools = match cache.get_for(name, sc) {
+                Some(t) => t.to_vec(),
+                None => match probe_tools(sc).await {
+                    Ok(probed) => {
+                        cache.put(name, sc, probed.clone());
+                        cache_dirty = true;
+                        probed
+                    }
+                    Err(e) => {
+                        warn!(server = %name, error = %e, "MCP probe failed; server unavailable");
+                        Vec::new()
+                    }
+                },
+            };
+            servers.insert(
+                name.clone(),
+                ServerEntry {
+                    config: sc.clone(),
+                    enabled: AtomicBool::new(sc.enabled),
+                    tools,
+                    client: Mutex::new(None),
+                },
+            );
+        }
+
+        if cache_dirty {
+            if let Err(e) = cache.save(workdir) {
+                warn!(error = %e, "failed to persist MCP cache");
+            }
+        }
+
+        Ok(Arc::new(Self {
+            servers,
+            master_enabled: AtomicBool::new(cfg.enabled),
+        }))
     }
 
     /// A server is effective only when both the master switch and its own
@@ -278,6 +332,36 @@ async fn connect(cfg: &ServerConfig) -> Result<Client> {
     let transport = TokioChildProcess::new(command)?;
     let client = ().serve(transport).await?;
     Ok(client)
+}
+
+/// Connect once, list every tool, convert to cache entries, then disconnect.
+///
+/// The whole probe is bounded by `PROBE_TIMEOUT` so a server that hangs during
+/// startup cannot stall registration. The client is cancelled explicitly so the
+/// child process is reaped before the probe returns.
+async fn probe_tools(cfg: &ServerConfig) -> Result<Vec<CachedTool>> {
+    tokio::time::timeout(PROBE_TIMEOUT, async {
+        let client = connect(cfg).await?;
+        let tools = client.list_all_tools().await?;
+        let mut out = Vec::new();
+        for t in tools {
+            let read_only = t
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint)
+                .unwrap_or(false);
+            out.push(CachedTool {
+                name: t.name.to_string(),
+                description: t.description.as_ref().map(|d| d.to_string()),
+                input_schema: t.schema_as_json_value(),
+                read_only,
+            });
+        }
+        let _ = client.cancel().await;
+        Ok(out)
+    })
+    .await
+    .map_err(|_| anyhow!("MCP probe timed out after {PROBE_TIMEOUT:?}"))?
 }
 
 /// Return a live client for `server`, connecting (bounded by `CONNECT_TIMEOUT`)
