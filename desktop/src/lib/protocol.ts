@@ -40,8 +40,12 @@ export type Item =
 
 export type TurnStatus = "completed" | "interrupted" | "failed";
 
+/** thread 级实时状态；服务端权威（`thread/status/updated` / `thread/list(:All)`）。 */
+export type ThreadStatus = "idle" | "running" | "awaiting_approval";
+
 export type Notification =
   | { method: "thread/started"; params: { thread_id: string; cwd: string; model: string } }
+  | { method: "thread/status/updated"; params: { thread_id: string; status: ThreadStatus } }
   | { method: "turn/started"; params: { thread_id: string; turn_id: string } }
   | { method: "item/started"; params: { thread_id: string; item: Item } }
   | { method: "item/delta"; params: { thread_id: string; item_id: string; delta: string } }
@@ -108,6 +112,8 @@ export interface ThreadSummary {
   title: string | null;
   /** Per-thread autonomy mode. 缺省(旧服务端/旧数据)视为 "normal";读取用 `?? "normal"`。 */
   permission_mode?: ThreadMode;
+  /** 服务端权威状态；旧服务端缺省视为 "idle"。 */
+  status?: ThreadStatus;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */
