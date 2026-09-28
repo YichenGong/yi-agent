@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use yi_agent_core::{Tool, ToolResult};
+use yi_agent_core::{Tool, ToolRegistry, ToolResult};
 
 use crate::cache::{CachedTool, McpCache};
 use crate::config::{McpConfig, ServerConfig};
@@ -209,6 +209,20 @@ impl McpManager {
             }
         }
         out
+    }
+
+    /// Sync `registry` with the effective MCP tools: unregister every tool this
+    /// manager could register, then register the currently-effective ones.
+    ///
+    /// Idempotent. Call after changing the master/per-server switches so the next
+    /// `Agent` rebuild exposes the new tool set.
+    pub fn refresh_registry(self: &Arc<Self>, registry: &mut ToolRegistry) {
+        for name in self.all_tool_names() {
+            registry.remove(&name);
+        }
+        for tool in self.enabled_tools() {
+            registry.register(tool);
+        }
     }
 
     /// Dispatch a tool call, connecting to the server on first use.
@@ -482,6 +496,7 @@ fn map_result(result: rmcp::model::CallToolResult) -> ToolResult {
 mod tests {
     use super::*;
     use crate::cache::CachedTool;
+    use yi_agent_core::ToolRegistry;
 
     fn cfg(cmd: &str) -> ServerConfig {
         ServerConfig {
@@ -490,6 +505,23 @@ mod tests {
             env: Default::default(),
             enabled: true,
         }
+    }
+
+    /// A manager with master on and one server `fs` carrying a cached `read` tool.
+    fn manager_with_fs_read() -> Arc<McpManager> {
+        let mut m = McpManager::new_for_test(true);
+        m.insert_server_with_tools_for_test(
+            "fs",
+            cfg("npx"),
+            true,
+            vec![CachedTool {
+                name: "read".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+        );
+        Arc::new(m)
     }
 
     #[test]
@@ -536,6 +568,65 @@ mod tests {
         let m = McpManager::new_for_test(true);
         let res = rt.block_on(m.call_tool("nope", "x", serde_json::json!({})));
         assert!(res.is_error);
+    }
+
+    #[test]
+    fn refresh_registry_registers_effective_tools() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        m.refresh_registry(&mut registry);
+        assert!(
+            registry.get("mcp__fs__read").is_some(),
+            "effective tool must be registered; got {:?}",
+            registry.names()
+        );
+    }
+
+    #[test]
+    fn refresh_registry_drops_tools_when_server_disabled() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        m.refresh_registry(&mut registry);
+        m.set_server("fs", false).unwrap();
+        m.refresh_registry(&mut registry);
+        assert!(
+            registry.get("mcp__fs__read").is_none(),
+            "tool must be dropped after the server is disabled; got {:?}",
+            registry.names()
+        );
+    }
+
+    #[test]
+    fn refresh_registry_drops_tools_when_master_off() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        m.refresh_registry(&mut registry);
+        m.set_master(false);
+        m.refresh_registry(&mut registry);
+        assert!(
+            registry.get("mcp__fs__read").is_none(),
+            "tool must be dropped after the master switch is off; got {:?}",
+            registry.names()
+        );
+    }
+
+    #[test]
+    fn refresh_registry_is_idempotent() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        m.refresh_registry(&mut registry);
+        m.refresh_registry(&mut registry);
+        let occurrences = registry
+            .names()
+            .iter()
+            .filter(|n| n.as_str() == "mcp__fs__read")
+            .count();
+        assert_eq!(
+            occurrences,
+            1,
+            "double refresh must not duplicate the tool; got {:?}",
+            registry.names()
+        );
     }
 }
 

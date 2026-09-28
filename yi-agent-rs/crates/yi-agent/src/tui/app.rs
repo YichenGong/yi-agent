@@ -27,7 +27,9 @@ use super::process_popup::{
     ConfirmProcessKill as ConfirmProcessKillPopup, ProcessDetailPopup, ProcessListPopup,
     ProcessPopup, RuntimeTab,
 };
-use super::slash::{CommandPopup, SlashCommand, help_text};
+use super::slash::{
+    CommandPopup, McpAction, SlashCommand, help_text, parse_mcp_args, render_mcp_status,
+};
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
 
@@ -81,6 +83,7 @@ pub fn run_tui(
     >,
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
     workdir: std::path::PathBuf,
+    mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -107,6 +110,7 @@ pub fn run_tui(
         runtime_choice_tx,
         process_manager,
         workdir,
+        mcp,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -186,6 +190,7 @@ pub fn run_tui_with_backend<B: Backend>(
         None,
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         workdir.to_path_buf(),
+        yi_agent_mcp::McpManager::empty(),
     )
     .map(|_dropped| ())
 }
@@ -221,6 +226,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         None,
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         std::env::temp_dir(),
+        yi_agent_mcp::McpManager::empty(),
     )
     .map(|_dropped| ())
 }
@@ -244,6 +250,7 @@ fn run_loop<B: Backend, E: EventSource>(
     >,
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
     workdir: std::path::PathBuf,
+    mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> std::io::Result<usize> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
@@ -527,6 +534,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     &mut pending_quit,
                     &mut popup,
                     &workdir,
+                    &mcp,
                 ) {
                     KeyOutcome::Quit => break,
                     KeyOutcome::Submit(_) => {
@@ -1196,6 +1204,7 @@ fn handle_key(
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
     workdir: &std::path::Path,
+    mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> KeyOutcome {
     // Check if there's a pending permission request. Clone the small fields
     // we need so the immutable borrow ends before we mutate history.
@@ -1363,6 +1372,7 @@ fn handle_key(
                             control_tx,
                             workdir,
                             queued,
+                            mcp,
                         );
                     } else {
                         // No command selected (empty filter) — show error
@@ -1442,6 +1452,7 @@ fn handle_key(
                         control_tx,
                         workdir,
                         queued,
+                        mcp,
                     );
                 } else {
                     // Unknown slash command
@@ -1545,6 +1556,7 @@ fn execute_slash_command(
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     workdir: &std::path::Path,
     queued: &mut crate::tui::queued::PendingQueue,
+    mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> KeyOutcome {
     match cmd {
         SlashCommand::Quit => KeyOutcome::Quit,
@@ -1660,14 +1672,46 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Mcp => {
-            // 真正的开关切换在 Task 11 通过 mcp_tx 接入;此处先占位,
-            // 保证 match 穷尽且 /mcp 在 TUI 中可见。
-            history.push(
-                HistoryCell::Separator {
-                    label: Some("MCP server 管理 (暂未实现)".to_string()),
+            match parse_mcp_args(args.as_deref().unwrap_or("")) {
+                Ok(McpAction::Status) => {
+                    let text = render_mcp_status(mcp.master(), &mcp.status());
+                    history.push(HistoryCell::Markdown { text }, width);
+                }
+                Ok(McpAction::Master(on)) => {
+                    mcp.set_master(on);
+                    let _ = control_tx.blocking_send(crate::ControlCommand::McpRefresh);
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some(format!(
+                                "MCP master 已{}",
+                                if on { "开启" } else { "关闭" }
+                            )),
+                        },
+                        width,
+                    );
+                }
+                Ok(McpAction::Server { name, on }) => match mcp.set_server(&name, on) {
+                    Ok(()) => {
+                        let _ = control_tx.blocking_send(crate::ControlCommand::McpRefresh);
+                        history.push(
+                            HistoryCell::Separator {
+                                label: Some(format!(
+                                    "MCP server '{name}' 已{}",
+                                    if on { "开启" } else { "关闭" }
+                                )),
+                            },
+                            width,
+                        );
+                    }
+                    Err(err) => history.push(
+                        HistoryCell::Separator {
+                            label: Some(err.to_string()),
+                        },
+                        width,
+                    ),
                 },
-                width,
-            );
+                Err(msg) => history.push(HistoryCell::Separator { label: Some(msg) }, width),
+            }
             KeyOutcome::None
         }
         SlashCommand::Review => {
@@ -4166,6 +4210,7 @@ mod tests {
             None,
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
 
@@ -4249,6 +4294,7 @@ mod tests {
             None,
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
 
@@ -4315,6 +4361,7 @@ mod tests {
             None,
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
 
@@ -4434,6 +4481,7 @@ mod tests {
             Some(runtime_choice_tx),
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
 
@@ -4485,6 +4533,7 @@ mod tests {
             Some(runtime_choice_tx),
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
 
@@ -4642,6 +4691,7 @@ mod tests {
             None,
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
 
@@ -6202,6 +6252,7 @@ mod tests {
                 &mut pending_quit,
                 &mut popup,
                 &std::env::temp_dir(),
+                &yi_agent_mcp::McpManager::empty(),
             );
             assert_eq!(outcome, KeyOutcome::None);
             assert_eq!(history.scroll_offset, expected_offset, "key {key:?}");
@@ -6225,6 +6276,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(history.selected, Some(4));
         assert_eq!(
@@ -6264,6 +6316,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "Esc must not arm process exit");
@@ -6304,6 +6357,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "idle Esc must not arm process exit");
@@ -6344,6 +6398,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(pending_quit);
@@ -6381,6 +6436,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         let result = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
@@ -6399,6 +6455,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(result, KeyOutcome::None);
     }
@@ -6440,6 +6497,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
 
         assert_eq!(result, KeyOutcome::Submit(path.to_string()));
@@ -6484,6 +6542,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
 
         assert_eq!(result, KeyOutcome::None);
@@ -6531,6 +6590,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight msg");
         let history_len_before = history.cells.len();
@@ -6555,6 +6615,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -6609,6 +6670,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -6658,6 +6720,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight");
 
@@ -6682,6 +6745,7 @@ mod tests {
                 &mut pending_quit,
                 &mut popup,
                 &std::env::temp_dir(),
+                &yi_agent_mcp::McpManager::empty(),
             );
         }
         assert_eq!(queued.len(), crate::tui::queued::PendingQueue::CAPACITY);
@@ -6707,6 +6771,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
 
         assert_eq!(
@@ -6764,6 +6829,7 @@ mod tests {
                 &mut pending_quit,
                 &mut popup,
                 &std::env::temp_dir(),
+                &yi_agent_mcp::McpManager::empty(),
             );
         }
         assert_eq!(input_rx.try_recv().unwrap(), "first");
@@ -6803,6 +6869,7 @@ mod tests {
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -6843,6 +6910,7 @@ mod tests {
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -6880,6 +6948,7 @@ mod tests {
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -6888,6 +6957,114 @@ mod tests {
                 assert!(
                     text.contains("尚无数据"),
                     "empty cost should show no-data: {text}"
+                );
+            }
+            other => panic!("expected Markdown, got {other:?}"),
+        }
+    }
+
+    // ----- /mcp slash command tests -----
+
+    #[test]
+    fn mcp_on_sets_master_and_sends_refresh() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mcp = yi_agent_mcp::McpManager::empty();
+        assert!(!mcp.master(), "empty manager starts with master off");
+
+        let outcome = execute_slash_command(
+            SlashCommand::Mcp,
+            Some("on".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &mcp,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        assert!(mcp.master(), "/mcp on must set the master switch");
+        assert_eq!(
+            control_rx.try_recv().unwrap(),
+            crate::ControlCommand::McpRefresh,
+            "/mcp on must ask the driver to refresh the registry"
+        );
+    }
+
+    #[test]
+    fn mcp_disable_unknown_server_reports_error_without_refresh() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mcp = yi_agent_mcp::McpManager::empty();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Mcp,
+            Some("disable nope".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &mcp,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        // The unknown server must be reported, not silently ignored...
+        match history.cells.last().unwrap() {
+            HistoryCell::Separator { label: Some(label) } => {
+                assert!(
+                    label.contains("nope"),
+                    "error should name the server: {label}"
+                );
+            }
+            other => panic!("expected a Separator, got {other:?}"),
+        }
+        // ...and no refresh may be sent for a failed toggle.
+        assert!(
+            control_rx.try_recv().is_err(),
+            "unknown server must not trigger a registry refresh"
+        );
+    }
+
+    #[test]
+    fn mcp_status_on_empty_manager_says_unconfigured() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mcp = yi_agent_mcp::McpManager::empty();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Mcp,
+            None,
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &mcp,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        match history.cells.last().unwrap() {
+            HistoryCell::Markdown { text } => {
+                assert!(
+                    text.contains("未配置 MCP server"),
+                    "empty manager should say unconfigured: {text}"
                 );
             }
             other => panic!("expected Markdown, got {other:?}"),
@@ -7284,6 +7461,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert!(
@@ -7335,6 +7513,7 @@ mod tests {
             &mut pending_quit,
             &mut popup,
             &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert_eq!(

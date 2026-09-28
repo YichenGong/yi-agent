@@ -1030,6 +1030,18 @@ fn run_agent(cli: Cli) -> Result<()> {
     );
     yi_agent_tools::register_process_tools(&mut registry, process_manager.clone());
 
+    // Register MCP tools and keep the manager so the TUI can toggle servers and
+    // the driver can refresh the registry at runtime. A bad MCP config must never
+    // block the agent: warn and continue with an empty manager.
+    let mcp = match yi_agent_mcp::register_mcp_tools(&mut registry, &config.workdir) {
+        Ok(Some(manager)) => manager,
+        Ok(None) => yi_agent_mcp::McpManager::empty(),
+        Err(err) => {
+            tracing::warn!("MCP disabled: {err:#}");
+            yi_agent_mcp::McpManager::empty()
+        }
+    };
+
     let tools = Arc::new(registry);
 
     let agent_config =
@@ -1048,6 +1060,7 @@ fn run_agent(cli: Cli) -> Result<()> {
         base_registry,
         process_manager,
         prompt.catalog,
+        mcp,
     )
 }
 
@@ -1305,6 +1318,7 @@ fn run_tui_agent(
     base_registry: yi_agent_core::ToolRegistry,
     process_manager: Arc<yi_agent_tools::ProcessManager>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -1342,6 +1356,7 @@ fn run_tui_agent(
         let rebuild_config = agent_config.clone();
         let rebuild_decision_rx = Arc::clone(&decision_rx);
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
+        let mcp_for_driver = Arc::clone(&mcp);
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -1412,6 +1427,22 @@ fn run_tui_agent(
                                 }
                             }
                         }
+                        ControlCommand::McpRefresh => {
+                            let mut refreshed = (*current_tools).clone();
+                            mcp_for_driver.refresh_registry(&mut refreshed);
+                            current_tools = Arc::new(refreshed);
+                            agent = yi_agent_core::Agent::new(
+                                Arc::clone(&rebuild_provider),
+                                Arc::clone(&current_tools),
+                                rebuild_config.clone(),
+                            )
+                            .with_session(agent.session())
+                            .with_permission(
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                            );
+                            tracing::info!("MCP tool registry refreshed");
+                        }
                     }
                     continue;
                 }
@@ -1448,12 +1479,14 @@ fn run_tui_agent(
                                         attached_root.clone(),
                                     );
                                     let runtime_workdir = attached_root.workspace.path.clone();
-                                    let next_tools = Arc::new(build_tui_root_tools(
+                                    let mut next_registry = build_tui_root_tools(
                                         &base_registry,
                                         &config,
                                         socket_path.clone(),
                                         &attached_root,
-                                    ));
+                                    );
+                                    mcp_for_driver.refresh_registry(&mut next_registry);
+                                    let next_tools = Arc::new(next_registry);
                                     match load_permission_checker_for_workdir_async(runtime_workdir, &config).await {
                                         Ok(next_checker) => {
                                             let session = agent.session();
@@ -1618,6 +1651,7 @@ fn run_tui_agent(
                 Some(runtime_choice_tx),
                 process_manager,
                 workdir.clone(),
+                mcp,
             )
         });
 
@@ -1656,6 +1690,9 @@ pub(crate) enum ControlCommand {
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
+    /// Rebuild the agent so its tool registry matches the MCP switches the TUI
+    /// already applied directly to the shared `McpManager`.
+    McpRefresh,
 }
 
 #[cfg(test)]
