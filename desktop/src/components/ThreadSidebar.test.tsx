@@ -324,4 +324,33 @@ describe("ThreadSidebar status", () => {
     fireEvent.click(screen.getByText("beta-thread"));
     expect(onSelect).toHaveBeenCalledWith("2");
   });
+
+  it("colors the unread dot by the turn outcome", () => {
+    const completed = renderSidebar({
+      unread: new Map([["1", "completed"]]),
+      currentId: null,
+    });
+    expect(completed.container.querySelector('[aria-label="Unread"]')!.className).toContain(
+      "bg-blue-400",
+    );
+
+    const failed = renderSidebar({ unread: new Map([["1", "failed"]]), currentId: null });
+    expect(failed.container.querySelector('[aria-label="Unread"]')!.className).toContain(
+      "bg-red-400",
+    );
+
+    const interrupted = renderSidebar({
+      unread: new Map([["1", "interrupted"]]),
+      currentId: null,
+    });
+    expect(interrupted.container.querySelector('[aria-label="Unread"]')!.className).toContain(
+      "bg-neutral-400",
+    );
+  });
+
+  it("renders no status badge for an idle thread", () => {
+    const { container } = renderSidebar({ statuses: new Map([["1", "idle"]]) });
+    expect(container.querySelector('[aria-label="Running"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Awaiting approval"]')).toBeNull();
+  });
 });

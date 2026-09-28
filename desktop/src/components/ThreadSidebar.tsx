@@ -176,12 +176,14 @@ export function ThreadSidebar({
               <div className="flex items-center gap-1.5">
                 {st === "running" && (
                   <span
+                    role="img"
                     aria-label="Running"
                     className="size-3 shrink-0 animate-spin rounded-full border-2 border-neutral-600 border-t-neutral-300"
                   />
                 )}
                 {st === "awaiting_approval" && (
                   <span
+                    role="img"
                     aria-label="Awaiting approval"
                     className="size-2 shrink-0 rounded-full bg-amber-400"
                   />
@@ -214,7 +216,7 @@ export function ThreadSidebar({
               }}
               title="Delete"
               aria-label="Delete thread"
-              className="pointer-events-none shrink-0 rounded px-1 text-neutral-500 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-red-400 focus-visible:pointer-events-auto focus-visible:opacity-100 disabled:opacity-50"
+              className="pointer-events-none shrink-0 rounded px-1 text-neutral-500 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-red-400 focus-visible:pointer-events-auto focus-visible:opacity-100"
             >
               ×
             </button>
@@ -243,7 +245,7 @@ export function ThreadSidebar({
             setContextWs(null);
             setNewMenuOpen((v) => !v);
           }}
-          className="w-full rounded-md bg-neutral-800 px-3 py-2 text-left text-sm text-neutral-100 hover:bg-neutral-700 disabled:opacity-50"
+          className="w-full rounded-md bg-neutral-800 px-3 py-2 text-left text-sm text-neutral-100 hover:bg-neutral-700"
         >
           + New thread
         </button>
@@ -352,7 +354,7 @@ export function ThreadSidebar({
                         closeMenus();
                         onNew(g.workspace);
                       }}
-                      className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700 disabled:opacity-50"
+                      className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
                     >
                       New thread here
                     </button>
@@ -363,7 +365,7 @@ export function ThreadSidebar({
                         closeMenus();
                         onRemoveWorkspace(g.workspace);
                       }}
-                      className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700 disabled:opacity-50"
+                      className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
                     >
                       Remove from list
                     </button>
