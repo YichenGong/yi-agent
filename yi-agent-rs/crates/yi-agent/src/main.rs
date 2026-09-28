@@ -1269,6 +1269,7 @@ fn run_headless(
 
     let agent_config =
         yi_agent_runtime::bootstrap::build_agent_config(&config, setup.system_prompt);
+    let mcp = setup.mcp;
 
     let rt = tokio::runtime::Runtime::new()?;
     let exit_code = rt.block_on(async move {
@@ -1294,6 +1295,13 @@ fn run_headless(
             drain_stream_human(stream, &mut out, &mut err).await
         }
     });
+
+    // Close MCP server connections on a running reactor so the child processes
+    // are reaped; `std::process::exit` below would skip destructors. Done after
+    // `block_on` so it also covers the early-error exit path.
+    if let Some(manager) = &mcp {
+        rt.block_on(manager.shutdown());
+    }
 
     if let Some(runtime) = &headless_runtime {
         detach_headless_runtime_root(runtime);
@@ -1357,6 +1365,7 @@ fn run_tui_agent(
         let rebuild_decision_rx = Arc::clone(&decision_rx);
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let mcp_for_driver = Arc::clone(&mcp);
+        let mcp_for_teardown = Arc::clone(&mcp);
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -1672,6 +1681,10 @@ fn run_tui_agent(
         // TUI exited; abort the driver task to clean up
         // (driver may still be blocked on input_rx.recv() if agent was idle)
         driver.abort();
+
+        // Close MCP server connections while the reactor is still running so the
+        // child processes are reaped before the runtime is dropped.
+        mcp_for_teardown.shutdown().await;
 
         result
     });
