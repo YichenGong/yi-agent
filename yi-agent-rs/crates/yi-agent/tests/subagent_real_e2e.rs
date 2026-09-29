@@ -294,7 +294,10 @@ fn await_review(socket: &Path, task_id: &str) -> yi_agent_store::ipc::IpcTaskDet
         if detail.state == "awaiting_parent_review" {
             return detail;
         }
-        if detail.state == "failed" {
+        if matches!(
+            detail.state.as_str(),
+            "failed" | "completed_no_changes" | "cancelled"
+        ) {
             let workspace_status = detail
                 .workspace
                 .as_ref()
@@ -305,12 +308,24 @@ fn await_review(socket: &Path, task_id: &str) -> yi_agent_store::ipc::IpcTaskDet
                 .as_ref()
                 .map(|workspace| git(&workspace.path, &["log", "-1", "--format=%B"]))
                 .unwrap_or_else(|| "no workspace assigned".into());
+            let events = match send_request(
+                socket,
+                IpcRequest::ReadTaskEvents {
+                    task_id: task_id.into(),
+                    after_event_id: None,
+                },
+            ) {
+                Ok(IpcResponse::TaskEvents { events }) => format!("{events:?}"),
+                Ok(other) => format!("unexpected event response: {other:?}"),
+                Err(error) => format!("event read failed: {error}"),
+            };
             panic!(
-                "child task failed before review: {}; workspace status: {workspace_status:?}; workspace log: {workspace_log:?}",
+                "child task terminated before review in state {}; terminal: {}; workspace status: {workspace_status:?}; workspace log: {workspace_log:?}; events: {events}",
+                detail.state,
                 detail
                     .terminal_json
                     .as_deref()
-                    .unwrap_or("no terminal evidence recorded")
+                    .unwrap_or("no terminal evidence recorded"),
             );
         }
         assert!(
@@ -436,9 +451,9 @@ fn real_subagent_accepts_delivery_into_parent_history() {
     let delivery = await_review(&socket, &child_id);
     let delivery_json: serde_json::Value =
         serde_json::from_str(&delivery.delivery_json).expect("child delivery JSON");
-    let child_head = delivery_json["head_commit"]
+    let child_head = delivery_json["commit"]
         .as_str()
-        .expect("delivery head commit")
+        .unwrap_or_else(|| panic!("delivery commit missing from {delivery_json}"))
         .to_owned();
     let parent_workspace = root_workspace(&socket);
     confirm_review(
@@ -452,10 +467,17 @@ fn real_subagent_accepts_delivery_into_parent_history() {
         "real delivery root failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        std::fs::read_to_string(parent_workspace.join(DELIVERY_FILE)).expect("accepted file"),
-        format!("{DELIVERY_MARKER}\n")
-    );
+    let accepted_file = parent_workspace.join(DELIVERY_FILE);
+    let accepted_content = std::fs::read_to_string(&accepted_file).unwrap_or_else(|error| {
+        let parent_status = git(&parent_workspace, &["status", "--porcelain"]);
+        let parent_log = git(&parent_workspace, &["log", "--oneline", "-3"]);
+        let child_tree = git(&parent_workspace, &["show", "--format=", "--name-only", &child_head]);
+        panic!(
+            "accepted file {} is missing: {error}; child commit: {child_head}; child tree: {child_tree:?}; parent status: {parent_status:?}; parent log: {parent_log:?}; delivery: {delivery_json}",
+            accepted_file.display(),
+        )
+    });
+    assert_eq!(accepted_content, format!("{DELIVERY_MARKER}\n"));
     git(
         &parent_workspace,
         &["merge-base", "--is-ancestor", &child_head, "HEAD"],
