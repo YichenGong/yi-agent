@@ -4874,3 +4874,96 @@ async fn a_delivered_childs_real_diff_reaches_its_reviewer() {
         "an undelivered task reports no diff rather than an error"
     );
 }
+
+/// superpowers dispatches its code reviewer as a *sibling* of the implementer,
+/// not as its child, and tells it to read the change with
+/// `git diff $BASE..$HEAD`. That only works if a reviewer sitting in the
+/// parent's worktree can see the implementer's commit. `git worktree` shares
+/// one object database, so it can; this test holds that door open. If a future
+/// change isolates child object databases, superpowers' reviewer loses its
+/// view of the code and this fails.
+#[tokio::test]
+async fn a_reviewer_sibling_reaches_its_implementers_commit_in_shared_git() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, session, parent, implementer, delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    // The coordinator then dispatches a review subagent for the same task.
+    let reviewer = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &parent,
+            "Review the implementation".into(),
+            TaskWorkspaceMode::ReadOnly,
+            None,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &reviewer).await.unwrap();
+
+    // The reviewer runs in the parent's worktree: that is the whole point of a
+    // sibling review, so assert it rather than assume it.
+    let reviewer_start = factory
+        .starts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|start| start.task_id == reviewer)
+        .cloned()
+        .expect("the reviewer worker was started");
+    let reviewer_workspace = reviewer_start
+        .workspace
+        .expect("a read-only reviewer still records its execution root");
+
+    // The implementer delivered a real commit; the parent merges it, exactly as
+    // the built-in prompt instructs, which is what makes it an ancestor of the
+    // base the reviewer diffs against.
+    git_ok(
+        &reviewer_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &delivery.commit,
+            "-m",
+            "integrate the child",
+        ],
+    )
+    .unwrap();
+
+    // What the reviewer's `git diff BASE..HEAD` actually sees.
+    let diff = git_output(
+        &reviewer_workspace.path,
+        &[
+            "diff",
+            &format!("{}..{}", delivery.base_ref, delivery.commit),
+        ],
+    )
+    .unwrap();
+    assert!(
+        diff.contains("delivery.txt") && diff.contains("+ready"),
+        "a sibling reviewer must see the implementer's code, got:\n{diff}"
+    );
+
+    // And the ancestry the daemon relies on to accept the delivery holds in the
+    // same shared object database.
+    assert!(
+        git_output(
+            &reviewer_workspace.path,
+            &["merge-base", "--is-ancestor", &delivery.commit, "HEAD"],
+        )
+        .is_ok(),
+        "the merged child commit is an ancestor of the reviewer/parent HEAD"
+    );
+
+    // `implementer` is intentionally kept: it is the sibling whose commit the
+    // reviewer just read, and naming it here documents the topology.
+    let _ = implementer;
+}
