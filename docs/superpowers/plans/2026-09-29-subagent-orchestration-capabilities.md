@@ -558,7 +558,7 @@ git commit -m "feat: authorize child access to the caller's own subtree"
 - Consumes: `IpcRequest::InspectChild` (Task 4); `IpcResponse::TaskDetail` with `delivery_json`; `IpcRequest::ReadTaskDiff` (`ipc.rs:316`) for the diff body.
 - Produces: `DaemonInspectAgentTool` with tool name `inspect_agent`; input `{ task_id: String, include_diff: bool = false }`; output JSON with `task_id`, `state`, `delivery` (parsed `delivery_json`, or null), `report`, and `diff` present only when `include_diff` is true. `report` is parsed in this crate by a local `text_completion_report` helper, because `yi-agent-store`'s identically-named parser at `runtime.rs:3397` is private to that crate.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[tokio::test]
@@ -598,12 +598,12 @@ git commit -m "feat: authorize child access to the caller's own subtree"
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yi-agent --bin yi-agent inspect_agent_ -- --exact`
 Expected: FAIL to compile with "cannot find type `DaemonInspectAgentTool`".
 
-- [ ] **Step 3: Implement the tool**
+- [x] **Step 3: Implement the tool**
 
 Add a local parser next to the other tool helpers in the same file. It must
 mirror `yi-agent-store`'s private rule (`kind == "text_completion"`):
@@ -673,12 +673,12 @@ Follow `DaemonWaitAgentTool` in the same file as the structural template. The `c
 
 Give it the schema `{ task_id: string (required), include_diff: boolean (default false) }`, register it in `register_application_subagent_tools` and in the worker-facing registration beside the other tools, and add it to the tool-name lists that the recovery preflight compares (`worker_tool_names_for_workspace`, which already appends subagent tool names).
 
-- [ ] **Step 4: Run the test**
+- [x] **Step 4: Run the test**
 
 Run: `cargo test -p yi-agent --bin yi-agent inspect_agent_ -- --exact`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs

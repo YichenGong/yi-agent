@@ -144,6 +144,7 @@ impl DaemonAgentWorkerFactory {
             "spawn_agent".to_string(),
             "send_message".to_string(),
             "wait_agent".to_string(),
+            "inspect_agent".to_string(),
         ]);
         names.sort();
         names.dedup();
@@ -564,6 +565,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 worker_capability: request.message_capability.clone(),
             }));
             worker_tools.register(Arc::new(DaemonWaitAgentTool {
+                runtime_socket: runtime_socket.clone(),
+                session_id: request.root_session_id.to_string(),
+                caller_task_id: request.task_id.to_string(),
+                caller_capability: request.message_capability.clone(),
+            }));
+            worker_tools.register(Arc::new(DaemonInspectAgentTool {
                 runtime_socket,
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
@@ -1041,6 +1048,12 @@ pub fn register_application_subagent_tools(
         application_capability: application_capability.clone(),
     }));
     registry.register(Arc::new(DaemonWaitAgentTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        caller_capability: application_capability.clone(),
+    }));
+    registry.register(Arc::new(DaemonInspectAgentTool {
         runtime_socket,
         session_id,
         caller_task_id,
@@ -1098,6 +1111,23 @@ struct DaemonApplicationSpawnAgentTool {
     session_id: String,
     caller_task_id: String,
     application_capability: String,
+}
+
+/// Extract the child's text report from its stored terminal payload, using the
+/// same `kind` marker the store writes.
+fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
+    let payload = serde_json::from_str::<Value>(terminal_json?).ok()?;
+    (payload.get("kind").and_then(Value::as_str) == Some("text_completion"))
+        .then(|| payload.get("report").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_owned)
+}
+
+struct DaemonInspectAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    caller_capability: String,
 }
 
 struct DaemonWaitAgentTool {
@@ -1170,6 +1200,80 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonInspectAgentTool {
+    fn name(&self) -> &str {
+        "inspect_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Read one descendant's state, delivery and report, and optionally its diff. The task must be in your own subtree, and it may already be finished."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The child task to inspect." },
+                "include_diff": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also return the child's delivered diff. Off by default."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let include_diff = args
+            .get("include_diff")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::InspectChild {
+                session_id: self.session_id.clone(),
+                caller_task_id: self.caller_task_id.clone(),
+                capability: self.caller_capability.clone(),
+                task_id: task_id.to_owned(),
+            },
+        );
+        let detail = match response {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskDetail(detail)) => detail,
+            Ok(other) => return ToolResult::error(format_ipc_rejection("inspect request", &other)),
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap_or(Value::Null);
+        let report = text_completion_report(detail.terminal_json.as_deref());
+        let mut payload = json!({
+            "task_id": detail.task_id,
+            "state": detail.state,
+            "delivery": delivery,
+            "report": report,
+        });
+        if include_diff {
+            let diff = yi_agent_store::ipc::send_request(
+                &self.runtime_socket,
+                yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+                    task_id: task_id.to_owned(),
+                },
+            );
+            if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { delivery_json, .. }) = diff {
+                payload["diff"] = serde_json::from_str(&delivery_json).unwrap_or(Value::Null);
+            }
+        }
+        ToolResult::text(payload.to_string())
     }
 }
 
@@ -1356,6 +1460,40 @@ mod tests {
             "factory-model",
             "an empty request inherits the factory default"
         );
+    }
+
+    #[tokio::test]
+    async fn inspect_agent_rejects_a_missing_task_id_and_returns_a_delivery_summary() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket = directory.path().join("runtime.sock");
+        let tool = DaemonInspectAgentTool {
+            runtime_socket: socket.clone(),
+            session_id: "session".into(),
+            caller_task_id: "caller".into(),
+            caller_capability: "capability".into(),
+        };
+
+        let missing = tool.call(json!({})).await;
+        assert!(missing.is_error, "task_id is required");
+
+        let reached = tool.call(json!({"task_id": "not-a-uuid"})).await;
+        assert!(
+            reached.is_error,
+            "a malformed task id fails before any daemon call"
+        );
+    }
+
+    #[test]
+    fn inspect_agent_schema_defaults_include_diff_to_false() {
+        let schema = DaemonInspectAgentTool {
+            runtime_socket: PathBuf::from("/tmp/unused.sock"),
+            session_id: "s".into(),
+            caller_task_id: "c".into(),
+            caller_capability: "k".into(),
+        }
+        .schema();
+        assert_eq!(schema["properties"]["include_diff"]["default"], false);
+        assert_eq!(schema["required"], json!(["task_id"]));
     }
 
     #[test]
