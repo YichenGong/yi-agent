@@ -60,7 +60,11 @@ pub enum WaitMode {
 }
 
 pub enum WaitOutcome {
-    NeedsAttention,
+    /// The caller has mailbox work at high priority or above, such as a
+    /// permission request. Any child that has already finished still carries
+    /// its report, so a caller that only checks `reports` never loses a
+    /// delivery just because something else also needs attention.
+    NeedsAttention { reports: Vec<CompletedChildReport> },
     Completed {
         children: Vec<TaskId>,
         reports: Vec<CompletedChildReport>,
@@ -72,6 +76,8 @@ pub struct CompletedChildReport {
     pub task_id: TaskId,
     pub state: String,
     pub report: Option<String>,
+    /// The child's delivered commit, when the child produced a delivery.
+    pub delivery: Option<String>,
 }
 
 pub struct AgentSupervisor {
@@ -79,6 +85,7 @@ pub struct AgentSupervisor {
     tasks: HashMap<TaskId, AgentTask>,
     objectives: HashMap<TaskId, String>,
     workspace_modes: HashMap<TaskId, TaskWorkspaceMode>,
+    models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
@@ -118,6 +125,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -154,6 +162,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -205,6 +214,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -221,6 +231,7 @@ impl AgentSupervisor {
         task: AgentTask,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<(), String> {
         let parent_id = task
             .parent_id
@@ -234,6 +245,9 @@ impl AgentSupervisor {
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
+        if let Some(model) = model {
+            self.models.insert(task_id.clone(), model);
+        }
         self.children.entry(parent_id).or_default().push(task_id);
         Ok(())
     }
@@ -265,6 +279,7 @@ impl AgentSupervisor {
         recovery_gated: bool,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<(), String> {
         if !self.tasks.contains_key(&parent_id) {
             return Err("recovered child parent is missing".into());
@@ -301,6 +316,9 @@ impl AgentSupervisor {
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
+        if let Some(model) = model {
+            self.models.insert(task_id.clone(), model);
+        }
         self.children.entry(parent_id).or_default().push(task_id);
         Ok(())
     }
@@ -315,6 +333,16 @@ impl AgentSupervisor {
 
     pub fn objective(&self, task_id: &TaskId) -> Option<&str> {
         self.objectives.get(task_id).map(String::as_str)
+    }
+
+    /// Records the model the child should run with. The runtime seeds this
+    /// from the persisted task row so it survives a restart.
+    pub fn set_model(&mut self, task_id: &TaskId, model: String) {
+        self.models.insert(task_id.clone(), model);
+    }
+
+    pub fn model(&self, task_id: &TaskId) -> Option<&str> {
+        self.models.get(task_id).map(String::as_str)
     }
 
     pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: TaskWorkspaceMode) {
@@ -346,6 +374,19 @@ impl AgentSupervisor {
         self.objectives.insert(task_id.clone(), objective);
         self.notify_update();
         Ok(())
+    }
+
+    /// Whether `candidate` is `caller` or is reachable from `caller` by
+    /// descending through `parent_id`.
+    pub fn is_descendant_of(&self, caller: &TaskId, candidate: &TaskId) -> bool {
+        let mut current = self.task(candidate).and_then(|task| task.parent_id.clone());
+        while let Some(id) = current {
+            if &id == caller {
+                return true;
+            }
+            current = self.task(&id).and_then(|task| task.parent_id.clone());
+        }
+        false
     }
 
     pub fn children_of(&self, task_id: &TaskId) -> &[TaskId] {
@@ -527,6 +568,7 @@ impl AgentSupervisor {
         )
         .with_objective(objective)
         .with_workspace_mode(self.workspace_mode(task_id))
+        .with_model(self.model(task_id).unwrap_or_default().to_string())
         .with_message_capability(Uuid::new_v4().to_string())
         .with_initial_user_messages(
             initial_user_messages
@@ -864,15 +906,13 @@ impl AgentSupervisor {
     /// Computes the non-blocking part of a child join. Runtime callers own
     /// waiting on the update receiver so the supervisor mutex stays available.
     pub fn wait_outcome(&self, caller: &TaskId, mode: WaitMode) -> Option<WaitOutcome> {
-        if self.mailbox(caller).is_some_and(|mailbox| {
+        let children = self.children_of(caller);
+        let needs_attention = self.mailbox(caller).is_some_and(|mailbox| {
             mailbox
                 .messages()
                 .iter()
                 .any(|message| message.priority <= MessagePriority::High)
-        }) {
-            return Some(WaitOutcome::NeedsAttention);
-        }
-        let children = self.children_of(caller);
+        });
         let completed_children: Vec<TaskId> = children
             .iter()
             .filter(|child| {
@@ -895,10 +935,33 @@ impl AgentSupervisor {
                     })
             }
         };
+        if needs_attention {
+            return Some(WaitOutcome::NeedsAttention {
+                reports: self.completed_child_reports(&self.children_needing_attention(caller)),
+            });
+        }
         complete.then(|| WaitOutcome::Completed {
             reports: self.completed_child_reports(&selected_children),
             children: selected_children,
         })
+    }
+
+    /// Children whose outcome the caller must act on: finished children, and
+    /// children holding a delivery or report that is waiting for the caller's
+    /// review. A delivery is not terminal yet, so terminality alone would hide
+    /// exactly the child the caller has to merge.
+    fn children_needing_attention(&self, caller: &TaskId) -> Vec<TaskId> {
+        self.children_of(caller)
+            .iter()
+            .filter(|child| {
+                self.task(child).is_some_and(|task| {
+                    task.state().is_terminal()
+                        || task.active_attempt().delivery.is_some()
+                        || self.completion_reports.contains_key(*child)
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn child_completion_snapshot(
@@ -927,6 +990,11 @@ impl AgentSupervisor {
                     task_id: child.clone(),
                     state: task_state_label(task.state()).to_string(),
                     report: self.completion_reports.get(child).cloned(),
+                    delivery: task
+                        .active_attempt()
+                        .delivery
+                        .as_ref()
+                        .map(|delivery| delivery.commit.clone()),
                 })
             })
             .collect()
@@ -1001,6 +1069,19 @@ impl AgentSupervisor {
         let worker_message = match draft.kind() {
             MessageKind::UserInstruction(UserInstruction(body)) => Some(body.clone()),
             MessageKind::Rework(instruction) => Some(instruction.0.clone()),
+            // A child's terminal outcome is the parent's next input: the parent
+            // acts on a delivery even when it never called wait_agent.
+            MessageKind::Completed(delivery) => {
+                Some(format!("Your child delivered commit {}.", delivery.commit))
+            }
+            MessageKind::Failed(failure) => Some(format!(
+                "Your child's task failed: {}. Investigate before continuing.",
+                failure.0
+            )),
+            MessageKind::Blocked(reason) => Some(format!(
+                "Your child's task is blocked: {}. Resolve the blocker before continuing.",
+                reason.0
+            )),
             _ => None,
         };
         let sender_task = self
@@ -1781,7 +1862,21 @@ impl Tool for WaitAgentTool {
                 supervisor
                     .wait_outcome(&self.tools.caller, mode)
                     .map(|outcome| match outcome {
-                        WaitOutcome::NeedsAttention => ("needs_attention", Vec::new(), Vec::new()),
+                        WaitOutcome::NeedsAttention { reports } => (
+                            "needs_attention",
+                            Vec::new(),
+                            reports
+                                .into_iter()
+                                .map(|report| {
+                                    json!({
+                                        "task_id": report.task_id.to_string(),
+                                        "state": report.state,
+                                        "report": report.report,
+                                        "delivery": report.delivery,
+                                    })
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
                         WaitOutcome::Completed { children, reports } => (
                             "completed",
                             children
@@ -1795,6 +1890,7 @@ impl Tool for WaitAgentTool {
                                         "task_id": report.task_id.to_string(),
                                         "state": report.state,
                                         "report": report.report,
+                                        "delivery": report.delivery,
                                     })
                                 })
                                 .collect(),

@@ -63,6 +63,16 @@ impl DaemonAgentWorkerFactory {
         }
     }
 
+    /// The child's model: the request's override when present, else the
+    /// factory's configured model.
+    fn worker_config_model(&self, requested: &str) -> String {
+        if requested.trim().is_empty() {
+            self.config.model.clone()
+        } else {
+            requested.to_owned()
+        }
+    }
+
     pub fn with_sandbox(
         mut self,
         sandbox: yi_agent_tools::SandboxMode,
@@ -107,10 +117,11 @@ impl DaemonAgentWorkerFactory {
     ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
         let (sandbox, writable_roots) = match workspace_mode {
-            TaskWorkspaceMode::Coding => (
-                self.sandbox,
-                git_dir_for_worktree(&workspace.path).into_iter().collect(),
-            ),
+            TaskWorkspaceMode::Coding => {
+                let mut writable_roots = vec![workspace.path.clone()];
+                writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
+                (self.sandbox, writable_roots)
+            }
             TaskWorkspaceMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
         yi_agent_tools::register_builtin_tools_with_sandbox(
@@ -133,6 +144,9 @@ impl DaemonAgentWorkerFactory {
             "spawn_agent".to_string(),
             "send_message".to_string(),
             "wait_agent".to_string(),
+            "inspect_agent".to_string(),
+            "cancel_agent".to_string(),
+            "review_agent".to_string(),
         ]);
         names.sort();
         names.dedup();
@@ -154,6 +168,9 @@ impl DaemonAgentWorkerFactory {
                     "spawn_agent".to_string(),
                     "send_message".to_string(),
                     "wait_agent".to_string(),
+                    "inspect_agent".to_string(),
+                    "cancel_agent".to_string(),
+                    "review_agent".to_string(),
                 ]);
                 names.sort();
                 names.dedup();
@@ -516,6 +533,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let workspace_mode = request.workspace_mode;
         let worker_tools = Arc::new(self.worker_tool_registry(&workspace, workspace_mode));
         let mut config = self.config.clone();
+        config.model = self.worker_config_model(&request.model);
         if let Some(catalog) = &self.catalog {
             if let Some(prompt) = catalog.current_system_prompt() {
                 config.system_prompt = Some(prompt);
@@ -552,7 +570,25 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 worker_capability: request.message_capability.clone(),
             }));
             worker_tools.register(Arc::new(DaemonWaitAgentTool {
-                runtime_socket,
+                runtime_socket: runtime_socket.clone(),
+                session_id: request.root_session_id.to_string(),
+                caller_task_id: request.task_id.to_string(),
+                caller_capability: request.message_capability.clone(),
+            }));
+            worker_tools.register(Arc::new(DaemonInspectAgentTool {
+                runtime_socket: runtime_socket.clone(),
+                session_id: request.root_session_id.to_string(),
+                caller_task_id: request.task_id.to_string(),
+                caller_capability: request.message_capability.clone(),
+            }));
+            worker_tools.register(Arc::new(DaemonCancelAgentTool {
+                runtime_socket: runtime_socket.clone(),
+                session_id: request.root_session_id.to_string(),
+                caller_task_id: request.task_id.to_string(),
+                caller_capability: request.message_capability.clone(),
+            }));
+            worker_tools.register(Arc::new(DaemonReviewAgentTool {
+                runtime_socket: runtime_socket.clone(),
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
                 caller_capability: request.message_capability.clone(),
@@ -572,6 +608,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                         }
                         let mut prompt = objective;
                         let mut provider_retries = 0;
+                        let mut requested_delivery_commit = false;
                         let mut retrying_provider = false;
                         'run: loop {
                             let stream = match if retrying_provider {
@@ -654,6 +691,16 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                     match service.inspect_delivery(&workspace_for_delivery) {
                                                         Ok(delivery) => reporter.report_delivery(delivery),
                                                         Err(error)
+                                                            if !requested_delivery_commit
+                                                                && is_dirty_delivery_error(&error) =>
+                                                        {
+                                                            requested_delivery_commit = true;
+                                                            prompt = "Your worktree contains uncommitted changes, so the delivery cannot be reviewed. Run `git status --porcelain`, then stage every intended change with `git add` and create a commit with `git commit -m` in your assigned worktree. Do not only describe the commands; execute them. After committing, verify `git status --porcelain` is empty.".into();
+                                                            retrying_provider = false;
+                                                            assistant_report.clear();
+                                                            continue 'run;
+                                                        }
+                                                        Err(error)
                                                             if !assistant_report.trim().is_empty()
                                                                 && is_empty_delivery_error(&error) =>
                                                         {
@@ -729,10 +776,30 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
     }
 }
 
+fn is_dirty_delivery_error(error: &WorkerError) -> bool {
+    error.to_string().contains("child worktree is dirty")
+}
+
 fn is_empty_delivery_error(error: &WorkerError) -> bool {
     error
         .to_string()
         .contains("child delivery has no commits beyond")
+}
+
+fn git_writable_roots_for_worktree(workspace: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(git_dir) = git_dir_for_worktree(workspace) {
+        roots.push(git_dir.clone());
+        if let Some(common_dir) = git_output(workspace, &["rev-parse", "--git-common-dir"]) {
+            let common_dir = PathBuf::from(common_dir);
+            roots.push(if common_dir.is_absolute() {
+                common_dir
+            } else {
+                workspace.join(common_dir)
+            });
+        }
+    }
+    roots
 }
 
 fn git_dir_for_worktree(workspace: &std::path::Path) -> Option<PathBuf> {
@@ -998,6 +1065,24 @@ pub fn register_application_subagent_tools(
         application_capability: application_capability.clone(),
     }));
     registry.register(Arc::new(DaemonWaitAgentTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        caller_capability: application_capability.clone(),
+    }));
+    registry.register(Arc::new(DaemonInspectAgentTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        caller_capability: application_capability.clone(),
+    }));
+    registry.register(Arc::new(DaemonCancelAgentTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        caller_capability: application_capability.clone(),
+    }));
+    registry.register(Arc::new(DaemonReviewAgentTool {
         runtime_socket,
         session_id,
         caller_task_id,
@@ -1032,6 +1117,18 @@ fn spawn_mode(args: &Value) -> Result<TaskWorkspaceMode, ToolResult> {
     }
 }
 
+/// Resolves the optional `model` argument for a daemon `spawn_agent` call.
+/// An omitted model means the child inherits its parent's; a blank or
+/// non-string value is rejected rather than silently ignored.
+fn spawn_model(args: &Value) -> Result<Option<String>, ToolResult> {
+    match args.get("model") {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) => Err(ToolResult::error("model must not be blank")),
+        Some(_) => Err(ToolResult::error("model must be a string")),
+    }
+}
+
 struct DaemonSpawnAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
@@ -1043,6 +1140,37 @@ struct DaemonApplicationSpawnAgentTool {
     session_id: String,
     caller_task_id: String,
     application_capability: String,
+}
+
+/// Extract the child's text report from its stored terminal payload, using the
+/// same `kind` marker the store writes.
+fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
+    let payload = serde_json::from_str::<Value>(terminal_json?).ok()?;
+    (payload.get("kind").and_then(Value::as_str) == Some("text_completion"))
+        .then(|| payload.get("report").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_owned)
+}
+
+struct DaemonInspectAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    caller_capability: String,
+}
+
+struct DaemonCancelAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    caller_capability: String,
+}
+
+struct DaemonReviewAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    caller_capability: String,
 }
 
 struct DaemonWaitAgentTool {
@@ -1071,6 +1199,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                     "type": "string",
                     "enum": ["coding", "read_only"],
                     "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model for this child. Omit to inherit yours."
                 }
             },
             "required": ["task"],
@@ -1089,6 +1221,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(mode) => mode,
             Err(error) => return error,
         };
+        let model = match spawn_model(&args) {
+            Ok(model) => model,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
@@ -1097,6 +1233,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 capability: self.application_capability.clone(),
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
+                model,
             },
         );
         match response {
@@ -1104,6 +1241,211 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
             ),
             Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
+            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonInspectAgentTool {
+    fn name(&self) -> &str {
+        "inspect_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Read one descendant's state, delivery and report, and optionally its diff. The task must be in your own subtree, and it may already be finished."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The child task to inspect." },
+                "include_diff": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also return the child's delivered diff. Off by default."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let include_diff = args
+            .get("include_diff")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::InspectChild {
+                session_id: self.session_id.clone(),
+                caller_task_id: self.caller_task_id.clone(),
+                capability: self.caller_capability.clone(),
+                task_id: task_id.to_owned(),
+            },
+        );
+        let detail = match response {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskDetail(detail)) => detail,
+            Ok(other) => return ToolResult::error(format_ipc_rejection("inspect request", &other)),
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap_or(Value::Null);
+        let report = text_completion_report(detail.terminal_json.as_deref());
+        let mut payload = json!({
+            "task_id": detail.task_id,
+            "state": detail.state,
+            "delivery": delivery,
+            "report": report,
+        });
+        if include_diff {
+            let diff = yi_agent_store::ipc::send_request(
+                &self.runtime_socket,
+                yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+                    task_id: task_id.to_owned(),
+                },
+            );
+            if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { diff, .. }) = diff {
+                payload["diff"] = json!(diff);
+            }
+        }
+        ToolResult::text(payload.to_string())
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonCancelAgentTool {
+    fn name(&self) -> &str {
+        "cancel_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Cancel one of your descendants. Use recursive to cancel its whole subtree. Only tasks in your own subtree may be cancelled."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The descendant task to cancel." },
+                "recursive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also cancel the target's own descendants."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let recursive = args
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::CancelChild {
+                session_id: self.session_id.clone(),
+                caller_task_id: self.caller_task_id.clone(),
+                capability: self.caller_capability.clone(),
+                task_id: task_id.to_owned(),
+                recursive,
+            },
+        );
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskCancelled) => {
+                ToolResult::text(json!({ "task_id": task_id, "status": "cancelled" }).to_string())
+            }
+            Ok(other) => ToolResult::error(format_ipc_rejection("cancel request", &other)),
+            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonReviewAgentTool {
+    fn name(&self) -> &str {
+        "review_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Act on a direct child's delivery that is awaiting your review: send it back to rework with feedback, or reject it. Use decision \"rework\" to have the child try again with your feedback, or \"reject\" to stop it. To accept a delivery, merge the child's commit into your own branch instead; the runtime then completes the child."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "Your direct child task whose delivery you are reviewing." },
+                "decision": {
+                    "type": "string",
+                    "enum": ["rework", "reject"],
+                    "description": "rework sends the child back with feedback; reject stops it."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Feedback for a rework, or the reason for a rejection. Must not be empty."
+                }
+            },
+            "required": ["task_id", "decision", "message"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let Some(message) = args.get("message").and_then(Value::as_str) else {
+            return ToolResult::error("message is required");
+        };
+        let decision = match args.get("decision").and_then(Value::as_str) {
+            Some("rework") => yi_agent_store::ipc::ChildReviewDecision::Rework {
+                feedback: message.to_owned(),
+            },
+            Some("reject") => yi_agent_store::ipc::ChildReviewDecision::Reject {
+                reason: message.to_owned(),
+            },
+            Some(other) => {
+                return ToolResult::error(format!(
+                    "decision must be \"rework\" or \"reject\", got {other:?}"
+                ));
+            }
+            None => return ToolResult::error("decision is required"),
+        };
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::ReviewChild {
+                session_id: self.session_id.clone(),
+                caller_task_id: self.caller_task_id.clone(),
+                capability: self.caller_capability.clone(),
+                task_id: task_id.to_owned(),
+                decision,
+            },
+        );
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::ChildReviewAccepted) => ToolResult::text(
+                json!({ "task_id": task_id, "status": "review_recorded" }).to_string(),
+            ),
+            Ok(other) => ToolResult::error(format_ipc_rejection("review request", &other)),
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
     }
@@ -1178,6 +1520,10 @@ impl Tool for DaemonSpawnAgentTool {
                     "type": "string",
                     "enum": ["coding", "read_only"],
                     "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model for this child. Omit to inherit yours."
                 }
             },
             "required": ["task"],
@@ -1196,6 +1542,10 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(mode) => mode,
             Err(error) => return error,
         };
+        let model = match spawn_model(&args) {
+            Ok(model) => model,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
@@ -1203,6 +1553,7 @@ impl Tool for DaemonSpawnAgentTool {
                 parent_task_id: self.caller_task_id.clone(),
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
+                model,
             },
         );
         match response {
@@ -1262,6 +1613,161 @@ mod tests {
     }
 
     #[test]
+    fn worker_config_uses_the_requested_model_and_falls_back_to_the_factory_default() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let factory_config = AgentConfig {
+            model: "factory-model".into(),
+            ..AgentConfig::default()
+        };
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            factory_config,
+            directory.path().join("runtime.sock"),
+        );
+
+        assert_eq!(
+            factory.worker_config_model("small-model"),
+            "small-model",
+            "a requested model overrides the factory default"
+        );
+        assert_eq!(
+            factory.worker_config_model(""),
+            "factory-model",
+            "an empty request inherits the factory default"
+        );
+    }
+
+    #[test]
+    fn recovery_tool_names_include_every_child_orchestration_tool() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+
+        let names = factory.worker_tool_names();
+
+        for expected in [
+            "spawn_agent",
+            "send_message",
+            "wait_agent",
+            "inspect_agent",
+            "cancel_agent",
+            "review_agent",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "the recovery preflight must know {expected}, got {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn review_agent_validates_its_arguments_before_touching_the_daemon() {
+        let tool = DaemonReviewAgentTool {
+            runtime_socket: PathBuf::from("/tmp/unused.sock"),
+            session_id: "s".into(),
+            caller_task_id: "c".into(),
+            caller_capability: "k".into(),
+        };
+        let uuid = "00000000-0000-0000-0000-000000000001";
+        assert!(tool.call(json!({})).await.is_error, "task_id is required");
+        assert!(
+            tool.call(json!({"task_id": "nope", "decision": "rework", "message": "m"}))
+                .await
+                .is_error,
+            "task_id must be a UUID"
+        );
+        assert!(
+            tool.call(json!({"task_id": uuid, "message": "m"}))
+                .await
+                .is_error,
+            "decision is required"
+        );
+        assert!(
+            tool.call(json!({"task_id": uuid, "decision": "approve", "message": "m"}))
+                .await
+                .is_error,
+            "approve is not an agent decision: integration is the parent\'s own git action"
+        );
+        assert!(
+            tool.call(json!({"task_id": uuid, "decision": "rework"}))
+                .await
+                .is_error,
+            "message is required"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_agent_requires_a_task_id_and_a_valid_uuid() {
+        let tool = DaemonCancelAgentTool {
+            runtime_socket: PathBuf::from("/tmp/unused.sock"),
+            session_id: "s".into(),
+            caller_task_id: "c".into(),
+            caller_capability: "k".into(),
+        };
+        assert!(tool.call(json!({})).await.is_error, "task_id is required");
+        assert!(
+            tool.call(json!({"task_id": "nope"})).await.is_error,
+            "task_id must be a UUID"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_agent_rejects_a_missing_task_id_and_returns_a_delivery_summary() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket = directory.path().join("runtime.sock");
+        let tool = DaemonInspectAgentTool {
+            runtime_socket: socket.clone(),
+            session_id: "session".into(),
+            caller_task_id: "caller".into(),
+            caller_capability: "capability".into(),
+        };
+
+        let missing = tool.call(json!({})).await;
+        assert!(missing.is_error, "task_id is required");
+
+        let reached = tool.call(json!({"task_id": "not-a-uuid"})).await;
+        assert!(
+            reached.is_error,
+            "a malformed task id fails before any daemon call"
+        );
+    }
+
+    #[test]
+    fn inspect_agent_schema_defaults_include_diff_to_false() {
+        let schema = DaemonInspectAgentTool {
+            runtime_socket: PathBuf::from("/tmp/unused.sock"),
+            session_id: "s".into(),
+            caller_task_id: "c".into(),
+            caller_capability: "k".into(),
+        }
+        .schema();
+        assert_eq!(schema["properties"]["include_diff"]["default"], false);
+        assert_eq!(schema["required"], json!(["task_id"]));
+    }
+
+    #[test]
+    fn spawn_model_accepts_a_model_and_rejects_a_blank_one() {
+        assert_eq!(
+            spawn_model(&json!({"model": "small-model"})).unwrap(),
+            Some("small-model".to_string())
+        );
+        assert_eq!(spawn_model(&json!({})).unwrap(), None);
+        assert!(
+            spawn_model(&json!({"model": "   "})).is_err(),
+            "a blank model is not a valid request"
+        );
+        assert!(
+            spawn_model(&json!({"model": 7})).is_err(),
+            "a non-string model is not a valid request"
+        );
+    }
+
+    #[test]
     fn daemon_spawn_mode_uses_the_canonical_parser() {
         assert_eq!(
             spawn_mode(&json!({})).unwrap(),
@@ -1315,6 +1821,75 @@ mod tests {
     #[derive(Default)]
     struct RecordingHangingProvider {
         requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[derive(Default)]
+    struct DirtyDeliveryProvider {
+        calls: Mutex<usize>,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for DirtyDeliveryProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            let mut calls = self.calls.lock().unwrap();
+            let events = match *calls {
+                0 => vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "write-delivery".into(),
+                        name: "bash".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "write-delivery".into(),
+                        partial_json: r#"{"command":"printf 'ready\\n' > delivery.txt"}"#.into(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "write-delivery".into(),
+                    },
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                1 => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+                2 => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+                3 => vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "commit-delivery".into(),
+                        name: "bash".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "commit-delivery".into(),
+                        partial_json:
+                            r#"{"command":"git add delivery.txt && git commit -m 'deliver'"}"#
+                                .into(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "commit-delivery".into(),
+                    },
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                4 | 5 => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+                call => {
+                    return Err(ProviderError::InvalidRequest(format!(
+                        "unexpected call {call}"
+                    )));
+                }
+            };
+            *calls += 1;
+            Ok(futures::stream::iter(events).boxed())
+        }
     }
 
     struct UsageReportingProvider;
@@ -1500,12 +2075,43 @@ mod tests {
                 .is_error
         );
         let bash = registry.get("bash").expect("bash tool");
+        let add = bash.call(json!({"command":"git add delivery.txt"})).await;
         assert!(
-            !bash
-                .call(json!({"command":"git add delivery.txt"}))
-                .await
-                .is_error,
-            "child sandbox must permit its Git index writes"
+            !add.is_error,
+            "child sandbox must start Git staging: {add:?}"
+        );
+        assert!(
+            matches!(
+                add.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "child sandbox must permit its Git index writes: {add:?}"
+        );
+        let commit = bash
+            .call(json!({
+                "command": "git -c user.name=test -c user.email=test@example.invalid commit -m delivery"
+            }))
+            .await;
+        assert!(
+            !commit.is_error,
+            "child sandbox must start Git commit: {commit:?}"
+        );
+        assert!(
+            matches!(
+                commit.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "child sandbox must permit Git commit metadata writes: {commit:?}"
+        );
+        assert_eq!(
+            git_output(&workspace.path, &["status", "--porcelain"]),
+            None,
+            "a committed child delivery must leave its worktree clean",
+        );
+        assert_ne!(
+            git_output(&workspace.path, &["rev-parse", "HEAD"]),
+            Some(workspace.base_commit),
+            "the child commit must advance HEAD beyond its delivery base",
         );
     }
 
@@ -2101,6 +2707,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_worker_requests_a_commit_for_a_dirty_delivery_before_reporting_failure() {
+        let directory = TempDir::new().unwrap();
+        let base_head = initialize_git_repository(directory.path());
+        let root_path = directory.path().join(".worktrees/yi-root");
+        let root = WorktreeService::new()
+            .create_root(directory.path(), "feat/yi-agent-dirty-delivery", &root_path)
+            .unwrap();
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: root.path.clone(),
+            branch: root.branch.clone(),
+            parent_branch: root.parent_branch.clone(),
+            base_commit: base_head,
+        };
+        let provider = Arc::new(DirtyDeliveryProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let handle = factory
+            .start(
+                WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+                    .with_objective("Create and commit delivery.txt.")
+                    .with_workspace_mode(TaskWorkspaceMode::Coding)
+                    .with_workspace(workspace.clone()),
+            )
+            .await
+            .unwrap();
+
+        let delivery = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = handle.take_events();
+                if let Some(delivery) = events.into_iter().find_map(|event| match event {
+                    WorkerEvent::Delivered(delivery) => Some(delivery),
+                    WorkerEvent::Failed(error) => panic!(
+                        "worker failed instead of requesting a commit: {error}; status={:?}; log={:?}",
+                        git_output(&root.path, &["status", "--porcelain"]),
+                        git_output(&root.path, &["log", "-1", "--format=%B"]),
+                    ),
+                    _ => None,
+                }) {
+                    return delivery;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should repair the dirty delivery and report it");
+
+        assert_eq!(delivery.workspace, workspace.lease_id);
+        assert_eq!(
+            git_output(&root.path, &["status", "--porcelain"]),
+            None,
+            "committed delivery must leave the worktree clean",
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            6,
+            "the worker must continue through write, dirty inspection, recovery commit, and post-commit turns",
+        );
+        let recovery_prompt = requests[3]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                yi_agent_core::ContentBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .find(|text| text.contains("git commit -m"));
+        assert!(
+            recovery_prompt.is_some(),
+            "the commit turn must be prompted by dirty-delivery recovery: {:?}",
+            requests[3].messages,
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_worker_reports_a_structured_delivery_when_it_completes_cleanly() {
         let directory = TempDir::new().unwrap();
         let base_head = initialize_git_repository(directory.path());
@@ -2367,6 +3055,7 @@ mod tests {
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
                 mode: None,
+                model: None,
             },
         )
         .unwrap()
@@ -2414,6 +3103,7 @@ mod tests {
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
                 mode: None,
+                model: None,
             },
         )
         .unwrap()

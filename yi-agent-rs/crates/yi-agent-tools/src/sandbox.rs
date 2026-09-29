@@ -144,6 +144,9 @@ fn platform_command(
         policy.push_str("(deny file-write*)\n");
     } else {
         policy.push_str("(deny file-write* (subpath \"/\"))\n");
+        // Git opens this device while creating commits. It is not repository
+        // state, and allowing it does not broaden workspace write access.
+        policy.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         for root in writable_roots {
             policy.push_str(&format!(
                 "(allow file-write* (subpath \"{}\"))\n",

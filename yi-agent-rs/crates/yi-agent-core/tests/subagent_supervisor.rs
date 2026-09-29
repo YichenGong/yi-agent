@@ -9,12 +9,171 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
 use yi_agent_core::subagent::task::{
-    PauseReason, PermissionRequestId, RootSessionId, TaskDepth, TaskId, TaskState,
+    DeliveryReport, IntegrationValidation, PauseReason, PermissionRequestId, RootSessionId,
+    TaskDepth, TaskId, TaskState,
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{
     ContentBlock, ProviderTurnGate, ProviderTurnLease, TaskWorkspaceMode, ToolRegistry,
 };
+
+#[tokio::test]
+async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    // The delivery workspace must match the child task's own workspace.
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
+    let delivery_id = delivery.id.clone();
+    handle.report_delivery(delivery);
+    supervisor.reconcile_worker_events().unwrap();
+    // A parent resolves a child's delivery; only then does the child become
+    // terminal and enter the completion snapshot.
+    supervisor
+        .accept_review(
+            &child,
+            &root,
+            delivery_id,
+            IntegrationValidation::passed("cargo test -p parent"),
+        )
+        .unwrap();
+
+    let (_, reports) = supervisor.child_completion_snapshot(&root);
+
+    assert_eq!(
+        reports[0].delivery.as_deref(),
+        Some("deadbeef"),
+        "the parent learns the delivered commit"
+    );
+    assert_eq!(
+        reports[0].state, "completed",
+        "the accepted child is terminal"
+    );
+}
+
+/// A. A parent that already holds its child's completion message must still be
+/// able to see the delivered commit through wait_agent.
+#[tokio::test]
+async fn wait_agent_exposes_a_delivered_childs_commit() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    handle.report_delivery(DeliveryReport::coding(
+        "deadbeef",
+        "main",
+        workspace,
+        "cargo test -p child",
+    ));
+    supervisor.reconcile_worker_events().unwrap();
+
+    let supervisor = Arc::new(Mutex::new(supervisor));
+    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
+
+    let result = wait_tool.call(json!({ "mode": "all" })).await;
+
+    assert!(!result.is_error, "wait must not fail");
+    let ContentBlock::Text(text) = &result.content[0] else {
+        panic!("expected text result");
+    };
+    assert!(
+        text.contains("deadbeef"),
+        "the parent must learn the delivered commit, got {text}"
+    );
+}
+
+/// B. A delivered child must reach its running parent worker, so the parent
+/// learns the commit before choosing its next turn.
+#[tokio::test]
+async fn a_delivered_child_notifies_the_parent_worker() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCollectingWorkerFactory::default();
+    supervisor.start_worker(&factory, &root).await.unwrap();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    factory
+        .handle_for(&child)
+        .expect("child worker was started")
+        .report_delivery(DeliveryReport::coding(
+            "deadbeef",
+            "main",
+            workspace,
+            "cargo test -p child",
+        ));
+    supervisor.reconcile_worker_events().unwrap();
+
+    let mut mailbox = factory
+        .handle_for(&root)
+        .expect("parent worker was started")
+        .subscribe_messages();
+    let message = tokio::time::timeout(Duration::from_secs(1), mailbox.recv())
+        .await
+        .expect("the parent worker must be notified of its child's delivery")
+        .expect("the parent mailbox stays open");
+    assert!(
+        message.body.contains("deadbeef"),
+        "the parent learns the delivered commit, got {:?}",
+        message.body
+    );
+}
+
+#[test]
+fn a_caller_only_reaches_its_own_descendants() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let leaf = supervisor.spawn(child.clone()).unwrap();
+    let sibling = supervisor.spawn(root.clone()).unwrap();
+
+    assert!(
+        supervisor.is_descendant_of(&root, &child),
+        "a parent reaches its own child"
+    );
+    assert!(
+        supervisor.is_descendant_of(&root, &leaf),
+        "a parent reaches a grandchild"
+    );
+    assert!(
+        supervisor.is_descendant_of(&child, &leaf),
+        "an intermediate task reaches its own child"
+    );
+    assert!(
+        !supervisor.is_descendant_of(&child, &sibling),
+        "a sibling is not a descendant"
+    );
+    assert!(
+        !supervisor.is_descendant_of(&child, &root),
+        "a parent is not a descendant of its child"
+    );
+    assert!(
+        !supervisor.is_descendant_of(&root, &root),
+        "a task is not its own descendant"
+    );
+}
 
 #[test]
 fn spawn_enforces_depth_two_and_four_direct_children() {
@@ -235,6 +394,28 @@ impl AgentWorkerFactory for ReportingWorkerFactory {
 #[derive(Clone, Default)]
 struct HandleCapturingWorkerFactory {
     handle: Arc<Mutex<Option<WorkerHandle>>>,
+}
+
+#[derive(Default)]
+struct HandleCollectingWorkerFactory {
+    handles: Arc<Mutex<std::collections::HashMap<TaskId, WorkerHandle>>>,
+}
+
+impl HandleCollectingWorkerFactory {
+    fn handle_for(&self, task: &TaskId) -> Option<WorkerHandle> {
+        self.handles.lock().unwrap().get(task).cloned()
+    }
+}
+
+impl AgentWorkerFactory for HandleCollectingWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation);
+        self.handles
+            .lock()
+            .unwrap()
+            .insert(request.task_id.clone(), handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
 }
 
 impl AgentWorkerFactory for HandleCapturingWorkerFactory {

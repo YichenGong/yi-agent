@@ -913,6 +913,7 @@ fn reclaim_candidates_are_deepest_first_and_carry_their_workspace() {
             "completed",
             "root objective",
             TaskWorkspaceMode::Coding,
+            None,
         )
         .unwrap();
     repository
@@ -961,6 +962,7 @@ fn reclaim_candidates_exclude_tasks_without_a_workspace_row() {
             "completed",
             "objective",
             TaskWorkspaceMode::ReadOnly,
+            None,
         )
         .unwrap();
 

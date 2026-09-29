@@ -391,8 +391,9 @@ impl RuntimeCoordinator {
                     })?;
                     if supervisor.task(&ancestor.task_id).is_none() {
                         let mode = repository.task_workspace_mode(&ancestor.task_id)?;
+                        let model = repository.task_model(&ancestor.task_id)?;
                         supervisor
-                            .insert_hydrated_review_child(hydrated, objective, mode)
+                            .insert_hydrated_review_child(hydrated, objective, mode, model)
                             .map_err(RuntimeCoordinatorError::Supervisor)?;
                         hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                     }
@@ -402,6 +403,8 @@ impl RuntimeCoordinator {
                         "persisted recovered child has no recovered root".into(),
                     )
                 })?;
+                // Read the model before `task.task_id` is moved into the call.
+                let model = repository.task_model(&task.task_id)?;
                 supervisor
                     .try_lock()
                     .map_err(|_| {
@@ -416,6 +419,7 @@ impl RuntimeCoordinator {
                         task.recovery_gated || task.recovery_attested,
                         task.objective,
                         task.workspace_mode,
+                        model,
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
             } else {
@@ -494,8 +498,9 @@ impl RuntimeCoordinator {
                         RuntimeCoordinatorError::Supervisor("review hydration is busy".into())
                     })?;
                 let mode = repository.task_workspace_mode(&task.task_id)?;
+                let model = repository.task_model(&task.task_id)?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective, mode)
+                    .insert_hydrated_review_child(hydrated, objective, mode, model)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
             }
@@ -664,6 +669,7 @@ impl RuntimeCoordinator {
                 "queued",
                 &objective,
                 workspace_mode,
+                None,
             )?;
         self.supervisors
             .lock()
@@ -870,13 +876,18 @@ impl RuntimeCoordinator {
                     .lock()
                     .expect("runtime repository mutex poisoned")
                     .task_workspace_mode(&task_id)?;
+                let model = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_model(&task_id)?;
                 let supervisor = hydrated_supervisor.as_mut().ok_or_else(|| {
                     RuntimeCoordinatorError::Supervisor(
                         "application root child has no hydrated root".into(),
                     )
                 })?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective, mode)
+                    .insert_hydrated_review_child(hydrated, objective, mode, model)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(supervisor, task_id, completion_report)?;
             }
@@ -1022,9 +1033,10 @@ impl RuntimeCoordinator {
         capability: &str,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective, workspace_mode)
+        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model)
             .await
     }
 
@@ -1139,6 +1151,7 @@ impl RuntimeCoordinator {
             parent,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::ReadOnly,
+            None,
         )
         .await
     }
@@ -1149,6 +1162,7 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1212,7 +1226,11 @@ impl RuntimeCoordinator {
                 "queued",
                 &objective,
                 workspace_mode,
+                model.clone(),
             )?;
+        if let Some(model) = model {
+            supervisor.lock().await.set_model(&child, model);
+        }
         Ok(child)
     }
 
@@ -1226,9 +1244,10 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
-            .spawn_child_with_objective(session, parent, objective, workspace_mode)
+            .spawn_child_with_objective(session, parent, objective, workspace_mode, model)
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {
@@ -2741,6 +2760,54 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// The change a delivered child introduced, as a unified diff.
+    ///
+    /// A review is only possible if the reviewer can read the code, so this
+    /// recomputes the diff from the child's delivered commit rather than
+    /// echoing the child's own report. Returns `None` when git cannot produce
+    /// one: no commit, no recorded worktree, or a worktree already reclaimed.
+    pub fn delivery_diff(&self, task: &TaskId) -> Result<Option<String>, RuntimeCoordinatorError> {
+        let (repository_root, path, delivery) = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            let detail = repository.task_detail(task)?;
+            let Ok(delivery) = serde_json::from_str::<DeliveryReport>(&detail.delivery_json) else {
+                return Ok(None);
+            };
+            let Some(workspace) = repository.task_workspace_optional(task)? else {
+                return Ok(None);
+            };
+            (workspace.repository_root, workspace.path, delivery)
+        };
+        if delivery.commit.trim().is_empty() {
+            return Ok(None);
+        }
+        // The branch the child recorded as its base is the intended comparison.
+        // When it is unreachable, the commit's own parent is the honest fallback.
+        let directory = if path.exists() { path } else { repository_root };
+        let mut attempts: Vec<Vec<String>> = Vec::new();
+        if !delivery.base_ref.trim().is_empty() {
+            attempts.push(vec![
+                "diff".into(),
+                "--no-color".into(),
+                format!("{}...{}", delivery.base_ref, delivery.commit),
+            ]);
+        }
+        attempts.push(vec![
+            "diff".into(),
+            "--no-color".into(),
+            format!("{}^", delivery.commit),
+        ]);
+        for args in attempts {
+            if let Some(diff) = git_capture(&directory, &args) {
+                return Ok(Some(truncate_diff(diff)));
+            }
+        }
+        Ok(None)
+    }
+
     fn review_context(
         &self,
         task: &TaskId,
@@ -2883,6 +2950,133 @@ impl RuntimeCoordinator {
             updates.changed().await.map_err(|_| {
                 RuntimeCoordinatorError::Supervisor("supervisor is no longer available".into())
             })?;
+        }
+    }
+
+    /// Authenticates a caller for a child-scoped operation: either the
+    /// application root capability or the caller's own worker capability.
+    async fn authorize_child_access(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if self
+            .authorize_application_root(session, caller, capability)
+            .is_err()
+        {
+            let supervisor = self.supervisor(session)?;
+            supervisor
+                .lock()
+                .await
+                .can_use_worker_capability(caller, capability)
+                .map_err(|_| {
+                    RuntimeCoordinatorError::AuthorityDenied(
+                        "child access capability is invalid".into(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Reads one task's detail, but only when it lies in the caller's own
+    /// descendant subtree. Unlike `send_message`, a terminal target is fine:
+    /// a parent learns a finished child's result through this path.
+    pub async fn inspect_child_authorized(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        target: &TaskId,
+    ) -> Result<crate::repository::PersistedTaskDetail, RuntimeCoordinatorError> {
+        self.authorize_child_access(session, caller, capability)
+            .await?;
+        let allowed = self
+            .supervisor(session)?
+            .lock()
+            .await
+            .is_descendant_of(caller, target);
+        if !allowed {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "task is not a descendant of the caller".into(),
+            ));
+        }
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_detail(target)
+            .map_err(RuntimeCoordinatorError::from)
+    }
+
+    /// Cancels one task, but only when it lies in the caller's own descendant
+    /// subtree. Applies the same cancellation path `confirm_cancel` uses.
+    pub async fn cancel_child_authorized(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        target: &TaskId,
+        recursive: bool,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.authorize_child_access(session, caller, capability)
+            .await?;
+        let allowed = self
+            .supervisor(session)?
+            .lock()
+            .await
+            .is_descendant_of(caller, target);
+        if !allowed {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "task is not a descendant of the caller".into(),
+            ));
+        }
+        self.cancel_task(session, target, recursive).await
+    }
+
+    /// Directs one of the caller's own child deliveries to rework, or rejects
+    /// it. Authorization is the same capability check `inspect_child_authorized`
+    /// uses, plus one stricter rule the human path does not need: the caller
+    /// must be the child's *direct* parent, because that is who the review
+    /// state machine binds the decision to.
+    pub async fn review_child_authorized(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        target: &TaskId,
+        decision: crate::ipc::ChildReviewDecision,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.authorize_child_access(session, caller, capability)
+            .await?;
+        let allowed = self
+            .supervisor(session)?
+            .lock()
+            .await
+            .is_descendant_of(caller, target);
+        if !allowed {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "task is not a descendant of the caller".into(),
+            ));
+        }
+        let parent = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_detail(target)?
+            .parent_task_id
+            .and_then(|parent| parent.parse::<TaskId>().ok());
+        if parent.as_ref() != Some(caller) {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "only a delivery's direct parent may review it".into(),
+            ));
+        }
+        match decision {
+            crate::ipc::ChildReviewDecision::Rework { feedback } => {
+                self.rework_review(target, &feedback).await
+            }
+            crate::ipc::ChildReviewDecision::Reject { reason } => {
+                self.reject_review(target, &reason).await
+            }
         }
     }
 
@@ -4314,4 +4508,35 @@ impl RecoveryContext {
             tool_state_json: self.tool_state_json.clone(),
         }
     }
+}
+
+/// Runs git and returns its stdout on success. `None` on any failure keeps the
+/// caller's contract simple: a diff that cannot be produced is absent, never an
+/// error that would fail an otherwise valid inspection.
+fn git_capture(directory: &std::path::Path, args: &[String]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Diff bytes are unbounded in principle. A reviewer needs the shape of the
+/// change, not an entire vendored dependency: cap it and say so.
+fn truncate_diff(diff: String) -> String {
+    const MAX_DIFF_BYTES: usize = 64 * 1024;
+    if diff.len() <= MAX_DIFF_BYTES {
+        return diff;
+    }
+    let mut boundary = MAX_DIFF_BYTES;
+    while boundary > 0 && !diff.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut truncated = diff[..boundary].to_owned();
+    truncated.push_str("\n... diff truncated\n");
+    truncated
 }

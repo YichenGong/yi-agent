@@ -214,6 +214,8 @@ pub enum IpcRequest {
         objective: String,
         #[serde(default)]
         mode: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     SpawnApplicationChild {
         session_id: String,
@@ -222,6 +224,8 @@ pub enum IpcRequest {
         objective: String,
         #[serde(default)]
         mode: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     StartWorker {
         session_id: String,
@@ -298,6 +302,34 @@ pub enum IpcRequest {
     },
     InspectTask {
         task_id: String,
+    },
+    /// A parent reading one of its own descendants. Authorized by the
+    /// application-root capability or the caller's own worker capability.
+    InspectChild {
+        session_id: String,
+        caller_task_id: String,
+        capability: String,
+        task_id: String,
+    },
+    /// A parent cancelling one of its own descendants.
+    CancelChild {
+        session_id: String,
+        caller_task_id: String,
+        capability: String,
+        task_id: String,
+        #[serde(default)]
+        recursive: bool,
+    },
+    /// A parent directing one of its own descendants to rework or rejecting its
+    /// delivery. Authorized the same way `InspectChild` and `CancelChild` are.
+    /// This is the agent-facing counterpart of the human `Review` decision,
+    /// which the runtime otherwise reserves for the local operator.
+    ReviewChild {
+        session_id: String,
+        caller_task_id: String,
+        capability: String,
+        task_id: String,
+        decision: ChildReviewDecision,
     },
     ListTaskSummaries {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,6 +431,9 @@ pub enum IpcResponse {
     ReviewApproved,
     ReviewReworkRequested,
     ReviewRejected,
+    /// A direct parent's review direction for a child delivery was recorded.
+    /// The successor attempt (rework) or rejection is already durable.
+    ChildReviewAccepted,
     MessageQueued,
     WaitCompleted {
         status: String,
@@ -419,6 +454,11 @@ pub enum IpcResponse {
     TaskDiff {
         task_id: String,
         delivery_json: String,
+        /// The child's real change as a unified diff, when it can be produced.
+        /// Absent for a task that has not delivered, or whose worktree was
+        /// already reclaimed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
     },
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
@@ -482,6 +522,16 @@ impl From<IpcReviewDecision> for ReviewDecision {
 #[serde(deny_unknown_fields)]
 pub enum IpcReviewDecision {
     Accept {},
+    Rework { feedback: String },
+    Reject { reason: String },
+}
+
+/// What a parent asks of a child's delivery. Approval is deliberately absent:
+/// integration is the parent's own git action, and the runtime accepts a
+/// delivery by observing ancestry, never by an agent's assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildReviewDecision {
     Rework { feedback: String },
     Reject { reason: String },
 }
@@ -602,6 +652,9 @@ pub struct IpcCompletedChildReport {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
+    /// The child's delivered commit, when the child produced a delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
 }
 
 /// The stable wire payload for a top-level subscription event frame.
@@ -2599,6 +2652,7 @@ fn respond(
             parent_task_id,
             objective,
             mode,
+            model,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
@@ -2611,6 +2665,7 @@ fn respond(
                 &parent_task_id,
                 objective,
                 workspace_mode,
+                model,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2622,6 +2677,7 @@ fn respond(
             capability,
             objective,
             mode,
+            model,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
@@ -2635,6 +2691,7 @@ fn respond(
                 &capability,
                 objective,
                 workspace_mode,
+                model,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2838,14 +2895,27 @@ fn respond(
                                 task_id: report.task_id.to_string(),
                                 state: report.state,
                                 report: report.report,
+                                delivery: report.delivery,
                             })
                             .collect(),
                     )
                 }
                 Ok(outcome) => match outcome? {
-                    yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention => {
-                        ("needs_attention".into(), Vec::new(), Vec::new())
-                    }
+                    yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention {
+                        reports,
+                    } => (
+                        "needs_attention".into(),
+                        Vec::new(),
+                        reports
+                            .into_iter()
+                            .map(|report| IpcCompletedChildReport {
+                                task_id: report.task_id.to_string(),
+                                state: report.state,
+                                report: report.report,
+                                delivery: report.delivery,
+                            })
+                            .collect(),
+                    ),
                     yi_agent_core::subagent::supervisor::WaitOutcome::Completed {
                         children,
                         reports,
@@ -2861,6 +2931,7 @@ fn respond(
                                 task_id: report.task_id.to_string(),
                                 state: report.state,
                                 report: report.report,
+                                delivery: report.delivery,
                             })
                             .collect(),
                     ),
@@ -2885,6 +2956,79 @@ fn respond(
                 terminal_json: detail.terminal_json,
                 workspace: detail.workspace,
             }))
+        }
+        IpcRequest::InspectChild {
+            session_id,
+            caller_task_id,
+            capability,
+            task_id,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let detail = runtime.block_on(coordinator.inspect_child_authorized(
+                &session_id,
+                &caller_task_id,
+                &capability,
+                &task_id,
+            ))?;
+            Ok(IpcResponse::TaskDetail(IpcTaskDetail {
+                task_id: detail.task_id,
+                session_id: detail.session_id,
+                parent_task_id: detail.parent_task_id,
+                depth: detail.depth,
+                state: detail.state,
+                delivery_json: detail.delivery_json,
+                terminal_json: detail.terminal_json,
+                workspace: detail.workspace,
+            }))
+        }
+        IpcRequest::CancelChild {
+            session_id,
+            caller_task_id,
+            capability,
+            task_id,
+            recursive,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.cancel_child_authorized(
+                &session_id,
+                &caller_task_id,
+                &capability,
+                &task_id,
+                recursive,
+            ))?;
+            Ok(IpcResponse::TaskCancelled)
+        }
+        IpcRequest::ReviewChild {
+            session_id,
+            caller_task_id,
+            capability,
+            task_id,
+            decision,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.review_child_authorized(
+                &session_id,
+                &caller_task_id,
+                &capability,
+                &task_id,
+                decision,
+            ))?;
+            Ok(IpcResponse::ChildReviewAccepted)
         }
         IpcRequest::ListTaskSummaries {
             session_id,
@@ -2938,9 +3082,11 @@ fn respond(
         IpcRequest::ReadTaskDiff { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
             let detail = repository.task_detail(&task_id)?;
+            let diff = coordinator.delivery_diff(&task_id).ok().flatten();
             Ok(IpcResponse::TaskDiff {
                 task_id: detail.task_id,
                 delivery_json: detail.delivery_json,
+                diff,
             })
         }
         IpcRequest::SubscribeEvents {

@@ -788,6 +788,7 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
             &root,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -834,6 +835,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             &root,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -1113,10 +1115,17 @@ async fn coordinator_persists_worker_delivery_and_notifies_direct_parent() {
     .await
     .expect("delivery wakes the direct parent")
     .unwrap();
-    assert!(matches!(
-        outcome,
-        yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention
-    ));
+    let yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention { reports } = outcome
+    else {
+        panic!("delivery wakes the direct parent with an attention outcome");
+    };
+    assert_eq!(
+        reports
+            .first()
+            .and_then(|report| report.delivery.as_deref()),
+        Some(delivery.commit.as_str()),
+        "the attention outcome still carries the delivered commit"
+    );
 }
 
 #[tokio::test]
@@ -2346,6 +2355,7 @@ async fn delivered_child_coordinator(
             &parent,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -2966,6 +2976,7 @@ async fn recovered_child_resumes_after_runtime_restart() {
             "running",
             "Preserve this recovered child objective.",
             yi_agent_core::TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
+            None,
         )
         .unwrap();
     repository.recover_inflight_tasks().unwrap();
@@ -4028,6 +4039,7 @@ async fn coding_child_fails_clearly_without_a_git_repository() {
             &attached.root_task_id,
             "Change the files.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4104,6 +4116,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             &child,
             "Write code.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap_err();
@@ -4121,6 +4134,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             &child,
             "Read more.".into(),
             TaskWorkspaceMode::ReadOnly,
+            None,
         )
         .await
         .unwrap();
@@ -4195,6 +4209,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             &root,
             "merged child".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4229,6 +4244,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             &root,
             "unmerged child".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4321,6 +4337,7 @@ async fn reclaim_uses_the_recorded_parent_branch_not_the_owner_head() {
             &root,
             "merged child".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4441,6 +4458,7 @@ async fn reclaim_still_checks_merging_when_the_owner_directory_is_gone() {
             &root,
             "child with a vanished owner".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4525,6 +4543,7 @@ async fn reclaim_session_worktrees_keeps_a_running_childs_directory() {
             &root,
             "still working".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4819,4 +4838,132 @@ async fn reclaim_idle_sweeps_a_merged_child_whose_owner_was_already_reclaimed() 
             .is_some(),
         "the child's row survives so its worktree can be rebuilt"
     );
+}
+
+#[tokio::test]
+async fn a_delivered_childs_real_diff_reaches_its_reviewer() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, _session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory).await;
+
+    // The child's own report claims a change; the reviewer must see the code.
+    let diff = coordinator
+        .delivery_diff(&child)
+        .unwrap()
+        .expect("a delivered child with a live worktree has a real diff");
+    assert!(
+        diff.contains("delivery.txt"),
+        "the diff must show the delivered file, got:\n{diff}"
+    );
+    assert!(
+        diff.contains("+ready"),
+        "the diff must show the added line, got:\n{diff}"
+    );
+
+    // A task that never delivered has no diff, and asking must not fail.
+    assert!(
+        coordinator.delivery_diff(&parent).unwrap().is_none(),
+        "an undelivered task reports no diff rather than an error"
+    );
+}
+
+/// superpowers dispatches its code reviewer as a *sibling* of the implementer,
+/// not as its child, and tells it to read the change with
+/// `git diff $BASE..$HEAD`. That only works if a reviewer sitting in the
+/// parent's worktree can see the implementer's commit. `git worktree` shares
+/// one object database, so it can; this test holds that door open. If a future
+/// change isolates child object databases, superpowers' reviewer loses its
+/// view of the code and this fails.
+#[tokio::test]
+async fn a_reviewer_sibling_reaches_its_implementers_commit_in_shared_git() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, session, parent, implementer, delivery) =
+        delivered_child_coordinator(&database, factory.clone()).await;
+
+    // The coordinator then dispatches a review subagent for the same task.
+    let reviewer = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &parent,
+            "Review the implementation".into(),
+            TaskWorkspaceMode::ReadOnly,
+            None,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &reviewer).await.unwrap();
+
+    // The reviewer runs in the parent's worktree: that is the whole point of a
+    // sibling review, so assert it rather than assume it.
+    let reviewer_start = factory
+        .starts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|start| start.task_id == reviewer)
+        .cloned()
+        .expect("the reviewer worker was started");
+    let reviewer_workspace = reviewer_start
+        .workspace
+        .expect("a read-only reviewer still records its execution root");
+
+    // The implementer delivered a real commit; the parent merges it, exactly as
+    // the built-in prompt instructs, which is what makes it an ancestor of the
+    // base the reviewer diffs against.
+    git_ok(
+        &reviewer_workspace.path,
+        &[
+            "merge",
+            "--no-ff",
+            &delivery.commit,
+            "-m",
+            "integrate the child",
+        ],
+    )
+    .unwrap();
+
+    // What the reviewer's `git diff BASE..HEAD` actually sees.
+    let diff = git_output(
+        &reviewer_workspace.path,
+        &[
+            "diff",
+            &format!("{}..{}", delivery.base_ref, delivery.commit),
+        ],
+    )
+    .unwrap();
+    assert!(
+        diff.contains("delivery.txt") && diff.contains("+ready"),
+        "a sibling reviewer must see the implementer's code, got:\n{diff}"
+    );
+
+    // And the ancestry the daemon relies on to accept the delivery holds in the
+    // same shared object database.
+    assert!(
+        git_output(
+            &reviewer_workspace.path,
+            &["merge-base", "--is-ancestor", &delivery.commit, "HEAD"],
+        )
+        .is_ok(),
+        "the merged child commit is an ancestor of the reviewer/parent HEAD"
+    );
+
+    // `implementer` is intentionally kept: it is the sibling whose commit the
+    // reviewer just read, and naming it here documents the topology.
+    let _ = implementer;
 }
