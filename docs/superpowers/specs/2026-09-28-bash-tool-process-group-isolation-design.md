@@ -7,7 +7,9 @@
    不再留下孤儿空转。
 3. **保留跨调用长驻**：**正常结束**时不打扰后台进程，`nohup ... &` 等可跨调用存活。
 
-**状态：** 设计已确认（A 方案），待转实现计划。
+**状态：** 设计已确认（A 方案），**已实现**（分支 `fix/bash-tool-process-group`，提交 `feat(tools): run bash tool children in their own process group` → `test(tools): cover end-to-end process-group reclamation for bash`）。
+
+实现相对设计的一处补充：**`libc::SIGKILL` 在 Windows 目标上不存在**（libc 的 Windows 后端未定义该常量），若策略层直接写 `libc::SIGKILL` 会让非 unix 构建失败，与 §6「non-unix 为 no-op」冲突。故机制层多导出一个 `pub(crate) const SIGKILL`（unix = `libc::SIGKILL`，其余平台 = 占位值 9），调用点只引用该常量；非 unix 下信号函数整体 no-op，占位值不会被用到。
 
 **范围：** 只改 `yi-agent-tools`（`shell/bash.rs` 行为 + 新增 `process_group.rs`
 机制；`process/manager.rs` 仅改为复用共享机制，**行为不变**）。
@@ -213,7 +215,7 @@ process 工具。
 
 | 文件 | 改动 |
 |---|---|
-| `src/process_group.rs` | **新增**：两个机制函数 + non-unix 空实现（约 25–30 行） |
+| `src/process_group.rs` | **新增**：两个机制函数 + `SIGKILL` 常量 + non-unix 空实现（约 35 行） |
 | `src/shell/bash.rs` | spawn 加 `.process_group(0)`；超时/取消路径整组 SIGKILL；Drop guard（正常路径 disarm）；更新 description；新增测试 |
 | `src/process/manager.rs` | 删除本地两个 helper，改 `use crate::process_group::…`（**行为不变**） |
 | `src/lib.rs` | 加 `mod process_group;`（约 1 行） |

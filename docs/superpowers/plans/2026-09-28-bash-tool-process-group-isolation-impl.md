@@ -1,5 +1,12 @@
 # bash 工具进程组隔离与异常路径整组回收 Implementation Plan
 
+**状态：已完成。** 实现提交：`refactor(tools): extract shared process-group helpers` → `test(tools): cover end-to-end process-group reclamation for bash`。
+
+**与计划的差异（均为实现中发现的必要调整）：**
+
+1. **`libc::SIGKILL` 在 Windows 不存在**，会让 `shell/bash.rs` 在非 unix 目标上编译失败（`libc` 的 Windows 后端没有该常量），与「非 unix 为 no-op」的约束冲突。故在机制层新增 `pub(crate) const SIGKILL`：unix 取 `libc::SIGKILL`，其余平台取占位值 9，调用点统一写 `crate::process_group::SIGKILL`。
+2. **机制层第二个测试的断言由「组长 pid 不可查」改为「对整组发信号 0 返回 ESRCH」**（即 `kill(-pgid, 0)`），与计划 Task 1 Step 1 的正文一致。原断言因 `wait()` 已 reap 组长而无区分度，属文档已升级、实现待同步。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让 `BashTool` spawn 的 shell 自成独立进程组，并在超时/取消时回收整组，
@@ -61,7 +68,7 @@ libc 0.2、`yi-agent-tools` crate。测试用 `#[tokio::test]` + `tempfile`。
   - 参数 `pid` 语义：**进程组组长 pid，即子进程自身 pid**（因为 `process_group(0)`
     使 pgid == 子进程 pid）。
 
-- [ ] **Step 1: 写失败测试（机制层行为）**
+- [x] **Step 1: 写失败测试（机制层行为）**
 
 在新建的 `process_group.rs` 末尾追加：
 
@@ -119,12 +126,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools configure_process_group_puts_child_in_its_own_group`
 Expected: 编译失败 —— `configure_process_group` / `signal_process_group` 未定义。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `process_group.rs`（`#[cfg(test)] mod tests` 之前的部分）：
 
@@ -173,7 +180,7 @@ pub(crate) fn signal_process_group(_pid: u32, _sig: i32) {}
 mod process_group;
 ```
 
-- [ ] **Step 4: 让 manager.rs 复用机制（行为不变）**
+- [x] **Step 4: 让 manager.rs 复用机制（行为不变）**
 
 在 `process/manager.rs` 中：
 1. 删除本地 `#[cfg(unix)] fn configure_process_group` / `#[cfg(not(unix))] fn configure_process_group`（现 796-808 行附近）。
@@ -189,14 +196,14 @@ use crate::process_group::{configure_process_group, signal_process_group};
 > 行为不变：原 `kill_process_group` 正是对整组发 `SIGTERM`，此处逐字等价。
 > `configure_process_group(&mut cmd)` 调用点（现 343 行）保持不变。
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools process_group`
 Expected: PASS（2 个新测试）。再跑 manager 相关：
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools --lib process`
 Expected: PASS（原有 manager 测试全绿，证明行为未变）。
 
-- [ ] **Step 6: fmt + 提交**
+- [x] **Step 6: fmt + 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -220,7 +227,7 @@ git commit -m "refactor(tools): extract shared process-group helpers"
 - Produces: `BashTool` spawn 的子进程自成进程组；为 Task 3 提供
   「pgid 在 spawn 后立即抓取并存入变量」的代码结构。
 
-- [ ] **Step 1: 写失败测试（隔离断言）**
+- [x] **Step 1: 写失败测试（隔离断言）**
 
 在 `bash.rs` 的 `#[cfg(test)] mod tests` 内追加：
 
@@ -259,12 +266,12 @@ async fn bash_child_runs_in_its_own_process_group() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools bash_child_runs_in_its_own_process_group`
 Expected: FAIL —— 当前无隔离，`pgid != pid`（与被测进程同组）。
 
-- [ ] **Step 3: 写最小实现（加隔离 + 立即抓 pgid）**
+- [x] **Step 3: 写最小实现（加隔离 + 立即抓 pgid）**
 
 把 `bash.rs` 现 135-145 行的 spawn 块替换为：
 
@@ -293,7 +300,7 @@ Expected: FAIL —— 当前无隔离，`pgid != pid`（与被测进程同组）
         let child_pgid = child.id();
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools bash_child_runs_in_its_own_process_group`
 Expected: PASS。
@@ -302,7 +309,7 @@ Expected: PASS。
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools --lib bash`
 Expected: PASS（除 Task 3 待补的回收测试外，原有 bash 测试全绿）。
 
-- [ ] **Step 5: fmt + 提交**
+- [x] **Step 5: fmt + 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -325,7 +332,7 @@ git commit -m "feat(tools): run bash tool children in their own process group"
 - Produces: 一个 `ProcessGroupGuard`（文件内私有），`Drop` 时对整组发 `SIGKILL`；
   提供 `disarm(&mut self)`。语义：**只在未被 disarm 时才杀整组**。
 
-- [ ] **Step 1: 写失败测试（异常回收 + 正常保留 + 自杀防护）**
+- [x] **Step 1: 写失败测试（异常回收 + 正常保留 + 自杀防护）**
 
 在 `bash.rs` 的 `mod tests` 内追加：
 
@@ -454,14 +461,14 @@ async fn bash_self_kill_by_process_group_does_not_kill_the_caller() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools --lib bash_timeout_kills_the_whole_process_group bash_normal_exit_keeps_background_process_alive bash_cancel_reaps_the_whole_process_group`
 Expected: 至少 `bash_timeout_kills_the_whole_process_group` 与
 `bash_cancel_reaps_the_whole_process_group` FAIL（子孙未被回收）。
 `bash_normal_exit_keeps_background_process_alive` 可能已通过（现状本就保留）。
 
-- [ ] **Step 3: 实现 guard + 三路径回收**
+- [x] **Step 3: 实现 guard + 三路径回收**
 
 在 `bash.rs` 顶部（`use` 区之后、`pub struct BashTool` 之前）加入 guard：
 
@@ -530,7 +537,7 @@ impl Drop for ProcessGroupGuard {
 > 超时分支已各自 disarm；正常分支在此统一 disarm。取消（future drop）时
 > guard 未 disarm，Drop 负责杀整组。
 
-- [ ] **Step 4: 更新工具 description（A1 语义）**
+- [x] **Step 4: 更新工具 description（A1 语义）**
 
 把 `description()` 的字符串替换为：
 
@@ -538,14 +545,14 @@ impl Drop for ProcessGroupGuard {
         "Execute a shell command via sh -c. Subject to blocklist + timeout. cwd persists across calls. On timeout or cancellation the command's entire process group is killed, including background processes it started; for long-lived services use the managed process tools instead. Prefer combining dependent steps with && into a single call (e.g. `mkdir -p foo && touch foo/bar.txt && ls foo`) rather than splitting across turns."
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools --lib bash`
 Expected: PASS —— 新增 4 个测试 + 原有 bash 测试（含
 `bash_timeout_kills`、`dropping_bash_call_stops_the_child_process`、
 `bash_orphan_subprocess_does_not_hang_call_stream`）全绿。
 
-- [ ] **Step 6: fmt + 提交**
+- [x] **Step 6: fmt + 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -564,7 +571,7 @@ git commit -m "feat(tools): reap bash tool process group on timeout and cancella
 - Consumes: Task 1-3 的全部产出。
 - Produces: 无新接口；仅验证整链路。
 
-- [ ] **Step 1: 写集成回归测试**
+- [x] **Step 1: 写集成回归测试**
 
 在 `tests/bash_stream.rs` 末尾追加（如该文件缺少 `use`，按现有风格补齐）：
 
@@ -607,17 +614,17 @@ async fn bash_tool_does_not_leak_busy_loop_after_timeout() {
 }
 ```
 
-- [ ] **Step 2: 运行确认通过**
+- [x] **Step 2: 运行确认通过**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools --test bash_stream`
 Expected: PASS（含新测试）。
 
-- [ ] **Step 3: 全 crate 测试**
+- [x] **Step 3: 全 crate 测试**
 
 Run: `cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-tools`
 Expected: 全绿。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..

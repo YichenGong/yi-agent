@@ -85,8 +85,13 @@ mod tests {
         let _ = child.wait().await;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        // 整组已被清掉：组长 pid 不再可查。
-        let gone = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        assert_eq!(gone, -1, "group leader must be gone after group kill");
+        // 探测「进程组」而非「组长 pid」：wait() 已 reap 组长，组长 pid 在
+        // 任何实现下都查不到（含只杀组长/完全不杀），无区分度。对整组发
+        // 信号 0 才能区分：还有子孙存活时返回 0，整组已清时返回 -1(ESRCH)。
+        let group = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+        assert_eq!(
+            group, -1,
+            "process group must be gone after group kill (survivors remain)"
+        );
     }
 }
