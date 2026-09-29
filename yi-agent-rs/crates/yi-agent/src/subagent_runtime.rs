@@ -167,6 +167,8 @@ impl DaemonAgentWorkerFactory {
                     "spawn_agent".to_string(),
                     "send_message".to_string(),
                     "wait_agent".to_string(),
+                    "inspect_agent".to_string(),
+                    "cancel_agent".to_string(),
                 ]);
                 names.sort();
                 names.dedup();
@@ -1539,6 +1541,32 @@ mod tests {
             "factory-model",
             "an empty request inherits the factory default"
         );
+    }
+
+    #[test]
+    fn recovery_tool_names_include_every_child_orchestration_tool() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+
+        let names = factory.worker_tool_names();
+
+        for expected in [
+            "spawn_agent",
+            "send_message",
+            "wait_agent",
+            "inspect_agent",
+            "cancel_agent",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "the recovery preflight must know {expected}, got {names:?}"
+            );
+        }
     }
 
     #[tokio::test]

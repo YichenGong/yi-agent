@@ -2872,9 +2872,21 @@ fn respond(
                     )
                 }
                 Ok(outcome) => match outcome? {
-                    yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention => {
-                        ("needs_attention".into(), Vec::new(), Vec::new())
-                    }
+                    yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention {
+                        reports,
+                    } => (
+                        "needs_attention".into(),
+                        Vec::new(),
+                        reports
+                            .into_iter()
+                            .map(|report| IpcCompletedChildReport {
+                                task_id: report.task_id.to_string(),
+                                state: report.state,
+                                report: report.report,
+                                delivery: report.delivery,
+                            })
+                            .collect(),
+                    ),
                     yi_agent_core::subagent::supervisor::WaitOutcome::Completed {
                         children,
                         reports,

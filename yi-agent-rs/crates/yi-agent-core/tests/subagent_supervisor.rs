@@ -60,6 +60,87 @@ async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
     );
 }
 
+/// A. A parent that already holds its child's completion message must still be
+/// able to see the delivered commit through wait_agent.
+#[tokio::test]
+async fn wait_agent_exposes_a_delivered_childs_commit() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    handle.report_delivery(DeliveryReport::coding(
+        "deadbeef",
+        "main",
+        workspace,
+        "cargo test -p child",
+    ));
+    supervisor.reconcile_worker_events().unwrap();
+
+    let supervisor = Arc::new(Mutex::new(supervisor));
+    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
+
+    let result = wait_tool.call(json!({ "mode": "all" })).await;
+
+    assert!(!result.is_error, "wait must not fail");
+    let ContentBlock::Text(text) = &result.content[0] else {
+        panic!("expected text result");
+    };
+    assert!(
+        text.contains("deadbeef"),
+        "the parent must learn the delivered commit, got {text}"
+    );
+}
+
+/// B. A delivered child must reach its running parent worker, so the parent
+/// learns the commit before choosing its next turn.
+#[tokio::test]
+async fn a_delivered_child_notifies_the_parent_worker() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCollectingWorkerFactory::default();
+    supervisor.start_worker(&factory, &root).await.unwrap();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    factory
+        .handle_for(&child)
+        .expect("child worker was started")
+        .report_delivery(DeliveryReport::coding(
+            "deadbeef",
+            "main",
+            workspace,
+            "cargo test -p child",
+        ));
+    supervisor.reconcile_worker_events().unwrap();
+
+    let mut mailbox = factory
+        .handle_for(&root)
+        .expect("parent worker was started")
+        .subscribe_messages();
+    let message = tokio::time::timeout(Duration::from_secs(1), mailbox.recv())
+        .await
+        .expect("the parent worker must be notified of its child's delivery")
+        .expect("the parent mailbox stays open");
+    assert!(
+        message.body.contains("deadbeef"),
+        "the parent learns the delivered commit, got {:?}",
+        message.body
+    );
+}
+
 #[test]
 fn a_caller_only_reaches_its_own_descendants() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -313,6 +394,28 @@ impl AgentWorkerFactory for ReportingWorkerFactory {
 #[derive(Clone, Default)]
 struct HandleCapturingWorkerFactory {
     handle: Arc<Mutex<Option<WorkerHandle>>>,
+}
+
+#[derive(Default)]
+struct HandleCollectingWorkerFactory {
+    handles: Arc<Mutex<std::collections::HashMap<TaskId, WorkerHandle>>>,
+}
+
+impl HandleCollectingWorkerFactory {
+    fn handle_for(&self, task: &TaskId) -> Option<WorkerHandle> {
+        self.handles.lock().unwrap().get(task).cloned()
+    }
+}
+
+impl AgentWorkerFactory for HandleCollectingWorkerFactory {
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation);
+        self.handles
+            .lock()
+            .unwrap()
+            .insert(request.task_id.clone(), handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
 }
 
 impl AgentWorkerFactory for HandleCapturingWorkerFactory {

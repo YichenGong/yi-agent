@@ -1115,10 +1115,17 @@ async fn coordinator_persists_worker_delivery_and_notifies_direct_parent() {
     .await
     .expect("delivery wakes the direct parent")
     .unwrap();
-    assert!(matches!(
-        outcome,
-        yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention
-    ));
+    let yi_agent_core::subagent::supervisor::WaitOutcome::NeedsAttention { reports } = outcome
+    else {
+        panic!("delivery wakes the direct parent with an attention outcome");
+    };
+    assert_eq!(
+        reports
+            .first()
+            .and_then(|report| report.delivery.as_deref()),
+        Some(delivery.commit.as_str()),
+        "the attention outcome still carries the delivered commit"
+    );
 }
 
 #[tokio::test]
