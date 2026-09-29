@@ -697,7 +697,7 @@ git commit -m "feat: add the inspect_agent tool"
 - Consumes: `IpcRequest::CancelChild` (Task 4).
 - Produces: `DaemonCancelAgentTool`, tool name `cancel_agent`, input `{ task_id: String, recursive: bool = false }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[tokio::test]
@@ -716,21 +716,21 @@ git commit -m "feat: add the inspect_agent tool"
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yi-agent --bin yi-agent cancel_agent_requires -- --exact`
 Expected: FAIL to compile with "cannot find type `DaemonCancelAgentTool`".
 
-- [ ] **Step 3: Implement the tool**
+- [x] **Step 3: Implement the tool**
 
 Mirror Task 5's structure. Validate `task_id` as a UUID, read `recursive` with `unwrap_or(false)`, send `IpcRequest::CancelChild { session_id, caller_task_id, capability, task_id, recursive }`, and return `{"task_id": ..., "status": "cancelled"}` on `IpcResponse::TaskCancelled`. Give it the schema `{ task_id: string (required), recursive: boolean (default false) }` and register it everywhere Task 5 registered `inspect_agent`.
 
-- [ ] **Step 4: Run the test**
+- [x] **Step 4: Run the test**
 
 Run: `cargo test -p yi-agent --bin yi-agent cancel_agent_requires -- --exact`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs

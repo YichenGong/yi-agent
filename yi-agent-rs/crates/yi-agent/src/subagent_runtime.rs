@@ -145,6 +145,7 @@ impl DaemonAgentWorkerFactory {
             "send_message".to_string(),
             "wait_agent".to_string(),
             "inspect_agent".to_string(),
+            "cancel_agent".to_string(),
         ]);
         names.sort();
         names.dedup();
@@ -571,6 +572,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 caller_capability: request.message_capability.clone(),
             }));
             worker_tools.register(Arc::new(DaemonInspectAgentTool {
+                runtime_socket: runtime_socket.clone(),
+                session_id: request.root_session_id.to_string(),
+                caller_task_id: request.task_id.to_string(),
+                caller_capability: request.message_capability.clone(),
+            }));
+            worker_tools.register(Arc::new(DaemonCancelAgentTool {
                 runtime_socket,
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
@@ -1054,6 +1061,12 @@ pub fn register_application_subagent_tools(
         caller_capability: application_capability.clone(),
     }));
     registry.register(Arc::new(DaemonInspectAgentTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        caller_capability: application_capability.clone(),
+    }));
+    registry.register(Arc::new(DaemonCancelAgentTool {
         runtime_socket,
         session_id,
         caller_task_id,
@@ -1124,6 +1137,13 @@ fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
 }
 
 struct DaemonInspectAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    caller_capability: String,
+}
+
+struct DaemonCancelAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
@@ -1274,6 +1294,63 @@ impl Tool for DaemonInspectAgentTool {
             }
         }
         ToolResult::text(payload.to_string())
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonCancelAgentTool {
+    fn name(&self) -> &str {
+        "cancel_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Cancel one of your descendants. Use recursive to cancel its whole subtree. Only tasks in your own subtree may be cancelled."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The descendant task to cancel." },
+                "recursive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also cancel the target's own descendants."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let recursive = args
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::CancelChild {
+                session_id: self.session_id.clone(),
+                caller_task_id: self.caller_task_id.clone(),
+                capability: self.caller_capability.clone(),
+                task_id: task_id.to_owned(),
+                recursive,
+            },
+        );
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskCancelled) => {
+                ToolResult::text(json!({ "task_id": task_id, "status": "cancelled" }).to_string())
+            }
+            Ok(other) => ToolResult::error(format_ipc_rejection("cancel request", &other)),
+            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+        }
     }
 }
 
@@ -1459,6 +1536,21 @@ mod tests {
             factory.worker_config_model(""),
             "factory-model",
             "an empty request inherits the factory default"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_agent_requires_a_task_id_and_a_valid_uuid() {
+        let tool = DaemonCancelAgentTool {
+            runtime_socket: PathBuf::from("/tmp/unused.sock"),
+            session_id: "s".into(),
+            caller_task_id: "c".into(),
+            caller_capability: "k".into(),
+        };
+        assert!(tool.call(json!({})).await.is_error, "task_id is required");
+        assert!(
+            tool.call(json!({"task_id": "nope"})).await.is_error,
+            "task_id must be a UUID"
         );
     }
 
