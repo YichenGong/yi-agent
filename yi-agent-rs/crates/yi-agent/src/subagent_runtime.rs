@@ -63,6 +63,16 @@ impl DaemonAgentWorkerFactory {
         }
     }
 
+    /// The child's model: the request's override when present, else the
+    /// factory's configured model.
+    fn worker_config_model(&self, requested: &str) -> String {
+        if requested.trim().is_empty() {
+            self.config.model.clone()
+        } else {
+            requested.to_owned()
+        }
+    }
+
     pub fn with_sandbox(
         mut self,
         sandbox: yi_agent_tools::SandboxMode,
@@ -517,6 +527,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let workspace_mode = request.workspace_mode;
         let worker_tools = Arc::new(self.worker_tool_registry(&workspace, workspace_mode));
         let mut config = self.config.clone();
+        config.model = self.worker_config_model(&request.model);
         if let Some(catalog) = &self.catalog {
             if let Some(prompt) = catalog.current_system_prompt() {
                 config.system_prompt = Some(prompt);
@@ -1320,6 +1331,30 @@ mod tests {
         assert_eq!(
             format_ipc_rejection("spawn request", &response),
             "daemon rejected spawn request: invalid_state: an agent may have at most four direct children"
+        );
+    }
+
+    #[test]
+    fn worker_config_uses_the_requested_model_and_falls_back_to_the_factory_default() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut factory_config = AgentConfig::default();
+        factory_config.model = "factory-model".into();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            factory_config,
+            directory.path().join("runtime.sock"),
+        );
+
+        assert_eq!(
+            factory.worker_config_model("small-model"),
+            "small-model",
+            "a requested model overrides the factory default"
+        );
+        assert_eq!(
+            factory.worker_config_model(""),
+            "factory-model",
+            "an empty request inherits the factory default"
         );
     }
 

@@ -323,7 +323,7 @@ git commit -m "feat: let spawn_agent request a child model"
 - Consumes: `WorkerStart.model` (Task 1); `AgentConfig.model` (`agent.rs:85`).
 - Produces: the child's `AgentConfig.model` equals the requested model when one was supplied, and the factory's configured model otherwise.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[test]
@@ -351,12 +351,12 @@ git commit -m "feat: let spawn_agent request a child model"
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yi-agent --bin yi-agent worker_config_uses_the_requested_model -- --exact`
 Expected: FAIL to compile with "no method named `worker_config_model`".
 
-- [ ] **Step 3: Implement the model resolution**
+- [x] **Step 3: Implement the model resolution**
 
 Add to `impl DaemonAgentWorkerFactory`:
 
@@ -379,12 +379,12 @@ In `start_with_provider_turn_gate`, after `let mut config = self.config.clone();
 ```
 read `request.model` before any field of `request` is moved.
 
-- [ ] **Step 4: Run the test**
+- [x] **Step 4: Run the test**
 
 Run: `cargo test -p yi-agent --bin yi-agent worker_config_uses_the_requested_model -- --exact`
 Expected: PASS, then `cargo test -p yi-agent --bin yi-agent` stays green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs
