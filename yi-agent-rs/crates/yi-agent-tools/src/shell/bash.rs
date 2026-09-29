@@ -17,6 +17,35 @@ use crate::shell::blocklist::is_blocked;
 const DEFAULT_TIMEOUT: u64 = 120;
 const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100KB
 
+/// 保证异常退出时回收整个进程组；正常结束时由调用方 `disarm()`。
+///
+/// 只在未被 disarm 时于 `Drop` 中对整组发 `SIGKILL`。
+struct ProcessGroupGuard {
+    pgid: Option<u32>,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(pgid: Option<u32>) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    /// 标记为正常结束：不再回收整组（保留后台进程）。
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(pgid) = self.pgid {
+                crate::process_group::signal_process_group(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 pub struct BashTool {
     ctx: Arc<ToolsContext>,
     sandbox: SandboxPolicy,
@@ -51,7 +80,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command via sh -c. Subject to blocklist + timeout. cwd persists across calls. Prefer combining dependent steps with && into a single call (e.g. `mkdir -p foo && touch foo/bar.txt && ls foo`) rather than splitting across turns."
+        "Execute a shell command via sh -c. Subject to blocklist + timeout. cwd persists across calls. On timeout or cancellation the command's entire process group is killed, including background processes it started; for long-lived services use the managed process tools instead. Prefer combining dependent steps with && into a single call (e.g. `mkdir -p foo && touch foo/bar.txt && ls foo`) rather than splitting across turns."
     }
 
     fn schema(&self) -> Value {
@@ -154,6 +183,7 @@ impl Tool for BashTool {
         // 即返回 None（tokio 1.53.0 process/mod.rs:1216-1227）。
         // 隔离后该值同时是子进程的进程组 id。
         let child_pgid = child.id();
+        let mut pgid_guard = ProcessGroupGuard::new(child_pgid);
 
         // Take stdout/stderr pipes.
         let mut stdout = child.stdout.take().expect("stdout piped");
@@ -298,18 +328,30 @@ impl Tool for BashTool {
                 }
 
                 _ = tokio::time::sleep_until(next_idle_deadline) => {
-                    // Idle watchdog: no output for idle_limit.
-                    let _ = child.kill().await;
+                    // Idle watchdog: no output for idle_limit. Reap the whole
+                    // group, not just the direct child: background grandchildren
+                    // (`sh -c 'while :; do :; done' &`) would otherwise be
+                    // orphaned and keep burning CPU forever.
+                    if let Some(pgid) = child_pgid {
+                        crate::process_group::signal_process_group(pgid, libc::SIGKILL);
+                    }
+                    let _ = child.wait().await;
                     let _ = tx.send(ToolEvent::Timeout).await;
                     timed_out = true;
+                    pgid_guard.disarm();
                     break;
                 }
 
                 _ = tokio::time::sleep_until(hard_deadline) => {
-                    // Hard timeout.
-                    let _ = child.kill().await;
+                    // Hard timeout: same whole-group reclamation as the idle
+                    // watchdog above.
+                    if let Some(pgid) = child_pgid {
+                        crate::process_group::signal_process_group(pgid, libc::SIGKILL);
+                    }
+                    let _ = child.wait().await;
                     let _ = tx.send(ToolEvent::Timeout).await;
                     timed_out = true;
+                    pgid_guard.disarm();
                     break;
                 }
 
@@ -327,8 +369,13 @@ impl Tool for BashTool {
             }
         }
 
+        // Normal exit (the timeout branches already disarmed above and reaped
+        // in place): keep background processes alive so `nohup ... &` services
+        // can outlive this call. Without this the guard would kill them on drop.
+        pgid_guard.disarm();
+
         // Reap the child if it was killed (wait already done if we hit the child.wait branch).
-        // If we broke out via timeout, child.kill() was already called, but we need to reap.
+        // If we broke out via timeout, the group kill above already reaped it.
         if timed_out {
             let _ = child.wait().await;
         }
@@ -917,5 +964,136 @@ mod tests {
         // 且不与测试进程（即模拟的 yi-agent）同组。
         let own = unsafe { libc::getpgid(0) };
         assert_ne!(pgid, own, "child must not share the caller's group");
+    }
+
+    #[cfg(unix)]
+    /// 进程组 `pgid` 是否仍存在（至少还有一个成员）。
+    ///
+    /// 用 `kill(pgid, 0)` 探测，避免 `ps` 全文扫描的自匹配与竞态。
+    fn group_still_alive(pgid: i32) -> bool {
+        unsafe { libc::kill(-pgid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_the_whole_process_group() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        // 命令把自身 pgid 写入文件，便于测试精确探测该组是否仍存活。
+        let pgid_file = tmp.path().join("pgid.txt");
+        let cmd = format!(
+            "ps -o pgid= -p $$ | tr -d ' ' > {}; sh -c 'while :; do :; done' & sleep 30",
+            pgid_file.display()
+        );
+        let result = tool
+            .call(serde_json::json!({
+                "command": cmd,
+                "timeout": 1,
+                "expected_timeout_sec": 1
+            }))
+            .await;
+        assert!(result.is_error, "should report timeout");
+
+        let pgid: i32 = std::fs::read_to_string(&pgid_file)
+            .expect("command wrote its pgid")
+            .trim()
+            .parse()
+            .expect("pgid is numeric");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !group_still_alive(pgid),
+            "timeout must reap the whole group (pgid {pgid} still alive)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_normal_exit_keeps_background_process_alive() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        // 正常结束：后台进程应存活（跨调用长驻）。
+        let marker = tmp.path().join("bg.txt");
+        let cmd = format!(
+            "nohup sh -c 'sleep 1; touch {}' >/dev/null 2>&1 & exit 0",
+            marker.display()
+        );
+        let result = tool
+            // 显式给出 expected_timeout_sec：正常结束时后台进程仍攥着管道，
+            // reader_wait 需等到 idle_limit 才放弃；不设则默认 180s，测试会久等。
+            .call(serde_json::json!({
+                "command": cmd,
+                "timeout": 5,
+                "expected_timeout_sec": 3
+            }))
+            .await;
+        assert!(
+            !result.is_error,
+            "normal exit expected: {:?}",
+            result.content
+        );
+
+        // 后台进程仍在（未被 disarmed guard 误杀）→ 1 秒后写出 marker。
+        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+        assert!(
+            marker.exists(),
+            "background process must survive normal exit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_cancel_reaps_the_whole_process_group() {
+        let tmp = TempDir::new().unwrap();
+        let tool = Arc::new(make_tool(&tmp));
+
+        let pgid_file = tmp.path().join("pgid.txt");
+        let cmd = format!(
+            "ps -o pgid= -p $$ | tr -d ' ' > {}; sh -c 'while :; do :; done' & sleep 30",
+            pgid_file.display()
+        );
+        let task = tokio::spawn({
+            let tool = tool.clone();
+            let cmd = cmd.clone();
+            async move {
+                tool.call(serde_json::json!({ "command": cmd, "timeout": 30 }))
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let pgid: i32 = std::fs::read_to_string(&pgid_file)
+            .expect("command wrote its pgid")
+            .trim()
+            .parse()
+            .expect("pgid is numeric");
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !group_still_alive(pgid),
+            "cancel must reap the whole group (pgid {pgid} still alive)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_self_kill_by_process_group_does_not_kill_the_caller() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        // 复刻事故：命令内杀自身进程组。隔离后不应伤到调用方（本测试进程）。
+        // 外层用 `sleep` 制造组内成员，再由组内 sh 执行 kill -TERM -$PGID。
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            tool.call(serde_json::json!({
+                "command": "PGID=$(ps -o pgid= -p $$ | tr -d ' '); kill -TERM -$PGID; echo survived",
+                "timeout": 5,
+                "expected_timeout_sec": 2
+            })),
+        )
+        .await;
+        // 只要能拿到结果，就说明调用方（本测试进程）没被信号带走。
+        assert!(result.is_ok(), "caller must survive a self group-kill");
     }
 }
