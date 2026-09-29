@@ -573,6 +573,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                         }
                         let mut prompt = objective;
                         let mut provider_retries = 0;
+                        let mut requested_delivery_commit = false;
                         let mut retrying_provider = false;
                         'run: loop {
                             let stream = match if retrying_provider {
@@ -655,6 +656,16 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                     match service.inspect_delivery(&workspace_for_delivery) {
                                                         Ok(delivery) => reporter.report_delivery(delivery),
                                                         Err(error)
+                                                            if !requested_delivery_commit
+                                                                && is_dirty_delivery_error(&error) =>
+                                                        {
+                                                            requested_delivery_commit = true;
+                                                            prompt = "Your worktree contains uncommitted changes, so the delivery cannot be reviewed. Run `git status --porcelain`, then stage every intended change with `git add` and create a commit with `git commit -m` in your assigned worktree. Do not only describe the commands; execute them. After committing, verify `git status --porcelain` is empty.".into();
+                                                            retrying_provider = false;
+                                                            assistant_report.clear();
+                                                            continue 'run;
+                                                        }
+                                                        Err(error)
                                                             if !assistant_report.trim().is_empty()
                                                                 && is_empty_delivery_error(&error) =>
                                                         {
@@ -728,6 +739,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             Ok(handle)
         })
     }
+}
+
+fn is_dirty_delivery_error(error: &WorkerError) -> bool {
+    error.to_string().contains("child worktree is dirty")
 }
 
 fn is_empty_delivery_error(error: &WorkerError) -> bool {
@@ -1332,6 +1347,75 @@ mod tests {
     #[derive(Default)]
     struct RecordingHangingProvider {
         requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[derive(Default)]
+    struct DirtyDeliveryProvider {
+        calls: Mutex<usize>,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for DirtyDeliveryProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            let mut calls = self.calls.lock().unwrap();
+            let events = match *calls {
+                0 => vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "write-delivery".into(),
+                        name: "bash".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "write-delivery".into(),
+                        partial_json: r#"{"command":"printf 'ready\\n' > delivery.txt"}"#.into(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "write-delivery".into(),
+                    },
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                1 => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+                2 => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+                3 => vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "commit-delivery".into(),
+                        name: "bash".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "commit-delivery".into(),
+                        partial_json:
+                            r#"{"command":"git add delivery.txt && git commit -m 'deliver'"}"#
+                                .into(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "commit-delivery".into(),
+                    },
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                4 | 5 => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+                call => {
+                    return Err(ProviderError::InvalidRequest(format!(
+                        "unexpected call {call}"
+                    )));
+                }
+            };
+            *calls += 1;
+            Ok(futures::stream::iter(events).boxed())
+        }
     }
 
     struct UsageReportingProvider;
@@ -2146,6 +2230,88 @@ mod tests {
             |event| matches!(event, WorkerEvent::MessageConsumed { message_id: id } if id == &message_id)
         ));
         handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn daemon_worker_requests_a_commit_for_a_dirty_delivery_before_reporting_failure() {
+        let directory = TempDir::new().unwrap();
+        let base_head = initialize_git_repository(directory.path());
+        let root_path = directory.path().join(".worktrees/yi-root");
+        let root = WorktreeService::new()
+            .create_root(directory.path(), "feat/yi-agent-dirty-delivery", &root_path)
+            .unwrap();
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: directory.path().to_path_buf(),
+            path: root.path.clone(),
+            branch: root.branch.clone(),
+            parent_branch: root.parent_branch.clone(),
+            base_commit: base_head,
+        };
+        let provider = Arc::new(DirtyDeliveryProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let handle = factory
+            .start(
+                WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+                    .with_objective("Create and commit delivery.txt.")
+                    .with_workspace_mode(TaskWorkspaceMode::Coding)
+                    .with_workspace(workspace.clone()),
+            )
+            .await
+            .unwrap();
+
+        let delivery = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = handle.take_events();
+                if let Some(delivery) = events.into_iter().find_map(|event| match event {
+                    WorkerEvent::Delivered(delivery) => Some(delivery),
+                    WorkerEvent::Failed(error) => panic!(
+                        "worker failed instead of requesting a commit: {error}; status={:?}; log={:?}",
+                        git_output(&root.path, &["status", "--porcelain"]),
+                        git_output(&root.path, &["log", "-1", "--format=%B"]),
+                    ),
+                    _ => None,
+                }) {
+                    return delivery;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should repair the dirty delivery and report it");
+
+        assert_eq!(delivery.workspace, workspace.lease_id);
+        assert_eq!(
+            git_output(&root.path, &["status", "--porcelain"]),
+            None,
+            "committed delivery must leave the worktree clean",
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            6,
+            "the worker must continue through write, dirty inspection, recovery commit, and post-commit turns",
+        );
+        let recovery_prompt = requests[3]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                yi_agent_core::ContentBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .find(|text| text.contains("git commit -m"));
+        assert!(
+            recovery_prompt.is_some(),
+            "the commit turn must be prompted by dirty-delivery recovery: {:?}",
+            requests[3].messages,
+        );
     }
 
     #[tokio::test]
