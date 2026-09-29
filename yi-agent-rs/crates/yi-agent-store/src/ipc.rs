@@ -303,6 +303,23 @@ pub enum IpcRequest {
     InspectTask {
         task_id: String,
     },
+    /// A parent reading one of its own descendants. Authorized by the
+    /// application-root capability or the caller's own worker capability.
+    InspectChild {
+        session_id: String,
+        caller_task_id: String,
+        capability: String,
+        task_id: String,
+    },
+    /// A parent cancelling one of its own descendants.
+    CancelChild {
+        session_id: String,
+        caller_task_id: String,
+        capability: String,
+        task_id: String,
+        #[serde(default)]
+        recursive: bool,
+    },
     ListTaskSummaries {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -2893,6 +2910,57 @@ fn respond(
                 terminal_json: detail.terminal_json,
                 workspace: detail.workspace,
             }))
+        }
+        IpcRequest::InspectChild {
+            session_id,
+            caller_task_id,
+            capability,
+            task_id,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let detail = runtime.block_on(coordinator.inspect_child_authorized(
+                &session_id,
+                &caller_task_id,
+                &capability,
+                &task_id,
+            ))?;
+            Ok(IpcResponse::TaskDetail(IpcTaskDetail {
+                task_id: detail.task_id,
+                session_id: detail.session_id,
+                parent_task_id: detail.parent_task_id,
+                depth: detail.depth,
+                state: detail.state,
+                delivery_json: detail.delivery_json,
+                terminal_json: detail.terminal_json,
+                workspace: detail.workspace,
+            }))
+        }
+        IpcRequest::CancelChild {
+            session_id,
+            caller_task_id,
+            capability,
+            task_id,
+            recursive,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.cancel_child_authorized(
+                &session_id,
+                &caller_task_id,
+                &capability,
+                &task_id,
+                recursive,
+            ))?;
+            Ok(IpcResponse::TaskCancelled)
         }
         IpcRequest::ListTaskSummaries {
             session_id,

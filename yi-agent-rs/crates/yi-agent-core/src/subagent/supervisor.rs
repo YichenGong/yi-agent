@@ -370,6 +370,19 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    /// Whether `candidate` is `caller` or is reachable from `caller` by
+    /// descending through `parent_id`.
+    pub fn is_descendant_of(&self, caller: &TaskId, candidate: &TaskId) -> bool {
+        let mut current = self.task(candidate).and_then(|task| task.parent_id.clone());
+        while let Some(id) = current {
+            if &id == caller {
+                return true;
+            }
+            current = self.task(&id).and_then(|task| task.parent_id.clone());
+        }
+        false
+    }
+
     pub fn children_of(&self, task_id: &TaskId) -> &[TaskId] {
         self.children.get(task_id).map(Vec::as_slice).unwrap_or(&[])
     }

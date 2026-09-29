@@ -2905,6 +2905,86 @@ impl RuntimeCoordinator {
         }
     }
 
+    /// Authenticates a caller for a child-scoped operation: either the
+    /// application root capability or the caller's own worker capability.
+    async fn authorize_child_access(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if self
+            .authorize_application_root(session, caller, capability)
+            .is_err()
+        {
+            let supervisor = self.supervisor(session)?;
+            supervisor
+                .lock()
+                .await
+                .can_use_worker_capability(caller, capability)
+                .map_err(|_| {
+                    RuntimeCoordinatorError::AuthorityDenied(
+                        "child access capability is invalid".into(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Reads one task's detail, but only when it lies in the caller's own
+    /// descendant subtree. Unlike `send_message`, a terminal target is fine:
+    /// a parent learns a finished child's result through this path.
+    pub async fn inspect_child_authorized(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        target: &TaskId,
+    ) -> Result<crate::repository::PersistedTaskDetail, RuntimeCoordinatorError> {
+        self.authorize_child_access(session, caller, capability)
+            .await?;
+        let allowed = self
+            .supervisor(session)?
+            .lock()
+            .await
+            .is_descendant_of(caller, target);
+        if !allowed {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "task is not a descendant of the caller".into(),
+            ));
+        }
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_detail(target)
+            .map_err(RuntimeCoordinatorError::from)
+    }
+
+    /// Cancels one task, but only when it lies in the caller's own descendant
+    /// subtree. Applies the same cancellation path `confirm_cancel` uses.
+    pub async fn cancel_child_authorized(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        target: &TaskId,
+        recursive: bool,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.authorize_child_access(session, caller, capability)
+            .await?;
+        let allowed = self
+            .supervisor(session)?
+            .lock()
+            .await
+            .is_descendant_of(caller, target);
+        if !allowed {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "task is not a descendant of the caller".into(),
+            ));
+        }
+        self.cancel_task(session, target, recursive).await
+    }
+
     pub async fn wait_for_children_authorized(
         &self,
         session: &RootSessionId,

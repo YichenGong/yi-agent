@@ -17,6 +17,40 @@ use yi_agent_core::{
 };
 
 #[test]
+fn a_caller_only_reaches_its_own_descendants() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let leaf = supervisor.spawn(child.clone()).unwrap();
+    let sibling = supervisor.spawn(root.clone()).unwrap();
+
+    assert!(
+        supervisor.is_descendant_of(&root, &child),
+        "a parent reaches its own child"
+    );
+    assert!(
+        supervisor.is_descendant_of(&root, &leaf),
+        "a parent reaches a grandchild"
+    );
+    assert!(
+        supervisor.is_descendant_of(&child, &leaf),
+        "an intermediate task reaches its own child"
+    );
+    assert!(
+        !supervisor.is_descendant_of(&child, &sibling),
+        "a sibling is not a descendant"
+    );
+    assert!(
+        !supervisor.is_descendant_of(&child, &root),
+        "a parent is not a descendant of its child"
+    );
+    assert!(
+        !supervisor.is_descendant_of(&root, &root),
+        "a task is not its own descendant"
+    );
+}
+
+#[test]
 fn spawn_enforces_depth_two_and_four_direct_children() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let root = supervisor.root_task_id().clone();

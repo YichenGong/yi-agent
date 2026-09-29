@@ -407,7 +407,7 @@ git commit -m "feat: run a child worker on its requested model"
 - Consumes: `AgentSupervisor::children_of`; `Repository::task_detail`; `can_use_worker_capability` (`supervisor.rs:1123`); `authorize_application_root` (`runtime.rs:897`).
 - Produces: `AgentSupervisor::is_descendant_of(&self, caller: &TaskId, candidate: &TaskId) -> bool`; `RuntimeCoordinator::inspect_child_authorized(&self, session: &RootSessionId, caller: &TaskId, capability: &str, target: &TaskId) -> Result<PersistedTaskDetail, RuntimeCoordinatorError>`; `RuntimeCoordinator::cancel_child_authorized(&self, session: &RootSessionId, caller: &TaskId, capability: &str, target: &TaskId, recursive: bool) -> Result<(), RuntimeCoordinatorError>`; `IpcRequest::InspectChild { session_id, caller_task_id, capability, task_id }` and `IpcRequest::CancelChild { session_id, caller_task_id, capability, task_id, recursive }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `yi-agent-rs/crates/yi-agent-core/tests/subagent_supervisor.rs`, which
 constructs `AgentSupervisor` directly (see `AgentSupervisor::new`,
@@ -453,12 +453,12 @@ The authorized round trip over a live socket is covered by Task 8's test, which
 asserts an actual `AuthorityDenied` error for an out-of-subtree inspect; keep
 this test focused on the subtree rule itself.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yi-agent-core --test subagent_supervisor a_caller_only_reaches -- --exact`
 Expected: FAIL to compile with "no method named `is_descendant_of`".
 
-- [ ] **Step 3: Implement descendant membership and the authorized methods**
+- [x] **Step 3: Implement descendant membership and the authorized methods**
 
 In `supervisor.rs`, beside `children_of`:
 
@@ -531,12 +531,12 @@ Implement `cancel_child_authorized` the same way: authorize, require `is_descend
 
 Add the two requests in `ipc.rs` beside `InspectTask` and route them to the new methods. Return `IpcResponse::TaskDetail` for inspect and `IpcResponse::TaskCancelled` for cancel.
 
-- [ ] **Step 4: Run the test**
+- [x] **Step 4: Run the test**
 
 Run: `cargo test -p yi-agent-core --test subagent_supervisor a_caller_only_reaches -- --exact`
 Expected: PASS. Then `cargo test -p yi-agent-core --test subagent_supervisor` and `cargo test -p yi-agent-store --test runtime_coordinator` stay green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-core/src/subagent/supervisor.rs \

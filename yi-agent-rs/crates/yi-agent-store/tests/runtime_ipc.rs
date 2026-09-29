@@ -16,8 +16,8 @@ use yi_agent_core::subagent::worker::{
 };
 use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
 use yi_agent_store::ipc::{
-    Daemon, IpcRequest, IpcResponse, IpcReviewDecision, SubscriptionFilters, send_request,
-    send_request_with_version, subscribe, subscribe_with_filters,
+    Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision, SubscriptionFilters,
+    send_request, send_request_with_version, subscribe, subscribe_with_filters,
 };
 use yi_agent_store::repository::{
     RepositoryError, RuntimeCursorState, RuntimeEvent, RuntimeRepository,
@@ -407,6 +407,101 @@ fn application_root_daemon(
     )
     .unwrap();
     (daemon, starts)
+}
+
+#[test]
+fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "authz-project".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "child".into(),
+            mode: Some("read_only".into()),
+            model: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected spawn");
+    };
+
+    // Authorized: the root inspects its own child.
+    let detail = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectChild {
+            session_id: session_id.clone(),
+            caller_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            task_id: task_id.clone(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(detail, IpcResponse::TaskDetail(_)),
+        "authorized inspect returns the child detail, got {detail:?}"
+    );
+
+    // Denied: a bogus capability cannot inspect.
+    let denied = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectChild {
+            session_id: session_id.clone(),
+            caller_task_id: root_task_id.clone(),
+            capability: "not-the-capability".into(),
+            task_id: task_id.clone(),
+        },
+    );
+    assert!(
+        matches!(
+            denied,
+            Ok(IpcResponse::Error {
+                code: IpcErrorCode::AuthorityDenied,
+                ..
+            })
+        ),
+        "a bad capability must be denied by authority, got {denied:?}"
+    );
+
+    // Denied: the child may not inspect its own parent (not a descendant).
+    let upward = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectChild {
+            session_id: session_id.clone(),
+            caller_task_id: task_id.clone(),
+            capability: message_capability.clone(),
+            task_id: root_task_id.clone(),
+        },
+    );
+    assert!(
+        matches!(
+            upward,
+            Ok(IpcResponse::Error {
+                code: IpcErrorCode::AuthorityDenied,
+                ..
+            })
+        ),
+        "a child must not inspect its parent, got {upward:?}"
+    );
 }
 
 #[test]
