@@ -9,12 +9,56 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
 use yi_agent_core::subagent::task::{
-    PauseReason, PermissionRequestId, RootSessionId, TaskDepth, TaskId, TaskState,
+    DeliveryReport, IntegrationValidation, PauseReason, PermissionRequestId, RootSessionId,
+    TaskDepth, TaskId, TaskState,
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{
     ContentBlock, ProviderTurnGate, ProviderTurnLease, TaskWorkspaceMode, ToolRegistry,
 };
+
+#[tokio::test]
+async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    // The delivery workspace must match the child task's own workspace.
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
+    let delivery_id = delivery.id.clone();
+    handle.report_delivery(delivery);
+    supervisor.reconcile_worker_events().unwrap();
+    // A parent resolves a child's delivery; only then does the child become
+    // terminal and enter the completion snapshot.
+    supervisor
+        .accept_review(
+            &child,
+            &root,
+            delivery_id,
+            IntegrationValidation::passed("cargo test -p parent"),
+        )
+        .unwrap();
+
+    let (_, reports) = supervisor.child_completion_snapshot(&root);
+
+    assert_eq!(
+        reports[0].delivery.as_deref(),
+        Some("deadbeef"),
+        "the parent learns the delivered commit"
+    );
+    assert_eq!(
+        reports[0].state, "completed",
+        "the accepted child is terminal"
+    );
+}
 
 #[test]
 fn a_caller_only_reaches_its_own_descendants() {

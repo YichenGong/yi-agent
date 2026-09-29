@@ -72,6 +72,8 @@ pub struct CompletedChildReport {
     pub task_id: TaskId,
     pub state: String,
     pub report: Option<String>,
+    /// The child's delivered commit, when the child produced a delivery.
+    pub delivery: Option<String>,
 }
 
 pub struct AgentSupervisor {
@@ -963,6 +965,11 @@ impl AgentSupervisor {
                     task_id: child.clone(),
                     state: task_state_label(task.state()).to_string(),
                     report: self.completion_reports.get(child).cloned(),
+                    delivery: task
+                        .active_attempt()
+                        .delivery
+                        .as_ref()
+                        .map(|delivery| delivery.commit.clone()),
                 })
             })
             .collect()
@@ -1831,6 +1838,7 @@ impl Tool for WaitAgentTool {
                                         "task_id": report.task_id.to_string(),
                                         "state": report.state,
                                         "report": report.report,
+                                        "delivery": report.delivery,
                                     })
                                 })
                                 .collect(),

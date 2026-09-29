@@ -623,6 +623,9 @@ pub struct IpcCompletedChildReport {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
+    /// The child's delivered commit, when the child produced a delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
 }
 
 /// The stable wire payload for a top-level subscription event frame.
@@ -2863,6 +2866,7 @@ fn respond(
                                 task_id: report.task_id.to_string(),
                                 state: report.state,
                                 report: report.report,
+                                delivery: report.delivery,
                             })
                             .collect(),
                     )
@@ -2886,6 +2890,7 @@ fn respond(
                                 task_id: report.task_id.to_string(),
                                 state: report.state,
                                 report: report.report,
+                                delivery: report.delivery,
                             })
                             .collect(),
                     ),

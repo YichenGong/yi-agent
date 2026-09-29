@@ -750,41 +750,58 @@ git commit -m "feat: add the cancel_agent tool"
 - Consumes: `AgentTask::active_attempt().delivery` (`DeliveryReport` with `commit`).
 - Produces: `CompletedChildReport.delivery: Option<String>` holding the child's `commit` when it delivered; `IpcCompletedChildReport.delivery: Option<String>`; `wait_agent`'s returned `reports[].delivery`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `yi-agent-rs/crates/yi-agent-core/tests/subagent_supervisor.rs`, mirroring the existing `wait_agent_returns_completed_child_reports` test (line ~765) and its `HandleCapturingWorkerFactory`:
 
+> **Reachability note (discovered during execution).** A `wait_agent` call
+> cannot observe a delivered child: once a child delivers, the parent's mailbox
+> holds the child's High-priority `Completed` message, so `wait_outcome` returns
+> `needs_attention` and no `reports`. Agent-to-agent mail is never marked
+> `consumed_by_worker` (only external user overrides are), so that gate does not
+> clear. The reachable surface that carries `reports` is the timeout snapshot,
+> `child_completion_snapshot`, which has no such gate. Snapshot also filters to
+> terminal children, so the test accepts the delivery first.
+
 ```rust
 #[tokio::test]
-async fn wait_agent_reports_a_childs_delivered_commit() {
+async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let root = supervisor.root_task_id().clone();
     let child = supervisor.spawn(root.clone()).unwrap();
     let factory = HandleCapturingWorkerFactory::default();
     supervisor.start_worker(&factory, &child).await.unwrap();
     let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
-    let workspace = WorkspaceLeaseId::new();
-    handle.report_delivery(DeliveryReport::coding(
-        "deadbeef",
-        "main",
-        workspace,
-        "cargo test -p child",
-    ));
+    // The delivery workspace must match the child task's own workspace.
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
+    let delivery_id = delivery.id.clone();
+    handle.report_delivery(delivery);
     supervisor.reconcile_worker_events().unwrap();
-    let supervisor = Arc::new(Mutex::new(supervisor));
-    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
+    // A parent resolves a child's delivery; only then is the child terminal and
+    // present in the snapshot.
+    supervisor
+        .accept_review(
+            &child,
+            &root,
+            delivery_id,
+            IntegrationValidation::passed("cargo test -p parent"),
+        )
+        .unwrap();
 
-    let result = wait_tool.call(json!({ "mode": "all" })).await;
+    let (_, reports) = supervisor.child_completion_snapshot(&root);
 
-    assert!(!result.is_error);
-    let ContentBlock::Text(text) = &result.content[0] else {
-        panic!("expected text result");
-    };
-    let value: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(
-        value["reports"][0]["delivery"], "deadbeef",
+        reports[0].delivery.as_deref(),
+        Some("deadbeef"),
         "the parent learns the delivered commit"
     );
+    assert_eq!(reports[0].state, "completed", "the accepted child is terminal");
 }
 ```
 
@@ -796,12 +813,12 @@ The file's imports need two additions for this test; add them to the existing
 use yi_agent_core::subagent::task::{DeliveryReport, WorkspaceLeaseId, /* existing items */};
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p yi-agent-core --test subagent_supervisor wait_agent_reports_a_childs_delivered_commit -- --exact`
+Run: `cargo test -p yi-agent-core --test subagent_supervisor child_completion_snapshot_reports -- --exact`
 Expected: FAIL to compile with "no field `delivery` on type `CompletedChildReport`".
 
-- [ ] **Step 3: Add the field**
+- [x] **Step 3: Add the field**
 
 In `supervisor.rs`:
 
@@ -826,12 +843,17 @@ and in `completed_child_reports`, populate it:
 
 In `ipc.rs`, add the same optional field to `IpcCompletedChildReport`, and carry it through both places that build those records (the `WaitCompleted` assembly and the timeout snapshot at `ipc.rs:2846`).
 
-- [ ] **Step 4: Run the test**
+Also add `"delivery": report.delivery` to the hand-built report JSON in the core
+`WaitAgentTool::call` (`supervisor.rs`), which the plan originally missed: the
+core tool serializes `reports` itself rather than reusing `CompletedChildReport`,
+so without this the field never reaches a caller.
 
-Run: `cargo test -p yi-agent-core --test subagent_supervisor wait_agent_reports_a_childs_delivered_commit -- --exact`
+- [x] **Step 4: Run the test**
+
+Run: `cargo test -p yi-agent-core --test subagent_supervisor child_completion_snapshot_reports -- --exact`
 Expected: PASS, then `cargo test -p yi-agent-core --test subagent_supervisor` stays green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-core/src/subagent/supervisor.rs \
