@@ -2602,16 +2602,23 @@ fn respond(
                 &root_task_id,
                 &capability,
             ))?;
-            // Reclaim on a background thread: git is a synchronous subprocess and
-            // the client's `send_request` sets no read timeout, so doing this
-            // inline would make the TUI wait for the full duration. Detached is
-            // safe because the reclaim is idempotent and re-runnable, and
-            // `prepare_task_workspace` rebuilds any directory it removes.
-            let reclaim_coordinator = Arc::clone(coordinator);
-            let reclaim_session = session_id.clone();
-            std::thread::spawn(move || {
-                reclaim_coordinator.reclaim_session_worktrees(&reclaim_session);
-            });
+            // Reclaim BEFORE answering, on this handler thread.
+            //
+            // Running it on a detached thread looks harmless but is unbounded
+            // harm: an embedded daemon lives inside the client that detaches and
+            // dies with it. The client returns from `send_request` the instant
+            // this response is written and then exits, killing the parked thread
+            // mid-reclaim — so the root worktree leaks on every exit, which is
+            // exactly the leak this reclaim exists to prevent. It only wins when
+            // some *other* daemon outlives the client, which is not the normal
+            // embedded case.
+            //
+            // Waiting here is safe and bounded: the reclaim only removes the
+            // directories of already-clean, already-merged tasks picked by
+            // `reclaim_session_worktrees`, it is idempotent, and every removed
+            // directory is rebuilt by `prepare_task_workspace`. The client sets
+            // no read timeout, so it simply waits for this same answer.
+            coordinator.reclaim_session_worktrees(&session_id);
             Ok(IpcResponse::ApplicationRootDetached)
         }
         IpcRequest::CreateSchedule { cron, objective } => {

@@ -461,6 +461,63 @@ impl AgentWorkspaceService for ReclaimRecordingWorkspaceService {
     }
 }
 
+/// A workspace service whose reclaim signals that it started and then blocks
+/// until the test releases it.
+///
+/// It makes the reclaim's *duration* observable, which is the whole point of the
+/// regression: an embedded daemon dies with the client that detaches, so the
+/// detach response must not be written while the reclaim it seeded is still
+/// running. Without the gate the reclaim finishes too fast to observe the race.
+struct GatedReclaimWorkspaceService {
+    entered: mpsc::Sender<()>,
+    release: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+
+impl AgentWorkspaceService for GatedReclaimWorkspaceService {
+    fn prepare_root(
+        &self,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn reclaim_worktree(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        // Announce, then park until the test lets the reclaim complete. A
+        // dropped `release` sender also unblocks, so a panicking test cannot
+        // wedge the daemon's reclaim.
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
+        Ok(())
+    }
+
+    fn is_merged_into(
+        &self,
+        _owner: &WorkerWorkspace,
+        _branch: &str,
+        _parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
+        Ok(true)
+    }
+}
+
 #[derive(Clone)]
 struct ApplicationRootFactory {
     workspace_service: Arc<dyn AgentWorkspaceService>,
@@ -1441,7 +1498,8 @@ fn detaching_an_application_root_seeds_a_worktree_reclaim() {
         "detach still answers with the same response"
     );
 
-    // The reclaim runs on a background thread, so poll rather than assert once.
+    // The reclaim runs before the response, so it has already happened by the
+    // time this answer arrives; poll only to keep the assertion robust.
     for _ in 0..100 {
         if !reclaimed.lock().unwrap().is_empty() {
             break;
@@ -1450,8 +1508,87 @@ fn detaching_an_application_root_seeds_a_worktree_reclaim() {
     }
     assert!(
         !reclaimed.lock().unwrap().is_empty(),
-        "detach seeded a background reclaim"
+        "detach seeded a worktree reclaim"
     );
+}
+
+/// The detach response must not be written while the reclaim it seeds still runs.
+///
+/// An embedded daemon lives in the client process and dies when the client
+/// exits. The client returns from `detach_tui_runtime_root` as soon as the
+/// response arrives, so an in-flight reclaim thread is killed with the process
+/// and the root worktree leaks on every exit. The reclaim must therefore finish
+/// before the answer is written; otherwise "reclaim on exit" is a promise the
+/// IPC layer cannot keep.
+#[test]
+fn detach_does_not_answer_until_the_seeded_reclaim_finishes() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(GatedReclaimWorkspaceService {
+                entered,
+                release: Arc::new(Mutex::new(release_rx)),
+            }),
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "embedded-reclaim".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    let socket = daemon.socket_path().to_path_buf();
+    let (response_tx, response_rx) = mpsc::channel();
+    let detach = std::thread::spawn(move || {
+        let response = send_request(
+            &socket,
+            IpcRequest::DetachApplicationRoot {
+                session_id,
+                root_task_id,
+                capability: message_capability,
+            },
+        );
+        let _ = response_tx.send(response);
+    });
+
+    // The reclaim has started and is parked; the client must still be waiting.
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("detach seeded a reclaim");
+    assert!(
+        matches!(
+            response_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "detach answered while its reclaim was still running, so a client exit \
+         would kill the reclaim before it removes the root worktree"
+    );
+
+    // Release the reclaim; only now may the answer arrive.
+    release.send(()).unwrap();
+    let response = response_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("detach answers once its reclaim completes");
+    assert_eq!(response.unwrap(), IpcResponse::ApplicationRootDetached);
+    detach.join().unwrap();
 }
 
 #[test]
