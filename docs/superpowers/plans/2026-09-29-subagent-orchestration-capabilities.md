@@ -200,10 +200,28 @@ In `runtime.rs`, where the worker request is assembled (the block beginning `let
         }
 ```
 
+- [ ] **Step 4b: Update the existing schema-version assertions**
+
+Bumping `LATEST_SCHEMA_VERSION` to 10 breaks every test that asserts the store
+version. Raise the constant, add the migration, then update these five sites in
+`yi-agent-rs/crates/yi-agent-store/tests/runtime_ipc.rs`:
+
+- Line 76, the `legacy_v6_database` helper: `schema_version().unwrap(), 9` becomes `10`.
+- Line 83, the same helper: the drop list `DELETE FROM schema_migrations WHERE version IN (7, 8, 9)` becomes `(7, 8, 9, 10)`.
+- Line 437, `opening_runtime_store_migrates_the_complete_runtime_schema`: `9` becomes `10`.
+- Line 2346, `opening_a_version_one_store_adds_replay_metadata_without_rewriting_history`: `9` becomes `10`.
+- Line 5372, `workspace_mode_is_persisted_and_recovered`: `9` becomes `10`.
+
 - [ ] **Step 5: Run the test**
 
 Run: `cargo test -p yi-agent-store --test runtime_ipc a_child_model_is_persisted -- --exact`
-Expected: PASS. Then `cargo test -p yi-agent-store --test runtime_coordinator` to confirm the migration did not break existing fixtures.
+Expected: PASS. Then run the whole store suite to confirm the migration and the
+assertion updates leave it green:
+
+```bash
+cargo test -p yi-agent-store --test runtime_ipc      # 102 tests, expect 0 failed
+cargo test -p yi-agent-store --test runtime_coordinator
+```
 
 - [ ] **Step 6: Commit**
 
