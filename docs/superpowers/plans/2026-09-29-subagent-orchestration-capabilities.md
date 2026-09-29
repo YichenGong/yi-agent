@@ -756,14 +756,17 @@ git commit -m "feat: add the cancel_agent tool"
 
 Add to `yi-agent-rs/crates/yi-agent-core/tests/subagent_supervisor.rs`, mirroring the existing `wait_agent_returns_completed_child_reports` test (line ~765) and its `HandleCapturingWorkerFactory`:
 
-> **Reachability note (discovered during execution).** A `wait_agent` call
-> cannot observe a delivered child: once a child delivers, the parent's mailbox
-> holds the child's High-priority `Completed` message, so `wait_outcome` returns
-> `needs_attention` and no `reports`. Agent-to-agent mail is never marked
-> `consumed_by_worker` (only external user overrides are), so that gate does not
-> clear. The reachable surface that carries `reports` is the timeout snapshot,
-> `child_completion_snapshot`, which has no such gate. Snapshot also filters to
-> terminal children, so the test accepts the delivery first.
+> **Resolved during review.** Execution first covered this through the timeout
+> snapshot only, because `wait_outcome` returned `needs_attention` with empty
+> reports whenever the caller's mailbox held a high-priority message and a
+> child's `Completed` message is high priority and never consumed. That made a
+> delivered child permanently invisible to `wait_agent`. The fix carries the
+> children needing attention in the `NeedsAttention` outcome (including a child
+> whose delivery awaits review, which is not terminal yet) and delivers a
+> child's terminal outcome to its running parent worker. `wait_agent` now
+> reports the commit; the tests are
+> `wait_agent_exposes_a_delivered_childs_commit` and
+> `a_delivered_child_notifies_the_parent_worker`.
 
 ```rust
 #[tokio::test]
