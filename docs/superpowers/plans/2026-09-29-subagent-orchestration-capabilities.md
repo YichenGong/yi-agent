@@ -247,7 +247,7 @@ git commit -m "feat: persist a per-child model override"
 - Consumes: `IpcRequest::SpawnChild.model`, `IpcRequest::SpawnApplicationChild.model` (Task 1); `DaemonAgentWorkerFactory` stored `config`.
 - Produces: a `spawn_model(args: &Value) -> Result<Option<String>, ToolResult>` helper; `spawn_agent` schema with a `model` property.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `subagent_runtime.rs` test module, beside `spawn_mode`'s existing coverage:
 
@@ -270,12 +270,12 @@ Add to the `subagent_runtime.rs` test module, beside `spawn_mode`'s existing cov
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yi-agent --bin yi-agent spawn_model_accepts -- --exact`
 Expected: FAIL to compile with "cannot find function `spawn_model`".
 
-- [ ] **Step 3: Implement the helper and wire it into both spawn tools**
+- [x] **Step 3: Implement the helper and wire it into both spawn tools**
 
 ```rust
 fn spawn_model(args: &Value) -> Result<Option<String>, ToolResult> {
@@ -299,12 +299,12 @@ Add to both spawn schemas:
 
 In both `call` bodies, resolve `spawn_model(&args)` after `spawn_mode`, return early on error, and pass the value into `IpcRequest::SpawnChild { ..., model }` / `SpawnApplicationChild { ..., model }`.
 
-- [ ] **Step 4: Run the test**
+- [x] **Step 4: Run the test**
 
 Run: `cargo test -p yi-agent --bin yi-agent spawn_model_accepts -- --exact`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent/src/subagent_runtime.rs

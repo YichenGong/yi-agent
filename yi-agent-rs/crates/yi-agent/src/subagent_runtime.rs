@@ -1064,6 +1064,18 @@ fn spawn_mode(args: &Value) -> Result<TaskWorkspaceMode, ToolResult> {
     }
 }
 
+/// Resolves the optional `model` argument for a daemon `spawn_agent` call.
+/// An omitted model means the child inherits its parent's; a blank or
+/// non-string value is rejected rather than silently ignored.
+fn spawn_model(args: &Value) -> Result<Option<String>, ToolResult> {
+    match args.get("model") {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) => Err(ToolResult::error("model must not be blank")),
+        Some(_) => Err(ToolResult::error("model must be a string")),
+    }
+}
+
 struct DaemonSpawnAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
@@ -1103,6 +1115,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                     "type": "string",
                     "enum": ["coding", "read_only"],
                     "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model for this child. Omit to inherit yours."
                 }
             },
             "required": ["task"],
@@ -1121,6 +1137,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(mode) => mode,
             Err(error) => return error,
         };
+        let model = match spawn_model(&args) {
+            Ok(model) => model,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
@@ -1129,7 +1149,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 capability: self.application_capability.clone(),
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
-                model: None,
+                model,
             },
         );
         match response {
@@ -1211,6 +1231,10 @@ impl Tool for DaemonSpawnAgentTool {
                     "type": "string",
                     "enum": ["coding", "read_only"],
                     "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model for this child. Omit to inherit yours."
                 }
             },
             "required": ["task"],
@@ -1229,6 +1253,10 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(mode) => mode,
             Err(error) => return error,
         };
+        let model = match spawn_model(&args) {
+            Ok(model) => model,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
@@ -1236,7 +1264,7 @@ impl Tool for DaemonSpawnAgentTool {
                 parent_task_id: self.caller_task_id.clone(),
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
-                model: None,
+                model,
             },
         );
         match response {
@@ -1292,6 +1320,23 @@ mod tests {
         assert_eq!(
             format_ipc_rejection("spawn request", &response),
             "daemon rejected spawn request: invalid_state: an agent may have at most four direct children"
+        );
+    }
+
+    #[test]
+    fn spawn_model_accepts_a_model_and_rejects_a_blank_one() {
+        assert_eq!(
+            spawn_model(&json!({"model": "small-model"})).unwrap(),
+            Some("small-model".to_string())
+        );
+        assert_eq!(spawn_model(&json!({})).unwrap(), None);
+        assert!(
+            spawn_model(&json!({"model": "   "})).is_err(),
+            "a blank model is not a valid request"
+        );
+        assert!(
+            spawn_model(&json!({"model": 7})).is_err(),
+            "a non-string model is not a valid request"
         );
     }
 
