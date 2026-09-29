@@ -56,3 +56,4 @@
   CLI：`/agent <task_id>`（`yi-agent-rs/crates/yi-agent/src/tui/app.rs:1870` `daemon_agent_detail_at`）走 `IpcRequest::InspectTask`（`app.rs:1873`），只返回一次性元数据快照——`Agent/session/parent/depth/state/delivery`（`app.rs:1882` 起），看不到 child 的消息流、工具调用与实时进度。目标为两级入口：slash command 默认给进度摘要，并可进一步钻进只读完整轨迹。
   App：app-server 无任何 `agent/` 方法（现有命名空间仅 `thread/`、`turn/`、`item/`、`workspace/`、`config/read`），`desktop/src/components/` 也无 subagent 入口。目标为对话框内给出可点击的 subagent 引用，点开先看进度，再可进入只读轨迹。
   两级语义一致（先摘要后轨迹），CLI 与 App 共用同一后端能力：需要新增「列出/订阅 child 会话事件」的 IPC 与 app-server 方法（现有仅有快照式 `InspectTask`）。
+- [ ] 检查一下interrupt逻辑，现在是否是interrupt后，是否会有信息的截断？截断在哪里？我怀疑截断到上次用户输入？这个是不对的。应该截断到上次的assistant的turn的信息。
