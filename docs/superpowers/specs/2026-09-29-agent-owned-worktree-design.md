@@ -1,5 +1,7 @@
 # 子 Agent 工作区交给 Agent 自治设计
 
+**状态：** 评审中。评审决定（2026-09-30）：交付上报保留、仅去 worktree 语义（§3.7）。
+
 ## 1. 问题
 
 daemon 目前在"起 subagent runtime"和"派 coding 子任务"两个环节自动创建 git worktree，
@@ -46,6 +48,9 @@ workspace、校验交付、自动验收、自动回收。
 - **副作用（已确认接受）**：根 agent 的 bash/edit 直接落到用户 checkout 上，
   误改风险由"被 worktree 挡住"转为"靠提示词自觉"。
 - **连带收益**：非 git 目录也可用委派（`supports_coding()` 的 git 门禁随之失效）。
+- 注意 `root_mode` 只决定**是否为 root 建 workspace**，不决定根 agent 的写权限：
+  根 agent 的工具沙箱来自 `main.rs` 的 `config.sandbox`，与这里的 mode 无关。
+  否则「root 恒为 `ReadOnly`」会被误读成「根 session 不能写文件」。
 
 ### 3.3 子任务工作目录显式传入
 
@@ -74,7 +79,10 @@ workspace、校验交付、自动验收、自动回收。
 - IPC：`PreviewGc` / `ConfirmGc`（`yi-agent daemon gc` 整个命令）
 - 持久化：`task_workspaces` 表、`TaskWorkspaceRecycled` /
   `TaskWorkspaceRecycleFailed` 事件
-- 交付纪律：干净校验、commit 校验、"已进父历史才算完成"的自动验收
+- 交付纪律中的**自动**部分：`RuntimeCoordinator::reconcile_integrated_deliveries`
+  （`runtime.rs:3263`，经 `contains_commit` 判定子提交已进父 HEAD）与
+  `confirm_review` 对 worktree 的 `inspect_delivery` 复核。
+  coding child 自身的交付上报**保留**，见 §3.7。
 - `yi-agent-tools/src/worktree.rs`：仅移除**为 daemon 编排**的方法
   （`create_root`/`create_child`/`inspect_delivery`/`merge_accepted`/
   `remove_accepted_clean`/`reclaim_directory`/`reattach_worktree`/`remove_created`/
@@ -91,6 +99,25 @@ workspace、校验交付、自动验收、自动回收。
 降级为"不再写入 + 建表语句移除"。**已有库中保留旧表与旧行，不主动 DROP**，
 避免动用户数据；运行期不再读也不再写。
 
+### 3.7 交付上报保留，仅去掉 worktree 语义
+
+交付**证据链保留**：coding child 仍在自己的 `workdir` 里 commit，仍上报
+`DeliveryReport`（`AwaitingParentReview` / `review_agent` / `accept_review` 结构不变）。
+只删除挂在 worktree 上的**自动**部分（见 §3.5）。
+
+- **交付身份改由 workdir 承担**：`WorkspaceLeaseId` 不再来自 `task_workspaces` 行，
+  改为由 workdir 路径派生（与 `recovery_context_for_workspace` 现有的
+  `format!("workspace:{}", path)` 同一形态）。`AgentTask::validate_for` 的
+  `delivery.workspace == task.workspace` 校验因此仍然成立，只是来源变了。
+- **coding child 收口**：`subagent_runtime.rs` 原先在
+  `workspace_mode == Coding` 时经 `AgentWorkspaceService::inspect_delivery` 产出交付；
+  该 trait 方法退役后，改为在子任务的 `workdir` 上直接做 git 探测（干净校验 + HEAD
+  与 base 的差异）。「child worktree is dirty」的重试提示语义保持不变，只把措辞里的
+  "worktree" 改为子任务 `workdir`。
+- **只读 child 不变**：仍走文本结果收口，无交付。
+- **diff 读取不变**：`inspect_agent` / `ReadTaskDiff` 仍以子任务 `workdir` 为 diff 目录，
+  不依赖 `task_workspaces`。
+
 ## 4. 备选方案与否决理由
 
 - **子 agent 自己建 worktree**（否决）：路径与分支名由每个子 agent 各自决定，
@@ -106,6 +133,8 @@ workspace、校验交付、自动验收、自动回收。
 - 不主动 DROP 已有库中的 `task_workspaces` 表与行。
 - 不改动 provider / TUI 渲染 / 权限检查器本身的语义。
 - `mode` 的沙箱与工具注册分支逻辑基本不动，仅移除其 worktree 触发作用。
+- 交付上报结构（`DeliveryReport` / `AwaitingParentReview` / `review_agent`）保留，
+  改动仅限其中依赖 worktree 身份的部分（§3.7）。
 
 ## 6. 测试影响
 
@@ -115,6 +144,8 @@ workspace、校验交付、自动验收、自动回收。
   （但其中 `ignore_*` 相关用例需迁到保留测试中）。
 - 新增用例应覆盖：root 在项目目录原地运行、`spawn_agent` 的 `workdir` 生效、
   `mode` 只影响写权限而不建目录、非 git 目录可委派。
+- 交付链路（§3.7）改为断言：coding child 在 `workdir` 里的交付仍可上报，
+  且 `delivery.workspace` 与由 `workdir` 派生的身份一致（不再有 `task_workspaces` 行）。
 
 ## 7. 验证
 
