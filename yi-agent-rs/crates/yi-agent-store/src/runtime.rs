@@ -27,7 +27,7 @@ use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
     DeliveryReport, IntegrationValidation, MessageId, PauseReason, PermissionDecision,
     PermissionRequestId, RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState,
-    TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence,
+    TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
@@ -222,13 +222,16 @@ fn digest_hex(value: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The workspace mode a per-service root should run in. A service that cannot
-/// code forces the root to run in place (`ReadOnly`); a missing service is also
-/// treated as read-only so callers never provision a worktree they cannot own.
-fn root_mode_for(service: Option<&dyn WorkerWorkspaceProvider>) -> ChildWriteMode {
-    match service {
-        Some(service) if service.supports_coding() => ChildWriteMode::Coding,
-        _ => ChildWriteMode::ReadOnly,
+/// The minimum recorded position `project_workspace_matches` needs: it compares
+/// only `repository_root`.
+fn recorded_workspace(repository_root: &str) -> WorkerWorkspace {
+    WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: PathBuf::from(repository_root),
+        path: PathBuf::from(repository_root),
+        branch: String::new(),
+        parent_branch: String::new(),
+        base_commit: String::new(),
     }
 }
 
@@ -702,7 +705,8 @@ impl RuntimeCoordinator {
                     "application root workspace service is unavailable".into(),
                 )
             })?;
-        let root_mode = root_mode_for(Some(service.as_ref()));
+        // A root never provisions a worktree: it runs in the project directory.
+        let root_mode = ChildWriteMode::ReadOnly;
         let existing = {
             self.repository
                 .lock()
@@ -729,16 +733,21 @@ impl RuntimeCoordinator {
                     }
                     workspace
                 }
-                // A read-only application root keeps no `task_workspaces` row: it
-                // runs in place. Reattaching it with a git repository is a
-                // mismatch; otherwise synthesize the in-place workspace from the
-                // requested project.
+                // A read-only application root keeps no `task_workspaces` row:
+                // it runs in place, so its project is validated against the
+                // durable attachment record instead, and the in-place position is
+                // synthesized from the requested project.
                 None => {
-                    if service.supports_coding() {
-                        return Err(RuntimeCoordinatorError::Supervisor(
-                            "application root workspace does not match its recorded repository"
-                                .into(),
-                        ));
+                    if let Some(recorded) = existing.workspace_root.as_deref() {
+                        if !self.factory.project_workspace_matches(
+                            requested_workspace,
+                            &recorded_workspace(recorded),
+                        ) {
+                            return Err(RuntimeCoordinatorError::Supervisor(
+                                "application root workspace does not match its recorded repository"
+                                    .into(),
+                            ));
+                        }
                     }
                     service
                         .read_only_workspace(None, &existing.root_task_id)
@@ -808,6 +817,7 @@ impl RuntimeCoordinator {
                 &root_task_id,
                 &capability_digest,
                 &capability,
+                &workspace.repository_root.to_string_lossy(),
             )?;
         Ok(AttachedApplicationRoot {
             session_id,
@@ -839,10 +849,7 @@ impl RuntimeCoordinator {
                 attachment.root_session_id.clone(),
             ));
         }
-        let root_mode = root_mode_for(
-            self.workspace_service_for(&attachment.root_session_id)
-                .as_deref(),
-        );
+        let root_mode = ChildWriteMode::ReadOnly;
         let mut hydrated_supervisor = None;
         for task in tasks {
             let depth = persisted_depth(task.depth)?;
@@ -1653,27 +1660,34 @@ impl RuntimeCoordinator {
             .expect("runtime repository mutex poisoned")
             .task_workspace_optional(task)?;
         if let Some(existing) = existing {
-            // A reclaimed worktree keeps its row, so the row can outlive its
-            // directory. Rebuild before handing the path to a worker.
+            // A recorded position is reused across restarts rather than
+            // re-resolved: a reclaimed directory is rebuilt from its branch, and
+            // any other path is taken as already correct.
             if !existing.path.exists() {
-                let Some(service) = self.workspace_service_for(session) else {
-                    return Ok(None);
-                };
-                service
-                    .reattach_workspace(&existing)
-                    .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+                match self.workspace_service_for(session) {
+                    Some(provider) => provider
+                        .reattach_workspace(&existing)
+                        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?,
+                    None => return Ok(None),
+                }
             }
             supervisor
                 .assign_workspace(task, existing.lease_id.clone())
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             return Ok(Some(existing));
         }
-        let Some(service) = self.workspace_service_for(session) else {
+        let Some(provider) = self.workspace_service_for(session) else {
             return Ok(None);
         };
+        // A coding task runs where its parent prepared it, when the parent handed
+        // over a `workdir`. Without one it runs in place: the runtime resolves a
+        // path, it never creates a directory. A read-only task inherits the
+        // nearest ancestor's path.
         if workspace_mode == ChildWriteMode::ReadOnly {
+            // A read-only task runs in place: it inherits the nearest ancestor's
+            // path and records no workspace of its own.
             let parent = self.nearest_ancestor_workspace(supervisor, task)?;
-            let workspace = service
+            let workspace = provider
                 .read_only_workspace(parent.as_ref(), task)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
             supervisor
@@ -1681,36 +1695,32 @@ impl RuntimeCoordinator {
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             return Ok(Some(workspace));
         }
-        let task_snapshot = supervisor
-            .task(task)
-            .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?;
-        let workspace = if let Some(parent_id) = task_snapshot.parent_id.as_ref() {
-            let parent = self
+        // A coding task runs where its parent prepared it, when the parent handed
+        // over a `workdir`; without one it falls back to an in-place path. Either
+        // way the runtime resolves a path, it never creates a directory.
+        let workspace = match supervisor.spawn_workdir(task) {
+            Some(workdir) => provider.workspace_in(task, &workdir),
+            None => provider.in_place_workspace(session, task, attempt),
+        }
+        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        // Only a branch-backed position gets a `task_workspaces` row. An in-place
+        // position (no branch) is a view of a parent directory, not a worktree
+        // the daemon owns, so recording it would claim an ownership it has none of.
+        if !workspace.branch.is_empty() {
+            let record_result = self
                 .repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
-                .task_workspace(parent_id)?;
-            service
-                .workspace_in(&parent, session, task, attempt)
-                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
-        } else {
-            service
-                .in_place_workspace(session, task, attempt)
-                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
-        };
-        let record_result = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .record_task_workspace(task, attempt, &workspace);
-        if let Err(error) = record_result {
-            if let Err(cleanup) = service.cleanup_prepared(&workspace) {
-                return Err(RuntimeCoordinatorError::WorkspaceRecordingCleanup {
-                    record: error.to_string(),
-                    cleanup: cleanup.to_string(),
-                });
+                .record_task_workspace(task, attempt, &workspace);
+            if let Err(error) = record_result {
+                if let Err(cleanup) = provider.cleanup_prepared(&workspace) {
+                    return Err(RuntimeCoordinatorError::WorkspaceRecordingCleanup {
+                        record: error.to_string(),
+                        cleanup: cleanup.to_string(),
+                    });
+                }
+                return Err(RuntimeCoordinatorError::Repository(error));
             }
-            return Err(RuntimeCoordinatorError::Repository(error));
         }
         supervisor
             .assign_workspace(task, workspace.lease_id.clone())

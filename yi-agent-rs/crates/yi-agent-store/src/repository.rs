@@ -192,6 +192,9 @@ pub struct ApplicationRootAttachment {
     pub root_task_id: TaskId,
     pub capability_digest: String,
     pub capability_secret: Option<String>,
+    /// The project workspace the root was attached to. A read-only root keeps no
+    /// `task_workspaces` row, so this is the only durable record of its project.
+    pub workspace_root: Option<String>,
     pub state: String,
 }
 
@@ -2936,7 +2939,7 @@ impl RuntimeRepository {
         self.connection
             .query_row(
                 "SELECT idempotency_key, root_session_id, root_task_id, capability_digest,
-                        capability_secret, state
+                        capability_secret, workspace_root, state
                  FROM application_root_attachments WHERE idempotency_key = ?1",
                 params![idempotency_key],
                 |row| {
@@ -2958,7 +2961,8 @@ impl RuntimeRepository {
                         })?,
                         capability_digest: row.get(3)?,
                         capability_secret: row.get(4)?,
-                        state: row.get(5)?,
+                        workspace_root: row.get(5)?,
+                        state: row.get(6)?,
                     })
                 },
             )
@@ -2973,18 +2977,20 @@ impl RuntimeRepository {
         root_task_id: &TaskId,
         capability_digest: &str,
         capability_secret: &str,
+        workspace_root: &str,
     ) -> Result<(), RepositoryError> {
         self.connection.execute(
             "INSERT INTO application_root_attachments
                 (idempotency_key, root_session_id, root_task_id, capability_digest,
-                 capability_secret, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'attached')",
+                 capability_secret, workspace_root, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'attached')",
             params![
                 idempotency_key,
                 root_session_id.to_string(),
                 root_task_id.to_string(),
                 capability_digest,
-                capability_secret
+                capability_secret,
+                workspace_root
             ],
         )?;
         Ok(())
@@ -4737,6 +4743,27 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             transaction.execute_batch("ALTER TABLE tasks ADD COLUMN model TEXT;")?;
         }
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
+        transaction.commit()?;
+    }
+
+    if current_version < 11 {
+        let transaction = connection.unchecked_transaction()?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('application_root_attachments')
+                WHERE name = 'workspace_root'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // A read-only application root keeps no `task_workspaces` row, so its
+            // project workspace is recorded here instead.
+            transaction.execute_batch(
+                "ALTER TABLE application_root_attachments ADD COLUMN workspace_root TEXT;",
+            )?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
         transaction.commit()?;
     }
     Ok(())

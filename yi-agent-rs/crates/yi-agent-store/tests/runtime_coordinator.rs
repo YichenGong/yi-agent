@@ -15,7 +15,7 @@ use yi_agent_core::subagent::task::{
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
-    WorkerWorkspace, WorkerWorkspaceProvider,
+    WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
@@ -88,6 +88,7 @@ struct MessageRecordingFactory {
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
     recovery_preflights: Arc<Mutex<Vec<WorkerRecoveryPreflight>>>,
     workspace_service: Option<Arc<dyn WorkerWorkspaceProvider>>,
+    workspace_registry: Option<Arc<dyn WorkerWorkspaceRegistry>>,
 }
 
 impl AgentWorkerFactory for MessageRecordingFactory {
@@ -112,6 +113,10 @@ impl AgentWorkerFactory for MessageRecordingFactory {
 
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         self.workspace_service.clone()
+    }
+
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
+        self.workspace_registry.clone()
     }
 }
 
@@ -153,12 +158,22 @@ impl WorkerWorkspaceProvider for StaticWorkspaceService {
 
     fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
         _task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(self.workspace.clone())
+    }
+}
+
+/// The prepared-workspace lookup the runtime consults for a parent-chosen
+/// workdir. The test double holds exactly one prepared workspace.
+impl WorkerWorkspaceRegistry for StaticWorkspaceService {
+    fn register_prepared(&self, workspace: &WorkerWorkspace) {
+        let _ = workspace;
+    }
+
+    fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace> {
+        (self.workspace.path == workdir).then(|| self.workspace.clone())
     }
 }
 
@@ -232,38 +247,21 @@ impl WorkerWorkspaceProvider for GitWorkspaceService {
 
     fn workspace_in(
         &self,
-        parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
         task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        let child_path = self
-            .repository_root
-            .join(".worktrees")
-            .join(format!("child-{task_id}"));
-        let base = git_output(&parent.path, &["rev-parse", "HEAD"])?
+        let base = git_output(&self.repository_root, &["rev-parse", "HEAD"])?
             .trim()
             .to_owned();
-        git_ok(
-            &self.repository_root,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                child_path.to_str().unwrap(),
-                &base,
-            ],
-        )?;
-        git_ok(
-            &child_path,
-            &["checkout", "-b", &format!("feat/child-{task_id}"), &base],
-        )?;
         Ok(WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: self.repository_root.clone(),
-            path: child_path,
+            path: self
+                .repository_root
+                .join(".worktrees")
+                .join(format!("child-{task_id}")),
             branch: format!("feat/child-{task_id}"),
-            parent_branch: parent.branch.clone(),
+            parent_branch: "main".into(),
             base_commit: base,
         })
     }
@@ -438,10 +436,8 @@ impl WorkerWorkspaceProvider for NonGitWorkspaceService {
 
     fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
-        _task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        task_id: &TaskId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Err(WorkerError::Startup(
             "non-git workspace has no child worktree".into(),
@@ -521,18 +517,16 @@ impl WorkerWorkspaceProvider for DerivedWorkspaceService {
 
     fn workspace_in(
         &self,
-        parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
         task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
-            repository_root: parent.repository_root.clone(),
-            path: parent.repository_root.join(format!("child-{task_id}")),
+            repository_root: self.repository_root.clone(),
+            path: workdir.to_path_buf(),
             branch: format!("feat/child-{task_id}"),
-            parent_branch: parent.branch.clone(),
-            base_commit: parent.base_commit.clone(),
+            parent_branch: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
         })
     }
 }
@@ -556,10 +550,8 @@ impl WorkerWorkspaceProvider for CleanupRecordingWorkspaceService {
 
     fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
-        _task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        task_id: &TaskId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(self.workspace.clone())
     }
@@ -588,10 +580,8 @@ impl WorkerWorkspaceProvider for FailingWorkspaceService {
 
     fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
-        _task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        task_id: &TaskId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Err(WorkerError::Startup("Git workspace error: boom".into()))
     }
@@ -1199,66 +1189,6 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
     assert_eq!(review_actor["initiated_by"]["kind"], "parent_integration");
     let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
     assert_eq!(parent_mailbox.len(), 1);
-}
-
-#[tokio::test]
-async fn accepted_review_recycles_the_child_workspace() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let repository_root = directory.path().join("repo");
-    std::fs::create_dir(&repository_root).unwrap();
-    initialize_git_repository(&repository_root);
-    let accepted = Arc::new(Mutex::new(Vec::new()));
-    let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::new(GitWorkspaceService {
-            repository_root: repository_root.clone(),
-            accepted: Arc::clone(&accepted),
-            cleanup_error: None,
-            merge_checks: Arc::new(Mutex::new(Vec::new())),
-        })),
-        ..Default::default()
-    });
-    let (coordinator, _session, parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-
-    coordinator
-        .accept_review(&child, IntegrationValidation::passed("integrated"))
-        .await
-        .unwrap();
-
-    let recorded = accepted.lock().unwrap().clone();
-    assert_eq!(
-        recorded.len(),
-        1,
-        "cleanup_accepted runs once for the accepted child"
-    );
-    assert_eq!(recorded[0].0.branch, format!("feat/root-{parent}"));
-    assert_eq!(recorded[0].1.branch, format!("feat/child-{child}"));
-
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.task_state(&child).unwrap(), "completed");
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_none(),
-        "the child's workspace row is deleted after recycling"
-    );
-    assert!(
-        repository
-            .task_workspace_optional(&parent)
-            .unwrap()
-            .is_some(),
-        "the parent's workspace row survives recycling"
-    );
-    assert!(
-        repository
-            .event_records_for_task_after(&child, 0)
-            .unwrap()
-            .iter()
-            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycled),
-        "a recycle-success event is recorded"
-    );
 }
 
 #[tokio::test]
@@ -3965,6 +3895,114 @@ async fn coordinator_resolves_permission_with_a_daemon_owned_actor() {
     assert!(!event.payload_json.contains(&task.to_string()));
 }
 
+/// Resolves a prepared workdir while letting the root run elsewhere, so the
+/// root's row and the child's resolved row never share a workspace path.
+#[derive(Clone)]
+struct PreparedWorkdirService {
+    in_place: WorkerWorkspace,
+    prepared: WorkerWorkspace,
+}
+
+impl WorkerWorkspaceProvider for PreparedWorkdirService {
+    fn in_place_workspace(
+        &self,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.in_place.clone())
+    }
+
+    fn workspace_in(
+        &self,
+        _task_id: &TaskId,
+        _workdir: &std::path::Path,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.prepared.clone())
+    }
+
+    fn observe_workdir(&self, _workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.prepared.clone())
+    }
+}
+
+impl WorkerWorkspaceRegistry for PreparedWorkdirService {
+    fn register_prepared(&self, workspace: &WorkerWorkspace) {
+        let _ = workspace;
+    }
+
+    fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace> {
+        (self.prepared.path == workdir).then(|| self.prepared.clone())
+    }
+}
+
+#[tokio::test]
+async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let project_root = directory.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let prepared = directory.path().join("prepared-child");
+    std::fs::create_dir_all(&prepared).unwrap();
+    let workspace = WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: project_root.clone(),
+        path: prepared.clone(),
+        branch: "feat/yi-agent-prepared-child".into(),
+        parent_branch: "main".into(),
+        base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+    };
+    let service = Arc::new(PreparedWorkdirService {
+        in_place: WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: project_root.clone(),
+            path: project_root.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        },
+        prepared: workspace.clone(),
+    });
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    // The parent prepared this directory and handed over its path; the runtime
+    // must resolve it, not create a `.worktrees/...` directory of its own.
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "implement".into(),
+            ChildWriteMode::Coding,
+            None,
+            Some(prepared.clone()),
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let starts = factory.starts.lock().unwrap();
+    let started = starts
+        .iter()
+        .find(|start| start.task_id == child)
+        .expect("the child worker started");
+    assert_eq!(
+        started.workspace.as_ref().map(|workspace| &workspace.path),
+        Some(&prepared)
+    );
+    assert!(
+        !prepared.join(".worktrees").exists(),
+        "no worktree was created"
+    );
+}
+
 #[tokio::test]
 async fn read_only_child_runs_in_place_without_a_workspace_row() {
     let directory = TempDir::new().unwrap();
@@ -3998,7 +4036,7 @@ async fn read_only_child_runs_in_place_without_a_workspace_row() {
     let root_workspace = starts[0]
         .workspace
         .as_ref()
-        .expect("root worker owns a worktree");
+        .expect("root worker owns a workspace");
     let child_workspace = starts[1]
         .workspace
         .as_ref()

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
-use yi_agent_core::subagent::task::{DeliveryReport, WorkspaceLeaseId};
+use yi_agent_core::subagent::task::{DeliveryReport, TaskId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider,
@@ -28,12 +28,25 @@ impl WorkerWorkspaceProvider for DeliveryFactory {
     }
     fn workspace_in(
         &self,
-        _: &WorkerWorkspace,
-        root: &yi_agent_core::RootSessionId,
-        task: &yi_agent_core::TaskId,
-        _: &yi_agent_core::AttemptId,
+        task_id: &TaskId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        Ok(workspace(root, task))
+        Ok(workspace(&yi_agent_core::RootSessionId::new(), task_id))
+    }
+
+    fn read_only_workspace(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let mut position = parent
+            .cloned()
+            .unwrap_or_else(|| workspace(&yi_agent_core::RootSessionId::new(), task_id));
+        position.branch = String::new();
+        position.parent_branch = String::new();
+        position.base_commit = String::new();
+        position.lease_id = WorkspaceLeaseId::new();
+        Ok(position)
     }
 
     fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {

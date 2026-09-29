@@ -475,12 +475,12 @@ pub trait WorkerWorkspaceProvider: Send + Sync {
         attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError>;
 
+    /// Resolves the workspace a coding task runs in, from the workdir its parent
+    /// prepared. The provider looks the path up; it never creates a directory.
     fn workspace_in(
         &self,
-        parent: &WorkerWorkspace,
-        root_session_id: &RootSessionId,
         task_id: &TaskId,
-        attempt_id: &AttemptId,
+        workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError>;
 
     /// Whether this service can create coding worktrees. A non-git service
@@ -615,10 +615,8 @@ impl WorkerWorkspaceProvider for UnavailableWorkspaceProvider {
 
     fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
         _task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Err(WorkerError::Startup(
             "coding workspace service is unavailable".into(),
