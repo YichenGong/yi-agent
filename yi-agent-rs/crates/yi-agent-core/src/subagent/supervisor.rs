@@ -79,6 +79,7 @@ pub struct AgentSupervisor {
     tasks: HashMap<TaskId, AgentTask>,
     objectives: HashMap<TaskId, String>,
     workspace_modes: HashMap<TaskId, TaskWorkspaceMode>,
+    models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
     workers: HashMap<TaskId, WorkerHandle>,
@@ -118,6 +119,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -154,6 +156,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -205,6 +208,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
             workers: HashMap::new(),
@@ -221,6 +225,7 @@ impl AgentSupervisor {
         task: AgentTask,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<(), String> {
         let parent_id = task
             .parent_id
@@ -234,6 +239,9 @@ impl AgentSupervisor {
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
+        if let Some(model) = model {
+            self.models.insert(task_id.clone(), model);
+        }
         self.children.entry(parent_id).or_default().push(task_id);
         Ok(())
     }
@@ -265,6 +273,7 @@ impl AgentSupervisor {
         recovery_gated: bool,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<(), String> {
         if !self.tasks.contains_key(&parent_id) {
             return Err("recovered child parent is missing".into());
@@ -301,6 +310,9 @@ impl AgentSupervisor {
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
+        if let Some(model) = model {
+            self.models.insert(task_id.clone(), model);
+        }
         self.children.entry(parent_id).or_default().push(task_id);
         Ok(())
     }
@@ -315,6 +327,16 @@ impl AgentSupervisor {
 
     pub fn objective(&self, task_id: &TaskId) -> Option<&str> {
         self.objectives.get(task_id).map(String::as_str)
+    }
+
+    /// Records the model the child should run with. The runtime seeds this
+    /// from the persisted task row so it survives a restart.
+    pub fn set_model(&mut self, task_id: &TaskId, model: String) {
+        self.models.insert(task_id.clone(), model);
+    }
+
+    pub fn model(&self, task_id: &TaskId) -> Option<&str> {
+        self.models.get(task_id).map(String::as_str)
     }
 
     pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: TaskWorkspaceMode) {
@@ -527,6 +549,7 @@ impl AgentSupervisor {
         )
         .with_objective(objective)
         .with_workspace_mode(self.workspace_mode(task_id))
+        .with_model(self.model(task_id).unwrap_or_default().to_string())
         .with_message_capability(Uuid::new_v4().to_string())
         .with_initial_user_messages(
             initial_user_messages

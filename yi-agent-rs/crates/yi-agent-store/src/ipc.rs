@@ -214,6 +214,8 @@ pub enum IpcRequest {
         objective: String,
         #[serde(default)]
         mode: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     SpawnApplicationChild {
         session_id: String,
@@ -222,6 +224,8 @@ pub enum IpcRequest {
         objective: String,
         #[serde(default)]
         mode: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     StartWorker {
         session_id: String,
@@ -2599,6 +2603,7 @@ fn respond(
             parent_task_id,
             objective,
             mode,
+            model,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
@@ -2611,6 +2616,7 @@ fn respond(
                 &parent_task_id,
                 objective,
                 workspace_mode,
+                model,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2622,6 +2628,7 @@ fn respond(
             capability,
             objective,
             mode,
+            model,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
@@ -2635,6 +2642,7 @@ fn respond(
                 &capability,
                 objective,
                 workspace_mode,
+                model,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),

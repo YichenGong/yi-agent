@@ -46,6 +46,8 @@ pub struct WorkerStart {
     pub initial_user_messages: Vec<WorkerMessage>,
     /// Narrow task instruction supplied by the parent supervisor.
     pub objective: String,
+    /// Per-child model override; empty means inherit the parent's model.
+    pub model: String,
 }
 
 /// Non-secret evidence recorded when a worker is admitted. The runtime keeps
@@ -102,6 +104,7 @@ impl WorkerStart {
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
             objective: String::new(),
+            model: String::new(),
         }
     }
 
@@ -123,6 +126,11 @@ impl WorkerStart {
 
     pub fn with_workspace_mode(mut self, workspace_mode: TaskWorkspaceMode) -> Self {
         self.workspace_mode = workspace_mode;
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
         self
     }
 

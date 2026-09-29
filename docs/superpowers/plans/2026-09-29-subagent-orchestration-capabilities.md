@@ -49,7 +49,7 @@
 - Consumes: `TaskWorkspaceMode::parse` (`task.rs:453`), `LATEST_SCHEMA_VERSION` (`repository.rs:22`).
 - Produces: `WorkerStart::with_model(self, model: impl Into<String>) -> Self`; `WorkerStart.model: String`; `Repository::task_model(&self, task: &TaskId) -> Result<Option<String>, RepositoryError>`; `AgentSupervisor::set_model(&mut self, task_id: &TaskId, model: String)` and `AgentSupervisor::model(&self, task_id: &TaskId) -> Option<&str>`; `IpcRequest::SpawnChild.model: Option<String>` and `IpcRequest::SpawnApplicationChild.model: Option<String>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `yi-agent-rs/crates/yi-agent-store/tests/runtime_ipc.rs`:
 
@@ -109,12 +109,12 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yi-agent-store --test runtime_ipc a_child_model_is_persisted -- --exact`
 Expected: FAIL to compile with "no field `model` on struct `IpcRequest::SpawnApplicationChild`" and "no method named `task_model`".
 
-- [ ] **Step 3: Add the schema column and read-back**
+- [x] **Step 3: Add the schema column and read-back**
 
 In `repository.rs`, bump the version and add a migration block after the version-9 block (which ends at the `INSERT INTO schema_migrations (version) VALUES (9)` line):
 
@@ -162,7 +162,7 @@ Extend both task inserts to write the column. The insert at line ~920 becomes:
 ```
 with `model` added as the seventh parameter, and the insert at line ~1005 likewise. Thread `model: Option<String>` through the two functions that own those inserts, and write `None` when the caller supplied none.
 
-- [ ] **Step 4: Carry the model to the worker**
+- [x] **Step 4: Carry the model to the worker**
 
 In `worker.rs`, add to `WorkerStart`:
 
@@ -200,7 +200,7 @@ In `runtime.rs`, where the worker request is assembled (the block beginning `let
         }
 ```
 
-- [ ] **Step 4b: Update the existing schema-version assertions**
+- [x] **Step 4b: Update the existing schema-version assertions**
 
 Bumping `LATEST_SCHEMA_VERSION` to 10 breaks every test that asserts the store
 version. Raise the constant, add the migration, then update these five sites in
@@ -212,7 +212,7 @@ version. Raise the constant, add the migration, then update these five sites in
 - Line 2346, `opening_a_version_one_store_adds_replay_metadata_without_rewriting_history`: `9` becomes `10`.
 - Line 5372, `workspace_mode_is_persisted_and_recovered`: `9` becomes `10`.
 
-- [ ] **Step 5: Run the test**
+- [x] **Step 5: Run the test**
 
 Run: `cargo test -p yi-agent-store --test runtime_ipc a_child_model_is_persisted -- --exact`
 Expected: PASS. Then run the whole store suite to confirm the migration and the
@@ -223,7 +223,7 @@ cargo test -p yi-agent-store --test runtime_ipc      # 102 tests, expect 0 faile
 cargo test -p yi-agent-store --test runtime_coordinator
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-store/src/repository.rs \

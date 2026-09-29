@@ -2947,6 +2947,7 @@ mod tests {
                 parent_task_id: root_task_id,
                 objective: "实现 parser".into(),
                 mode: Some("coding".into()),
+                model: None,
             },
         )
         .unwrap();

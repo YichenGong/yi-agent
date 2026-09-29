@@ -1129,6 +1129,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 capability: self.application_capability.clone(),
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
+                model: None,
             },
         );
         match response {
@@ -1235,6 +1236,7 @@ impl Tool for DaemonSpawnAgentTool {
                 parent_task_id: self.caller_task_id.clone(),
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
+                model: None,
             },
         );
         match response {
@@ -2581,6 +2583,7 @@ mod tests {
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
                 mode: None,
+                model: None,
             },
         )
         .unwrap()
@@ -2628,6 +2631,7 @@ mod tests {
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
                 mode: None,
+                model: None,
             },
         )
         .unwrap()

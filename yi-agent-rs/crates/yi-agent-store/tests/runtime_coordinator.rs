@@ -788,6 +788,7 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
             &root,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -834,6 +835,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             &root,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -2346,6 +2348,7 @@ async fn delivered_child_coordinator(
             &parent,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -2966,6 +2969,7 @@ async fn recovered_child_resumes_after_runtime_restart() {
             "running",
             "Preserve this recovered child objective.",
             yi_agent_core::TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
+            None,
         )
         .unwrap();
     repository.recover_inflight_tasks().unwrap();
@@ -4028,6 +4032,7 @@ async fn coding_child_fails_clearly_without_a_git_repository() {
             &attached.root_task_id,
             "Change the files.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4104,6 +4109,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             &child,
             "Write code.".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap_err();
@@ -4121,6 +4127,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             &child,
             "Read more.".into(),
             TaskWorkspaceMode::ReadOnly,
+            None,
         )
         .await
         .unwrap();
@@ -4195,6 +4202,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             &root,
             "merged child".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4229,6 +4237,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             &root,
             "unmerged child".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4321,6 +4330,7 @@ async fn reclaim_uses_the_recorded_parent_branch_not_the_owner_head() {
             &root,
             "merged child".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4441,6 +4451,7 @@ async fn reclaim_still_checks_merging_when_the_owner_directory_is_gone() {
             &root,
             "child with a vanished owner".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();
@@ -4525,6 +4536,7 @@ async fn reclaim_session_worktrees_keeps_a_running_childs_directory() {
             &root,
             "still working".into(),
             TaskWorkspaceMode::Coding,
+            None,
         )
         .await
         .unwrap();

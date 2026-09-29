@@ -19,7 +19,7 @@ use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 9;
+const LATEST_SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -896,6 +896,7 @@ impl RuntimeRepository {
             // Root tasks own an isolated session worktree, so this convenience
             // wrapper keeps the coding mode.
             TaskWorkspaceMode::Coding,
+            None,
         )
     }
 
@@ -909,6 +910,7 @@ impl RuntimeRepository {
         state: &str,
         objective: &str,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
@@ -917,8 +919,8 @@ impl RuntimeRepository {
             params![root.to_string()],
         )?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode)
-             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model)
+             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6, ?7)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -926,6 +928,7 @@ impl RuntimeRepository {
                 attempt.to_string(),
                 delivery_json,
                 workspace_mode.as_str(),
+                model,
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -983,6 +986,7 @@ impl RuntimeRepository {
             // Legacy compat wrapper used only by tests; callers needing a
             // read-only child go through `create_child_task_with_attempt_and_objective`.
             TaskWorkspaceMode::Coding,
+            None,
         )
     }
 
@@ -998,12 +1002,13 @@ impl RuntimeRepository {
         state: &str,
         objective: &str,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -1013,6 +1018,7 @@ impl RuntimeRepository {
                 attempt.to_string(),
                 delivery_json,
                 workspace_mode.as_str(),
+                model,
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -3373,6 +3379,20 @@ impl RuntimeRepository {
             .collect())
     }
 
+    /// The per-child model override, or `None` when the child inherits the
+    /// parent's model.
+    pub fn task_model(&self, task: &TaskId) -> Result<Option<String>, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT model FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn task_workspace_mode(&self, task: &TaskId) -> Result<TaskWorkspaceMode, RepositoryError> {
         let value = self
             .connection
@@ -4699,6 +4719,24 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             )?;
         }
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])?;
+        transaction.commit()?;
+    }
+
+    if current_version < 10 {
+        let transaction = connection.unchecked_transaction()?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tasks')
+                WHERE name = 'model'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // Null means the child inherits its parent's model.
+            transaction.execute_batch("ALTER TABLE tasks ADD COLUMN model TEXT;")?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
         transaction.commit()?;
     }
     Ok(())

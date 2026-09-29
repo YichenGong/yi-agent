@@ -391,8 +391,9 @@ impl RuntimeCoordinator {
                     })?;
                     if supervisor.task(&ancestor.task_id).is_none() {
                         let mode = repository.task_workspace_mode(&ancestor.task_id)?;
+                        let model = repository.task_model(&ancestor.task_id)?;
                         supervisor
-                            .insert_hydrated_review_child(hydrated, objective, mode)
+                            .insert_hydrated_review_child(hydrated, objective, mode, model)
                             .map_err(RuntimeCoordinatorError::Supervisor)?;
                         hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                     }
@@ -402,6 +403,8 @@ impl RuntimeCoordinator {
                         "persisted recovered child has no recovered root".into(),
                     )
                 })?;
+                // Read the model before `task.task_id` is moved into the call.
+                let model = repository.task_model(&task.task_id)?;
                 supervisor
                     .try_lock()
                     .map_err(|_| {
@@ -416,6 +419,7 @@ impl RuntimeCoordinator {
                         task.recovery_gated || task.recovery_attested,
                         task.objective,
                         task.workspace_mode,
+                        model,
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
             } else {
@@ -494,8 +498,9 @@ impl RuntimeCoordinator {
                         RuntimeCoordinatorError::Supervisor("review hydration is busy".into())
                     })?;
                 let mode = repository.task_workspace_mode(&task.task_id)?;
+                let model = repository.task_model(&task.task_id)?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective, mode)
+                    .insert_hydrated_review_child(hydrated, objective, mode, model)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
             }
@@ -664,6 +669,7 @@ impl RuntimeCoordinator {
                 "queued",
                 &objective,
                 workspace_mode,
+                None,
             )?;
         self.supervisors
             .lock()
@@ -870,13 +876,18 @@ impl RuntimeCoordinator {
                     .lock()
                     .expect("runtime repository mutex poisoned")
                     .task_workspace_mode(&task_id)?;
+                let model = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_model(&task_id)?;
                 let supervisor = hydrated_supervisor.as_mut().ok_or_else(|| {
                     RuntimeCoordinatorError::Supervisor(
                         "application root child has no hydrated root".into(),
                     )
                 })?;
                 supervisor
-                    .insert_hydrated_review_child(hydrated, objective, mode)
+                    .insert_hydrated_review_child(hydrated, objective, mode, model)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
                 hydrate_completion_report(supervisor, task_id, completion_report)?;
             }
@@ -1022,9 +1033,10 @@ impl RuntimeCoordinator {
         capability: &str,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective, workspace_mode)
+        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model)
             .await
     }
 
@@ -1139,6 +1151,7 @@ impl RuntimeCoordinator {
             parent,
             "Complete the delegated task.".into(),
             TaskWorkspaceMode::ReadOnly,
+            None,
         )
         .await
     }
@@ -1149,6 +1162,7 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1212,7 +1226,11 @@ impl RuntimeCoordinator {
                 "queued",
                 &objective,
                 workspace_mode,
+                model.clone(),
             )?;
+        if let Some(model) = model {
+            supervisor.lock().await.set_model(&child, model);
+        }
         Ok(child)
     }
 
@@ -1226,9 +1244,10 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         objective: String,
         workspace_mode: TaskWorkspaceMode,
+        model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
-            .spawn_child_with_objective(session, parent, objective, workspace_mode)
+            .spawn_child_with_objective(session, parent, objective, workspace_mode, model)
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {

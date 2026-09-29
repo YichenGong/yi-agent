@@ -449,6 +449,7 @@ fn spawn_child(
             capability: capability.into(),
             objective: objective.into(),
             mode: Some("coding".into()),
+            model: None,
         },
     )
     .unwrap();
@@ -502,6 +503,7 @@ fn delivery_review_survives_restart_without_restarting_worker() {
             capability: message_capability,
             objective: "deliver".into(),
             mode: Some("coding".into()),
+            model: None,
         },
     )
     .unwrap();
