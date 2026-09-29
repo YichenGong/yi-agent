@@ -1518,8 +1518,10 @@ mod tests {
     #[test]
     fn worker_config_uses_the_requested_model_and_falls_back_to_the_factory_default() {
         let directory = tempfile::TempDir::new().unwrap();
-        let mut factory_config = AgentConfig::default();
-        factory_config.model = "factory-model".into();
+        let factory_config = AgentConfig {
+            model: "factory-model".into(),
+            ..AgentConfig::default()
+        };
         let factory = DaemonAgentWorkerFactory::new(
             Arc::new(RecordingProvider::default()),
             Arc::new(ToolRegistry::new()),
