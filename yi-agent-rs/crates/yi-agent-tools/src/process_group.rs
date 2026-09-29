@@ -4,6 +4,15 @@
 
 use tokio::process::Command;
 
+/// `SIGKILL` value, defined on every platform so the policy layer can name it
+/// unconditionally. On non-unix nothing is ever signalled (both helpers below
+/// are no-ops), so the value is only a placeholder there.
+#[cfg(unix)]
+pub(crate) const SIGKILL: i32 = libc::SIGKILL;
+
+#[cfg(not(unix))]
+pub(crate) const SIGKILL: i32 = 9;
+
 /// 让 `cmd` spawn 出的子进程自任组长（等价于子进程内 `setpgid(0, 0)`）。
 ///
 /// 使子进程组 pgid == 子进程 pid，从而与 yi-agent 自身进程组隔离。

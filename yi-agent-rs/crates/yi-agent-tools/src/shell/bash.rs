@@ -40,7 +40,7 @@ impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if self.armed {
             if let Some(pgid) = self.pgid {
-                crate::process_group::signal_process_group(pgid, libc::SIGKILL);
+                crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
             }
         }
     }
@@ -333,7 +333,7 @@ impl Tool for BashTool {
                     // (`sh -c 'while :; do :; done' &`) would otherwise be
                     // orphaned and keep burning CPU forever.
                     if let Some(pgid) = child_pgid {
-                        crate::process_group::signal_process_group(pgid, libc::SIGKILL);
+                        crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
                     }
                     let _ = child.wait().await;
                     let _ = tx.send(ToolEvent::Timeout).await;
@@ -346,7 +346,7 @@ impl Tool for BashTool {
                     // Hard timeout: same whole-group reclamation as the idle
                     // watchdog above.
                     if let Some(pgid) = child_pgid {
-                        crate::process_group::signal_process_group(pgid, libc::SIGKILL);
+                        crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
                     }
                     let _ = child.wait().await;
                     let _ = tx.send(ToolEvent::Timeout).await;
