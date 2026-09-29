@@ -272,8 +272,12 @@ fn control_agent(cli: &Cli, action: AgentAction) -> Result<()> {
         yi_agent_store::ipc::IpcResponse::TaskDiff {
             task_id,
             delivery_json,
+            diff,
         } => {
             println!("{task_id} {delivery_json}");
+            if let Some(diff) = diff {
+                println!("{diff}");
+            }
             Ok(())
         }
         yi_agent_store::ipc::IpcResponse::TaskCancelled

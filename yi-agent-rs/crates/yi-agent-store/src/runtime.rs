@@ -2760,6 +2760,54 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// The change a delivered child introduced, as a unified diff.
+    ///
+    /// A review is only possible if the reviewer can read the code, so this
+    /// recomputes the diff from the child's delivered commit rather than
+    /// echoing the child's own report. Returns `None` when git cannot produce
+    /// one: no commit, no recorded worktree, or a worktree already reclaimed.
+    pub fn delivery_diff(&self, task: &TaskId) -> Result<Option<String>, RuntimeCoordinatorError> {
+        let (repository_root, path, delivery) = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            let detail = repository.task_detail(task)?;
+            let Ok(delivery) = serde_json::from_str::<DeliveryReport>(&detail.delivery_json) else {
+                return Ok(None);
+            };
+            let Some(workspace) = repository.task_workspace_optional(task)? else {
+                return Ok(None);
+            };
+            (workspace.repository_root, workspace.path, delivery)
+        };
+        if delivery.commit.trim().is_empty() {
+            return Ok(None);
+        }
+        // The branch the child recorded as its base is the intended comparison.
+        // When it is unreachable, the commit's own parent is the honest fallback.
+        let directory = if path.exists() { path } else { repository_root };
+        let mut attempts: Vec<Vec<String>> = Vec::new();
+        if !delivery.base_ref.trim().is_empty() {
+            attempts.push(vec![
+                "diff".into(),
+                "--no-color".into(),
+                format!("{}...{}", delivery.base_ref, delivery.commit),
+            ]);
+        }
+        attempts.push(vec![
+            "diff".into(),
+            "--no-color".into(),
+            format!("{}^", delivery.commit),
+        ]);
+        for args in attempts {
+            if let Some(diff) = git_capture(&directory, &args) {
+                return Ok(Some(truncate_diff(diff)));
+            }
+        }
+        Ok(None)
+    }
+
     fn review_context(
         &self,
         task: &TaskId,
@@ -4460,4 +4508,35 @@ impl RecoveryContext {
             tool_state_json: self.tool_state_json.clone(),
         }
     }
+}
+
+/// Runs git and returns its stdout on success. `None` on any failure keeps the
+/// caller's contract simple: a diff that cannot be produced is absent, never an
+/// error that would fail an otherwise valid inspection.
+fn git_capture(directory: &std::path::Path, args: &[String]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Diff bytes are unbounded in principle. A reviewer needs the shape of the
+/// change, not an entire vendored dependency: cap it and say so.
+fn truncate_diff(diff: String) -> String {
+    const MAX_DIFF_BYTES: usize = 64 * 1024;
+    if diff.len() <= MAX_DIFF_BYTES {
+        return diff;
+    }
+    let mut boundary = MAX_DIFF_BYTES;
+    while boundary > 0 && !diff.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut truncated = diff[..boundary].to_owned();
+    truncated.push_str("\n... diff truncated\n");
+    truncated
 }

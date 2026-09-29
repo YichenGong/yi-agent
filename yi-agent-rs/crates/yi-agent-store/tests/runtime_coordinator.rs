@@ -4839,3 +4839,38 @@ async fn reclaim_idle_sweeps_a_merged_child_whose_owner_was_already_reclaimed() 
         "the child's row survives so its worktree can be rebuilt"
     );
 }
+
+#[tokio::test]
+async fn a_delivered_childs_real_diff_reaches_its_reviewer() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        ..Default::default()
+    });
+    let (coordinator, _session, parent, child, _delivery) =
+        delivered_child_coordinator(&database, factory).await;
+
+    // The child's own report claims a change; the reviewer must see the code.
+    let diff = coordinator
+        .delivery_diff(&child)
+        .unwrap()
+        .expect("a delivered child with a live worktree has a real diff");
+    assert!(
+        diff.contains("delivery.txt"),
+        "the diff must show the delivered file, got:\n{diff}"
+    );
+    assert!(
+        diff.contains("+ready"),
+        "the diff must show the added line, got:\n{diff}"
+    );
+
+    // A task that never delivered has no diff, and asking must not fail.
+    assert!(
+        coordinator.delivery_diff(&parent).unwrap().is_none(),
+        "an undelivered task reports no diff rather than an error"
+    );
+}

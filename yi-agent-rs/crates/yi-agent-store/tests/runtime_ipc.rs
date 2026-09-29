@@ -5008,6 +5008,7 @@ fn daemon_reads_task_delivery_evidence_for_diff_inspection() {
     let IpcResponse::TaskDiff {
         task_id,
         delivery_json,
+        diff,
     } = send_request(
         daemon.socket_path(),
         IpcRequest::ReadTaskDiff {
@@ -5024,6 +5025,10 @@ fn daemon_reads_task_delivery_evidence_for_diff_inspection() {
     assert_eq!(
         evidence["objective"],
         "Root session objective not specified."
+    );
+    assert!(
+        diff.is_none(),
+        "a task that never delivered has no code diff"
     );
 }
 

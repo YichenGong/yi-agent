@@ -1312,8 +1312,8 @@ impl Tool for DaemonInspectAgentTool {
                     task_id: task_id.to_owned(),
                 },
             );
-            if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { delivery_json, .. }) = diff {
-                payload["diff"] = serde_json::from_str(&delivery_json).unwrap_or(Value::Null);
+            if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { diff, .. }) = diff {
+                payload["diff"] = json!(diff);
             }
         }
         ToolResult::text(payload.to_string())

@@ -454,6 +454,11 @@ pub enum IpcResponse {
     TaskDiff {
         task_id: String,
         delivery_json: String,
+        /// The child's real change as a unified diff, when it can be produced.
+        /// Absent for a task that has not delivered, or whose worktree was
+        /// already reclaimed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
     },
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
@@ -3077,9 +3082,11 @@ fn respond(
         IpcRequest::ReadTaskDiff { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
             let detail = repository.task_detail(&task_id)?;
+            let diff = coordinator.delivery_diff(&task_id).ok().flatten();
             Ok(IpcResponse::TaskDiff {
                 task_id: detail.task_id,
                 delivery_json: detail.delivery_json,
+                diff,
             })
         }
         IpcRequest::SubscribeEvents {
