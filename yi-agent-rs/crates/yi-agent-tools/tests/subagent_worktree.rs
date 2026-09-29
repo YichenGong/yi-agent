@@ -919,3 +919,38 @@ fn ignoring_works_inside_a_linked_git_worktree() {
         "a linked worktree must also end up clean"
     );
 }
+
+#[test]
+fn inspect_workdir_reports_head_and_cleanliness_without_a_worktree() {
+    let (repo, before) = repository();
+    let service = WorktreeService::new();
+    std::fs::write(repo.path().join("delivery.txt"), "ready\n").unwrap();
+    git(repo.path(), &["add", "delivery.txt"]);
+    git(repo.path(), &["commit", "-m", "delivery"]);
+
+    let delivery = service.inspect_workdir(repo.path(), &before).unwrap();
+    assert!(delivery.clean, "committed work is clean");
+    assert_ne!(delivery.head_commit, before);
+    assert_eq!(delivery.base_commit, before);
+    assert_eq!(delivery.branch, "main");
+
+    std::fs::write(repo.path().join("delivery.txt"), "not committed\n").unwrap();
+    let dirty = service.inspect_workdir(repo.path(), &before).unwrap_err();
+    assert!(
+        dirty.to_string().contains("child worktree is dirty"),
+        "unexpected error: {dirty}"
+    );
+}
+
+#[test]
+fn inspect_workdir_rejects_a_head_equal_to_its_base() {
+    let (repo, before) = repository();
+    let service = WorktreeService::new();
+
+    let error = service.inspect_workdir(repo.path(), &before).unwrap_err();
+
+    assert!(
+        error.to_string().contains("no commits beyond"),
+        "unexpected error: {error}"
+    );
+}

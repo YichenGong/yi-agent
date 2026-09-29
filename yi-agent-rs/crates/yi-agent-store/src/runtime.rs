@@ -1217,6 +1217,24 @@ impl RuntimeCoordinator {
                 workspace_mode,
                 model.clone(),
             )?;
+        // Auto-registration: the parent prepares the directory (`git worktree
+        // add`) and hands over its path; the daemon only records that position.
+        // A bad path fails the spawn rather than deferring to worker start, so
+        // the parent learns immediately that its workdir was not usable.
+        if let Some(workdir) = workdir.as_deref() {
+            let registry = self.factory.worker_workspace_registry().ok_or_else(|| {
+                RuntimeCoordinatorError::Supervisor(
+                    "coding child requires a prepared-workspace registry".into(),
+                )
+            })?;
+            let provider = self.workspace_service_for(session).ok_or_else(|| {
+                RuntimeCoordinatorError::Supervisor("no workspace provider for session".into())
+            })?;
+            let observed = provider
+                .observe_workdir(workdir)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+            registry.register_prepared(&observed);
+        }
         if let Some(model) = model {
             supervisor.lock().await.set_model(&child, model);
         }

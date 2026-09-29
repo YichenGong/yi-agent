@@ -20,8 +20,12 @@ pub enum WorktreeError {
     ExistingBranch { branch: String },
     #[error("child worktree is dirty: {path}")]
     DirtyChild { path: PathBuf },
+    #[error("child worktree is dirty: {path}")]
+    DirtyWorkdir { path: PathBuf },
     #[error("child delivery has no commits beyond its recorded base {base}")]
     EmptyDelivery { base: String },
+    #[error("child delivery has no commits beyond its recorded base {base}")]
+    NoCommitsBeyond { path: PathBuf, base: String },
     #[error("reviewed child HEAD {reviewed} changed to {current}")]
     ReviewedHeadChanged { reviewed: String, current: String },
     #[error("parent base commit is not available: {base}")]
@@ -39,7 +43,15 @@ pub enum WorktreeError {
 #[derive(Debug, Default)]
 pub struct WorktreeService;
 
+/// The facts a workdir reports about its own delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkdirDelivery {
+    pub branch: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub clean: bool,
+}
+
 pub struct ChildWorktree {
     pub path: PathBuf,
     pub branch: String,
@@ -58,6 +70,38 @@ pub struct InspectedDelivery {
 impl WorktreeService {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Reads a workdir's delivery facts with plain git probes.
+    ///
+    /// Unlike worktree orchestration, this requires nothing of the directory
+    /// beyond being a git checkout: the parent may have created it by any means.
+    /// An uncommitted change is [`WorktreeError::DirtyWorkdir`] and a HEAD equal
+    /// to `base` is [`WorktreeError::NoCommitsBeyond`]; those are the only two
+    /// conditions a delivery cannot be reviewed with.
+    pub fn inspect_workdir(
+        &self,
+        workdir: &Path,
+        base: &str,
+    ) -> Result<WorkdirDelivery, WorktreeError> {
+        let head_commit = git(workdir, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if !git(workdir, &["status", "--porcelain"])?.trim().is_empty() {
+            return Err(WorktreeError::DirtyWorkdir {
+                path: workdir.to_path_buf(),
+            });
+        }
+        if head_commit == base {
+            return Err(WorktreeError::NoCommitsBeyond {
+                path: workdir.to_path_buf(),
+                base: base.to_owned(),
+            });
+        }
+        Ok(WorkdirDelivery {
+            branch: current_branch(workdir).unwrap_or_default(),
+            base_commit: base.to_owned(),
+            head_commit,
+            clean: true,
+        })
     }
 
     pub fn create_root(

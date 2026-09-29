@@ -489,6 +489,18 @@ pub trait WorkerWorkspaceProvider: Send + Sync {
         true
     }
 
+    /// Observes a parent-prepared workdir and returns the workspace for it.
+    ///
+    /// The runtime calls this when a parent hands over a `workdir`; it is how a
+    /// worktree's lease identity reaches the registry without the daemon ever
+    /// creating the directory. The default reports that the provider cannot
+    /// observe a workdir, which keeps non-git providers honest.
+    fn observe_workdir(&self, _workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup(
+            "workspace provider cannot observe a workdir".into(),
+        ))
+    }
+
     /// Supplies the in-place execution root for a read-only task. `parent` is
     /// the nearest ancestor workspace, when one exists. The default cannot
     /// invent a path and therefore fails.
@@ -575,6 +587,17 @@ pub trait WorkerWorkspaceProvider: Send + Sync {
     }
 }
 
+/// Application-owned lookup from a `spawn_agent` workdir to the workspace the
+/// runtime resolved for it. The runtime asks the registry; it never creates a
+/// directory itself.
+pub trait WorkerWorkspaceRegistry: Send + Sync {
+    /// Remembers a workspace so a later lookup resolves the same lease.
+    fn register_prepared(&self, workspace: &WorkerWorkspace);
+
+    /// Returns the workspace for `workdir`, when one was prepared.
+    fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace>;
+}
+
 #[derive(Debug, Default)]
 pub struct UnavailableWorkspaceProvider;
 
@@ -619,6 +642,12 @@ pub trait AgentWorkerFactory: Send + Sync {
     }
 
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
+        None
+    }
+
+    /// The application's prepared-workspace registry, when it has one. The
+    /// runtime uses it to resolve a parent-chosen workdir to its workspace.
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
         None
     }
 

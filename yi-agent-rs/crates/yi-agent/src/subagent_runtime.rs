@@ -1,8 +1,9 @@
 //! Application-owned construction for daemon subagent workers.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -15,7 +16,7 @@ use yi_agent_core::subagent::task::{
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
-    WorkerWorkspace, WorkerWorkspaceProvider,
+    WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_core::{
     Agent, AgentConfig, AgentError, AgentEvent, Provider, ProviderError, ProviderTurnGate, Tool,
@@ -206,6 +207,9 @@ pub struct DaemonWorkspaceService {
     worktree_root: PathBuf,
     is_git_repository: bool,
     service: yi_agent_tools::worktree::WorktreeService,
+    /// Workspaces resolved from a parent-chosen workdir. Additive: the
+    /// worktree-creating paths still populate this only when asked.
+    prepared: Mutex<HashMap<PathBuf, WorkerWorkspace>>,
 }
 
 impl DaemonWorkspaceService {
@@ -219,7 +223,58 @@ impl DaemonWorkspaceService {
             worktree_root,
             is_git_repository,
             service: yi_agent_tools::worktree::WorktreeService::new(),
+            prepared: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Records the position for a parent-chosen workdir.
+    ///
+    /// The parent prepares the directory itself (`git worktree add`); the daemon
+    /// only observes it. A workdir that does not exist, or that git does not
+    /// recognize as a worktree, is refused so a coding child cannot silently run
+    /// somewhere unprepared.
+    pub fn register_workdir(
+        &self,
+        workdir: &std::path::Path,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let canonical = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        if let Some(existing) = self
+            .prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .get(&canonical)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+        if !canonical.is_dir() {
+            return Err(WorkerError::Startup(format!(
+                "workdir does not exist: {} — create it with `git worktree add` first",
+                workdir.display()
+            )));
+        }
+        let toplevel =
+            git_output(&canonical, &["rev-parse", "--show-toplevel"]).ok_or_else(|| {
+                WorkerError::Startup(format!(
+                    "workdir is not inside a git worktree: {}",
+                    workdir.display()
+                ))
+            })?;
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: PathBuf::from(toplevel),
+            path: canonical.clone(),
+            branch: current_git_branch(&canonical).unwrap_or_default(),
+            parent_branch: String::new(),
+            base_commit: git_output(&canonical, &["rev-parse", "HEAD"]).unwrap_or_default(),
+        };
+        self.prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .insert(canonical, workspace.clone());
+        Ok(workspace)
     }
 
     fn inspect_delivery_report(
@@ -255,6 +310,10 @@ impl DaemonWorkspaceService {
 impl WorkerWorkspaceProvider for DaemonWorkspaceService {
     fn supports_coding(&self) -> bool {
         self.is_git_repository
+    }
+
+    fn observe_workdir(&self, workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
+        self.register_workdir(workdir)
     }
 
     fn read_only_workspace(
@@ -415,6 +474,30 @@ impl WorkerWorkspaceProvider for DaemonWorkspaceService {
     }
 }
 
+impl WorkerWorkspaceRegistry for DaemonWorkspaceService {
+    fn register_prepared(&self, workspace: &WorkerWorkspace) {
+        let canonical = workspace
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.path.clone());
+        self.prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .insert(canonical, workspace.clone());
+    }
+
+    fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace> {
+        let canonical = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        self.prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .get(&canonical)
+            .cloned()
+    }
+}
+
 fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {
     if root {
         format!("feat/yi-agent-{}-root", short(&session.to_string()))
@@ -470,6 +553,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         Some(Arc::new(DaemonWorkspaceService::new(
             workspace.to_path_buf(),
         )))
+    }
+
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
+        self.workspace_service
+            .as_ref()
+            .map(|service| service.clone() as Arc<dyn WorkerWorkspaceRegistry>)
     }
 
     fn project_workspace_matches(
@@ -810,6 +899,12 @@ fn git_dir_for_worktree(workspace: &std::path::Path) -> Option<PathBuf> {
     } else {
         Some(workspace.join(git_dir))
     }
+}
+
+/// The checked-out branch of `workdir`, or `None` on a detached HEAD.
+fn current_git_branch(workdir: &std::path::Path) -> Option<String> {
+    let branch = git_output(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    (!branch.trim().is_empty() && branch != "HEAD").then_some(branch)
 }
 
 fn git_output(directory: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -2240,6 +2335,57 @@ mod tests {
             coding_names.iter().any(|name| name == "write")
                 && coding_names.iter().any(|name| name == "edit"),
             "coding registry must include write/edit, got {coding_names:?}"
+        );
+    }
+
+    #[test]
+    fn observe_workdir_resolves_a_prepared_directory_and_rejects_a_missing_one() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        initialize_git_repository(&repository);
+        let service = DaemonWorkspaceService::new(repository.clone());
+
+        let observed = service
+            .observe_workdir(&repository)
+            .expect("an existing git checkout is a usable workdir");
+        assert_eq!(observed.path, repository.canonicalize().unwrap());
+        assert_eq!(observed.repository_root, repository.canonicalize().unwrap());
+
+        // A parent only runs `git worktree add`; a workdir that was never
+        // prepared must be refused rather than silently used as the project.
+        let missing = directory.path().join("never-created");
+        let error = service
+            .observe_workdir(&missing)
+            .expect_err("a missing workdir is refused");
+        assert!(
+            error.to_string().contains("workdir does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_round_trips_a_prepared_workdir_to_its_workspace() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        initialize_git_repository(&repository);
+        let service = DaemonWorkspaceService::new(repository.clone());
+
+        let workspace = service.observe_workdir(&repository).unwrap();
+        let registry: Arc<dyn WorkerWorkspaceRegistry> =
+            Arc::new(DaemonWorkspaceService::new(repository.clone()));
+        registry.register_prepared(&workspace);
+
+        assert_eq!(
+            registry
+                .prepared_workspace_for_workdir(&repository)
+                .map(|found| found.path),
+            Some(workspace.path.clone())
+        );
+        assert_eq!(
+            registry.prepared_workspace_for_workdir(&directory.path().join("elsewhere")),
+            None
         );
     }
 
