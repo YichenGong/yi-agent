@@ -11,10 +11,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::{MessageId, PermissionRequestId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
-    WorkerStart, WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+    WorkerWorkspace, WorkerWorkspaceProvider,
 };
-use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
+use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
     SubscriptionFilters, send_request, send_request_with_version, subscribe,
@@ -171,10 +171,10 @@ impl AgentWorkerFactory for ApplicationReportingFactory {
         durable_context()
     }
 
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(LiveWorkspaceService {
             repository_root: workspace.to_path_buf(),
         }))
@@ -202,7 +202,7 @@ impl AgentWorkerFactory for ReviewReportingFactory {
 }
 
 impl AgentWorkerFactory for ReportingWorkerFactory {
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(StaticWorkspaceService))
     }
 
@@ -250,8 +250,8 @@ impl LiveWorkspaceService {
     }
 }
 
-impl AgentWorkspaceService for LiveWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for LiveWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -263,7 +263,7 @@ impl AgentWorkspaceService for LiveWorkspaceService {
         Ok(workspace)
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -281,7 +281,7 @@ impl AgentWorkspaceService for LiveWorkspaceService {
             .map_err(|error| WorkerError::Startup(error.to_string()))
     }
 
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -306,8 +306,8 @@ impl AgentWorkspaceService for LiveWorkspaceService {
     }
 }
 
-impl AgentWorkspaceService for ProjectWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for ProjectWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -326,14 +326,14 @@ impl AgentWorkspaceService for ProjectWorkspaceService {
         })
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
         attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        self.prepare_root(root_session_id, task_id, attempt_id)
+        self.in_place_workspace(root_session_id, task_id, attempt_id)
     }
 }
 
@@ -345,16 +345,16 @@ impl AgentWorkerFactory for ProjectWorkspaceFactory {
         durable_context()
     }
 
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(ProjectWorkspaceService {
             repository_root: workspace.to_path_buf(),
         }))
     }
 
-    fn application_root_workspace_matches(
+    fn project_workspace_matches(
         &self,
         workspace: &std::path::Path,
         recorded: &WorkerWorkspace,
@@ -367,8 +367,8 @@ impl AgentWorkerFactory for ProjectWorkspaceFactory {
     }
 }
 
-impl AgentWorkspaceService for StaticWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for StaticWorkspaceService {
+    fn in_place_workspace(
         &self,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -380,7 +380,7 @@ impl AgentWorkspaceService for StaticWorkspaceService {
         ))
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         root_session_id: &RootSessionId,
@@ -393,7 +393,7 @@ impl AgentWorkspaceService for StaticWorkspaceService {
         ))
     }
 
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         task_id: &TaskId,
@@ -413,15 +413,15 @@ impl AgentWorkspaceService for StaticWorkspaceService {
 /// A workspace service that records every reclaim instead of running git.
 ///
 /// It mirrors the production service in the one respect the reclaim path
-/// depends on: `prepare_root` and `prepare_child` really create the worktree
+/// depends on: `in_place_workspace` and `workspace_in` really create the worktree
 /// directory, so the caller's `path.exists()` gate is satisfied.
 #[derive(Clone, Default)]
 struct ReclaimRecordingWorkspaceService {
     reclaimed: Arc<Mutex<Vec<PathBuf>>>,
 }
 
-impl AgentWorkspaceService for ReclaimRecordingWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for ReclaimRecordingWorkspaceService {
+    fn in_place_workspace(
         &self,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -433,7 +433,7 @@ impl AgentWorkspaceService for ReclaimRecordingWorkspaceService {
         Ok(workspace)
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         root_session_id: &RootSessionId,
@@ -473,8 +473,8 @@ struct GatedReclaimWorkspaceService {
     release: Arc<Mutex<mpsc::Receiver<()>>>,
 }
 
-impl AgentWorkspaceService for GatedReclaimWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for GatedReclaimWorkspaceService {
+    fn in_place_workspace(
         &self,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -486,7 +486,7 @@ impl AgentWorkspaceService for GatedReclaimWorkspaceService {
         Ok(workspace)
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         root_session_id: &RootSessionId,
@@ -520,7 +520,7 @@ impl AgentWorkspaceService for GatedReclaimWorkspaceService {
 
 #[derive(Clone)]
 struct ApplicationRootFactory {
-    workspace_service: Arc<dyn AgentWorkspaceService>,
+    workspace_service: Arc<dyn WorkerWorkspaceProvider>,
     starts: Arc<Mutex<Vec<WorkerStart>>>,
 }
 
@@ -535,7 +535,7 @@ impl AgentWorkerFactory for TextCompletionFactory {
         durable_context()
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(StaticWorkspaceService))
     }
 
@@ -552,7 +552,7 @@ impl AgentWorkerFactory for ApplicationRootFactory {
         durable_context()
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(self.workspace_service.clone())
     }
 
@@ -2263,7 +2263,7 @@ fn gc_confirm_consumes_its_token_exactly_once() {
 fn gc_preview_lists_a_detached_sessions_reclaimable_worktree() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
-    // The recording service creates the worktree directory in `prepare_root`, the
+    // The recording service creates the worktree directory in `in_place_workspace`, the
     // way the production service really does. The listing reports a candidate only
     // while its directory exists, so a fixture that never creates one would not be
     // listable and this test would prove nothing.
@@ -2438,7 +2438,7 @@ fn gc_preview_merged_and_dirty_match_the_reclaim_semantics() {
                 1,
                 "paused",
                 "root",
-                TaskWorkspaceMode::Coding,
+                ChildWriteMode::Coding,
                 None,
             )
             .unwrap();
@@ -2466,7 +2466,7 @@ fn gc_preview_merged_and_dirty_match_the_reclaim_semantics() {
                     1,
                     state,
                     objective,
-                    TaskWorkspaceMode::Coding,
+                    ChildWriteMode::Coding,
                     None,
                 )
                 .unwrap();
@@ -5895,13 +5895,13 @@ fn workspace_mode_is_persisted_and_recovered() {
             1,
             "queued",
             "root",
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .unwrap();
     assert_eq!(
         repository.task_workspace_mode(&root).unwrap(),
-        TaskWorkspaceMode::Coding
+        ChildWriteMode::Coding
     );
 
     // A recoverable child carries a non-default mode so the `recovered_tasks`
@@ -5918,19 +5918,19 @@ fn workspace_mode_is_persisted_and_recovered() {
             1,
             "recovery_required",
             "child",
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             None,
         )
         .unwrap();
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
-        TaskWorkspaceMode::ReadOnly
+        ChildWriteMode::ReadOnly
     );
 
     let recovered = repository.recovered_tasks().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].task_id, child);
-    assert_eq!(recovered[0].workspace_mode, TaskWorkspaceMode::ReadOnly);
+    assert_eq!(recovered[0].workspace_mode, ChildWriteMode::ReadOnly);
 
     // The legacy insert omits `workspace_mode`, so it must fall back to the
     // DDL default of 'coding'.
@@ -5940,7 +5940,7 @@ fn workspace_mode_is_persisted_and_recovered() {
         .unwrap();
     assert_eq!(
         repository.task_workspace_mode(&legacy).unwrap(),
-        TaskWorkspaceMode::Coding
+        ChildWriteMode::Coding
     );
 }
 
@@ -5987,7 +5987,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
     let repository = RuntimeRepository::open(&database).unwrap();
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
-        TaskWorkspaceMode::Coding
+        ChildWriteMode::Coding
     );
     assert!(
         repository
@@ -6041,7 +6041,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
     let repository = RuntimeRepository::open(&database).unwrap();
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
-        TaskWorkspaceMode::ReadOnly
+        ChildWriteMode::ReadOnly
     );
     assert!(
         repository

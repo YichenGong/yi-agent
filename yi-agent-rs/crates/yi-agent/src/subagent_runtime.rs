@@ -10,12 +10,12 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use yi_agent_core::subagent::task::DeliveryReport;
 use yi_agent_core::subagent::task::{
-    AttemptId, RootSessionId, TaskId, TaskWorkspaceMode, WorkspaceLeaseId,
+    AttemptId, ChildWriteMode, RootSessionId, TaskId, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
-    WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult, WorkerStart, WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
+    WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
+    WorkerWorkspace, WorkerWorkspaceProvider,
 };
 use yi_agent_core::{
     Agent, AgentConfig, AgentError, AgentEvent, Provider, ProviderError, ProviderTurnGate, Tool,
@@ -113,16 +113,16 @@ impl DaemonAgentWorkerFactory {
     fn worker_tool_registry(
         &self,
         workspace: &WorkerWorkspace,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
     ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
         let (sandbox, writable_roots) = match workspace_mode {
-            TaskWorkspaceMode::Coding => {
+            ChildWriteMode::Coding => {
                 let mut writable_roots = vec![workspace.path.clone()];
                 writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
                 (self.sandbox, writable_roots)
             }
-            TaskWorkspaceMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
+            ChildWriteMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
@@ -252,12 +252,12 @@ impl DaemonWorkspaceService {
     }
 }
 
-impl AgentWorkspaceService for DaemonWorkspaceService {
+impl WorkerWorkspaceProvider for DaemonWorkspaceService {
     fn supports_coding(&self) -> bool {
         self.is_git_repository
     }
 
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -275,7 +275,7 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
         })
     }
 
-    fn prepare_root(
+    fn in_place_workspace(
         &self,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -300,7 +300,7 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
         })
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         parent: &WorkerWorkspace,
         root_session_id: &RootSessionId,
@@ -457,22 +457,22 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         Some("daemon-default".into())
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         self.workspace_service
             .as_ref()
-            .map(|service| Arc::clone(service) as Arc<dyn AgentWorkspaceService>)
+            .map(|service| Arc::clone(service) as Arc<dyn WorkerWorkspaceProvider>)
     }
 
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(DaemonWorkspaceService::new(
             workspace.to_path_buf(),
         )))
     }
 
-    fn application_root_workspace_matches(
+    fn project_workspace_matches(
         &self,
         workspace: &std::path::Path,
         recorded: &WorkerWorkspace,
@@ -686,7 +686,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 assistant_report.clear();
                                                 continue 'run;
                                             }
-                                            if workspace_mode == TaskWorkspaceMode::Coding {
+                                            if workspace_mode == ChildWriteMode::Coding {
                                                 if let Some(service) = workspace_service.as_ref() {
                                                     match service.inspect_delivery(&workspace_for_delivery) {
                                                         Ok(delivery) => reporter.report_delivery(delivery),
@@ -1105,13 +1105,13 @@ fn format_ipc_rejection(action: &str, response: &yi_agent_store::ipc::IpcRespons
 }
 
 /// Resolves the optional `mode` argument for a daemon `spawn_agent` call via the
-/// canonical [`TaskWorkspaceMode::parse`], so the tool, the core tool, and the
+/// canonical [`ChildWriteMode::parse`], so the tool, the core tool, and the
 /// IPC helper agree on the accepted spellings. An omitted mode defaults to
 /// read-only; an explicit unknown or non-string value is rejected.
-fn spawn_mode(args: &Value) -> Result<TaskWorkspaceMode, ToolResult> {
+fn spawn_mode(args: &Value) -> Result<ChildWriteMode, ToolResult> {
     match args.get("mode") {
-        None => Ok(TaskWorkspaceMode::ReadOnly),
-        Some(Value::String(value)) => TaskWorkspaceMode::parse(value)
+        None => Ok(ChildWriteMode::ReadOnly),
+        Some(Value::String(value)) => ChildWriteMode::parse(value)
             .ok_or_else(|| ToolResult::error("mode must be 'coding' or 'read_only'")),
         Some(_) => Err(ToolResult::error("mode must be a string")),
     }
@@ -1771,16 +1771,16 @@ mod tests {
     fn daemon_spawn_mode_uses_the_canonical_parser() {
         assert_eq!(
             spawn_mode(&json!({})).unwrap(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             "an omitted mode defaults to read-only"
         );
         assert_eq!(
             spawn_mode(&json!({ "mode": "coding" })).unwrap(),
-            TaskWorkspaceMode::Coding
+            ChildWriteMode::Coding
         );
         assert_eq!(
             spawn_mode(&json!({ "mode": "read_only" })).unwrap(),
-            TaskWorkspaceMode::ReadOnly
+            ChildWriteMode::ReadOnly
         );
 
         let unknown = spawn_mode(&json!({ "mode": "bogus" })).unwrap_err();
@@ -2066,7 +2066,7 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
+        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -2187,7 +2187,7 @@ mod tests {
             base_commit: String::new(),
         };
 
-        let read_only = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::ReadOnly);
+        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly);
         let read_only_names: Vec<_> = read_only
             .schemas()
             .into_iter()
@@ -2200,7 +2200,7 @@ mod tests {
             "read-only registry must omit write/edit, got {read_only_names:?}"
         );
 
-        let coding = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
+        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
         let coding_names: Vec<_> = coding
             .schemas()
             .into_iter()
@@ -2292,7 +2292,7 @@ mod tests {
         initialize_git_repository(directory.path());
         let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
         let workspace = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .in_place_workspace(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
             .unwrap();
         assert!(workspace.path.exists());
         assert!(
@@ -2345,7 +2345,7 @@ mod tests {
         assert!(!service.supports_coding());
 
         let workspace = service
-            .prepare_read_only(None, &TaskId::new())
+            .read_only_workspace(None, &TaskId::new())
             .expect("read-only workspace is always available");
         assert_eq!(workspace.path, directory.path());
         assert!(workspace.branch.is_empty());
@@ -2375,7 +2375,7 @@ mod tests {
         };
 
         let workspace = service
-            .prepare_read_only(Some(&parent), &TaskId::new())
+            .read_only_workspace(Some(&parent), &TaskId::new())
             .unwrap();
         assert_eq!(workspace.path, parent.path);
     }
@@ -2386,10 +2386,10 @@ mod tests {
         initialize_git_repository(directory.path());
         let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
         let root = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .in_place_workspace(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
             .unwrap();
         let child = service
-            .prepare_child(
+            .workspace_in(
                 &root,
                 &RootSessionId::new(),
                 &TaskId::new(),
@@ -2455,7 +2455,7 @@ mod tests {
         initialize_git_repository(directory.path());
         let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
         let root = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .in_place_workspace(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
             .unwrap();
         std::fs::write(root.path.join("delivery.txt"), "ready\n").unwrap();
         Command::new("git")
@@ -2513,10 +2513,10 @@ mod tests {
         initialize_git_repository(directory.path());
         let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
         let root = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
+            .in_place_workspace(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
             .unwrap();
         let child = service
-            .prepare_child(
+            .workspace_in(
                 &root,
                 &RootSessionId::new(),
                 &TaskId::new(),
@@ -2734,7 +2734,7 @@ mod tests {
             .start(
                 WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
                     .with_objective("Create and commit delivery.txt.")
-                    .with_workspace_mode(TaskWorkspaceMode::Coding)
+                    .with_workspace_mode(ChildWriteMode::Coding)
                     .with_workspace(workspace.clone()),
             )
             .await
@@ -2826,7 +2826,7 @@ mod tests {
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Return immediately after one clean provider turn.")
             .with_workspace(workspace.clone())
-            .with_workspace_mode(TaskWorkspaceMode::Coding);
+            .with_workspace_mode(ChildWriteMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let delivery = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2912,7 +2912,7 @@ mod tests {
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Report whether the sub-agent is healthy.")
             .with_workspace(workspace)
-            .with_workspace_mode(TaskWorkspaceMode::Coding);
+            .with_workspace_mode(ChildWriteMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let report = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2965,7 +2965,7 @@ mod tests {
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Report whether the sub-agent is healthy.")
             .with_workspace(workspace)
-            .with_workspace_mode(TaskWorkspaceMode::ReadOnly);
+            .with_workspace_mode(ChildWriteMode::ReadOnly);
         let handle = factory.start(request).await.unwrap();
 
         let report = tokio::time::timeout(Duration::from_secs(1), async {

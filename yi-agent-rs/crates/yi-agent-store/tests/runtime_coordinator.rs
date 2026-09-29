@@ -9,13 +9,13 @@ use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
-    AttemptId, BudgetKind, DeliveryReport, IntegrationValidation, MessageId, PermissionDecision,
-    PermissionRequestId, TaskId, TaskWorkspaceMode, TimeoutKind, WorkspaceLeaseId,
+    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, IntegrationValidation, MessageId,
+    PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
-    WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult, WorkerStart, WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
+    WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
+    WorkerWorkspace, WorkerWorkspaceProvider,
 };
 use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
@@ -87,7 +87,7 @@ struct MessageRecordingFactory {
     starts: Arc<Mutex<Vec<WorkerStart>>>,
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
     recovery_preflights: Arc<Mutex<Vec<WorkerRecoveryPreflight>>>,
-    workspace_service: Option<Arc<dyn AgentWorkspaceService>>,
+    workspace_service: Option<Arc<dyn WorkerWorkspaceProvider>>,
 }
 
 impl AgentWorkerFactory for MessageRecordingFactory {
@@ -110,7 +110,7 @@ impl AgentWorkerFactory for MessageRecordingFactory {
         Box::pin(async move { Ok(handle) })
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         self.workspace_service.clone()
     }
 }
@@ -141,8 +141,8 @@ struct StaticWorkspaceService {
     workspace: WorkerWorkspace,
 }
 
-impl AgentWorkspaceService for StaticWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for StaticWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         _task_id: &TaskId,
@@ -151,7 +151,7 @@ impl AgentWorkspaceService for StaticWorkspaceService {
         Ok(self.workspace.clone())
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -187,8 +187,8 @@ impl GitWorkspaceService {
     }
 }
 
-impl AgentWorkspaceService for GitWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for GitWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -230,7 +230,7 @@ impl AgentWorkspaceService for GitWorkspaceService {
         })
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -268,7 +268,7 @@ impl AgentWorkspaceService for GitWorkspaceService {
         })
     }
 
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -402,12 +402,12 @@ struct NonGitWorkspaceService {
     repository_root: std::path::PathBuf,
 }
 
-impl AgentWorkspaceService for NonGitWorkspaceService {
+impl WorkerWorkspaceProvider for NonGitWorkspaceService {
     fn supports_coding(&self) -> bool {
         false
     }
 
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -425,7 +425,7 @@ impl AgentWorkspaceService for NonGitWorkspaceService {
         })
     }
 
-    fn prepare_root(
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         _task_id: &TaskId,
@@ -436,7 +436,7 @@ impl AgentWorkspaceService for NonGitWorkspaceService {
         ))
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -454,7 +454,7 @@ struct WorkspaceObservingFactory {
     database: std::path::PathBuf,
     starts: Arc<Mutex<Vec<WorkerStart>>>,
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
-    workspace_service: Arc<dyn AgentWorkspaceService>,
+    workspace_service: Arc<dyn WorkerWorkspaceProvider>,
 }
 
 impl AgentWorkerFactory for WorkspaceObservingFactory {
@@ -466,7 +466,7 @@ impl AgentWorkerFactory for WorkspaceObservingFactory {
             .unwrap_or_else(durable_context)
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::clone(&self.workspace_service))
     }
 
@@ -502,8 +502,8 @@ struct DerivedWorkspaceService {
     repository_root: std::path::PathBuf,
 }
 
-impl AgentWorkspaceService for DerivedWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for DerivedWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -519,7 +519,7 @@ impl AgentWorkspaceService for DerivedWorkspaceService {
         })
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -544,8 +544,8 @@ struct CleanupRecordingWorkspaceService {
     cleanup_error: Option<&'static str>,
 }
 
-impl AgentWorkspaceService for CleanupRecordingWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for CleanupRecordingWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         _task_id: &TaskId,
@@ -554,7 +554,7 @@ impl AgentWorkspaceService for CleanupRecordingWorkspaceService {
         Ok(self.workspace.clone())
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -576,8 +576,8 @@ impl AgentWorkspaceService for CleanupRecordingWorkspaceService {
 #[derive(Clone, Default)]
 struct FailingWorkspaceService;
 
-impl AgentWorkspaceService for FailingWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for FailingWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         _task_id: &TaskId,
@@ -586,7 +586,7 @@ impl AgentWorkspaceService for FailingWorkspaceService {
         Err(WorkerError::Startup("Git workspace error: boom".into()))
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -787,7 +787,7 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
             &session,
             &root,
             "Complete the delegated task.".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -834,7 +834,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             &session,
             &root,
             "Complete the delegated task.".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -2354,7 +2354,7 @@ async fn delivered_child_coordinator(
             &session,
             &parent,
             "Complete the delegated task.".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -2975,7 +2975,7 @@ async fn recovered_child_resumes_after_runtime_restart() {
             1,
             "running",
             "Preserve this recovered child objective.",
-            yi_agent_core::TaskWorkspaceMode::Coding, // Task 5/6 threads the requested mode through here.
+            yi_agent_core::ChildWriteMode::Coding, // Task 5/6 threads the requested mode through here.
             None,
         )
         .unwrap();
@@ -4002,7 +4002,7 @@ async fn read_only_child_runs_in_place_without_a_workspace_row() {
         .expect("read-only child still receives a workspace");
     assert_eq!(child_workspace.path, root_workspace.path);
     assert!(child_workspace.branch.is_empty());
-    assert_eq!(starts[1].workspace_mode, TaskWorkspaceMode::ReadOnly);
+    assert_eq!(starts[1].workspace_mode, ChildWriteMode::ReadOnly);
 }
 
 #[tokio::test]
@@ -4038,7 +4038,7 @@ async fn coding_child_fails_clearly_without_a_git_repository() {
             &attached.session_id,
             &attached.root_task_id,
             "Change the files.".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -4115,7 +4115,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             &session,
             &child,
             "Write code.".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -4133,7 +4133,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             &session,
             &child,
             "Read more.".into(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             None,
         )
         .await
@@ -4208,7 +4208,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             &session,
             &root,
             "merged child".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -4243,7 +4243,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             &session,
             &root,
             "unmerged child".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -4336,7 +4336,7 @@ async fn reclaim_uses_the_recorded_parent_branch_not_the_owner_head() {
             &session,
             &root,
             "merged child".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -4443,7 +4443,7 @@ async fn reclaim_still_checks_merging_when_the_owner_directory_is_gone() {
     let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
     let merge_checks = service.merge_checks();
     let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::clone(&service) as Arc<dyn AgentWorkspaceService>),
+        workspace_service: Some(Arc::clone(&service) as Arc<dyn WorkerWorkspaceProvider>),
         ..Default::default()
     });
     let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
@@ -4457,7 +4457,7 @@ async fn reclaim_still_checks_merging_when_the_owner_directory_is_gone() {
             &session,
             &root,
             "child with a vanished owner".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -4542,7 +4542,7 @@ async fn reclaim_session_worktrees_keeps_a_running_childs_directory() {
             &session,
             &root,
             "still working".into(),
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .await
@@ -4902,7 +4902,7 @@ async fn a_reviewer_sibling_reaches_its_implementers_commit_in_shared_git() {
             &session,
             &parent,
             "Review the implementation".into(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             None,
         )
         .await

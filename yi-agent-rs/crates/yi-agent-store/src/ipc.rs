@@ -3140,12 +3140,10 @@ where
 /// Resolves the requested workspace mode for a spawn request. An omitted mode
 /// defaults to read-only so an existing client cannot accidentally request a
 /// writable worktree; an explicit but unknown value is rejected.
-fn parse_workspace_mode(
-    mode: Option<String>,
-) -> Result<yi_agent_core::TaskWorkspaceMode, IpcError> {
+fn parse_workspace_mode(mode: Option<String>) -> Result<yi_agent_core::ChildWriteMode, IpcError> {
     match mode.as_deref() {
-        None => Ok(yi_agent_core::TaskWorkspaceMode::ReadOnly),
-        Some(value) => yi_agent_core::TaskWorkspaceMode::parse(value).ok_or_else(|| {
+        None => Ok(yi_agent_core::ChildWriteMode::ReadOnly),
+        Some(value) => yi_agent_core::ChildWriteMode::parse(value).ok_or_else(|| {
             IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("mode must be 'coding' or 'read_only', got {value}"),

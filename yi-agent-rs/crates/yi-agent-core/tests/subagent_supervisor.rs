@@ -14,7 +14,7 @@ use yi_agent_core::subagent::task::{
 };
 use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
 use yi_agent_core::{
-    ContentBlock, ProviderTurnGate, ProviderTurnLease, TaskWorkspaceMode, ToolRegistry,
+    ChildWriteMode, ContentBlock, ProviderTurnGate, ProviderTurnLease, ToolRegistry,
 };
 
 #[tokio::test]
@@ -236,7 +236,7 @@ fn spawning_with_an_objective_retains_the_worker_instruction() {
         .spawn_with_objective(
             root,
             "Audit the scheduler fairness tests".into(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
         )
         .unwrap();
 
@@ -252,22 +252,19 @@ fn children_default_to_read_only_and_can_be_spawned_as_coding() {
     let root = supervisor.root_task_id().clone();
 
     let read_only = supervisor
-        .spawn_with_objective(root.clone(), "audit".into(), TaskWorkspaceMode::ReadOnly)
+        .spawn_with_objective(root.clone(), "audit".into(), ChildWriteMode::ReadOnly)
         .unwrap();
     let coding = supervisor
-        .spawn_with_objective(root.clone(), "implement".into(), TaskWorkspaceMode::Coding)
+        .spawn_with_objective(root.clone(), "implement".into(), ChildWriteMode::Coding)
         .unwrap();
 
     assert_eq!(
         supervisor.workspace_mode(&read_only),
-        TaskWorkspaceMode::ReadOnly
+        ChildWriteMode::ReadOnly
     );
-    assert_eq!(
-        supervisor.workspace_mode(&coding),
-        TaskWorkspaceMode::Coding
-    );
+    assert_eq!(supervisor.workspace_mode(&coding), ChildWriteMode::Coding);
     // Root with no explicit entry defaults to coding.
-    assert_eq!(supervisor.workspace_mode(&root), TaskWorkspaceMode::Coding);
+    assert_eq!(supervisor.workspace_mode(&root), ChildWriteMode::Coding);
 }
 
 #[test]
@@ -275,7 +272,7 @@ fn unregistered_task_defaults_to_read_only() {
     let supervisor = AgentSupervisor::new(RootSessionId::new());
     assert_eq!(
         supervisor.workspace_mode(&TaskId::new()),
-        TaskWorkspaceMode::ReadOnly
+        ChildWriteMode::ReadOnly
     );
 }
 
@@ -315,11 +312,11 @@ async fn spawn_tool_parses_optional_mode_and_rejects_invalid_values() {
         let supervisor = supervisor.lock().unwrap();
         assert_eq!(
             supervisor.workspace_mode(&default_child),
-            TaskWorkspaceMode::ReadOnly
+            ChildWriteMode::ReadOnly
         );
         assert_eq!(
             supervisor.workspace_mode(&coding_child),
-            TaskWorkspaceMode::Coding
+            ChildWriteMode::Coding
         );
     }
 

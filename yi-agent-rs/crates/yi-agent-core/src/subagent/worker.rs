@@ -13,8 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::ProviderTurnGate;
 
 use super::task::{
-    AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId, TaskWorkspaceMode,
-    WorkspaceLeaseId,
+    AttemptId, ChildWriteMode, DeliveryReport, MessageId, RootSessionId, TaskId, WorkspaceLeaseId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +36,7 @@ pub struct WorkerStart {
     /// Full application-owned workspace assignment for this task, when known.
     pub workspace: Option<WorkerWorkspace>,
     /// Whether this worker owns a writable worktree or runs read-only in place.
-    pub workspace_mode: TaskWorkspaceMode,
+    pub workspace_mode: ChildWriteMode,
     pub cancellation: CancellationToken,
     /// Opaque daemon-issued capability required for worker IPC mutations.
     pub message_capability: String,
@@ -99,7 +98,7 @@ impl WorkerStart {
             root_session_id,
             workspace_lease_id: None,
             workspace: None,
-            workspace_mode: TaskWorkspaceMode::default(),
+            workspace_mode: ChildWriteMode::default(),
             cancellation: CancellationToken::new(),
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
@@ -124,7 +123,7 @@ impl WorkerStart {
         self
     }
 
-    pub fn with_workspace_mode(mut self, workspace_mode: TaskWorkspaceMode) -> Self {
+    pub fn with_workspace_mode(mut self, workspace_mode: ChildWriteMode) -> Self {
         self.workspace_mode = workspace_mode;
         self
     }
@@ -180,11 +179,11 @@ mod tests {
     #[test]
     fn worker_start_defaults_to_read_only_and_accepts_an_override() {
         let default = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new());
-        assert_eq!(default.workspace_mode, TaskWorkspaceMode::ReadOnly);
+        assert_eq!(default.workspace_mode, ChildWriteMode::ReadOnly);
 
         let coding = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
-            .with_workspace_mode(TaskWorkspaceMode::Coding);
-        assert_eq!(coding.workspace_mode, TaskWorkspaceMode::Coding);
+            .with_workspace_mode(ChildWriteMode::Coding);
+        assert_eq!(coding.workspace_mode, ChildWriteMode::Coding);
     }
 }
 
@@ -432,15 +431,15 @@ pub enum WorkerError {
     Startup(String),
 }
 
-pub trait AgentWorkspaceService: Send + Sync {
-    fn prepare_root(
+pub trait WorkerWorkspaceProvider: Send + Sync {
+    fn in_place_workspace(
         &self,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
         attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError>;
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         parent: &WorkerWorkspace,
         root_session_id: &RootSessionId,
@@ -457,7 +456,7 @@ pub trait AgentWorkspaceService: Send + Sync {
     /// Supplies the in-place execution root for a read-only task. `parent` is
     /// the nearest ancestor workspace, when one exists. The default cannot
     /// invent a path and therefore fails.
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         _parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -541,10 +540,10 @@ pub trait AgentWorkspaceService: Send + Sync {
 }
 
 #[derive(Debug, Default)]
-pub struct UnavailableWorkspaceService;
+pub struct UnavailableWorkspaceProvider;
 
-impl AgentWorkspaceService for UnavailableWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for UnavailableWorkspaceProvider {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         _task_id: &TaskId,
@@ -555,7 +554,7 @@ impl AgentWorkspaceService for UnavailableWorkspaceService {
         ))
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _parent: &WorkerWorkspace,
         _root_session_id: &RootSessionId,
@@ -583,23 +582,23 @@ pub trait AgentWorkerFactory: Send + Sync {
         None
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         None
     }
 
     /// Builds the Git workspace service for one application root attachment.
     /// The daemon invokes this with the client-resolved project workspace rather
     /// than its own startup directory, so concurrent projects stay isolated.
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         _workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
-        self.workspace_service()
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
+        self.default_workspace_service()
     }
 
     /// Verifies that a client reattaching an existing root belongs to the
     /// repository that owns its persisted workspace.
-    fn application_root_workspace_matches(
+    fn project_workspace_matches(
         &self,
         _workspace: &std::path::Path,
         _recorded: &WorkerWorkspace,

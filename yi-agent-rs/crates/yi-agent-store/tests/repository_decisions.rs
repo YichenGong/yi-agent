@@ -1,8 +1,8 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::{
-    AttemptId, DeliveryReport, IntegrationValidation, MessageId, PermissionDecision,
-    PermissionRequestId, RootSessionId, TaskId, TaskWorkspaceMode, WorkspaceLeaseId,
+    AttemptId, ChildWriteMode, DeliveryReport, IntegrationValidation, MessageId,
+    PermissionDecision, PermissionRequestId, RootSessionId, TaskId, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::WorkerWorkspace;
 use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
@@ -912,7 +912,7 @@ fn reclaim_candidates_are_deepest_first_and_carry_their_workspace() {
             1,
             "completed",
             "root objective",
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .unwrap();
@@ -961,7 +961,7 @@ fn reclaim_candidates_exclude_tasks_without_a_workspace_row() {
             1,
             "completed",
             "objective",
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             None,
         )
         .unwrap();

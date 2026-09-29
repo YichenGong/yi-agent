@@ -15,7 +15,7 @@ use yi_agent_core::subagent::task::{
 use yi_agent_core::subagent::worker::{
     WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerWorkspace,
 };
-use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
+use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
@@ -363,7 +363,7 @@ pub struct PersistedRecoveredTask {
     pub objective: String,
     pub recovery_gated: bool,
     pub recovery_attested: bool,
-    pub workspace_mode: TaskWorkspaceMode,
+    pub workspace_mode: ChildWriteMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -895,7 +895,7 @@ impl RuntimeRepository {
             "Root session objective not specified.",
             // Root tasks own an isolated session worktree, so this convenience
             // wrapper keeps the coding mode.
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
     }
@@ -909,7 +909,7 @@ impl RuntimeRepository {
         attempt_number: u32,
         state: &str,
         objective: &str,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
@@ -985,7 +985,7 @@ impl RuntimeRepository {
             "Complete the delegated task.",
             // Legacy compat wrapper used only by tests; callers needing a
             // read-only child go through `create_child_task_with_attempt_and_objective`.
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
     }
@@ -1001,7 +1001,7 @@ impl RuntimeRepository {
         attempt_number: u32,
         state: &str,
         objective: &str,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
@@ -3393,7 +3393,7 @@ impl RuntimeRepository {
             .flatten())
     }
 
-    pub fn task_workspace_mode(&self, task: &TaskId) -> Result<TaskWorkspaceMode, RepositoryError> {
+    pub fn task_workspace_mode(&self, task: &TaskId) -> Result<ChildWriteMode, RepositoryError> {
         let value = self
             .connection
             .query_row(
@@ -3404,7 +3404,7 @@ impl RuntimeRepository {
             .optional()?;
         match value {
             Some(value) => {
-                TaskWorkspaceMode::parse(&value).ok_or_else(|| RepositoryError::UnknownEventKind {
+                ChildWriteMode::parse(&value).ok_or_else(|| RepositoryError::UnknownEventKind {
                     kind: format!("invalid workspace_mode in store: {value}"),
                 })
             }
@@ -3628,7 +3628,7 @@ impl RuntimeRepository {
                         }),
                     recovery_gated: task_state == "recovery_gated",
                     recovery_attested: task_state == "recovery_attested",
-                    workspace_mode: TaskWorkspaceMode::parse(&workspace_mode).ok_or_else(|| {
+                    workspace_mode: ChildWriteMode::parse(&workspace_mode).ok_or_else(|| {
                         RepositoryError::UnknownEventKind {
                             kind: format!("invalid workspace_mode in store: {workspace_mode}"),
                         }

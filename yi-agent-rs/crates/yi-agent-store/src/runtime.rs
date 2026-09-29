@@ -24,15 +24,15 @@ use yi_agent_core::subagent::supervisor::{
     WaitOutcome,
 };
 use yi_agent_core::subagent::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, DeliveryReport,
-    IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
-    RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState, TaskWorkspaceMode,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
+    DeliveryReport, IntegrationValidation, MessageId, PauseReason, PermissionDecision,
+    PermissionRequestId, RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState,
     TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
-    WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent,
-    WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
+    WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
+    WorkerWorkspaceProvider,
 };
 
 use crate::repository::{
@@ -144,9 +144,9 @@ struct PendingReviewConfirmation {
 pub struct RuntimeCoordinator {
     repository: Arc<Mutex<RuntimeRepository>>,
     factory: Arc<dyn AgentWorkerFactory>,
-    workspace_service: Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>>,
+    workspace_service: Option<Arc<dyn yi_agent_core::subagent::worker::WorkerWorkspaceProvider>>,
     application_root_workspace_services: Mutex<
-        HashMap<RootSessionId, Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>>,
+        HashMap<RootSessionId, Arc<dyn yi_agent_core::subagent::worker::WorkerWorkspaceProvider>>,
     >,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
     resident_tasks: Mutex<HashSet<TaskId>>,
@@ -227,10 +227,10 @@ fn digest_hex(value: &str) -> String {
 /// The workspace mode a per-service root should run in. A service that cannot
 /// code forces the root to run in place (`ReadOnly`); a missing service is also
 /// treated as read-only so callers never provision a worktree they cannot own.
-fn root_mode_for(service: Option<&dyn AgentWorkspaceService>) -> TaskWorkspaceMode {
+fn root_mode_for(service: Option<&dyn WorkerWorkspaceProvider>) -> ChildWriteMode {
     match service {
-        Some(service) if service.supports_coding() => TaskWorkspaceMode::Coding,
-        _ => TaskWorkspaceMode::ReadOnly,
+        Some(service) if service.supports_coding() => ChildWriteMode::Coding,
+        _ => ChildWriteMode::ReadOnly,
     }
 }
 
@@ -580,7 +580,7 @@ impl RuntimeCoordinator {
             }
         }
         let provider_profile_id = factory.provider_profile_id();
-        let workspace_service = factory.workspace_service();
+        let workspace_service = factory.default_workspace_service();
         if let Some(profile_id) = &provider_profile_id {
             resource_coordinator.configure_provider_llm_capacity(profile_id);
             for resource_key in [
@@ -636,7 +636,7 @@ impl RuntimeCoordinator {
         &self,
         objective: String,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
-        self.create_session_with_objective_and_mode(objective, TaskWorkspaceMode::Coding)
+        self.create_session_with_objective_and_mode(objective, ChildWriteMode::Coding)
     }
 
     /// Creates an isolated root session with an immutable initial objective and
@@ -645,7 +645,7 @@ impl RuntimeCoordinator {
     pub fn create_session_with_objective_and_mode(
         &self,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
@@ -698,7 +698,7 @@ impl RuntimeCoordinator {
         }
         let service = self
             .factory
-            .workspace_service_for_application_root(requested_workspace)
+            .workspace_service_for_project(requested_workspace)
             .ok_or_else(|| {
                 RuntimeCoordinatorError::Supervisor(
                     "application root workspace service is unavailable".into(),
@@ -722,7 +722,7 @@ impl RuntimeCoordinator {
                 Some(workspace) => {
                     if !self
                         .factory
-                        .application_root_workspace_matches(requested_workspace, &workspace)
+                        .project_workspace_matches(requested_workspace, &workspace)
                     {
                         return Err(RuntimeCoordinatorError::Supervisor(
                             "application root workspace does not match its recorded repository"
@@ -743,7 +743,7 @@ impl RuntimeCoordinator {
                         ));
                     }
                     service
-                        .prepare_read_only(None, &existing.root_task_id)
+                        .read_only_workspace(None, &existing.root_task_id)
                         .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
                 }
             };
@@ -1032,7 +1032,7 @@ impl RuntimeCoordinator {
         parent: &TaskId,
         capability: &str,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
@@ -1150,7 +1150,7 @@ impl RuntimeCoordinator {
             session,
             parent,
             "Complete the delegated task.".into(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             None,
         )
         .await
@@ -1161,7 +1161,7 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
@@ -1184,9 +1184,9 @@ impl RuntimeCoordinator {
             let session_supports_coding = self
                 .workspace_service_for(session)
                 .is_some_and(|service| service.supports_coding());
-            if workspace_mode == TaskWorkspaceMode::Coding
+            if workspace_mode == ChildWriteMode::Coding
                 && session_supports_coding
-                && supervisor.workspace_mode(parent) == TaskWorkspaceMode::ReadOnly
+                && supervisor.workspace_mode(parent) == ChildWriteMode::ReadOnly
             {
                 return Err(RuntimeCoordinatorError::Supervisor(
                     "read-only tasks cannot spawn coding children".into(),
@@ -1243,7 +1243,7 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
@@ -1601,7 +1601,7 @@ impl RuntimeCoordinator {
     fn workspace_service_for(
         &self,
         session: &RootSessionId,
-    ) -> Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn yi_agent_core::subagent::worker::WorkerWorkspaceProvider>> {
         self.application_root_workspace_services
             .lock()
             .expect("runtime application root workspace service mutex poisoned")
@@ -1642,7 +1642,7 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         task: &TaskId,
         attempt: &AttemptId,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
     ) -> Result<Option<WorkerWorkspace>, RuntimeCoordinatorError> {
         let existing = self
             .repository
@@ -1668,10 +1668,10 @@ impl RuntimeCoordinator {
         let Some(service) = self.workspace_service_for(session) else {
             return Ok(None);
         };
-        if workspace_mode == TaskWorkspaceMode::ReadOnly {
+        if workspace_mode == ChildWriteMode::ReadOnly {
             let parent = self.nearest_ancestor_workspace(supervisor, task)?;
             let workspace = service
-                .prepare_read_only(parent.as_ref(), task)
+                .read_only_workspace(parent.as_ref(), task)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
             supervisor
                 .assign_workspace(task, workspace.lease_id.clone())
@@ -1691,11 +1691,11 @@ impl RuntimeCoordinator {
                 .expect("runtime repository mutex poisoned")
                 .task_workspace(parent_id)?;
             service
-                .prepare_child(&parent, session, task, attempt)
+                .workspace_in(&parent, session, task, attempt)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
         } else {
             service
-                .prepare_root(session, task, attempt)
+                .in_place_workspace(session, task, attempt)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
         };
         let record_result = self

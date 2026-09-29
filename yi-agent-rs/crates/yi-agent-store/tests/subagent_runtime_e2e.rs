@@ -6,8 +6,8 @@ use futures::future::BoxFuture;
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::{DeliveryReport, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
-    WorkerStart, WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+    WorkerWorkspace, WorkerWorkspaceProvider,
 };
 use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, IpcReviewDecision, send_request};
 
@@ -17,8 +17,8 @@ struct DeliveryFactory {
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
 }
 
-impl AgentWorkspaceService for DeliveryFactory {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for DeliveryFactory {
+    fn in_place_workspace(
         &self,
         root: &yi_agent_core::RootSessionId,
         task: &yi_agent_core::TaskId,
@@ -26,7 +26,7 @@ impl AgentWorkspaceService for DeliveryFactory {
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(workspace(root, task))
     }
-    fn prepare_child(
+    fn workspace_in(
         &self,
         _: &WorkerWorkspace,
         root: &yi_agent_core::RootSessionId,
@@ -67,7 +67,7 @@ fn workspace(root: &yi_agent_core::RootSessionId, task: &yi_agent_core::TaskId) 
 }
 
 impl AgentWorkerFactory for DeliveryFactory {
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(self.clone()))
     }
     fn recovery_context(&self) -> WorkerRecoveryContext {

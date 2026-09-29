@@ -11,9 +11,9 @@ use uuid::Uuid;
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::scheduler::AdmissionPriority;
 use super::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, IntegrationValidation,
-    MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
-    RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState, TaskWorkspaceMode,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
+    IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
+    RecoveryEvidence, RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState,
     TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::worker::{
@@ -84,7 +84,7 @@ pub struct AgentSupervisor {
     root_task_id: TaskId,
     tasks: HashMap<TaskId, AgentTask>,
     objectives: HashMap<TaskId, String>,
-    workspace_modes: HashMap<TaskId, TaskWorkspaceMode>,
+    workspace_modes: HashMap<TaskId, ChildWriteMode>,
     models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
@@ -230,7 +230,7 @@ impl AgentSupervisor {
         &mut self,
         task: AgentTask,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<(), String> {
         let parent_id = task
@@ -278,7 +278,7 @@ impl AgentSupervisor {
         attempt_number: u32,
         recovery_gated: bool,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<(), String> {
         if !self.tasks.contains_key(&parent_id) {
@@ -345,7 +345,7 @@ impl AgentSupervisor {
         self.models.get(task_id).map(String::as_str)
     }
 
-    pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: TaskWorkspaceMode) {
+    pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: ChildWriteMode) {
         self.workspace_modes.insert(task_id.clone(), mode);
     }
 
@@ -353,14 +353,14 @@ impl AgentSupervisor {
     /// defaults to `Coding` (it owns session isolation) and any other task to
     /// `ReadOnly`. The root's implicit `Coding` is a default pending persisted
     /// mode hydration.
-    pub fn workspace_mode(&self, task_id: &TaskId) -> TaskWorkspaceMode {
+    pub fn workspace_mode(&self, task_id: &TaskId) -> ChildWriteMode {
         if let Some(mode) = self.workspace_modes.get(task_id) {
             return *mode;
         }
         if task_id == &self.root_task_id {
-            TaskWorkspaceMode::Coding
+            ChildWriteMode::Coding
         } else {
-            TaskWorkspaceMode::ReadOnly
+            ChildWriteMode::ReadOnly
         }
     }
 
@@ -1009,7 +1009,7 @@ impl AgentSupervisor {
         self.spawn_with_objective(
             parent_id,
             "Complete the delegated task.".into(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
         )
     }
 
@@ -1017,7 +1017,7 @@ impl AgentSupervisor {
         &mut self,
         parent_id: TaskId,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
     ) -> Result<TaskId, SpawnError> {
         let parent = self
             .tasks
@@ -1801,8 +1801,8 @@ impl Tool for SpawnAgentTool {
             return ToolResult::error("task must not be empty");
         }
         let mode = match args.get("mode") {
-            None => TaskWorkspaceMode::ReadOnly,
-            Some(Value::String(value)) => match TaskWorkspaceMode::parse(value) {
+            None => ChildWriteMode::ReadOnly,
+            Some(Value::String(value)) => match ChildWriteMode::parse(value) {
                 Some(mode) => mode,
                 None => return ToolResult::error("mode must be 'coding' or 'read_only'"),
             },
