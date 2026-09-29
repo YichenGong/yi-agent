@@ -135,6 +135,7 @@ impl Tool for BashTool {
         let mut child = match Command::new(program)
             .args(command_args)
             .current_dir(&cwd)
+            .process_group(0) // 自成进程组（pgid == 子进程 pid），与 yi-agent 隔离
             // Dropping the agent's tool future must not leave the shell running.
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -148,6 +149,11 @@ impl Tool for BashTool {
                 return ToolsError::Io(e).into();
             }
         };
+
+        // 必须在任何 wait() 之前抓取：Child::id() 一旦子进程被 poll 完成
+        // 即返回 None（tokio 1.53.0 process/mod.rs:1216-1227）。
+        // 隔离后该值同时是子进程的进程组 id。
+        let child_pgid = child.id();
 
         // Take stdout/stderr pipes.
         let mut stdout = child.stdout.take().expect("stdout piped");
@@ -868,5 +874,48 @@ mod tests {
             "expected success (exit 0), got error: {:?}",
             result.content
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_child_runs_in_its_own_process_group() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        // 子进程打印自身 pgid 与 pid；隔离后应相等（自任组长）。
+        let result = tool
+            .call(serde_json::json!({
+                "command": "echo \"pgid=$(ps -o pgid= -p $$ | tr -d ' ') pid=$$\""
+            }))
+            .await;
+        assert!(!result.is_error);
+
+        let text = match &result.content[0] {
+            yi_agent_core::ContentBlock::Text(s) => s.clone(),
+            _ => panic!("expected text block"),
+        };
+        let pgid: i32 = text
+            .split("pgid=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let pid: i32 = text
+            .split("pid=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(pgid, pid, "child should lead its own process group");
+
+        // 且不与测试进程（即模拟的 yi-agent）同组。
+        let own = unsafe { libc::getpgid(0) };
+        assert_ne!(pgid, own, "child must not share the caller's group");
     }
 }
