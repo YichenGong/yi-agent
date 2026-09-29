@@ -873,7 +873,7 @@ git commit -m "feat: report a child's delivered commit to the parent"
 - Consumes: `IpcRequest::InspectChild` (Task 4); the existing `application_root_daemon` fixture (`runtime_ipc.rs:395`).
 - Produces: an end-to-end assertion that a parent learns the commit, merges it, and the child then reaches `completed`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `runtime_ipc.rs`. It must use the same workspaces the fixture reports, because a real merge is asserted:
 
@@ -957,21 +957,21 @@ workspace and asserts the child reaches `completed`. This task adds the missing
 inspection half over a real socket, so the inspect + merge + terminal loop is
 covered end to end across the two suites.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yi-agent-store --test runtime_ipc a_parent_inspects_a_delivered_child -- --exact`
 Expected: FAIL — the assertion fails because the child stays in `awaiting_parent_review`, which is the deadlock this plan removes.
 
-- [ ] **Step 3: Confirm the fix is already in place**
+- [x] **Step 3: Confirm the fix is already in place**
 
 This task adds no production code. It verifies Task 4, 5 and 7 together on a real socket. If it fails, the defect is in one of those tasks: check that `InspectChild` authorizes a root inspecting its own child, that the response carries `delivery_json`, and that `wait_agent`/inspect surface the commit.
 
-- [ ] **Step 4: Run the test**
+- [x] **Step 4: Run the test**
 
 Run: `cargo test -p yi-agent-store --test runtime_ipc a_parent_inspects_a_delivered_child -- --exact`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full gate and commit**
+- [x] **Step 5: Run the full gate and commit**
 
 ```bash
 cargo fmt --check

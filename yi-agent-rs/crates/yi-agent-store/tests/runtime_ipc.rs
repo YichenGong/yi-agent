@@ -410,6 +410,77 @@ fn application_root_daemon(
 }
 
 #[test]
+fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "inspect-loop".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    let IpcResponse::TaskSpawned { task_id: child } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "child task".into(),
+            mode: Some("read_only".into()),
+            model: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected child spawn");
+    };
+
+    let IpcResponse::TaskDetail(detail) = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectChild {
+            session_id: session_id.clone(),
+            caller_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            task_id: child.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("the parent can inspect its own child");
+    };
+    assert_eq!(
+        detail.task_id, child,
+        "inspect returns the requested task, closing the wait-for-terminal deadlock"
+    );
+
+    assert!(
+        matches!(
+            send_request(
+                daemon.socket_path(),
+                IpcRequest::InspectChild {
+                    session_id: session_id.clone(),
+                    caller_task_id: child.clone(),
+                    capability: message_capability.clone(),
+                    task_id: root_task_id.clone(),
+                },
+            )
+            .unwrap(),
+            IpcResponse::Error { .. }
+        ),
+        "a child may not inspect its parent, which is outside its own subtree"
+    );
+}
+
+#[test]
 fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
