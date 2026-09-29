@@ -320,6 +320,17 @@ pub enum IpcRequest {
         #[serde(default)]
         recursive: bool,
     },
+    /// A parent directing one of its own descendants to rework or rejecting its
+    /// delivery. Authorized the same way `InspectChild` and `CancelChild` are.
+    /// This is the agent-facing counterpart of the human `Review` decision,
+    /// which the runtime otherwise reserves for the local operator.
+    ReviewChild {
+        session_id: String,
+        caller_task_id: String,
+        capability: String,
+        task_id: String,
+        decision: ChildReviewDecision,
+    },
     ListTaskSummaries {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -420,6 +431,9 @@ pub enum IpcResponse {
     ReviewApproved,
     ReviewReworkRequested,
     ReviewRejected,
+    /// A direct parent's review direction for a child delivery was recorded.
+    /// The successor attempt (rework) or rejection is already durable.
+    ChildReviewAccepted,
     MessageQueued,
     WaitCompleted {
         status: String,
@@ -503,6 +517,16 @@ impl From<IpcReviewDecision> for ReviewDecision {
 #[serde(deny_unknown_fields)]
 pub enum IpcReviewDecision {
     Accept {},
+    Rework { feedback: String },
+    Reject { reason: String },
+}
+
+/// What a parent asks of a child's delivery. Approval is deliberately absent:
+/// integration is the parent's own git action, and the runtime accepts a
+/// delivery by observing ancestry, never by an agent's assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildReviewDecision {
     Rework { feedback: String },
     Reject { reason: String },
 }
@@ -2978,6 +3002,28 @@ fn respond(
                 recursive,
             ))?;
             Ok(IpcResponse::TaskCancelled)
+        }
+        IpcRequest::ReviewChild {
+            session_id,
+            caller_task_id,
+            capability,
+            task_id,
+            decision,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(coordinator.review_child_authorized(
+                &session_id,
+                &caller_task_id,
+                &capability,
+                &task_id,
+                decision,
+            ))?;
+            Ok(IpcResponse::ChildReviewAccepted)
         }
         IpcRequest::ListTaskSummaries {
             session_id,

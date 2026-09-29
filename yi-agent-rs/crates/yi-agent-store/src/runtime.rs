@@ -2985,6 +2985,53 @@ impl RuntimeCoordinator {
         self.cancel_task(session, target, recursive).await
     }
 
+    /// Directs one of the caller's own child deliveries to rework, or rejects
+    /// it. Authorization is the same capability check `inspect_child_authorized`
+    /// uses, plus one stricter rule the human path does not need: the caller
+    /// must be the child's *direct* parent, because that is who the review
+    /// state machine binds the decision to.
+    pub async fn review_child_authorized(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        target: &TaskId,
+        decision: crate::ipc::ChildReviewDecision,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.authorize_child_access(session, caller, capability)
+            .await?;
+        let allowed = self
+            .supervisor(session)?
+            .lock()
+            .await
+            .is_descendant_of(caller, target);
+        if !allowed {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "task is not a descendant of the caller".into(),
+            ));
+        }
+        let parent = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_detail(target)?
+            .parent_task_id
+            .and_then(|parent| parent.parse::<TaskId>().ok());
+        if parent.as_ref() != Some(caller) {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "only a delivery's direct parent may review it".into(),
+            ));
+        }
+        match decision {
+            crate::ipc::ChildReviewDecision::Rework { feedback } => {
+                self.rework_review(target, &feedback).await
+            }
+            crate::ipc::ChildReviewDecision::Reject { reason } => {
+                self.reject_review(target, &reason).await
+            }
+        }
+    }
+
     pub async fn wait_for_children_authorized(
         &self,
         session: &RootSessionId,

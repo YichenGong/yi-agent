@@ -16,8 +16,9 @@ use yi_agent_core::subagent::worker::{
 };
 use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
 use yi_agent_store::ipc::{
-    Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision, SubscriptionFilters,
-    send_request, send_request_with_version, subscribe, subscribe_with_filters,
+    ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
+    SubscriptionFilters, send_request, send_request_with_version, subscribe,
+    subscribe_with_filters,
 };
 use yi_agent_store::repository::{
     RepositoryError, RuntimeCursorState, RuntimeEvent, RuntimeRepository,
@@ -155,6 +156,38 @@ struct ReviewReportingFactory {
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
 }
 
+/// Records starts and hands out worker handles for an *application root*
+/// session, so a test can drive a delivered child through the socket while the
+/// root inspects or reviews it. `ReviewReportingFactory` cannot: it does not
+/// expose an application-root workspace service, which attachment requires.
+#[derive(Clone, Default)]
+struct ApplicationReportingFactory {
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
+    handles: Arc<Mutex<Vec<WorkerHandle>>>,
+}
+
+impl AgentWorkerFactory for ApplicationReportingFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn workspace_service_for_application_root(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+        Some(Arc::new(LiveWorkspaceService {
+            repository_root: workspace.to_path_buf(),
+        }))
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation.clone());
+        self.starts.lock().unwrap().push(request);
+        self.handles.lock().unwrap().push(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+}
+
 impl AgentWorkerFactory for ReviewReportingFactory {
     fn recovery_context(&self) -> WorkerRecoveryContext {
         durable_context()
@@ -190,6 +223,87 @@ struct StaticWorkspaceService;
 #[derive(Clone)]
 struct ProjectWorkspaceService {
     repository_root: PathBuf,
+}
+
+/// A workspace service whose directories really exist, so a reworked child can
+/// restart on a fresh attempt. `ProjectWorkspaceService` reports paths without
+/// creating them, which a restart treats as a reclaimed worktree needing a
+/// rebuild it cannot perform.
+#[derive(Clone)]
+struct LiveWorkspaceService {
+    repository_root: PathBuf,
+}
+
+impl LiveWorkspaceService {
+    fn workspace_for(&self, task_id: &TaskId) -> WorkerWorkspace {
+        WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path: self
+                .repository_root
+                .join(".worktrees")
+                .join(task_id.to_string()),
+            branch: format!("feat/{task_id}"),
+            parent_branch: "main".into(),
+            base_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+        }
+    }
+}
+
+impl AgentWorkspaceService for LiveWorkspaceService {
+    fn prepare_root(
+        &self,
+        _root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = self.workspace_for(task_id);
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn prepare_child(
+        &self,
+        _parent: &WorkerWorkspace,
+        _root_session_id: &RootSessionId,
+        task_id: &TaskId,
+        _attempt_id: &AttemptId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let workspace = self.workspace_for(task_id);
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))?;
+        Ok(workspace)
+    }
+
+    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+        std::fs::create_dir_all(&workspace.path)
+            .map_err(|error| WorkerError::Startup(error.to_string()))
+    }
+
+    fn prepare_read_only(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let mut workspace = parent
+            .cloned()
+            .unwrap_or_else(|| self.workspace_for(&TaskId::new()));
+        workspace.lease_id = WorkspaceLeaseId::new();
+        workspace.branch = String::new();
+        workspace.parent_branch = String::new();
+        workspace.base_commit = String::new();
+        Ok(workspace)
+    }
+
+    fn is_merged_into(
+        &self,
+        _owner: &WorkerWorkspace,
+        _branch: &str,
+        _parent_branch: &str,
+    ) -> Result<bool, WorkerError> {
+        Ok(true)
+    }
 }
 
 impl AgentWorkspaceService for ProjectWorkspaceService {
@@ -5972,5 +6086,188 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
         serde_json::from_str::<Value>(delivery).unwrap()["objective"],
         Value::String(objective),
         "the delivered objective must survive the round trip intact"
+    );
+}
+
+/// Attaches an application root and spawns one coding child that has delivered,
+/// so the child is awaiting its parent's review over a real socket. Returns
+/// `(session_id, root_task_id, capability, child_task_id)`.
+fn delivered_application_child_over_ipc(
+    daemon: &Daemon,
+    database: &std::path::Path,
+    factory: &ApplicationReportingFactory,
+) -> (String, String, String, String) {
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "review-child".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned { task_id: child } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "Implement the parser".into(),
+            mode: Some("coding".into()),
+            model: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child");
+    };
+
+    let (index, workspace) = {
+        let starts = factory.starts.lock().unwrap();
+        let index = starts
+            .iter()
+            .position(|start| start.task_id.to_string() == child)
+            .expect("the child worker was started");
+        let workspace = starts[index]
+            .workspace_lease_id
+            .clone()
+            .expect("a coding child owns a workspace lease");
+        (index, workspace)
+    };
+    factory.handles.lock().unwrap()[index].report_delivery(
+        yi_agent_core::subagent::task::DeliveryReport::coding(
+            "deadbeef",
+            "main",
+            workspace,
+            "cargo test -p child",
+        ),
+    );
+    let child_id: TaskId = child.parse().unwrap();
+    for _ in 0..200 {
+        if RuntimeRepository::open(database)
+            .unwrap()
+            .task_state(&child_id)
+            .unwrap()
+            == "awaiting_parent_review"
+        {
+            return (session_id, root_task_id, message_capability, child);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the delivery did not reach durable parent review");
+}
+
+#[test]
+fn a_parent_reworks_a_child_delivery_over_ipc() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ApplicationReportingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let (session_id, root_task_id, capability, child) =
+        delivered_application_child_over_ipc(&daemon, &database, &factory);
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReviewChild {
+            session_id: session_id.clone(),
+            caller_task_id: root_task_id.clone(),
+            capability: capability.clone(),
+            task_id: child.clone(),
+            decision: ChildReviewDecision::Rework {
+                feedback: "rerun the parser regression suite".into(),
+            },
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::ChildReviewAccepted),
+        "the direct parent may rework its child's delivery, got {response:?}"
+    );
+
+    let starts = factory.starts.lock().unwrap();
+    assert!(
+        starts.iter().any(|start| start
+            .initial_user_messages
+            .iter()
+            .any(|message| message.body.contains("parser regression"))),
+        "the successor worker starts with the parent's feedback"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child.parse().unwrap())
+            .unwrap(),
+        "running",
+        "a reworked child runs again on a fresh attempt"
+    );
+}
+
+#[test]
+fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ApplicationReportingFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let (session_id, root_task_id, capability, child) =
+        delivered_application_child_over_ipc(&daemon, &database, &factory);
+
+    // A second child is a sibling of the delivered child, not its parent, so it
+    // may not review it even though it lies in the same subtree.
+    let sibling_response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: capability.clone(),
+            objective: "A sibling that must not review".into(),
+            mode: Some("read_only".into()),
+            model: None,
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskSpawned { task_id: sibling } = sibling_response else {
+        panic!("expected a sibling child, got {sibling_response:?}");
+    };
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReviewChild {
+            session_id: session_id.clone(),
+            caller_task_id: sibling,
+            capability: capability.clone(),
+            task_id: child.clone(),
+            decision: ChildReviewDecision::Reject {
+                reason: "not mine to judge".into(),
+            },
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            response,
+            IpcResponse::Error {
+                code: IpcErrorCode::AuthorityDenied,
+                ..
+            }
+        ),
+        "only a delivery's direct parent may review it, got {response:?}"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child.parse().unwrap())
+            .unwrap(),
+        "awaiting_parent_review",
+        "a refused review leaves the delivery untouched"
     );
 }

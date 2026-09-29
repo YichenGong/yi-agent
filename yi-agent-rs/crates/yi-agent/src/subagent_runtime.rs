@@ -146,6 +146,7 @@ impl DaemonAgentWorkerFactory {
             "wait_agent".to_string(),
             "inspect_agent".to_string(),
             "cancel_agent".to_string(),
+            "review_agent".to_string(),
         ]);
         names.sort();
         names.dedup();
@@ -169,6 +170,7 @@ impl DaemonAgentWorkerFactory {
                     "wait_agent".to_string(),
                     "inspect_agent".to_string(),
                     "cancel_agent".to_string(),
+                    "review_agent".to_string(),
                 ]);
                 names.sort();
                 names.dedup();
@@ -580,7 +582,13 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 caller_capability: request.message_capability.clone(),
             }));
             worker_tools.register(Arc::new(DaemonCancelAgentTool {
-                runtime_socket,
+                runtime_socket: runtime_socket.clone(),
+                session_id: request.root_session_id.to_string(),
+                caller_task_id: request.task_id.to_string(),
+                caller_capability: request.message_capability.clone(),
+            }));
+            worker_tools.register(Arc::new(DaemonReviewAgentTool {
+                runtime_socket: runtime_socket.clone(),
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
                 caller_capability: request.message_capability.clone(),
@@ -1069,6 +1077,12 @@ pub fn register_application_subagent_tools(
         caller_capability: application_capability.clone(),
     }));
     registry.register(Arc::new(DaemonCancelAgentTool {
+        runtime_socket: runtime_socket.clone(),
+        session_id: session_id.clone(),
+        caller_task_id: caller_task_id.clone(),
+        caller_capability: application_capability.clone(),
+    }));
+    registry.register(Arc::new(DaemonReviewAgentTool {
         runtime_socket,
         session_id,
         caller_task_id,
@@ -1146,6 +1160,13 @@ struct DaemonInspectAgentTool {
 }
 
 struct DaemonCancelAgentTool {
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    caller_capability: String,
+}
+
+struct DaemonReviewAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
@@ -1357,6 +1378,80 @@ impl Tool for DaemonCancelAgentTool {
 }
 
 #[async_trait]
+impl Tool for DaemonReviewAgentTool {
+    fn name(&self) -> &str {
+        "review_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Act on a direct child's delivery that is awaiting your review: send it back to rework with feedback, or reject it. Use decision \"rework\" to have the child try again with your feedback, or \"reject\" to stop it. To accept a delivery, merge the child's commit into your own branch instead; the runtime then completes the child."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "Your direct child task whose delivery you are reviewing." },
+                "decision": {
+                    "type": "string",
+                    "enum": ["rework", "reject"],
+                    "description": "rework sends the child back with feedback; reject stops it."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Feedback for a rework, or the reason for a rejection. Must not be empty."
+                }
+            },
+            "required": ["task_id", "decision", "message"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let Some(message) = args.get("message").and_then(Value::as_str) else {
+            return ToolResult::error("message is required");
+        };
+        let decision = match args.get("decision").and_then(Value::as_str) {
+            Some("rework") => yi_agent_store::ipc::ChildReviewDecision::Rework {
+                feedback: message.to_owned(),
+            },
+            Some("reject") => yi_agent_store::ipc::ChildReviewDecision::Reject {
+                reason: message.to_owned(),
+            },
+            Some(other) => {
+                return ToolResult::error(format!(
+                    "decision must be \"rework\" or \"reject\", got {other:?}"
+                ));
+            }
+            None => return ToolResult::error("decision is required"),
+        };
+        let response = yi_agent_store::ipc::send_request(
+            &self.runtime_socket,
+            yi_agent_store::ipc::IpcRequest::ReviewChild {
+                session_id: self.session_id.clone(),
+                caller_task_id: self.caller_task_id.clone(),
+                capability: self.caller_capability.clone(),
+                task_id: task_id.to_owned(),
+                decision,
+            },
+        );
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::ChildReviewAccepted) => ToolResult::text(
+                json!({ "task_id": task_id, "status": "review_recorded" }).to_string(),
+            ),
+            Ok(other) => ToolResult::error(format_ipc_rejection("review request", &other)),
+            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+        }
+    }
+}
+
+#[async_trait]
 impl Tool for DaemonWaitAgentTool {
     fn name(&self) -> &str {
         "wait_agent"
@@ -1561,12 +1656,49 @@ mod tests {
             "wait_agent",
             "inspect_agent",
             "cancel_agent",
+            "review_agent",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
                 "the recovery preflight must know {expected}, got {names:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn review_agent_validates_its_arguments_before_touching_the_daemon() {
+        let tool = DaemonReviewAgentTool {
+            runtime_socket: PathBuf::from("/tmp/unused.sock"),
+            session_id: "s".into(),
+            caller_task_id: "c".into(),
+            caller_capability: "k".into(),
+        };
+        let uuid = "00000000-0000-0000-0000-000000000001";
+        assert!(tool.call(json!({})).await.is_error, "task_id is required");
+        assert!(
+            tool.call(json!({"task_id": "nope", "decision": "rework", "message": "m"}))
+                .await
+                .is_error,
+            "task_id must be a UUID"
+        );
+        assert!(
+            tool.call(json!({"task_id": uuid, "message": "m"}))
+                .await
+                .is_error,
+            "decision is required"
+        );
+        assert!(
+            tool.call(json!({"task_id": uuid, "decision": "approve", "message": "m"}))
+                .await
+                .is_error,
+            "approve is not an agent decision: integration is the parent\'s own git action"
+        );
+        assert!(
+            tool.call(json!({"task_id": uuid, "decision": "rework"}))
+                .await
+                .is_error,
+            "message is required"
+        );
     }
 
     #[tokio::test]
