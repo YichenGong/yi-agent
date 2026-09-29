@@ -994,7 +994,7 @@ git commit -m "test: prove a parent closes the child delivery loop"
 - Consumes: every capability and test name produced by Tasks 1-8.
 - Produces: tracked feature entries with exact verification commands.
 
-- [ ] **Step 1: Add the feature entries**
+- [x] **Step 1: Add the feature entries**
 
 Append to the Features list, in the file's existing style, one entry per capability that is now real, each naming its code files and its exact verification commands:
 
@@ -1002,16 +1002,16 @@ Append to the Features list, in the file's existing style, one entry per capabil
 - `inspect_agent`: `cargo test -p yi-agent --bin yi-agent inspect_agent_`
 - `cancel_agent`: `cargo test -p yi-agent --bin yi-agent cancel_agent_requires`
 - descendant authorization: `cargo test -p yi-agent-core --test subagent_supervisor a_caller_only_reaches`
-- delivery summary in `wait_agent`: `cargo test -p yi-agent-core --test subagent_supervisor wait_agent_reports_a_childs_delivered_commit`
+- delivery summary: `cargo test -p yi-agent-core --test subagent_supervisor child_completion_snapshot_reports_a_childs_delivered_commit`
 - closed loop: `cargo test -p yi-agent-store --test runtime_ipc a_parent_inspects_a_delivered_child`
 
 State explicitly in each entry that workflows are not encoded in the runtime and are composed by the model from these tools.
 
-- [ ] **Step 2: Verify every command in the entry actually passes**
+- [x] **Step 2: Verify every command in the entry actually passes**
 
 Run each command named above and confirm each passes before the entry claims it.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/project-management/subagent-runtime.md
