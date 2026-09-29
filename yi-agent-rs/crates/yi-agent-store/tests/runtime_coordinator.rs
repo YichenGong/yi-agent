@@ -789,6 +789,7 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
             "Complete the delegated task.".into(),
             ChildWriteMode::Coding,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -835,6 +836,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             &root,
             "Complete the delegated task.".into(),
             ChildWriteMode::Coding,
+            None,
             None,
         )
         .await
@@ -2355,6 +2357,7 @@ async fn delivered_child_coordinator(
             &parent,
             "Complete the delegated task.".into(),
             ChildWriteMode::Coding,
+            None,
             None,
         )
         .await
@@ -4040,6 +4043,7 @@ async fn coding_child_fails_clearly_without_a_git_repository() {
             "Change the files.".into(),
             ChildWriteMode::Coding,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4117,6 +4121,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             "Write code.".into(),
             ChildWriteMode::Coding,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -4134,6 +4139,7 @@ async fn read_only_task_cannot_spawn_a_coding_child() {
             &child,
             "Read more.".into(),
             ChildWriteMode::ReadOnly,
+            None,
             None,
         )
         .await
@@ -4210,6 +4216,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             "merged child".into(),
             ChildWriteMode::Coding,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4244,6 +4251,7 @@ async fn reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_on
             &root,
             "unmerged child".into(),
             ChildWriteMode::Coding,
+            None,
             None,
         )
         .await
@@ -4337,6 +4345,7 @@ async fn reclaim_uses_the_recorded_parent_branch_not_the_owner_head() {
             &root,
             "merged child".into(),
             ChildWriteMode::Coding,
+            None,
             None,
         )
         .await
@@ -4459,6 +4468,7 @@ async fn reclaim_still_checks_merging_when_the_owner_directory_is_gone() {
             "child with a vanished owner".into(),
             ChildWriteMode::Coding,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4543,6 +4553,7 @@ async fn reclaim_session_worktrees_keeps_a_running_childs_directory() {
             &root,
             "still working".into(),
             ChildWriteMode::Coding,
+            None,
             None,
         )
         .await
@@ -4903,6 +4914,7 @@ async fn a_reviewer_sibling_reaches_its_implementers_commit_in_shared_git() {
             &parent,
             "Review the implementation".into(),
             ChildWriteMode::ReadOnly,
+            None,
             None,
         )
         .await

@@ -444,6 +444,7 @@ fn spawn_child(
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.into(),
             parent_task_id: root_task_id.into(),
             capability: capability.into(),
@@ -498,6 +499,7 @@ fn delivery_review_survives_restart_without_restarting_worker() {
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,

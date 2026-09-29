@@ -26,6 +26,42 @@ pub struct WorkerWorkspace {
     pub base_commit: String,
 }
 
+impl WorkerWorkspace {
+    /// Replaces the runtime-assigned lease identity. Used when the position is
+    /// resolved from a path but the identity is carried by a prepared record.
+    pub fn with_lease(mut self, lease_id: WorkspaceLeaseId) -> Self {
+        self.lease_id = lease_id;
+        self
+    }
+}
+
+/// A parent's decision about one spawned task: what to do, whether it may
+/// write, and where it runs. The runtime resolves the workspace from `workdir`;
+/// the parent never names a branch or a lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnRequest {
+    pub objective: String,
+    pub mode: ChildWriteMode,
+    /// The directory the parent asked this task to run in. `None` means "you
+    /// decide", which is what a read-only task and the root both use.
+    pub workdir: Option<PathBuf>,
+}
+
+impl SpawnRequest {
+    pub fn new(objective: String, mode: ChildWriteMode, workdir: Option<PathBuf>) -> Self {
+        Self {
+            objective,
+            mode,
+            workdir,
+        }
+    }
+
+    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+        self.workdir = Some(workdir);
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerStart {
     pub task_id: TaskId,

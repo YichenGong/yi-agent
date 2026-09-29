@@ -216,6 +216,8 @@ pub enum IpcRequest {
         mode: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        workdir: Option<String>,
     },
     SpawnApplicationChild {
         session_id: String,
@@ -226,6 +228,8 @@ pub enum IpcRequest {
         mode: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        workdir: Option<String>,
     },
     StartWorker {
         session_id: String,
@@ -2660,10 +2664,12 @@ fn respond(
             objective,
             mode,
             model,
+            workdir,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
             let workspace_mode = parse_workspace_mode(mode)?;
+            let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -2673,6 +2679,7 @@ fn respond(
                 objective,
                 workspace_mode,
                 model,
+                workdir,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2685,10 +2692,12 @@ fn respond(
             objective,
             mode,
             model,
+            workdir,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
             let workspace_mode = parse_workspace_mode(mode)?;
+            let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -2699,6 +2708,7 @@ fn respond(
                 objective,
                 workspace_mode,
                 model,
+                workdir,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),

@@ -1,7 +1,7 @@
 //! Process-local ownership of subagent supervisors and application workers.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1034,9 +1034,10 @@ impl RuntimeCoordinator {
         objective: String,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        workdir: Option<PathBuf>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model)
+        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model, workdir)
             .await
     }
 
@@ -1152,6 +1153,7 @@ impl RuntimeCoordinator {
             "Complete the delegated task.".into(),
             ChildWriteMode::ReadOnly,
             None,
+            None,
         )
         .await
     }
@@ -1163,6 +1165,7 @@ impl RuntimeCoordinator {
         objective: String,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        workdir: Option<PathBuf>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1194,8 +1197,11 @@ impl RuntimeCoordinator {
             }
             let child = supervisor.spawn_with_objective(
                 parent.clone(),
-                objective.clone(),
-                workspace_mode,
+                yi_agent_core::subagent::worker::SpawnRequest::new(
+                    objective.clone(),
+                    workspace_mode,
+                    workdir.clone(),
+                ),
             )?;
             let depth = match supervisor
                 .task(&child)
@@ -1245,9 +1251,10 @@ impl RuntimeCoordinator {
         objective: String,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        workdir: Option<PathBuf>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
-            .spawn_child_with_objective(session, parent, objective, workspace_mode, model)
+            .spawn_child_with_objective(session, parent, objective, workspace_mode, model, workdir)
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {

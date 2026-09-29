@@ -604,6 +604,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
     let IpcResponse::TaskSpawned { task_id: child } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -675,6 +676,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -770,6 +772,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -922,6 +925,7 @@ fn application_roots_use_their_attaching_project_workspace() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -1077,6 +1081,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id: first_session,
                 parent_task_id: first_root,
                 capability: second_capability,
@@ -1615,6 +1620,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
     let IpcResponse::TaskSpawned { task_id: child } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -1679,6 +1685,7 @@ fn application_root_can_spawn_multiple_direct_children() {
     let first = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -1691,6 +1698,7 @@ fn application_root_can_spawn_multiple_direct_children() {
     let second = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -1732,6 +1740,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -1749,6 +1758,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -1802,6 +1812,7 @@ fn application_root_rejects_more_than_four_direct_children() {
             send_request(
                 daemon.socket_path(),
                 IpcRequest::SpawnApplicationChild {
+                    workdir: None,
                     session_id: session_id.clone(),
                     parent_task_id: root_task_id.clone(),
                     capability: message_capability.clone(),
@@ -1818,6 +1829,7 @@ fn application_root_rejects_more_than_four_direct_children() {
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -1865,6 +1877,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
             send_request(
                 daemon.socket_path(),
                 IpcRequest::SpawnApplicationChild {
+                    workdir: None,
                     session_id: session_id.clone(),
                     parent_task_id: root_task_id.clone(),
                     capability: message_capability.clone(),
@@ -1897,6 +1910,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id,
                 parent_task_id: root_task_id,
                 capability: message_capability,
@@ -1993,6 +2007,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id: reattached_session,
                 parent_task_id: reattached_root.clone(),
                 capability: reattached_capability,
@@ -2071,6 +2086,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id,
                 parent_task_id: root_task_id,
                 capability: reattached_capability,
@@ -2140,6 +2156,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id,
                 parent_task_id: root_task_id,
                 capability: message_capability,
@@ -3752,6 +3769,7 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect child behavior".into(),
@@ -3803,6 +3821,7 @@ fn daemon_rejects_unbound_agent_message_requests_without_persisting_them() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect child behavior".into(),
@@ -3896,6 +3915,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -3974,6 +3994,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4040,6 +4061,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4057,6 +4079,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4128,6 +4151,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4145,6 +4169,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4214,6 +4239,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4289,6 +4315,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
     let IpcResponse::TaskSpawned { .. } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability,
@@ -4348,6 +4375,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4423,6 +4451,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4530,6 +4559,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4615,6 +4645,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4777,6 +4808,7 @@ fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             objective: "Inspect child behavior".into(),
@@ -4821,6 +4853,7 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect the target".into(),
@@ -4866,6 +4899,7 @@ fn inspect_task_includes_the_authoritative_recorded_workspace() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id,
             objective: "Inspect workspace assignment".into(),
@@ -4970,6 +5004,7 @@ fn subscription_snapshot_includes_recorded_task_workspace() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id,
             objective: "Publish workspace assignment".into(),
@@ -5027,6 +5062,7 @@ fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id.clone(),
             objective: "Unrelated task".into(),
@@ -5186,6 +5222,7 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id.clone(),
             objective: "Child task".into(),
@@ -5403,6 +5440,7 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Implement the parser".into(),
@@ -5756,6 +5794,7 @@ fn delivered_child_over_ipc(
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             objective: "Implement the parser".into(),
@@ -5970,6 +6009,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -6024,6 +6064,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -6184,6 +6225,7 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             objective: objective.clone(),
@@ -6258,6 +6300,7 @@ fn delivered_application_child_over_ipc(
     let IpcResponse::TaskSpawned { task_id: child } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -6368,6 +6411,7 @@ fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
     let sibling_response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: capability.clone(),

@@ -12,7 +12,9 @@ use yi_agent_core::subagent::task::{
     DeliveryReport, IntegrationValidation, PauseReason, PermissionRequestId, RootSessionId,
     TaskDepth, TaskId, TaskState,
 };
-use yi_agent_core::subagent::worker::{AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart};
+use yi_agent_core::subagent::worker::{
+    AgentWorkerFactory, SpawnRequest, WorkerError, WorkerHandle, WorkerStart,
+};
 use yi_agent_core::{
     ChildWriteMode, ContentBlock, ProviderTurnGate, ProviderTurnLease, ToolRegistry,
 };
@@ -235,8 +237,11 @@ fn spawning_with_an_objective_retains_the_worker_instruction() {
     let child = supervisor
         .spawn_with_objective(
             root,
-            "Audit the scheduler fairness tests".into(),
-            ChildWriteMode::ReadOnly,
+            SpawnRequest::new(
+                "Audit the scheduler fairness tests".into(),
+                ChildWriteMode::ReadOnly,
+                None,
+            ),
         )
         .unwrap();
 
@@ -252,10 +257,16 @@ fn children_default_to_read_only_and_can_be_spawned_as_coding() {
     let root = supervisor.root_task_id().clone();
 
     let read_only = supervisor
-        .spawn_with_objective(root.clone(), "audit".into(), ChildWriteMode::ReadOnly)
+        .spawn_with_objective(
+            root.clone(),
+            SpawnRequest::new("audit".into(), ChildWriteMode::ReadOnly, None),
+        )
         .unwrap();
     let coding = supervisor
-        .spawn_with_objective(root.clone(), "implement".into(), ChildWriteMode::Coding)
+        .spawn_with_objective(
+            root.clone(),
+            SpawnRequest::new("implement".into(), ChildWriteMode::Coding, None),
+        )
         .unwrap();
 
     assert_eq!(

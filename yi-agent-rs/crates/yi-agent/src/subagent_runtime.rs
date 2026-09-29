@@ -1117,6 +1117,18 @@ fn spawn_mode(args: &Value) -> Result<ChildWriteMode, ToolResult> {
     }
 }
 
+/// Resolves the optional `workdir` argument for a daemon `spawn_agent` call.
+/// A blank or non-string value is rejected rather than silently ignored; an
+/// omitted workdir means the runtime chooses the child's position.
+fn spawn_workdir(args: &Value) -> Result<Option<String>, ToolResult> {
+    match args.get("workdir") {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) => Err(ToolResult::error("workdir must not be blank")),
+        Some(_) => Err(ToolResult::error("workdir must be a string")),
+    }
+}
+
 /// Resolves the optional `model` argument for a daemon `spawn_agent` call.
 /// An omitted model means the child inherits its parent's; a blank or
 /// non-string value is rejected rather than silently ignored.
@@ -1203,6 +1215,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model for this child. Omit to inherit yours."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
                 }
             },
             "required": ["task"],
@@ -1225,6 +1241,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(model) => model,
             Err(error) => return error,
         };
+        let workdir = match spawn_workdir(&args) {
+            Ok(workdir) => workdir,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
@@ -1234,6 +1254,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
                 model,
+                workdir,
             },
         );
         match response {
@@ -1524,6 +1545,10 @@ impl Tool for DaemonSpawnAgentTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model for this child. Omit to inherit yours."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
                 }
             },
             "required": ["task"],
@@ -1546,6 +1571,10 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(model) => model,
             Err(error) => return error,
         };
+        let workdir = match spawn_workdir(&args) {
+            Ok(workdir) => workdir,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
@@ -1554,6 +1583,7 @@ impl Tool for DaemonSpawnAgentTool {
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
                 model,
+                workdir,
             },
         );
         match response {
@@ -3051,6 +3081,7 @@ mod tests {
         } = send_request(
             daemon.socket_path(),
             IpcRequest::SpawnChild {
+                workdir: None,
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
@@ -3099,6 +3130,7 @@ mod tests {
         } = send_request(
             daemon.socket_path(),
             IpcRequest::SpawnChild {
+                workdir: None,
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
