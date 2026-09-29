@@ -2358,40 +2358,6 @@ mod tests {
     }
 
     #[test]
-    fn non_git_workspace_service_supports_only_read_only() {
-        let directory = tempfile::TempDir::new().unwrap();
-        if std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(directory.path())
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            eprintln!("skip: temp dir is inside a git repository");
-            return;
-        }
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-
-        assert!(!service.supports_coding());
-
-        let workspace = service
-            .read_only_workspace(None, &TaskId::new())
-            .expect("read-only workspace is always available");
-        assert_eq!(workspace.path, directory.path());
-        assert!(workspace.branch.is_empty());
-        assert!(workspace.base_commit.is_empty());
-    }
-
-    #[test]
-    fn git_workspace_service_supports_coding() {
-        let directory = tempfile::TempDir::new().unwrap();
-        initialize_git_repository(directory.path());
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-
-        assert!(service.supports_coding());
-    }
-
-    #[test]
     fn read_only_workspace_inherits_the_parent_path() {
         let directory = tempfile::TempDir::new().unwrap();
         let service = DaemonWorkspaceService::new(directory.path().to_path_buf());

@@ -70,8 +70,6 @@ pub enum RuntimeCoordinatorError {
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
     Supervisor(String),
-    #[error("coding requires a git repository")]
-    CodingRequiresGitRepository,
     #[error("authority denied: {0}")]
     AuthorityDenied(String),
     #[error(transparent)]
@@ -1180,21 +1178,6 @@ impl RuntimeCoordinator {
         let supervisor = self.supervisor(session)?;
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
-            // A read-only task owns no worktree, so it cannot integrate a coding
-            // child's delivery: reject the escalation outright. Sessions whose
-            // workspace service cannot code at all (non-git) keep their specific
-            // `CodingRequiresGitRepository` provisioning failure instead.
-            let session_supports_coding = self
-                .workspace_service_for(session)
-                .is_some_and(|service| service.supports_coding());
-            if workspace_mode == ChildWriteMode::Coding
-                && session_supports_coding
-                && supervisor.workspace_mode(parent) == ChildWriteMode::ReadOnly
-            {
-                return Err(RuntimeCoordinatorError::Supervisor(
-                    "read-only tasks cannot spawn coding children".into(),
-                ));
-            }
             let child = supervisor.spawn_with_objective(
                 parent.clone(),
                 yi_agent_core::subagent::worker::SpawnRequest::new(
@@ -1314,12 +1297,7 @@ impl RuntimeCoordinator {
         ) {
             Ok(workspace) => workspace,
             Err(error) => {
-                let reason = match &error {
-                    RuntimeCoordinatorError::CodingRequiresGitRepository => {
-                        "coding_requires_git_repository"
-                    }
-                    _ => "workspace_provision_failed",
-                };
+                let reason = "workspace_provision_failed";
                 let evidence = serde_json::to_string(&serde_json::json!({
                     "reason": reason,
                     "error": error.to_string(),
@@ -1684,9 +1662,6 @@ impl RuntimeCoordinator {
                 .assign_workspace(task, workspace.lease_id.clone())
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
             return Ok(Some(workspace));
-        }
-        if !service.supports_coding() {
-            return Err(RuntimeCoordinatorError::CodingRequiresGitRepository);
         }
         let task_snapshot = supervisor
             .task(task)
