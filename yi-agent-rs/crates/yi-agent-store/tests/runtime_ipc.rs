@@ -5641,3 +5641,74 @@ fn a_stale_socket_left_by_a_killed_daemon_does_not_block_a_new_daemon() {
         .expect("a stale socket node must not block a new daemon");
     drop(restarted);
 }
+
+#[test]
+fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
+    // Every other read-side test builds its connection with UnixStream::pair,
+    // which is blocking and therefore cannot reproduce the production defect:
+    // a connection accepted by the non-blocking listener inherits O_NONBLOCK.
+    // Only a real daemon exercises the accepted-connection path, and only a
+    // payload past the 8192-byte send buffer makes truncation observable.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let IpcResponse::SessionCreated {
+        session_id,
+        root_task_id,
+    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
+    else {
+        panic!("expected a created session");
+    };
+
+    // The objective is persisted verbatim as the task's delivery_json, so a
+    // large objective produces a large InspectTask response.
+    let objective = "x".repeat(64 * 1024);
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            session_id,
+            parent_task_id: root_task_id,
+            objective: objective.clone(),
+            mode: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child task");
+    };
+
+    // Read raw bytes rather than JSON: a truncated frame is only detectable by
+    // its missing terminator, and serde would report a parse error instead.
+    let request = json!({
+        "protocol_version": 1,
+        "request_id": "large-response",
+        "command": { "type": "InspectTask", "task_id": task_id },
+    });
+    let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
+    writeln!(stream, "{request}").unwrap();
+    stream.flush().unwrap();
+
+    let mut line = Vec::new();
+    BufReader::new(stream).read_until(b'\n', &mut line).unwrap();
+
+    assert!(
+        line.ends_with(b"\n"),
+        "response was truncated at {} bytes without a terminator",
+        line.len()
+    );
+    assert!(
+        line.len() > 8 * 1024,
+        "expected a response past the send buffer, got {} bytes",
+        line.len()
+    );
+
+    let envelope: Value = serde_json::from_slice(&line).unwrap();
+    let detail = &envelope["result"];
+    assert_eq!(detail["type"], "TaskDetail");
+    let delivery = detail["delivery_json"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(delivery).unwrap()["objective"],
+        Value::String(objective),
+        "the delivered objective must survive the round trip intact"
+    );
+}

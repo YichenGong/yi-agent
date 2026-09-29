@@ -35,6 +35,11 @@ const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_EVENT_FRAMES: usize = 1024;
 const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
+// A command response may legitimately reach MAX_FRAME_BYTES (1 MiB). Writing
+// that through a socket whose peer reads slowly takes far longer than the 1s
+// timeout used to detect half-open readers, so the write side gets its own,
+// much looser budget.
+const COMMAND_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 // Invalid JSON has no trustworthy request ID to echo, so its error frame uses
 // this documented stable empty identifier.
 const MISSING_REQUEST_ID: &str = "";
@@ -133,6 +138,10 @@ pub enum IpcError {
     AlreadyRunning { path: PathBuf },
     #[error("IPC frame exceeds {MAX_FRAME_BYTES} bytes")]
     FrameTooLarge,
+    #[error("IPC response frame is truncated after {received} bytes (the peer closed mid-frame)")]
+    TruncatedFrame { received: usize },
+    #[error("timed out writing response frame after {written} of {total} bytes")]
+    FrameWriteTimeout { written: usize, total: usize },
     #[error("daemon listener thread panicked during shutdown")]
     ListenerPanicked,
     #[error(
@@ -1014,7 +1023,10 @@ fn handle_client(
     confirmations: &Arc<ConfirmationStore>,
 ) -> Result<(), IpcError> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    // The read timeout guards against a half-open peer and stays tight. The
+    // write timeout must span a full 1 MiB response to a slow reader, so it
+    // tracks COMMAND_WRITE_DEADLINE rather than the read budget.
+    stream.set_write_timeout(Some(COMMAND_WRITE_DEADLINE))?;
     let frame = match read_incoming_frame(&mut BufReader::new(stream.try_clone()?))? {
         Some(IncomingFrame::TooLarge(prefix)) => {
             return write_response_frame(
@@ -1732,6 +1744,50 @@ fn response_envelope(
     }
 }
 
+/// Writes a whole frame, tolerating partial writes and backpressure.
+///
+/// The accepted connection inherits `O_NONBLOCK` from the non-blocking
+/// listener, so a single `write` consumes only what fits in the socket send
+/// buffer (8192 bytes on macOS) and then reports `WouldBlock`. `write_all`
+/// treats that as fatal and abandons the response mid-frame; this loops
+/// instead, sleeping briefly until the peer drains the buffer or the deadline
+/// expires.
+fn write_frame_until(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), IpcError> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write response frame",
+                )));
+            }
+            Ok(step) => written += step,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(IpcError::FrameWriteTimeout {
+                        written,
+                        total: bytes.len(),
+                    });
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(IpcError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
 fn write_envelope_frame(
     stream: &mut UnixStream,
     envelope: &ResponseEnvelope,
@@ -1750,8 +1806,9 @@ fn write_envelope_frame(
         ))?,
         Err(error) => return Err(error),
     };
-    stream.write_all(&frame)?;
-    stream.write_all(b"\n")?;
+    let deadline = Instant::now() + COMMAND_WRITE_DEADLINE;
+    write_frame_until(stream, &frame, deadline)?;
+    write_frame_until(stream, b"\n", deadline)?;
     stream.flush()?;
     Ok(())
 }
@@ -2028,6 +2085,65 @@ mod subscription_queue_tests {
     }
 
     #[test]
+    fn a_truncated_response_is_reported_as_truncated_not_as_oversized() {
+        // A peer that closes mid-frame yields a frame without its terminator.
+        // That is a *transport* failure, not a size violation; conflating the two
+        // sends operators chasing a payload-size limit that was never hit.
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"{\"partial\":").unwrap();
+        writer.shutdown(Shutdown::Write).unwrap();
+
+        let mut reader = BufReader::new(reader);
+        let error = read_limited_frame(&mut reader).unwrap_err();
+
+        assert!(
+            matches!(error, IpcError::TruncatedFrame { .. }),
+            "a closed mid-frame response must be TruncatedFrame, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_over_the_cap_is_reported_as_too_large_not_truncated() {
+        // The genuine size violation keeps its own distinct error.
+        //
+        // The payload is larger than the socket buffer, so it has to be written
+        // from its own thread: a same-thread write fills the buffer and blocks
+        // before this thread ever reaches read_limited_frame, hanging the test
+        // instead of exercising the error path.
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let pump = std::thread::spawn(move || {
+            let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+            writer.write_all(&oversized).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        });
+
+        let mut reader = BufReader::new(reader);
+        let error = read_limited_frame(&mut reader).unwrap_err();
+
+        assert!(
+            matches!(error, IpcError::FrameTooLarge),
+            "a frame past the cap must stay FrameTooLarge, got: {error:?}"
+        );
+        pump.join().unwrap();
+    }
+
+    #[test]
+    fn truncation_and_write_timeout_map_to_validation_not_internal() {
+        assert_eq!(
+            ipc_error_code(&IpcError::TruncatedFrame { received: 12 }),
+            IpcErrorCode::Validation
+        );
+        assert_eq!(
+            ipc_error_code(&IpcError::FrameWriteTimeout {
+                written: 8192,
+                total: 26000,
+            }),
+            IpcErrorCode::Validation
+        );
+    }
+
+    #[test]
     fn subscription_failure_after_initial_frame_does_not_append_an_error_frame() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(br#"{"partial":"#).unwrap();
@@ -2065,6 +2181,44 @@ mod subscription_queue_tests {
             )
         };
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_send_buffer_is_written_in_full() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        set_send_buffer(&writer, 4 * 1024);
+
+        let payload = vec![b'x'; 64 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        // Drain until EOF rather than a byte count: the frame is payload plus
+        // its terminator, so stopping at `payload.len()` closes the reader
+        // before the trailing newline is written and the writer sees BrokenPipe.
+        let pump = std::thread::spawn(move || {
+            let mut drained = 0usize;
+            let mut scratch = [0u8; 8192];
+            loop {
+                match reader.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(n) => drained += n,
+                    Err(_) => break,
+                }
+            }
+            drained
+        });
+
+        write_frame_until(&mut writer, &payload, deadline).unwrap();
+        write_frame_until(&mut writer, b"\n", deadline).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let drained = pump.join().unwrap();
+        assert_eq!(
+            drained,
+            payload.len() + 1,
+            "the whole frame, terminator included, must reach the peer"
+        );
     }
 
     fn wait_until_socket_has_bytes(stream: &UnixStream) -> bool {
@@ -2180,7 +2334,13 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             IpcErrorCode::Validation
         }
-        IpcError::Json(_) | IpcError::FrameTooLarge => IpcErrorCode::Validation,
+        // Transport-layer failures stay Validation: a truncated or timed-out
+        // response is not a daemon fault, and reporting it as Internal sends
+        // operators hunting for a crashed daemon that is running fine.
+        IpcError::Json(_)
+        | IpcError::FrameTooLarge
+        | IpcError::TruncatedFrame { .. }
+        | IpcError::FrameWriteTimeout { .. } => IpcErrorCode::Validation,
         _ => IpcErrorCode::Internal,
     }
 }
@@ -2261,8 +2421,13 @@ fn read_limited_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, Ipc
     if read == 0 {
         return Ok(None);
     }
-    if frame.len() > MAX_FRAME_BYTES || !frame.ends_with(b"\n") {
+    if frame.len() > MAX_FRAME_BYTES {
         return Err(IpcError::FrameTooLarge);
+    }
+    if !frame.ends_with(b"\n") {
+        return Err(IpcError::TruncatedFrame {
+            received: frame.len(),
+        });
     }
     frame.pop();
     Ok(Some(frame))
