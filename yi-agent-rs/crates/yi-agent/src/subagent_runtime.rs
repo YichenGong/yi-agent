@@ -107,10 +107,11 @@ impl DaemonAgentWorkerFactory {
     ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
         let (sandbox, writable_roots) = match workspace_mode {
-            TaskWorkspaceMode::Coding => (
-                self.sandbox,
-                git_dir_for_worktree(&workspace.path).into_iter().collect(),
-            ),
+            TaskWorkspaceMode::Coding => {
+                let mut writable_roots = vec![workspace.path.clone()];
+                writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
+                (self.sandbox, writable_roots)
+            }
             TaskWorkspaceMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
         yi_agent_tools::register_builtin_tools_with_sandbox(
@@ -733,6 +734,22 @@ fn is_empty_delivery_error(error: &WorkerError) -> bool {
     error
         .to_string()
         .contains("child delivery has no commits beyond")
+}
+
+fn git_writable_roots_for_worktree(workspace: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(git_dir) = git_dir_for_worktree(workspace) {
+        roots.push(git_dir.clone());
+        if let Some(common_dir) = git_output(workspace, &["rev-parse", "--git-common-dir"]) {
+            let common_dir = PathBuf::from(common_dir);
+            roots.push(if common_dir.is_absolute() {
+                common_dir
+            } else {
+                workspace.join(common_dir)
+            });
+        }
+    }
+    roots
 }
 
 fn git_dir_for_worktree(workspace: &std::path::Path) -> Option<PathBuf> {
@@ -1500,12 +1517,43 @@ mod tests {
                 .is_error
         );
         let bash = registry.get("bash").expect("bash tool");
+        let add = bash.call(json!({"command":"git add delivery.txt"})).await;
         assert!(
-            !bash
-                .call(json!({"command":"git add delivery.txt"}))
-                .await
-                .is_error,
-            "child sandbox must permit its Git index writes"
+            !add.is_error,
+            "child sandbox must start Git staging: {add:?}"
+        );
+        assert!(
+            matches!(
+                add.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "child sandbox must permit its Git index writes: {add:?}"
+        );
+        let commit = bash
+            .call(json!({
+                "command": "git -c user.name=test -c user.email=test@example.invalid commit -m delivery"
+            }))
+            .await;
+        assert!(
+            !commit.is_error,
+            "child sandbox must start Git commit: {commit:?}"
+        );
+        assert!(
+            matches!(
+                commit.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "child sandbox must permit Git commit metadata writes: {commit:?}"
+        );
+        assert_eq!(
+            git_output(&workspace.path, &["status", "--porcelain"]),
+            None,
+            "a committed child delivery must leave its worktree clean",
+        );
+        assert_ne!(
+            git_output(&workspace.path, &["rev-parse", "HEAD"]),
+            Some(workspace.base_commit),
+            "the child commit must advance HEAD beyond its delivery base",
         );
     }
 
