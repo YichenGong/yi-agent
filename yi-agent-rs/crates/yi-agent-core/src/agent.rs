@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::message::{ContentBlock, Message};
+use crate::message::{ContentBlock, Message, Role};
 use crate::provider::{
     GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, StreamEnd,
     TokenUsage,
@@ -440,6 +440,34 @@ impl Agent {
     }
 }
 
+/// Rollback length for a cancelled run under the "preserve completed work"
+/// policy: keep this run's user prompt plus every assistant/tool round-trip that
+/// already completed, and drop only a trailing assistant message whose tool_use
+/// has no matching tool_result.
+///
+/// A cancel during THINK leaves the session ending on the user message (nothing
+/// is dropped); a cancel during ACT leaves a trailing `assistant(tool_use)` whose
+/// results were never observed, which must go or the next provider request is
+/// rejected for an unpaired tool_use.
+fn safe_cancel_truncate_len(session: &Session) -> usize {
+    let messages = session.messages();
+    match messages.last() {
+        Some(last) if last.role == Role::Assistant && has_tool_use(last) => messages.len() - 1,
+        // The session is empty, ends on the user prompt, or ends on an already
+        // paired tool_result round-trip: everything present is safe to keep.
+        _ => messages.len(),
+    }
+}
+
+/// Whether a message carries any `tool_use` block (and therefore needs a
+/// following `tool_result` to keep the transcript valid for the provider).
+fn has_tool_use(message: &Message) -> bool {
+    message
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+}
+
 /// Delay before stall retry `attempt` (1-based): `base * 2^(attempt-1)`,
 /// capped at 30s to match the runtime retry policy.
 fn stall_backoff_delay(base: std::time::Duration, attempt: u16) -> std::time::Duration {
@@ -492,11 +520,6 @@ async fn run_loop(
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
-    // 记录进入 run_loop 时的 session 长度(含 Agent::run push 的 user 消息,
-    // 不含任何 assistant 回复)。cancel 时 truncate 到此长度,回滚悬空的
-    // assistant(tool_use),避免下次 run 被 Anthropic API 拒绝(tool_use
-    // 必须跟 tool_result)。
-    let session_len = session.lock().unwrap().len();
     let mut turn = 0u32;
     let mut verification_pending = false;
     let mut audit_attempted = false;
@@ -627,10 +650,10 @@ async fn run_loop(
                 },
                 _ = cancel_token.cancelled() => {
                     info!(turn, "agent loop cancelled during think");
-                    // THINK 阶段 cancel: session 里只有 user 消息(无 assistant
-                    // 回复),truncate 到 session_len 保留 user 消息(可接受,
-                    // Anthropic 允许 user 无 assistant 回复)。
-                    session.lock().unwrap().truncate(session_len);
+                    // Cancel during THINK: no assistant reply exists yet, so this
+                    // keeps the run's user prompt and every completed round-trip.
+                    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+                    session.lock().unwrap().truncate(keep);
                     let _ = tx.send(AgentEvent::Cancelled).await;
                     return;
                 }
@@ -684,7 +707,10 @@ async fn run_loop(
                         _ = tokio::time::sleep(delay) => {}
                         _ = cancel_token.cancelled() => {
                             info!(turn, "agent loop cancelled during retry backoff");
-                            session.lock().unwrap().truncate(session_len);
+                            // Same policy as the other cancel points: keep the
+                            // run's user prompt and completed round-trips.
+                            let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+                            session.lock().unwrap().truncate(keep);
                             let _ = tx.send(AgentEvent::Cancelled).await;
                             return;
                         }
@@ -1014,11 +1040,13 @@ async fn run_loop(
             r = futures::future::join_all(futures) => r,
             _ = cancel_token.cancelled() => {
                 info!(turn, "agent loop cancelled during act");
-                // ACT 阶段 cancel: session 里有 user + assistant(tool_use),
-                // 但无对应 tool_result。truncate 到 session_len(含 user,
-                // 不含 assistant)回滚悬空的 tool_use,避免下次 run 被
-                // Anthropic API 拒绝。
-                session.lock().unwrap().truncate(session_len);
+                // Cancel during ACT: the session holds this run's user prompt,
+                // every completed round-trip, and a trailing assistant(tool_use)
+                // whose results were never observed. Dropping that last message
+                // keeps the transcript valid (no unpaired tool_use) while
+                // preserving the completed work.
+                let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+                session.lock().unwrap().truncate(keep);
                 let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }
@@ -2189,6 +2217,16 @@ mod tests {
             !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
             "should NOT have Done event"
         );
+        // Cancel during THINK keeps this run's user prompt (B policy: preserve
+        // completed work); nothing has been produced yet, so the session ends on
+        // the user message.
+        assert_eq!(
+            agent.session().len(),
+            1,
+            "THINK cancel must keep the run's user prompt: {:?}",
+            agent.session().messages()
+        );
+        assert_eq!(agent.session().messages()[0].role, Role::User);
     }
 
     /// When the provider stream emits a TextDelta then stalls (no Stop event),
@@ -2484,15 +2522,19 @@ mod tests {
             "should NOT have ToolResult (tool was still running)"
         );
 
-        // Fix 2: ACT 阶段 cancel 后,session 应回滚到 cancel 前长度
-        // (只含 user 消息,不含悬空的 assistant(tool_use))。
+        // B policy: keep this run's user prompt, drop only the trailing
+        // assistant(tool_use) whose results were never observed.
         let session = agent.session();
         assert_eq!(
             session.len(),
             1,
-            "session should be rolled back to only the user message"
+            "session should keep the user prompt and drop the dangling tool_use"
         );
         assert_eq!(session.messages()[0].role, Role::User);
+        assert!(
+            !session.messages().iter().any(|m| m.role == Role::Assistant),
+            "no dangling assistant(tool_use) may remain"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2530,17 +2572,117 @@ mod tests {
         let _ = collect_events(stream);
 
         let session = agent.session();
-        // session 应只含 user 消息(1 条),不含 assistant(tool_use)。
+        // B policy: keep the user prompt; only the dangling assistant(tool_use)
+        // is dropped, so the session ends on the user message.
         assert_eq!(
             session.len(),
             1,
-            "session should contain only the user message after ACT cancel"
+            "session should keep the user prompt after ACT cancel"
         );
         assert_eq!(session.messages()[0].role, Role::User);
-        // 确认没有任何 Assistant 消息残留(tool_use 悬空)。
         assert!(
             !session.messages().iter().any(|m| m.role == Role::Assistant),
             "no Assistant message should remain after ACT cancel"
+        );
+    }
+
+    /// B policy: a multi-step turn that already completed a round-trip must keep
+    /// that work when a *later* step is cancelled — only the trailing, unpaired
+    /// assistant(tool_use) is dropped. This is the case that distinguishes the
+    /// "preserve completed work" policy from dropping the whole turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_keeps_completed_round_trips_and_drops_only_the_dangling_tool_use() {
+        // Step 1: a text-free, read-only tool round-trip that completes. Because
+        // it emits no text, the loop continues (rather than ending) and asks the
+        // provider again.
+        // Step 2: another tool_use whose tool hangs until cancelled.
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "done".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "done".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "done".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "hang".into(),
+                    name: "hang".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "hang".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "hang".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool)); // name "upper"
+        tools.register(Arc::new(HangingTool)); // name "hang"
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let stream = agent.run("go".into()).await.unwrap();
+        let cancel_token = agent.cancel_token();
+        let _handle = tokio::spawn(async move {
+            // Long enough for step 1's round-trip to commit and step 2's tool to
+            // start hanging, then cancel.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            cancel_token.cancel();
+        });
+        let events = collect_events(stream);
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "expected Cancelled, got: {events:?}"
+        );
+
+        let session = agent.session();
+        let roles: Vec<Role> = session.messages().iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![Role::User, Role::Assistant, Role::Tool],
+            "user + completed round-trip (assistant + tool_results) must survive"
+        );
+        // The surviving assistant must be step 1's (paired) tool_use, not the
+        // dangling step-2 tool_use.
+        let ast = &session.messages()[1];
+        let ids: Vec<&str> = ast
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["done"], "only the completed tool_use survives");
+        // The trailing message is the paired tool_results, and no unpaired
+        // assistant(tool_use) remains.
+        let tool_results = &session.messages()[2];
+        let paired: Vec<&str> = tool_results
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paired, vec!["done"], "the completed tool_result is retained");
+        assert!(
+            !session.messages().iter().any(|m| m.role == Role::Assistant
+                && m.content.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::ToolUse { id, .. } if id == "hang"
+                ))),
+            "the dangling step-2 tool_use must not remain"
         );
     }
 
