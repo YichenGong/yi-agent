@@ -126,30 +126,25 @@ turn/started → status:"running" → <turn/start 响应> → item/started
 这条不变量用一句话概括：**本地已有的状态只由推送写，快照只负责播种。**
 把 `seed()` 里"覆盖安全"的注释改成这条不变量的说明。
 
-### 2.3 A：输入框"发送/停止"改用 session 状态（消除第二个判定源）
+### 2.3 A：不对的地方——输入框的 `turnActive` 已是对的
 
-`App.tsx:394` 传给 `MessageInput` 的 `turnActive` 从
-`current.session.turnActive` 取，而它**已经**是 session 状态了。A 的实际问题
-不在这一行，而在 §2.1 的 `send()` 用 `statuses[id]` 判方法——修完 §2.1 后，
-两个判定源仍然存在。
+原设计（本文件初稿）打算把 `send()` 的**首选**判定也改成 `session.turnActive`。
+实现时发现这条改不动，且原因值得记录：
 
-为避免二者分叉（运行时提示"Stop"、按下却发 `turn/start` 被 `-32012` 拒），
-`send()` 的**首选**判定也改为 `session.turnActive`：
+`MessageInput` 在 `turnActive` 为真时把按钮渲染成 **"Stop"** 并绑定
+`onInterrupt`，Enter 也走中断分支（`MessageInput.tsx:51`/`:64`）。
+也就是说 **`turnActive === true` 时根本不存在可点的 "Send"**——"发送"这条路径
+只在 `turnActive === false` 时可达。
 
-- `turnActive === true` → `turn/interject`
-- `turnActive === false` → `turn/start`
+于是"首选方法跟随界面"这件事，在 A 的层面**已经由 `MessageInput` 保证了**：
+界面显示 Send 时 `turnActive` 必为 false，`statuses` 若仍是过期的 `running`，
+才产生分歧。把首选判定改成 `turnActive` 会让这个可达场景下首选变成
+`turn/start`，反而**破坏**"运行中把话折叠进当前 turn"的产品行为，并使既有
+测试 `uses turn/interject instead of turn/start while a turn is running` 失去意义。
 
-这样"按钮显示 Send"与"实际发 `turn/start`"永远一致；随后的错误码自愈
-（§2.1）再兜住两侧都存在的竞态窗口。
-
-**代价（明示）：** `turnActive` 依赖 `turn/started`/`turn/completed` 两条
-通知的到达。若用户极快地连续两次发送（第二次在 `turn/started` 到达前），
-第二次会走 `turn/start` 并被 `-32012` 拒绝，随后由 §2.1 自愈为
-`turn/interject`。净效果正确、最多多一次往返；这是把"界面提示"与"实际方法"
-绑定的必然代价，可接受。
-
-**排除：** 让 `send()` 继续用 `statuses[id]`——那正是 A/B 的误判源，且会与
-按钮提示分叉。
+**结论：** 首选判定保留 `statuses[id]`（可点击路径下的最佳猜测），由 §2.1 的
+错误码自愈负责兜住两侧的分歧窗口。这比"改判定源"更小、更准确。
+`session.turnActive` 仍在自愈时被同步纠正（服务端才是权威）。
 
 ### 2.4 测试
 
@@ -161,8 +156,9 @@ turn/started → status:"running" → <turn/start 响应> → item/started
    `turn/interject`，气泡保留。
 3. 不无限循环：两跳都失败时，`turn/start` 与 `turn/interject` 各只出现一次，
    且 `lastError` 有值、乐观气泡被回滚。
-4. 首选方法跟随「界面显示」：`turn/started` 后（`turnActive=true`）发送
-   → 首选 `turn/interject`；`turn/completed` 后 → 首选 `turn/start`。
+4. 首选方法跟随缓存状态：`running` 状态（经 listAll 播种）下发送 → 首选
+   `turn/interject`；`idle` 下发送 → 首选 `turn/start`。（既有测试
+   `uses turn/interject ...` / `still uses turn/start ...` 即覆盖。）
 
 **`desktop/src/lib/threadStore.test.ts`（单元）**
 
@@ -184,7 +180,7 @@ cd desktop && npm run build
 
 | 文件 | 改动 |
 |---|---|
-| `desktop/src/App.tsx` | `send()` 抽成"首选方法 + 错误码自愈（最多两跳）"；首选判定改用 `session.turnActive` |
+| `desktop/src/App.tsx` | `send()` 抽成"首选方法（按缓存状态）+ 错误码自愈（最多两跳）"；自愈时同步纠正 `session.turnActive` 与缓存状态 |
 | `desktop/src/lib/threadStore.ts` | `seed()` 加"不回退既有状态"不变量；更新注释表述 |
 | `desktop/src/App.test.tsx` | +4 个集成用例（自愈两向、不循环、首选跟随界面） |
 | `desktop/src/lib/threadStore.test.ts` | +2 个单元用例（不回退 / 仍播种） |
@@ -203,3 +199,7 @@ cd desktop && npm run build
   版本号属于协议演进，留作独立议题。
 - **不改 `refreshThreads` 的调用时机**：它仍负责刷新标题/时间/分组，
   只是不再污染状态。
+- **不改 `send()` 的首选判定源**（保留 `statuses[id]`）：`MessageInput` 在
+  `turnActive` 为真时按钮就是 "Stop"，"发送"路径只在 `turnActive === false`
+  时可达，故首选判定必须是缓存状态，否则会破坏"运行中折叠进当前 turn"的
+  产品行为。见 §2.3。
