@@ -459,6 +459,13 @@ impl HistoryState {
                     label: Some(format!("Error: {err}")),
                 });
             }
+            // `stage`/`cause` are deliberately dropped: the raw diagnostic is
+            // in the trace, and rendering it here buried the remedy behind
+            // `Error { code: ... }` noise. See `runtime_restart_notice`.
+            AgentEvent::SubagentRuntimeUnavailable { .. } => {
+                self.cells
+                    .push(crate::tui::subagents::runtime_restart_notice());
+            }
             AgentEvent::PermissionRequest {
                 request_id,
                 tool_name,

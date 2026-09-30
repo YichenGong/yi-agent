@@ -344,6 +344,12 @@ impl Translator {
             // `toolCall` 卡片里出现一次(且分片到达时会显示成半截 JSON)。TUI
             // (`tui/history.rs` 的 `DecodeDelta => 不跟踪`)与 headless drain 都
             // 有意忽略它,这里同样忽略。
+            // App-server has no runtime bring-up of its own, so this event is
+            // unreachable from its driver; a non-exhaustive arm would silently
+            // swallow a future producer's notice.
+            AgentEvent::SubagentRuntimeUnavailable { .. } => {
+                tracing::warn!("subagent runtime unavailable for this session");
+            }
             AgentEvent::Start
             | AgentEvent::ToolRetry { .. }
             | AgentEvent::EstimatedPrefill(_)
@@ -390,6 +396,19 @@ mod tests {
         let mut t = Translator::new("th1".into());
         t.set_turn("turn1".into());
         t
+    }
+
+    /// App-server runs no runtime bring-up of its own, so this must not be
+    /// mistaken for a turn failure (which would abort a turn the user can
+    /// actually continue).
+    #[test]
+    fn subagent_runtime_unavailable_is_not_a_turn_failure() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::SubagentRuntimeUnavailable {
+            stage: "runtime attach".into(),
+            cause: "file is not a database".into(),
+        });
+        assert!(out.is_empty(), "unexpected notifications: {out:?}");
     }
 
     #[test]

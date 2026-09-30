@@ -267,6 +267,18 @@ pub enum AgentEvent {
         message: String,
     },
     Cancelled,
+    /// The subagent runtime the user asked for could not be started or
+    /// activated, so this session runs without delegation.
+    ///
+    /// Distinct from `Error`: bring-up is best-effort and the session stays
+    /// usable, so consumers must report this as a notice that names the remedy
+    /// (restart) instead of rendering it as a turn failure. `stage` is the
+    /// internal bring-up step and `cause` the raw diagnostic; both are for the
+    /// trace and for non-TUI consumers, not for the user-visible line.
+    SubagentRuntimeUnavailable {
+        stage: String,
+        cause: String,
+    },
     Error(AgentError),
     PermissionRequest {
         request_id: u64,

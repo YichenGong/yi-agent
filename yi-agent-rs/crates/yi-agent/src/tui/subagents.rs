@@ -38,6 +38,23 @@ pub struct AttachedRoot {
     pub workspace: WorkerWorkspace,
 }
 
+/// The Chinese line shown when the runtime the user asked for (`y`, or a
+/// remembered `always`) could not be started or activated.
+///
+/// Bring-up is best-effort: a runtime that cannot start degrades the session to
+/// no-delegation rather than aborting it, so the notice must keep the session
+/// usable *and* tell the user how to get delegation back. The raw cause is
+/// logged (see `main.rs`) instead of rendered: an
+/// `Error { code: InvalidState, message: ... }` dump buries the remedy, and
+/// every failure kind clears the same way -- a fresh process.
+pub const RUNTIME_RESTART_NOTICE: &str = "子 Agent runtime 未能启用；重启 yi-agent 后即可用";
+
+pub fn runtime_restart_notice() -> crate::tui::cell::HistoryCell {
+    crate::tui::cell::HistoryCell::Separator {
+        label: Some(RUNTIME_RESTART_NOTICE.to_string()),
+    }
+}
+
 static CURRENT_ATTACHED_ROOT: OnceLock<Mutex<Option<AttachedRoot>>> = OnceLock::new();
 
 pub fn set_current_attached_root(root: AttachedRoot) {
@@ -113,5 +130,46 @@ mod tests {
                 .iter()
                 .any(|command| command.name() == "delegate")
         );
+    }
+}
+
+#[cfg(test)]
+mod restart_notice_tests {
+    use super::*;
+
+    /// The restart notice is the whole user-facing story after a failed `y`, so
+    /// it must name the remedy rather than the fault.
+    #[test]
+    fn the_notice_tells_the_user_to_restart() {
+        let label = label_of(runtime_restart_notice());
+        assert!(label.contains("重启"), "no restart guidance: {label}");
+        assert!(
+            label.contains("子 Agent"),
+            "does not say what is off: {label}"
+        );
+    }
+
+    /// What the user actually saw when the runtime failed to start after `y`:
+    /// one English line (`Error: provider turn admission failed: subagent
+    /// delegation unavailable: ...`) carrying an `IpcError` or
+    /// `Error { code: InvalidState, message: ... }` dump. That reads as an
+    /// internal fault and offers no next step, so the notice must not carry any
+    /// of it -- the raw cause belongs in the trace, which `main.rs` writes.
+    #[test]
+    fn the_notice_never_renders_a_raw_diagnostic() {
+        let label = label_of(runtime_restart_notice());
+        for leak in ["Error", "error", "{", "code:", "unavailable", "admission"] {
+            assert!(
+                !label.contains(leak),
+                "leaked {leak:?} to the user: {label}"
+            );
+        }
+    }
+
+    fn label_of(notice: crate::tui::cell::HistoryCell) -> String {
+        match notice {
+            crate::tui::cell::HistoryCell::Separator { label: Some(label) } => label,
+            other => panic!("expected a labelled separator, got {other:?}"),
+        }
     }
 }

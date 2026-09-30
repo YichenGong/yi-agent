@@ -1439,12 +1439,15 @@ fn run_tui_agent(
                         Some(crate::tui::subagents::RuntimeStartupChoice::Start) => {
                             match attach_tui_runtime(&cli, &config) {
                                 Ok(Some(TuiRuntimeSession::Unavailable { reason })) => {
+                                    tracing::warn!(
+                                        cause = %reason,
+                                        "subagent runtime unavailable; continuing without delegation"
+                                    );
                                     let _ = agent_tx
-                                        .send(yi_agent_core::AgentEvent::Error(
-                                            yi_agent_core::AgentError::ProviderTurnAdmission(
-                                                reason,
-                                            ),
-                                        ))
+                                        .send(yi_agent_core::AgentEvent::SubagentRuntimeUnavailable {
+                                            stage: "runtime attach".to_owned(),
+                                            cause: reason,
+                                        })
                                         .await;
                                 }
                                 Ok(Some(TuiRuntimeSession::Attached(attached))) => {
@@ -1507,12 +1510,16 @@ fn run_tui_agent(
                                             {
                                                 detach_tui_runtime_root(&socket, &root);
                                             }
+                                            let cause = error.to_string();
+                                            tracing::warn!(
+                                                %cause,
+                                                "subagent runtime attach failed; continuing without delegation"
+                                            );
                                             let _ = agent_tx
-                                                .send(yi_agent_core::AgentEvent::Error(
-                                                    yi_agent_core::AgentError::ProviderTurnAdmission(
-                                                        error.to_string(),
-                                                    ),
-                                                ))
+                                                .send(yi_agent_core::AgentEvent::SubagentRuntimeUnavailable {
+                                                    stage: "runtime attach".to_owned(),
+                                                    cause,
+                                                })
                                                 .await;
                                         }
                                     }
@@ -1556,12 +1563,16 @@ fn run_tui_agent(
                             &attached.attached_root,
                             &text,
                         ) {
+                            let cause = error.to_string();
+                            tracing::warn!(
+                                %cause,
+                                "could not activate TUI runtime root; continuing without delegation"
+                            );
                             let _ = agent_tx
-                                .send(yi_agent_core::AgentEvent::Error(
-                                    yi_agent_core::AgentError::ProviderTurnAdmission(
-                                        error.to_string(),
-                                    ),
-                                ))
+                                .send(yi_agent_core::AgentEvent::SubagentRuntimeUnavailable {
+                                    stage: "runtime activation".to_owned(),
+                                    cause,
+                                })
                                 .await;
                             continue;
                         }
