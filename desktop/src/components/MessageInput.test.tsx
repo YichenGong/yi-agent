@@ -58,6 +58,60 @@ describe("MessageInput", () => {
     expect(onSend).toHaveBeenCalledWith("hello");
   });
 
+  it("does not send when Enter confirms an IME candidate (keyCode 229)", () => {
+    // macOS WKWebView (what Tauri uses) rebuilds the committing keydown after the
+    // composition is torn down: isComposing is false, keyCode is forced to 229.
+    const onSend = vi.fn(async () => true);
+    renderInput({ onSend });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+
+    fireEvent.keyDown(textarea, { key: "Enter", keyCode: 229 });
+    expect(onSend).not.toHaveBeenCalled();
+
+    // The next Enter is the user's: it sends.
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("hello");
+  });
+
+  it("does not send while a composition is live", () => {
+    const onSend = vi.fn(async () => true);
+    const onInterrupt = vi.fn();
+    renderInput({ onSend, onInterrupt });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "nihao" } });
+
+    fireEvent.compositionStart(textarea);
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onInterrupt).not.toHaveBeenCalled();
+
+    // A stray Enter before compositionend must still not act on the half-typed
+    // composition, even if the engine forgets isComposing/keyCode.
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(textarea);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("nihao");
+  });
+
+  it("forgets a composition torn down without compositionend", () => {
+    const onSend = vi.fn(async () => true);
+    renderInput({ onSend });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    fireEvent.compositionStart(textarea);
+    fireEvent.blur(textarea);
+    fireEvent.focus(textarea);
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("hi");
+  });
+
   it("sends on Enter but not on Shift+Enter", () => {
     const onSend = vi.fn(async () => true);
     renderInput({ onSend });
