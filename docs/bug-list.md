@@ -49,9 +49,9 @@
   修复：view_image 编码后字节预算 + 阶梯降级 + 占位兜底（`crates/yi-agent-tools/src/fs/view_image.rs`）；验证：`cargo test -p yi-agent-tools --lib fs::view_image`。另注：实测（trace）auto-compact 不会触发（413 在 usage 到达前即 `return`），但手动 `/compact` 能解卡；compaction 图片 token 估算已从 0 改为显式 1844（`crates/yi-agent-core/src/compact.rs`）。
 - [ ] 如果遇到 entry too big问题。当前没有办法维持上下文，也不能compact（因为compact依赖合理上下文长度）。遇到这个情况只能丢弃session重来。
 - [ ] `compact_tool_budget_tokens` 默认值不一致：`agent.rs:118` 与 `runtime/config.rs:357` 为 `12_000`，但 `yi-agent/src/main.rs:1568` 覆写为 `4096`。非阻塞，但属潜在意外，需确认哪一个是期望默认。
-- [ ] 一个新问题。如何在desktop app里面，开启yolo模式。
+- [x] 一个新问题。如何在desktop app里面，开启yolo模式。
 - [ ] 一个问题，如果一个对话前后过长，terminal会变得比较卡顿。TUI里面显示的上下文可以有舍弃。
-- [ ] app目前不支持后台进程。如果一个进程在跑，就没办法检查其他的进程的状态了。
+- [x] app目前不支持后台进程。如果一个进程在跑，就没办法检查其他的进程的状态了。
 - [ ] 目前没有路径进入 subagent 内部看它的内容与进度，CLI 与 App 都缺这条入口。
   CLI：`/agent <task_id>`（`yi-agent-rs/crates/yi-agent/src/tui/app.rs:1870` `daemon_agent_detail_at`）走 `IpcRequest::InspectTask`（`app.rs:1873`），只返回一次性元数据快照——`Agent/session/parent/depth/state/delivery`（`app.rs:1882` 起），看不到 child 的消息流、工具调用与实时进度。目标为两级入口：slash command 默认给进度摘要，并可进一步钻进只读完整轨迹。
   App：app-server 无任何 `agent/` 方法（现有命名空间仅 `thread/`、`turn/`、`item/`、`workspace/`、`config/read`），`desktop/src/components/` 也无 subagent 入口。目标为对话框内给出可点击的 subagent 引用，点开先看进度，再可进入只读轨迹。
