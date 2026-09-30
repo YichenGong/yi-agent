@@ -171,41 +171,44 @@ git commit -m "feat(subagent): add runtime liveness probe"
 
 - [ ] **Step 1: 写失败测试**
 
-```rust
-    use super::{RuntimeProbe, ensure_owned_runtime, probe_runtime};
-    use std::path::PathBuf;
-    use yi_agent_runtime::config::RuntimeConfig;
-    use yi_agent_store::ipc::{Daemon, socket_path_for};
+把这两个测试放进 **`crates/yi-agent-subagent/tests/attach_delegation.rs`**（集成测试文件，已存在），
+**复用该文件已有的 `config_for(path)` 助手**——不要新建重复的 `test_config`（同一 crate 里重复构造
+`RuntimeConfig` 属于无谓复制）。把 `ensure_owned_runtime` / `probe_runtime` 加进该文件的 `use`：
 
-    fn test_config(workdir: &std::path::Path) -> RuntimeConfig {
-        // Mirrors the app-server test helper: the provider is never called by
-        // attach/daemon bring-up, so a minimal config is enough.
-        let mut cfg = RuntimeConfig::default();
-        cfg.workdir = workdir.to_path_buf();
-        cfg
-    }
+```rust
+    use yi_agent_subagent::attach::{RuntimeProbe, ensure_owned_runtime, probe_runtime, worker_factory};
 
     #[test]
     fn ensure_owned_starts_a_daemon_when_none_is_listening() {
-        let project = tempfile::TempDir::new().unwrap();
+        let repo = tempfile::TempDir::new().unwrap();
         let runtime = tempfile::TempDir::new().unwrap();
-        let cfg = test_config(project.path());
+        init_git_repo(repo.path());
+        let cfg = config_for(repo.path());
 
         let owned = ensure_owned_runtime(&cfg, runtime.path().to_path_buf())
             .expect("a dead runtime must be replaced with a fresh one");
 
         assert!(owned.embedded_daemon.is_some(), "this process must own the new daemon");
-        let socket = socket_path_for(runtime.path()).unwrap();
+        let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
         assert_eq!(probe_runtime(&socket), RuntimeProbe::Healthy);
     }
 
     #[test]
     fn ensure_owned_reuses_a_healthy_daemon() {
-        let project = tempfile::TempDir::new().unwrap();
+        let repo = tempfile::TempDir::new().unwrap();
         let runtime = tempfile::TempDir::new().unwrap();
-        let cfg = test_config(project.path());
+        init_git_repo(repo.path());
+        let cfg = config_for(repo.path());
+        // The pre-existing daemon must be a *real* one: `Daemon::start` uses an
+        // unavailable factory whose workspace service is absent, so the attach
+        // that follows would be rejected for unrelated reasons and this test
+        // could not tell "reused" from "broken".
         let database = runtime.path().join("runtime.sqlite");
-        let _existing = Daemon::start(runtime.path(), &database).expect("daemon starts");
+        let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
+        let factory = worker_factory(&cfg, socket).expect("factory");
+        let _existing =
+            yi_agent_store::ipc::Daemon::start_with_factory(runtime.path(), &database, factory)
+                .expect("daemon starts");
 
         let joined = ensure_owned_runtime(&cfg, runtime.path().to_path_buf())
             .expect("a healthy runtime must be adopted, not replaced");
@@ -213,8 +216,6 @@ git commit -m "feat(subagent): add runtime liveness probe"
         assert!(joined.embedded_daemon.is_none(), "must not steal a healthy daemon");
     }
 ```
-
-> 注：`RuntimeConfig::default()` 若不存在，用 app-server 测试里的 `test_config()` 同款构造（provider 缺失不影响 attach 链路）——见 `yi-agent-rs/crates/yi-agent-app-server/src/server.rs` 的 `fn test_config()`。实现时以该文件为准复制一份最小构造。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -691,7 +692,25 @@ Expected: 编译失败（`register_attached_root_tools` 仍收 `PathBuf` + `&Att
 3. `register_application_subagent_tools`（`:1111`）与 `register_attached_root_tools`（`:1097`）签名改为收 `binding: Arc<RuntimeBinding>`，内部把 `Arc::clone(&binding)` 传给六个工具。
 4. `DaemonApplicationSendMessageTool` 里 `self.runtime_socket` 的另一处用法（`:1012`）与其 `:1066`、`spawn` 的 `:1312` / `:1371` / `:1394`、`inspect` / `cancel` / `review` / `wait` 的对应处一并改为经 binding。
 
-**worker 侧六个工具（`DaemonSpawnAgentTool` / `DaemonSendMessageTool` 等，`:551` 附近）保持不动。**
+**本任务属于依赖图的关键枢纽:** `register_attached_root_tools` 签名一变,`attach_delegation.rs`
+里那次调用就会编译失败,且它就在同一个 crate 内(`cargo test -p yi-agent-subagent` 会直接撞上)。
+因此 **Task 4 同时更新该调用点**,把旧的 `(socket, &attached_root)` 换成一个 `RuntimeBinding`:
+
+```rust
+    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
+        yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: attached.socket_path.clone(),
+            workspace_root: attached.workspace_root.clone(),
+            session_id: attached.attached_root.session_id.clone(),
+            task_id: attached.attached_root.task_id.clone(),
+            capability: attached.attached_root.capability.clone(),
+        },
+    );
+    yi_agent_subagent::register_attached_root_tools(&mut registry, binding);
+```
+
+其余`send_request(...)` 断言（既有测试里对 `SpawnApplicationChild` 的那段）保持不变。
+保持这个 crate 的测试目标绿，是"每步都有可独立验证交付物"的硬要求。
 
 - [ ] **Step 4: 运行测试确认通过**
 
