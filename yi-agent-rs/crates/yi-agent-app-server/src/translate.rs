@@ -308,6 +308,31 @@ impl Translator {
             AgentEvent::Cancelled => {
                 self.finish_turn(TurnStatus::Interrupted, None, &mut out);
             }
+            AgentEvent::InterjectionAccepted { text, tag, .. } => {
+                // `tag` is the interjection id minted at the RPC boundary; fall
+                // back to the item namespace when a caller supplied none (the
+                // TUI does not need cross-process matching).
+                let id = tag.unwrap_or_else(|| self.alloc_item_id());
+                let item = crate::protocol::Item::UserInterjection { id, text };
+                out.push(Notification::ItemStarted {
+                    thread_id: self.thread_id.clone(),
+                    item: item.clone(),
+                });
+                out.push(Notification::ItemCompleted {
+                    thread_id: self.thread_id.clone(),
+                    item,
+                });
+            }
+            AgentEvent::InterjectionsReturned { items } => {
+                out.push(Notification::InterjectionsReturned {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    items: items
+                        .into_iter()
+                        .map(|i| i.tag.unwrap_or_default())
+                        .collect(),
+                });
+            }
             AgentEvent::Error(e) => {
                 self.finish_turn(TurnStatus::Failed, Some(e.to_string()), &mut out);
             }
@@ -1026,6 +1051,89 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    #[test]
+    fn interjection_accepted_becomes_a_user_interjection_item() {
+        let mut t = translator();
+        t.set_turn("turn-1".into());
+        let out = t.on_event(AgentEvent::InterjectionAccepted {
+            seq: 1,
+            text: "also check the logs".into(),
+            tag: Some("interject-turn-1-abc".into()),
+        });
+        assert_eq!(out.len(), 2, "expected ItemStarted then ItemCompleted");
+        for n in &out {
+            match n {
+                Notification::ItemStarted {
+                    item: Item::UserInterjection { id, text },
+                    ..
+                }
+                | Notification::ItemCompleted {
+                    item: Item::UserInterjection { id, text },
+                    ..
+                } => {
+                    // The id must be the caller's tag, not a freshly allocated
+                    // item id: that is what lets the client reconcile.
+                    assert_eq!(id, "interject-turn-1-abc");
+                    assert_eq!(text, "also check the logs");
+                }
+                other => panic!("expected UserInterjection item, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn interjection_without_a_tag_falls_back_to_an_item_id() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::InterjectionAccepted {
+            seq: 1,
+            text: "hi".into(),
+            tag: None,
+        });
+        match &out[0] {
+            Notification::ItemStarted {
+                item: Item::UserInterjection { id, .. },
+                ..
+            } => assert!(!id.is_empty(), "expected an allocated item id"),
+            other => panic!("expected UserInterjection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interjections_returned_is_reported_to_the_client() {
+        let mut t = translator();
+        t.set_turn("turn-7".into());
+        let out = t.on_event(AgentEvent::InterjectionsReturned {
+            items: vec![
+                yi_agent_core::Interjection {
+                    seq: 3,
+                    text: "alpha".into(),
+                    tag: Some("interject-a".into()),
+                },
+                yi_agent_core::Interjection {
+                    seq: 4,
+                    text: "beta".into(),
+                    tag: Some("interject-b".into()),
+                },
+            ],
+        });
+        assert_eq!(out.len(), 1, "expected exactly one notification");
+        match &out[0] {
+            Notification::InterjectionsReturned {
+                thread_id,
+                turn_id,
+                items,
+            } => {
+                assert_eq!(thread_id, "th1");
+                assert_eq!(turn_id, "turn-7");
+                assert_eq!(
+                    items,
+                    &vec!["interject-a".to_string(), "interject-b".to_string()]
+                );
+            }
+            other => panic!("expected InterjectionsReturned, got {other:?}"),
+        }
     }
 
     #[test]

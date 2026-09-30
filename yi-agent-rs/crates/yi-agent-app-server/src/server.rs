@@ -22,7 +22,7 @@ use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
     RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, ThreadStatus,
 };
-use crate::session::{ThreadSession, TurnPrompt};
+use crate::session::{InterjectionRequest, ThreadSession, TurnPrompt};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -398,6 +398,8 @@ where
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+                        let (interject_tx, interject_rx) =
+                            mpsc::channel::<InterjectionRequest>(16);
 
                         let model = cfg.model.clone();
 
@@ -440,6 +442,7 @@ where
                                 yolo,
                                 prompt_tx,
                                 interrupt_tx,
+                                interject_tx,
                                 store: Arc::clone(&thread_store),
                                 status: Arc::clone(&store_status),
                             },
@@ -455,6 +458,7 @@ where
                             agent,
                             prompt_rx,
                             interrupt_rx,
+                            interject_rx,
                             driver_writer,
                             driver_turn_tx,
                             decision_tx,
@@ -586,6 +590,8 @@ where
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+                        let (interject_tx, interject_rx) =
+                            mpsc::channel::<InterjectionRequest>(16);
                         // 同一 `Arc` 句柄:session 存一份供 `thread/list` 读,
                         // driver 拿一份用于推送 `thread/status/updated`。
                         let store_status = ThreadSession::new_status();
@@ -599,6 +605,7 @@ where
                                 yolo,
                                 prompt_tx,
                                 interrupt_tx,
+                                interject_tx,
                                 store: Arc::clone(&thread_store),
                                 status: Arc::clone(&store_status),
                             },
@@ -612,6 +619,7 @@ where
                             agent,
                             prompt_rx,
                             interrupt_rx,
+                            interject_rx,
                             driver_writer,
                             driver_turn_tx,
                             decision_tx,
@@ -889,6 +897,77 @@ where
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
                     }
+                    "turn/interject" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let text = match extract_prompt(&req.params) {
+                            Some(p) => p,
+                            None => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params("missing or empty input text"),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 单值 `active_turn_id` 决定了"往哪一轮追加":没有活跃 turn
+                        // 就没有可并入的上下文,返回 -32013 让客户端改走 turn/start。
+                        let (tx, turn_id) = {
+                            let Some(session) = threads.get(&thread_id) else {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                                continue;
+                            };
+                            match session.active_turn_id.clone() {
+                                Some(turn_id) => (session.interject_tx.clone(), turn_id),
+                                None => {
+                                    write_response(
+                                        &writer,
+                                        err_response(id, RpcError::not_running()),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        };
+                        let interjection_id =
+                            format!("interject-{}-{}", turn_id, uuid::Uuid::new_v4());
+                        if tx
+                            .send(InterjectionRequest {
+                                turn_id: turn_id.clone(),
+                                interjection_id: interjection_id.clone(),
+                                text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            // driver 已退出:没有接收方,按"没有活跃 turn"报。
+                            write_response(&writer, err_response(id, RpcError::not_running()))
+                                .await?;
+                            continue;
+                        }
+                        write_response(
+                            &writer,
+                            ok_response(
+                                id,
+                                json!({
+                                    "turn_id": turn_id,
+                                    "interjection_id": interjection_id,
+                                }),
+                            ),
+                        )
+                        .await?;
+                    }
                     _ => {
                         write_response(&writer, err_response(id, RpcError::method_not_found(&method)))
                             .await?;
@@ -1086,6 +1165,7 @@ async fn run_thread_driver<W>(
     mut agent: yi_agent_core::Agent,
     mut prompt_rx: mpsc::Receiver<TurnPrompt>,
     mut interrupt_rx: mpsc::Receiver<String>,
+    mut interject_rx: mpsc::Receiver<InterjectionRequest>,
     writer: Arc<MessageWriter<W>>,
     turn_tx: mpsc::Sender<TurnEvent>,
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
@@ -1136,6 +1216,8 @@ async fn run_thread_driver<W>(
 
         // 必须在 run() 之后捕获:run() 内部会重建 cancel token。
         let cancel_token = agent.cancel_token();
+        // 同一次 run 的投递句柄;run() 结束即失效,下一轮重新取。
+        let inbox = agent.inbox_handle();
         let mut cancel_sent = false;
 
         loop {
@@ -1250,6 +1332,34 @@ async fn run_thread_driver<W>(
                         cancel_token.cancel();
                     }
                     // 继续消费 stream,直到 run loop 发 Cancelled 并结束。
+                }
+                Some(request) = interject_rx.recv() => {
+                    // 只并入这条请求所指的 turn;上一轮的残留请求直接还回客户端,
+                    // 否则它会落进错误的上下文。
+                    let matches_turn = request.turn_id == turn_id;
+                    let accepted = matches_turn
+                        && inbox
+                            .as_ref()
+                            .is_some_and(|handle| {
+                                handle
+                                    .interject(request.text.clone(), Some(request.interjection_id.clone()))
+                                    .is_ok()
+                            });
+                    if !accepted {
+                        // 未能并入(非当前 turn / 无句柄 / inbox 满):把文本还回去,
+                        // 让客户端能恢复输入而不是静默丢弃。
+                        for n in translator.on_event(
+                            yi_agent_core::AgentEvent::InterjectionsReturned {
+                                items: vec![yi_agent_core::Interjection {
+                                    seq: 0,
+                                    text: request.text,
+                                    tag: Some(request.interjection_id),
+                                }],
+                            },
+                        ) {
+                            let _ = write_notification(&writer, &n).await;
+                        }
+                    }
                 }
             }
         }
@@ -2135,6 +2245,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn turn_interject_while_running_keeps_the_same_turn() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        let started_turn = loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(11)) {
+                break v["result"]["turn_id"].as_str().unwrap().to_string();
+            }
+        };
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"turn/interject","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"also do X"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(12)) {
+                assert_eq!(
+                    v["result"]["turn_id"].as_str().unwrap(),
+                    started_turn,
+                    "an interjection must not open a new turn: {v}"
+                );
+                assert!(
+                    v["result"]["interjection_id"].as_str().is_some(),
+                    "expected an interjection_id: {v}"
+                );
+                break;
+            }
+        }
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_interject_without_an_active_turn_is_rejected() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":13,"method":"turn/interject","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"too early"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(13)) {
+                assert_eq!(v["error"]["code"], -32013, "expected not running: {v}");
+                break;
+            }
+        }
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn turn_start_while_turn_in_progress_returns_turn_in_progress() {
         let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
         let tid = start_thread(&mut h).await;
@@ -2205,6 +2370,7 @@ mod tests {
     async fn driver_ignores_interrupt_tagged_with_other_turn() {
         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let writer = Arc::new(MessageWriter::new(server_w));
@@ -2223,6 +2389,7 @@ mod tests {
             .agent,
             prompt_rx,
             interrupt_rx,
+            interject_rx,
             writer,
             turn_tx,
             None,
@@ -2281,6 +2448,7 @@ mod tests {
     async fn driver_reports_finished_when_writer_fails() {
         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
         let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         drop(client_r); // 断开读端 → 写通知失败
@@ -2300,6 +2468,7 @@ mod tests {
             .agent,
             prompt_rx,
             interrupt_rx,
+            interject_rx,
             writer,
             turn_tx,
             None,
@@ -2335,6 +2504,7 @@ mod tests {
     async fn driver_uses_unique_item_ids_across_turns() {
         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
         let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let writer = Arc::new(MessageWriter::new(server_w));
@@ -2353,6 +2523,7 @@ mod tests {
             .agent,
             prompt_rx,
             interrupt_rx,
+            interject_rx,
             writer,
             turn_tx,
             None,
@@ -2698,6 +2869,7 @@ mod tests {
     async fn stale_interrupt_does_not_cancel_turn_during_approval() {
         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let writer = Arc::new(MessageWriter::new(server_w));
@@ -2718,6 +2890,7 @@ mod tests {
             built.agent,
             prompt_rx,
             interrupt_rx,
+            interject_rx,
             writer,
             turn_tx,
             built.decision_tx,

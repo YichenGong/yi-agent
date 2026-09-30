@@ -99,6 +99,12 @@ impl RpcError {
     pub fn turn_in_progress(id: &str) -> Self {
         Self::new(-32012, format!("turn already in progress: {id}"))
     }
+    /// `turn/interject` arrived when no turn was active. Distinct from
+    /// `-32012`: that one means "a turn is busy", this one means "there is
+    /// nothing to fold into".
+    pub fn not_running() -> Self {
+        Self::new(-32013, "no turn is running".to_string())
+    }
 }
 
 /// 服务端 → 客户端通知(无 id)。
@@ -135,6 +141,15 @@ pub enum Notification {
         status: TurnStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// Mid-turn user messages the server could not consume, handed back so the
+    /// client can restore them to the input box. Carries the `tag` ids, because
+    /// those are what the client minted and therefore knows about.
+    #[serde(rename = "turn/interjectionsReturned")]
+    InterjectionsReturned {
+        thread_id: String,
+        turn_id: String,
+        items: Vec<String>,
     },
     #[serde(rename = "turn/retry")]
     TurnRetry {
@@ -220,6 +235,12 @@ pub enum Item {
         status: ToolStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<String>,
+    },
+    /// A user message that arrived mid-turn, rendered as its own bubble so it is
+    /// not confused with the message that opened the turn.
+    UserInterjection {
+        id: String,
+        text: String,
     },
 }
 

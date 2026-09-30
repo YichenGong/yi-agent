@@ -14,6 +14,16 @@ pub struct TurnPrompt {
     pub prompt: String,
 }
 
+/// 一条中途追加的用户消息,投递给该 thread 的 driver。
+#[derive(Debug)]
+pub struct InterjectionRequest {
+    /// 这条消息要并入的 turn。driver 只接受与当前 turn 匹配的请求。
+    pub turn_id: String,
+    /// 协议层 item id,在 RPC 入口铸好,便于客户端精确对账。
+    pub interjection_id: String,
+    pub text: String,
+}
+
 /// app-server 侧的一个 thread。
 pub struct ThreadSession {
     pub thread_id: String,
@@ -27,6 +37,8 @@ pub struct ThreadSession {
     pub(crate) prompt_tx: mpsc::Sender<TurnPrompt>,
     /// 请求中断当前 turn(携带目标 turn id,driver 据此丢弃残留信号)。
     pub(crate) interrupt_tx: mpsc::Sender<String>,
+    /// 向该 thread 的 driver 投递中途追加消息(与 prompt_tx/interrupt_tx 同类)。
+    pub(crate) interject_tx: mpsc::Sender<InterjectionRequest>,
     /// 该 thread 的 store;driver 与主循环的 rename/delete 共用同一实例,
     /// 以共享 `ThreadStore.meta_lock`(否则并发 touch/rename 会丢更新)。
     pub store: Arc<crate::thread_store::ThreadStore>,
