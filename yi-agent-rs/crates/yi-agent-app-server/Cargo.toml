@@ -14,6 +14,9 @@ path = "src/lib.rs"
 [dependencies]
 yi-agent-core = { workspace = true }
 yi-agent-runtime = { workspace = true }
+yi-agent-store = { workspace = true }
+yi-agent-subagent = { workspace = true }
+yi-agent-tools = { workspace = true }
 anyhow.workspace = true
 futures.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -25,4 +28,3 @@ uuid.workspace = true
 [dev-dependencies]
 async-trait = "0.1"
 tempfile = "3"
-yi-agent-tools = { workspace = true }

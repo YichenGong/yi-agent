@@ -4016,6 +4016,8 @@ dependencies = [
  "uuid",
  "yi-agent-core",
  "yi-agent-runtime",
+ "yi-agent-store",
+ "yi-agent-subagent",
  "yi-agent-tools",
 ]
 

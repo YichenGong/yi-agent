@@ -8,10 +8,18 @@ use tokio::sync::mpsc;
 use crate::protocol::ThreadStatus;
 
 /// 一次 turn 的输入(由 driver task 消费)。
-#[derive(Debug)]
+///
+/// 不用 `Debug`:字段含 `AttachedProjectRuntime`,其内部持有 daemon 句柄与 std
+/// `Mutex`,既不便打印也不应被打印。
 pub struct TurnPrompt {
     pub turn_id: String,
     pub prompt: String,
+    /// 该 thread 若已 attach 到项目 runtime,则带上它在**首个 turn** 激活。
+    ///
+    /// 激活是同步 socket 调用,放在 driver 里(而不是请求循环)才不会让一个 thread
+    /// 卡住所有 thread 的请求处理;用首个 turn 的真正 prompt 作 objective,因为
+    /// objective 会被写进 root 任务。
+    pub activate: Option<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>>,
 }
 
 /// 一条中途追加的用户消息,投递给该 thread 的 driver。
