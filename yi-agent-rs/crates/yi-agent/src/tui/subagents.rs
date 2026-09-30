@@ -2,9 +2,6 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use yi_agent_core::ToolRegistry;
-use yi_agent_core::subagent::worker::WorkerWorkspace;
-
 #[cfg(test)]
 use crate::tui::slash::SlashCommand;
 
@@ -66,7 +63,9 @@ pub fn current_attached_root() -> Option<AttachedRoot> {
 
 #[cfg(test)]
 mod tests {
+    use yi_agent_core::ToolRegistry;
     use yi_agent_core::subagent::task::WorkspaceLeaseId;
+    use yi_agent_core::subagent::worker::WorkerWorkspace;
 
     use super::*;
 
