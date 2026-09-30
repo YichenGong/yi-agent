@@ -1043,10 +1043,19 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        thread_id: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model, workdir)
-            .await
+        self.spawn_child_and_admit(
+            session,
+            parent,
+            objective,
+            workspace_mode,
+            model,
+            workdir,
+            thread_id,
+        )
+        .await
     }
 
     pub fn root_task_id(&self, session: &RootSessionId) -> Result<TaskId, RuntimeCoordinatorError> {
@@ -1179,10 +1188,19 @@ impl RuntimeCoordinator {
             ChildWriteMode::ReadOnly,
             None,
             None,
+            None,
         )
         .await
     }
 
+    /// Spawns a child and durably records it.
+    ///
+    /// `thread_id` is the conversation marker a UI groups subagents by. It is
+    /// metadata only: it never gates admission or scheduling. An explicit value
+    /// wins; otherwise the child inherits its parent's stored marker, read from
+    /// the parent row so inheritance is transitive no matter which entry point
+    /// created the intermediate task.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child_with_objective(
         &self,
         session: &RootSessionId,
@@ -1191,6 +1209,7 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        thread_id: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1208,6 +1227,17 @@ impl RuntimeCoordinator {
         // (which is unrelated to any task). Resolving before the spawn means the
         // supervisor stores the absolute path worker start will look up.
         let workdir = workdir.map(|workdir| self.resolve_parent_workdir(parent, &workdir));
+        // Resolve the marker before the child row is written so the inherited
+        // value lands in the same INSERT as the row: there is no intermediate
+        // state in which the task exists but its marker does not.
+        let thread_id = thread_id.or_else(|| {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .task_thread_id(parent)
+                .ok()
+                .flatten()
+        });
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(
@@ -1248,6 +1278,7 @@ impl RuntimeCoordinator {
                 &objective,
                 workspace_mode,
                 model.clone(),
+                thread_id.as_deref(),
             )?;
         // Auto-registration: the parent prepares the directory (`git worktree
         // add`) and hands over its path; the daemon only records that position.
@@ -1285,6 +1316,7 @@ impl RuntimeCoordinator {
     /// durably queued. A capacity wait is represented by the existing queued
     /// state; a real application worker starts immediately when capacity is
     /// available.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child_and_admit(
         &self,
         session: &RootSessionId,
@@ -1293,9 +1325,18 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        thread_id: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
-            .spawn_child_with_objective(session, parent, objective, workspace_mode, model, workdir)
+            .spawn_child_with_objective(
+                session,
+                parent,
+                objective,
+                workspace_mode,
+                model,
+                workdir,
+                thread_id,
+            )
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {

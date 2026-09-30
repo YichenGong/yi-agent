@@ -476,6 +476,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
             objective: "child task".into(),
             mode: Some("read_only".into()),
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -548,6 +549,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
             objective: "child".into(),
             mode: Some("read_only".into()),
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -644,6 +646,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
             objective: "do the work".into(),
             mode: Some("read_only".into()),
             model: Some("small-model".into()),
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -889,6 +892,7 @@ fn application_roots_use_their_attaching_project_workspace() {
             objective: "inspect project B".into(),
             mode: Some("coding".into()),
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -1046,6 +1050,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
                 objective: "inspect the parser".into(),
                 mode: None,
                 model: None,
+                thread_id: None,
             },
         )
         .unwrap(),
@@ -1431,6 +1436,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
             objective: "child task".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -1496,6 +1502,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             objective: "fast child".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap();
@@ -1509,6 +1516,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             objective: "slow child".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap();
@@ -1551,6 +1559,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             objective: "fast child".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -1569,6 +1578,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             objective: "slow child".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap();
@@ -1623,6 +1633,7 @@ fn application_root_rejects_more_than_four_direct_children() {
                     objective: format!("child {index}"),
                     mode: None,
                     model: None,
+                    thread_id: None,
                 },
             )
             .unwrap(),
@@ -1640,6 +1651,7 @@ fn application_root_rejects_more_than_four_direct_children() {
             objective: "fifth child".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap();
@@ -1688,6 +1700,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                     objective: format!("historical child {index}"),
                     mode: None,
                     model: None,
+                    thread_id: None,
                 },
             )
             .unwrap(),
@@ -1721,6 +1734,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                 objective: "new child after historical completions".into(),
                 mode: None,
                 model: None,
+                thread_id: None,
             },
         )
         .unwrap(),
@@ -1818,6 +1832,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
                 objective: "after paused reattach".into(),
                 mode: None,
                 model: None,
+                thread_id: None,
             },
         )
         .unwrap(),
@@ -1897,6 +1912,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
                 objective: "after reattach".into(),
                 mode: None,
                 model: None,
+                thread_id: None,
             },
         )
         .unwrap(),
@@ -1967,6 +1983,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
                 objective: "after restart".into(),
                 mode: None,
                 model: None,
+                thread_id: None,
             },
         )
         .unwrap(),
@@ -3159,6 +3176,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -3238,6 +3256,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             objective: "Inspect child behavior slowly".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -3305,6 +3324,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             objective: "finish first".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -3323,6 +3343,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -3395,6 +3416,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             objective: "finish first".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -3413,6 +3435,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -3483,6 +3506,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
             objective: "reply quickly".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -3559,6 +3583,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -3619,6 +3644,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -3695,6 +3721,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -3803,6 +3830,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -3889,6 +3917,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -5035,6 +5064,7 @@ fn workspace_mode_is_persisted_and_recovered() {
             "child",
             ChildWriteMode::ReadOnly,
             None,
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -5092,6 +5122,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
             objective: "Change a file".into(),
             mode: Some("coding".into()),
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -5140,6 +5171,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
             objective: "Inspect without editing".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap()
@@ -5152,6 +5184,249 @@ fn daemon_spawn_agent_defaults_to_read_only() {
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
         ChildWriteMode::ReadOnly
+    );
+}
+
+/// The conversation marker is metadata: a client that tags a spawn must find the
+/// tag on the child row, not on the client's own bookkeeping.
+#[test]
+fn a_child_records_the_thread_that_spawned_it() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-tagged-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "a tagged investigation".into(),
+            mode: None,
+            model: None,
+            thread_id: Some("thread-a".into()),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&child)
+            .unwrap()
+            .as_deref(),
+        Some("thread-a"),
+        "the child records the conversation that spawned it"
+    );
+}
+
+/// The marker is inherited through the parent's STORED row, so a grandchild
+/// inherits no matter which entry point created it: the child-spawns-a-child
+/// path passes no marker of its own.
+#[test]
+fn a_grandchild_inherits_its_parents_thread() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-inherited-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "a tagged child".into(),
+            mode: None,
+            model: None,
+            thread_id: Some("thread-a".into()),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+    // The child delegates onward through a DIFFERENT entry point, the legacy
+    // session spawn, which carries no marker of its own. Inheritance still
+    // works because the daemon reads the parent's stored row.
+    let descendant = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            workdir: None,
+            session_id,
+            parent_task_id: child_task_id.clone(),
+            objective: "a descendant that names no conversation".into(),
+            mode: None,
+            model: None,
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskSpawned {
+        task_id: grandchild_task_id,
+    } = descendant
+    else {
+        panic!("expected a spawned descendant task, got {descendant:?}");
+    };
+
+    let grandchild: TaskId = grandchild_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&grandchild)
+            .unwrap()
+            .as_deref(),
+        Some("thread-a"),
+        "a descendant inherits its parent's conversation when it names none"
+    );
+}
+
+#[test]
+fn an_explicit_thread_overrides_the_inherited_one() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-override-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    // The root itself is bound to a conversation (Task 8 owns that surface in
+    // production); a child that names its own conversation must keep it.
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .set_task_thread_id(&root_task_id.parse().unwrap(), "thread-a")
+        .unwrap();
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "a child that names its own conversation".into(),
+            mode: None,
+            model: None,
+            thread_id: Some("thread-b".into()),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&child)
+            .unwrap()
+            .as_deref(),
+        Some("thread-b"),
+        "an explicit marker wins over the one inherited from the parent"
+    );
+}
+
+#[test]
+fn a_child_with_no_thread_and_no_parent_thread_has_none() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-absent-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "an untagged investigation".into(),
+            mode: None,
+            model: None,
+            thread_id: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&child)
+            .unwrap(),
+        None,
+        "with no marker anywhere the child stays unbound, exactly as before"
     );
 }
 
@@ -5369,6 +5644,7 @@ fn delivered_application_child_over_ipc(
             objective: "Implement the parser".into(),
             mode: Some("coding".into()),
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {
@@ -5480,6 +5756,7 @@ fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
             objective: "A sibling that must not review".into(),
             mode: Some("read_only".into()),
             model: None,
+            thread_id: None,
         },
     )
     .unwrap();
@@ -5656,6 +5933,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
             objective: "Rewrite the parser".into(),
             mode: None,
             model: None,
+            thread_id: None,
         },
     )
     .unwrap() else {

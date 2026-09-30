@@ -1044,6 +1044,7 @@ impl RuntimeRepository {
             // read-only child go through `create_child_task_with_attempt_and_objective`.
             ChildWriteMode::Coding,
             None,
+            None,
         )
     }
 
@@ -1060,12 +1061,13 @@ impl RuntimeRepository {
         objective: &str,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        thread_id: Option<&str>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, thread_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -1076,6 +1078,7 @@ impl RuntimeRepository {
                 delivery_json,
                 workspace_mode.as_str(),
                 model,
+                thread_id,
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;

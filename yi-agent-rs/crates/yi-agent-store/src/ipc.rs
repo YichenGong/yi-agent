@@ -198,6 +198,11 @@ pub enum IpcRequest {
         model: Option<String>,
         #[serde(default)]
         workdir: Option<String>,
+        /// The conversation this child belongs to. Additive and optional: an
+        /// older client that omits it deserializes to `None` and the daemon
+        /// inherits the parent's marker, or leaves the child unbound.
+        #[serde(default)]
+        thread_id: Option<String>,
     },
     StartWorker {
         session_id: String,
@@ -2540,6 +2545,9 @@ fn respond(
                 workspace_mode,
                 model,
                 workdir,
+                // Legacy session spawns carry no conversation; a descendant
+                // still inherits its parent's marker inside the coordinator.
+                None,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2553,6 +2561,7 @@ fn respond(
             mode,
             model,
             workdir,
+            thread_id,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
@@ -2569,6 +2578,7 @@ fn respond(
                 workspace_mode,
                 model,
                 workdir,
+                thread_id,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),

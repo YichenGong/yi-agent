@@ -1426,6 +1426,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 mode: Some(mode.as_str().to_string()),
                 model,
                 workdir,
+                thread_id: None,
             },
         );
         match response {
