@@ -51,13 +51,6 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
     }
 }
 
-/// Run the ratatui TUI main loop with the real terminal.
-///
-/// - `agent_rx`: receives agent events to display in history
-/// - `input_tx`: sends user-submitted input strings to the agent driver
-/// - `interrupt_tx`: signals to interrupt the current agent run
-/// - `is_running`: shared flag indicating if agent is currently running
-#[allow(clippy::too_many_arguments)]
 /// Write the "pending messages were dropped" notice, if any.
 ///
 /// Split out from `run_tui` so the message and the `> 0` condition are both
@@ -69,6 +62,13 @@ fn report_dropped_pending<W: io::Write>(out: &mut W, dropped: usize) {
     }
 }
 
+/// Run the ratatui TUI main loop with the real terminal.
+///
+/// - `agent_rx`: receives agent events to display in history
+/// - `input_tx`: sends user-submitted input strings to the agent driver
+/// - `interrupt_tx`: signals to interrupt the current agent run
+/// - `is_running`: shared flag indicating if agent is currently running
+#[allow(clippy::too_many_arguments)]
 pub fn run_tui(
     mut agent_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::Sender<String>,
