@@ -1007,6 +1007,29 @@ git commit -m "feat(tui): honour persisted runtime preference and add /runtime"
         assert!(reason.contains("/runtime"), "reason: {reason}");
         assert!(reason.contains("已禁用"), "reason: {reason}");
     }
+
+    #[test]
+    fn never_does_not_touch_the_preference_file() {
+        use crate::tui::runtime_prefs::{preferences_path, save, RuntimePreference};
+        use crate::tui::subagents::RuntimeStartupIntent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        save(dir.path(), RuntimePreference::Never).unwrap();
+        // Remove the file but keep the directory, so a stray `load` in the
+        // Never path cannot recreate anything silently.
+        std::fs::remove_file(preferences_path(dir.path())).unwrap();
+
+        assert!(matches!(
+            startup_intent_for(dir.path()),
+            Some(RuntimeStartupIntent::DisabledNotice { .. })
+        ));
+        // A `never` run must fail closed and not create `.yi-agent/` in projects
+        // that never opted in.
+        assert!(
+            !preferences_path(dir.path()).exists(),
+            "Never must not read or write the preference file"
+        );
+    }
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1094,8 +1117,15 @@ fn startup_intent_for(
 ```bash
 cargo test -p yi-agent --bin yi-agent -- preference_maps_to_startup_intent 2>&1 | tail -10
 cargo test -p yi-agent --bin yi-agent -- never_notice 2>&1 | tail -10
+cargo test -p yi-agent --bin yi-agent -- never_does_not_touch_the_preference_file 2>&1 | tail -10
 ```
-预期：2 passed。
+预期：3 passed。
+
+**为什么需要第三条测试**（防一个静默失效模式）：`Never` 分支**不**调用 `load`，所以它读不出
+用户实际保存的值。若把 `startup_intent_for` 误改成无条件调用 `load`（例如为了日志或"顺手
+取一下 path"），该函数就会**对每个项目都创建 `<workdir>/.yi-agent/`**——即使用户选的是
+`never`。这会静默弄脏没有忽略它的仓库，而现有断言全部照旧通过。第三条测试断言"函数不
+凭空创建目录"，用一条断言钉住这一行为。
 
 - [ ] **Step 6: 全量回归、格式化、提交**
 
