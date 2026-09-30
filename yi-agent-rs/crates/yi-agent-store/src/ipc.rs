@@ -746,7 +746,15 @@ impl Daemon {
                 .expect("daemon reconciliation runtime must initialize");
             let mut last_schedule_minute = None;
             while !thread_stop.load(Ordering::Acquire) {
-                let _ = runtime.block_on(coordinator.reconcile_worker_events());
+                // Worker facts arrive independently of client traffic. A failure
+                // here used to vanish, so a wedged repository looked like a
+                // healthy daemon: keep listening, but say what broke.
+                if let Err(error) = runtime.block_on(coordinator.reconcile_worker_events()) {
+                    tracing::error!(
+                        error = %error,
+                        "daemon worker reconciliation failed; retrying next tick"
+                    );
+                }
                 let now = Local::now();
                 let minute = now
                     .with_second(0)
@@ -1116,7 +1124,10 @@ fn handle_client(
             IpcRequest::PreviewCancel { task_id, recursive } => {
                 match preview_cancel(database_path, confirmations, task_id, recursive) {
                     Ok(response) => response,
-                    Err(error) => error_response(&error),
+                    Err(error) => {
+                        log_request_failure(&envelope.request_id, &error);
+                        error_response(&error)
+                    }
                 }
             }
             IpcRequest::ConfirmCancel {
@@ -1132,11 +1143,17 @@ fn handle_client(
                 confirmation_token,
             ) {
                 Ok(response) => response,
-                Err(error) => error_response(&error),
+                Err(error) => {
+                    log_request_failure(&envelope.request_id, &error);
+                    error_response(&error)
+                }
             },
             request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
-                Err(error) => error_response(&error),
+                Err(error) => {
+                    log_request_failure(&envelope.request_id, &error);
+                    error_response(&error)
+                }
             },
         },
         Err(_) => IpcResponse::Error {
@@ -2180,6 +2197,22 @@ fn error_response(error: &IpcError) -> IpcResponse {
     }
 }
 
+/// Records why a request failed.
+///
+/// `error_response` deliberately strips the cause so the wire contract never
+/// leaks database, environment, or implementation detail, and most variants map
+/// to a bare `internal`. Without this the daemon is silently wrong: a wedged
+/// runtime that answers every request with `internal` leaves no trace, and the
+/// client can only report the opaque code. The full error goes here; the client
+/// still gets the stable code.
+fn log_request_failure(request_id: &str, error: &IpcError) {
+    tracing::error!(
+        request_id,
+        error = %error,
+        "request failed; the client sees only the stable error code"
+    );
+}
+
 fn ipc_error_message(error: &IpcError) -> Option<String> {
     match error {
         IpcError::Runtime(RuntimeCoordinatorError::Supervisor(message)) => Some(message.clone()),
@@ -3049,5 +3082,56 @@ mod socket_path_tests {
         let second = socket_path_for(shared).expect("resolves");
 
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod error_logging_tests {
+    use super::*;
+
+    /// The daemon used to answer every failed request with a bare `internal`
+    /// and log nothing, so a wedged runtime -- one whose per-request repository
+    /// connection fails before it can read anything -- left no trace at all.
+    /// The field symptom was a client that could only ever print
+    /// `daemon rejected the runtime attachment: internal`, with nothing to
+    /// diagnose from.
+    #[test]
+    fn a_request_failure_is_logged_with_its_cause() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(std::sync::Arc::clone(&captured));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = IpcError::Repository(crate::repository::RepositoryError::TaskNotFound {
+            task: "task-9f2c".into(),
+        });
+        log_request_failure("client-7", &error);
+
+        let logged = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("client-7"),
+            "the log must identify the request: {logged}"
+        );
+        assert!(
+            logged.contains("task-9f2c"),
+            "the log must carry the real cause, not just `internal`: {logged}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct CapturedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
