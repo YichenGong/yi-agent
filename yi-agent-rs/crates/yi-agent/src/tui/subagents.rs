@@ -1,12 +1,7 @@
 //! TUI-facing subagent runtime attachment model.
 
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use yi_agent_core::ToolRegistry;
-use yi_agent_core::subagent::worker::WorkerWorkspace;
-
-use crate::subagent_runtime::register_application_subagent_tools;
 #[cfg(test)]
 use crate::tui::slash::SlashCommand;
 
@@ -30,13 +25,7 @@ pub enum RuntimeStartupIntent {
     AutoStart,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachedRoot {
-    pub session_id: String,
-    pub task_id: String,
-    pub capability: String,
-    pub workspace: WorkerWorkspace,
-}
+pub use yi_agent_subagent::{AttachedRoot, register_attached_root_tools};
 
 /// The Chinese line shown when the runtime the user asked for (`y`, or a
 /// remembered `always`) could not be started or activated.
@@ -72,23 +61,11 @@ pub fn current_attached_root() -> Option<AttachedRoot> {
         .clone()
 }
 
-pub fn register_attached_root_tools(
-    registry: &mut ToolRegistry,
-    runtime_socket: PathBuf,
-    root: &AttachedRoot,
-) {
-    register_application_subagent_tools(
-        registry,
-        runtime_socket,
-        root.session_id.clone(),
-        root.task_id.clone(),
-        root.capability.clone(),
-    );
-}
-
 #[cfg(test)]
 mod tests {
+    use yi_agent_core::ToolRegistry;
     use yi_agent_core::subagent::task::WorkspaceLeaseId;
+    use yi_agent_core::subagent::worker::WorkerWorkspace;
 
     use super::*;
 

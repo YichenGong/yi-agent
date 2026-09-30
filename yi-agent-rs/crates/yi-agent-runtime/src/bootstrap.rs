@@ -246,6 +246,15 @@ pub type DecisionReceiver = Arc<
 pub struct AgentBootstrap {
     pub agent: yi_agent_core::Agent,
     pub permission: Arc<yi_agent_core::permission::PermissionChecker>,
+    /// The provider the agent runs on. Callers that rebuild the agent with a
+    /// different tool set must reuse this instance rather than building a
+    /// second one, so the credential and the client stay a single object.
+    pub provider: Arc<dyn yi_agent_core::Provider>,
+    /// The registry the agent was built with. Callers that need to add tools
+    /// (for example the six delegation tools) rebuild from this instead of
+    /// re-deriving a tool set of their own, which would drop the skills and
+    /// MCP wiring only this constructor knows about.
+    pub tools: Arc<yi_agent_core::ToolRegistry>,
     /// 交互模式下由调用方(CLI / app-server)用它回传权限决定;
     /// AutoAllow 模式下为 `None`(通道已关闭,黑名单命令解析为 Deny)。
     pub decision_tx: Option<tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>>,
@@ -297,6 +306,9 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
 
     let agent_config = build_agent_config(cfg, setup.system_prompt);
 
+    let provider_handle = Arc::clone(&provider);
+    let tools = Arc::clone(&setup.tools);
+    let catalog = setup.catalog;
     match mode {
         PermissionMode::Interactive => {
             let agent = yi_agent_core::Agent::new(provider, setup.tools, agent_config)
@@ -304,9 +316,11 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
             Ok(AgentBootstrap {
                 agent,
                 permission: checker,
+                provider: provider_handle,
+                tools,
+                catalog,
                 decision_tx: Some(decision_tx),
                 decision_rx: Some(rx_arc),
-                catalog: setup.catalog,
                 yolo: switch.clone(),
             })
         }
@@ -320,9 +334,11 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
             Ok(AgentBootstrap {
                 agent,
                 permission: checker,
+                provider: provider_handle,
+                tools,
+                catalog,
                 decision_tx: None,
                 decision_rx: None,
-                catalog: setup.catalog,
                 yolo: switch.clone(),
             })
         }
@@ -499,6 +515,37 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// The app-server rebuilds a thread's agent with a different tool set once
+    /// the project runtime is attached. It can only do that if the bootstrap
+    /// hands back the registry it built — re-deriving one would silently drop
+    /// the skills and MCP wiring — and the provider, so no second provider is
+    /// constructed (which would re-read the credential).
+    #[test]
+    fn bootstrap_exposes_the_provider_registry_and_catalog_handle() {
+        let mut cfg = sample_config();
+        cfg.workdir = tempfile::TempDir::new().unwrap().path().to_path_buf();
+        let built = bootstrap_agent(&cfg, PermissionMode::Interactive).expect("bootstrap");
+
+        let names = built.tools.names();
+        assert!(
+            names.contains(&"bash".to_string()),
+            "the bootstrap must expose the registry it built, got {names:?}"
+        );
+        assert!(
+            built.catalog.is_some(),
+            "the bootstrap must expose the skills catalog handle it built"
+        );
+        // The provider is exposed so a rebuilding caller reuses this instance
+        // instead of constructing a second one. Identity cannot be compared
+        // from outside the struct (a fresh `build_provider` is a different
+        // allocation by definition), so assert the handle is live and shared:
+        // the agent holds the other reference.
+        assert!(
+            Arc::strong_count(&built.provider) >= 2,
+            "the exposed provider must be the instance the agent runs on"
+        );
     }
 
     #[test]

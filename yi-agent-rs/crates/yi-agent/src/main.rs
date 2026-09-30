@@ -4,7 +4,6 @@ mod config;
 mod control_commands;
 mod llm_prefix;
 mod schedule_intent;
-mod subagent_runtime;
 mod tracing_init;
 mod tui;
 
@@ -519,30 +518,7 @@ fn build_daemon_worker_factory(
     runtime_socket: std::path::PathBuf,
 ) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
     let config = config::load(cli)?;
-    let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
-
-    // Skills-only registry: the worker's deliberate contract is to NOT register
-    // builtin/process tools here (recovery path adds its own workspace-rooted set).
-    let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(&config)?;
-    let catalog = prompt.catalog;
-    let mut registry = yi_agent_core::ToolRegistry::new();
-    if let Some(skills) = &prompt.skills {
-        registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
-    }
-    let agent_config =
-        yi_agent_runtime::bootstrap::build_agent_config(&config, prompt.system_prompt);
-    Ok(Arc::new(
-        subagent_runtime::DaemonAgentWorkerFactory::new(
-            provider,
-            Arc::new(registry),
-            agent_config,
-            runtime_socket,
-        )
-        .with_catalog(catalog)
-        // Recovery must inspect the same worktree ordinary builtin tools use.
-        .with_sandbox(config.sandbox, config.sandbox_writable_roots)
-        .with_workspace(config.workdir),
-    ))
+    yi_agent_subagent::attach::worker_factory(&config, runtime_socket)
 }
 
 /// The runtime socket for a project, resolved identically everywhere.
@@ -556,19 +532,7 @@ pub(crate) fn runtime_socket_for(
 }
 
 pub(crate) fn runtime_directory_for(workdir: &std::path::Path) -> std::path::PathBuf {
-    runtime_directory_from(
-        std::env::var_os("YI_AGENT_RUNTIME_DIR")
-            .filter(|value| !value.is_empty())
-            .map(std::path::PathBuf::from),
-        workdir,
-    )
-}
-
-fn runtime_directory_from(
-    override_path: Option<std::path::PathBuf>,
-    workdir: &std::path::Path,
-) -> std::path::PathBuf {
-    override_path.unwrap_or_else(|| workdir.join(".yi-agent/runtime"))
+    yi_agent_subagent::attach::project_runtime_directory(workdir)
 }
 
 /// Single source of truth for the runtime database filename. The daemon and the
@@ -580,34 +544,10 @@ fn runtime_database_path(runtime_dir: &std::path::Path) -> std::path::PathBuf {
 
 /// Keeps the daemon's own project-local state out of the checkout's git status.
 ///
-/// The runtime state root is `<workdir>/.yi-agent/` (the daemon's `runtime/`
-/// store plus the TUI's `threads/` logs). Creating it dirties a checkout that
-/// does not already ignore it, and git worktree provisioning then refuses that
-/// dirty parent — so the very first delegation would fail on a clean project.
-/// This records the state root in the shared, untracked `.git/info/exclude`, so
-/// the tool never defeats its own precondition. It is a no-op for a non-git
-/// workdir or a workdir outside any repository. The entry is keyed on
-/// `<workdir>/.yi-agent` even when `YI_AGENT_RUNTIME_DIR` relocates the store:
-/// the TUI's `threads/` logs, the permission cache and the project `.env` still
-/// live under `.yi-agent/`, so ignoring it is what keeps the checkout clean
-/// regardless of the runtime directory. Recording the entry is idempotent and
-/// harmless when the project already ignores the path elsewhere: git tolerates
-/// redundant ignore sources.
+/// The shared implementation is the single source of truth; this wrapper keeps
+/// the existing call sites (and their regression tests) reading the same name.
 fn ignore_project_local_runtime_state(workdir: &std::path::Path) {
-    let state_root = workdir.join(".yi-agent");
-    let service = yi_agent_tools::worktree::WorktreeService::new();
-    match service.ignore_project_path(&state_root) {
-        Ok(()) => {}
-        Err(error) => {
-            // Degrade to the previous behavior: a non-git or unreadable
-            // workdir must not turn delegation setup into a hard failure.
-            tracing::debug!(
-                error = %error,
-                workdir = %workdir.display(),
-                "could not record the project-local runtime state in git exclude"
-            );
-        }
-    }
+    yi_agent_subagent::attach::ignore_project_local_runtime_state(workdir);
 }
 
 fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Result<()> {
@@ -921,35 +861,15 @@ fn activate_tui_runtime_root(
     root: &crate::tui::subagents::AttachedRoot,
     objective: &str,
 ) -> Result<()> {
-    match yi_agent_store::ipc::send_request(
-        socket_path,
-        yi_agent_store::ipc::IpcRequest::ActivateApplicationRoot {
-            session_id: root.session_id.clone(),
-            root_task_id: root.task_id.clone(),
-            capability: root.capability.clone(),
-            objective: objective.to_owned(),
-        },
-    )? {
-        yi_agent_store::ipc::IpcResponse::ApplicationRootActivated => Ok(()),
-        other => anyhow::bail!("daemon rejected TUI runtime activation: {other:?}"),
-    }
+    yi_agent_subagent::attach::activate_root(socket_path, root, objective)
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 fn detach_tui_runtime_root(
     socket_path: &std::path::Path,
     root: &crate::tui::subagents::AttachedRoot,
 ) {
-    let response = yi_agent_store::ipc::send_request(
-        socket_path,
-        yi_agent_store::ipc::IpcRequest::DetachApplicationRoot {
-            session_id: root.session_id.clone(),
-            root_task_id: root.task_id.clone(),
-            capability: root.capability.clone(),
-        },
-    );
-    if let Err(error) = response {
-        tracing::warn!(error = %error, "could not detach TUI runtime root");
-    }
+    yi_agent_subagent::attach::detach_root(socket_path, root);
 }
 
 fn load_permission_checker_for_workdir(
@@ -2395,58 +2315,6 @@ mod tests {
         };
         assert_eq!(idempotency_key, "test-key");
         assert_eq!(workspace, std::path::PathBuf::from("/projects/b"));
-    }
-
-    #[test]
-    fn runtime_directory_uses_workdir_local_default() {
-        assert_eq!(
-            runtime_directory_from(None, std::path::Path::new("/tmp/project-a")),
-            std::path::PathBuf::from("/tmp/project-a/.yi-agent/runtime"),
-        );
-    }
-
-    #[test]
-    fn runtime_directory_prefers_a_nonempty_explicit_override() {
-        assert_eq!(
-            runtime_directory_from(
-                Some(std::path::PathBuf::from("/tmp/shared-runtime")),
-                std::path::Path::new("/tmp/project-a"),
-            ),
-            std::path::PathBuf::from("/tmp/shared-runtime"),
-        );
-    }
-
-    #[test]
-    fn runtime_directory_isolated_between_workdirs() {
-        let first = runtime_directory_from(None, std::path::Path::new("/tmp/project-a"));
-        let second = runtime_directory_from(None, std::path::Path::new("/tmp/project-b"));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn runtime_directory_for_workdir_uses_the_same_project_path_for_daemon_and_attachment() {
-        let workdir = std::path::PathBuf::from("/tmp/isolated-project");
-        let daemon_runtime = runtime_directory_from(None, &workdir);
-        let attachment_runtime = runtime_directory_from(None, &workdir);
-
-        assert_eq!(daemon_runtime, attachment_runtime);
-        assert_eq!(
-            daemon_runtime,
-            std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime"),
-        );
-    }
-
-    #[test]
-    fn runtime_database_path_is_shared_by_daemon_and_attachment() {
-        let workdir = std::path::PathBuf::from("/tmp/isolated-project");
-        let daemon_database = runtime_database_path(&runtime_directory_from(None, &workdir));
-        let attachment_database = runtime_database_path(&runtime_directory_from(None, &workdir));
-
-        assert_eq!(daemon_database, attachment_database);
-        assert_eq!(
-            daemon_database,
-            std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime/runtime.sqlite"),
-        );
     }
 
     #[test]

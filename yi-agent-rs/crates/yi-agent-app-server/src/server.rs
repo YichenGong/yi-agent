@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::json;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use yi_agent_core::permission::Decision;
@@ -35,15 +36,205 @@ enum TurnEvent {
     Finished { thread_id: String, turn_id: String },
 }
 
-/// 工厂产出的 agent 及其权限决定通道。
+/// 工厂产出的 agent 及其重建所需的部件。
+///
+/// 项目 runtime attach 成功后,该 thread 的 agent 要用新的工具集与新的权限根**重建**
+/// (见 `wrap_for_delegation`),所以这里只带出重建必须沿用的那些部件:重建 provider
+/// 会重读凭据并多一个 client,重建决定通道会打断正在等待审批的 turn。被替换掉的
+/// 工具集与权限检查器留在 `RuntimeTooling` 里,正是因为它俩不该出现在这张单子上。
 struct BuiltAgent {
     agent: yi_agent_core::Agent,
+    provider: Arc<dyn yi_agent_core::Provider>,
+    config: yi_agent_core::AgentConfig,
     /// 交互模式下的权限决定回传端;None 表示该 agent 不需要审批。
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
+    decision_rx: Option<yi_agent_runtime::bootstrap::DecisionReceiver>,
     /// 刷新 skills catalog 的句柄;无 skills 服务时为 `None`。
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
     /// 该 agent 的运行时 yolo 开关;`ThreadSession` 存它以便 RPC 即时切换。
     yolo: yi_agent_core::autonomy::YoloSwitch,
+}
+
+/// 一个 cwd 的工具集与其权限检查器。
+struct RuntimeTooling {
+    registry: Arc<yi_agent_core::ToolRegistry>,
+    permission: Arc<yi_agent_core::permission::PermissionChecker>,
+}
+
+/// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目
+/// 划分的,因此 attach 以 canonical cwd 为键、懒初始化。
+///
+/// 失败也缓存(存 `Err(原因)`):否则纯目录下每开一个 thread 都会重跑一遍注定失败的
+/// bring-up(git 检查 + daemon 起停尝试)。
+type ProjectRuntimes = Arc<
+    StdMutex<
+        HashMap<PathBuf, Result<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>, String>>,
+    >,
+>;
+
+/// 一次 attach 的结果:可能被换过工具集的 agent,以及该 thread 首个 turn 要激活的 runtime。
+struct Activation {
+    built: BuiltAgent,
+    runtime: Option<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>>,
+}
+
+/// 为该 cwd 的 agent 接上委派能力。失败即降级:保留原 agent,只记 trace。
+///
+/// 调用方必须已拿到 `build_agent` 的产物,且**不得**在 `threads` 的可变借用内调用:
+/// 本函数只经 `runtimes` 的 `Mutex` 访问,不触碰 `threads`,所以先调用、再
+/// `threads.insert(..)` 是安全的。
+fn attach_delegation(
+    runtimes: &ProjectRuntimes,
+    cfg: &RuntimeConfig,
+    cwd: &str,
+    built: BuiltAgent,
+) -> Activation {
+    let mut thread_cfg = cfg.clone();
+    thread_cfg.workdir = PathBuf::from(cwd);
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&thread_cfg.workdir);
+    let runtime = match attach_cwd_runtime(runtimes, &runtime_dir, &thread_cfg) {
+        Ok(runtime) => runtime,
+        Err(cause) => {
+            tracing::warn!(
+                stage = "attach",
+                %cause,
+                cwd,
+                "subagent delegation unavailable for this thread"
+            );
+            return Activation {
+                built,
+                runtime: None,
+            };
+        }
+    };
+    match build_runtime_tooling(&thread_cfg, &runtime, built.yolo.clone()) {
+        Ok(tooling) => Activation {
+            built: wrap_for_delegation(built, tooling),
+            runtime: Some(runtime),
+        },
+        Err(cause) => {
+            tracing::warn!(
+                stage = "tooling",
+                %cause,
+                cwd,
+                "subagent delegation unavailable for this thread"
+            );
+            Activation {
+                built,
+                runtime: None,
+            }
+        }
+    }
+}
+
+/// 取出(或建立)该 cwd 的项目 runtime。
+fn attach_cwd_runtime(
+    runtimes: &ProjectRuntimes,
+    runtime_dir: &Path,
+    cfg: &RuntimeConfig,
+) -> Result<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>, String> {
+    let key = std::fs::canonicalize(&cfg.workdir).unwrap_or_else(|_| cfg.workdir.clone());
+    if let Some(existing) = runtimes.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return existing.clone();
+    }
+    let outcome = yi_agent_subagent::attach::attach_project_runtime(cfg, runtime_dir.to_path_buf())
+        .map(Arc::new)
+        .map_err(|failure| format!("{}: {}", failure.stage, failure.cause));
+    runtimes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, outcome.clone());
+    outcome
+}
+
+/// 断开已 attach、但已无 thread 使用的项目 root。
+///
+/// 判据是「该项目目录下还有没有活着的 thread」,而不是「被删的 thread 属于哪个项目」:
+/// `thread/delete` 靠 `store_lookup` 按 thread_id 定位,分支里拿不到 cwd。这样删掉某个
+/// 项目里的**一个** thread 不会连带废掉同项目其它 thread 的委派(daemon 对重复 detach
+/// 幂等,但被断开后那个 driver 不会再激活第二次,故不能多断)。
+fn detach_unused_runtimes(runtimes: &ProjectRuntimes, live_cwds: &[String]) {
+    for runtime in attached_runtimes(runtimes) {
+        if live_cwds
+            .iter()
+            .any(|cwd| Path::new(cwd) == runtime.project_root)
+        {
+            continue;
+        }
+        yi_agent_subagent::attach::detach_root(&runtime.socket_path, &runtime.attached_root);
+    }
+}
+
+/// 本进程已 attach 的 runtime(只看成功项)。
+fn attached_runtimes(
+    runtimes: &ProjectRuntimes,
+) -> Vec<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>> {
+    runtimes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .filter_map(|entry| entry.clone().ok())
+        .collect()
+}
+
+/// 委派就绪的工具集。
+///
+/// 只有内置工具与权限根搬到 checkout;skills 与 MCP 的项目根仍取 `cfg.workdir`
+/// (用户选的项目)。`yolo` 必须是该 thread 自己的开关,否则运行期切 YOLO 时沙箱层
+/// 与权限层会脱钩。
+fn build_runtime_tooling(
+    cfg: &RuntimeConfig,
+    attached: &yi_agent_subagent::attach::AttachedProjectRuntime,
+    yolo: yi_agent_core::autonomy::YoloSwitch,
+) -> Result<RuntimeTooling, String> {
+    let setup =
+        yi_agent_runtime::bootstrap::build_tool_setup_in(cfg, false, &attached.workspace_root)
+            .map_err(|error| error.to_string())?;
+    let mut registry = (*setup.tools).clone();
+    yi_agent_subagent::register_attached_root_tools(
+        &mut registry,
+        attached.socket_path.clone(),
+        &attached.attached_root,
+    );
+    let permission = yi_agent_runtime::bootstrap::load_permission_checker_with_switch(
+        &attached.workspace_root,
+        yolo,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(RuntimeTooling {
+        registry: Arc::new(registry),
+        permission,
+    })
+}
+
+/// 把 thread 的工具集与权限根换成 attached runtime 的,其余部件沿用。
+fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent {
+    let BuiltAgent {
+        agent,
+        provider,
+        config,
+        decision_tx,
+        decision_rx,
+        catalog,
+        yolo,
+        ..
+    } = built;
+    let session = agent.session();
+    let mut rebuilt =
+        yi_agent_core::Agent::new(provider.clone(), tooling.registry.clone(), config.clone())
+            .with_session(session);
+    if let Some(rx) = decision_rx.clone() {
+        rebuilt = rebuilt.with_permission(tooling.permission.clone(), rx);
+    }
+    BuiltAgent {
+        agent: rebuilt,
+        provider,
+        config,
+        decision_tx,
+        decision_rx,
+        catalog,
+        yolo,
+    }
 }
 
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
@@ -56,12 +247,14 @@ where
 {
     let cfg_for_factory = cfg.clone();
     let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     run_with(
         reader,
         writer,
         cfg,
         PERMISSION_TIMEOUT,
         workspaces,
+        runtimes,
         move |session, cwd, mode| {
             let mut thread_cfg = cfg_for_factory.clone();
             thread_cfg.workdir = cwd.to_path_buf();
@@ -70,9 +263,15 @@ where
                 &thread_cfg,
                 yi_agent_runtime::bootstrap::PermissionMode::Interactive,
             )?;
+            // The provider stays the single object the bootstrap built; a second
+            // one would re-read the credential and duplicate the client.
+            let config = built.agent.config().clone();
             Ok(BuiltAgent {
                 agent: apply_session(built.agent, session),
+                provider: built.provider,
+                config,
                 decision_tx: built.decision_tx,
+                decision_rx: built.decision_rx,
                 catalog: built.catalog,
                 yolo: built.yolo,
             })
@@ -92,6 +291,7 @@ async fn run_with<R, W, F>(
     cfg: RuntimeConfig,
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
+    runtimes: ProjectRuntimes,
     build_agent: F,
 ) -> anyhow::Result<()>
 where
@@ -143,6 +343,12 @@ where
 
     let mut initialized = false;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+    // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
+    // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
+    let mut pending_activation: HashMap<
+        String,
+        Option<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>>,
+    > = HashMap::new();
 
     loop {
         tokio::select! {
@@ -387,14 +593,18 @@ where
                         // 抽成局部量避免两处字面量漂移。
                         let mode = crate::thread_store::ThreadMode::Normal;
 
-                        let BuiltAgent { agent, decision_tx, catalog, yolo } =
-                            match build_agent(None, Path::new(&cwd), mode) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
-                                    continue;
-                                }
-                            };
+                        let built = match build_agent(None, Path::new(&cwd), mode) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
+                                continue;
+                            }
+                        };
+                        // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
+                        // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
+                        let activation = attach_delegation(&runtimes, &cfg, &cwd, built);
+                        let BuiltAgent { agent, decision_tx, catalog, yolo, .. } = activation.built;
+                        pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
@@ -575,8 +785,7 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
-                        let BuiltAgent { agent, decision_tx, catalog, yolo } =
-                            match build_agent(Some(session), Path::new(&cwd), mode) {
+                        let built = match build_agent(Some(session), Path::new(&cwd), mode) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
@@ -587,6 +796,9 @@ where
                                 continue;
                             }
                         };
+                        let activation = attach_delegation(&runtimes, &cfg, &cwd, built);
+                        let BuiltAgent { agent, decision_tx, catalog, yolo, .. } = activation.built;
+                        pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
@@ -800,6 +1012,12 @@ where
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
+                        pending_activation.remove(&thread_id);
+                        let live_cwds = threads
+                            .values()
+                            .map(|session| session.cwd.clone())
+                            .collect::<Vec<_>>();
+                        detach_unused_runtimes(&runtimes, &live_cwds);
                         if let Err(e) = thread_store.delete(&thread_id) {
                             eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
                         }
@@ -869,7 +1087,19 @@ where
                         )
                         .await?;
 
-                        if prompt_tx.send(TurnPrompt { turn_id, prompt }).await.is_err() {
+                        let activate = pending_activation
+                            .get(&thread_id)
+                            .cloned()
+                            .flatten();
+                        if prompt_tx
+                            .send(TurnPrompt {
+                                turn_id,
+                                prompt,
+                                activate,
+                            })
+                            .await
+                            .is_err()
+                        {
                             // driver 已退出(理论上不会):清掉活跃标记,
                             // 避免后续 turn 永远报 turn_in_progress。
                             if let Some(s) = threads.get_mut(&thread_id) {
@@ -986,6 +1216,11 @@ where
                 }
             }
         }
+    }
+
+    // 进程退出前断开所有项目 root。同步调用:已经不在热路径上,而进程即将结束。
+    for runtime in attached_runtimes(&runtimes) {
+        yi_agent_subagent::attach::detach_root(&runtime.socket_path, &runtime.attached_root);
     }
 
     Ok(())
@@ -1183,7 +1418,43 @@ async fn run_thread_driver<W>(
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
     let mut translator = Translator::new(thread_id.clone());
-    while let Some(TurnPrompt { turn_id, prompt }) = prompt_rx.recv().await {
+    // 只在首个 turn 尝试激活:objective 会被写进 root 任务,不能用占位串,也不能
+    // 每轮重写。即使 `activate` 为 None 也置位,避免每轮重试。
+    let mut activation_attempted = false;
+    while let Some(TurnPrompt {
+        turn_id,
+        prompt,
+        activate,
+    }) = prompt_rx.recv().await
+    {
+        if !activation_attempted {
+            activation_attempted = true;
+            if let Some(runtime) = activate {
+                let socket = runtime.socket_path.clone();
+                let root = runtime.attached_root.clone();
+                let objective = prompt.clone();
+                // 同步调用放到阻塞线程池:driver 是 async 任务,直接调用会占住 executor。
+                let outcome = tokio::task::spawn_blocking(move || {
+                    yi_agent_subagent::attach::activate_root(&socket, &root, &objective)
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(cause)) => tracing::warn!(
+                        stage = "activation",
+                        %cause,
+                        %thread_id,
+                        "subagent delegation unavailable for this thread"
+                    ),
+                    Err(error) => tracing::warn!(
+                        stage = "activation",
+                        %error,
+                        %thread_id,
+                        "subagent delegation unavailable for this thread"
+                    ),
+                }
+            }
+        }
         // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
         // `last_usage` 记录的是本轮**最后一次** provider 调用的完整快照
         // (input 来自 `message_start`、output 来自 `message_delta`,由 Translator 合并)。
@@ -1495,6 +1766,188 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    /// A throwaway Git repository. Coding children need one; attaching does not.
+    fn init_git_repo(dir: &std::path::Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .status()
+                .expect("git must be available");
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        }
+    }
+
+    /// The six tools a root agent needs to delegate.
+    const DELEGATION_TOOLS: [&str; 6] = [
+        "spawn_agent",
+        "send_message",
+        "wait_agent",
+        "inspect_agent",
+        "cancel_agent",
+        "review_agent",
+    ];
+
+    /// A git project thread reaches the delegation tools.
+    ///
+    /// This is the desktop half of the TUI's
+    /// `build_tui_root_tools_registers_subagent_tools_for_attached_runtime`: the
+    /// app-server never had the wiring, so the model had no `spawn_agent`.
+    #[test]
+    fn a_git_project_gets_the_delegation_tools() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let attached =
+            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
+                .expect("a clean git repo must attach");
+
+        let tooling = build_runtime_tooling(
+            &cfg,
+            &attached,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+        )
+        .expect("tooling");
+        let names = tooling.registry.names();
+
+        for expected in DELEGATION_TOOLS {
+            assert!(
+                names.contains(&expected.to_string()),
+                "an attached root must expose {expected}, got {names:?}"
+            );
+        }
+
+        // Existing is not enough: the six tools have to work here. Drive the
+        // same request `spawn_agent` sends, so the test fails the day a git
+        // project stops admitting a delegated child.
+        yi_agent_subagent::attach::activate_root(
+            &attached.socket_path,
+            &attached.attached_root,
+            "investigate the build",
+        )
+        .expect("activation must succeed");
+        let spawned = yi_agent_store::ipc::send_request(
+            &attached.socket_path,
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: attached.attached_root.session_id.clone(),
+                parent_task_id: attached.attached_root.task_id.clone(),
+                capability: attached.attached_root.capability.clone(),
+                objective: "a delegated read-only investigation".into(),
+                mode: Some("read_only".into()),
+                model: None,
+                workdir: None,
+            },
+        )
+        .expect("the runtime socket must answer");
+        let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id } = spawned else {
+            panic!("a git project must admit a delegated child, got {spawned:?}");
+        };
+        assert!(!task_id.is_empty(), "the child must get an id to wait on");
+    }
+
+    /// A plain directory has no checkout to move into, so the root runs in
+    /// place. That is the shared bring-up's decision (the TUI attaches a plain
+    /// directory the same way), not an app-server rule, and the tools it
+    /// registers are exactly as usable as the project is.
+    #[test]
+    fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
+        let plain = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = plain.path().to_path_buf();
+
+        let outcome =
+            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf());
+
+        let attached = outcome.expect("a plain directory attaches as an in-place root");
+        assert_eq!(
+            attached.workspace_root, attached.project_root,
+            "a non-git project has no checkout to move the root into"
+        );
+        let names = build_runtime_tooling(
+            &cfg,
+            &attached,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+        )
+        .expect("tooling")
+        .registry
+        .names();
+        for expected in DELEGATION_TOOLS {
+            assert!(
+                names.contains(&expected.to_string()),
+                "attach in place still yields a root, so {expected} must be present, got {names:?}"
+            );
+        }
+
+        assert_eq!(
+            attached.workspace_root, attached.project_root,
+            "an in-place root is the project directory itself"
+        );
+        // Activation must still work: this is what the thread's first turn does,
+        // and a plain directory is not itself a reason for that to fail.
+        yi_agent_subagent::attach::activate_root(
+            &attached.socket_path,
+            &attached.attached_root,
+            "investigate the build",
+        )
+        .expect("an in-place root must activate");
+
+        // Delegating is where a plain directory stops: the daemon refuses the
+        // worker because it cannot name a Git worktree lease to recover into.
+        // Pin it here so the boundary is a documented fact rather than a
+        // surprise in a chat window -- the desktop app's default cwd is $HOME.
+        let spawned = yi_agent_store::ipc::send_request(
+            &attached.socket_path,
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: attached.attached_root.session_id.clone(),
+                parent_task_id: attached.attached_root.task_id.clone(),
+                capability: attached.attached_root.capability.clone(),
+                objective: "a read-only investigation".into(),
+                mode: Some("read_only".into()),
+                model: None,
+                workdir: None,
+            },
+        )
+        .expect("the runtime socket answers even when it refuses");
+        assert!(
+            !matches!(
+                spawned,
+                yi_agent_store::ipc::IpcResponse::TaskSpawned { .. }
+            ),
+            "delegation needs a checkpoint to recover into, so a plain directory \
+             must be refused rather than half-admitted; got {spawned:?}"
+        );
+    }
+
+    /// A second thread in one cwd reuses the attached runtime: the app-server is
+    /// one long-lived process, but a runtime is per project.
+    #[test]
+    fn two_threads_in_one_cwd_share_one_attached_runtime() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+
+        let first = attach_cwd_runtime(&runtimes, runtime.path(), &cfg).expect("first attach");
+        let second = attach_cwd_runtime(&runtimes, runtime.path(), &cfg).expect("second attach");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second thread in the same cwd must reuse the attached runtime"
+        );
+        assert_eq!(runtimes.lock().unwrap().len(), 1);
+    }
+
     use async_trait::async_trait;
     use futures::StreamExt;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1604,16 +2057,21 @@ mod tests {
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
-                    Arc::new(MockProvider),
+                    provider.clone(),
                     Arc::new(yi_agent_core::ToolRegistry::new()),
-                    yi_agent_core::AgentConfig::default(),
+                    config.clone(),
                 ),
                 session,
             ),
+            provider,
+            config,
             decision_tx: None,
+            decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
@@ -1624,16 +2082,21 @@ mod tests {
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(SlowProvider);
+        let config = yi_agent_core::AgentConfig::default();
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
-                    Arc::new(SlowProvider),
+                    provider.clone(),
                     Arc::new(yi_agent_core::ToolRegistry::new()),
-                    yi_agent_core::AgentConfig::default(),
+                    config.clone(),
                 ),
                 session,
             ),
+            provider,
+            config,
             decision_tx: None,
+            decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
@@ -1644,16 +2107,21 @@ mod tests {
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(DelayedProvider);
+        let config = yi_agent_core::AgentConfig::default();
         Ok(BuiltAgent {
             agent: apply_session(
                 yi_agent_core::Agent::new(
-                    Arc::new(DelayedProvider),
+                    provider.clone(),
                     Arc::new(yi_agent_core::ToolRegistry::new()),
-                    yi_agent_core::AgentConfig::default(),
+                    config.clone(),
                 ),
                 session,
             ),
+            provider,
+            config,
             decision_tx: None,
+            decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
@@ -1731,6 +2199,7 @@ mod tests {
                 cfg,
                 permission_timeout,
                 workspaces,
+                Arc::new(StdMutex::new(HashMap::new())),
                 build,
             ));
             Self {
@@ -2015,6 +2484,7 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            Arc::new(StdMutex::new(HashMap::new())),
             build_test_agent,
         ));
 
@@ -2068,6 +2538,7 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            Arc::new(StdMutex::new(HashMap::new())),
             |_s: Option<yi_agent_core::Session>,
              _cwd: &std::path::Path,
              _mode: crate::thread_store::ThreadMode| {
@@ -2125,6 +2596,7 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            Arc::new(StdMutex::new(HashMap::new())),
             build_test_agent,
         ));
 
@@ -2407,6 +2879,7 @@ mod tests {
             .send(TurnPrompt {
                 turn_id: "turn-1".into(),
                 prompt: "hi".into(),
+                activate: None,
             })
             .await
             .unwrap();
@@ -2484,6 +2957,7 @@ mod tests {
             .send(TurnPrompt {
                 turn_id: "turn-1".into(),
                 prompt: "hi".into(),
+                activate: None,
             })
             .await
             .unwrap();
@@ -2543,6 +3017,7 @@ mod tests {
                 .send(TurnPrompt {
                     turn_id: turn.into(),
                     prompt: "hi".into(),
+                    activate: None,
                 })
                 .await
                 .unwrap();
@@ -2655,11 +3130,12 @@ mod tests {
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
-        let provider = Arc::new(PermissionMockProvider {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(PermissionMockProvider {
             calls: AtomicUsize::new(0),
         });
         let mut registry = yi_agent_core::ToolRegistry::new();
         registry.register(Arc::new(FakeBash));
+        let config = yi_agent_core::AgentConfig::default();
         let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
             yi_agent_core::permission::PermissionsConfig::default(),
             yi_agent_core::autonomy::YoloSwitch::new(false),
@@ -2669,17 +3145,16 @@ mod tests {
         let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
         let rx_arc = Arc::new(Mutex::new(decision_rx));
         let agent = apply_session(
-            yi_agent_core::Agent::new(
-                provider,
-                Arc::new(registry),
-                yi_agent_core::AgentConfig::default(),
-            )
-            .with_permission(checker, rx_arc),
+            yi_agent_core::Agent::new(provider.clone(), Arc::new(registry), config.clone())
+                .with_permission(checker.clone(), rx_arc.clone()),
             session,
         );
         Ok(BuiltAgent {
             agent,
+            provider,
+            config,
             decision_tx: Some(decision_tx),
+            decision_rx: Some(rx_arc),
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         })
@@ -2906,6 +3381,7 @@ mod tests {
             .send(TurnPrompt {
                 turn_id: "turn-1".into(),
                 prompt: "hi".into(),
+                activate: None,
             })
             .await
             .unwrap();
@@ -3473,18 +3949,23 @@ mod tests {
         let build = move |session: Option<yi_agent_core::Session>,
                           _cwd: &std::path::Path,
                           _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RecordingProvider {
+                seen: Arc::clone(&seen_factory),
+            });
+            let config = yi_agent_core::AgentConfig::default();
             Ok(BuiltAgent {
                 agent: apply_session(
                     yi_agent_core::Agent::new(
-                        Arc::new(RecordingProvider {
-                            seen: Arc::clone(&seen_factory),
-                        }),
+                        provider.clone(),
                         Arc::new(yi_agent_core::ToolRegistry::new()),
-                        yi_agent_core::AgentConfig::default(),
+                        config.clone(),
                     ),
                     session,
                 ),
+                provider,
+                config,
                 decision_tx: None,
+                decision_rx: None,
                 catalog: None,
                 yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             })

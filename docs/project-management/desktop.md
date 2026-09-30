@@ -9,7 +9,7 @@
 （`desktop/src/lib/protocol.ts`），从不依赖 Rust 类型。
 
 `desktop/` **不是** `yi-agent-rs/` cargo workspace 的成员，独立构建。Rust workspace
-不受本模块影响：`cargo test -p yi-agent-app-server`（148 个测试）与
+不受本模块影响：`cargo test -p yi-agent-app-server`（157 个测试）与
 `cargo test -p yi-agent-runtime`（全绿）仍全绿。
 
 ## 范围边界
@@ -55,6 +55,7 @@
 - [x] 可拖拽侧边栏宽度（拖动右侧分隔条调宽、夹到 [200, 480]、`localStorage` 持久化、重启恢复、漏 mouseup/窗口失焦不残留监听）— `desktop/src/lib/sidebarWidth.ts:11`（`clampSidebarWidth`）/ `desktop/src/lib/sidebarWidth.ts:17`（`loadSidebarWidth`）/ `desktop/src/lib/sidebarWidth.ts:29`（`saveSidebarWidth`）/ `desktop/src/components/ThreadSidebar.tsx:57`（`onHandleDown`）/ `desktop/src/components/ThreadSidebar.tsx:200`（`style={{ width }}`）/ `desktop/src/components/ThreadSidebar.tsx:354`（`role="separator"` 拖拽手柄）；显示名统一为 `Yi-Agent` — `desktop/index.html:7` / `desktop/src-tauri/tauri.conf.json:15`；验证 `cd desktop && npx vitest run && npx tsc --noEmit && npm run build`
 - [x] 每 thread 状态徽标 + 未读注意力点 + 逐 thread 审批横幅 — `desktop/src/lib/threadStore.ts:6`（`ThreadView` = session / status / unread / approval / info / mode；按 `thread_id` 路由通知，离开 `awaiting_approval` 清审批 `desktop/src/lib/threadStore.ts:88`，非当前 thread 的 `turn/completed` 置 unread `desktop/src/lib/threadStore.ts:100`）/ `desktop/src/components/ApprovalBanner.tsx:10`（顶部可关闭横幅 + 逐 thread「Jump · <tool>」按钮）；判据：`desktop/src/components/ThreadSidebar.tsx` 渲染 `StatusBadge`（`aria-label="Thread status"` + `data-status`，`running` 旋转环 / `awaiting_approval` 琥珀点）、`aria-label="Unread"`；验证 `cd desktop && npx vitest run src/lib/threadStore.test.ts src/components/ApprovalBanner.test.tsx src/components/ThreadSidebar.test.tsx`
 - [x] 运行指示器动画跨状态翻转不重启（修掉「卡住 / 只播放很短一段就循环」）— 根因两条：① 状态徽标原本用互斥分支渲染两个不同 `<span>`，`running → awaiting_approval → running`（每次需确认的工具调用都走这条）逐次卸载/重挂节点、CSS 动画从 `currentTime=0` 重来；② `ChatView` 每个 delta 重渲染整条对话（定稿 markdown 全量重解析、工具卡片 `JSON.stringify(input, null, 2)` 重新序列化）。修复：`StatusBadge` 两态共用**同一** `<span>` 且 `animate-spin` 常驻（`desktop/src/components/ThreadSidebar.tsx`），并新增 `AgentMessage` / 记忆化 `ToolCallCard`（`desktop/src/components/MarkdownText.tsx`、`desktop/src/components/ChatView.tsx`）。验证：`cd desktop && npx vitest run src/components/ChatView.test.tsx src/components/ThreadSidebar.test.tsx`（定稿工具卡片在流式期间只渲染 1 次 / 翻转后徽标是同一 DOM 节点，回退即失败）；WKWebView 回放合成流式回合实测动画净推进率 **0.008 → 1.000**（`currentTime` 归零次数 51 → 0）。见 [设计](../superpowers/specs/2026-09-30-desktop-sidebar-running-animation-design.md)
+- [x] 子 Agent 委派（`spawn_agent` 等六个工具在对话里可用）— 前端**零改动**：`spawn_agent` 就是普通工具，经 `translate.rs` 变成既有 `toolCall` item，由既有 `ToolCallCard` 渲染；能力来自 app-server 按 thread 的 cwd attach 项目 runtime（见 [yi-agent-app-server](./yi-agent-app-server.md)）。**已知限制：** 桌面端默认 cwd 是 `$HOME`（sidecar `current_dir(home)`，`desktop/src-tauri/src/bridge.rs:94`），不是 git 项目——此时 attach 与工具注册都照常成功，但 `spawn_agent` 会被 daemon 拒绝（worker 准入需要一个可恢复的 `worktree:` lease，见 [subagent-runtime](./subagent-runtime.md)），所以要在 GUI 里显式选一个 git 项目目录。判据：`cd yi-agent-rs && cargo test -p yi-agent-app-server a_git_project_gets_the_delegation_tools && cargo test -p yi-agent-app-server a_non_git_cwd_attaches_in_place_with_the_delegation_tools && cd desktop && npx tsc --noEmit && npm test` — [设计](../superpowers/specs/2026-09-30-desktop-subagent-delegation-design.md)
 
 **打包交付缺口：**
 

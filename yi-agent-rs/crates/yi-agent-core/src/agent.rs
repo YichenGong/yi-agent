@@ -497,6 +497,15 @@ impl Agent {
         self.config.system_prompt = prompt;
     }
 
+    /// The configuration this agent was built with.
+    ///
+    /// Callers that rebuild the agent around a different tool set (for example
+    /// once a project runtime is attached) reuse this instead of re-deriving a
+    /// configuration, so the model, budgets and system prompt cannot drift.
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
     pub fn session(&self) -> Session {
         self.session.lock().unwrap().clone()
     }
