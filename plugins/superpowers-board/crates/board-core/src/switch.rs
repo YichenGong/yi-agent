@@ -97,6 +97,24 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_typed_switch_value_is_treated_as_unset() {
+        // 类型不对（字符串/数字）不是解析错误，而是"该层未设置"：返回 None 且绝不 panic。
+        assert_eq!(parse_switch_json(r#"{"superpowers_board":"yes"}"#), None);
+        assert_eq!(parse_switch_json(r#"{"superpowers_board":1}"#), None);
+        assert_eq!(parse_switch_json(r#"{"superpowers_board":null}"#), None);
+    }
+
+    #[test]
+    fn an_unset_layer_falls_through_to_the_other_layer() {
+        // 项目层类型不对 → 视作未设置，必须继承全局层而不是被读成 false。
+        assert_eq!(parse_switch_json(r#"{"superpowers_board":"yes"}"#), None);
+        assert_eq!(
+            resolve(Some(SwitchValue::Enabled), None),
+            BoardSwitch::Enabled
+        );
+    }
+
+    #[test]
     fn a_preferences_file_keeps_its_other_keys_untouched_on_read() {
         // 现有 preferences.json 里已有 subagent_runtime 等键，读取必须忽略它们。
         assert_eq!(
