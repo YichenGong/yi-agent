@@ -147,6 +147,24 @@ fn attach_cwd_runtime(
     outcome
 }
 
+/// 断开已 attach、但已无 thread 使用的项目 root。
+///
+/// 判据是「该项目目录下还有没有活着的 thread」,而不是「被删的 thread 属于哪个项目」:
+/// `thread/delete` 靠 `store_lookup` 按 thread_id 定位,分支里拿不到 cwd。这样删掉某个
+/// 项目里的**一个** thread 不会连带废掉同项目其它 thread 的委派(daemon 对重复 detach
+/// 幂等,但被断开后那个 driver 不会再激活第二次,故不能多断)。
+fn detach_unused_runtimes(runtimes: &ProjectRuntimes, live_cwds: &[String]) {
+    for runtime in attached_runtimes(runtimes) {
+        if live_cwds
+            .iter()
+            .any(|cwd| Path::new(cwd) == runtime.project_root)
+        {
+            continue;
+        }
+        yi_agent_subagent::attach::detach_root(&runtime.socket_path, &runtime.attached_root);
+    }
+}
+
 /// 本进程已 attach 的 runtime(只看成功项)。
 fn attached_runtimes(
     runtimes: &ProjectRuntimes,
@@ -995,15 +1013,11 @@ where
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         pending_activation.remove(&thread_id);
-                        // 断开已 attach 的项目 root。`thread/delete` 分支拿不到该 thread
-                        // 的 cwd(它靠 store_lookup 按 thread_id 定位),故按位置无关的
-                        // 方式断开全部;daemon 对重复 detach 幂等。
-                        for runtime in attached_runtimes(&runtimes) {
-                            yi_agent_subagent::attach::detach_root(
-                                &runtime.socket_path,
-                                &runtime.attached_root,
-                            );
-                        }
+                        let live_cwds = threads
+                            .values()
+                            .map(|session| session.cwd.clone())
+                            .collect::<Vec<_>>();
+                        detach_unused_runtimes(&runtimes, &live_cwds);
                         if let Err(e) = thread_store.delete(&thread_id) {
                             eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
                         }
@@ -1752,8 +1766,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    /// A throwaway Git repository. The attach path needs a real worktree: the
-    /// daemon refuses a project that is not inside one.
+    /// A throwaway Git repository. Coding children need one; attaching does not.
     fn init_git_repo(dir: &std::path::Path) {
         for args in [
             vec!["init", "-q"],
@@ -1811,6 +1824,33 @@ mod tests {
                 "an attached root must expose {expected}, got {names:?}"
             );
         }
+
+        // Existing is not enough: the six tools have to work here. Drive the
+        // same request `spawn_agent` sends, so the test fails the day a git
+        // project stops admitting a delegated child.
+        yi_agent_subagent::attach::activate_root(
+            &attached.socket_path,
+            &attached.attached_root,
+            "investigate the build",
+        )
+        .expect("activation must succeed");
+        let spawned = yi_agent_store::ipc::send_request(
+            &attached.socket_path,
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: attached.attached_root.session_id.clone(),
+                parent_task_id: attached.attached_root.task_id.clone(),
+                capability: attached.attached_root.capability.clone(),
+                objective: "a delegated read-only investigation".into(),
+                mode: Some("read_only".into()),
+                model: None,
+                workdir: None,
+            },
+        )
+        .expect("the runtime socket must answer");
+        let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id } = spawned else {
+            panic!("a git project must admit a delegated child, got {spawned:?}");
+        };
+        assert!(!task_id.is_empty(), "the child must get an id to wait on");
     }
 
     /// A plain directory has no checkout to move into, so the root runs in
@@ -1846,6 +1886,45 @@ mod tests {
                 "attach in place still yields a root, so {expected} must be present, got {names:?}"
             );
         }
+
+        assert_eq!(
+            attached.workspace_root, attached.project_root,
+            "an in-place root is the project directory itself"
+        );
+        // Activation must still work: this is what the thread's first turn does,
+        // and a plain directory is not itself a reason for that to fail.
+        yi_agent_subagent::attach::activate_root(
+            &attached.socket_path,
+            &attached.attached_root,
+            "investigate the build",
+        )
+        .expect("an in-place root must activate");
+
+        // Delegating is where a plain directory stops: the daemon refuses the
+        // worker because it cannot name a Git worktree lease to recover into.
+        // Pin it here so the boundary is a documented fact rather than a
+        // surprise in a chat window -- the desktop app's default cwd is $HOME.
+        let spawned = yi_agent_store::ipc::send_request(
+            &attached.socket_path,
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: attached.attached_root.session_id.clone(),
+                parent_task_id: attached.attached_root.task_id.clone(),
+                capability: attached.attached_root.capability.clone(),
+                objective: "a read-only investigation".into(),
+                mode: Some("read_only".into()),
+                model: None,
+                workdir: None,
+            },
+        )
+        .expect("the runtime socket answers even when it refuses");
+        assert!(
+            !matches!(
+                spawned,
+                yi_agent_store::ipc::IpcResponse::TaskSpawned { .. }
+            ),
+            "delegation needs a checkpoint to recover into, so a plain directory \
+             must be refused rather than half-admitted; got {spawned:?}"
+        );
     }
 
     /// A second thread in one cwd reuses the attached runtime: the app-server is
