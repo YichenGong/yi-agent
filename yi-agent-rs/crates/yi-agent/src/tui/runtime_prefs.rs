@@ -1,10 +1,5 @@
 //! Project-level TUI preferences persisted under `<workdir>/.yi-agent/`.
 
-// Scaffolding: nothing consumes this module yet. Tasks 2/4/5 wire it into the
-// TUI; remove this allow when the last consumer lands. Same pattern as
-// `tui/subagents.rs`.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

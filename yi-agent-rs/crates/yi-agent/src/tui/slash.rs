@@ -1,6 +1,7 @@
 //! Slash command definitions and popup state for the TUI.
 
 use crate::control_commands::{CommandSpec, ControlCommand};
+use crate::tui::runtime_prefs::RuntimePreference;
 
 /// A slash command the user can invoke from the TUI input.
 ///
@@ -34,6 +35,7 @@ pub enum SlashCommand {
     Budget,
     Daemon,
     Mcp,
+    Runtime,
 }
 
 impl SlashCommand {
@@ -60,7 +62,13 @@ impl SlashCommand {
             Self::Daemon => ControlCommand::Daemon,
             Self::Mcp => ControlCommand::Mcp,
             Self::Help => ControlCommand::Help,
-            Self::Quit | Self::Clear | Self::Model | Self::Cost | Self::Compact | Self::Config => {
+            Self::Quit
+            | Self::Clear
+            | Self::Model
+            | Self::Cost
+            | Self::Compact
+            | Self::Config
+            | Self::Runtime => {
                 return None;
             }
         };
@@ -100,6 +108,7 @@ impl SlashCommand {
             SlashCommand::Budget => "budget",
             SlashCommand::Daemon => "daemon",
             SlashCommand::Mcp => "mcp",
+            SlashCommand::Runtime => "runtime",
         }
     }
 
@@ -136,6 +145,7 @@ impl SlashCommand {
             SlashCommand::Budget => "查看或收窄任务预算",
             SlashCommand::Daemon => "管理本地 runtime daemon",
             SlashCommand::Mcp => "管理 MCP server 开关",
+            SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
         }
     }
 
@@ -153,6 +163,7 @@ impl SlashCommand {
             SlashCommand::Cancel => Some("<task-id> [--recursive] [--confirm <token>]"),
             SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => Some("<task-id>"),
             SlashCommand::Priority => Some("<task-id> <level>"),
+            SlashCommand::Runtime => Some("[ask|always|never]"),
             SlashCommand::Approve => Some("<request-id> [once|task]"),
             SlashCommand::Deny => Some("<request-id>"),
             SlashCommand::Review => Some("<task-id>"),
@@ -199,6 +210,7 @@ impl SlashCommand {
             SlashCommand::Budget,
             SlashCommand::Daemon,
             SlashCommand::Mcp,
+            SlashCommand::Runtime,
         ]
     }
 
@@ -245,6 +257,26 @@ pub fn help_text(target: Option<&str>) -> String {
             }
             text
         }
+    }
+}
+
+/// A parsed `/runtime` action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAction {
+    /// Show the current preference and its source.
+    Status,
+    /// Persist a new preference.
+    Set(RuntimePreference),
+}
+
+/// Parse `/runtime` arguments. Returns a user-facing usage error on bad input.
+pub fn parse_runtime_args(args: &str) -> Result<RuntimeAction, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] | ["status"] => Ok(RuntimeAction::Status),
+        ["ask"] => Ok(RuntimeAction::Set(RuntimePreference::Ask)),
+        ["always"] => Ok(RuntimeAction::Set(RuntimePreference::Always)),
+        ["never"] => Ok(RuntimeAction::Set(RuntimePreference::Never)),
+        _ => Err("用法: /runtime [ask|always|never]".into()),
     }
 }
 
@@ -507,6 +539,49 @@ mod tests {
             Some("[on|off|enable <server>|disable <server>|status]")
         );
         assert!(SlashCommand::all().contains(&SlashCommand::Mcp));
+    }
+
+    #[test]
+    fn runtime_command_is_registered_with_usage() {
+        assert_eq!(
+            SlashCommand::from_name("runtime"),
+            Some(SlashCommand::Runtime)
+        );
+        assert_eq!(
+            SlashCommand::Runtime.argument_usage(),
+            Some("[ask|always|never]")
+        );
+        assert!(SlashCommand::all().contains(&SlashCommand::Runtime));
+    }
+
+    #[test]
+    fn parse_runtime_args_accepts_status_and_every_state() {
+        assert_eq!(parse_runtime_args(""), Ok(RuntimeAction::Status));
+        assert_eq!(parse_runtime_args("status"), Ok(RuntimeAction::Status));
+        assert_eq!(
+            parse_runtime_args("ask"),
+            Ok(RuntimeAction::Set(RuntimePreference::Ask))
+        );
+        assert_eq!(
+            parse_runtime_args("always"),
+            Ok(RuntimeAction::Set(RuntimePreference::Always))
+        );
+        assert_eq!(
+            parse_runtime_args("never"),
+            Ok(RuntimeAction::Set(RuntimePreference::Never))
+        );
+    }
+
+    #[test]
+    fn parse_runtime_args_rejects_unknown_input() {
+        assert_eq!(
+            parse_runtime_args("sometimes"),
+            Err("用法: /runtime [ask|always|never]".into())
+        );
+        assert_eq!(
+            parse_runtime_args("always never"),
+            Err("用法: /runtime [ask|always|never]".into())
+        );
     }
 
     #[test]

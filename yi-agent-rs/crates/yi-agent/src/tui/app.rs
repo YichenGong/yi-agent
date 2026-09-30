@@ -77,7 +77,7 @@ pub fn run_tui(
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     model: String,
-    runtime_start_prompt: Option<crate::tui::subagents::RuntimeStartPrompt>,
+    runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
     runtime_choice_tx: Option<
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
@@ -106,7 +106,7 @@ pub fn run_tui(
         &is_running,
         &CrosstermEventSource,
         &model,
-        runtime_start_prompt,
+        runtime_intent,
         runtime_choice_tx,
         process_manager,
         workdir,
@@ -231,6 +231,41 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     .map(|_dropped| ())
 }
 
+/// Body lines of the runtime startup dialog.
+///
+/// Kept as a function so the narrow-terminal test renders exactly what the live
+/// UI renders — a duplicated literal could drift and hide a clipping bug.
+///
+/// Keep every line's **display width** (CJK counts as 2 columns) within
+/// `BOX_WIDTH - 2` = 56, or it needs `Wrap` to fold. The key legend is 58 columns
+/// on purpose: it must fold into two lines, and the test below locks that in.
+fn runtime_prompt_lines() -> Vec<ratatui::text::Line<'static>> {
+    vec![
+        ratatui::text::Line::raw("启动后可以直接用自然语言创建和管理子 Agent。"),
+        ratatui::text::Line::raw("此选择会被记住，可用 /runtime 修改。"),
+        ratatui::text::Line::raw(""),
+        ratatui::text::Line::raw("[y] 启动并记住"),
+        ratatui::text::Line::raw("[n] 跳过并记住    [Esc] 本次跳过（不记住）"),
+    ]
+}
+
+/// Persists a runtime preference, but never blocks the session on failure.
+fn persist_runtime_choice(
+    workdir: &std::path::Path,
+    pref: crate::tui::runtime_prefs::RuntimePreference,
+    history: &mut HistoryState,
+    width: u16,
+) {
+    if let Err(error) = crate::tui::runtime_prefs::save(workdir, pref) {
+        history.push(
+            HistoryCell::Separator {
+                label: Some(format!("无法保存偏好（本次仍然生效）: {error}")),
+            },
+            width,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_loop<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
@@ -244,7 +279,7 @@ fn run_loop<B: Backend, E: EventSource>(
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
     model: &str,
-    runtime_start_prompt: Option<crate::tui::subagents::RuntimeStartPrompt>,
+    runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
     runtime_choice_tx: Option<
         tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
     >,
@@ -259,7 +294,13 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
     let mut runtime_popup: RuntimePopup = RuntimePopup::None;
-    let mut runtime_start_prompt = runtime_start_prompt;
+    let mut runtime_intent = runtime_intent;
+    // `DisabledNotice` prints exactly one line, on the first frame, once the
+    // history width is known.
+    let mut runtime_notice_pending = matches!(
+        runtime_intent,
+        Some(crate::tui::subagents::RuntimeStartupIntent::DisabledNotice { .. })
+    );
     let mut process_events = process_manager.subscribe();
     let mut process_snapshots = process_manager.list();
     let mut process_outputs: std::collections::HashMap<String, yi_agent_tools::ProcessReadResult> =
@@ -373,6 +414,20 @@ fn run_loop<B: Backend, E: EventSource>(
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let layout = compute_layout(area, input, pending_quit, &popup, queued_height);
 
+        if runtime_notice_pending {
+            runtime_notice_pending = false;
+            if let Some(crate::tui::subagents::RuntimeStartupIntent::DisabledNotice { reason }) =
+                &runtime_intent
+            {
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some(reason.clone()),
+                    },
+                    layout.chunks[0].width,
+                );
+            }
+        }
+
         let active_process_count = process_snapshots
             .iter()
             .filter(|snapshot| is_active_managed_process(&snapshot.status))
@@ -412,9 +467,9 @@ fn run_loop<B: Backend, E: EventSource>(
             let input_line = build_input_line(input, pending_quit, chunks[5].width);
             f.render_widget(input_line, chunks[5]);
 
-            if let Some(prompt) = &runtime_start_prompt {
+            if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
                 let box_w = 58u16.min(chunks[0].width.saturating_sub(4));
-                let box_h = 6u16.min(chunks[0].height.max(1));
+                let box_h = 10u16.min(chunks[0].height.max(1));
                 let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
                 let box_y = chunks[0].y + (chunks[0].height.saturating_sub(box_h)) / 3;
                 let box_area = ratatui::layout::Rect {
@@ -425,16 +480,13 @@ fn run_loop<B: Backend, E: EventSource>(
                 };
                 f.render_widget(Clear, box_area);
                 f.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![
-                        ratatui::text::Line::raw(prompt.body.clone()),
-                        ratatui::text::Line::raw(""),
-                        ratatui::text::Line::raw("[y] 启动并启用子 Agent   [n/Esc] 暂不启用"),
-                    ])
-                    .block(
-                        ratatui::widgets::Block::default()
-                            .borders(ratatui::widgets::Borders::ALL)
-                            .title(prompt.title.clone()),
-                    ),
+                    ratatui::widgets::Paragraph::new(runtime_prompt_lines())
+                        .wrap(ratatui::widgets::Wrap { trim: true })
+                        .block(
+                            ratatui::widgets::Block::default()
+                                .borders(ratatui::widgets::Borders::ALL)
+                                .title("启动本地 Agent Runtime?"),
+                        ),
                     box_area,
                 );
             }
@@ -491,23 +543,45 @@ fn run_loop<B: Backend, E: EventSource>(
                     }
                     continue;
                 }
-                if runtime_start_prompt.is_some() {
+                if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            persist_runtime_choice(
+                                &workdir,
+                                crate::tui::runtime_prefs::RuntimePreference::Always,
+                                history,
+                                layout.chunks[0].width,
+                            );
                             if let Some(tx) = &runtime_choice_tx {
                                 let _ = tx.blocking_send(
                                     crate::tui::subagents::RuntimeStartupChoice::Start,
                                 );
                             }
-                            runtime_start_prompt = None;
+                            runtime_intent = None;
                         }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            persist_runtime_choice(
+                                &workdir,
+                                crate::tui::runtime_prefs::RuntimePreference::Never,
+                                history,
+                                layout.chunks[0].width,
+                            );
                             if let Some(tx) = &runtime_choice_tx {
                                 let _ = tx.blocking_send(
                                     crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
                                 );
                             }
-                            runtime_start_prompt = None;
+                            runtime_intent = None;
+                        }
+                        // Esc means "skip this time"; it must NOT overwrite the
+                        // stored preference, so the next launch asks again.
+                        KeyCode::Esc => {
+                            if let Some(tx) = &runtime_choice_tx {
+                                let _ = tx.blocking_send(
+                                    crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
+                                );
+                            }
+                            runtime_intent = None;
                         }
                         _ => {}
                     }
@@ -1669,6 +1743,39 @@ fn execute_slash_command(
                 },
                 width,
             );
+            KeyOutcome::None
+        }
+        SlashCommand::Runtime => {
+            use crate::tui::runtime_prefs::{self, RuntimePreference};
+            let label = match crate::tui::slash::parse_runtime_args(args.as_deref().unwrap_or("")) {
+                Ok(crate::tui::slash::RuntimeAction::Status) => {
+                    let current = runtime_prefs::load(workdir);
+                    format!(
+                        "子 Agent runtime 偏好: {}（来源: {}）; 重启后生效",
+                        match current {
+                            RuntimePreference::Ask => "ask",
+                            RuntimePreference::Always => "always",
+                            RuntimePreference::Never => "never",
+                        },
+                        runtime_prefs::preferences_path(workdir).display()
+                    )
+                }
+                Ok(crate::tui::slash::RuntimeAction::Set(pref)) => {
+                    match runtime_prefs::save(workdir, pref) {
+                        Ok(()) => format!(
+                            "已设为 {}（重启后生效）",
+                            match pref {
+                                RuntimePreference::Ask => "ask",
+                                RuntimePreference::Always => "always",
+                                RuntimePreference::Never => "never",
+                            }
+                        ),
+                        Err(error) => format!("无法保存偏好: {error}"),
+                    }
+                }
+                Err(usage) => usage,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
         SlashCommand::Mcp => {
@@ -4463,6 +4570,7 @@ mod tests {
                 Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             ])),
         };
+        let project = tempfile::TempDir::new().unwrap();
 
         run_loop(
             &mut terminal,
@@ -4476,13 +4584,10 @@ mod tests {
             &is_running,
             &events,
             "test-model",
-            Some(crate::tui::subagents::RuntimeStartPrompt {
-                title: "启动本地 Agent Runtime?".into(),
-                body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
-            }),
+            Some(crate::tui::subagents::RuntimeStartupIntent::Prompt),
             Some(runtime_choice_tx),
-            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
-            std::env::temp_dir(),
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
@@ -4494,6 +4599,10 @@ mod tests {
         assert!(
             input_rx.try_recv().is_err(),
             "startup choice must not be sent as chat input"
+        );
+        assert_eq!(
+            crate::tui::runtime_prefs::load(project.path()),
+            crate::tui::runtime_prefs::RuntimePreference::Always
         );
     }
 
@@ -4515,6 +4624,7 @@ mod tests {
                 Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
             ])),
         };
+        let project = tempfile::TempDir::new().unwrap();
 
         run_loop(
             &mut terminal,
@@ -4528,13 +4638,10 @@ mod tests {
             &is_running,
             &events,
             "test-model",
-            Some(crate::tui::subagents::RuntimeStartPrompt {
-                title: "启动本地 Agent Runtime?".into(),
-                body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
-            }),
+            Some(crate::tui::subagents::RuntimeStartupIntent::Prompt),
             Some(runtime_choice_tx),
-            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
-            std::env::temp_dir(),
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
         )
         .unwrap();
@@ -4546,6 +4653,226 @@ mod tests {
         assert!(
             input_rx.try_recv().is_err(),
             "skip choice must not be sent as chat input"
+        );
+        assert_eq!(
+            crate::tui::runtime_prefs::load(project.path()),
+            crate::tui::runtime_prefs::RuntimePreference::Never
+        );
+    }
+
+    #[test]
+    fn escape_skips_runtime_for_this_session_without_persisting() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (runtime_choice_tx, mut runtime_choice_rx) = tokio::sync::mpsc::channel(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            Some(crate::tui::subagents::RuntimeStartupIntent::Prompt),
+            Some(runtime_choice_tx),
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+        )
+        .unwrap();
+
+        // Session behaviour matches "n": delegation is not enabled this run.
+        assert_eq!(
+            runtime_choice_rx.try_recv().unwrap(),
+            crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation
+        );
+        // ...but Esc must not write a preference: the next launch asks again.
+        assert!(!crate::tui::runtime_prefs::preferences_path(project.path()).exists());
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    /// Collects every `Separator` label pushed into history.
+    fn separator_labels(history: &HistoryState) -> Vec<String> {
+        history
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::Separator { label } => label.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn runtime_start_prompt_is_fully_visible_at_supported_widths() {
+        // (terminal width, requested box width, box height) — 40 exercises
+        // folding of the legend line; 80 covers the common case where the text
+        // fits the box.
+        for (term_w, box_w, box_h) in [(40u16, 58u16, 10u16), (80, 58, 10)] {
+            let backend = TestBackend::new(term_w, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            // Mirror the live clamp in `run_loop` (`58.min(width - 4)`): ratatui's
+            // buffer panics ("index outside of buffer") if the rendered area is
+            // wider than the terminal, so a raw 58-wide rect is not a valid model
+            // of a 40-column terminal.
+            let effective_w = box_w.min(term_w.saturating_sub(4));
+            let area = ratatui::layout::Rect::new(0, 0, effective_w, box_h);
+            terminal
+                .draw(|f| {
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new(runtime_prompt_lines())
+                            .wrap(ratatui::widgets::Wrap { trim: true }),
+                        area,
+                    );
+                })
+                .unwrap();
+
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            // ratatui paints the second cell of every wide CJK glyph as a blank
+            // continuation cell, so the raw buffer reads "启 动 并 记 住".
+            // Compare glyphs without whitespace: the property under test is that
+            // no glyph is dropped at the right edge, and clipping still removes
+            // one, so the assertion keeps its teeth.
+            let rendered: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+
+            // Tail of every selectable option must survive; clipping would drop it.
+            assert!(rendered.contains("启动并记住"), "width {term_w}");
+            assert!(rendered.contains("跳过并记住"), "width {term_w}");
+            assert!(rendered.contains("本次跳过"), "width {term_w}");
+            assert!(rendered.contains("不记住"), "width {term_w}");
+        }
+    }
+
+    #[test]
+    fn disabled_notice_prints_the_reason_into_history_only() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (runtime_choice_tx, mut runtime_choice_rx) = tokio::sync::mpsc::channel(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reason = "已按偏好禁用本地 Agent Runtime";
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+            ))])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+        let mut history = HistoryState::new();
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            Some(
+                crate::tui::subagents::RuntimeStartupIntent::DisabledNotice {
+                    reason: reason.to_string(),
+                },
+            ),
+            Some(runtime_choice_tx),
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+        )
+        .unwrap();
+
+        // Exactly one line explains why delegation is off for this launch.
+        assert_eq!(separator_labels(&history), vec![reason.to_string()]);
+        // Nothing was asked and nothing was written: a disabled notice is not a
+        // user decision, so it must not touch the stored preference.
+        assert!(runtime_choice_rx.try_recv().is_err());
+        assert!(!crate::tui::runtime_prefs::preferences_path(project.path()).exists());
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn auto_start_intent_asks_nothing_and_persists_nothing() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (runtime_choice_tx, mut runtime_choice_rx) = tokio::sync::mpsc::channel(1);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A "y" would answer a prompt; AutoStart must never show one, so this key
+        // must stay free for ordinary chat input instead.
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+        let mut history = HistoryState::new();
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            Some(crate::tui::subagents::RuntimeStartupIntent::AutoStart),
+            Some(runtime_choice_tx),
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+        )
+        .unwrap();
+
+        // No dialog, no choice (main.rs pre-seeds `Start`), no notice, no write.
+        let _ = runtime_choice_rx.try_recv();
+        assert!(separator_labels(&history).is_empty());
+        assert!(!crate::tui::runtime_prefs::preferences_path(project.path()).exists());
+        assert!(
+            input_rx.try_recv().is_err(),
+            "an unsubmitted 'y' must not reach the agent as chat input"
         );
     }
 
@@ -7071,6 +7398,116 @@ mod tests {
             }
             other => panic!("expected Markdown, got {other:?}"),
         }
+    }
+
+    // ----- /runtime slash command tests -----
+
+    #[test]
+    fn runtime_status_reports_preference_and_its_source_path() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::PendingQueue::new();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Runtime,
+            None,
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        assert_eq!(outcome, KeyOutcome::None);
+        match history.cells.last().unwrap() {
+            HistoryCell::Separator { label: Some(label) } => {
+                assert!(label.contains("ask"), "missing default value: {label}");
+                assert!(
+                    label.contains("preferences.json"),
+                    "status must name its source file: {label}"
+                );
+            }
+            other => panic!("expected a Separator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_set_persists_the_preference_and_reports_it() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::PendingQueue::new();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Runtime,
+            Some("never".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        assert_eq!(outcome, KeyOutcome::None);
+        assert_eq!(
+            crate::tui::runtime_prefs::load(project.path()),
+            crate::tui::runtime_prefs::RuntimePreference::Never,
+            "/runtime never must persist"
+        );
+        match history.cells.last().unwrap() {
+            HistoryCell::Separator { label: Some(label) } => assert!(
+                label.contains("never"),
+                "confirmation must name the new value: {label}"
+            ),
+            other => panic!("expected a Separator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_rejects_bad_args_with_usage_without_touching_the_file() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::PendingQueue::new();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Runtime,
+            Some("sometimes".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        assert_eq!(outcome, KeyOutcome::None);
+        assert_eq!(
+            separator_labels(&history),
+            vec!["用法: /runtime [ask|always|never]".to_string()]
+        );
+        assert!(
+            !crate::tui::runtime_prefs::preferences_path(project.path()).exists(),
+            "a rejected argument must not create a preference file"
+        );
     }
 
     #[test]
