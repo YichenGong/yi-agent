@@ -325,6 +325,26 @@ pub enum IpcRequest {
     ReadTaskDiff {
         task_id: String,
     },
+    ReadTaskTrace {
+        task_id: String,
+    },
+    /// Follows one or more tasks' traces live.
+    ///
+    /// `task_ids` is REQUIRED to hold at least one valid task id. The store
+    /// reads a trace per task and has no "every task" cursor, so an empty or
+    /// wholly invalid list is rejected with a validation error rather than
+    /// silently answering like an idle stream.
+    ///
+    /// `kinds` filters on the RAW trace kind the writer stored (e.g.
+    /// `assistant_text`, `tool_call`), not on a derived runtime event name, so a
+    /// value that is not a trace kind matches nothing. Empty means every kind.
+    SubscribeTrace {
+        task_ids: Vec<String>,
+        #[serde(default)]
+        after_id: Option<i64>,
+        #[serde(default)]
+        kinds: Vec<String>,
+    },
     SubscribeEvents {
         after_event_id: i64,
         #[serde(default)]
@@ -429,8 +449,19 @@ pub enum IpcResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
     },
+    /// A point-in-time snapshot of one task's retained trace.
+    TaskTrace {
+        task_id: String,
+        high_water_id: i64,
+        rows: Vec<IpcTraceRow>,
+    },
     Subscription(SubscriptionSnapshot),
     Event(IpcEvent),
+    /// The wire payload for one followed trace row.
+    TraceEvent(IpcTraceRow),
+    /// The first frame of a trace subscription: the rows already durable at
+    /// subscribe time, plus the cursor to resume from.
+    TraceSubscription(TraceSnapshot),
     ResyncRequired,
     UnsupportedProtocol {
         supported_min: u32,
@@ -584,6 +615,26 @@ pub struct IpcEvent {
     pub task_id: String,
     pub kind: String,
     pub payload_json: String,
+}
+
+/// One durable observation row of a task's trace.
+///
+/// `event_id` is the row's own monotonic id and doubles as the resume cursor.
+/// `kind` and `payload_json` are the writer's own vocabulary, returned verbatim:
+/// the IPC layer never interprets a trace payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcTraceRow {
+    pub event_id: i64,
+    pub task_id: String,
+    pub kind: String,
+    pub payload_json: String,
+}
+
+/// The first frame of a trace subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceSnapshot {
+    pub high_water_id: i64,
+    pub rows: Vec<IpcTraceRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1133,6 +1184,51 @@ fn handle_client(
                 stop.store(true, Ordering::Release);
                 IpcResponse::Stopping
             }
+            IpcRequest::SubscribeTrace {
+                task_ids,
+                after_id,
+                kinds,
+            } => {
+                let requested = task_ids
+                    .iter()
+                    .map(|task_id| parse_id::<TaskId>(task_id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        IpcError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "invalid task id in trace subscription",
+                        ))
+                    })
+                    .unwrap_or_default();
+                if requested.is_empty() {
+                    return write_response_frame(
+                        &mut stream,
+                        &envelope.request_id,
+                        None,
+                        &IpcResponse::Error {
+                            code: IpcErrorCode::Validation,
+                            message: Some(
+                                "a trace subscription requires at least one valid task id".into(),
+                            ),
+                        },
+                    );
+                }
+                let subscription = stream_trace_subscription(
+                    &mut stream,
+                    database_path,
+                    Arc::clone(stop),
+                    Arc::clone(coordinator),
+                    requested,
+                    after_id.unwrap_or(0),
+                    kinds,
+                    &envelope.request_id,
+                );
+                return respond_to_subscription_result(
+                    &mut stream,
+                    &envelope.request_id,
+                    subscription,
+                );
+            }
             IpcRequest::SubscribeEvents {
                 after_event_id,
                 filters,
@@ -1442,6 +1538,119 @@ fn stream_subscription(
     producer_result
 }
 
+/// The rows a trace subscriber resumes from, plus the cursor it resumes at.
+///
+/// The rows are read first and the cursor is the largest id actually returned
+/// (never a separately sampled watermark), so a row committed while this runs is
+/// either inside `rows` or strictly after the cursor — never both, and never
+/// neither. Sampling a watermark first would leave a window in which a row is
+/// already visible to the cursor yet absent from `rows`, which is exactly how a
+/// subscriber would lose or double-report it.
+///
+/// Row ids are global (one `AUTOINCREMENT` sequence for the whole table) and
+/// never reused, so this single cursor orders every subscribed task's rows.
+fn trace_snapshot(
+    repository: &RuntimeRepository,
+    task_ids: &[TaskId],
+    after_id: i64,
+    kinds: &[String],
+) -> Result<TraceSnapshot, IpcError> {
+    let mut rows = Vec::new();
+    for task_id in task_ids {
+        for row in repository.trace_after(task_id, after_id)? {
+            if kinds.is_empty() || kinds.iter().any(|kind| kind == &row.kind) {
+                rows.push(ipc_trace_row(row));
+            }
+        }
+    }
+    rows.sort_by_key(|row| row.event_id);
+    let high_water_id = rows.last().map(|row| row.event_id).unwrap_or(0);
+    Ok(TraceSnapshot {
+        high_water_id,
+        rows,
+    })
+}
+
+fn stream_trace_subscription(
+    stream: &mut UnixStream,
+    database_path: &Path,
+    stop: Arc<AtomicBool>,
+    coordinator: Arc<RuntimeCoordinator>,
+    task_ids: Vec<TaskId>,
+    after_id: i64,
+    kinds: Vec<String>,
+    request_id: &str,
+) -> Result<(), SubscriptionFailure> {
+    let repository = RuntimeRepository::open(database_path)
+        .map_err(|_| SubscriptionFailure::BeforeInitialFrame)?;
+    let snapshot = trace_snapshot(&repository, &task_ids, after_id, &kinds)
+        .map_err(|_| SubscriptionFailure::BeforeInitialFrame)?;
+    let mut cursor = snapshot.high_water_id;
+    write_response_frame(
+        stream,
+        request_id,
+        None,
+        &IpcResponse::TraceSubscription(snapshot),
+    )
+    .map_err(|_| SubscriptionFailure::AfterInitialFrame)?;
+
+    let pending = Arc::new(PendingSubscriptionFrames::new(
+        request_id,
+        MAX_PENDING_EVENT_FRAMES,
+    ));
+    let subscription_stop = Arc::new(AtomicBool::new(false));
+    let producer_pending = Arc::clone(&pending);
+    let producer_stop = Arc::clone(&subscription_stop);
+    let producer_daemon_stop = Arc::clone(&stop);
+    let database_path = database_path.to_path_buf();
+    let producer = thread::spawn(move || -> Result<(), IpcError> {
+        let result = (|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            while !producer_daemon_stop.load(Ordering::Acquire)
+                && !producer_stop.load(Ordering::Acquire)
+            {
+                runtime.block_on(coordinator.reconcile_worker_events())?;
+                let repository = RuntimeRepository::open(&database_path)?;
+                // Rows are filtered per subscribed task but the cursor is the
+                // global row id, so a task's own rows cannot advance it past
+                // another task's unseen rows.
+                let mut fresh: Vec<IpcTraceRow> = Vec::new();
+                for task_id in &task_ids {
+                    // `task_id` is a `TaskId`, already validated by the caller.
+                    for row in repository.trace_after(task_id, cursor)? {
+                        fresh.push(ipc_trace_row(row));
+                    }
+                }
+                fresh.sort_by_key(|row| row.event_id);
+                for row in fresh {
+                    cursor = row.event_id;
+                    if kinds.is_empty() || kinds.iter().any(|kind| kind == &row.kind) {
+                        if !producer_pending.push_trace_row(row) {
+                            return Ok(());
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        })();
+        producer_pending.close();
+        result
+    });
+
+    let write_result = write_subscription_frames(stream, &pending, &stop);
+    subscription_stop.store(true, Ordering::Release);
+    pending.close();
+    let producer_result = producer
+        .join()
+        .map_err(|_| SubscriptionFailure::AfterInitialFrame)?
+        .map_err(|_| SubscriptionFailure::AfterInitialFrame);
+    write_result.map_err(|_| SubscriptionFailure::AfterInitialFrame)?;
+    producer_result
+}
+
 struct PendingSubscriptionFrames {
     request_id: String,
     capacity: usize,
@@ -1503,6 +1712,35 @@ impl PendingSubscriptionFrames {
             &self.request_id,
             Some(event_id),
             IpcResponse::Event(event),
+        ));
+        self.available.notify_one();
+        true
+    }
+
+    /// Appends one followed trace row, with the same overflow contract as
+    /// [`Self::push_event`]: the queue is bounded, and exceeding it tells the
+    /// reader to resync rather than silently dropping rows.
+    fn push_trace_row(&self, row: IpcTraceRow) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.close_reason != SubscriptionQueueClose::Open {
+            return false;
+        }
+        if state.frames.len() == self.capacity {
+            state.frames.clear();
+            state.frames.push_back(response_envelope(
+                &self.request_id,
+                None,
+                IpcResponse::ResyncRequired,
+            ));
+            state.close_reason = SubscriptionQueueClose::Overflowed;
+            self.available.notify_one();
+            return false;
+        }
+        let event_id = row.event_id;
+        state.frames.push_back(response_envelope(
+            &self.request_id,
+            Some(event_id),
+            IpcResponse::TraceEvent(row),
         ));
         self.available.notify_one();
         true
@@ -1754,7 +1992,10 @@ fn encode_subscription_envelope(
     if let Ok(frame) = encode_envelope(envelope) {
         return Ok((
             frame,
-            matches!(envelope.result, IpcResponse::Event(_)),
+            matches!(
+                envelope.result,
+                IpcResponse::Event(_) | IpcResponse::TraceEvent(_)
+            ),
             matches!(envelope.result, IpcResponse::ResyncRequired),
         ));
     }
@@ -1792,6 +2033,47 @@ mod subscription_queue_tests {
             kind: "task_started".into(),
             payload_json: "{}".into(),
         }
+    }
+
+    fn trace_row(event_id: i64) -> IpcTraceRow {
+        IpcTraceRow {
+            event_id,
+            task_id: "task-1".into(),
+            kind: "assistant_text".into(),
+            payload_json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn a_trace_row_frame_is_correlated_and_an_overflow_resyncs_like_events() {
+        let queue = PendingSubscriptionFrames::new("trace-client", 2);
+        assert!(queue.push_trace_row(trace_row(1)));
+        assert!(queue.push_trace_row(trace_row(2)));
+        assert!(!queue.push_trace_row(trace_row(3)));
+
+        let frames = queue.drain_for_test();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].request_id, "trace-client");
+        assert_eq!(frames[0].event_id, None);
+        assert_eq!(frames[0].result, IpcResponse::ResyncRequired);
+        assert!(queue.is_closed());
+    }
+
+    #[test]
+    fn a_trace_row_frame_carries_its_own_id_on_the_envelope() {
+        let queue = PendingSubscriptionFrames::new("trace-client", 4);
+        assert!(queue.push_trace_row(trace_row(7)));
+        let frames = queue.drain_for_test();
+        assert_eq!(frames[0].event_id, Some(7));
+        assert!(matches!(
+            &frames[0].result,
+            IpcResponse::TraceEvent(row) if row.event_id == 7
+        ));
+        // A trace frame must encode as an event frame so the writer applies the
+        // same drop-on-overflow rule as a normal event.
+        let (_, is_event, is_resync) = encode_subscription_envelope(&frames[0]).unwrap();
+        assert!(is_event);
+        assert!(!is_resync);
     }
 
     #[test]
@@ -2382,6 +2664,15 @@ fn ipc_event(event: crate::repository::PersistedEvent) -> IpcEvent {
     }
 }
 
+fn ipc_trace_row(row: crate::repository::PersistedTraceRow) -> IpcTraceRow {
+    IpcTraceRow {
+        event_id: row.id,
+        task_id: row.task_id.to_string(),
+        kind: row.kind,
+        payload_json: row.payload_json,
+    }
+}
+
 fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
     match event {
         crate::repository::RuntimeEvent::RuntimeDraining => "runtime_draining",
@@ -2968,6 +3259,22 @@ fn respond(
                 diff,
             })
         }
+        IpcRequest::ReadTaskTrace { task_id } => {
+            let task_id = parse_id::<TaskId>(&task_id)?;
+            let rows: Vec<IpcTraceRow> = repository
+                .trace_after(&task_id, 0)?
+                .into_iter()
+                .map(ipc_trace_row)
+                .collect();
+            // The cursor is the last row actually returned, so it can never
+            // claim a row the caller did not receive.
+            let high_water_id = rows.last().map(|row| row.event_id).unwrap_or(0);
+            Ok(IpcResponse::TaskTrace {
+                task_id: task_id.to_string(),
+                high_water_id,
+                rows,
+            })
+        }
         IpcRequest::SubscribeEvents {
             after_event_id,
             filters,
@@ -2993,6 +3300,13 @@ fn respond(
                 events,
             }))
         }
+        // Trace subscriptions stream their rows on the connection itself; this
+        // request/response path cannot represent a stream, so it is answered
+        // like any other unserviceable command rather than half-served.
+        IpcRequest::SubscribeTrace { .. } => Ok(IpcResponse::Error {
+            code: IpcErrorCode::Validation,
+            message: Some("trace subscriptions are served on their own connection".into()),
+        }),
     }
 }
 

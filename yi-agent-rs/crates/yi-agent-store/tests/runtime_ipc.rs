@@ -2695,6 +2695,276 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
 }
 
 #[test]
+fn daemon_reads_a_task_trace_snapshot() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            r#"{"type":"assistant_text","text":"hello"}"#,
+        )
+        .unwrap();
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            r#"{"type":"tool_call","name":"read","summary":"x"}"#,
+        )
+        .unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskTrace {
+            task_id: task.to_string(),
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskTrace {
+        task_id,
+        high_water_id,
+        rows,
+    } = response
+    else {
+        panic!("expected a trace snapshot");
+    };
+    assert_eq!(task_id, task.to_string());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].kind, "assistant_text");
+    assert_eq!(rows[1].kind, "tool_call");
+    assert!(rows[0].event_id < rows[1].event_id);
+    assert_eq!(high_water_id, rows.last().unwrap().event_id);
+}
+
+#[test]
+fn a_task_trace_snapshot_is_empty_with_zero_high_water() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskTrace {
+            task_id: task.to_string(),
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskTrace {
+        high_water_id,
+        rows,
+        ..
+    } = response
+    else {
+        panic!("expected a trace snapshot");
+    };
+    assert!(rows.is_empty());
+    assert_eq!(high_water_id, 0);
+}
+
+#[test]
+fn a_trace_subscription_replays_then_streams_without_gaps_or_duplicates() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    for text in ["one", "two"] {
+        repository
+            .append_trace(
+                &task,
+                "assistant_text",
+                &json!({ "type": "assistant_text", "text": text }).to_string(),
+            )
+            .unwrap();
+    }
+
+    let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::to_string(&json!({
+            "protocol_version": 1,
+            "request_id": "trace-stream",
+            "command": {
+                "type": "SubscribeTrace",
+                "task_ids": [task.to_string()],
+                "after_id": 0,
+            },
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let snapshot = raw_response(&mut reader);
+    assert_eq!(snapshot["result"]["type"], "TraceSubscription");
+    let mut seen: Vec<i64> = snapshot["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["event_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seen.len(), 2, "both durable rows are replayed");
+    assert_eq!(
+        snapshot["result"]["high_water_id"].as_i64().unwrap(),
+        *seen.last().unwrap()
+    );
+
+    // Only a row written AFTER subscribing is streamed; the replayed rows are
+    // already delivered by the snapshot and must not repeat.
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            &json!({ "type": "tool_call", "name": "read", "summary": "third" }).to_string(),
+        )
+        .unwrap();
+    let frame = raw_response(&mut reader);
+    assert_eq!(frame["result"]["type"], "TraceEvent");
+    let streamed = frame["result"]["event_id"].as_i64().unwrap();
+    assert_eq!(frame["event_id"], frame["result"]["event_id"]);
+    assert!(
+        streamed > *seen.last().unwrap(),
+        "a streamed row must be newer than everything replayed"
+    );
+    seen.push(streamed);
+
+    // Appending a fourth row must arrive as the next streamed frame, proving
+    // the cursor advanced rather than re-reporting the third.
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            &json!({ "type": "assistant_text", "text": "fourth" }).to_string(),
+        )
+        .unwrap();
+    let frame = raw_response(&mut reader);
+    assert_eq!(frame["result"]["type"], "TraceEvent");
+    seen.push(frame["result"]["event_id"].as_i64().unwrap());
+
+    assert!(
+        seen.windows(2).all(|pair| pair[0] < pair[1]),
+        "ids strictly increase with no repeats and no gaps: {seen:?}"
+    );
+    assert_eq!(seen.len(), 4, "two replayed and two streamed: {seen:?}");
+}
+
+#[test]
+fn a_trace_subscription_can_be_kind_filtered() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            r#"{"type":"assistant_text","text":"ignored"}"#,
+        )
+        .unwrap();
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            r#"{"type":"tool_call","name":"read","summary":"kept"}"#,
+        )
+        .unwrap();
+
+    let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::to_string(&json!({
+            "protocol_version": 1,
+            "request_id": "trace-filtered",
+            "command": {
+                "type": "SubscribeTrace",
+                "task_ids": [task.to_string()],
+                "after_id": 0,
+                "kinds": ["tool_call"],
+            },
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let snapshot = raw_response(&mut reader);
+    let rows = snapshot["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the assistant_text row is filtered out");
+    assert_eq!(rows[0]["kind"], "tool_call");
+    assert_eq!(
+        snapshot["result"]["high_water_id"].as_i64().unwrap(),
+        rows[0]["event_id"].as_i64().unwrap(),
+        "the cursor follows the filtered view actually delivered"
+    );
+
+    // A newly written row of the watched kind streams; a filtered kind does not.
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            r#"{"type":"assistant_text","text":"also ignored"}"#,
+        )
+        .unwrap();
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            r#"{"type":"tool_call","name":"write","summary":"kept too"}"#,
+        )
+        .unwrap();
+    let frame = raw_response(&mut reader);
+    assert_eq!(frame["result"]["type"], "TraceEvent");
+    assert_eq!(frame["result"]["kind"], "tool_call");
+    let payload: Value =
+        serde_json::from_str(frame["result"]["payload_json"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["summary"], "kept too");
+}
+
+#[test]
+fn a_trace_subscription_requires_task_ids() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let response = raw_request(
+        daemon.socket_path(),
+        json!({
+            "protocol_version": 1,
+            "request_id": "trace-unscoped",
+            "command": {"type": "SubscribeTrace", "task_ids": []},
+        }),
+    );
+    assert_eq!(response["result"]["type"], "Error");
+    assert_eq!(response["result"]["code"], "validation");
+}
+
+#[test]
 fn daemon_lists_compact_task_summaries() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
