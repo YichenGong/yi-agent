@@ -290,7 +290,7 @@ fn run_loop<B: Backend, E: EventSource>(
 ) -> std::io::Result<usize> {
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
-    let mut queued = crate::tui::queued::PendingQueue::new();
+    let mut queued = crate::tui::queued::DeliveredInterjections::new();
     let mut statusbar_state = StatusBarState::default();
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
@@ -389,6 +389,18 @@ fn run_loop<B: Backend, E: EventSource>(
                 &mut statusbar_state,
                 &mut cost_tracker,
                 &event,
+            );
+            // 先应用收据/回推，再处理回合结束。核心保证 `InterjectionsReturned`
+            // 排在 `Cancelled`/`Done` 之前；放在回合结束分支之后虽然通常也能生效
+            // （二者是相邻的两帧），但那样就依赖事件循环的批处理边界，一旦将来
+            // 把一帧内的多个事件合并处理，退回的文本就会被回合结束分支抢先消费。
+            // 顺序固定下来后，两种情形都安全。
+            apply_interjection_event(
+                &event,
+                &mut queued,
+                input,
+                history,
+                final_history_area.width,
             );
             history.push_event(event, final_history_area.width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
@@ -1334,7 +1346,7 @@ fn handle_key(
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    queued: &mut crate::tui::queued::PendingQueue,
+    queued: &mut crate::tui::queued::DeliveredInterjections,
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
     workdir: &std::path::Path,
@@ -1510,7 +1522,7 @@ fn handle_key(
                         );
                     } else {
                         // No command selected (empty filter) — show error
-                        // Not routed through `PendingQueue`: this text never
+                        // Not routed through `DeliveredInterjections`: this text never
                         // reaches the agent, so queuing it would make it look
                         // like a pending prompt.
                         let text = input.take_submitted();
@@ -1590,7 +1602,7 @@ fn handle_key(
                     );
                 } else {
                     // Unknown slash command
-                    // Not routed through `PendingQueue`: a slash command is a
+                    // Not routed through `DeliveredInterjections`: a slash command is a
                     // local action, not a prompt for the agent.
                     *popup = None;
                     history.push(
@@ -1613,7 +1625,22 @@ fn handle_key(
                     let _ = input_tx.try_send(text.clone());
                 }
                 SubmitOutcome::Queued => {
-                    // 只在预览区显示,发送推迟到本回合结束。
+                    // 已投递给 driver，由它在本轮下一次 provider 请求前折进上下文。
+                    // 在收到 core 回执前，它一直留在预览区（"已送达，待生效"）。
+                    if input_tx.try_send(text.clone()).is_err() {
+                        // 通道满或已关闭：把文本放回输入框，不做静默丢弃。
+                        // 此处 `text` 是 String（非对 input 的借用），故可变借 input 合法。
+                        input.insert_str(&text);
+                        history.push(
+                            HistoryCell::Separator {
+                                label: Some(format!(
+                                    "追加未送达（通道已满 {}），已退回输入框",
+                                    crate::tui::queued::DeliveredInterjections::CAPACITY
+                                )),
+                            },
+                            history_width,
+                        );
+                    }
                 }
                 SubmitOutcome::Rejected => {
                     // 文本已被 take_submitted 取走,必须退回,否则静默丢失。
@@ -1622,8 +1649,8 @@ fn handle_key(
                     history.push(
                         HistoryCell::Separator {
                             label: Some(format!(
-                                "排队已满 ({})，本条未发送，已退回输入框",
-                                crate::tui::queued::PendingQueue::CAPACITY
+                                "待生效追加已达上限 ({})，本条未投递，已退回输入框",
+                                crate::tui::queued::DeliveredInterjections::CAPACITY
                             )),
                         },
                         history_width,
@@ -1633,6 +1660,43 @@ fn handle_key(
             KeyOutcome::Submit(text)
         }
         _ => KeyOutcome::None,
+    }
+}
+
+/// 应用两条追加生命周期事件（收据 / 回推）。
+///
+/// **必须在回合结束分支之前调用**：`InterjectionsReturned` 由 core 在
+/// `Cancelled`/`Done` **之前**发出（D15 顺序不变量），若让回合结束分支先跑，
+/// 回推的文本就再也无人接收了——这正是本设计要修掉的"文本静默丢失"。
+fn apply_interjection_event(
+    event: &AgentEvent,
+    queued: &mut crate::tui::queued::DeliveredInterjections,
+    input: &mut InputLine,
+    history: &mut HistoryState,
+    width: u16,
+) {
+    match event {
+        AgentEvent::InterjectionAccepted { .. } => queued.on_receipt(),
+        AgentEvent::InterjectionsReturned { items } => {
+            let restored = queued.take_returned(items.len());
+            if restored.is_empty() {
+                return;
+            }
+            // 输入框是单行的；一批回推用换行连接，`wrap_input_buffer` 会折行。
+            for (i, text) in restored.iter().enumerate() {
+                if i > 0 {
+                    input.insert_str("\n");
+                }
+                input.insert_str(text);
+            }
+            history.push(
+                HistoryCell::Separator {
+                    label: Some(format!("{} 条追加未生效，已退回输入框", restored.len())),
+                },
+                width,
+            );
+        }
+        _ => {}
     }
 }
 
@@ -1689,7 +1753,7 @@ fn execute_slash_command(
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     workdir: &std::path::Path,
-    queued: &mut crate::tui::queued::PendingQueue,
+    queued: &mut crate::tui::queued::DeliveredInterjections,
     mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> KeyOutcome {
     match cmd {
@@ -4206,6 +4270,58 @@ mod tests {
         }
     }
 
+    /// Submits a mid-turn message, then delivers `InterjectionsReturned`
+    /// immediately followed by `Cancelled` in a single frame — the order core
+    /// guarantees. The returned text must land back in the input box, which only
+    /// happens if the return is applied before the turn-end handling.
+    struct InterjectionThenCancelEvents {
+        agent_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for InterjectionThenCancelEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let poll_count = self.poll_count.get();
+            self.poll_count.set(poll_count + 1);
+            match poll_count {
+                0 => Ok(Some(Event::Paste("opening".into()))),
+                1 => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))),
+                2 => Ok(Some(Event::Paste("mid-turn".into()))),
+                3 => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))),
+                // Queue the pair but do NOT quit in the same frame: `run_loop`
+                // drains `agent_rx` at the top of an iteration, so the events
+                // sent here are only observed on the next one. An inert key
+                // gives that frame a chance to happen before the quit below.
+                4 => {
+                    self.agent_tx
+                        .try_send(AgentEvent::InterjectionsReturned {
+                            items: vec![yi_agent_core::Interjection {
+                                seq: 1,
+                                text: "mid-turn".into(),
+                                tag: None,
+                            }],
+                        })
+                        .unwrap();
+                    self.agent_tx.try_send(AgentEvent::Cancelled).unwrap();
+                    Ok(Some(Event::Key(KeyEvent::new(
+                        KeyCode::F(1),
+                        KeyModifiers::NONE,
+                    ))))
+                }
+                _ => Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                )))),
+            }
+        }
+    }
+
     /// A test backend whose size can change from a fake event source between
     /// frames, matching a terminal resize without sharing the terminal itself.
     #[derive(Clone)]
@@ -4483,6 +4599,64 @@ mod tests {
         assert!(
             final_row.contains(&top_marker),
             "expected top marker {top_marker:?} after local insertion, got {final_row:?}"
+        );
+    }
+
+    #[test]
+    fn returned_interjection_survives_the_turn_end_it_precedes() {
+        let backend = TestBackend::new(60, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let source = InterjectionThenCancelEvents {
+            agent_tx,
+            poll_count: Cell::new(0),
+        };
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut input,
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
+        )
+        .unwrap();
+
+        // The core invariant: `InterjectionsReturned` arrives ahead of
+        // `Cancelled`, and the TUI hands the text back rather than losing it
+        // when the turn ends in the very next frame. Without
+        // `apply_interjection_event` wired into the event loop this assertion
+        // fails with an empty input box.
+        assert_eq!(
+            input.buffer, "mid-turn",
+            "the returned text must be restored to the input box"
+        );
+        assert!(
+            history.cells.iter().any(|c| matches!(
+                c,
+                HistoryCell::Separator { label: Some(label) }
+                    if label.contains("已退回输入框")
+            )),
+            "the return must be reported in history: {:?}",
+            history.cells
         );
     }
 
@@ -6667,7 +6841,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(false));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -6744,7 +6918,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -6785,7 +6959,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(false));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -6826,7 +7000,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -6864,7 +7038,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -6921,7 +7095,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(false));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
         let path = "/Users/name/project explain this";
@@ -6967,7 +7141,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(false));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -7003,7 +7177,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_while_running_goes_to_queue_not_history() {
+    fn submit_while_running_is_delivered_not_held_in_history() {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -7012,7 +7186,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -7044,7 +7218,7 @@ mod tests {
         assert_eq!(input_rx.try_recv().unwrap(), "inflight msg");
         let history_len_before = history.cells.len();
 
-        input.buffer = "queued msg".to_string();
+        input.buffer = "mid-turn msg".to_string();
         input.cursor = input.buffer.len();
 
         let result = handle_key(
@@ -7068,21 +7242,198 @@ mod tests {
         );
         match result {
             KeyOutcome::Submit(text) => {
-                assert_eq!(text, "queued msg");
+                assert_eq!(text, "mid-turn msg");
+                // Delivered immediately: the driver folds it into the running
+                // turn before the next provider request, rather than holding it
+                // back until the turn ends.
+                assert_eq!(
+                    input_rx.try_recv().unwrap(),
+                    "mid-turn msg",
+                    "a mid-turn submit must be delivered, not held back"
+                );
+                // Accounting only: it stays in the preview until core confirms.
                 assert_eq!(queued.len(), 1);
-                assert_eq!(queued.items(), ["queued msg".to_string()]);
+                assert_eq!(queued.items(), ["mid-turn msg".to_string()]);
                 assert_eq!(
                     history.cells.len(),
                     history_len_before,
-                    "a queued message must not be added to history yet"
-                );
-                assert!(
-                    input_rx.try_recv().is_err(),
-                    "a queued message must NOT be sent while a turn is in flight"
+                    "a mid-turn message must not be added to history as a new turn"
                 );
             }
             _ => panic!("expected Submit"),
         }
+    }
+
+    #[test]
+    fn busy_submit_reaches_the_agent_channel() {
+        use crate::tui::queued::SubmitOutcome;
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(false));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let mut pending_quit = false;
+        let mut popup = None;
+
+        // Establish an in-flight turn and take the opening message off the
+        // channel, so the next submit is a mid-turn delivery.
+        assert_eq!(queued.submit("opening".into()), SubmitOutcome::Sent);
+        let _ = input_tx.try_send("opening".into());
+        let _ = input_rx.try_recv();
+
+        input.buffer = "follow-up".to_string();
+        input.cursor = input.buffer.len();
+
+        let _ = handle_key(
+            make_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut input,
+            &mut history,
+            1000,
+            80,
+            24,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &mut queued,
+            &mut pending_quit,
+            &mut popup,
+            &std::env::temp_dir(),
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        assert_eq!(
+            input_rx.try_recv().ok(),
+            Some("follow-up".to_string()),
+            "a busy submit must be delivered, not merely previewed"
+        );
+        assert_eq!(queued.items(), ["follow-up".to_string()]);
+    }
+
+    #[test]
+    fn returned_interjection_goes_back_to_the_input_box() {
+        use crate::tui::queued::SubmitOutcome;
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let mut input = InputLine::new();
+        let mut history = HistoryState::new();
+        assert_eq!(queued.submit("unconsumed".into()), SubmitOutcome::Sent);
+        assert_eq!(queued.submit("mid-turn".into()), SubmitOutcome::Queued);
+
+        apply_interjection_event(
+            &AgentEvent::InterjectionsReturned {
+                items: vec![yi_agent_core::Interjection {
+                    seq: 1,
+                    text: "mid-turn".into(),
+                    tag: None,
+                }],
+            },
+            &mut queued,
+            &mut input,
+            &mut history,
+            80,
+        );
+
+        assert_eq!(input.buffer, "mid-turn");
+        assert!(queued.is_empty());
+        assert!(
+            matches!(
+                history.cells.as_slice(),
+                [HistoryCell::Separator { label: Some(label) }]
+                    if label == "1 条追加未生效，已退回输入框"
+            ),
+            "the return must be reported: {:?}",
+            history.cells
+        );
+    }
+
+    #[test]
+    fn multiple_returned_interjections_join_with_newlines() {
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let mut input = InputLine::new();
+        let mut history = HistoryState::new();
+        queued.submit("opening".into());
+        queued.submit("one".into());
+        queued.submit("two".into());
+
+        apply_interjection_event(
+            &AgentEvent::InterjectionsReturned {
+                items: vec![
+                    yi_agent_core::Interjection {
+                        seq: 1,
+                        text: "one".into(),
+                        tag: None,
+                    },
+                    yi_agent_core::Interjection {
+                        seq: 2,
+                        text: "two".into(),
+                        tag: None,
+                    },
+                ],
+            },
+            &mut queued,
+            &mut input,
+            &mut history,
+            80,
+        );
+
+        assert_eq!(input.buffer, "one\ntwo");
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn accepted_receipt_lowers_the_pending_count_without_touching_history() {
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let mut input = InputLine::new();
+        let mut history = HistoryState::new();
+        queued.submit("opening".into());
+        queued.submit("first".into());
+        queued.submit("second".into());
+
+        apply_interjection_event(
+            &AgentEvent::InterjectionAccepted {
+                seq: 1,
+                text: "first".into(),
+                tag: None,
+            },
+            &mut queued,
+            &mut input,
+            &mut history,
+            80,
+        );
+
+        assert_eq!(queued.items(), ["second".to_string()]);
+        assert_eq!(input.buffer, "", "a receipt must not touch the input box");
+        assert!(
+            history.cells.is_empty(),
+            "the receipt is rendered by history.rs"
+        );
+    }
+
+    #[test]
+    fn interjection_events_are_noops_for_unrelated_events() {
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let mut input = InputLine::new();
+        let mut history = HistoryState::new();
+        queued.submit("opening".into());
+        queued.submit("pending".into());
+
+        apply_interjection_event(
+            &AgentEvent::Start,
+            &mut queued,
+            &mut input,
+            &mut history,
+            80,
+        );
+
+        assert_eq!(queued.items(), ["pending".to_string()]);
+        assert_eq!(input.buffer, "");
+        assert!(history.cells.is_empty());
     }
 
     #[test]
@@ -7095,7 +7446,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(false));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -7145,7 +7496,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -7174,7 +7525,7 @@ mod tests {
         assert_eq!(input_rx.try_recv().unwrap(), "inflight");
 
         // Fill the queue to capacity.
-        for i in 0..crate::tui::queued::PendingQueue::CAPACITY {
+        for i in 0..crate::tui::queued::DeliveredInterjections::CAPACITY {
             input.buffer = format!("msg{i}");
             input.cursor = input.buffer.len();
             let _ = handle_key(
@@ -7197,7 +7548,20 @@ mod tests {
                 &yi_agent_mcp::McpManager::empty(),
             );
         }
-        assert_eq!(queued.len(), crate::tui::queued::PendingQueue::CAPACITY);
+        assert_eq!(
+            queued.len(),
+            crate::tui::queued::DeliveredInterjections::CAPACITY
+        );
+        // Every one of those submits was delivered, not buffered locally, so the
+        // channel holds CAPACITY entries; drain them so the overflow assertion
+        // below cannot be satisfied by an earlier message.
+        for i in 0..crate::tui::queued::DeliveredInterjections::CAPACITY {
+            assert_eq!(input_rx.try_recv().unwrap(), format!("msg{i}"));
+        }
+        assert!(
+            input_rx.try_recv().is_err(),
+            "channel should now be drained"
+        );
         let history_len_before = history.cells.len();
 
         // The overflow submit must not block and must not be accepted.
@@ -7225,7 +7589,7 @@ mod tests {
 
         assert_eq!(
             queued.len(),
-            crate::tui::queued::PendingQueue::CAPACITY,
+            crate::tui::queued::DeliveredInterjections::CAPACITY,
             "the queue must stay at capacity"
         );
         assert_eq!(
@@ -7238,12 +7602,12 @@ mod tests {
         );
         assert!(
             input_rx.try_recv().is_err(),
-            "nothing may reach the channel while a turn is in flight"
+            "a rejected message must not reach the channel"
         );
     }
 
     #[test]
-    fn turn_end_sends_next_queued_message_even_while_is_running_is_true() {
+    fn delivered_messages_are_not_re_held_until_turn_end() {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
@@ -7251,7 +7615,7 @@ mod tests {
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -7281,14 +7645,22 @@ mod tests {
                 &yi_agent_mcp::McpManager::empty(),
             );
         }
+        // Both reached the driver already: the first opened the turn, the second
+        // was delivered as a mid-turn interjection. Neither waits for turn end.
         assert_eq!(input_rx.try_recv().unwrap(), "first");
-        assert!(input_rx.try_recv().is_err(), "second must still be queued");
-        assert_eq!(queued.len(), 1);
-
-        // Turn ends: the queued message is sent despite is_running being true.
-        assert_eq!(queued.on_turn_end(), Some("second".to_string()));
-        let _ = input_tx.try_send("second".to_string());
         assert_eq!(input_rx.try_recv().unwrap(), "second");
+        assert!(input_rx.try_recv().is_err());
+        // `is_running` is still true here, mirroring the real ordering where
+        // Done is emitted before the driver clears the flag; delivery must not
+        // have depended on it either way.
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued.items(), ["second".to_string()]);
+
+        // Turn end reconciles: core accepted it, so the receipt retires it and
+        // the fallback promotion finds nothing left to send.
+        queued.on_receipt();
+        assert!(queued.is_empty());
+        assert_eq!(queued.on_turn_end(), None);
     }
 
     // ----- /cost slash command tests -----
@@ -7299,7 +7671,7 @@ mod tests {
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut history = HistoryState::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
 
         // One in flight plus two waiting.
         use crate::tui::queued::SubmitOutcome;
@@ -7347,7 +7719,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let outcome = execute_slash_command(
             SlashCommand::Cost,
             None,
@@ -7385,7 +7757,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let outcome = execute_slash_command(
             SlashCommand::Cost,
             None,
@@ -7420,7 +7792,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mcp = yi_agent_mcp::McpManager::empty();
         assert!(!mcp.master(), "empty manager starts with master off");
 
@@ -7452,7 +7824,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mcp = yi_agent_mcp::McpManager::empty();
 
         let outcome = execute_slash_command(
@@ -7492,7 +7864,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mcp = yi_agent_mcp::McpManager::empty();
 
         let outcome = execute_slash_command(
@@ -7529,7 +7901,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
 
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
@@ -7565,7 +7937,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
 
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
@@ -7603,7 +7975,7 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
 
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
@@ -7997,7 +8369,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(false));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 
@@ -8045,7 +8417,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(false));
         let mut history = HistoryState::new();
         let mut input = InputLine::new();
-        let mut queued = crate::tui::queued::PendingQueue::new();
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mut pending_quit = false;
         let mut popup = None;
 

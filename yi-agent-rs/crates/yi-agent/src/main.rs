@@ -1600,6 +1600,9 @@ fn run_tui_agent(
                 match agent.run(text).await {
                     Ok(stream) => {
                         let mut stream = Box::pin(stream);
+                        // 每次 run() 之后取一次：句柄只在本次 stream 的生命期内有效，
+                        // 下一轮重新取（run() 内部会重建 inbox）。
+                        let inbox = agent.inbox_handle();
                         loop {
                             // Concurrently forward events and listen for interrupt
                             tokio::select! {
@@ -1621,6 +1624,35 @@ fn run_tui_agent(
                                         if agent_tx.send(ev).await.is_err() { break; }
                                     }
                                     break;
+                                }
+                                Some(text) = input_rx.recv() => {
+                                    // 本轮在途时的提交：折进当前轮次，而不是让 driver
+                                    // 把它当成下一个 prompt（那要等整轮结束才生效）。
+                                    // inbox 为 None 的窗口（attach/重建 agent 与首次
+                                    // run() 之间）走回推分支，TUI 收到后把文本还给输入框。
+                                    let outcome = match &inbox {
+                                        Some(handle) => handle.interject(text.clone(), None),
+                                        None => Err(yi_agent_core::InterjectError::NotRunning),
+                                    };
+                                    if let Err(error) = outcome {
+                                        tracing::warn!(
+                                            %error,
+                                            "mid-turn interjection was not accepted"
+                                        );
+                                        if agent_tx
+                                            .send(yi_agent_core::AgentEvent::InterjectionsReturned {
+                                                items: vec![yi_agent_core::Interjection {
+                                                    seq: 0,
+                                                    text,
+                                                    tag: None,
+                                                }],
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }

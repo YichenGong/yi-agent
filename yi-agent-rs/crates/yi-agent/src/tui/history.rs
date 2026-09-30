@@ -454,6 +454,16 @@ impl HistoryState {
                     label: Some("Interrupted".into()),
                 });
             }
+            // 中途追加：在转录里留一行，让用户看到它确实被折进了本轮。
+            // 其文本同时会作为 `UserInterjection` item 出现在协议层（app-server）。
+            AgentEvent::InterjectionAccepted { text, .. } => {
+                self.cells.push(HistoryCell::Separator {
+                    label: Some(format!("追加: {text}")),
+                });
+            }
+            // 回推本身已由 `apply_interjection_event` 负责把文本还给输入框并写提示行；
+            // 这里不能再写一行，否则同一条会出现在转录里两次。
+            AgentEvent::InterjectionsReturned { .. } => {}
             AgentEvent::Error(err) => {
                 self.cells.push(HistoryCell::Separator {
                     label: Some(format!("Error: {err}")),
