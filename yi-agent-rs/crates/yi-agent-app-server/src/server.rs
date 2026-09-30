@@ -23,7 +23,7 @@ use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
     RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, ThreadStatus,
 };
-use crate::session::{InterjectionRequest, ThreadSession, TurnPrompt};
+use crate::session::{InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -610,6 +610,9 @@ where
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
                         let (interject_tx, interject_rx) =
                             mpsc::channel::<InterjectionRequest>(16);
+                        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+                        // Task 3 wires this into the driver; dropped for now to keep the build warning-free.
+                        drop(session_rx);
 
                         let model = cfg.model.clone();
 
@@ -653,6 +656,7 @@ where
                                 prompt_tx,
                                 interrupt_tx,
                                 interject_tx,
+                                session_tx,
                                 store: Arc::clone(&thread_store),
                                 status: Arc::clone(&store_status),
                             },
@@ -804,6 +808,9 @@ where
                         let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
                         let (interject_tx, interject_rx) =
                             mpsc::channel::<InterjectionRequest>(16);
+                        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+                        // Task 3 wires this into the driver; dropped for now to keep the build warning-free.
+                        drop(session_rx);
                         // 同一 `Arc` 句柄:session 存一份供 `thread/list` 读,
                         // driver 拿一份用于推送 `thread/status/updated`。
                         let store_status = ThreadSession::new_status();
@@ -818,6 +825,7 @@ where
                                 prompt_tx,
                                 interrupt_tx,
                                 interject_tx,
+                                session_tx,
                                 store: Arc::clone(&thread_store),
                                 status: Arc::clone(&store_status),
                             },
