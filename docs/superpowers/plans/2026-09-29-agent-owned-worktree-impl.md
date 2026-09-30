@@ -86,7 +86,7 @@ Behavior is identical after this task; only names change. It is a separate task 
   - `AgentWorkerFactory::default_workspace_service`, `::workspace_service_for_project`, `::project_workspace_matches`
   - All other trait methods keep their names for now: `supports_coding`, `inspect_delivery`, `cleanup_prepared`, `contains_commit`, `cleanup_accepted`, `reclaim_worktree`, `reattach_workspace`, `is_merged_into`.
 
-- [ ] **Step 1: Apply the mechanical renames**
+- [x] **Step 1: Apply the mechanical renames**
 
 ```bash
 cd yi-agent-rs
@@ -102,7 +102,7 @@ rg -l 'application_root_workspace_matches' --glob '*.rs' | xargs sed -i '' 's/ap
 
 `prepare_root`/`prepare_child` are also **test-local helpers** with unrelated bodies; the rename is safe (same signature, same semantics) but each must still compile.
 
-- [ ] **Step 2: Rename the factory-global accessor by hand**
+- [x] **Step 2: Rename the factory-global accessor by hand**
 
 `s/workspace_service(/default_workspace_service(/` is unsafe: the same spelling is a field name and a struct field initializer. Edit these three sites by hand instead.
 
@@ -131,7 +131,7 @@ rg -l 'application_root_workspace_matches' --glob '*.rs' | xargs sed -i '' 's/ap
 
 `crates/yi-agent-store/src/runtime.rs:701` — already `self.factory.workspace_service_for_project(requested_workspace)` after Step 1.
 
-- [ ] **Step 3: Rename the struct definition too**
+- [x] **Step 3: Rename the struct definition too**
 
 `crates/yi-agent-store/src/ipc.rs` and the test factories declare `fn workspace_service(&self)`. Update each declaration to `default_workspace_service`. Find them with:
 
@@ -141,7 +141,7 @@ cd yi-agent-rs && rg -n 'fn workspace_service\b' --glob '*.rs'
 
 Only the declarations change; bodies are untouched.
 
-- [ ] **Step 4: Verify the whole workspace still compiles**
+- [x] **Step 4: Verify the whole workspace still compiles**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-core --no-run && cargo test -p yi-agent-store --no-run && cargo test -p yi-agent --no-run
@@ -149,7 +149,7 @@ cd yi-agent-rs && cargo test -p yi-agent-core --no-run && cargo test -p yi-agent
 
 Expected: all three compile. Any `cannot find`/`no method` error names a site Step 1–3 missed.
 
-- [ ] **Step 5: Verify core behavior is unchanged**
+- [x] **Step 5: Verify core behavior is unchanged**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-core
@@ -157,7 +157,7 @@ cd yi-agent-rs && cargo test -p yi-agent-core
 
 Expected: PASS, same count as before the rename.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -185,7 +185,7 @@ git commit -m "refactor: disambiguate the workspace vocabulary"
   - `RuntimeCoordinator::spawn_child_with_objective(..., workdir: Option<PathBuf>)`
   - `WorkerWorkspaceProvider::workspace_in` no longer derives a temp path; it resolves a registered one (see Task 4).
 
-- [ ] **Step 1: Write the failing core test**
+- [x] **Step 1: Write the failing core test**
 
 Append to the `#[cfg(test)] mod tests` block in `crates/yi-agent-core/src/subagent/supervisor.rs`:
 
@@ -210,7 +210,7 @@ Append to the `#[cfg(test)] mod tests` block in `crates/yi-agent-core/src/subage
     }
 ```
 
-- [ ] **Step 2: Run it to confirm it fails**
+- [x] **Step 2: Run it to confirm it fails**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-core --lib spawn_request_carries_the_parents_workdir
@@ -218,7 +218,7 @@ cd yi-agent-rs && cargo test -p yi-agent-core --lib spawn_request_carries_the_pa
 
 Expected: FAIL to compile — `spawn_with_objective` takes 3 arguments, and `spawn_workdir` does not exist.
 
-- [ ] **Step 3: Create `SpawnRequest` and carry the field**
+- [x] **Step 3: Create `SpawnRequest` and carry the field**
 
 `SpawnRequest` does not exist yet; the parallel `WorkerStart` already does, so follow its shape. Add it to `crates/yi-agent-core/src/subagent/worker.rs`:
 
@@ -306,7 +306,7 @@ The `spawn` helper (the legacy 2-argument form) passes a read-only request:
     }
 ```
 
-- [ ] **Step 4: Update every call site the compiler names**
+- [x] **Step 4: Update every call site the compiler names**
 
 Production call sites (`rg -n 'spawn_with_objective' crates/ --glob '*.rs' | grep -v '/tests/'`):
 - `crates/yi-agent-core/src/subagent/supervisor.rs:1009` — the internal `spawn` helper (now passes a `SpawnRequest`).
@@ -328,7 +328,7 @@ Production call sites (`rg -n 'spawn_with_objective' crates/ --glob '*.rs' | gre
 
 `start_worker`'s recovered-root replay (`runtime.rs:430`–`449`) does **not** call `spawn_with_objective`; it rebuilds the supervisor with `from_recovered_root` / `from_recovered_gated_root`, whose constructors must initialize the new `workdirs` map (Step 3). No signature change is needed there.
 
-- [ ] **Step 5: Thread it through the coordinator**
+- [x] **Step 5: Thread it through the coordinator**
 
 `crates/yi-agent-store/src/runtime.rs`:
 
@@ -357,7 +357,7 @@ and at the `spawn_with_objective` call:
 
 `spawn_child_and_admit` and `spawn_application_child` gain the same trailing `workdir: Option<PathBuf>` parameter and forward it.
 
-- [ ] **Step 6: Run the test to confirm it passes**
+- [x] **Step 6: Run the test to confirm it passes**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-core --lib spawn_request_carries_the_parents_workdir
@@ -365,7 +365,7 @@ cd yi-agent-rs && cargo test -p yi-agent-core --lib spawn_request_carries_the_pa
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -389,7 +389,7 @@ git commit -m "feat: carry a parent-chosen workdir into spawn requests"
 - Consumes: T1 renames.
 - Produces: `RuntimeCoordinatorError::CodingRequiresGitRepository` is removed; `start_worker`'s failure evidence maps every provisioning failure to `workspace_provision_failed`.
 
-- [ ] **Step 1: Delete the trait method**
+- [x] **Step 1: Delete the trait method**
 
 Remove from `WorkerWorkspaceProvider` (`worker.rs`) the declaration and its default body:
 
@@ -401,7 +401,7 @@ Remove from `WorkerWorkspaceProvider` (`worker.rs`) the declaration and its defa
     }
 ```
 
-- [ ] **Step 2: Delete the `DaemonWorkspaceService` override**
+- [x] **Step 2: Delete the `DaemonWorkspaceService` override**
 
 In `crates/yi-agent/src/subagent_runtime.rs` remove:
 
@@ -413,7 +413,7 @@ In `crates/yi-agent/src/subagent_runtime.rs` remove:
 
 The `is_git_repository` field becomes unused; if the compiler now warns, it is deleted in Task 4 when the struct is reshaped.
 
-- [ ] **Step 3: Delete every gate**
+- [x] **Step 3: Delete every gate**
 
 `crates/yi-agent-store/src/runtime.rs`:
 
@@ -455,7 +455,7 @@ Delete the variant from the error enum:
     CodingRequiresGitRepository,
 ```
 
-- [ ] **Step 4: Delete the tests that asserted the gate**
+- [x] **Step 4: Delete the tests that asserted the gate**
 
 ```bash
 cd yi-agent-rs && rg -n 'coding_requires_git_repository|read-only tasks cannot spawn coding children|supports_coding' --glob '*.rs'
@@ -463,7 +463,7 @@ cd yi-agent-rs && rg -n 'coding_requires_git_repository|read-only tasks cannot s
 
 Delete each resulting test (`coding_child_fails_clearly_without_a_git_repository` in `runtime_coordinator.rs`, `runtime_coordinator.rs:4126`, and the two `subagent_runtime.rs` unit tests `git_workspace_service_supports_coding` / the non-git assertion at `2345`). They assert a behavior the spec deletes.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --no-run && cargo test -p yi-agent-store --test runtime_coordinator
@@ -471,7 +471,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --no-run && cargo test -p yi-agen
 
 Expected: compiles; the remaining `runtime_coordinator` cases pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -504,14 +504,14 @@ This is the core of §3.2 and §3.3. After it, `start_worker` no longer creates 
 
   - `WorkerStart.workspace` must be `Some`; a `None` remains a startup error (the invariant from `2026-09-26-subagent-readonly-default-design.md` §2 is preserved).
 
-- [ ] **Step 1: Reuse the file's existing fixture**
+- [x] **Step 1: Reuse the file's existing fixture**
 
 There is no shared harness in `runtime_coordinator.rs`; each test builds its own. The one this task needs already exists — `WorkspaceObservingFactory` (line 460) records every `WorkerStart` into a `starts` vector and installs a `StaticWorkspaceService`; `worker_receives_its_persisted_workspace_before_provider_start` (line 724) is the template. First make the test doubles honour the split trait:
 
 - `StaticWorkspaceService` gains `impl WorkerWorkspaceRegistry` (it already holds the one `WorkerWorkspace`): `register_prepared` stores it, `prepared_workspace_for_workdir` returns it when the canonical paths match, `inspect_delivery` returns an error ("test provider cannot inspect").
 - `WorkspaceObservingFactory::workspace_service()` returns it (renamed to `default_workspace_service` in Task 1), and the new `worker_workspace_registry()` returns the same `Arc`.
 
-- [ ] **Step 2: Write the failing coordinator test**
+- [x] **Step 2: Write the failing coordinator test**
 
 Add next to `worker_receives_its_persisted_workspace_before_provider_start`:
 
@@ -579,7 +579,7 @@ async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
 }
 ```
 
-- [ ] **Step 3: Run it to confirm it fails**
+- [x] **Step 3: Run it to confirm it fails**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_coding_child_runs_in_the_workdir_its_parent_prepared
@@ -587,7 +587,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_codi
 
 Expected: FAIL — `spawn_child_and_admit` takes no `workdir` yet, and the worker receives a generated `.worktrees/...` path.
 
-- [ ] **Step 4: Add the registry trait**
+- [x] **Step 4: Add the registry trait**
 
 In `crates/yi-agent-core/src/subagent/worker.rs`:
 
@@ -611,7 +611,7 @@ and on `AgentWorkerFactory`:
     }
 ```
 
-- [ ] **Step 5: Implement it in `yi-agent`**
+- [x] **Step 5: Implement it in `yi-agent`**
 
 In `crates/yi-agent/src/subagent_runtime.rs`, reshape `DaemonWorkspaceService` into `WorkerWorkspaces` and give it the registry:
 
@@ -697,7 +697,7 @@ fn in_place_workspace_at(repository_root: PathBuf, path: PathBuf) -> WorkerWorks
     }
 ```
 
-- [ ] **Step 6: Rewrite `prepare_task_workspace`**
+- [x] **Step 6: Rewrite `prepare_task_workspace`**
 
 `crates/yi-agent-store/src/runtime.rs` — replace the body:
 
@@ -770,7 +770,7 @@ fn in_place_workspace_at(repository_root: PathBuf, path: PathBuf) -> WorkerWorks
     WorkspaceServiceUnavailable,
 ```
 
-- [ ] **Step 7: Delete root's worktree provisioning (§3.2)**
+- [x] **Step 7: Delete root's worktree provisioning (§3.2)**
 
 `crates/yi-agent-store/src/runtime.rs` — delete `root_mode_for` and its two call sites (lines 707, 844); both become the constant:
 
@@ -780,7 +780,7 @@ fn in_place_workspace_at(repository_root: PathBuf, path: PathBuf) -> WorkerWorks
 
 The comment at line 430 (`a factory-global guess would wrongly promote a non-git root to Coding`) goes with it: there is no `Coding` root anymore.
 
-- [ ] **Step 8: Run the test to confirm it passes**
+- [x] **Step 8: Run the test to confirm it passes**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_coding_child_runs_in_the_workdir_its_parent_prepared
@@ -788,7 +788,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_codi
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -816,7 +816,7 @@ Delivery reporting stays (§3.7); only its worktree machinery goes. `inspect_del
   - `yi_agent_tools::worktree::WorkdirDelivery { branch: String, base_commit: String, head_commit: String, clean: bool }`
   - `WorktreeService::inspect_workdir(&self, workdir: &Path, base: &str) -> Result<WorkdirDelivery, WorktreeError>`
 
-- [ ] **Step 1: Write the failing tools test**
+- [x] **Step 1: Write the failing tools test**
 
 ```rust
 #[test]
@@ -838,7 +838,7 @@ fn inspect_workdir_reports_head_and_cleanliness_without_a_worktree() {
 }
 ```
 
-- [ ] **Step 2: Run it to confirm it fails**
+- [x] **Step 2: Run it to confirm it fails**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree inspect_workdir_reports_head_and_cleanliness_without_a_worktree
@@ -846,7 +846,7 @@ cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree inspect_
 
 Expected: FAIL — no method `inspect_workdir`.
 
-- [ ] **Step 3: Implement the primitive**
+- [x] **Step 3: Implement the primitive**
 
 In `crates/yi-agent-tools/src/worktree.rs`:
 
@@ -899,7 +899,7 @@ Add the two error variants. Their `Display` must keep the substrings the retry p
 
 `subagent_runtime.rs:779` and `:783` match on `"child worktree is dirty"` and `"child delivery has no commits beyond"`, so these strings are load-bearing.
 
-- [ ] **Step 4: Move inspection onto the registry**
+- [x] **Step 4: Move inspection onto the registry**
 
 Add to `WorkerWorkspaceRegistry` in `worker.rs`:
 
@@ -934,7 +934,7 @@ and remove `inspect_delivery` from `WorkerWorkspaceProvider`. In `subagent_runti
     }
 ```
 
-- [ ] **Step 5: Point both consumers at the registry**
+- [x] **Step 5: Point both consumers at the registry**
 
 `crates/yi-agent-store/src/runtime.rs:2487` (`confirm_review`):
 
@@ -955,11 +955,11 @@ and remove `inspect_delivery` from `WorkerWorkspaceProvider`. In `subagent_runti
 
 `crates/yi-agent/src/subagent_runtime.rs:689` (worker terminal) — replace `service.inspect_delivery(&workspace_for_delivery)` with the same registry call, keeping the dirty/empty retry branches verbatim.
 
-- [ ] **Step 6: Delete the worktree-shaped primitive**
+- [x] **Step 6: Delete the worktree-shaped primitive**
 
 Remove `WorktreeService::inspect_delivery` and `ChildWorktree` from `worktree.rs`, and the tests for them from `subagent_worktree.rs`. `merge_inspected_delivery`, `validate_parent_base`, `merge_accepted`, `remove_accepted_clean` are deleted in Task 6; this step only removes the inspection path Task 5 replaced.
 
-- [ ] **Step 7: Verify**
+- [x] **Step 7: Verify**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree && cargo test -p yi-agent --bin yi-agent
@@ -967,7 +967,7 @@ cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree && cargo
 
 Expected: PASS. The child's dirty-delivery retry prompt still fires, because the error strings are unchanged.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -995,11 +995,11 @@ git commit -m "refactor: inspect deliveries through the workdir, not the worktre
   - `RuntimeCoordinator::accept_review` no longer calls a recycle.
   - `WORKTREE_RECLAIM_TTL` is deleted.
 
-- [ ] **Step 1: Delete `reconcile_integrated_deliveries` and its caller**
+- [x] **Step 1: Delete `reconcile_integrated_deliveries` and its caller**
 
 In `runtime.rs`, remove the whole `reconcile_integrated_deliveries` method (line 3263) and its call inside the reconcile pass. The comment "It runs on every reconcile pass because the application root is not a daemon worker" goes with it: there is nothing left to observe.
 
-- [ ] **Step 2: Delete the recycle chain**
+- [x] **Step 2: Delete the recycle chain**
 
 Remove `recycle_accepted_delivery` (line 2118) and the call at the end of `accept_review`:
 
@@ -1010,7 +1010,7 @@ Remove `recycle_accepted_delivery` (line 2118) and the call at the end of `accep
 
 This leaves `accept_review` with one job: record the accepted review. That is §3.5's "自动验收" removal; the parent's own merge is the integration, and the daemon no longer watches for it.
 
-- [ ] **Step 3: Delete the reclaim surface**
+- [x] **Step 3: Delete the reclaim surface**
 
 Remove from `runtime.rs`: `reclaim_session_worktrees`, `reclaim_idle_worktrees`, `reclaim_idle_session`, `reclaim_candidate_directories`, `reclaim_candidates_in_session`, `record_recycle_event`, `task_state_is_terminal` if it has no other caller, and `WORKTREE_RECLAIM_TTL` (line 51).
 
@@ -1027,13 +1027,13 @@ Remove from `ipc.rs` the detach-time call (line 2621) and the daemon tick's recl
 
 The tick keeps `evaluate_schedules` and `reconcile_worker_events` and drops the spawn block.
 
-- [ ] **Step 4: Delete the trait methods and the git primitives**
+- [x] **Step 4: Delete the trait methods and the git primitives**
 
 Remove from `WorkerWorkspaceProvider` and `WorkerWorkspaceRegistry`: `cleanup_prepared`, `contains_commit`, `cleanup_accepted`, `reclaim_worktree`, `reattach_workspace`, `is_merged_into`. Remove their implementations from `WorkerWorkspaces` and from `UnavailableWorkspaceProvider`.
 
 Remove from `worktree.rs`: `create_root`, `create_child`, `merge_accepted`, `merge_inspected_delivery`, `validate_parent_base`, `remove_accepted_clean`, `reclaim_directory`, `reattach_worktree`, `remove_created`, `remove_clean`, `contains_commit`, `is_ancestor`, plus the now-unused helpers `same_path`, `ensure_worktree_target_available`, `add_worktree`, `ensure_worktree_parent_is_ignored`, `resolve_parent_base`, and the `ChildWorktree` struct (there is no `RootWorktree`; `create_root` returns a `ChildWorktree`). Keep `ignore_inside_repository`, `ignore_project_path`, `containing_worktree_root`, `repository_relative_ignore_entry`, `deepest_existing_directory`, `canonicalize_deepest_existing`, `append_exclude_entry`, `current_branch`, `git`.
 
-- [ ] **Step 5: Delete the tests for the deleted behavior**
+- [x] **Step 5: Delete the tests for the deleted behavior**
 
 ```bash
 cd yi-agent-rs && rg -n 'reclaim|recycle|cleanup_accepted|contains_commit|is_merged_into|merge_inspected_delivery|remove_accepted_clean|reattach_worktree|reclaim_directory|create_child|create_root' crates/yi-agent-store/tests crates/yi-agent-tools/tests
@@ -1041,7 +1041,7 @@ cd yi-agent-rs && rg -n 'reclaim|recycle|cleanup_accepted|contains_commit|is_mer
 
 Delete every hit. In `runtime_coordinator.rs` this includes `accepted_review_recycles_the_child_workspace` (1203), `a_reclaimed_worktree_is_rebuilt_before_a_worker_starts` (4144), `reclaim_session_worktrees_removes_merged_children_and_keeps_unmerged_ones` (4190), `reclaim_session_worktrees_keeps_a_running_childs_directory` (4524). In `runtime_ipc.rs`: `detaching_an_application_root_seeds_a_worktree_reclaim` (1433).
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree && cargo test -p yi-agent-store --test runtime_coordinator
@@ -1049,7 +1049,7 @@ cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree && cargo
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -1070,11 +1070,11 @@ git commit -m "refactor: drop automatic delivery acceptance and worktree reclaim
 - Consumes: T6 (the reclaim the command drove).
 - Produces: `IpcRequest::PreviewGc` / `ConfirmGc` and `IpcResponse::GcPreview` / `GcCompleted` / `IpcGcEntry` no longer exist.
 
-- [ ] **Step 1: Delete the IPC surface**
+- [x] **Step 1: Delete the IPC surface**
 
 Remove from `ipc.rs`: the `PreviewGc` and `ConfirmGc` request variants (lines 197–202), the `GcPreview`/`GcCompleted`/`IpcGcEntry` response types (392–397, 594–), `preview_gc`, `confirm_gc`, `gc_entries`, the two dispatch arms (1152, 1156, 2729), and the `gc` half of `ConfirmationStore` (`issue_gc`, `consume_gc`, and its token map).
 
-- [ ] **Step 2: Delete the CLI surface**
+- [x] **Step 2: Delete the CLI surface**
 
 `config.rs` — remove the variant:
 
@@ -1085,7 +1085,7 @@ Remove from `ipc.rs`: the `PreviewGc` and `ConfirmGc` request variants (lines 19
 
 `main.rs` — remove `DaemonAction::Gc => gc_daemon_client(&runtime),` from the dispatch, the `gc_daemon_client` function (line 648), the `DaemonAction::Gc |` arm at line 618, and the parse test at line 2279.
 
-- [ ] **Step 3: Delete the tests**
+- [x] **Step 3: Delete the tests**
 
 ```bash
 cd yi-agent-rs && rg -n 'PreviewGc|ConfirmGc|GcPreview|GcCompleted|gc_' crates/yi-agent-store/tests crates/yi-agent/src
@@ -1093,7 +1093,7 @@ cd yi-agent-rs && rg -n 'PreviewGc|ConfirmGc|GcPreview|GcCompleted|gc_' crates/y
 
 Delete every hit, including `gc_preview_lists_a_detached_sessions_reclaimable_worktree` (`runtime_ipc.rs:2263`) and the three `runtime_ipc.rs:2165-2244` gc cases.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent && cargo test -p yi-agent-store --test runtime_ipc
@@ -1101,7 +1101,7 @@ cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent && cargo test -p yi-agen
 
 Expected: PASS. `yi-agent daemon gc` now fails as an unknown subcommand, which is the intended surface.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -1127,7 +1127,7 @@ git commit -m "refactor: remove the daemon gc command"
   - `WorkerStart.workspace_lease_id` and `AgentTask::validate_for`'s workspace clause are deleted.
   - `RuntimeRepository` has no `task_workspaces` access.
 
-- [ ] **Step 1: Write the failing schema test**
+- [x] **Step 1: Write the failing schema test**
 
 ```rust
 #[test]
@@ -1148,7 +1148,7 @@ fn a_fresh_database_has_no_task_workspaces_table() {
 
 `RuntimeRepository::open_in_memory` and a test-visible `connection` accessor already exist for `repository_decisions.rs`; reuse them, or add `#[cfg(test)] pub(crate) fn table_exists(&self, name: &str) -> bool`.
 
-- [ ] **Step 2: Run it to confirm it fails**
+- [x] **Step 2: Run it to confirm it fails**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test repository_decisions a_fresh_database_has_no_task_workspaces_table
@@ -1156,7 +1156,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test repository_decisions a_fre
 
 Expected: FAIL — the table exists.
 
-- [ ] **Step 3: Drop the DDL and the accessors**
+- [x] **Step 3: Drop the DDL and the accessors**
 
 Delete the `CREATE TABLE task_workspaces (...)` statement from the `current_version < 7` migration block (line 4659). Keep the `application_root_attachments` statement in that block. Do not add a migration that drops the table (§3.6).
 
@@ -1164,7 +1164,7 @@ Delete `record_task_workspace`, `task_workspace`, `task_workspace_optional`, `de
 
 Delete the `TaskWorkspaceRecycled` and `TaskWorkspaceRecycleFailed` variants and their `as_str`/`parse` arms.
 
-- [ ] **Step 4: Drop the identity fields**
+- [x] **Step 4: Drop the identity fields**
 
 `task.rs` — delete `AgentTask.workspace`, `with_workspace`, and the clause:
 
@@ -1209,7 +1209,7 @@ Delete the `TaskWorkspaceRecycled` and `TaskWorkspaceRecycleFailed` variants and
 
 `inspect_task` and the subscription snapshot in `ipc.rs` lose the `workspace` field they read from `IpcTask.workspace` / `IpcTaskDetail.workspace`; delete those fields and their `#[serde(default)]` attributes.
 
-- [ ] **Step 5: Delete the tests**
+- [x] **Step 5: Delete the tests**
 
 ```bash
 cd yi-agent-rs && rg -n 'task_workspace|TaskWorkspace|workspace_lease|WorkspaceAssignedFactory|delivery workspace does not match' crates/yi-agent-store/tests crates/yi-agent-core/src crates/yi-agent-store/src
@@ -1217,7 +1217,7 @@ cd yi-agent-rs && rg -n 'task_workspace|TaskWorkspace|workspace_lease|WorkspaceA
 
 Delete each hit. In `repository_decisions.rs` that is the whole `task_workspace_*` group (lines 39–172). In `runtime_coordinator.rs`: `worker_receives_its_persisted_workspace_before_provider_start` (724), `child_recovery_context_uses_the_persisted_workspace_assignment` (768), `workspace_record_failure_*` (895, 937), `child_workspace_lease_identity_reaches_worker_and_durable_task` (1020), `read_only_child_runs_in_place_without_a_workspace_row` (3966). In `runtime_ipc.rs`: `inspect_task_includes_the_authoritative_recorded_workspace` (4855) and the two subscription cases (4929, 4959).
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test repository_decisions && cargo test -p yi-agent-store --test runtime_coordinator && cargo test -p yi-agent-store --test runtime_ipc && cargo test -p yi-agent --bin yi-agent
@@ -1225,7 +1225,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test repository_decisions && ca
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -1247,7 +1247,7 @@ git commit -m "refactor: stop persisting task workspaces"
 - Consumes: everything above.
 - Produces: `default_system_prompt` tells the parent to prepare and pass a workdir.
 
-- [ ] **Step 1: Change the failing prompt test**
+- [x] **Step 1: Change the failing prompt test**
 
 `crates/yi-agent/src/main.rs:1735`:
 
@@ -1266,7 +1266,7 @@ git commit -m "refactor: stop persisting task workspaces"
     }
 ```
 
-- [ ] **Step 2: Run it to confirm it fails**
+- [x] **Step 2: Run it to confirm it fails**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent default_system_prompt_requires_a_workdir_for_isolation
@@ -1274,7 +1274,7 @@ cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent default_system_prompt_re
 
 Expected: FAIL — the prompt still says `git merge --no-ff` and never says `workdir`.
 
-- [ ] **Step 3: Replace the prompt section**
+- [x] **Step 3: Replace the prompt section**
 
 `crates/yi-agent-core/src/agent.rs`:
 
@@ -1292,7 +1292,7 @@ Subagent integration:
 
 Keep the surrounding `File discovery:` and `Task execution:` blocks untouched.
 
-- [ ] **Step 4: Run the test to confirm it passes**
+- [x] **Step 4: Run the test to confirm it passes**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent default_system_prompt_requires_a_workdir_for_isolation
@@ -1300,7 +1300,7 @@ cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent default_system_prompt_re
 
 Expected: PASS.
 
-- [ ] **Step 5: Update the status log**
+- [x] **Step 5: Update the status log**
 
 In `docs/bug-list.md`, replace the worktree entry (line 16) with:
 
@@ -1308,7 +1308,7 @@ In `docs/bug-list.md`, replace the worktree entry (line 16) with:
 - [x] 当前启动subagent runtime 就会创建worktree。太多了怎么清理。（修复：daemon 不再自动建 worktree、不再跟踪/验收/回收子任务工作区。root 原地运行在项目目录；`spawn_agent` 新增必填 `workdir`，父 agent 需要隔离时自己 `git worktree add` 再传路径。删除 `AgentWorkspaceService` 的编排方法、`reclaim_session_worktrees`/`reclaim_idle_worktrees`、`yi-agent daemon gc`、`task_workspaces` 的读写（旧表保留不 DROP）、以及"已进父历史才算完成"的自动验收；交付上报保留，身份改由 workdir 派生。见 [设计](../superpowers/specs/2026-09-29-agent-owned-worktree-design.md)、[计划](../superpowers/plans/2026-09-29-agent-owned-worktree-impl.md)。验证：`cargo test -p yi-agent-store --test runtime_coordinator`、`cargo test -p yi-agent-store --test runtime_ipc`、`cargo test -p yi-agent --bin yi-agent`，以及干净 git 项目下 `run --subagents` 不产生 `.worktrees/yi-agent-*-root`）
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -1329,7 +1329,7 @@ git commit -m "docs: point the agent prompt and status log at agent-owned worktr
 - Consumes: every task above.
 - Produces: the four behaviors §6 requires.
 
-- [ ] **Step 1: Write the four unit/integration tests**
+- [x] **Step 1: Write the four unit/integration tests**
 
 Reuse the `TempDir` + `RuntimeCoordinator::open(&database, factory)` shape from Task 4 Step 2. Both tests below pass `StaticWorkspaceService` (whose registry holds the project root as the in-place position) and read the recorded `starts` vector for the path the worker actually received.
 
@@ -1442,7 +1442,7 @@ async fn mode_only_changes_write_access_not_the_directory() {
 
 `tempfile` is a dev-dependency of both `yi-agent` (line 49) and `yi-agent-store` (line 29), so no manifest change is needed.
 
-- [ ] **Step 2: Run them to confirm they fail**
+- [x] **Step 2: Run them to confirm they fail**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_root_runs_in_the_project_directory && cargo test -p yi-agent --bin yi-agent a_workdir_outside_any_repository
@@ -1450,11 +1450,11 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_root
 
 Expected: FAIL — `WorkerStart.workspace_mode` is not yet public to the test, and the root still receives a generated `.worktrees/yi-agent-*-root` path.
 
-- [ ] **Step 3: Make `WorkerStart.workspace_mode` readable by the fixture**
+- [x] **Step 3: Make `WorkerStart.workspace_mode` readable by the fixture**
 
 If `starts` cannot read `workspace_mode`, widen it to `pub` (it already is, line 40 of `worker.rs`) and confirm `WorkspaceObservingFactory` copies it into the recorded start. No production behavior changes.
 
-- [ ] **Step 4: Run them to confirm they pass**
+- [x] **Step 4: Run them to confirm they pass**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_root_runs_in_the_project_directory && cargo test -p yi-agent-store --test runtime_coordinator mode_only_changes_write_access_not_the_directory && cargo test -p yi-agent --bin yi-agent a_workdir_outside_any_repository
@@ -1462,7 +1462,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator a_root
 
 Expected: PASS.
 
-- [ ] **Step 5: Add the end-to-end assertion**
+- [x] **Step 5: Add the end-to-end assertion**
 
 In `crates/yi-agent/tests/subagent_real_e2e.rs`, the existing harness runs a clean git project. It is opt-in (`#[ignore]` without API keys). Add the assertion §7 requires:
 
@@ -1486,7 +1486,7 @@ In `crates/yi-agent/tests/subagent_real_e2e.rs`, the existing harness runs a cle
     );
 ```
 
-- [ ] **Step 6: Run the full verification list from §7**
+- [x] **Step 6: Run the full verification list from §7**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator && cargo test -p yi-agent-store --test runtime_ipc && cargo test -p yi-agent --bin yi-agent
@@ -1494,7 +1494,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator && car
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -1506,14 +1506,14 @@ git commit -m "test: cover in-place roots, explicit workdirs, and the no-worktre
 
 ## Final verification
 
-- [ ] `cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator`
-- [ ] `cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_ipc`
-- [ ] `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent`
-- [ ] `cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree` (should now hold only `ignore_*` cases)
-- [ ] `cd yi-agent-rs && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cd yi-agent-rs && cargo fmt --all -- --check`
-- [ ] Clean git project, `run --subagents`: no `.worktrees/yi-agent-*-root`, clean checkout on exit
-- [ ] `git diff --stat main` touches no `task_workspaces` `DROP`, and no branch ref deletion
+- [x] `cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_coordinator`
+- [x] `cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_ipc`
+- [x] `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent`
+- [x] `cd yi-agent-rs && cargo test -p yi-agent-tools --test subagent_worktree` (should now hold only `ignore_*` cases)
+- [x] `cd yi-agent-rs && cargo clippy --all-targets --all-features -- -D warnings`
+- [x] `cd yi-agent-rs && cargo fmt --all -- --check`
+- [x] Clean git project, `run --subagents`: no `.worktrees/yi-agent-*-root`, clean checkout on exit
+- [x] `git diff --stat main` touches no `task_workspaces` `DROP`, and no branch ref deletion
 
 ## Open decision recorded
 
