@@ -1,5 +1,6 @@
 //! Agent loop: think -> act -> observe.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -194,6 +195,10 @@ pub struct Agent {
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    /// Interjection inbox shared with the spawned `run_loop`, so a test (or a
+    /// caller holding an `InboxHandle`) can deliver without a live `&Agent`.
+    /// Only present while a run is active.
+    inbox: Option<InboxHandle>,
 }
 
 /// Events emitted during agent loop.
@@ -267,6 +272,19 @@ pub enum AgentEvent {
         message: String,
     },
     Cancelled,
+    /// A mid-turn user message was pushed into the session as a user message.
+    /// Emitted only after the text is actually in the transcript, so consumers
+    /// can promote a "delivered, pending" entry to a real one.
+    InterjectionAccepted {
+        seq: u64,
+        text: String,
+        tag: Option<String>,
+    },
+    /// Mid-turn user messages that were never consumed, handed back on any
+    /// terminal exit. MUST be emitted before `Cancelled` / `Done`.
+    InterjectionsReturned {
+        items: Vec<Interjection>,
+    },
     /// The subagent runtime the user asked for could not be started or
     /// activated, so this session runs without delegation.
     ///
@@ -315,6 +333,101 @@ const CONTINUE_AFTER_TRUNCATION: &str =
 const COMPLETION_AUDIT_PROMPT: &str =
     "Before you finish, verify the changed result using an appropriate read, diff, build, or test.";
 
+/// Wrapper placed around user text that arrives mid-turn, so the model reads it
+/// as a revision of the current task rather than a brand-new request.
+const INTERJECTION_PREFIX: &str = "The user added the following requirement while you were working on this task. \
+Fold it into the current task without repeating work you have already completed:\n";
+
+/// One user message submitted while a turn was in flight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Interjection {
+    /// Monotonic token assigned by `Inbox`; the frontend's reconciliation key.
+    pub seq: u64,
+    pub text: String,
+    /// Caller-supplied reconciliation id. `None` when the caller does not need
+    /// cross-process matching (the TUI).
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InterjectError {
+    #[error("interjection inbox is full")]
+    Full,
+    #[error("no run is active")]
+    NotRunning,
+}
+
+/// Bounded FIFO of interjections, drained by `run_loop`.
+#[derive(Debug)]
+pub struct Inbox {
+    items: VecDeque<Interjection>,
+    next_seq: u64,
+}
+
+impl Inbox {
+    /// Matches `PendingQueue::CAPACITY` and the TUI input channel capacity.
+    pub const CAPACITY: usize = 16;
+
+    pub fn new() -> Self {
+        Self {
+            items: VecDeque::new(),
+            next_seq: 0,
+        }
+    }
+
+    pub fn push(&mut self, text: String, tag: Option<String>) -> Result<u64, InterjectError> {
+        if self.items.len() >= Self::CAPACITY {
+            return Err(InterjectError::Full);
+        }
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.items.push_back(Interjection { seq, text, tag });
+        Ok(seq)
+    }
+
+    pub fn drain_all(&mut self) -> Vec<Interjection> {
+        self.items.drain(..).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+impl Default for Inbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Cloneable delivery handle for the active run's inbox.
+#[derive(Debug, Clone)]
+pub struct InboxHandle(Arc<Mutex<Inbox>>);
+
+impl InboxHandle {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(Inbox::new())))
+    }
+
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
+        self.0.lock().unwrap()
+    }
+
+    pub fn interject(&self, text: String, tag: Option<String>) -> Result<u64, InterjectError> {
+        self.lock().push(text, tag)
+    }
+}
+
+impl Default for InboxHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum AgentError {
     #[error("provider error: {0}")]
@@ -336,6 +449,7 @@ impl Agent {
             permission_checker: None,
             decision_rx: None,
             provider_turn_gate: None,
+            inbox: None,
         }
     }
 
@@ -390,6 +504,21 @@ impl Agent {
         self.cancel_token.clone()
     }
 
+    /// Deliver a mid-turn user message. Returns the inbox sequence number, or
+    /// `NotRunning` when no run is active / `Full` when the inbox is saturated.
+    pub fn interject(&self, text: String, tag: Option<String>) -> Result<u64, InterjectError> {
+        match &self.inbox {
+            Some(handle) => handle.interject(text, tag),
+            None => Err(InterjectError::NotRunning),
+        }
+    }
+
+    /// Handle for the active run's inbox. A caller can clone it before moving
+    /// the event stream away and still deliver into that same run.
+    pub fn inbox_handle(&self) -> Option<InboxHandle> {
+        self.inbox.clone()
+    }
+
     /// Run the agent loop, returning a stream of events.
     pub async fn run(
         &mut self,
@@ -412,6 +541,9 @@ impl Agent {
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
         // Every run uses a fresh cancel token.
         self.cancel_token = CancellationToken::new();
+        // Each run gets a fresh inbox: a handle from the previous run must not
+        // feed the next one.
+        self.inbox = Some(InboxHandle::new());
         if let Some(user_prompt) = user_prompt {
             self.session
                 .lock()
@@ -427,6 +559,9 @@ impl Agent {
         let permission_checker = self.permission_checker.clone();
         let decision_rx = self.decision_rx.clone();
         let provider_turn_gate = self.provider_turn_gate.clone();
+        // Clone before the loop owns it: the `Agent` keeps its handle so
+        // `interject()` works even after the stream has been moved away.
+        let inbox = self.inbox.clone();
 
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = EventTx(tx);
@@ -444,6 +579,7 @@ impl Agent {
                 permission_checker,
                 decision_rx,
                 provider_turn_gate,
+                inbox,
             )
             .await;
         });
@@ -530,6 +666,7 @@ async fn run_loop(
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    inbox: Option<InboxHandle>,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
@@ -1378,6 +1515,63 @@ mod tests {
 
     fn collect_events(stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
         futures::executor::block_on_stream(stream).collect()
+    }
+
+    #[test]
+    fn inbox_assigns_monotonic_seq_and_rejects_when_full() {
+        let mut inbox = Inbox::new();
+        assert_eq!(inbox.push("a".into(), None).unwrap(), 1);
+        assert_eq!(inbox.push("b".into(), Some("tag-1".into())).unwrap(), 2);
+        assert!(!inbox.is_empty());
+        for i in 0..(Inbox::CAPACITY - 2) {
+            inbox.push(format!("m{i}"), None).unwrap();
+        }
+        assert_eq!(
+            inbox.push("overflow".into(), None),
+            Err(InterjectError::Full)
+        );
+        assert_eq!(inbox.len(), Inbox::CAPACITY);
+        let drained = inbox.drain_all();
+        assert_eq!(drained.len(), Inbox::CAPACITY);
+        assert_eq!(drained[0].text, "a");
+        assert_eq!(drained[1].tag.as_deref(), Some("tag-1"));
+        assert!(inbox.drain_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interject_before_first_run_reports_not_running() {
+        let provider = ScriptedProvider::new(vec![]);
+        let agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        assert!(matches!(
+            agent.interject("late".into(), None),
+            Err(InterjectError::NotRunning)
+        ));
+        assert!(agent.inbox_handle().is_none());
+    }
+
+    #[tokio::test]
+    async fn interject_after_run_starts_is_accepted_in_order() {
+        let provider = ScriptedProvider::new(vec![vec![ProviderEvent::Stop {
+            reason: StopReason::EndTurn,
+        }]]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        let stream = agent.run("hello".into()).await.unwrap();
+        assert_eq!(agent.interject("first".into(), None).unwrap(), 1);
+        assert_eq!(
+            agent.interject("second".into(), Some("t".into())).unwrap(),
+            2
+        );
+        let handle = agent.inbox_handle().expect("handle after run starts");
+        assert_eq!(handle.lock().len(), 2);
+        drop(stream);
     }
 
     #[tokio::test]
