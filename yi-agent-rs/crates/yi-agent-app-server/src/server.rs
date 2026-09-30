@@ -1400,14 +1400,15 @@ async fn interrupt_and_wait_for_persist(
 }
 
 /// 一个 turn 结束后（或被 clear / compact 改动后）的收尾：把当前 session 快照
-/// 落盘、置 Idle、上报 Finished。
+/// 落盘、置 Idle，并在 `turn_id` 为 `Some` 时上报 Finished。
 ///
 /// clear / compact 之后必须调用它：`/clear` 要落一条空快照（否则 resume 回放的是
-/// 旧日志），`/compact` 要把压缩结果写回 `.jsonl`。
+/// 旧日志），`/compact` 要把压缩结果写回 `.jsonl`。此时**没有 turn 在收尾**，
+/// 传 `turn_id = None`：不发 `TurnEvent::Finished`，也不 touch meta。
 #[allow(clippy::too_many_arguments)]
 async fn persist_and_finish_turn<W>(
     thread_id: &str,
-    turn_id: &str,
+    turn_id: Option<&str>,
     user_prompt: Option<&str>,
     agent: &yi_agent_core::Agent,
     completed_items: Vec<crate::protocol::Item>,
@@ -1423,7 +1424,7 @@ async fn persist_and_finish_turn<W>(
     if let Some(prompt) = user_prompt {
         // 基线 server 不 emit userMessage，必须在落盘时补齐，否则 resume 会丢用户提问。
         items.push(crate::protocol::Item::UserMessage {
-            id: format!("user-{turn_id}"),
+            id: format!("user-{}", turn_id.unwrap_or("session-command")),
             text: prompt.to_string(),
         });
     }
@@ -1436,7 +1437,7 @@ async fn persist_and_finish_turn<W>(
     };
     // append 失败则跳过 touch：避免出现"幽灵" thread。
     if let Err(e) = store.append_turn(thread_id, &record) {
-        eprintln!("[app-server] failed to persist turn {turn_id} of {thread_id}: {e}");
+        eprintln!("[app-server] failed to persist turn {thread_id}: {e}");
     } else if let Some(prompt) = user_prompt {
         if let Err(e) = store.touch(thread_id, Some(prompt)) {
             eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
@@ -1444,7 +1445,81 @@ async fn persist_and_finish_turn<W>(
     }
 
     let _ = update_status(writer, status, thread_id, ThreadStatus::Idle).await;
-    let _ = turn_tx.send(finished_event(thread_id, turn_id)).await;
+    if let Some(turn_id) = turn_id {
+        let _ = turn_tx.send(finished_event(thread_id, turn_id)).await;
+    }
+}
+
+/// 在**没有 turn 在跑**的时刻执行一条会话命令，返回（可能被重建过的）agent。
+///
+/// 按值传入/返回是刻意的：`Agent::with_session` 消费 self，而 `Agent` 既不是
+/// `Clone` 也没有便宜的占位值，所以无法用 `&mut Agent` 调用它。
+#[allow(clippy::too_many_arguments)]
+async fn apply_session_command<W>(
+    mut agent: yi_agent_core::Agent,
+    command: SessionCommand,
+    provider: &Arc<dyn yi_agent_core::Provider>,
+    config: &yi_agent_core::AgentConfig,
+    store: &crate::thread_store::ThreadStore,
+    thread_id: &str,
+    writer: &MessageWriter<W>,
+    turn_tx: &mpsc::Sender<TurnEvent>,
+    status: &Arc<std::sync::Mutex<ThreadStatus>>,
+) -> yi_agent_core::Agent
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match command {
+        SessionCommand::Clear { reply } => {
+            agent = agent.with_session(yi_agent_core::Session::new());
+            let truncate = store.truncate(thread_id);
+            if let Err(e) = &truncate {
+                eprintln!("[app-server] failed to truncate thread log {thread_id}: {e}");
+            }
+            // 不是 turn 收尾：turn_id 传 None（不发 Finished），也不 touch meta。
+            persist_and_finish_turn(
+                thread_id,
+                None,
+                None,
+                &agent,
+                Vec::new(),
+                None,
+                store,
+                writer,
+                turn_tx,
+                status,
+            )
+            .await;
+            // `truncate` 返回 io::Result<bool>，而 reply 通道是 Result<(), String>。
+            let _ = reply.send(truncate.map(|_| ()).map_err(|e| e.to_string()));
+        }
+        SessionCommand::Compact { reply } => {
+            let session = agent.session();
+            let outcome = match yi_agent_core::compact_session(provider, config, &session).await {
+                Ok(Some(compacted)) => {
+                    agent = agent.with_session(compacted);
+                    CompactOutcome::Compacted
+                }
+                Ok(None) => CompactOutcome::NotReduced,
+                Err(e) => CompactOutcome::Failed(e.to_string()),
+            };
+            persist_and_finish_turn(
+                thread_id,
+                None,
+                None,
+                &agent,
+                Vec::new(),
+                None,
+                store,
+                writer,
+                turn_tx,
+                status,
+            )
+            .await;
+            let _ = reply.send(outcome);
+        }
+    }
+    agent
 }
 
 /// 单个 thread 的 driver task:串行消费 turn,驱动 `agent.run()` 的 stream,
@@ -1490,12 +1565,31 @@ async fn run_thread_driver<W>(
     // 内层 select 期间收到的会话命令。此刻 turn 正在跑，不能改 agent，
     // 暂存到这里，等本轮收尾时执行（见 persist_and_finish_turn 之后的处理）。
     let mut pending_session_command: Option<SessionCommand> = None;
-    while let Some(TurnPrompt {
-        turn_id,
-        prompt,
-        activate,
-    }) = prompt_rx.recv().await
-    {
+    loop {
+        // 空闲路径:没有 turn 在跑时收到的会话命令,立即执行——此刻改 agent 是安全的。
+        // 没有这条路径,空闲 thread 永远读不到 clear / compact(命令会一直躺在 channel 里)。
+        //
+        // 只在 `select!` 里做 `recv`,把执行放到 `select!` 之外:`apply_session_command`
+        // 按值消费并返回 agent,若写进分支体就会与另一分支的 `prompt_rx` 借用冲突。
+        let turn_prompt = tokio::select! {
+            Some(command) = session_rx.recv() => {
+                agent = apply_session_command(
+                    agent, command, &provider, &config, &store, &thread_id, &writer, &turn_tx,
+                    &status,
+                )
+                .await;
+                continue;
+            }
+            maybe_prompt = prompt_rx.recv() => maybe_prompt,
+        };
+        let Some(TurnPrompt {
+            turn_id,
+            prompt,
+            activate,
+        }) = turn_prompt
+        else {
+            break; // prompt_rx 关闭:driver 收尾退出
+        };
         if !activation_attempted {
             activation_attempted = true;
             if let Some(runtime) = activate {
@@ -1723,68 +1817,23 @@ async fn run_thread_driver<W>(
         }
 
         // 先执行本轮暂存的会话命令（此刻 turn 已结束，改 agent 是安全的），
-        // 再落盘——否则会先用压缩前的 session 覆盖日志，再被压缩结果覆盖一次。
-        match pending_session_command.take() {
-            Some(SessionCommand::Clear { reply }) => {
-                agent = agent.with_session(yi_agent_core::Session::new());
-                // 截断日志：只清内存而保留 .jsonl 的话，resume 会把旧消息回放
-                // 回来，用户以为清空了实则没有。
-                let truncate = store.truncate(&thread_id);
-                if let Err(e) = &truncate {
-                    eprintln!("[app-server] failed to truncate thread log {thread_id}: {e}");
-                }
-                // 不传 user_prompt → 不 touch meta（清空不改 thread 身份）。
-                persist_and_finish_turn(
-                    &thread_id,
-                    &turn_id,
-                    None,
-                    &agent,
-                    Vec::new(),
-                    None,
-                    &store,
-                    &writer,
-                    &turn_tx,
-                    &status,
-                )
-                .await;
-                // truncate 的 io::Error 不是 Send 友好的错误类型,转成字符串再回。
-                let _ = reply.send(truncate.map(|_| ()).map_err(|e| e.to_string()));
-                continue;
-            }
-            Some(SessionCommand::Compact { reply }) => {
-                let session = agent.session();
-                let outcome =
-                    match yi_agent_core::compact_session(&provider, &config, &session).await {
-                        Ok(Some(compacted)) => {
-                            agent = agent.with_session(compacted);
-                            CompactOutcome::Compacted
-                        }
-                        Ok(None) => CompactOutcome::NotReduced,
-                        Err(e) => CompactOutcome::Failed(e.to_string()),
-                    };
-                persist_and_finish_turn(
-                    &thread_id,
-                    &turn_id,
-                    None,
-                    &agent,
-                    Vec::new(),
-                    None,
-                    &store,
-                    &writer,
-                    &turn_tx,
-                    &status,
-                )
-                .await;
-                let _ = reply.send(outcome);
-                continue;
-            }
-            None => {}
+        // 再为刚结束的 turn 收尾。
+        if let Some(command) = pending_session_command.take() {
+            agent = apply_session_command(
+                agent, command, &provider, &config, &store, &thread_id, &writer, &turn_tx, &status,
+            )
+            .await;
+            // 命令路径已 append 过最终状态;这里只需为这个 turn 发 Finished 让主循环清
+            // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
+            let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Idle).await;
+            let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+            continue;
         }
 
         // 无暂存命令：常规收尾（把本轮结果落盘）。
         persist_and_finish_turn(
             &thread_id,
-            &turn_id,
+            Some(&turn_id),
             Some(&user_prompt),
             &agent,
             std::mem::take(&mut completed_items),
@@ -3113,6 +3162,84 @@ mod tests {
 
         drop(prompt_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// 回归:driver 空闲(没有 turn 在跑)时,也必须在有限时间内响应会话命令。
+    ///
+    /// 修复前 `session_rx` 只在每轮的内层 select 里被轮询,空闲 thread 的命令
+    /// 会一直躺在 channel 里,直到下一个 turn/start 才被读到——这个测试会超时。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_driver_serves_a_session_command_without_a_new_turn() {
+        use crate::session::{CompactOutcome, SessionCommand};
+
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 本测试不看 writer 输出
+        let writer = Arc::new(MessageWriter::new(server_w));
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(8);
+        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        // prompt_tx 保住不 drop:driver 应停在 idle,而不是因 prompt_rx 关闭退出。
+        let _keep_prompt_tx = prompt_tx;
+
+        let built = build_test_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-idle-1".into(),
+            built.agent,
+            prompt_rx,
+            interrupt_rx,
+            interject_rx,
+            session_rx,
+            writer,
+            turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(5),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            store,
+            ThreadSession::new_status(),
+            built.provider,
+            built.config,
+        ));
+
+        // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。
+        let (reply, answer) = oneshot::channel();
+        session_tx
+            .send(SessionCommand::Compact { reply })
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("an idle driver must service a session command without a new turn")
+            .expect("the reply channel must be fulfilled");
+        assert_eq!(
+            outcome,
+            CompactOutcome::NotReduced,
+            "an empty session has nothing to compact"
+        );
+
+        // driver 仍在运行(命令不该把它弄停)。
+        assert!(!handle.is_finished());
+        handle.abort();
+
+        // turn_rx 里的 Finished 是可选的:本路径 turn_id 为 None,不该发 Finished。
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a command with no turn must not report a turn as finished"
+        );
     }
 
     /// 一个 thread 的 driver 复用同一个 `Translator`,因此 item id 跨 turn 单调
