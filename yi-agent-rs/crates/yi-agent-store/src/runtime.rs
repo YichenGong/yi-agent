@@ -1015,6 +1015,9 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    // The arguments mirror the IPC spawn request one-for-one; grouping them
+    // would only move the field list.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_application_child(
         &self,
         session: &RootSessionId,
