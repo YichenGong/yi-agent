@@ -23,7 +23,9 @@ use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
     RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, ThreadStatus,
 };
-use crate::session::{InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt};
+use crate::session::{
+    CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
+};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -603,7 +605,8 @@ where
                         // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
                         // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
                         let activation = attach_delegation(&runtimes, &cfg, &cwd, built);
-                        let BuiltAgent { agent, decision_tx, catalog, yolo, .. } = activation.built;
+                        let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
+                            activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
@@ -611,8 +614,6 @@ where
                         let (interject_tx, interject_rx) =
                             mpsc::channel::<InterjectionRequest>(16);
                         let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
-                        // Task 3 wires this into the driver; dropped for now to keep the build warning-free.
-                        drop(session_rx);
 
                         let model = cfg.model.clone();
 
@@ -673,6 +674,7 @@ where
                             prompt_rx,
                             interrupt_rx,
                             interject_rx,
+                            session_rx,
                             driver_writer,
                             driver_turn_tx,
                             decision_tx,
@@ -682,6 +684,8 @@ where
                             catalog,
                             Arc::clone(&thread_store),
                             Arc::clone(&store_status),
+                            provider,
+                            config,
                         ));
 
                         write_notification(
@@ -801,7 +805,8 @@ where
                             }
                         };
                         let activation = attach_delegation(&runtimes, &cfg, &cwd, built);
-                        let BuiltAgent { agent, decision_tx, catalog, yolo, .. } = activation.built;
+                        let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
+                            activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
@@ -809,8 +814,6 @@ where
                         let (interject_tx, interject_rx) =
                             mpsc::channel::<InterjectionRequest>(16);
                         let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
-                        // Task 3 wires this into the driver; dropped for now to keep the build warning-free.
-                        drop(session_rx);
                         // 同一 `Arc` 句柄:session 存一份供 `thread/list` 读,
                         // driver 拿一份用于推送 `thread/status/updated`。
                         let store_status = ThreadSession::new_status();
@@ -840,6 +843,7 @@ where
                             prompt_rx,
                             interrupt_rx,
                             interject_rx,
+                            session_rx,
                             driver_writer,
                             driver_turn_tx,
                             decision_tx,
@@ -849,6 +853,8 @@ where
                             catalog,
                             Arc::clone(&thread_store),
                             Arc::clone(&store_status),
+                            provider,
+                            config,
                         ));
 
                         // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
@@ -1393,6 +1399,54 @@ async fn interrupt_and_wait_for_persist(
     }
 }
 
+/// 一个 turn 结束后（或被 clear / compact 改动后）的收尾：把当前 session 快照
+/// 落盘、置 Idle、上报 Finished。
+///
+/// clear / compact 之后必须调用它：`/clear` 要落一条空快照（否则 resume 回放的是
+/// 旧日志），`/compact` 要把压缩结果写回 `.jsonl`。
+#[allow(clippy::too_many_arguments)]
+async fn persist_and_finish_turn<W>(
+    thread_id: &str,
+    turn_id: &str,
+    user_prompt: Option<&str>,
+    agent: &yi_agent_core::Agent,
+    completed_items: Vec<crate::protocol::Item>,
+    last_usage: Option<crate::thread_store::TurnUsage>,
+    store: &crate::thread_store::ThreadStore,
+    writer: &MessageWriter<W>,
+    turn_tx: &mpsc::Sender<TurnEvent>,
+    status: &Arc<std::sync::Mutex<ThreadStatus>>,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut items = Vec::with_capacity(completed_items.len() + 1);
+    if let Some(prompt) = user_prompt {
+        // 基线 server 不 emit userMessage，必须在落盘时补齐，否则 resume 会丢用户提问。
+        items.push(crate::protocol::Item::UserMessage {
+            id: format!("user-{turn_id}"),
+            text: prompt.to_string(),
+        });
+    }
+    items.extend(completed_items);
+
+    let record = crate::thread_store::TurnLine::Turn {
+        items,
+        usage: last_usage,
+        messages: agent.session().messages().to_vec(),
+    };
+    // append 失败则跳过 touch：避免出现"幽灵" thread。
+    if let Err(e) = store.append_turn(thread_id, &record) {
+        eprintln!("[app-server] failed to persist turn {turn_id} of {thread_id}: {e}");
+    } else if let Some(prompt) = user_prompt {
+        if let Err(e) = store.touch(thread_id, Some(prompt)) {
+            eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
+        }
+    }
+
+    let _ = update_status(writer, status, thread_id, ThreadStatus::Idle).await;
+    let _ = turn_tx.send(finished_event(thread_id, turn_id)).await;
+}
+
 /// 单个 thread 的 driver task:串行消费 turn,驱动 `agent.run()` 的 stream,
 /// 经 `Translator` 写成协议通知。
 ///
@@ -1409,6 +1463,7 @@ async fn run_thread_driver<W>(
     mut prompt_rx: mpsc::Receiver<TurnPrompt>,
     mut interrupt_rx: mpsc::Receiver<String>,
     mut interject_rx: mpsc::Receiver<InterjectionRequest>,
+    mut session_rx: mpsc::Receiver<SessionCommand>,
     writer: Arc<MessageWriter<W>>,
     turn_tx: mpsc::Sender<TurnEvent>,
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
@@ -1420,6 +1475,9 @@ async fn run_thread_driver<W>(
     // 该 thread 的共享状态句柄;driver 在各转换点更新并推送
     // `thread/status/updated`(与写进 `ThreadSession.status` 的是同一 `Arc`)。
     status: Arc<std::sync::Mutex<ThreadStatus>>,
+    // clear / compact 需要它们：compact 要调 provider 生成摘要，两者都要重建 agent。
+    provider: Arc<dyn yi_agent_core::Provider>,
+    config: yi_agent_core::AgentConfig,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1429,6 +1487,9 @@ async fn run_thread_driver<W>(
     // 只在首个 turn 尝试激活:objective 会被写进 root 任务,不能用占位串,也不能
     // 每轮重写。即使 `activate` 为 None 也置位,避免每轮重试。
     let mut activation_attempted = false;
+    // 内层 select 期间收到的会话命令。此刻 turn 正在跑，不能改 agent，
+    // 暂存到这里，等本轮收尾时执行（见 persist_and_finish_turn 之后的处理）。
+    let mut pending_session_command: Option<SessionCommand> = None;
     while let Some(TurnPrompt {
         turn_id,
         prompt,
@@ -1640,34 +1701,100 @@ async fn run_thread_driver<W>(
                         }
                     }
                 }
+                Some(command) = session_rx.recv() => {
+                    // 本轮已有一个待执行命令时保留先到的那个,后到的直接拒绝,
+                    // 避免两端各自 await 一个永远不会有回应的 reply。
+                    if pending_session_command.is_some() {
+                        match command {
+                            SessionCommand::Clear { reply } => {
+                                let _ = reply.send(Err("另有一个会话命令待执行".into()));
+                            }
+                            SessionCommand::Compact { reply } => {
+                                let _ = reply.send(CompactOutcome::Failed(
+                                    "另有一个会话命令待执行".into(),
+                                ));
+                            }
+                        }
+                    } else {
+                        pending_session_command = Some(command);
+                    }
+                }
             }
         }
 
-        // 落盘(尽力而为):合成一条 userMessage item 放在首部,再拼本轮最终 item。
-        // 基线 server 不 emit userMessage,必须在此补齐,否则 resume 会丢用户提问。
-        let mut items = Vec::with_capacity(completed_items.len() + 1);
-        items.push(crate::protocol::Item::UserMessage {
-            id: format!("user-{turn_id}"),
-            text: user_prompt.clone(),
-        });
-        items.append(&mut completed_items);
-
-        let record = crate::thread_store::TurnLine::Turn {
-            items,
-            usage: last_usage,
-            messages: agent.session().messages().to_vec(),
-        };
-        // append 失败则跳过 touch:避免 updated_at/title 被推进却无日志内容,
-        // 留下 `thread/list` 会列出的"幽灵" thread。
-        if let Err(e) = store.append_turn(&thread_id, &record) {
-            eprintln!("[app-server] failed to persist turn {turn_id} of {thread_id}: {e}");
-        } else if let Err(e) = store.touch(&thread_id, Some(user_prompt.as_str())) {
-            eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
+        // 先执行本轮暂存的会话命令（此刻 turn 已结束，改 agent 是安全的），
+        // 再落盘——否则会先用压缩前的 session 覆盖日志，再被压缩结果覆盖一次。
+        match pending_session_command.take() {
+            Some(SessionCommand::Clear { reply }) => {
+                agent = agent.with_session(yi_agent_core::Session::new());
+                // 截断日志：只清内存而保留 .jsonl 的话，resume 会把旧消息回放
+                // 回来，用户以为清空了实则没有。
+                let truncate = store.truncate(&thread_id);
+                if let Err(e) = &truncate {
+                    eprintln!("[app-server] failed to truncate thread log {thread_id}: {e}");
+                }
+                // 不传 user_prompt → 不 touch meta（清空不改 thread 身份）。
+                persist_and_finish_turn(
+                    &thread_id,
+                    &turn_id,
+                    None,
+                    &agent,
+                    Vec::new(),
+                    None,
+                    &store,
+                    &writer,
+                    &turn_tx,
+                    &status,
+                )
+                .await;
+                // truncate 的 io::Error 不是 Send 友好的错误类型,转成字符串再回。
+                let _ = reply.send(truncate.map(|_| ()).map_err(|e| e.to_string()));
+                continue;
+            }
+            Some(SessionCommand::Compact { reply }) => {
+                let session = agent.session();
+                let outcome =
+                    match yi_agent_core::compact_session(&provider, &config, &session).await {
+                        Ok(Some(compacted)) => {
+                            agent = agent.with_session(compacted);
+                            CompactOutcome::Compacted
+                        }
+                        Ok(None) => CompactOutcome::NotReduced,
+                        Err(e) => CompactOutcome::Failed(e.to_string()),
+                    };
+                persist_and_finish_turn(
+                    &thread_id,
+                    &turn_id,
+                    None,
+                    &agent,
+                    Vec::new(),
+                    None,
+                    &store,
+                    &writer,
+                    &turn_tx,
+                    &status,
+                )
+                .await;
+                let _ = reply.send(outcome);
+                continue;
+            }
+            None => {}
         }
 
-        // 本轮已落盘:回 Idle 后再上报 Finished。
-        let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Idle).await;
-        let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+        // 无暂存命令：常规收尾（把本轮结果落盘）。
+        persist_and_finish_turn(
+            &thread_id,
+            &turn_id,
+            Some(&user_prompt),
+            &agent,
+            std::mem::take(&mut completed_items),
+            last_usage.take(),
+            &store,
+            &writer,
+            &turn_tx,
+            &status,
+        )
+        .await;
     }
 }
 
@@ -2858,18 +2985,20 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
+        let (_session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        let built = build_delayed_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_delayed_agent(
-                None,
-                std::path::Path::new("/tmp"),
-                crate::thread_store::ThreadMode::Normal,
-            )
-            .unwrap()
-            .agent,
+            built.agent,
             prompt_rx,
             interrupt_rx,
             interject_rx,
+            session_rx,
             writer,
             turn_tx,
             None,
@@ -2879,6 +3008,8 @@ mod tests {
             None,
             store,
             ThreadSession::new_status(),
+            built.provider,
+            built.config,
         ));
 
         // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -2938,18 +3069,20 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
+        let (_session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        let built = build_test_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(
-                None,
-                std::path::Path::new("/tmp"),
-                crate::thread_store::ThreadMode::Normal,
-            )
-            .unwrap()
-            .agent,
+            built.agent,
             prompt_rx,
             interrupt_rx,
             interject_rx,
+            session_rx,
             writer,
             turn_tx,
             None,
@@ -2959,6 +3092,8 @@ mod tests {
             None,
             store,
             ThreadSession::new_status(),
+            built.provider,
+            built.config,
         ));
 
         prompt_tx
@@ -2994,18 +3129,20 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
+        let (_session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        let built = build_test_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
         let handle = tokio::spawn(run_thread_driver(
             "thread-1".into(),
-            build_test_agent(
-                None,
-                std::path::Path::new("/tmp"),
-                crate::thread_store::ThreadMode::Normal,
-            )
-            .unwrap()
-            .agent,
+            built.agent,
             prompt_rx,
             interrupt_rx,
             interject_rx,
+            session_rx,
             writer,
             turn_tx,
             None,
@@ -3015,6 +3152,8 @@ mod tests {
             None,
             store,
             ThreadSession::new_status(),
+            built.provider,
+            built.config,
         ));
 
         let mut client_r = BufReader::new(client_r);
@@ -3362,6 +3501,7 @@ mod tests {
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
 
+        let (_session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
         let built = build_permission_agent(
             None,
             std::path::Path::new("/tmp"),
@@ -3374,6 +3514,7 @@ mod tests {
             prompt_rx,
             interrupt_rx,
             interject_rx,
+            session_rx,
             writer,
             turn_tx,
             built.decision_tx,
@@ -3383,6 +3524,8 @@ mod tests {
             None,
             store,
             ThreadSession::new_status(),
+            built.provider,
+            built.config,
         ));
 
         prompt_tx
