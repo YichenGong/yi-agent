@@ -715,6 +715,96 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     }
 }
 
+/// A database left exactly as the previous release wrote it: at schema
+/// version 10, without the `workspace_root` column the current code SELECTs.
+fn v10_database_without_workspace_root() -> PathBuf {
+    let directory = TempDir::new().unwrap();
+    let database = directory.keep().join("runtime.sqlite");
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 11);
+    drop(repository);
+    let connection = Connection::open(&database).unwrap();
+    // Rebuild the pre-v11 shape of the attachment table and roll the schema
+    // version back to 10, exactly as an existing install would be.
+    connection
+        .execute_batch(
+            "DROP TABLE application_root_attachments;
+             CREATE TABLE application_root_attachments (
+                 idempotency_key TEXT PRIMARY KEY,
+                 root_session_id TEXT NOT NULL,
+                 root_task_id TEXT NOT NULL,
+                 capability_digest TEXT NOT NULL,
+                 capability_secret TEXT,
+                 state TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 detached_at TEXT
+             );
+             DELETE FROM schema_migrations WHERE version = 11;",
+        )
+        .unwrap();
+    database
+}
+
+#[test]
+fn a_version_10_database_is_migrated_to_the_current_schema() {
+    // Regression: a database written by the previous release reports schema
+    // version 10, which equals LATEST_SCHEMA_VERSION. The migration gate then
+    // returns early and the v11 `workspace_root` column is never added, so the
+    // first attach fails with `no such column: workspace_root`.
+    let database = v10_database_without_workspace_root();
+    let repository = RuntimeRepository::open(&database).unwrap();
+
+    assert_eq!(repository.schema_version().unwrap(), 11);
+    let has_column: bool = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('application_root_attachments')
+             WHERE name = 'workspace_root')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        has_column,
+        "the v11 migration must add workspace_root to a version-10 database"
+    );
+}
+
+#[test]
+fn attaching_to_a_version_10_database_succeeds() {
+    // The user-visible failure: attach is the first call the TUI makes, and it
+    // reads workspace_root, so a skipped migration surfaces as a generic
+    // `internal` rejection that disables delegation.
+    let database = v10_database_without_workspace_root();
+    let daemon = Daemon::start_with_factory(
+        database.parent().unwrap(),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let workspace = daemon
+        .socket_path()
+        .parent()
+        .and_then(|runtime_dir| runtime_dir.parent())
+        .unwrap()
+        .to_path_buf();
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui:v10".into(),
+            workspace,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::ApplicationRootAttached { .. }),
+        "attach to a migrated version-10 database must succeed, got {response:?}"
+    );
+}
+
 #[test]
 fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();

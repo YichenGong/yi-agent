@@ -15,7 +15,7 @@ use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 10;
+const LATEST_SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
