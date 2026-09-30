@@ -291,6 +291,67 @@ fn is_dead_io(error: &std::io::Error) -> bool {
     )
 }
 
+/// Starts, joins, or replaces the project daemon so *this* process ends up
+/// owning a usable runtime.
+///
+/// Strategy B: a healthy daemon is adopted -- its owner keeps it, we never
+/// steal it. Only a `Dead` socket (nobody listening) or a `Wedged` daemon
+/// (alive but answering `internal`) is replaced, because those cannot serve us
+/// and would only keep failing.
+///
+/// `Unknown` is not a takeover signal: it is returned as an `AttachFailure` so
+/// the caller degrades exactly as it did before.
+pub fn ensure_owned_runtime(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
+    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
+        .map_err(|error| AttachFailure::new("runtime directory", error))?;
+    match probe_runtime(&socket_path) {
+        RuntimeProbe::Healthy => {}
+        RuntimeProbe::Dead => {}
+        RuntimeProbe::Wedged => {
+            if !retire_if_wedged(&socket_path) {
+                return Err(AttachFailure::new(
+                    "daemon start",
+                    "the local runtime answered `internal` and could not be retired",
+                ));
+            }
+        }
+        RuntimeProbe::Unknown => {
+            return Err(AttachFailure::new(
+                "daemon start",
+                "the local runtime could not be probed",
+            ));
+        }
+    }
+    // `attach_project_runtime` already implements the three outcomes this
+    // classification implies: a fresh start, a join on `AlreadyRunning`, or a
+    // start over the socket node a dead daemon left behind.
+    attach_project_runtime(cfg, runtime_dir)
+}
+
+/// Retires a *wedged* daemon (listening, but every request answers `internal`)
+/// so a fresh `Daemon::start` can take over.
+///
+/// Returns `true` only when a `Stop` was accepted. Every other outcome --
+/// including a healthy daemon or a `Stop` that could not be delivered -- returns
+/// `false`, because such a daemon is not ours to replace. Shared by the TUI's
+/// bring-up and the desktop's self-heal so both apply one rule.
+pub fn retire_if_wedged(socket_path: &std::path::Path) -> bool {
+    if probe_runtime(socket_path) != RuntimeProbe::Wedged {
+        return false;
+    }
+    tracing::warn!(
+        socket = %socket_path.display(),
+        "local runtime answered `internal`; retiring it so this session can start a working one"
+    );
+    matches!(
+        send_request(socket_path, yi_agent_store::ipc::IpcRequest::Stop),
+        Ok(yi_agent_store::ipc::IpcResponse::Stopping)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RuntimeProbe, probe_runtime, project_runtime_directory};
