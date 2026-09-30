@@ -1816,6 +1816,42 @@ mod tests {
         assert!(!names.contains(&"accept_review".to_string()));
     }
 
+    /// A bring-up failure must come back as a reportable session, never as an
+    /// `Err` the driver renders as `Error: ...`.
+    ///
+    /// The reported symptom was an English internal string where a Chinese
+    /// notice belonged. `attach_tui_runtime` signals every ordinary bring-up
+    /// failure (including a runtime directory the daemon cannot create) by
+    /// returning `Unavailable`, so the driver has something to show the user.
+    /// Only the `?` sites inside still raise, and those are configuration
+    /// failures that happen before the daemon is involved.
+    #[test]
+    fn a_failed_runtime_bring_up_is_reported_rather_than_raised() {
+        // `attach_tui_runtime` only reads the non-subcommand fields, so the
+        // default command line is enough to exercise bring-up.
+        let cli = <Cli as clap::Parser>::parse_from(["yi-agent"]);
+        let mut config = test_config();
+        // A path no process can create the runtime directory under, so bring-up
+        // fails regardless of the machine's `$TMPDIR` or permissions.
+        config.workdir = std::path::PathBuf::from(format!("/{}", "a".repeat(200)));
+
+        match attach_tui_runtime(&cli, &config) {
+            Ok(Some(TuiRuntimeSession::Unavailable { reason })) => {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "an unavailable runtime must explain itself"
+                );
+            }
+            Ok(Some(TuiRuntimeSession::Attached(_))) => {
+                panic!("bring-up was expected to fail for an uncreatable workdir")
+            }
+            Ok(None) => panic!("the TUI must always get a session, attached or not"),
+            Err(error) => {
+                panic!("a failed bring-up escaped as `Error: ...` instead of a notice: {error}")
+            }
+        }
+    }
+
     /// A runtime that cannot start must say so. Silently continuing left the
     /// user with no visible reason why `spawn_agent` was missing from the tool
     /// list, which is exactly how the long-socket-path failure hid for days.
