@@ -240,8 +240,25 @@ root 由 daemon 侧按既有规则收敛"并把该取舍写进实现计划的偏
 
 ### 2.4 失败与降级语义
 
-非 git 目录（默认 cwd 是 `$HOME`）、daemon 起不来、attach 被拒 → **一律静默降级**：
-`tracing::warn!` 记原因，agent 少几个工具，其余一切照常。
+daemon 起不来、attach 被拒 → **一律静默降级**：`tracing::warn!` 记原因，agent 少几个工具，
+其余一切照常。
+
+**非 git 目录（默认 cwd 是 `$HOME`）不是 attach 失败，实测有三段不同的行为**（与 TUI
+完全一致，因为两端口走同一份 `attach_project_runtime`）：
+
+1. **attach 成功**：application root 本来就可以原地建立（`attach_application_root` 的既有
+   测试 `non_git_application_root_can_be_reattached` 已经钉住这一点），非 git 项目没有
+   checkout 可搬，root 就地运行，`workspace_root == project_root`。
+2. **六个工具照常注册**：`register_attached_root_tools` 只看 attach 结果，不看项目是不是
+   git 仓库。
+3. **真正委派时才失败**：daemon 的 worker 准入要求一个可恢复的 `worktree:` lease
+   （`repositories` 侧 `validate_recovery_context`），非 git 项目给不出，`spawn_agent` 返回
+   `Error { code: Internal }`。
+
+所以「非 git 目录下没有委派工具」这个前提是错的：工具在、调用会被拒。判定依据是
+`cargo test -p yi-agent-app-server a_non_git_cwd_attaches_in_place_with_the_delegation_tools`
+（断言 attach 成功、激活成功、工具齐全，且 spawn 被明确拒绝而不是半准入）。**结论不变**：
+要在桌面端真正起子 Agent，仍需选一个 git 项目目录。
 
 不新增协议通知、不加前端 banner、不加错误气泡：`spawn_agent` 就是普通工具，经
 `crates/yi-agent-app-server/src/translate.rs` 变 `toolCall` item，桌面端已有卡片渲染
@@ -268,15 +285,16 @@ TUI 是否 `y` 询问/自动启动/禁用。本设计**不**让 app-server 读�
 **app-server 新增确定性测试**（临时 git repo 作 cwd、临时 Unix socket + SQLite、mock
 provider，不调真实 LLM）：
 
-1. `daemon_attached_thread_exposes_the_delegation_tools` —— 该 cwd 为 git repo 时，
-   thread 的 registry 含六个工具（即 `crates/yi-agent/src/main.rs:1966`
+1. `a_git_project_gets_the_delegation_tools` —— 该 cwd 为 git repo 时，thread 的 registry
+   含六个工具（即 `crates/yi-agent/src/main.rs` 的
    `build_tui_root_tools_registers_subagent_tools_for_attached_runtime` 的 app-server 版）；
-2. `non_git_cwd_degrades_without_the_delegation_tools` —— 非 git cwd 时不注册工具且 turn
-   正常完成（守住降级路径不会把 bring-up 失败升级成 turn 失败）；
-3. `two_threads_in_one_cwd_share_one_attached_runtime` —— 同 cwd 两个 thread 只 attach 一次
-   （daemon 实例数 / attach 计数）；
-4. `a_delegated_child_reaches_a_terminal_state` —— 经 daemon `ListTaskSummaries` 观察子任务
-   落到终态（对齐既有 `runtime_ipc` 的观察手法）。
+2. `a_non_git_cwd_attaches_in_place_with_the_delegation_tools` —— 非 git cwd 下 attach 成功、
+   六个工具齐全、激活成功，但 `spawn_agent` 被 daemon 明确拒绝（见 §2.4 修正）；
+3. `two_threads_in_one_cwd_share_one_attached_runtime` —— 同 cwd 两个 thread 只 attach 一次，
+   复用同一个 `Arc`；
+4. 端到端装配契约放在共享 crate 里（两个前端共用，故不属于 app-server）：
+   `crates/yi-agent-subagent/tests/attach_delegation.rs` —— attach → 激活两次（验幂等）→
+   六工具齐全 → `SpawnApplicationChild` 落在真实 git 项目上被接纳 → detach。
 
 **回归**：`cargo test -p yi-agent-app-server`、`cargo test -p yi-agent --bin yi-agent`
 （守平移）、`cargo test -p yi-agent-runtime`、`cd desktop && npx tsc --noEmit && npm test`。
@@ -302,9 +320,9 @@ provider，不调真实 LLM）：
 - **首次 attach 阻塞请求循环**：Unix socket + SQLite，每个 cwd 一次（激活已移入 driver task，
   见 §2.3）。
 - **默认 cwd 非 git 仓库仍不可用**（§2.4），需用户在 GUI 里选一个 git 项目目录。
-- **六个工具需要 git repo 才能工作**：`DaemonWorkspaceService::new` 的
-  `git rev-parse --show-toplevel` 失败会原样返回传入路径，`spawn_agent` 的 `workdir` 解析
-  因此可能落到非仓库路径——这属于运行时既有行为，本设计不改，仅靠 §2.4 的降级提示。
+- **六个工具需要 git repo 才能工作**：非 git 项目下工具在、但 daemon 的 worker 准入给不出
+  `worktree:` lease，`spawn_agent` 返回 `Error { code: Internal }`。这是运行时既有行为
+  （TUI 同样如此），本设计不改；差异只在于文档此前把它误记成「工具不注册」。
 
 ---
 
@@ -314,7 +332,7 @@ provider，不调真实 LLM）：
    子任务调研 X"），桌面端对话里出现 `toolCall` 卡片 `spawn_agent` 并返回 `task_id`。
 2. 该 thread 的 tool registry 含六个委派工具：`cargo test -p yi-agent-app-server
    daemon_attached_thread_`。
-3. 非 git 目录（如 `$HOME`）下新建 thread 一切照常、只是没有委派工具：
-   `cargo test -p yi-agent-app-server non_git_cwd_degrades`。
+3. 非 git 目录（如 `$HOME`）下新建 thread 一切照常（有工具，但 `spawn_agent` 会被 daemon
+   拒绝）：`cargo test -p yi-agent-app-server a_non_git_cwd_attaches_in_place`。
 4. TUI 行为零回归：`cargo test -p yi-agent --bin yi-agent`、`cargo test -p yi-agent-subagent`。
 5. 前端零改动成立：`cd desktop && npx tsc --noEmit && npm test`。
