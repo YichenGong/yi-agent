@@ -816,6 +816,22 @@ fn runtime_attached_root_rejection(response: &yi_agent_store::ipc::IpcResponse) 
     }
 }
 
+/// Builds the notice emitted when subagent-runtime bring-up fails after the
+/// user asked for it (`y`, or a remembered `always`).
+///
+/// Returns the event rather than sending it so the classification is testable
+/// without a live driver: the original bug was that this path produced
+/// `AgentEvent::Error(ProviderTurnAdmission)`, rendering the raw cause as
+/// `Error: provider turn admission failed: ...` with no hint that a restart
+/// restores delegation. `stage` names the failing bring-up step and `cause`
+/// carries the diagnostic; both go to the trace, never to the user's line.
+fn runtime_unavailable_event(stage: &str, cause: impl Into<String>) -> yi_agent_core::AgentEvent {
+    yi_agent_core::AgentEvent::SubagentRuntimeUnavailable {
+        stage: stage.to_owned(),
+        cause: cause.into(),
+    }
+}
+
 /// Maps the persisted runtime preference to what the TUI should do on launch.
 ///
 /// The preference file is the single source of truth: a missing or malformed
@@ -1444,10 +1460,7 @@ fn run_tui_agent(
                                         "subagent runtime unavailable; continuing without delegation"
                                     );
                                     let _ = agent_tx
-                                        .send(yi_agent_core::AgentEvent::SubagentRuntimeUnavailable {
-                                            stage: "runtime attach".to_owned(),
-                                            cause: reason,
-                                        })
+                                        .send(runtime_unavailable_event("runtime attach", reason))
                                         .await;
                                 }
                                 Ok(Some(TuiRuntimeSession::Attached(attached))) => {
@@ -1516,10 +1529,10 @@ fn run_tui_agent(
                                                 "subagent runtime attach failed; continuing without delegation"
                                             );
                                             let _ = agent_tx
-                                                .send(yi_agent_core::AgentEvent::SubagentRuntimeUnavailable {
-                                                    stage: "runtime attach".to_owned(),
+                                                .send(runtime_unavailable_event(
+                                                    "runtime attach",
                                                     cause,
-                                                })
+                                                ))
                                                 .await;
                                         }
                                     }
@@ -1569,10 +1582,7 @@ fn run_tui_agent(
                                 "could not activate TUI runtime root; continuing without delegation"
                             );
                             let _ = agent_tx
-                                .send(yi_agent_core::AgentEvent::SubagentRuntimeUnavailable {
-                                    stage: "runtime activation".to_owned(),
-                                    cause,
-                                })
+                                .send(runtime_unavailable_event("runtime activation", cause))
                                 .await;
                             continue;
                         }
@@ -2378,6 +2388,40 @@ mod tests {
         ignore_project_local_runtime_state(directory.path());
 
         assert!(!directory.path().join(".git").exists());
+    }
+
+    /// The user pressed `y` and the runtime did not come up. That outcome must
+    /// reach the session as a notice, never as `Error`: an error reads as a
+    /// failed turn, and the code this replaced sent `ProviderTurnAdmission`,
+    /// which rendered the raw `IpcError` text as `Error: provider turn
+    /// admission failed: ...` and never mentioned the restart that fixes it.
+    ///
+    /// This pins the classification. Reverting the emit site to the error path
+    /// used to leave every test green, so the regression could only be caught
+    /// by hand-driving a TUI.
+    #[test]
+    fn a_runtime_bring_up_failure_becomes_a_notice_not_an_error() {
+        let event = runtime_unavailable_event("runtime attach", "file is not a database");
+        match event {
+            yi_agent_core::AgentEvent::SubagentRuntimeUnavailable { stage, cause } => {
+                assert_eq!(stage, "runtime attach");
+                assert_eq!(cause, "file is not a database");
+            }
+            other => panic!("bring-up failure must be a notice, not a turn error: {other:?}"),
+        }
+    }
+
+    /// The activation step reports the same remedy, so it takes the same
+    /// notice path with its own stage label.
+    #[test]
+    fn a_runtime_activation_failure_takes_the_same_notice_path() {
+        let event = runtime_unavailable_event("runtime activation", "daemon rejected: internal");
+        match event {
+            yi_agent_core::AgentEvent::SubagentRuntimeUnavailable { stage, .. } => {
+                assert_eq!(stage, "runtime activation");
+            }
+            other => panic!("activation failure must be a notice: {other:?}"),
+        }
     }
 
     #[test]
