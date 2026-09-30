@@ -93,6 +93,27 @@ describe("ThreadStore", () => {
     expect(s.view("a").info).toEqual({ cwd: "/w", model: "m" });
   });
 
+  it("does not let a stale listing snapshot roll back a live status", () => {
+    const s = new ThreadStore();
+    s.seed([summary("a", "running")]);
+    // The push stream is authoritative and says the turn just finished.
+    s.applyNotification({
+      method: "thread/status/updated",
+      params: { thread_id: "a", status: "idle" },
+    });
+    expect(s.view("a").status).toBe("idle");
+
+    // A listing read *before* the driver flipped to idle arrives late.
+    s.seed([summary("a", "running")]);
+    expect(s.view("a").status).toBe("idle");
+  });
+
+  it("still seeds the status of a thread it has not seen before", () => {
+    const s = new ThreadStore();
+    s.seed([summary("b", "running")]);
+    expect(s.view("b").status).toBe("running");
+  });
+
   it("reports pending approvals for threads other than the current one", () => {
     const s = new ThreadStore();
     s.select("a");

@@ -66,14 +66,27 @@ export class ThreadStore {
   }
 
   /**
-   * 用 `thread/listAll` 快照播种状态与 cwd/model。**不改动会话内容**——
-   * 会话只由通知累积。快照覆盖状态是安全的：服务端既是快照也是实时流的权威，
-   * 且每次 `turn/completed` 后都会重新拉取快照。
+   * Seeds status and cwd/model from a `thread/listAll` snapshot. **Does not
+   * touch session content** — sessions are accumulated from notifications only.
+   *
+   * The snapshot is a point-in-time read that can be stale: the server writes
+   * `turn/completed` *before* it persists the turn and flips the thread back to
+   * `idle`, and the app re-lists the moment it sees `turn/completed`. A listing
+   * issued inside that window still reports `running`. So the snapshot only
+   * *seeds* a status the client has never learned; once the push stream has set
+   * one, the snapshot must not roll it back.
    */
   seed(threads: ThreadSummary[]): void {
     for (const t of threads) {
-      const v = this.view(t.thread_id);
-      v.status = t.status ?? "idle";
+      // Read the map directly (not `view()`) so we can tell a pre-existing view
+      // from a freshly created one: a new view is initialised to "idle", which
+      // is indistinguishable from an "idle" the push stream wrote.
+      const existing = this.views.get(t.thread_id);
+      const v = existing ?? this.create();
+      if (!existing) {
+        this.views.set(t.thread_id, v);
+        v.status = t.status ?? "idle";
+      }
       v.info = { cwd: t.cwd, model: t.model };
     }
   }
