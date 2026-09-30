@@ -655,6 +655,38 @@ impl EventTx {
     }
 }
 
+/// Move every queued interjection into the transcript, announcing each one.
+///
+/// Returns `true` when at least one message was injected, so the `EndTurn` check
+/// can decide whether to keep looping.
+async fn inject_pending(
+    tx: &EventTx,
+    inbox: &Option<InboxHandle>,
+    messages: &mut Vec<Message>,
+    session: &Arc<Mutex<Session>>,
+) -> bool {
+    let Some(handle) = inbox else {
+        return false;
+    };
+    let pending = handle.lock().drain_all();
+    if pending.is_empty() {
+        return false;
+    }
+    for item in pending {
+        let text = format!("{INTERJECTION_PREFIX}{}", item.text);
+        messages.push(Message::user(text.clone()));
+        session.lock().unwrap().push(Message::user(text));
+        let _ = tx
+            .send(AgentEvent::InterjectionAccepted {
+                seq: item.seq,
+                text: item.text,
+                tag: item.tag,
+            })
+            .await;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: EventTx,
@@ -710,6 +742,11 @@ async fn run_loop(
                 return;
             }
         }
+
+        // Fold in anything the user sent while the previous request/tools ran.
+        // Placed after the max_turns check (so an interjection consumes a turn)
+        // and before the request-delta log (so it shows up there).
+        inject_pending(&tx, &inbox, &mut messages, &session).await;
 
         info!(turn, msg_count = messages.len(), "think: calling provider");
 
@@ -976,6 +1013,13 @@ async fn run_loop(
             .collect();
 
         if tool_uses.is_empty() {
+            // A message can land after the model's last tool call but before the
+            // loop decides to finish. Check once more so it joins this turn
+            // instead of being replayed as a brand-new prompt later, and so it
+            // outranks the completion audit below.
+            if inject_pending(&tx, &inbox, &mut messages, &session).await {
+                continue;
+            }
             if verification_pending && !audit_attempted {
                 audit_attempted = true;
                 messages.push(Message::user(COMPLETION_AUDIT_PROMPT));
@@ -1515,6 +1559,258 @@ mod tests {
 
     fn collect_events(stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
         futures::executor::block_on_stream(stream).collect()
+    }
+
+    /// A provider whose response is fed event-by-event from the test, so the
+    /// test knows precisely when the stream has been consumed. Used to place an
+    /// interjection deterministically inside a request's lifetime.
+    struct FedProvider {
+        tx: tokio::sync::Mutex<Option<mpsc::Sender<ProviderEvent>>>,
+        seen: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl FedProvider {
+        fn new() -> Self {
+            Self {
+                tx: tokio::sync::Mutex::new(None),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn messages_of(&self, index: usize) -> Vec<Message> {
+            self.seen.lock().unwrap()[index].clone()
+        }
+
+        /// Wait until request `index` is open, then hand it one event.
+        ///
+        /// A `Stop` closes the stream: `ReceiverStream` only ends once every
+        /// sender is dropped, so leaving the sender alive would make the
+        /// provider stream (and therefore the agent loop) hang forever.
+        async fn feed_to(&self, index: usize, event: ProviderEvent) {
+            let mut event = Some(event);
+            let is_stop = matches!(event.as_ref().unwrap(), ProviderEvent::Stop { .. });
+            loop {
+                if self.request_count() > index {
+                    let mut guard = self.tx.lock().await;
+                    if let Some(tx) = guard.as_ref() {
+                        tx.send(event.take().unwrap()).await.unwrap();
+                        if is_stop {
+                            *guard = None;
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FedProvider {
+        async fn call_stream(
+            &self,
+            req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.seen.lock().unwrap().push(req.messages.clone());
+            let (tx, rx) = mpsc::channel(8);
+            *self.tx.lock().await = Some(tx);
+            Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
+        }
+    }
+
+    /// Wait until `provider` has opened request `index`.
+    async fn wait_for_request(provider: &FedProvider, index: usize) {
+        for _ in 0..600 {
+            if provider.request_count() > index {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("request {index} never opened");
+    }
+
+    /// A read-only tool that always succeeds, so the loop round-trips through
+    /// ACT and comes back to the top of the loop (the loop-top drain), never
+    /// reaching the `EndTurn` check.
+    struct NoopTool;
+
+    #[async_trait]
+    impl Tool for NoopTool {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn description(&self) -> &str {
+            "Does nothing"
+        }
+        async fn call(&self, _args: serde_json::Value) -> ToolResult {
+            ToolResult::text("noop")
+        }
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata {
+                read_only: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interjection_lands_in_context_before_the_next_request() {
+        let provider = Arc::new(FedProvider::new());
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(NoopTool));
+        let mut agent = Agent::new(provider.clone(), Arc::new(tools), AgentConfig::default());
+
+        let stream = agent.run("original task".into()).await.unwrap();
+        let collector = tokio::spawn(async move { collect_events_async(stream).await });
+
+        // Request 1 asks for a tool. The loop then goes through ACT and returns
+        // to the top, which is where the loop-top drain runs.
+        wait_for_request(&provider, 0).await;
+        agent.interject("also check the logs".into(), None).unwrap();
+        provider
+            .feed_to(
+                0,
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "noop".into(),
+                },
+            )
+            .await;
+        provider
+            .feed_to(
+                0,
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into(),
+                },
+            )
+            .await;
+        provider
+            .feed_to(0, ProviderEvent::ToolUseEnd { id: "t1".into() })
+            .await;
+        provider
+            .feed_to(
+                0,
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            )
+            .await;
+
+        wait_for_request(&provider, 1).await;
+
+        let events_so_far = provider.request_count();
+        let second = provider.messages_of(1);
+        let injected = second
+            .iter()
+            .find(|m| {
+                m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text(t) if t.contains("also check the logs")),
+                )
+            })
+            .unwrap_or_else(|| panic!("request 1 of {events_so_far} must carry the interjection"));
+        assert!(
+            injected
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("without repeating"))),
+            "the interjection must carry the prefix: {injected:?}"
+        );
+
+        provider
+            .feed_to(
+                1,
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            )
+            .await;
+        let events = collector.await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::InterjectionAccepted { .. })),
+            "expected InterjectionAccepted: {events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interjection_before_end_turn_keeps_the_turn_alive() {
+        let provider = Arc::new(FedProvider::new());
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+
+        let stream = agent.run("task".into()).await.unwrap();
+        let collector = tokio::spawn(async move { collect_events_async(stream).await });
+
+        // Deliver the interjection while the only request is still open, then
+        // let that request finish with no tool call. Without the EndTurn drain
+        // the run ends here and only one request is ever made.
+        wait_for_request(&provider, 0).await;
+        agent.interject("one more thing".into(), None).unwrap();
+        provider
+            .feed_to(
+                0,
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            )
+            .await;
+
+        for _ in 0..600 {
+            if provider.request_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            provider.request_count(),
+            2,
+            "the interjection must open a second request instead of ending the turn"
+        );
+        provider
+            .feed_to(
+                1,
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            )
+            .await;
+
+        let events = collector.await.unwrap();
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::InterjectionAccepted { .. })),
+            "expected InterjectionAccepted: {events:?}"
+        );
+        let second = provider.messages_of(1);
+        assert!(
+            second.iter().any(|m| m.content.iter().any(|b| matches!(
+                b, ContentBlock::Text(t) if t.contains("one more thing")
+            ))),
+            "the follow-up request must carry the interjection: {second:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Done {
+                    reason: DoneReason::EndTurn
+                })
+            ),
+            "the turn must still finish: {events:?}"
+        );
     }
 
     #[test]
