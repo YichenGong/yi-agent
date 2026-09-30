@@ -1095,7 +1095,7 @@ pub mod calendar;
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd plugins/superpowers-board && cargo test -p board-core calendar::`
-Expected: PASS（11 个测试）。
+Expected: PASS（12 个测试）。
 
 - [ ] **Step 5: 提交**
 
@@ -1256,7 +1256,7 @@ pub mod switch;
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd plugins/superpowers-board && cargo test -p board-core switch::`
-Expected: PASS（6 个测试）。
+Expected: PASS（8 个测试）。
 
 - [ ] **Step 5: 提交**
 
