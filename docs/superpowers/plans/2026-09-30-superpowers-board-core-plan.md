@@ -478,7 +478,9 @@ mod tests {
     fn a_card_without_a_workdir_field_still_deserializes() {
         // 前向兼容：早期落盘的 board.json 没有 workdir 字段，读回时必须是 None，
         // 而不是整份状态解析失败。
-        let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],"next_order":1}"#;
+        // 注意：CardState 带 `#[serde(rename_all = "snake_case")]`（见 card.rs），
+        // 所以线格式里的状态值是 `"queued"`，不是 `"Queued"`。
+        let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],"next_order":1}"#;
         let board: Board = serde_json::from_str(json).unwrap();
         assert_eq!(board.get(&CardId::new("a")).unwrap().workdir, None);
     }
