@@ -9,7 +9,7 @@
 （`desktop/src/lib/protocol.ts`），从不依赖 Rust 类型。
 
 `desktop/` **不是** `yi-agent-rs/` cargo workspace 的成员，独立构建。Rust workspace
-不受本模块影响：`cargo test -p yi-agent-app-server`（148 个测试）与
+不受本模块影响：`cargo test -p yi-agent-app-server`（157 个测试）与
 `cargo test -p yi-agent-runtime`（全绿）仍全绿。
 
 ## 范围边界

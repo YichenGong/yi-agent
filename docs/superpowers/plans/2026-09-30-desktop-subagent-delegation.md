@@ -57,7 +57,7 @@ per-cwd 的 daemon + `AttachApplicationRoot`，并把六个工具叠加到该 th
   后续任务用 `yi_agent_subagent::DaemonAgentWorkerFactory::new(provider, tools, config, socket)`
   与 `yi_agent_subagent::register_application_subagent_tools(&mut registry, socket, session_id, task_id, capability)`。
 
-- [ ] **Step 1: 建立 crate 目录与 Cargo.toml**
+- [x] **Step 1: 建立 crate 目录与 Cargo.toml**
 
 创建 `yi-agent-rs/crates/yi-agent-subagent/Cargo.toml`：
 
@@ -90,7 +90,7 @@ uuid.workspace = true
 tempfile = "3"
 ```
 
-- [ ] **Step 2: 注册到 workspace**
+- [x] **Step 2: 注册到 workspace**
 
 在 `yi-agent-rs/Cargo.toml` 的 `members` 列表里，`"crates/yi-agent-app-server",` 之后加一行：
 
@@ -105,14 +105,14 @@ tempfile = "3"
 yi-agent-subagent = { path = "crates/yi-agent-subagent" }
 ```
 
-- [ ] **Step 3: 平移源文件**
+- [x] **Step 3: 平移源文件**
 
 ```bash
 cd yi-agent-rs
 git mv crates/yi-agent/src/subagent_runtime.rs crates/yi-agent-subagent/src/lib.rs
 ```
 
-- [ ] **Step 4: 把文件内已有的模块文档注释改成 crate 文档，并删掉直接内部引用**
+- [x] **Step 4: 把文件内已有的模块文档注释改成 crate 文档，并删掉直接内部引用**
 
 `crates/yi-agent-subagent/src/lib.rs` 开头第一行保持 crate 文档风格（内容不变）：
 
@@ -126,7 +126,7 @@ git mv crates/yi-agent/src/subagent_runtime.rs crates/yi-agent-subagent/src/lib.
 `yi_agent_store::runtime::RuntimeCoordinator`、`yi_agent_core::...` 等外部 crate 路径，
 全部保持不变。
 
-- [ ] **Step 5: 在 `yi-agent` 里改用新 crate**
+- [x] **Step 5: 在 `yi-agent` 里改用新 crate**
 
 `crates/yi-agent/src/main.rs`：删掉 `mod subagent_runtime;` 这一行（第 7 行附近）。
 把唯一的调用点（`build_daemon_worker_factory`，约第 535 行）
@@ -141,7 +141,7 @@ git mv crates/yi-agent/src/subagent_runtime.rs crates/yi-agent-subagent/src/lib.
 use yi_agent_subagent::register_application_subagent_tools;
 ```
 
-- [ ] **Step 6: 给 `yi-agent` 加依赖**
+- [x] **Step 6: 给 `yi-agent` 加依赖**
 
 `crates/yi-agent/Cargo.toml` 的 `[dependencies]` 里，`yi-agent-app-server = { workspace = true }`
 之后加：
@@ -150,7 +150,7 @@ use yi_agent_subagent::register_application_subagent_tools;
 yi-agent-subagent = { workspace = true }
 ```
 
-- [ ] **Step 7: 编译并跑测试**
+- [x] **Step 7: 编译并跑测试**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-subagent
@@ -164,7 +164,7 @@ cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent
 
 预期：全绿（约 486 个），证明 TUI 侧只是改了路径。
 
-- [ ] **Step 8: 格式化并提交**
+- [x] **Step 8: 格式化并提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && \
@@ -200,7 +200,7 @@ git commit -m "refactor: extract the subagent runtime construction into a shared
   用 `<workdir>/.yi-agent/runtime` 这个项目内路径做到天然隔离，**不需要**动
   `YI_AGENT_RUNTIME_DIR` 环境变量（动它会让同一测试二进制里的并行测试互相污染）。
 
-- [ ] **Step 1: 在共享 crate 里定义 `AttachedRoot` 与注册函数**
+- [x] **Step 1: 在共享 crate 里定义 `AttachedRoot` 与注册函数**
 
 从 `crates/yi-agent/src/tui/subagents.rs` 平移 `AttachedRoot`（第 34-39 行）与
 `register_attached_root_tools`（第 75-86 行），写进 `crates/yi-agent-subagent/src/lib.rs`
@@ -235,7 +235,7 @@ pub fn register_attached_root_tools(
 `WorkerWorkspace` 需要 `use yi_agent_core::subagent::worker::WorkerWorkspace;`——
 `lib.rs` 顶部的 `use yi_agent_core::subagent::worker::{...}` 清单里已有它，不必重复。
 
-- [ ] **Step 2: 写 attach 客户端**
+- [x] **Step 2: 写 attach 客户端**
 
 创建 `crates/yi-agent-subagent/src/attach.rs`：
 
@@ -470,7 +470,7 @@ pub mod attach;
 `tracing.workspace = true`、`uuid.workspace = true`（后两者已在 Task 1 的清单里），
 在 `[dependencies]` 里补上 `anyhow.workspace = true`。
 
-- [ ] **Step 3: 让 TUI 使用共享定义**
+- [x] **Step 3: 让 TUI 使用共享定义**
 
 `crates/yi-agent/src/tui/subagents.rs`：删掉本地 `AttachedRoot` 定义与
 `register_attached_root_tools` 函数，改为：
@@ -490,7 +490,7 @@ pub use yi_agent_subagent::{AttachedRoot, register_attached_root_tools};
 文件内原有的测试 `attached_tui_root_exposes_subagent_tools_without_a_delegate_command`
 保留（它只用到 `register_attached_root_tools` 与 `AttachedRoot`，re-export 后仍然可用）。
 
-- [ ] **Step 4: `main.rs` 改用共享 attach 客户端**
+- [x] **Step 4: `main.rs` 改用共享 attach 客户端**
 
 `crates/yi-agent/src/main.rs`：
 
@@ -563,7 +563,7 @@ fn detach_tui_runtime_root(
    而 `attach_project_runtime` 只返回 `AttachFailure`。两者共用的是更下面的部件
    （`worker_factory` / `ignore_project_local_runtime_state` / `project_runtime_directory`）。
 
-- [ ] **Step 5: 编译并跑测试**
+- [x] **Step 5: 编译并跑测试**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-subagent
@@ -576,7 +576,7 @@ cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent
 预期：两者全绿。`yi-agent --bin yi-agent` 的测试数应与 Task 1 结束时一致（本任务只移动
 代码，不删测试）。
 
-- [ ] **Step 6: 格式化并提交**
+- [x] **Step 6: 格式化并提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && \
@@ -597,7 +597,7 @@ git commit -m "refactor: share the runtime attach client between the TUI and oth
 - Consumes: 无
 - Produces: `AgentBootstrap { provider: Arc<dyn yi_agent_core::Provider>, tools: Arc<yi_agent_core::ToolRegistry>, catalog: Option<SkillsCatalogHandle>, .. }`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent-runtime/src/bootstrap.rs` 的测试模块里加：
 
@@ -622,7 +622,7 @@ fn bootstrap_exposes_the_registry_and_the_catalog_handle() {
 （若该测试模块没有 `test_config()`，用同文件既有测试里构造 `RuntimeConfig` 的写法；注意
 把 `workdir` 设成 `tempfile::TempDir`，避免读用户真实配置。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-runtime bootstrap_exposes_the_registry
@@ -630,7 +630,7 @@ cd yi-agent-rs && cargo test -p yi-agent-runtime bootstrap_exposes_the_registry
 
 预期：编译失败，`no field tools on type AgentBootstrap`。
 
-- [ ] **Step 3: 加字段**
+- [x] **Step 3: 加字段**
 
 `crates/yi-agent-runtime/src/bootstrap.rs` 的 `AgentBootstrap`（第 246 行起）加三个字段：
 
@@ -698,7 +698,7 @@ pub struct AgentBootstrap {
     }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-runtime
@@ -706,7 +706,7 @@ cd yi-agent-rs && cargo test -p yi-agent-runtime
 
 预期：全绿（约 61 个 + 新增 1 个）。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && \
@@ -732,7 +732,7 @@ git commit -m "feat(runtime): expose the built registry and catalog on the boots
   Task 3 的 `AgentBootstrap.tools` / `.catalog`。
 - Produces: app-server 内部 `BuiltAgent` 新增字段与 `ProjectRuntimes` 缓存；无协议变化。
 
-- [ ] **Step 1: 加依赖**
+- [x] **Step 1: 加依赖**
 
 `crates/yi-agent-app-server/Cargo.toml` 的 `[dependencies]` 里加：
 
@@ -744,7 +744,7 @@ yi-agent-tools = { workspace = true }
 
 并把已有 dev-dependencies 里的 `yi-agent-tools = { workspace = true }` 删掉（它已进生产依赖）。
 
-- [ ] **Step 2: 写失败测试（工具集存在 + 非 git 降级 + 同 cwd 复用）**
+- [x] **Step 2: 写失败测试（工具集存在 + 非 git 降级 + 同 cwd 复用）**
 
 在 `crates/yi-agent-app-server/src/server.rs` 的测试模块里加。先加两个共用 helper：
 
@@ -874,14 +874,14 @@ yi-agent-tools = { workspace = true }
 `Ok(attached)` 分支（说明非 git 项目也能 attach），保留该分支的断言即可——两条分支都表达
 同一个契约「非 git cwd 不得到达委派工具」。
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-app-server a_git_project_gets
 ```
 
 预期：编译失败，`cannot find function build_runtime_tooling`。
-- [ ] **Step 4: 实现 `build_runtime_tooling` 与 per-cwd 缓存**
+- [x] **Step 4: 实现 `build_runtime_tooling` 与 per-cwd 缓存**
 
 在 `crates/yi-agent-app-server/src/server.rs` 里加（放在 `run_with` 之前）：
 
@@ -961,7 +961,7 @@ fn build_runtime_tooling(
 }
 ```
 
-- [ ] **Step 5: 让 `BuiltAgent` 携带重建所需的一切**
+- [x] **Step 5: 让 `BuiltAgent` 携带重建所需的一切**
 
 `BuiltAgent`（第 39 行起）改为：
 
@@ -1015,7 +1015,7 @@ struct BuiltAgent {
     }
 ```
 
-- [ ] **Step 6: 重建 agent 的 `wrap_for_delegation`**
+- [x] **Step 6: 重建 agent 的 `wrap_for_delegation`**
 
 在 `server.rs` 里加（`BuildAgent` 附近）：
 
@@ -1056,7 +1056,7 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
 }
 ```
 
-- [ ] **Step 7: 在 `run_with` 里接线**
+- [x] **Step 7: 在 `run_with` 里接线**
 
 `run_with` 签名加一个参数（放在 `workspaces` 之后）：
 
@@ -1130,7 +1130,7 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
 **作用域之外**，否则会与后续 `threads.insert(..)` 一起造成借用冲突。实现时把接线放在
 拿到 `cwd` 之后、`threads.insert(..)` **之前**，用自己的局部变量保存 `activation`。
 
-- [ ] **Step 8: 首个 turn 激活 root**
+- [x] **Step 8: 首个 turn 激活 root**
 
 `crates/yi-agent-app-server/src/session.rs` 的 `TurnPrompt` 加字段：
 
@@ -1204,7 +1204,7 @@ pub struct TurnPrompt {
 注意 `activated` 必须在 `while` **之外**声明，且即使 `activate` 为 `None` 也要置位——
 否则每一轮都会重试。同时保留语句体内原有的 `let user_prompt = prompt.clone();` 等逻辑。
 
-- [ ] **Step 9: `thread/delete` 与退出时的 detach**
+- [x] **Step 9: `thread/delete` 与退出时的 detach**
 
 `thread/delete` 分支在 `threads.remove(&thread_id);` 之后加：
 
@@ -1252,7 +1252,7 @@ fn attached_runtimes(
 }
 ```
 
-- [ ] **Step 11: 跑测试**
+- [x] **Step 11: 跑测试**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-app-server
@@ -1264,7 +1264,7 @@ cd yi-agent-rs && cargo test -p yi-agent-app-server
 cd yi-agent-rs && cargo test -p yi-agent-subagent
 ```
 
-- [ ] **Step 12: 格式化并提交**
+- [x] **Step 12: 格式化并提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && \
@@ -1286,7 +1286,7 @@ git commit -m "feat(app-server): give git-project threads the subagent delegatio
 - Consumes: Task 1/2 的公开 API。
 - Produces: 无（测试专用）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `yi-agent-rs/crates/yi-agent-subagent/tests/attach_delegation.rs`：
 
@@ -1374,7 +1374,7 @@ yi-agent-runtime = { workspace = true }
 yi-agent-tools = { workspace = true }
 ```
 
-- [ ] **Step 2: 跑测试确认失败（或直接通过）**
+- [x] **Step 2: 跑测试确认失败（或直接通过）**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-subagent --test attach_delegation
@@ -1383,7 +1383,7 @@ cd yi-agent-rs && cargo test -p yi-agent-subagent --test attach_delegation
 预期：编译并运行；若 attach 路径有实现缺口（例如 idempotency key 前缀、objective 写入），
 这里会暴露。
 
-- [ ] **Step 3: 全量回归**
+- [x] **Step 3: 全量回归**
 
 逐条跑（**不要并行**）：
 
@@ -1401,7 +1401,7 @@ cd desktop && npx tsc --noEmit && npm test
 
 预期：全部通过。任何失败都先修再提交。
 
-- [ ] **Step 4: 格式化并提交**
+- [x] **Step 4: 格式化并提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && \
@@ -1419,7 +1419,7 @@ git commit -m "test(subagent): cover the shared attach path end to end"
   `subagent-runtime.md`、`yi-agent-runtime.md`
 - Modify: `docs/bug-list.md`
 
-- [ ] **Step 1: 新建模块文件**
+- [x] **Step 1: 新建模块文件**
 
 创建 `docs/project-management/yi-agent-subagent.md`：
 
@@ -1461,7 +1461,7 @@ daemon，避免两处各写一份 daemon 工厂与委派工具。它由 `crates/
 **验证命令：** `cargo test -p yi-agent-subagent`
 ```
 
-- [ ] **Step 2: 更新索引与计数**
+- [x] **Step 2: 更新索引与计数**
 
 `docs/project-management/README.md` 的模块索引表加一行（放在 `yi-agent-app-server` 之后）：
 
@@ -1472,7 +1472,7 @@ daemon，避免两处各写一份 daemon 工厂与委派工具。它由 `crates/
 同步刷新同一张表里 `desktop`、`yi-agent-app-server`、`subagent-runtime`、
 `yi-agent-runtime` 四行的「完成 / 总计」计数（各自模块文件改完后再数）。
 
-- [ ] **Step 3: 更新四个模块文件**
+- [x] **Step 3: 更新四个模块文件**
 
 - `desktop.md`：在 Features 里加一条 `[x]`，说明「git 项目目录下的 thread 与 TUI 一样拿到
   六个委派工具」，判据写
@@ -1488,7 +1488,7 @@ daemon，避免两处各写一份 daemon 工厂与委派工具。它由 `crates/
 - `yi-agent-runtime.md`：在 `bootstrap_agent()` 那条上补 `AgentBootstrap` 新增
   `tools` / `catalog` 字段与理由。
 
-- [ ] **Step 4: 更新 bug-list**
+- [x] **Step 4: 更新 bug-list**
 
 `docs/bug-list.md` 里那条「Mac desktop 版本的 yi-agent app 上面，没法起 subagent」改
 `[x]`，按同文件既有格式补齐：根因（app-server 从不接触 daemon，`bootstrap_agent` 也不暴露
@@ -1496,7 +1496,7 @@ registry，所以模型手里没有 `spawn_agent`）、修复（新 crate + per-
 验证命令（`cargo test -p yi-agent-app-server`、`cargo test -p yi-agent-subagent`、
 `cargo test -p yi-agent --bin yi-agent`）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs && git commit -m "docs: record desktop subagent delegation parity"
@@ -1516,3 +1516,40 @@ git add docs && git commit -m "docs: record desktop subagent delegation parity"
 5. 手工验收（可选，需真实 API key）：`cd desktop && npm run sidecar && npm run tauri dev`，
    选一个 git 项目目录建 thread，发「用 spawn_agent 起一个只读子任务调研 X」，对话里出现
    `spawn_agent` 的 toolCall 卡片并返回 `task_id`。
+
+---
+
+## 执行偏差记录
+
+计划本身没覆盖、实现时才暴露的三点，均已按"以实测为准"处理：
+
+1. **非 git 目录不是"不注册工具"**（Task 4 的期望被实测推翻）。计划与设计都假设
+   `attach` 会因非 git 项目失败，于是"没有六个工具"。实测：`attach_application_root`
+   对非 git 项目原地建 root，`register_attached_root_tools` 照常注册，真正失败发生在
+   `spawn_agent` —— daemon 的 worker 准入要求可恢复的 `worktree:` lease
+   （`validate_recovery_context`，见 `crates/yi-agent-store/src/repository.rs`）。
+   测试因此改名并改为断言"attach 成功 + 工具齐全 + spawn 被拒"，设计文档 §2.4 与 §5 同步更正。
+   这不是本设计引入的行为，TUI 一直如此（共用同一份 `attach_project_runtime`）。
+2. **`TurnPrompt` 不能在首次激活后清除 `activate`**。计划 Step 8 让 driver 只消费一次；
+   实现改为 `pending_activation: HashMap<thread_id, Option<Arc<..>>>` + 主循环投递时 clone，
+   因为 `thread/start` 与 `turn/start` 是两个 RPC，attach 发生在前者、激活发生在后者。
+3. **`thread/delete` 的 detach 收窄**（计划里标注的"优先验证"项，实测证实不能全断）：
+   计划给的写法是删任一线程即断开该项目全部 root。实测语义上不可接受——同一个 driver
+   只激活一次，被断开后同项目其它 thread 的委派不会自动恢复。故改为
+   `detach_unused_runtimes(&runtimes, &live_cwds)`：只有当项目目录下不再有任何活着的
+   thread 时才 detach（`crates/yi-agent-app-server/src/server.rs`）。
+4. **`BuiltAgent` 不必保留被替换的 `tools` / `permission`**：计划 Step 4 让 `wrap_for_delegation`
+   把它们回填进 `BuiltAgent`，clippy 报 `fields are never read`。实测无任何读取方，故删除，
+   只保留重建必须沿用的 provider / config / 决定通道 / session / catalog / yolo。
+
+**验证结果**（逐步实测，未并行跑 cargo）：
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p yi-agent-subagent` | 28 + 1 通过 |
+| `cargo test -p yi-agent-app-server` | 157 通过（本次新增 3 个；app-server 模块文档此前记的 148 已过期，一并更正为实测 157） |
+| `cargo test -p yi-agent-runtime` | 64 通过 |
+| `cargo test -p yi-agent --bin yi-agent` | 486 通过 |
+| `cargo test -p yi-agent-store --test runtime_ipc` | 98 通过 |
+| `cd desktop && npx tsc --noEmit && npm test` | 158 通过（前端零改动） |
+| `cargo clippy -p yi-agent-app-server -p yi-agent-subagent --all-targets` | 无告警 |
