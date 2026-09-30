@@ -673,6 +673,12 @@ pub struct Daemon {
     stop: Arc<AtomicBool>,
     coordinator: Arc<RuntimeCoordinator>,
     listener: Option<JoinHandle<()>>,
+    /// Orphaned tasks the startup sweep reclaimed, reported to the caller
+    /// instead of printed. Whoever owns the terminal must decide how this
+    /// reaches the user: a bare write corrupts a live TUI frame, because the
+    /// embedded daemon shares the process (and therefore the terminal) with the
+    /// front end that started it.
+    reclaimed_orphans: usize,
     /// Held for the daemon's whole lifetime. Dropping it releases the kernel
     /// lock, so a crashed daemon can never leave a lock behind.
     _instance_lock: InstanceLock,
@@ -717,10 +723,7 @@ impl Daemon {
         // is a terminal state, so anything that cannot actually resume would sit
         // there forever and pin its session's supervisor. Reclaim those, plus
         // tasks whose owning root has detached, before the coordinator hydrates.
-        let reclaimed = repository.reclaim_orphaned_tasks(DEFAULT_ORPHAN_GRACE_SECS)?;
-        if reclaimed > 0 {
-            eprintln!("yi-agent runtime: reclaimed {reclaimed} orphaned task(s)");
-        }
+        let reclaimed_orphans = repository.reclaim_orphaned_tasks(DEFAULT_ORPHAN_GRACE_SECS)?;
         drop(repository);
         let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
         let listener = UnixListener::bind(&socket_path)?;
@@ -805,12 +808,25 @@ impl Daemon {
             stop,
             coordinator: daemon_coordinator,
             listener: Some(listener),
+            reclaimed_orphans,
             _instance_lock: instance_lock,
         })
     }
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// How many orphaned tasks this daemon's startup sweep reclaimed.
+    ///
+    /// Only a daemon whose caller owns the terminal should print this. The TUI
+    /// starts the daemon on its own thread while it paints an alternate screen,
+    /// so writing here would land in the middle of a frame and smudge the
+    /// layout; it surfaces the count as a transcript notice instead. The CLI
+    /// (`daemon serve`) and headless runs have a terminal of their own and keep
+    /// printing the historical one-liner.
+    pub fn reclaimed_orphans(&self) -> usize {
+        self.reclaimed_orphans
     }
 
     /// Stop this manually started daemon and release its local runtime files.

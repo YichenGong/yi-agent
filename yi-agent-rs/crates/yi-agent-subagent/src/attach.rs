@@ -129,6 +129,19 @@ pub fn attach_project_runtime(
         Err(IpcError::AlreadyRunning { .. }) => None,
         Err(error) => return Err(AttachFailure::new("daemon start", error)),
     };
+    // The startup sweep reclaims tasks whose owning root is gone, and whoever
+    // owns the terminal announces the count: `main.rs` prints the historical
+    // line for `daemon serve` and headless runs, and the TUI renders a
+    // transcript notice. This shared path has no terminal contract -- it serves
+    // the desktop's app-server -- so the count would otherwise vanish with no
+    // way to tell "the sweep tidied up leftovers" from "it reclaimed nothing".
+    // Record it instead of writing to a stream this process does not own.
+    if let Some(daemon) = &embedded_daemon {
+        let reclaimed = daemon.reclaimed_orphans();
+        if reclaimed > 0 {
+            tracing::info!(reclaimed, "reclaimed orphaned subagent tasks");
+        }
+    }
     let idempotency_key = format!(
         "project:{}:{}:{}",
         std::process::id(),

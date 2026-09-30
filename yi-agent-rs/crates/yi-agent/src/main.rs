@@ -497,7 +497,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // invoked `serve` must record the same self-ignore so the project
             // state it creates never dirties the checkout.
             ignore_project_local_runtime_state(&workdir);
-            yi_agent_store::ipc::Daemon::start_with_factory(
+            let daemon = yi_agent_store::ipc::Daemon::start_with_factory(
                 &runtime_dir,
                 &database,
                 build_daemon_worker_factory(
@@ -505,9 +505,14 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
                     yi_agent_store::ipc::socket_path_for(&runtime_dir)?,
                 )?,
             )
-            .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?
-            .wait()
-            .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}"))
+            .map_err(|error| anyhow::anyhow!("could not start runtime daemon: {error}"))?;
+            // `daemon start` detaches this subcommand with its stderr on
+            // `/dev/null`, but a directly invoked `serve` owns the terminal and
+            // so keeps the historical line.
+            report_reclaimed_orphans_to_stderr(daemon.reclaimed_orphans());
+            daemon
+                .wait()
+                .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}"))
         }
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
     }
@@ -1177,6 +1182,28 @@ fn record_human<W: std::io::Write, E: std::io::Write>(
     }
 }
 
+/// Announces a startup reclaim sweep on stderr.
+///
+/// The store used to print this itself as it reclaimed. That write is unsafe
+/// whenever the daemon is embedded: it shares the process -- and the terminal --
+/// with the front end that started it, so a bare `eprintln!` landed in the
+/// middle of a live TUI frame and smeared the input box's styling. The store now
+/// only reports the count; whoever owns the terminal decides what to do with it.
+/// A TUI renders it as a transcript notice, everyone else keeps this line.
+fn report_reclaimed_orphans_to_stderr(reclaimed: usize) {
+    report_reclaimed_orphans(&mut std::io::stderr(), reclaimed);
+}
+
+/// The writer-injectable core of [`report_reclaimed_orphans_to_stderr`].
+fn report_reclaimed_orphans<W: std::io::Write>(out: &mut W, reclaimed: usize) {
+    if reclaimed > 0 {
+        let _ = writeln!(
+            out,
+            "yi-agent runtime: reclaimed {reclaimed} orphaned task(s)"
+        );
+    }
+}
+
 fn is_terminal(event: &yi_agent_core::AgentEvent) -> bool {
     matches!(
         event,
@@ -1260,6 +1287,15 @@ fn run_headless(
 
     let headless_runtime = if subagents {
         let runtime = attach_headless_runtime(&cli, &config)?;
+        // `yi-agent run` owns the terminal and streams its own diagnostics, so
+        // the reclaim line keeps its historical home here.
+        if let Some(reclaimed) = runtime
+            .embedded_daemon
+            .as_ref()
+            .map(|daemon| daemon.reclaimed_orphans())
+        {
+            report_reclaimed_orphans_to_stderr(reclaimed);
+        }
         activate_headless_runtime_root(&runtime, &prompt_text)?;
         Some(runtime)
     } else {
@@ -1507,8 +1543,27 @@ fn run_tui_agent(
                                         attached_root,
                                         embedded_daemon,
                                     } = *attached;
-                                    if embedded_daemon.is_some() {
+                                    if let Some(daemon) = &embedded_daemon {
                                         tracing::info!("embedded subagent runtime started for TUI");
+                                        // A started daemon may have swept orphaned
+                                        // tasks. The count goes through the event
+                                        // stream so the TUI draws it in the
+                                        // transcript; printing it here would write
+                                        // into a live frame and smear the input box.
+                                        let reclaimed = daemon.reclaimed_orphans();
+                                        if reclaimed > 0 {
+                                            tracing::info!(
+                                                reclaimed,
+                                                "reclaimed orphaned subagent tasks"
+                                            );
+                                            let _ = agent_tx
+                                                .send(
+                                                    yi_agent_core::AgentEvent::OrphanedTasksReclaimed {
+                                                        count: reclaimed,
+                                                    },
+                                                )
+                                                .await;
+                                        }
                                     }
                                     *runtime_detach_for_driver
                                         .lock()
@@ -2062,6 +2117,27 @@ mod tests {
         assert_eq!(lines.len(), 2, "one JSONL line per event, got {lines:?}");
         assert!(lines[0].contains("hi"), "first line: {}", lines[0]);
         assert_eq!(code, 130, "a cancelled --json run still reports 130");
+    }
+
+    /// The reclaim line belongs to whoever owns the terminal. `daemon serve`
+    /// and a headless run have a real stderr, so the sweep must still announce
+    /// itself there.
+    #[test]
+    fn reclaim_report_names_the_count_on_a_plain_stream() {
+        let mut out = Vec::new();
+        report_reclaimed_orphans(&mut out, 3);
+        assert_eq!(
+            String::from_utf8(out).unwrap().trim(),
+            "yi-agent runtime: reclaimed 3 orphaned task(s)"
+        );
+    }
+
+    /// A clean start must stay silent: a `0` line is pure noise.
+    #[test]
+    fn reclaim_report_stays_silent_when_nothing_was_reclaimed() {
+        let mut out = Vec::new();
+        report_reclaimed_orphans(&mut out, 0);
+        assert!(out.is_empty(), "a zero count must not print: {out:?}");
     }
 
     fn drain_stream_human_sync<W: std::io::Write, E: std::io::Write>(
