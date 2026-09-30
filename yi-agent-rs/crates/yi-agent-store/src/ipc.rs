@@ -755,6 +755,7 @@ impl Daemon {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, IpcError> {
+        raise_file_descriptor_limit();
         let runtime_dir = runtime_dir.as_ref();
         fs::create_dir_all(runtime_dir)?;
         fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700))?;
@@ -891,6 +892,41 @@ pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Resolves the Unix-domain socket for a runtime directory.
 ///
+/// Raises the process soft file-descriptor limit toward the hard limit.
+///
+/// A daemon holds one descriptor per live client, worker, and database handle,
+/// and an embedding test process holds many daemons at once. The default soft
+/// limit (256 on macOS) is easily exhausted, at which point `accept` fails with
+/// `EMFILE` and the listener thread exits, dropping every connection. Raising
+/// the soft limit toward the hard limit lets the daemon keep serving.
+fn raise_file_descriptor_limit() {
+    static RAISED: std::sync::Once = std::sync::Once::new();
+    RAISED.call_once(|| {
+        // Enough headroom for a busy daemon without claiming the whole hard
+        // limit on a machine that allows an enormous one.
+        const TARGET: libc::rlim_t = 4096;
+        // SAFETY: `getrlimit`/`setrlimit` receive a valid pointer to a
+        // zero-initialized `rlimit`. Only the soft limit is raised, and never
+        // above the hard limit the kernel enforces.
+        unsafe {
+            let mut limit = std::mem::zeroed::<libc::rlimit>();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                return;
+            }
+            let target = if limit.rlim_max == libc::RLIM_INFINITY {
+                TARGET
+            } else {
+                limit.rlim_max.min(TARGET)
+            };
+            if limit.rlim_cur >= target {
+                return;
+            }
+            limit.rlim_cur = target;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    });
+}
+
 /// A runtime directory normally owns its socket (`<runtime_dir>/runtime.sock`).
 /// That layout cannot always work: `sun_path` is capped at
 /// [`MAX_SOCKET_PATH_BYTES`], so a deep project path — the default runtime
