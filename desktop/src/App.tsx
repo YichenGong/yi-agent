@@ -8,6 +8,7 @@ import { StatusBar } from "./components/StatusBar";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ApprovalBanner } from "./components/ApprovalBanner";
 import { ThreadSidebar } from "./components/ThreadSidebar";
+import { TitleBar } from "./components/TitleBar";
 import type { ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "./lib/protocol";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
@@ -378,7 +379,9 @@ export default function App() {
 
   return (
     <>
-      <div className="flex h-screen flex-row bg-neutral-950 text-neutral-100">
+      <div className="flex h-screen flex-col bg-neutral-950 text-neutral-100">
+        <TitleBar />
+        <div className="flex min-h-0 flex-1 flex-row">
         <ThreadSidebar
           groups={groups}
           workspaces={workspaces}
@@ -436,6 +439,7 @@ export default function App() {
               }}
             />
           )}
+        </div>
         </div>
       </div>
     </>
