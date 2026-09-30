@@ -1298,6 +1298,10 @@ fn run_tui_agent(
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(8);
+        // Mid-turn kill requests (TUI bash panel) need their own channel: the
+        // control channel is consumed at prompt boundaries, and a kill has to
+        // land while the tool is actually running.
+        let (kill_tx, mut kill_rx) = mpsc::channel::<String>(8);
         let (runtime_choice_tx, mut runtime_choice_rx) =
             mpsc::channel::<crate::tui::subagents::RuntimeStartupChoice>(1);
         let runtime_detach = Arc::new(std::sync::Mutex::new(None::<(
@@ -1593,6 +1597,17 @@ fn run_tui_agent(
                                         None => break, // stream ended
                                     }
                                 }
+                                Some(tool_call_id) = kill_rx.recv() => {
+                                    // The TUI's bash panel asked to stop one call.
+                                    // The run keeps going; the model sees an error
+                                    // result for the killed call.
+                                    let killed = agent.cancel_tool_call(&tool_call_id);
+                                    tracing::info!(
+                                        tool_call = %tool_call_id,
+                                        killed,
+                                        "TUI requested a tool-call kill"
+                                    );
+                                }
                                 _ = interrupt_rx.recv() => {
                                     // User pressed Ctrl+C/Esc: cancel agent
                                     agent.cancel();
@@ -1657,6 +1672,7 @@ fn run_tui_agent(
                 agent_rx,
                 input_tx,
                 interrupt_tx,
+                kill_tx,
                 control_tx,
                 decision_tx,
                 is_running,

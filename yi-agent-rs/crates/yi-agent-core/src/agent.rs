@@ -208,7 +208,14 @@ pub struct Agent {
     /// caller holding an `InboxHandle`) can deliver without a live `&Agent`.
     /// Only present while a run is active.
     inbox: Option<InboxHandle>,
+    /// Per-tool-call cancellation tokens for the active run, keyed by tool_use
+    /// id. Lets a caller stop one long-running tool (the TUI's bash panel) without
+    /// cancelling the whole turn. Rebuilt on every run.
+    tool_call_tokens: ToolCallTokens,
 }
+
+/// Shared map of the active run's per-tool-call cancellation tokens.
+type ToolCallTokens = Arc<Mutex<std::collections::HashMap<String, CancellationToken>>>;
 
 /// Events emitted during agent loop.
 #[derive(Debug, Clone, Serialize)]
@@ -457,6 +464,7 @@ impl Agent {
             decision_rx: None,
             provider_turn_gate: None,
             inbox: None,
+            tool_call_tokens: ToolCallTokens::default(),
         }
     }
 
@@ -535,6 +543,26 @@ impl Agent {
         self.inbox.clone()
     }
 
+    /// Stop a single in-flight tool call, leaving the rest of the turn alone.
+    ///
+    /// Cancelling the call's token makes the run loop drop that tool's future.
+    /// For a process-spawning tool (bash) the drop is what reaps the process
+    /// group, so this genuinely kills the command rather than just stopping our
+    /// wait for it. The turn continues with a synthetic "killed by user" result
+    /// so the model learns the command did not finish.
+    ///
+    /// Returns false when no call with that id is running (already finished).
+    pub fn cancel_tool_call(&self, id: &str) -> bool {
+        let tokens = self.tool_call_tokens.lock().unwrap();
+        match tokens.get(id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Run the agent loop, returning a stream of events.
     pub async fn run(
         &mut self,
@@ -557,6 +585,9 @@ impl Agent {
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
         // Every run uses a fresh cancel token.
         self.cancel_token = CancellationToken::new();
+        // ...and a fresh per-tool-call token map: an id from the previous run
+        // must not be able to stop a call in this one.
+        self.tool_call_tokens = ToolCallTokens::default();
         // Each run gets a fresh inbox: a handle from the previous run must not
         // feed the next one.
         self.inbox = Some(InboxHandle::new());
@@ -578,6 +609,7 @@ impl Agent {
         // Clone before the loop owns it: the `Agent` keeps its handle so
         // `interject()` works even after the stream has been moved away.
         let inbox = self.inbox.clone();
+        let tool_call_tokens = self.tool_call_tokens.clone();
 
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = EventTx(tx);
@@ -596,6 +628,7 @@ impl Agent {
                 decision_rx,
                 provider_turn_gate,
                 inbox,
+                tool_call_tokens,
             )
             .await;
         });
@@ -731,6 +764,7 @@ async fn run_loop(
     decision_rx: Option<DecisionRx>,
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
     inbox: Option<InboxHandle>,
+    tool_call_tokens: ToolCallTokens,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
@@ -1164,11 +1198,24 @@ async fn run_loop(
             }
         }
 
+        // Publish a kill token per call of this batch before racing them, and
+        // drop ids left over from the previous round. Done here (not after
+        // `Checker 3`) so the registration and the execution are adjacent: a
+        // kill can never land on a call the run loop has stopped waiting for —
+        // that would orphan the token and leave the command running.
+        {
+            let mut tokens = tool_call_tokens.lock().unwrap();
+            tokens.clear();
+            for (id, _, _) in &checked_uses {
+                tokens.insert(id.clone(), CancellationToken::new());
+            }
+        }
         let futures: Vec<_> = checked_uses
             .iter()
             .map(|(id, name, input)| {
                 let tools = tools.clone();
                 let tx = tx.clone();
+                let tool_calls = tool_call_tokens.clone();
                 async move {
                     let tool_span = info_span!("tool_call", tool = %name, id = %id);
                     let _enter = tool_span.enter();
@@ -1227,9 +1274,34 @@ async fn run_loop(
                         }
                     });
 
-                    let result = tool.call_stream(input.clone(), event_tx).await;
+                    // Race the call against its own kill token. Dropping the
+                    // `call_stream` future is what reaps a spawned process
+                    // group, so this is a real kill, not just a stopped wait.
+                    let call_token = tool_calls
+                        .lock()
+                        .unwrap()
+                        .get(id.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    let result = tokio::select! {
+                        r = tool.call_stream(input.clone(), event_tx) => r,
+                        _ = call_token.cancelled() => {
+                            info!(tool = %name, "tool call killed by the user");
+                            let _ = tx
+                                .send(AgentEvent::ToolExit { id: id.clone(), code: None })
+                                .await;
+                            ToolResult::error(
+                                "killed by the user before it finished; its output is incomplete",
+                            )
+                        }
+                    };
 
                     info!(is_error = result.is_error, "tool call done");
+
+                    // Retire the token: a kill request arriving after this point
+                    // must be reported as "nothing to kill", not silently
+                    // accepted against a finished call.
+                    tool_calls.lock().unwrap().remove(id.as_str());
 
                     if tx
                         .send(AgentEvent::ToolResult {
@@ -2989,6 +3061,76 @@ mod tests {
             std::future::pending::<()>().await;
             ToolResult::text("unreachable")
         }
+    }
+
+    /// Cancelling one tool call must stop *that* call and leave the turn
+    /// running, so the model learns the command was killed. This is the
+    /// primitive behind the TUI's bash-panel kill: it must not behave like the
+    /// turn-wide cancel (which rolls the session back and ends the run).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_one_tool_call_stops_only_that_call() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "hang".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("recovered".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangingTool));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let stream = agent.run("hang".into()).await.unwrap();
+        assert!(
+            !agent.cancel_tool_call("t1"),
+            "no call is registered before the batch starts"
+        );
+
+        // Kill the call once it is actually in flight: wait for the run loop to
+        // publish the token, then trigger it.
+        let handle = agent.tool_call_tokens.clone();
+        let killer = tokio::spawn(async move {
+            for _ in 0..500 {
+                let token = handle.lock().unwrap().get("t1").cloned();
+                if let Some(token) = token {
+                    token.cancel();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the run loop never registered a token for the call");
+        });
+        let _ = killer.await;
+
+        let events = collect_events(stream);
+        // The turn survived: the synthetic error result was fed back and the
+        // provider's second script produced text.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolResult { result, .. } if result.is_error
+            )),
+            "a killed call must report an error result: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "killing one call must not cancel the whole run: {events:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
