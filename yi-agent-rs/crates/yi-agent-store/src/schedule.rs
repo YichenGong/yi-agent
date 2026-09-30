@@ -153,7 +153,7 @@ pub struct WatchdogLimits {
 impl Default for WatchdogLimits {
     fn default() -> Self {
         Self {
-            max_turns: Some(100),
+            max_turns: Some(200),
             max_tokens: None,
             max_cost_micros: None,
             max_wall_time_secs: Some(2_700),
@@ -340,7 +340,7 @@ impl RuntimePolicyLayer {
             max_queued_subagents: 64,
             max_depth: 2,
             max_direct_children_per_agent: 4,
-            max_turns: 100,
+            max_turns: 200,
             max_wall_time_secs: 2700,
             max_idle_time_secs: 300,
             max_llm_requests_per_provider_key: 8,
@@ -583,7 +583,7 @@ impl Default for SchedulePolicy {
         Self {
             runtime: RuntimePolicy {
                 max_resident_subagents: 4,
-                max_turns: 30,
+                max_turns: 200,
                 max_wall_time_secs: 900,
                 read_only: true,
                 allow_coding: false,

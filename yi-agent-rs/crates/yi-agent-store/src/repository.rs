@@ -17,6 +17,12 @@ use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, W
 
 const LATEST_SCHEMA_VERSION: i64 = 11;
 
+/// Grace period before a task with no application-root attachment at all is
+/// treated as unowned. An application root writes its attachment before it
+/// spawns any child, so this window only ever covers a boot in progress or a
+/// legacy row; it is not a waiting period a healthy session can fall into.
+pub const DEFAULT_ORPHAN_GRACE_SECS: i64 = 300;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error(transparent)]
@@ -2709,6 +2715,135 @@ impl RuntimeRepository {
         Ok(task_ids.len())
     }
 
+    /// Reclaims tasks that can never finish because nothing owns them any more.
+    ///
+    /// A subagent only makes progress while its owning daemon holds it in
+    /// memory. Once that process is gone, `paused`, `queued` and `running` rows
+    /// are not merely idle: no code path will ever move them, because
+    /// [`Self::recover_inflight_tasks`] only sweeps the `waiting_*` family and
+    /// hydration only revives tasks that carry recovery context. They
+    /// accumulate forever, and any parent waiting on "all my children finished"
+    /// waits forever too.
+    ///
+    /// A task is an orphan when the application root that owns its session has
+    /// no live attachment (`state = 'detached'`), or has no attachment at all
+    /// and has not been touched for `grace_seconds` (a root that is mid-boot
+    /// has not written its attachment yet, and must not be reaped).
+    ///
+    /// Reaping is deliberately gentle: the partial report is preserved in the
+    /// attempt's `terminal_json`, so a task killed while it was mid-sentence
+    /// still yields whatever it had said.
+    pub fn reclaim_orphaned_tasks(&mut self, grace_seconds: i64) -> Result<usize, RepositoryError> {
+        let reclaimable_state = "state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled', \
+             'blocked', 'stalled', 'timed_out', 'budget_exhausted', 'recovery_required')";
+        let orphaned_because_detached = "EXISTS(
+                 SELECT 1 FROM application_root_attachments a
+                 WHERE a.root_session_id = tasks.root_session_id AND a.state = 'detached')";
+        let orphaned_because_unowned = "(
+                 NOT EXISTS(
+                     SELECT 1 FROM application_root_attachments a
+                     WHERE a.root_session_id = tasks.root_session_id)
+                 AND tasks.updated_at <= datetime('now', '-' || ?1 || ' seconds'))";
+        // `recovery_required` is a holding pen for explicit resume, not a
+        // resting state, and it is itself terminal, so a row parked there can
+        // never be swept again once its owner is gone. It is abandoned only if
+        // it has no lease and no checkpoint or tool state *and* its root is
+        // unowned; a row under a live attachment is the session's own root
+        // task, which hydration owns and a user may still resume. (The retired
+        // `task_workspaces` table is deliberately not consulted: a fresh schema
+        // must not have it.)
+        let abandoned_recovery = format!(
+            "(state_json = 'recovery_required'
+                 AND (workspace_lease_id IS NULL OR workspace_lease_id = '')
+                 AND NOT EXISTS(
+                     SELECT 1 FROM attempts a
+                     WHERE a.id = tasks.active_attempt_id
+                       AND (COALESCE(a.checkpoint_json, '') <> ''
+                            OR COALESCE(a.usage_json, '') NOT IN ('', '{{}}')))
+                 AND ({orphaned_because_detached} OR {orphaned_because_unowned}))"
+        );
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let orphaned = transaction
+            .prepare(&format!(
+                "SELECT id, state_json FROM tasks WHERE {reclaimable_state} \
+                 AND ({orphaned_because_detached} OR {orphaned_because_unowned})"
+            ))?
+            .query_map(params![grace_seconds], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let abandoned = transaction
+            .prepare(&format!(
+                "SELECT id, state_json FROM tasks WHERE {abandoned_recovery}"
+            ))?
+            .query_map(params![grace_seconds], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut reclaimed = 0usize;
+        for (task_id, state) in orphaned.into_iter().chain(abandoned) {
+            let task: TaskId = task_id
+                .parse()
+                .map_err(|_| RepositoryError::UnknownEventKind {
+                    kind: format!("invalid task ID in store: {task_id}"),
+                })?;
+            // Carry the partial report forward: the terminal stamp replaces
+            // the attempt's `terminal_json`, and that field is the only
+            // surviving trace of what the child had managed to say.
+            let report: Option<String> = transaction
+                .query_row(
+                    "SELECT attempts.terminal_json FROM attempts
+                     JOIN tasks ON tasks.active_attempt_id = attempts.id
+                     WHERE tasks.id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let terminal_json = match text_completion_report(report.as_deref()) {
+                Some(report) => serde_json::to_string(&serde_json::json!({
+                    "reason": "reclaimed_orphan",
+                    "previous_state": state,
+                    "report": report,
+                }))?,
+                None => serde_json::to_string(&serde_json::json!({
+                    "reason": "reclaimed_orphan",
+                    "previous_state": state,
+                }))?,
+            };
+            transaction.execute(
+                "UPDATE tasks SET state_json = 'cancelled', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                params![task_id],
+            )?;
+            transaction.execute(
+                "UPDATE attempts SET state = 'cancelled', ended_at = CURRENT_TIMESTAMP,
+                     terminal_json = ?1
+                 WHERE id = (SELECT active_attempt_id FROM tasks WHERE id = ?2)",
+                params![terminal_json, task_id],
+            )?;
+            transaction.execute(
+                "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1 AND state = 'active'",
+                params![task_id],
+            )?;
+            transaction.execute(
+                "UPDATE application_root_attachments SET state = 'detached',
+                     detached_at = COALESCE(detached_at, CURRENT_TIMESTAMP)
+                 WHERE root_task_id = ?1 AND state = 'attached'",
+                params![task_id],
+            )?;
+            append_event(&transaction, &task, RuntimeEvent::TaskCancelled)?;
+            reclaimed += 1;
+        }
+        transaction.commit()?;
+        Ok(reclaimed)
+    }
+
     /// Persists a permission wait with the immutable request payload before an
     /// operator can see or resolve it.
     pub fn request_permission(
@@ -4274,6 +4409,19 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.commit()?;
     }
     Ok(())
+}
+
+/// The partial report a text-only worker left in its attempt's terminal JSON.
+///
+/// Mirrors the store's own decoder; kept local so the reclaim path does not
+/// reach across module boundaries for one field.
+fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
+    let payload = serde_json::from_str::<serde_json::Value>(terminal_json?).ok()?;
+    (payload.get("kind").and_then(serde_json::Value::as_str) == Some("text_completion"))
+        .then(|| payload.get("report").and_then(serde_json::Value::as_str))
+        .flatten()
+        .filter(|report| !report.trim().is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

@@ -785,6 +785,13 @@ pub enum TaskEvent {
     WorkerCompletedNoChanges {
         attempt_id: AttemptId,
     },
+    /// The child's agent loop hit its turn ceiling. Distinct from
+    /// [`Self::WorkerCompletedNoChanges`]: the child was cut off mid-task, so
+    /// the parent must not read the partial transcript as a finished report.
+    WorkerBudgetExhausted {
+        attempt_id: AttemptId,
+        kind: BudgetKind,
+    },
     WorkerFailed {
         attempt_id: AttemptId,
         failure: TaskFailure,
@@ -867,6 +874,7 @@ impl TaskEvent {
             | Self::WatchdogStalled { attempt_id, .. }
             | Self::WatchdogTimedOut { attempt_id, .. }
             | Self::WatchdogBudgetExhausted { attempt_id, .. }
+            | Self::WorkerBudgetExhausted { attempt_id, .. }
             | Self::RetryRequested { attempt_id } => attempt_id,
         }
     }
@@ -1091,7 +1099,8 @@ pub fn reduce(
         TaskEvent::WatchdogTimedOut { kind, .. } => {
             transition(task, TaskState::TimedOut(kind), now)?
         }
-        TaskEvent::WatchdogBudgetExhausted { kind, .. } => {
+        TaskEvent::WatchdogBudgetExhausted { kind, .. }
+        | TaskEvent::WorkerBudgetExhausted { kind, .. } => {
             transition(task, TaskState::BudgetExhausted(kind), now)?
         }
         TaskEvent::RetryRequested { .. } => {

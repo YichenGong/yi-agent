@@ -23,7 +23,7 @@
 | yi-agent-store | 0 / 1 | [详情](./yi-agent-store.md) |
 | yi-agent-runtime | 10 / 10 | [详情](./yi-agent-runtime.md) |
 | yi-agent-app-server | 16 / 16 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 20 / 27 | [详情](./subagent-runtime.md) |
+| subagent-runtime | 32 / 39 | [详情](./subagent-runtime.md) |
 | desktop | 19 / 33 | [详情](./desktop.md) |
 
 ## 已知问题

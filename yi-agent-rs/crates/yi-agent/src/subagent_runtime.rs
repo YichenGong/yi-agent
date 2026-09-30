@@ -663,9 +663,44 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             // generated text and streamed stdout are intentionally excluded.
                                             reporter.report_meaningful_progress();
                                         }
-                                        Some(AgentEvent::Done { .. }) | None => {
+                                        done @ (Some(AgentEvent::Done { .. }) | None) => {
+                                            // `None` is the stream ending, which is
+                                            // never a turn-budget stop; only an
+                                            // explicit MaxTurns done is.
+                                            let done_reason = match &done {
+                                                Some(AgentEvent::Done { reason }) => Some(reason),
+                                                _ => None,
+                                            };
                                             if pause_forwarded {
                                                 reporter.report_paused();
+                                                break 'run;
+                                            }
+                                            if matches!(
+                                                done_reason,
+                                                Some(yi_agent_core::agent::DoneReason::MaxTurns)
+                                            ) {
+                                                // The loop was cut off at its turn
+                                                // ceiling. Never dress the truncated
+                                                // transcript up as a finished report.
+                                                if workspace_mode == ChildWriteMode::Coding {
+                                                    match workspace_service.as_ref() {
+                                                        Some(service)
+                                                            if service
+                                                                .inspect_delivery(&workspace_for_delivery)
+                                                                .is_ok() =>
+                                                        {
+                                                            // Real work landed; the
+                                                            // delivery is the result.
+                                                            reporter
+                                                                .report_completed_without_delivery();
+                                                            break 'run;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                                reporter.report_budget_exhausted(
+                                                    assistant_report.trim(),
+                                                );
                                                 break 'run;
                                             }
                                             if let Some(next_prompt) = message_prompt.take() {
@@ -2457,6 +2492,120 @@ mod tests {
         };
         assert!(resumed_prompt.contains("Root session objective not specified."));
         assert!(!resumed_prompt.contains("RECOVERY_CONTROLLER"));
+    }
+
+    /// Always emits assistant text and then requests one more turn. With
+    /// `max_turns = 1` the loop is cut off right after the first turn, which is
+    /// exactly the shape that used to masquerade as a finished report.
+    struct AlwaysWorkingProvider;
+
+    #[async_trait]
+    impl Provider for AlwaysWorkingProvider {
+        async fn call_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            Ok(futures::stream::iter([
+                ProviderEvent::TextDelta("I was halfway through rewriting the parser when".into()),
+                ProviderEvent::ToolUseStart {
+                    id: "keep-going".into(),
+                    name: "noop".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "keep-going".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd {
+                    id: "keep-going".into(),
+                },
+                ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                },
+            ])
+            .boxed())
+        }
+    }
+
+    struct NoopTool;
+
+    #[async_trait]
+    impl yi_agent_core::Tool for NoopTool {
+        fn name(&self) -> &str {
+            "noop"
+        }
+
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+
+        fn description(&self) -> &str {
+            "Does nothing; keeps the worker issuing turns."
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> yi_agent_core::ToolResult {
+            yi_agent_core::ToolResult::text("ok")
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_stopped_by_its_turn_ceiling_reports_budget_exhaustion_not_completion() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(NoopTool));
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(AlwaysWorkingProvider),
+            Arc::new(tools),
+            AgentConfig {
+                max_turns: Some(1),
+                ..AgentConfig::default()
+            },
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Rewrite the parser.")
+            .with_workspace(worker_workspace(directory.path()))
+            .with_workspace_mode(ChildWriteMode::ReadOnly);
+        let handle = factory.start(request).await.unwrap();
+
+        // The loop stops before issuing a second turn, so no provider call waits
+        // on a timer here; the generous bound only guards against a hang.
+        let events = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let events = handle.take_events();
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WorkerEvent::BudgetExhausted { .. } | WorkerEvent::Completed { .. }
+                    )
+                }) {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker should report a terminal outcome");
+
+        match events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    WorkerEvent::BudgetExhausted { .. } | WorkerEvent::Completed { .. }
+                )
+            })
+            .expect("a terminal outcome event")
+        {
+            WorkerEvent::BudgetExhausted { report } => assert_eq!(
+                report, "I was halfway through rewriting the parser when",
+                "the partial transcript must survive as the report"
+            ),
+            WorkerEvent::Completed { report } => panic!(
+                "a turn-ceiling stop must not masquerade as a completion, got report {report:?}"
+            ),
+            other => panic!("unexpected terminal event: {other:?}"),
+        }
     }
 
     #[tokio::test]
