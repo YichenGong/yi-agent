@@ -135,7 +135,10 @@ Replace the body of `seed` and its doc comment:
   seed(threads: ThreadSummary[]): void {
     for (const t of threads) {
       const v = this.view(t.thread_id);
-      if (this.statusSource.get(t.thread_id) !== "live") v.status = t.status ?? "idle";
+      if (this.statusSource.get(t.thread_id) !== "live") {
+        v.status = t.status ?? "idle";
+        this.statusSource.set(t.thread_id, "snapshot");
+      }
       v.info = { cwd: t.cwd, model: t.model };
     }
   }
