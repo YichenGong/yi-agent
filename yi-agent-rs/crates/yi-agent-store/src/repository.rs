@@ -15,7 +15,7 @@ use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 11;
+const LATEST_SCHEMA_VERSION: i64 = 12;
 
 /// Grace period before a task with no application-root attachment at all is
 /// treated as unowned. An application root writes its attachment before it
@@ -405,6 +405,14 @@ impl RuntimeRepository {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// A read-only handle on the underlying connection so migration tests can
+    /// assert on the schema itself, without going through a read API that the
+    /// migration under test has not added yet.
+    #[cfg(test)]
+    pub(crate) fn connection_for_test(&self) -> &Connection {
+        &self.connection
     }
 
     /// Persists a validated schedule without coupling it to an interactive
@@ -4408,6 +4416,36 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
         transaction.commit()?;
     }
+
+    if current_version < 12 {
+        let transaction = connection.unchecked_transaction()?;
+        // A worker's trace lives apart from the audit `events` table: it is
+        // high-volume, prunable observation data, not durable history.
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_trace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS task_trace_task_id_idx ON task_trace_events(task_id, id);",
+        )?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // Null means the task belongs to no desktop conversation, which is
+            // every task that predates this column.
+            transaction.execute_batch("ALTER TABLE tasks ADD COLUMN thread_id TEXT;")?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -4429,4 +4467,79 @@ mod runtime_event_tests {
 
     #[test]
     fn recycle_events_round_trip_through_name_and_parse() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_twelve_adds_the_trace_table_and_thread_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        let repository = RuntimeRepository::open(&path).unwrap();
+
+        let connection = repository.connection_for_test();
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_trace_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
+
+        let has_thread_id: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_thread_id);
+        assert_eq!(LATEST_SCHEMA_VERSION, 12);
+    }
+
+    #[test]
+    fn a_version_eleven_database_gains_the_trace_table_and_thread_id() {
+        // The fresh-open test above never exercises the upgrade an existing
+        // install performs, so roll a database back to exactly the v11 shape
+        // and reopen it.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_trace_events;
+                 ALTER TABLE tasks DROP COLUMN thread_id;
+                 DELETE FROM schema_migrations WHERE version = 12;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 12);
+        let connection = repository.connection_for_test();
+        assert!(
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_trace_events')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "a v11 database must gain the trace table"
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "a v11 database must gain tasks.thread_id"
+        );
+    }
 }

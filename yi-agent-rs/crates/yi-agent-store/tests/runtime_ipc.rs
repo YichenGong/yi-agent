@@ -74,13 +74,13 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
             "DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11);",
+             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12);",
         )
         .unwrap();
     database
@@ -692,7 +692,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     for table in [
         "sessions",
         "tasks",
@@ -721,7 +721,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     // Rebuild the pre-v11 shape of the attachment table and roll the schema
@@ -739,7 +739,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                  detached_at TEXT
              );
-             DELETE FROM schema_migrations WHERE version = 11;",
+             DELETE FROM schema_migrations WHERE version IN (11, 12);",
         )
         .unwrap();
     database
@@ -754,7 +754,7 @@ fn a_version_10_database_is_migrated_to_the_current_schema() {
     let database = v10_database_without_workspace_root();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     let has_column: bool = Connection::open(&database)
         .unwrap()
         .query_row(
@@ -810,7 +810,7 @@ fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     assert!(
         repository
             .has_table("application_root_attachments")
@@ -2083,7 +2083,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -4997,7 +4997,7 @@ fn workspace_mode_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
