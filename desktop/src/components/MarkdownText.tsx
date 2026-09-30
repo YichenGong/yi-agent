@@ -52,3 +52,20 @@ export const MarkdownText = memo(
   },
   (prev, next) => prev.text === next.text,
 );
+
+/**
+ * 一条 agent 消息气泡（静态包装 + markdown）。整体 memo：
+ * `ChatView` 在流式期间每个 delta 都会重渲染，若只有内层 `MarkdownText` 被 memo，
+ * 外层包装 div 仍会被重建并参与 diff——定稿的历史消息因此被反复「重新渲染」，
+ * 白占主线程、饿死侧栏 spinner 的动画帧。按 `text` 判定即可：文本变了才需要重解析。
+ */
+export const AgentMessage = memo(
+  function AgentMessage({ text }: { text: string }) {
+    return (
+      <div className="my-1 max-w-[90%] self-start">
+        <MarkdownText text={text} />
+      </div>
+    );
+  },
+  (prev, next) => prev.text === next.text,
+);
