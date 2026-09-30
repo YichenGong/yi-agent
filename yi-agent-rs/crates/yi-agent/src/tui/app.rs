@@ -368,6 +368,14 @@ fn run_loop<B: Backend, E: EventSource>(
         );
         let final_history_area = final_layout.chunks[0];
 
+        // The width the draw will actually use, not the raw area width. The
+        // history renderer reserves its rightmost column for the scrollbar, and
+        // the cache is keyed by width, so applying events at the area width
+        // would re-render the whole scrollback at one width and then again at
+        // the other -- once per streamed token.
+        let draw_text_width =
+            history.text_width(final_history_area.width, final_history_area.height);
+
         for event in pending_events {
             let is_turn_end = matches!(
                 event,
@@ -395,20 +403,14 @@ fn run_loop<B: Backend, E: EventSource>(
             // （二者是相邻的两帧），但那样就依赖事件循环的批处理边界，一旦将来
             // 把一帧内的多个事件合并处理，退回的文本就会被回合结束分支抢先消费。
             // 顺序固定下来后，两种情形都安全。
-            apply_interjection_event(
-                &event,
-                &mut queued,
-                input,
-                history,
-                final_history_area.width,
-            );
-            history.push_event(event, final_history_area.width);
+            apply_interjection_event(&event, &mut queued, input, history, draw_text_width);
+            history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
             if is_turn_end {
                 if let Some(text) = queued.on_turn_end() {
                     let _ = input_tx.try_send(text.clone());
-                    history.push(HistoryCell::UserMessage { text }, final_history_area.width);
+                    history.push(HistoryCell::UserMessage { text }, draw_text_width);
                 }
             }
         }
@@ -4504,11 +4506,7 @@ mod tests {
         let narrow_history_area = narrow_layout.chunks[0];
         let narrow_text_width =
             history.text_width(narrow_history_area.width, narrow_history_area.height);
-        let mut before_resize = HistoryState {
-            cells: history.cells.clone(),
-            selected: None,
-            scroll_offset: 16,
-        };
+        let mut before_resize = HistoryState::from_cells(history.cells.clone(), 16);
         let wide_area = ratatui::layout::Rect::new(0, 0, 32, 14);
         let wide_layout = compute_layout(wide_area, &InputLine::new(), false, &None, 0);
         let wide_history_area = wide_layout.chunks[0];
@@ -4727,11 +4725,7 @@ mod tests {
             "wrapped history reserves a scrollbar column"
         );
 
-        let mut before = HistoryState {
-            cells: before_cells,
-            selected: None,
-            scroll_offset: 30,
-        };
+        let mut before = HistoryState::from_cells(before_cells, 30);
         // The loop first renders without a queue and clamps the deliberately
         // over-large starting offset before the queued preview appears.
         let prior_layout = compute_layout(area, &InputLine::new(), false, &None, 0);
@@ -4741,11 +4735,7 @@ mod tests {
         let anchor = before
             .capture_viewport_anchor(prior_text_width, prior_layout.chunks[0].height)
             .expect("the initial viewport is scrolled up");
-        let mut expected = HistoryState {
-            cells: history.cells.clone(),
-            selected: None,
-            scroll_offset: 0,
-        };
+        let mut expected = HistoryState::from_cells(history.cells.clone(), 0);
         expected.restore_viewport_anchor(anchor, final_text_width, final_history_area.height);
 
         assert_eq!(
@@ -6427,6 +6417,101 @@ mod tests {
                 KeyModifiers::CONTROL,
             )))))
         }
+    }
+
+    /// Delivers one streamed assistant token per frame, then quits.
+    struct StreamingTokenEvents {
+        agent_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for StreamingTokenEvents {
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let count = self.poll_count.get();
+            self.poll_count.set(count + 1);
+            if count < 4 {
+                let _ = self
+                    .agent_tx
+                    .try_send(AgentEvent::AssistantText(" more".into()));
+                return Ok(None);
+            }
+            Ok(Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+            ))))
+        }
+    }
+
+    /// A streamed token must re-render only the cell it changed.
+    ///
+    /// `run_loop` applies events at the width the draw will use, not the raw
+    /// area width. The history renderer reserves its rightmost column for the
+    /// scrollbar, and the cache is keyed by width, so applying events at the
+    /// area width used to re-render the whole scrollback once at each width,
+    /// i.e. twice per token.
+    #[test]
+    fn streaming_a_token_re_renders_only_the_changed_cell() {
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        const CELLS: usize = 30;
+        let mut history = HistoryState::new();
+        for index in 0..CELLS {
+            history.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("answer {index} with some words in it"),
+                },
+                79,
+            );
+        }
+        // Warm the cache the way a settled session would have it.
+        let warm_width = history.text_width(80, 6);
+        assert_eq!(warm_width, 79, "the fixture must overflow the viewport");
+        let _ = HistoryView {
+            state: &history,
+            width: 80,
+        }
+        .flattened_lines(warm_width);
+
+        let source = StreamingTokenEvents {
+            agent_tx,
+            poll_count: Cell::new(0),
+        };
+
+        crate::tui::cell::reset_lines_call_count();
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            std::env::temp_dir(),
+            yi_agent_mcp::McpManager::empty(),
+        )
+        .unwrap();
+
+        let renders = crate::tui::cell::lines_call_count();
+        assert!(
+            renders <= 8,
+            "streaming 4 tokens over {CELLS} cells re-rendered {renders} cells; \
+             it must re-render only the changed tail, not the whole scrollback"
+        );
     }
 
     /// Spawn a thread that sends `PermissionResolved` for `request_id` after
