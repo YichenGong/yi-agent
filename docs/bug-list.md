@@ -36,3 +36,4 @@
   App：app-server 无任何 `agent/` 方法（现有命名空间仅 `thread/`、`turn/`、`item/`、`workspace/`、`config/read`），`desktop/src/components/` 也无 subagent 入口。目标为对话框内给出可点击的 subagent 引用，点开先看进度，再可进入只读轨迹。
   两级语义一致（先摘要后轨迹），CLI 与 App 共用同一后端能力：需要新增「列出/订阅 child 会话事件」的 IPC 与 app-server 方法（现有仅有快照式 `InspectTask`）。
 - [ ]  希望有一个kanban能自动按照已经写好确认的spec 和 plan顺序执行。
+- [ ]  当前的文件变更，希望在同一个窗口里边就能看到它的变化，而不是需要去另外一个APP里边去找。
