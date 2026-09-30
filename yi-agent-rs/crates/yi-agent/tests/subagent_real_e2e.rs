@@ -235,17 +235,26 @@ fn await_direct_child(socket: &Path, run: &mut RealAgentRun) -> String {
         )
         .expect("list runtime tasks");
         if let IpcResponse::TaskSummaries { tasks } = response {
-            let children = tasks
-                .into_iter()
-                .filter(|task| !task.is_root)
-                .collect::<Vec<_>>();
-            if children.len() == 1 {
-                return children[0].task_id.clone();
+            // The root's DIRECT child is the one under review. A misbehaving
+            // root can also spawn a grandchild, so select by depth rather than
+            // by counting non-root tasks.
+            for task in tasks.into_iter().filter(|task| !task.is_root) {
+                let Ok(IpcResponse::TaskDetail(detail)) = send_request(
+                    socket,
+                    IpcRequest::InspectTask {
+                        task_id: task.task_id.clone(),
+                    },
+                ) else {
+                    continue;
+                };
+                if detail.depth == 1 {
+                    return task.task_id;
+                }
             }
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for one child task; runtime snapshot:\n{}",
+            "timed out waiting for the root's direct child; runtime snapshot:\n{}",
             task_snapshot(socket)
         );
         std::thread::sleep(Duration::from_millis(50));

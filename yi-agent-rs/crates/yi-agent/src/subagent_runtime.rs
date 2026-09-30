@@ -40,6 +40,9 @@ pub struct DaemonAgentWorkerFactory {
     sandbox: yi_agent_tools::SandboxMode,
     sandbox_writable_roots: Vec<PathBuf>,
     workspace_service: Option<Arc<DaemonWorkspaceService>>,
+    /// The single registry instance the coordinator registers into and workers
+    /// read from. Separate from the position provider so both sides share one map.
+    workspace_registry: Option<Arc<DaemonWorkspaceService>>,
     recovery_workspace: Option<PathBuf>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
 }
@@ -59,6 +62,7 @@ impl DaemonAgentWorkerFactory {
             sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
             sandbox_writable_roots: Vec::new(),
             workspace_service: None,
+            workspace_registry: None,
             recovery_workspace: None,
             catalog: None,
         }
@@ -87,7 +91,8 @@ impl DaemonAgentWorkerFactory {
     /// Configures the Git repository from which task worktrees are created.
     pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
         self.recovery_workspace = Some(workspace.clone());
-        self.workspace_service = Some(Arc::new(DaemonWorkspaceService::new(workspace)));
+        self.workspace_service = Some(Arc::new(DaemonWorkspaceService::new(workspace.clone())));
+        self.workspace_registry = Some(Arc::new(DaemonWorkspaceService::new(workspace)));
         self
     }
 
@@ -282,9 +287,18 @@ impl DaemonWorkspaceService {
             .inspect_workdir(&workspace.path, &workspace.base_commit)
             .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
         let head_commit = delivery.head_commit.clone();
+        // The base ref is the branch the workdir is on: a delivery is `that
+        // branch` at `head_commit`. `parent_branch` is empty for an observed
+        // workdir, so using it here would leave the delivery without a base and
+        // the reducer would reject it as invalid evidence.
+        let base_ref = if delivery.branch.trim().is_empty() {
+            workspace.branch.clone()
+        } else {
+            delivery.branch.clone()
+        };
         Ok(DeliveryReport::coding(
             head_commit,
-            workspace.parent_branch.clone(),
+            base_ref,
             workspace.lease_id.clone(),
             serde_json::json!({
                 "kind": "clean_delivery",
@@ -341,14 +355,26 @@ impl WorkerWorkspaceProvider for DaemonWorkspaceService {
         task_id: &TaskId,
         workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        // The runtime resolves the path here; the parent already created the
-        // directory, so a miss is a caller error, not a provisioning request.
-        WorkerWorkspaceRegistry::prepared_workspace_for_workdir(self, workdir).ok_or_else(|| {
-            WorkerError::Startup(format!(
+        // The parent already created the directory and the coordinator recorded
+        // it; resolve the recorded position, and fall back to probing the workdir
+        // itself when this instance holds no record (a different instance than
+        // the one the spawn registered into). A workdir the parent never created
+        // is still refused.
+        if let Some(workspace) =
+            WorkerWorkspaceRegistry::prepared_workspace_for_workdir(self, workdir)
+        {
+            return Ok(workspace);
+        }
+        let canonical = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        if !canonical.is_dir() {
+            return Err(WorkerError::Startup(format!(
                 "no prepared workspace for workdir {}; the parent must prepare it before spawning {task_id}",
                 workdir.display()
-            ))
-        })
+            )));
+        }
+        self.register_workdir(&canonical)
     }
 }
 
@@ -426,7 +452,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
     }
 
     fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
-        self.workspace_service
+        // One registry instance for the whole daemon: the coordinator registers a
+        // parent-prepared workdir here, and the worker-start read must reach the
+        // same map. The per-project position provider stays separate.
+        self.workspace_registry
             .as_ref()
             .map(|service| service.clone() as Arc<dyn WorkerWorkspaceRegistry>)
     }
@@ -2636,7 +2665,9 @@ mod tests {
         .expect("worker should complete and report a delivery");
 
         assert_eq!(delivery.commit, head);
-        assert_eq!(delivery.base_ref, workspace.parent_branch);
+        // The base ref is the workdir's own branch: a workdir the parent
+        // prepared carries no separate parent branch.
+        assert_eq!(delivery.base_ref, workspace.branch);
         assert_eq!(delivery.workspace, workspace.lease_id);
     }
 

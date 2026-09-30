@@ -159,9 +159,13 @@ impl WorkerWorkspaceProvider for StaticWorkspaceService {
     fn workspace_in(
         &self,
         _task_id: &TaskId,
-        _workdir: &std::path::Path,
+        workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        Ok(self.workspace.clone())
+        // The parent chose this directory; the position is exactly it.
+        Ok(WorkerWorkspace {
+            path: workdir.to_path_buf(),
+            ..self.workspace.clone()
+        })
     }
 
     fn read_only_workspace(
@@ -3702,6 +3706,64 @@ async fn mode_only_changes_write_access_not_the_directory() {
     );
     assert_eq!(started.workspace_mode, ChildWriteMode::ReadOnly);
     assert!(!project_root.join(".worktrees").exists());
+}
+
+#[tokio::test]
+async fn a_relative_workdir_resolves_against_the_parents_position() {
+    // A parent typically says `workdir: "."` or names a subdirectory. The daemon
+    // must resolve that against the parent's own workdir, not its own cwd.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let project_root = directory.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let child_dir = project_root.join("sub");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    let service = Arc::new(StaticWorkspaceService {
+        workspace: WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: project_root.clone(),
+            path: project_root.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        },
+    });
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "implement".into(),
+            ChildWriteMode::Coding,
+            None,
+            Some(std::path::PathBuf::from("sub")),
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let starts = factory.starts.lock().unwrap();
+    let child_start = starts
+        .iter()
+        .find(|start| start.task_id == child)
+        .expect("the coding child started");
+    assert_eq!(
+        child_start
+            .workspace
+            .as_ref()
+            .map(|workspace| &workspace.path),
+        Some(&child_dir),
+        "a relative workdir is resolved against the parent's position"
+    );
 }
 
 #[tokio::test]

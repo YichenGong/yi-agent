@@ -1170,6 +1170,11 @@ impl RuntimeCoordinator {
             return Err(RuntimeCoordinatorError::QueueCapacityExceeded);
         }
         let supervisor = self.supervisor(session)?;
+        // A parent names the directory from its own position, so a relative
+        // workdir resolves against the parent's workdir, not the daemon's cwd
+        // (which is unrelated to any task). Resolving before the spawn means the
+        // supervisor stores the absolute path worker start will look up.
+        let workdir = workdir.map(|workdir| self.resolve_parent_workdir(parent, &workdir));
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(
@@ -1230,6 +1235,17 @@ impl RuntimeCoordinator {
             supervisor.lock().await.set_model(&child, model);
         }
         Ok(child)
+    }
+
+    /// Resolves a spawn `workdir` the way the parent meant it: an absolute path
+    /// stands alone, a relative one is taken from the parent task's own workdir.
+    fn resolve_parent_workdir(&self, parent: &TaskId, workdir: &Path) -> PathBuf {
+        if workdir.is_absolute() {
+            return workdir.to_path_buf();
+        }
+        self.remembered_task_position(parent)
+            .map(|position| position.path.join(workdir))
+            .unwrap_or_else(|| workdir.to_path_buf())
     }
 
     /// Performs non-blocking scheduler admission after the task has been
