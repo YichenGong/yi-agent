@@ -27,6 +27,10 @@
 - **前端不改动 `desktop/src-tauri/`**：桌面端是纯帧桥接，新增能力只走 app-server 的 JSON-RPC。
 - **保留上限是硬要求**：每任务轨迹 ≤ 2000 行，终态后 24 小时清理。不允许无上限增长。
 
+- **命名消歧**：本特性的「轨迹（trace）」指子 agent 的消息/工具流（`task_trace_events`、
+  `TraceFact`），与既有的 `~/.yi-agent/trace/`（`crates/yi-agent/src/tracing_init.rs` 写的
+  诊断日志 `session-*.jsonl`）**毫无关系**，勿混淆，也不要复用那个目录。
+
 **仓内既有测试基建（本计划的测试示例引用它们，不要新造）：**
 
 - 建任务：`RuntimeRepository::create_task_with_attempt(&task, &session, &attempt, 1, "running")`
