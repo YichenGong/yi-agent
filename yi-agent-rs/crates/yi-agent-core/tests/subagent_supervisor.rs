@@ -375,6 +375,32 @@ async fn spawn_tool_parses_optional_mode_and_rejects_invalid_values() {
     );
 }
 
+#[tokio::test]
+async fn supervisor_drains_trace_facts_keyed_by_task() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+
+    handle.report_trace(yi_agent_core::subagent::trace::TraceFact::StateNote {
+        note: "running".into(),
+    });
+
+    let drained = supervisor.take_worker_trace_events();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].0, child);
+    assert_eq!(
+        drained[0].1,
+        yi_agent_core::subagent::trace::TraceFact::StateNote {
+            note: "running".into()
+        }
+    );
+    // Draining is destructive: a second call yields nothing.
+    assert!(supervisor.take_worker_trace_events().is_empty());
+}
+
 struct ImmediateWorkerFactory;
 
 impl AgentWorkerFactory for ImmediateWorkerFactory {
