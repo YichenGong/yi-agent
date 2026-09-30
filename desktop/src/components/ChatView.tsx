@@ -1,7 +1,54 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
-import { MarkdownText } from "./MarkdownText";
+import { AgentMessage } from "./MarkdownText";
 import { ToolCallCard } from "./ToolCallCard";
+
+/**
+ * `ToolCallCard` memoized on its `item` prop.
+ *
+ * `Session.apply` replaces the slot with a *new* item object when a tool call
+ * starts or completes, so identity is a sound signal here: the same object means
+ * the card cannot have changed. Without this boundary every streamed text delta
+ * re-rendered every settled tool card (re-serializing its JSON with
+ * `JSON.stringify(item.input, null, 2)`), which is unbounded work that grows with
+ * the transcript and competes with the sidebar spinner for the main thread.
+ */
+const ToolCallRow = memo(ToolCallCard);
+
+/**
+ * One transcript item.
+ *
+ * The memo boundary sits on the *leaf* components and their value props, not on
+ * the item object: `item/delta` mutates the trailing agent message **in place**,
+ * so a memo keyed on object identity would never see the text change and the
+ * streamed reply would freeze. Passing `text` (a primitive) lets React's default
+ * shallow prop comparison notice the change while leaving every other message —
+ * whose text did not move — untouched.
+ */
+function ChatItem({ item }: { item: Item }) {
+  switch (item.type) {
+    case "userMessage":
+      return (
+        <div className="my-1 max-w-[80%] self-end rounded-lg bg-blue-600 px-3 py-2 text-sm whitespace-pre-wrap text-white">
+          {item.text}
+        </div>
+      );
+    case "agentMessage":
+      return <AgentMessage text={item.text} />;
+    case "toolCall":
+      return <ToolCallRow item={item} />;
+    default: {
+      // Defensive: the server sent an item type this build does not know
+      // about. Surface it rather than silently dropping the item.
+      const unknown = item as { type?: string };
+      return (
+        <div className="my-1 font-mono text-xs text-neutral-500">
+          [unsupported item type: {unknown.type ?? "unknown"}]
+        </div>
+      );
+    }
+  }
+}
 
 export function ChatView({
   items,
@@ -28,37 +75,11 @@ export function ChatView({
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto px-4 py-3">
-      {items.map((item, index) => {
-        switch (item.type) {
-          case "userMessage":
-            return (
-              <div
-                key={item.id}
-                className="my-1 max-w-[80%] self-end rounded-lg bg-blue-600 px-3 py-2 text-sm whitespace-pre-wrap text-white"
-              >
-                {item.text}
-              </div>
-            );
-          case "agentMessage":
-            return (
-              <div key={item.id} className="my-1 max-w-[90%] self-start">
-                <MarkdownText text={item.text} />
-              </div>
-            );
-          case "toolCall":
-            return <ToolCallCard key={item.id} item={item} />;
-          default: {
-            // Defensive: the server sent an item type this build does not know
-            // about. Surface it rather than silently dropping the item.
-            const unknown = item as { type?: string };
-            return (
-              <div key={index} className="my-1 font-mono text-xs text-neutral-500">
-                [unsupported item type: {unknown.type ?? "unknown"}]
-              </div>
-            );
-          }
-        }
-      })}
+      {items.map((item, index) => (
+        // `index` is only a fallback key for defensive unknown-type items; every
+        // known item carries a stable protocol `id`.
+        <ChatItem key={item.id ?? index} item={item} />
+      ))}
       {retrying && (
         <div className="my-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
           {retrying.cause === "request_timeout"

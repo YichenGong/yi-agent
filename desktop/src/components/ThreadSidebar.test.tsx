@@ -33,7 +33,7 @@ const groups: WorkspaceGroup[] = [
   },
 ];
 
-function renderSidebar(overrides: Partial<ComponentProps<typeof ThreadSidebar>> = {}) {
+function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> = {}) {
   const props: ComponentProps<typeof ThreadSidebar> = {
     groups,
     workspaces: [],
@@ -48,7 +48,11 @@ function renderSidebar(overrides: Partial<ComponentProps<typeof ThreadSidebar>> 
     onBrowse: vi.fn(),
     ...overrides,
   };
-  return render(<ThreadSidebar {...props} />);
+  return props;
+}
+
+function renderSidebar(overrides: Partial<ComponentProps<typeof ThreadSidebar>> = {}) {
+  return render(<ThreadSidebar {...sidebarProps(overrides)} />);
 }
 
 const newThreadTrigger = (container: HTMLElement) =>
@@ -313,14 +317,21 @@ describe("ThreadSidebar drag hygiene", () => {
 });
 
 describe("ThreadSidebar status", () => {
-  it("shows a spinner for a running thread", () => {
+  it("shows a spinning badge for a running thread", () => {
     const { container } = renderSidebar({ statuses: new Map([["1", "running"]]) });
-    expect(container.querySelector('[aria-label="Running"]')).not.toBeNull();
+    const badge = container.querySelector('[aria-label="Thread status"]')!;
+    expect(badge.getAttribute("data-status")).toBe("running");
+    expect(badge.className).toContain("animate-spin");
   });
 
-  it("shows an awaiting-approval badge", () => {
+  it("shows an amber badge for an awaiting-approval thread", () => {
     const { container } = renderSidebar({ statuses: new Map([["1", "awaiting_approval"]]) });
-    expect(container.querySelector('[aria-label="Awaiting approval"]')).not.toBeNull();
+    const badge = container.querySelector('[aria-label="Thread status"]')!;
+    expect(badge.getAttribute("data-status")).toBe("awaiting_approval");
+    expect(badge.className).toContain("bg-amber-400");
+    // The animation must stay applied across states: dropping and re-adding it
+    // recreates the CSS animation and resets its timeline.
+    expect(badge.className).toContain("animate-spin");
   });
 
   it("shows an unread dot and clears it when the thread is current", () => {
@@ -367,9 +378,26 @@ describe("ThreadSidebar status", () => {
     );
   });
 
+  it("keeps the running badge mounted across a status flip", () => {
+    const props = sidebarProps({ statuses: new Map([["1", "running"]]) });
+    const { container, rerender } = render(<ThreadSidebar {...props} />);
+    const running = container.querySelector('[aria-label="Thread status"]')!;
+    expect(running).not.toBeNull();
+
+    // A tool call asks for approval, then the user allows it: running →
+    // awaiting_approval → running. Unmounting the badge in between restarts its
+    // CSS animation, which reads as "plays a short segment then loops".
+    rerender(<ThreadSidebar {...props} statuses={new Map([["1", "awaiting_approval"]])} />);
+    expect(container.querySelector('[aria-label="Thread status"]')!.getAttribute("data-status")).toBe(
+      "awaiting_approval",
+    );
+
+    rerender(<ThreadSidebar {...props} statuses={new Map([["1", "running"]])} />);
+    expect(container.querySelector('[aria-label="Thread status"]')).toBe(running);
+  });
+
   it("renders no status badge for an idle thread", () => {
     const { container } = renderSidebar({ statuses: new Map([["1", "idle"]]) });
-    expect(container.querySelector('[aria-label="Running"]')).toBeNull();
-    expect(container.querySelector('[aria-label="Awaiting approval"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Thread status"]')).toBeNull();
   });
 });

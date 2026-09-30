@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
@@ -22,6 +22,45 @@ function unreadDotClass(status: TurnStatus): string {
   if (status === "interrupted") return "bg-neutral-400";
   return "bg-blue-400";
 }
+
+/**
+ * The per-thread status badge.
+ *
+ * `running` and `awaiting_approval` must render the *same* element. The server
+ * flips a thread through running → awaiting_approval → running once per
+ * permission prompt; two mutually exclusive elements would unmount/remount the
+ * node on every flip, restarting the CSS animation from `currentTime = 0`. That
+ * restart is what makes the spinner look like it "plays a short segment then
+ * loops". One span, class-only variation, keeps the animation timeline intact.
+ *
+ * `memo` compares the semantic status only: `App` rebuilds the `statuses` Map on
+ * every notification, so a default (identity) comparison would never hit.
+ */
+export const StatusBadge = memo(
+  function StatusBadge({ status }: { status: ThreadStatus }) {
+    if (status === "idle") return null;
+    // `animate-spin` stays applied in *both* states on purpose. Removing it while
+    // awaiting approval (and re-adding it afterwards) drops and recreates the
+    // CSS animation, resetting `currentTime` — the very "plays a short segment
+    // then loops" symptom. A rotating perfect circle is visually static, so the
+    // amber dot loses nothing by keeping the animation alive, and the timeline
+    // survives the whole running → awaiting_approval → running flip.
+    return (
+      <span
+        role="img"
+        aria-label="Thread status"
+        data-status={status}
+        title={status === "running" ? "Running" : "Awaiting approval"}
+        className={`shrink-0 animate-spin rounded-full ${
+          status === "running"
+            ? "size-3 border-2 border-neutral-600 border-t-neutral-300"
+            : "size-2 bg-amber-400"
+        }`}
+      />
+    );
+  },
+  (prev, next) => prev.status === next.status,
+);
 
 export function ThreadSidebar({
   groups,
@@ -183,20 +222,7 @@ export function ThreadSidebar({
           <>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
-                {st === "running" && (
-                  <span
-                    role="img"
-                    aria-label="Running"
-                    className="size-3 shrink-0 animate-spin rounded-full border-2 border-neutral-600 border-t-neutral-300"
-                  />
-                )}
-                {st === "awaiting_approval" && (
-                  <span
-                    role="img"
-                    aria-label="Awaiting approval"
-                    className="size-2 shrink-0 rounded-full bg-amber-400"
-                  />
-                )}
+                <StatusBadge status={st} />
                 <div
                   className="truncate"
                   title={t.title ?? t.thread_id}
