@@ -2242,6 +2242,20 @@ mod tests {
     }
 
     #[test]
+    fn a_workdir_outside_any_repository_is_still_accepted() {
+        // A non-git directory has no repository root to fall back to, yet a
+        // position must still resolve: the workdir itself is the position.
+        let directory = TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+
+        let workspace = service
+            .read_only_workspace(None, &TaskId::new())
+            .expect("a non-git workdir still gets an in-place position");
+
+        assert_eq!(workspace.path, directory.path());
+    }
+
+    #[test]
     fn registry_round_trips_a_prepared_workdir_to_its_workspace() {
         let directory = TempDir::new().unwrap();
         let repository = directory.path().join("repository");

@@ -1672,11 +1672,19 @@ mod tests {
     }
 
     #[test]
-    fn default_system_prompt_requires_parent_integration_of_deliveries() {
+    fn default_system_prompt_requires_a_workdir_for_isolation() {
         let prompt = yi_agent_core::AgentConfig::default_system_prompt();
         assert!(
+            prompt.contains("git worktree add"),
+            "default prompt must tell a parent to prepare an isolated workdir"
+        );
+        assert!(
+            prompt.contains("workdir"),
+            "default prompt must name the spawn_agent workdir argument"
+        );
+        assert!(
             prompt.contains("git merge --no-ff"),
-            "default prompt must instruct parents to merge delivered commits"
+            "default prompt must still tell parents to integrate the delivered commit"
         );
     }
 

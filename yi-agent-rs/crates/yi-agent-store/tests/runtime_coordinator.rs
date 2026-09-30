@@ -163,6 +163,15 @@ impl WorkerWorkspaceProvider for StaticWorkspaceService {
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(self.workspace.clone())
     }
+
+    fn read_only_workspace(
+        &self,
+        _parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        // Read-only runs in the same place; the mode never changes a position.
+        Ok(self.workspace.clone())
+    }
 }
 
 /// The prepared-workspace lookup the runtime consults for a parent-chosen
@@ -174,6 +183,15 @@ impl WorkerWorkspaceRegistry for StaticWorkspaceService {
 
     fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace> {
         (self.workspace.path == workdir).then(|| self.workspace.clone())
+    }
+
+    fn observe_workdir(&self, workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
+        // A prepared directory is observed as-is: the parent made it, the daemon
+        // only reads its position.
+        Ok(WorkerWorkspace {
+            path: workdir.to_path_buf(),
+            ..self.workspace.clone()
+        })
     }
 }
 
@@ -334,10 +352,10 @@ impl WorkerWorkspaceProvider for NonGitWorkspaceService {
 
 #[derive(Clone)]
 struct WorkspaceObservingFactory {
-    database: std::path::PathBuf,
     starts: Arc<Mutex<Vec<WorkerStart>>>,
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
     workspace_service: Arc<dyn WorkerWorkspaceProvider>,
+    workspace_registry: Option<Arc<dyn WorkerWorkspaceRegistry>>,
 }
 
 impl AgentWorkerFactory for WorkspaceObservingFactory {
@@ -351,6 +369,10 @@ impl AgentWorkerFactory for WorkspaceObservingFactory {
 
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::clone(&self.workspace_service))
+    }
+
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
+        self.workspace_registry.clone()
     }
 
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
@@ -574,12 +596,12 @@ async fn worker_receives_its_assigned_workspace_before_provider_start() {
     let starts = Arc::new(Mutex::new(Vec::new()));
     let handles = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(WorkspaceObservingFactory {
-        database: database.clone(),
         starts: Arc::clone(&starts),
         handles,
         workspace_service: Arc::new(StaticWorkspaceService {
             workspace: workspace.clone(),
         }),
+        workspace_registry: None,
     });
     let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
     let session = coordinator.create_session().unwrap();
@@ -602,12 +624,12 @@ async fn child_recovery_context_uses_the_in_memory_workspace_assignment() {
     let starts = Arc::new(Mutex::new(Vec::new()));
     let handles = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(WorkspaceObservingFactory {
-        database: database.clone(),
         starts: Arc::clone(&starts),
         handles: Arc::clone(&handles),
         workspace_service: Arc::new(DerivedWorkspaceService {
             repository_root: directory.path().join("repo"),
         }),
+        workspace_registry: None,
     });
     let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
     let session = coordinator.create_session().unwrap();
@@ -652,12 +674,12 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
     let starts = Arc::new(Mutex::new(Vec::new()));
     let handles = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(WorkspaceObservingFactory {
-        database: database.clone(),
         starts: Arc::clone(&starts),
         handles: Arc::clone(&handles),
         workspace_service: Arc::new(DerivedWorkspaceService {
             repository_root: directory.path().join("repo"),
         }),
+        workspace_registry: None,
     });
     let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
     let session = coordinator.create_session().unwrap();
@@ -704,10 +726,10 @@ async fn workspace_provisioning_failure_is_terminal_before_provider_start() {
     let starts = Arc::new(Mutex::new(Vec::new()));
     let handles = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(WorkspaceObservingFactory {
-        database: database.clone(),
         starts: Arc::clone(&starts),
         handles,
         workspace_service: Arc::new(FailingWorkspaceService),
+        workspace_registry: None,
     });
     let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
     let session = coordinator.create_session().unwrap();
@@ -3588,6 +3610,98 @@ async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
         !prepared.join(".worktrees").exists(),
         "no worktree was created"
     );
+}
+
+#[tokio::test]
+async fn a_root_runs_in_the_project_directory_without_creating_a_worktree() {
+    let directory = TempDir::new().unwrap();
+    let project_root = directory.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(WorkspaceObservingFactory {
+        starts: Arc::clone(&starts),
+        handles: Arc::new(Mutex::new(Vec::new())),
+        workspace_service: Arc::new(StaticWorkspaceService {
+            workspace: WorkerWorkspace {
+                lease_id: WorkspaceLeaseId::new(),
+                repository_root: project_root.clone(),
+                path: project_root.clone(),
+                branch: String::new(),
+                parent_branch: String::new(),
+                base_commit: String::new(),
+            },
+        }),
+        workspace_registry: None,
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let starts = starts.lock().unwrap();
+    assert_eq!(
+        starts[0]
+            .workspace
+            .as_ref()
+            .map(|workspace| &workspace.path),
+        Some(&project_root),
+        "a root runs in the project directory itself"
+    );
+    assert!(!project_root.join(".worktrees").exists());
+}
+
+#[tokio::test]
+async fn mode_only_changes_write_access_not_the_directory() {
+    let directory = TempDir::new().unwrap();
+    let project_root = directory.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(StaticWorkspaceService {
+        workspace: WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: project_root.clone(),
+            path: project_root.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        },
+    });
+    let factory = Arc::new(WorkspaceObservingFactory {
+        starts: Arc::clone(&starts),
+        handles: Arc::new(Mutex::new(Vec::new())),
+        workspace_service: service.clone() as Arc<dyn WorkerWorkspaceProvider>,
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    // The parent handed over a workdir; the mode alone must not change where
+    // the child runs.
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "audit".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            Some(project_root.clone()),
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let starts = starts.lock().unwrap();
+    let started = starts.iter().find(|start| start.task_id == child).unwrap();
+    assert_eq!(
+        started.workspace.as_ref().map(|workspace| &workspace.path),
+        Some(&project_root),
+        "a read-only child still runs in its position, not a generated directory"
+    );
+    assert_eq!(started.workspace_mode, ChildWriteMode::ReadOnly);
+    assert!(!project_root.join(".worktrees").exists());
 }
 
 #[tokio::test]

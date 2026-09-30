@@ -54,7 +54,7 @@ workspace、校验交付、自动验收、自动回收。
 
 ### 3.3 子任务工作目录显式传入
 
-- `spawn_agent` 新增必填参数 `workdir`。
+- `spawn_agent` 新增参数 `workdir`（可选；缺省时子任务落在原地目录）。
 - 父 agent 需要隔离时自己执行 `git worktree add <path> -b <branch>`，
   再把 `<path>` 作为 `workdir` 传给子任务。
 - 子任务工具 root 在该路径；子任务不再自己建目录，也不再被分配分支。

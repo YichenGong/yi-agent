@@ -479,4 +479,23 @@ fn real_subagent_configuration_skips_without_keys_or_runs_without_leaking_key() 
         std::fs::read_to_string(fixture.repository.join("README.md")).unwrap(),
         "real subagent fixture\n"
     );
+    // Spec §7: the daemon creates no root worktree, and the checkout the run
+    // started in is left exactly as it was found.
+    let root_worktrees = fixture.repository.join(".worktrees");
+    assert!(
+        !root_worktrees.exists()
+            || std::fs::read_dir(&root_worktrees)
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("yi-agent-")),
+        "a subagent run must not leave a daemon-created root worktree"
+    );
+    assert_eq!(
+        git(&fixture.repository, &["status", "--porcelain"]),
+        "",
+        "the project checkout must be clean after the run"
+    );
 }
