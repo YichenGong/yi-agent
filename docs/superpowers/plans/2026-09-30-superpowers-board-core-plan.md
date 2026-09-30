@@ -23,9 +23,10 @@
 - 提交信息用 conventional commits，**不写** `Co-Authored-By`。
 - 每个任务结束时 `cargo fmt` + `cargo test` 必须通过。
 
-> **Spec 状态机补遗（本计划引入）：** spec §6 的状态表缺少 `Paused` 与 `Cancelled`，但 §10 明确要求"暂停/恢复、取消"操作。因此本计划的状态集为 8 个：
+> **Spec 状态机补遗（本计划引入，spec 已同步）：** spec §6 的状态表原缺 `Paused` 与
+> `Cancelled`，但 §10 明确要求"暂停/恢复、取消"操作。因此本计划的状态集为 8 个：
 > `Queued`、`Running`、`NeedsYou`、`AwaitingMerge`、`Failed`、`Done`、`Paused`、`Cancelled`。
-> 需同步在 spec §6 补这两行（占用槽位均为"否"）。
+> **spec §6 已于本计划落地时补齐这两行（占用槽位均为"否"），spec 与实现现已一致。**
 
 ---
 ## 文件结构
