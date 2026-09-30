@@ -2492,8 +2492,8 @@ impl RuntimeCoordinator {
                 )
             })?;
         let inspected_commit = if let Some(workspace) = preview_workspace.as_ref() {
-            if let Some(service) = self.workspace_service.as_ref() {
-                service
+            if let Some(registry) = self.factory.worker_workspace_registry() {
+                registry
                     .inspect_delivery(workspace)
                     .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
                     .commit

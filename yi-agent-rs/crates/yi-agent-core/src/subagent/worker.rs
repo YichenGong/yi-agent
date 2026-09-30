@@ -514,15 +514,6 @@ pub trait WorkerWorkspaceProvider: Send + Sync {
         ))
     }
 
-    fn inspect_delivery(
-        &self,
-        _workspace: &WorkerWorkspace,
-    ) -> Result<DeliveryReport, WorkerError> {
-        Err(WorkerError::Startup(
-            "coding workspace service does not support delivery inspection".into(),
-        ))
-    }
-
     fn cleanup_prepared(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
         Ok(())
     }
@@ -596,6 +587,16 @@ pub trait WorkerWorkspaceRegistry: Send + Sync {
 
     /// Returns the workspace for `workdir`, when one was prepared.
     fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace>;
+
+    /// Reads a workspace's delivery, probing its directory rather than a
+    /// daemon-managed worktree. The numbers a review needs (head, branch,
+    /// cleanliness) all come from the workdir itself.
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        let _ = workspace;
+        Err(WorkerError::Startup(
+            "workspace registry cannot inspect deliveries".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Default)]

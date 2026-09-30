@@ -284,29 +284,6 @@ impl WorkerWorkspaceProvider for GitWorkspaceService {
         })
     }
 
-    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
-        let status = git_output(&workspace.path, &["status", "--porcelain"])?;
-        if !status.is_empty() {
-            return Err(WorkerError::Startup(
-                "Git workspace error: dirty child".into(),
-            ));
-        }
-        let head = git_output(&workspace.path, &["rev-parse", "HEAD"])?
-            .trim()
-            .to_owned();
-        if head == workspace.base_commit {
-            return Err(WorkerError::Startup(
-                "Git workspace error: empty delivery".into(),
-            ));
-        }
-        Ok(DeliveryReport::coding(
-            head,
-            workspace.parent_branch.clone(),
-            workspace.lease_id.clone(),
-            "inspected delivery",
-        ))
-    }
-
     fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
         let _ = Command::new("git")
             .args([
@@ -395,6 +372,42 @@ impl WorkerWorkspaceProvider for GitWorkspaceService {
 /// Models a non-git application root: read-only provisioning works in place,
 /// while any coding request must be rejected by the coordinator before the
 /// service is asked for a worktree.
+/// Inspection is the registry's concern, so the double mirrors production: the
+/// provider resolves positions, the registry reports deliveries.
+impl WorkerWorkspaceRegistry for GitWorkspaceService {
+    fn register_prepared(&self, _workspace: &WorkerWorkspace) {}
+
+    fn prepared_workspace_for_workdir(
+        &self,
+        _workdir: &std::path::Path,
+    ) -> Option<WorkerWorkspace> {
+        None
+    }
+
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        let status = git_output(&workspace.path, &["status", "--porcelain"])?;
+        if !status.is_empty() {
+            return Err(WorkerError::Startup(
+                "Git workspace error: dirty child".into(),
+            ));
+        }
+        let head = git_output(&workspace.path, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        if head == workspace.base_commit {
+            return Err(WorkerError::Startup(
+                "Git workspace error: empty delivery".into(),
+            ));
+        }
+        Ok(DeliveryReport::coding(
+            head,
+            workspace.parent_branch.clone(),
+            workspace.lease_id.clone(),
+            "inspected delivery",
+        ))
+    }
+}
+
 #[derive(Clone)]
 struct NonGitWorkspaceService {
     repository_root: std::path::PathBuf,
@@ -1394,8 +1407,10 @@ async fn review_confirmation_rejects_a_delivery_head_change_between_preview_and_
     let repository_root = directory.path().join("repo");
     std::fs::create_dir(&repository_root).unwrap();
     initialize_git_repository(&repository_root);
+    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
     let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
         ..Default::default()
     });
     let (coordinator, _session, _parent, child, _delivery) =
@@ -4010,8 +4025,10 @@ async fn read_only_child_runs_in_place_without_a_workspace_row() {
     let repository_root = directory.path().join("repo");
     std::fs::create_dir(&repository_root).unwrap();
     initialize_git_repository(&repository_root);
+    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
     let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
         ..Default::default()
     });
     let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();

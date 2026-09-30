@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use yi_agent_core::subagent::task::{DeliveryReport, TaskId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
-    WorkerWorkspace, WorkerWorkspaceProvider,
+    WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, IpcReviewDecision, send_request};
 
@@ -49,15 +49,6 @@ impl WorkerWorkspaceProvider for DeliveryFactory {
         Ok(position)
     }
 
-    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
-        Ok(DeliveryReport::coding(
-            "deadbeef",
-            "main",
-            workspace.lease_id.clone(),
-            "verified",
-        ))
-    }
-
     fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
         // Mirror the production service: the rebuild path exists because a
         // reclaimed worktree keeps its row but loses its directory, so the
@@ -79,8 +70,32 @@ fn workspace(root: &yi_agent_core::RootSessionId, task: &yi_agent_core::TaskId) 
     }
 }
 
+impl WorkerWorkspaceRegistry for DeliveryFactory {
+    fn register_prepared(&self, _workspace: &WorkerWorkspace) {}
+
+    fn prepared_workspace_for_workdir(
+        &self,
+        _workdir: &std::path::Path,
+    ) -> Option<WorkerWorkspace> {
+        None
+    }
+
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        Ok(DeliveryReport::coding(
+            "deadbeef",
+            "main",
+            workspace.lease_id.clone(),
+            "verified",
+        ))
+    }
+}
+
 impl AgentWorkerFactory for DeliveryFactory {
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
         Some(Arc::new(self.clone()))
     }
     fn recovery_context(&self) -> WorkerRecoveryContext {

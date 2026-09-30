@@ -281,14 +281,12 @@ impl DaemonWorkspaceService {
         &self,
         workspace: &WorkerWorkspace,
     ) -> Result<DeliveryReport, WorkerError> {
+        // The parent prepared this directory; the daemon only reports on it, so
+        // a plain workdir probe replaces the former daemon-managed-worktree
+        // inspection.
         let delivery = self
             .service
-            .inspect_delivery(&yi_agent_tools::worktree::ChildWorktree {
-                path: workspace.path.clone(),
-                branch: workspace.branch.clone(),
-                parent_branch: workspace.parent_branch.clone(),
-                base_commit: workspace.base_commit.clone(),
-            })
+            .inspect_workdir(&workspace.path, &workspace.base_commit)
             .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
         let head_commit = delivery.head_commit.clone();
         Ok(DeliveryReport::coding(
@@ -374,10 +372,6 @@ impl WorkerWorkspaceProvider for DaemonWorkspaceService {
         })
     }
 
-    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
-        self.inspect_delivery_report(workspace)
-    }
-
     fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
         if workspace.branch.is_empty() {
             // A read-only workspace owns no worktree or branch; its `path` is
@@ -460,6 +454,10 @@ impl WorkerWorkspaceProvider for DaemonWorkspaceService {
 }
 
 impl WorkerWorkspaceRegistry for DaemonWorkspaceService {
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        self.inspect_delivery_report(workspace)
+    }
+
     fn register_prepared(&self, workspace: &WorkerWorkspace) {
         let canonical = workspace
             .path

@@ -240,46 +240,6 @@ impl WorktreeService {
     }
 
     /// Capture the exact clean commit that a parent may review and integrate.
-    pub fn inspect_delivery(
-        &self,
-        child: &ChildWorktree,
-    ) -> Result<InspectedDelivery, WorktreeError> {
-        let status = git(&child.path, &["status", "--porcelain"])?;
-        if !status.trim().is_empty() {
-            return Err(WorktreeError::DirtyChild {
-                path: child.path.clone(),
-            });
-        }
-        let branch = current_branch(&child.path)?;
-        if branch != child.branch {
-            return Err(WorktreeError::WrongParentBranch {
-                expected: child.branch.clone(),
-                actual: branch,
-            });
-        }
-        let head_commit = git(&child.path, &["rev-parse", "HEAD"])?.trim().to_owned();
-        let merge_base = git(
-            &child.path,
-            &["merge-base", &child.base_commit, &head_commit],
-        )?;
-        if merge_base.trim() != child.base_commit {
-            return Err(WorktreeError::UnknownBase {
-                base: child.base_commit.clone(),
-            });
-        }
-        if head_commit == child.base_commit {
-            return Err(WorktreeError::EmptyDelivery {
-                base: child.base_commit.clone(),
-            });
-        }
-        Ok(InspectedDelivery {
-            branch: child.branch.clone(),
-            base_commit: child.base_commit.clone(),
-            head_commit,
-            clean: true,
-        })
-    }
-
     /// Integrate the reviewed delivery into exactly the branch that created it.
     pub fn merge_accepted(
         &self,
