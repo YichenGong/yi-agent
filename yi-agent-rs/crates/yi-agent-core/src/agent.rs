@@ -687,6 +687,22 @@ async fn inject_pending(
     true
 }
 
+/// Give back every interjection that never made it into the transcript.
+///
+/// Called before each terminal event. A user message that is neither accepted
+/// nor returned is silently lost, so this runs on every exit path that can be
+/// reached while the inbox may still hold something.
+async fn flush_unconsumed(tx: &EventTx, inbox: &Option<InboxHandle>) {
+    let Some(handle) = inbox else {
+        return;
+    };
+    let items = handle.lock().drain_all();
+    if items.is_empty() {
+        return;
+    }
+    let _ = tx.send(AgentEvent::InterjectionsReturned { items }).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: EventTx,
@@ -715,6 +731,7 @@ async fn run_loop(
         // Check 1: THINK 前
         if cancel_token.is_cancelled() {
             info!(turn, "agent loop cancelled before think");
+            flush_unconsumed(&tx, &inbox).await;
             let _ = tx.send(AgentEvent::Cancelled).await;
             return;
         }
@@ -730,6 +747,7 @@ async fn run_loop(
         if let Some(max) = config.max_turns {
             if turn > max {
                 info!(turn, max, "agent loop reached max turns");
+                flush_unconsumed(&tx, &inbox).await;
                 if tx
                     .send(AgentEvent::Done {
                         reason: DoneReason::MaxTurns,
@@ -783,6 +801,7 @@ async fn run_loop(
                 Some(gate) => match tokio::select! {
                     lease = gate.acquire() => lease,
                     _ = cancel_token.cancelled() => {
+                        flush_unconsumed(&tx, &inbox).await;
                         let _ = tx.send(AgentEvent::Cancelled).await;
                         return;
                     }
@@ -840,6 +859,7 @@ async fn run_loop(
                     // keeps the run's user prompt and every completed round-trip.
                     let keep = safe_cancel_truncate_len(&session.lock().unwrap());
                     session.lock().unwrap().truncate(keep);
+                    flush_unconsumed(&tx, &inbox).await;
                     let _ = tx.send(AgentEvent::Cancelled).await;
                     return;
                 }
@@ -897,6 +917,7 @@ async fn run_loop(
                             // run's user prompt and completed round-trips.
                             let keep = safe_cancel_truncate_len(&session.lock().unwrap());
                             session.lock().unwrap().truncate(keep);
+                            flush_unconsumed(&tx, &inbox).await;
                             let _ = tx.send(AgentEvent::Cancelled).await;
                             return;
                         }
@@ -947,6 +968,7 @@ async fn run_loop(
         let stop_reason = match end {
             StreamEnd::Stopped(reason) => reason,
             StreamEnd::Failed(ProviderError::Network(_)) => {
+                flush_unconsumed(&tx, &inbox).await;
                 let _ = tx
                     .send(AgentEvent::Done {
                         reason: DoneReason::Interrupted {
@@ -962,6 +984,7 @@ async fn run_loop(
 
         match stop_reason {
             StopReason::Stalled => {
+                flush_unconsumed(&tx, &inbox).await;
                 let _ = tx
                     .send(AgentEvent::Done {
                         reason: DoneReason::Interrupted {
@@ -981,6 +1004,7 @@ async fn run_loop(
                 continue;
             }
             StopReason::StopSequence => {
+                flush_unconsumed(&tx, &inbox).await;
                 let _ = tx
                     .send(AgentEvent::Done {
                         reason: DoneReason::Interrupted {
@@ -991,6 +1015,7 @@ async fn run_loop(
                 return;
             }
             StopReason::Other(reason) => {
+                flush_unconsumed(&tx, &inbox).await;
                 let _ = tx
                     .send(AgentEvent::Done {
                         reason: DoneReason::Interrupted { reason },
@@ -1031,6 +1056,7 @@ async fn run_loop(
             }
             info!(turn, "agent loop done: end_turn");
             tracing::info!(turn, "emitting AgentEvent::Done(EndTurn)");
+            flush_unconsumed(&tx, &inbox).await;
             if tx
                 .send(AgentEvent::Done {
                     reason: DoneReason::EndTurn,
@@ -1240,6 +1266,7 @@ async fn run_loop(
                 // preserving the completed work.
                 let keep = safe_cancel_truncate_len(&session.lock().unwrap());
                 session.lock().unwrap().truncate(keep);
+                flush_unconsumed(&tx, &inbox).await;
                 let _ = tx.send(AgentEvent::Cancelled).await;
                 return;
             }
@@ -1810,6 +1837,48 @@ mod tests {
                 })
             ),
             "the turn must still finish: {events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_returns_unconsumed_interjections_before_cancelled() {
+        let provider = Arc::new(StallOnceThenSucceedProvider::new());
+        let mut agent = Agent::new(provider, Arc::new(ToolRegistry::new()), fast_stall_config());
+
+        let stream = agent.run("task".into()).await.unwrap();
+        // Clone the handle, then cancel: the stream (and so the run) is owned by
+        // the consumer task, which is spawned here so this task stays free to
+        // cancel and inspect.
+        let handle = agent.inbox_handle().expect("handle after run starts");
+        let collector = tokio::spawn(async move { collect_events_async(stream).await });
+
+        handle
+            .interject("never consumed".into(), Some("tag-9".into()))
+            .unwrap();
+        // Cancel at the ACT check: no call reaches the provider yet (the first
+        // call's idle timeout is 50ms in `fast_stall_config`).
+        agent.cancel();
+
+        let events = collector.await.unwrap();
+
+        let returned_at = events.iter().position(|e| {
+            matches!(e, AgentEvent::InterjectionsReturned { items }
+                if items.len() == 1
+                   && items[0].text == "never consumed"
+                   && items[0].tag.as_deref() == Some("tag-9"))
+        });
+        let cancelled_at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Cancelled));
+
+        assert!(
+            returned_at.is_some(),
+            "the unconsumed interjection must come back: {events:?}"
+        );
+        assert!(cancelled_at.is_some(), "expected Cancelled: {events:?}");
+        assert!(
+            returned_at.unwrap() < cancelled_at.unwrap(),
+            "InterjectionsReturned must precede Cancelled: {events:?}"
         );
     }
 
