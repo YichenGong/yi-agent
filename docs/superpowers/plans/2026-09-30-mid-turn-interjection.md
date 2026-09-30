@@ -1863,6 +1863,17 @@ Also corrected from the plan text: `feed_to` must clear its sender on
 `ProviderEvent::Stop` or the stream never ends, and the test provider is wrapped
 once (`provider.clone()`), not twice.
 
+### Post-merge note
+
+`main` removed the completion-audit self-check (`69a81b9`) and merged it as
+`64c02d4`; this branch merged that in. The conflict was in the single spot the
+two changes shared: the EndTurn drain sat immediately before the audit block
+that no longer exists. The drain is kept and the audit block dropped, so the
+`EndTurn` drain is now simply the last `continue` guard before the turn ends.
+The spec's D14 (audit outranked by a pending interjection) is retired with the
+audit itself -- nothing to outrank. Core's lib count drops 221 -> 220 because
+of the test that commit deleted; every interjection test still passes.
+
 ## Deferred (do not implement in this plan)
 
 - Unifying the subagent mailbox path (`subagent_runtime.rs:620-626`, `:735`, cancel-then-restart) with the inbox.
