@@ -2904,6 +2904,13 @@ impl RuntimeCoordinator {
                     yi_agent_core::TaskState::Cancelled(_) => {
                         ("cancelled", RuntimeEvent::TaskCancelled, None)
                     }
+                    yi_agent_core::TaskState::BudgetExhausted(_) => (
+                        "budget_exhausted",
+                        RuntimeEvent::TaskBudgetExhausted,
+                        Some(budget_exhausted_terminal_json(
+                            supervisor.completion_report(&task_id),
+                        )?),
+                    ),
                     yi_agent_core::TaskState::Failed(failure) => (
                         "failed",
                         RuntimeEvent::TaskFailed,
@@ -3227,6 +3234,21 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 
 fn text_completion_terminal_json(report: Option<&str>) -> Result<String, RuntimeCoordinatorError> {
     serde_json::to_string(&serde_json::json!({
+        "kind": "text_completion",
+        "report": report.unwrap_or(""),
+    }))
+    .map_err(RepositoryError::from)
+    .map_err(RuntimeCoordinatorError::from)
+}
+
+/// A child that ran out of turns still yields whatever it had managed to say.
+///
+/// The partial transcript is stored under the same `text_completion` shape the
+/// completed-report path uses, so hydration hands it back to the parent after a
+/// restart instead of losing it; `reason` records why the child stopped.
+fn budget_exhausted_terminal_json(report: Option<&str>) -> Result<String, RuntimeCoordinatorError> {
+    serde_json::to_string(&serde_json::json!({
+        "reason": "turn_budget_exhausted",
         "kind": "text_completion",
         "report": report.unwrap_or(""),
     }))

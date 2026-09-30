@@ -5610,3 +5610,124 @@ fn daemon_start_drains_tasks_whose_owning_root_is_gone() {
     );
     drop(daemon);
 }
+
+/// A child stopped at its turn ceiling must survive a restart with its partial
+/// transcript intact. The event-driven terminal path writes the task state but
+/// not the attempt's terminal stamp, so a report that is only held in memory is
+/// lost the moment the daemon restarts.
+#[test]
+fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let runtime_dir = directory.path().join("runtime");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon = Daemon::start_with_factory(&runtime_dir, &database, factory.clone()).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-budget-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached root");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "Rewrite the parser".into(),
+            mode: None,
+            model: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child task");
+    };
+    factory.handles.lock().unwrap()[0]
+        .report_budget_exhausted("I got as far as rewriting the lexer");
+
+    let IpcResponse::WaitCompleted { reports, .. } = send_request(
+        daemon.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id: session_id.clone(),
+            caller_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            mode: "all".into(),
+            timeout_ms: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected initial wait completion");
+    };
+    assert_eq!(reports[0].state, "budget_exhausted");
+    assert_eq!(
+        reports[0].report.as_deref(),
+        Some("I got as far as rewriting the lexer")
+    );
+    drop(daemon);
+
+    // The attempt stamp alone must carry the transcript across the restart.
+    let stamped: Option<String> = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT terminal_json FROM attempts WHERE task_id = ?1",
+            params![task_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stamped = stamped.expect("a budget-exhausted attempt records a terminal stamp");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stamped).unwrap()["reason"],
+        "turn_budget_exhausted"
+    );
+
+    let restarted = Daemon::start_with_factory(&runtime_dir, &database, factory).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        restarted.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-budget-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected reattached root after restart");
+    };
+    let IpcResponse::WaitCompleted { reports, .. } = send_request(
+        restarted.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id,
+            caller_task_id: root_task_id,
+            capability: message_capability,
+            mode: "all".into(),
+            timeout_ms: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected wait completion after restart");
+    };
+    assert_eq!(
+        reports[0].state, "budget_exhausted",
+        "the restart must not resurrect the child as a clean completion"
+    );
+    assert_eq!(
+        reports[0].report.as_deref(),
+        Some("I got as far as rewriting the lexer"),
+        "the partial transcript must survive the restart"
+    );
+}
