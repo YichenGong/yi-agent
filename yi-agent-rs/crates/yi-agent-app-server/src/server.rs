@@ -1037,6 +1037,59 @@ where
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
                     }
+                    "thread/clear" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let Some(session) = threads.get(&thread_id) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 清空跑在半个 turn 上会产出不自洽的历史，直接拒绝。
+                        if session.active_turn_id.is_some() {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::turn_in_progress(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        if session
+                            .session_tx
+                            .send(SessionCommand::Clear { reply: reply_tx })
+                            .await
+                            .is_err()
+                        {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::internal("thread driver is gone")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        match reply_rx.await {
+                            Ok(Ok(())) => {
+                                write_response(&writer, ok_response(id, json!({}))).await?
+                            }
+                            Ok(Err(message)) => write_response(
+                                &writer,
+                                err_response(id, RpcError::internal(message)),
+                            )
+                            .await?,
+                            Err(_) => write_response(
+                                &writer,
+                                err_response(id, RpcError::internal("thread driver dropped")),
+                            )
+                            .await?,
+                        }
+                    }
                     "turn/start" => {
                         // `id` 后续响应仍需使用,故传 clone。
                         let Some(thread_id) =
@@ -4330,6 +4383,149 @@ mod tests {
             "item ids must be unique across replay + resumed turn: {item_ids:?}"
         );
 
+        h.shutdown().await;
+    }
+
+    /// 发 thread/clear，被 `-32012` 拒时重试。
+    ///
+    /// 主循环要等 `TurnEvent::Finished` 才清 `active_turn_id`，而 driver 是在
+    /// `turn/completed` 之后（落盘之后）才发该事件；所以刚结束一轮就立刻 clear
+    /// 可能撞上这个窗口。这是已接受的残留限制（方案 A），客户端重试即可。
+    async fn clear_thread_retrying(h: &mut Harness, tid: &str) -> serde_json::Value {
+        for attempt in 0..20 {
+            let id = 100 + attempt;
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"thread/clear","params":{{"threadId":"{tid}"}}}}"#
+            ))
+            .await;
+            loop {
+                let v = h.read_value().await;
+                if v.get("id") == Some(&serde_json::json!(id)) {
+                    if v["error"]["code"] != -32012 {
+                        return v;
+                    }
+                    break; // 还在 turn 收尾窗口内：等一会儿再试
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        panic!("thread/clear kept answering -32012");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_clear_empties_the_context_and_resume_does_not_revive_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // 先跑一轮，制造可被清空的上下文；必须等本轮真正收尾（日志已 append 且
+        // turn/completed 已到）再发 clear——落盘发生在 turn/completed 之后,
+        // 早发会被主循环以 -32012（turn 进行中）拒绝。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .await;
+        let log = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.jsonl"));
+        let mut persisted = false;
+        for _ in 0..200 {
+            if let Ok(t) = std::fs::read_to_string(&log) {
+                if !t.trim().is_empty() {
+                    persisted = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(persisted, "turn must be persisted before we clear");
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        // clear（可能撞上收尾窗口，重试即可）。
+        let v = clear_thread_retrying(&mut h, &tid).await;
+        assert!(
+            v.get("error").is_none(),
+            "clear must eventually succeed: {v}"
+        );
+
+        // 关键回归：resume 不得把旧消息回放回来。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut replayed = Vec::new();
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed") {
+                replayed.push(
+                    v["params"]["item"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                assert!(v.get("error").is_none(), "resume must still work: {v}");
+                break;
+            }
+        }
+        assert!(
+            !replayed.iter().any(|t| t == "hello"),
+            "cleared context must not come back on resume: {replayed:?}"
+        );
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_clear_rejects_an_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/clear","params":{"threadId":"nope"}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32011, "expected unknown thread: {v}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_clear_is_rejected_while_a_turn_is_running() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        // 等到 turn 真正开始（turn/started）再发 clear。
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/started") {
+                break;
+            }
+        }
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/clear","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        // slow provider 期间会持续推 item/delta 通知,必须按 id 找到响应本身。
+        let mut rejected = None;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                rejected = Some(v);
+                break;
+            }
+        }
+        let v = rejected.expect("thread/clear must respond");
+        assert_eq!(v["error"]["code"], -32012, "expected turn in progress: {v}");
         h.shutdown().await;
     }
 
