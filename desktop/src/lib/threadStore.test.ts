@@ -114,6 +114,24 @@ describe("ThreadStore", () => {
     expect(s.view("b").status).toBe("running");
   });
 
+  it("seeds the status of a view that exists but never heard from the push stream", () => {
+    const s = new ThreadStore();
+    // Selecting a thread creates its view with a default "idle" before any
+    // status notification arrives; the listing is then the first real source.
+    s.select("a");
+    expect(s.view("a").status).toBe("idle");
+    s.seed([summary("a", "running")]);
+    expect(s.view("a").status).toBe("running");
+  });
+
+  it("seeds again after a thread is dropped and re-listed", () => {
+    const s = new ThreadStore();
+    s.seed([summary("a", "running")]);
+    s.drop("a");
+    s.seed([summary("a", "running")]);
+    expect(s.view("a").status).toBe("running");
+  });
+
   it("reports pending approvals for threads other than the current one", () => {
     const s = new ThreadStore();
     s.select("a");

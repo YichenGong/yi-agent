@@ -63,6 +63,24 @@ Add to `desktop/src/lib/threadStore.test.ts` inside the existing `describe("Thre
     s.seed([summary("b", "running")]);
     expect(s.view("b").status).toBe("running");
   });
+
+  it("seeds the status of a view that exists but never heard from the push stream", () => {
+    const s = new ThreadStore();
+    // Selecting a thread creates its view with a default "idle" before any
+    // status notification arrives; the listing is then the first real source.
+    s.select("a");
+    expect(s.view("a").status).toBe("idle");
+    s.seed([summary("a", "running")]);
+    expect(s.view("a").status).toBe("running");
+  });
+
+  it("seeds again after a thread is dropped and re-listed", () => {
+    const s = new ThreadStore();
+    s.seed([summary("a", "running")]);
+    s.drop("a");
+    s.seed([summary("a", "running")]);
+    expect(s.view("a").status).toBe("running");
+  });
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -72,7 +90,33 @@ Expected: FAIL — the first case reports `expected 'running' to be 'idle'`. (Th
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `desktop/src/lib/threadStore.ts`, replace the body of `seed` and its doc comment:
+In `desktop/src/lib/threadStore.ts`, add a source-tracking map next to `views`:
+
+```ts
+  /**
+   * Which source last wrote each thread's `status`: `"live"` for the
+   * `thread/status/updated` push stream (authoritative), `"snapshot"` for a
+   * `thread/listAll` listing (a point-in-time read that can be stale), or
+   * absent when no status has been learned yet. `seed` uses this to avoid
+   * rolling a live status back.
+   */
+  private statusSource = new Map<string, "live" | "snapshot">();
+```
+
+Mark the push stream as authoritative in `applyNotification` (the
+`thread/status/updated` branch, right after `v.status = n.params.status;`):
+
+```ts
+      this.statusSource.set(n.params.thread_id, "live");
+```
+
+Clear it in `drop`:
+
+```ts
+    this.statusSource.delete(id);
+```
+
+Replace the body of `seed` and its doc comment:
 
 ```ts
   /**
@@ -83,25 +127,23 @@ In `desktop/src/lib/threadStore.ts`, replace the body of `seed` and its doc comm
    * `turn/completed` *before* it persists the turn and flips the thread back to
    * `idle`, and the app re-lists the moment it sees `turn/completed`. A listing
    * issued inside that window still reports `running`. So the snapshot only
-   * *seeds* a status the client has never learned; once the push stream has set
-   * one, the snapshot must not roll it back.
+   * *seeds* a status the client has never had one for; once the push stream has
+   * written one, the snapshot must not roll it back. A default `idle` from a
+   * merely-created view is not "written by the push stream" — `statusSource`
+   * records which it is.
    */
   seed(threads: ThreadSummary[]): void {
     for (const t of threads) {
-      const existing = this.views.get(t.thread_id);
-      const v = existing ?? this.create();
-      if (!existing) this.views.set(t.thread_id, v);
-      // Only seed a status we do not have yet. `v.status` is initialised to
-      // "idle" at creation, so a fresh view is indistinguishable from one the
-      // push stream set to "idle" — hence the `existing` check, not a
-      // `v.status === "idle"` comparison.
-      if (!existing) v.status = t.status ?? "idle";
+      const v = this.view(t.thread_id);
+      if (this.statusSource.get(t.thread_id) !== "live") v.status = t.status ?? "idle";
       v.info = { cwd: t.cwd, model: t.model };
     }
   }
 ```
 
-Note: `this.view(id)` would create-and-insert; we need to know whether it pre-existed, so read `this.views` directly.
+Do **not** use "does the view already exist" as the guard: `select()` creates a
+view (default `idle`) before any status arrives, and that default is
+indistinguishable from a live `idle`, which would permanently block seeding.
 
 - [ ] **Step 4: Run test to verify it passes**
 

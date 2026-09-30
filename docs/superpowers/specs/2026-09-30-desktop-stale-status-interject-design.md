@@ -116,15 +116,25 @@ turn/started → status:"running" → <turn/start 响应> → item/started
 
 ### 2.2 B：快照不再回退实时状态（消除污染源）
 
-`ThreadStore.seed()` 只覆盖**服务端比本地新**的状态：
+`ThreadStore` 增加一张 `statusSource: Map<id, "live" | "snapshot">`，记录每个
+thread 的状态**最后一次由谁写下**：`thread/status/updated` 推送 → `"live"`；
+`thread/listAll` 快照 → `"snapshot"`；从未学到过 → 无条目。
 
-- 若该 thread 已存在且本地状态**不等**于快照，说明本地是由实时推送写下的
-  （快照是请求发出那一刻的旧值），保留本地；
-- 相等时无差别（写回同值）；
-- 新 thread（本地无视图）照常取快照值。
+`seed()` 只写 `statusSource !== "live"` 的 thread：
 
-这条不变量用一句话概括：**本地已有的状态只由推送写，快照只负责播种。**
-把 `seed()` 里"覆盖安全"的注释改成这条不变量的说明。
+- **从未学到过**（无条目）→ 用快照值播种；
+- **只被快照写过**（`"snapshot"`）→ 用更新的快照覆盖（如新建后首次列表）；
+- **已被推送写过**（`"live"`）→ **不覆盖**，保留权威值；
+- `drop()` 一并清掉条目，避免残留条目让重建的 thread 永远无法播种。
+
+判据用一句话概括：**快照只播种，不覆盖推送写下的状态。**
+
+不采用"视图是否存在"作为判据：`select()` 会先建视图（默认 `idle`），
+此时还没有任何推送，这个默认 `idle` 与推送写下的 `idle` 在视图上无法区分，
+会把"仅存在于视图的默认值"误判成权威值，导致该 thread 从此无法被播种。
+这也是实现期新增测试
+`seeds the status of a view that exists but never heard from the push stream`
+钉住的行为。
 
 ### 2.3 A：不对的地方——输入框的 `turnActive` 已是对的
 
@@ -165,7 +175,9 @@ turn/started → status:"running" → <turn/start 响应> → item/started
 5. `seed()` 不回退既有状态：先收到 `idle` 推送，再来一份 `running` 快照，
    状态仍是 `idle`。
 6. `seed()` 仍播种新 thread：本地没有视图时取快照值。
-7. `seed()` 不破坏 cwd/model 的播种（既有行为不变）。
+7. `seed()` 仍播种"视图已存在但从未收到推送"的 thread（`select()` 先建视图）。
+8. `drop()` 后再 `seed()` 仍能播种（`statusSource` 不残留）。
+9. `seed()` 不破坏 cwd/model 的播种（既有行为不变）。
 
 **验证命令**
 
