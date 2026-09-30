@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -11,13 +12,14 @@ use uuid::Uuid;
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::scheduler::AdmissionPriority;
 use super::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, IntegrationValidation,
-    MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
-    RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState, TaskWorkspaceMode,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
+    IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
+    RecoveryEvidence, RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState,
     TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::worker::{
-    AgentWorkerFactory, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
+    AgentWorkerFactory, SpawnRequest, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart,
+    WorkerWatchdogEvent,
 };
 use crate::agent::ProviderTurnGate;
 use crate::tool::{Tool, ToolRegistry, ToolResult};
@@ -84,7 +86,8 @@ pub struct AgentSupervisor {
     root_task_id: TaskId,
     tasks: HashMap<TaskId, AgentTask>,
     objectives: HashMap<TaskId, String>,
-    workspace_modes: HashMap<TaskId, TaskWorkspaceMode>,
+    workspace_modes: HashMap<TaskId, ChildWriteMode>,
+    workdirs: HashMap<TaskId, Option<PathBuf>>,
     models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
     mailboxes: HashMap<TaskId, Mailbox>,
@@ -125,6 +128,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
@@ -162,6 +166,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
@@ -214,6 +219,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
             mailboxes,
@@ -230,7 +236,7 @@ impl AgentSupervisor {
         &mut self,
         task: AgentTask,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<(), String> {
         let parent_id = task
@@ -278,7 +284,7 @@ impl AgentSupervisor {
         attempt_number: u32,
         recovery_gated: bool,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
     ) -> Result<(), String> {
         if !self.tasks.contains_key(&parent_id) {
@@ -345,7 +351,7 @@ impl AgentSupervisor {
         self.models.get(task_id).map(String::as_str)
     }
 
-    pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: TaskWorkspaceMode) {
+    pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: ChildWriteMode) {
         self.workspace_modes.insert(task_id.clone(), mode);
     }
 
@@ -353,14 +359,19 @@ impl AgentSupervisor {
     /// defaults to `Coding` (it owns session isolation) and any other task to
     /// `ReadOnly`. The root's implicit `Coding` is a default pending persisted
     /// mode hydration.
-    pub fn workspace_mode(&self, task_id: &TaskId) -> TaskWorkspaceMode {
+    /// The directory this task's parent asked it to run in, if any.
+    pub fn spawn_workdir(&self, task_id: &TaskId) -> Option<PathBuf> {
+        self.workdirs.get(task_id).cloned().flatten()
+    }
+
+    pub fn workspace_mode(&self, task_id: &TaskId) -> ChildWriteMode {
         if let Some(mode) = self.workspace_modes.get(task_id) {
             return *mode;
         }
         if task_id == &self.root_task_id {
-            TaskWorkspaceMode::Coding
+            ChildWriteMode::Coding
         } else {
-            TaskWorkspaceMode::ReadOnly
+            ChildWriteMode::ReadOnly
         }
     }
 
@@ -1008,16 +1019,18 @@ impl AgentSupervisor {
     pub fn spawn(&mut self, parent_id: TaskId) -> Result<TaskId, SpawnError> {
         self.spawn_with_objective(
             parent_id,
-            "Complete the delegated task.".into(),
-            TaskWorkspaceMode::ReadOnly,
+            SpawnRequest::new(
+                "Complete the delegated task.".into(),
+                ChildWriteMode::ReadOnly,
+                None,
+            ),
         )
     }
 
     pub fn spawn_with_objective(
         &mut self,
         parent_id: TaskId,
-        objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        request: SpawnRequest,
     ) -> Result<TaskId, SpawnError> {
         let parent = self
             .tasks
@@ -1044,9 +1057,10 @@ impl AgentSupervisor {
         child.depth = child_depth;
         let child_id = child.id.clone();
         self.tasks.insert(child_id.clone(), child);
-        self.objectives.insert(child_id.clone(), objective);
-        self.workspace_modes
-            .insert(child_id.clone(), workspace_mode);
+        self.objectives
+            .insert(child_id.clone(), request.objective.clone());
+        self.workspace_modes.insert(child_id.clone(), request.mode);
+        self.workdirs.insert(child_id.clone(), request.workdir);
         self.mailboxes.insert(child_id.clone(), Mailbox::default());
         self.children
             .entry(parent_id.clone())
@@ -1786,6 +1800,10 @@ impl Tool for SpawnAgentTool {
                     "type": "string",
                     "enum": ["coding", "read_only"],
                     "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
                 }
             },
             "required": ["task"],
@@ -1801,19 +1819,26 @@ impl Tool for SpawnAgentTool {
             return ToolResult::error("task must not be empty");
         }
         let mode = match args.get("mode") {
-            None => TaskWorkspaceMode::ReadOnly,
-            Some(Value::String(value)) => match TaskWorkspaceMode::parse(value) {
+            None => ChildWriteMode::ReadOnly,
+            Some(Value::String(value)) => match ChildWriteMode::parse(value) {
                 Some(mode) => mode,
                 None => return ToolResult::error("mode must be 'coding' or 'read_only'"),
             },
             Some(_) => return ToolResult::error("mode must be a string"),
+        };
+        let workdir = match args.get("workdir") {
+            None => None,
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(PathBuf::from(value)),
+            Some(Value::String(_)) => return ToolResult::error("workdir must not be blank"),
+            Some(_) => return ToolResult::error("workdir must be a string"),
         };
         let mut supervisor = self
             .tools
             .supervisor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match supervisor.spawn_with_objective(self.tools.caller.clone(), task.to_string(), mode) {
+        let request = SpawnRequest::new(task.to_string(), mode, workdir);
+        match supervisor.spawn_with_objective(self.tools.caller.clone(), request) {
             Ok(task_id) => ToolResult::text(
                 json!({ "task_id": task_id.to_string(), "status": "queued" }).to_string(),
             ),
@@ -1924,6 +1949,27 @@ mod provider_turn_priority_tests {
         DeliveryReport, IntegrationValidation, MessageId, PermissionDecision, PermissionRequestId,
         WorkspaceLeaseId,
     };
+
+    #[test]
+    fn spawn_request_carries_the_parents_workdir() {
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let root = supervisor.root_task_id().clone();
+        let child = supervisor
+            .spawn_with_objective(
+                root,
+                SpawnRequest::new(
+                    "implement".into(),
+                    ChildWriteMode::Coding,
+                    Some(PathBuf::from("/tmp/yi-agent-impl")),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            supervisor.spawn_workdir(&child),
+            Some(PathBuf::from("/tmp/yi-agent-impl"))
+        );
+    }
 
     #[test]
     fn parent_routes_pending_high_priority_mail_to_the_coordination_reserve() {

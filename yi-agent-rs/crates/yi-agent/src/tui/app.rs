@@ -2943,6 +2943,7 @@ mod tests {
         let spawn_response = yi_agent_store::ipc::send_request(
             daemon.socket_path(),
             yi_agent_store::ipc::IpcRequest::SpawnChild {
+                workdir: None,
                 session_id,
                 parent_task_id: root_task_id,
                 objective: "实现 parser".into(),

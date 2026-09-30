@@ -1,7 +1,7 @@
 //! Process-local ownership of subagent supervisors and application workers.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,15 +24,14 @@ use yi_agent_core::subagent::supervisor::{
     WaitOutcome,
 };
 use yi_agent_core::subagent::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, DeliveryId, DeliveryReport,
-    IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
-    RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState, TaskWorkspaceMode,
-    TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
+    DeliveryReport, IntegrationValidation, MessageId, PauseReason, PermissionDecision,
+    PermissionRequestId, RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState,
+    TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
-    WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent,
-    WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
+    WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
 };
 
 use crate::repository::{
@@ -42,13 +41,6 @@ use crate::repository::{
 use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 
 const REVIEW_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
-
-/// How long a task must be idle before its worktree directory is reclaimed.
-///
-/// Conservative by default: reclaim removes only the directory, keeps the branch
-/// and the workspace row, and is therefore reversible via
-/// `prepare_task_workspace`'s rebuild path.
-pub const WORKTREE_RECLAIM_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
@@ -62,16 +54,10 @@ pub enum RuntimeCoordinatorError {
         cleanup: Option<String>,
         recovery: Option<String>,
     },
-    #[error(
-        "record_task_workspace failed and cleanup_prepared failed: record={record}; cleanup={cleanup}"
-    )]
-    WorkspaceRecordingCleanup { record: String, cleanup: String },
     #[error("session does not exist: {0}")]
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
     Supervisor(String),
-    #[error("coding requires a git repository")]
-    CodingRequiresGitRepository,
     #[error("authority denied: {0}")]
     AuthorityDenied(String),
     #[error(transparent)]
@@ -144,9 +130,9 @@ struct PendingReviewConfirmation {
 pub struct RuntimeCoordinator {
     repository: Arc<Mutex<RuntimeRepository>>,
     factory: Arc<dyn AgentWorkerFactory>,
-    workspace_service: Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>>,
+    workspace_service: Option<Arc<dyn yi_agent_core::subagent::worker::WorkerWorkspaceProvider>>,
     application_root_workspace_services: Mutex<
-        HashMap<RootSessionId, Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>>,
+        HashMap<RootSessionId, Arc<dyn yi_agent_core::subagent::worker::WorkerWorkspaceProvider>>,
     >,
     supervisors: Mutex<HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>>>,
     resident_tasks: Mutex<HashSet<TaskId>>,
@@ -157,6 +143,9 @@ pub struct RuntimeCoordinator {
     provider_profile_id: Option<String>,
     recovery_contexts: Mutex<HashMap<TaskId, RecoveryContext>>,
     review_confirmations: Mutex<HashMap<String, PendingReviewConfirmation>>,
+    /// Where a task last ran, remembered for as long as the coordinator lives.
+    /// Nothing durable owns it: this replaces the retired `task_workspaces` row.
+    task_positions: Mutex<HashMap<TaskId, WorkerWorkspace>>,
     application_root_attach_lock: Mutex<()>,
     draining: AtomicBool,
 }
@@ -224,13 +213,31 @@ fn digest_hex(value: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The workspace mode a per-service root should run in. A service that cannot
-/// code forces the root to run in place (`ReadOnly`); a missing service is also
-/// treated as read-only so callers never provision a worktree they cannot own.
-fn root_mode_for(service: Option<&dyn AgentWorkspaceService>) -> TaskWorkspaceMode {
-    match service {
-        Some(service) if service.supports_coding() => TaskWorkspaceMode::Coding,
-        _ => TaskWorkspaceMode::ReadOnly,
+/// An in-place position: a task running directly in `path`, owning no branch.
+fn in_place_workspace_at(
+    repository_root: std::path::PathBuf,
+    path: std::path::PathBuf,
+) -> WorkerWorkspace {
+    WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root,
+        path,
+        branch: String::new(),
+        parent_branch: String::new(),
+        base_commit: String::new(),
+    }
+}
+
+/// The minimum recorded position `project_workspace_matches` needs: it compares
+/// only `repository_root`.
+fn recorded_workspace(repository_root: &str) -> WorkerWorkspace {
+    WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root: PathBuf::from(repository_root),
+        path: PathBuf::from(repository_root),
+        branch: String::new(),
+        parent_branch: String::new(),
+        base_commit: String::new(),
     }
 }
 
@@ -580,7 +587,7 @@ impl RuntimeCoordinator {
             }
         }
         let provider_profile_id = factory.provider_profile_id();
-        let workspace_service = factory.workspace_service();
+        let workspace_service = factory.default_workspace_service();
         if let Some(profile_id) = &provider_profile_id {
             resource_coordinator.configure_provider_llm_capacity(profile_id);
             for resource_key in [
@@ -621,6 +628,7 @@ impl RuntimeCoordinator {
             provider_profile_id,
             recovery_contexts: Mutex::new(recovery_contexts),
             review_confirmations: Mutex::new(HashMap::new()),
+            task_positions: Mutex::new(HashMap::new()),
             application_root_attach_lock: Mutex::new(()),
             draining: AtomicBool::new(false),
         })
@@ -636,7 +644,7 @@ impl RuntimeCoordinator {
         &self,
         objective: String,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
-        self.create_session_with_objective_and_mode(objective, TaskWorkspaceMode::Coding)
+        self.create_session_with_objective_and_mode(objective, ChildWriteMode::Coding)
     }
 
     /// Creates an isolated root session with an immutable initial objective and
@@ -645,7 +653,7 @@ impl RuntimeCoordinator {
     pub fn create_session_with_objective_and_mode(
         &self,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
@@ -698,13 +706,14 @@ impl RuntimeCoordinator {
         }
         let service = self
             .factory
-            .workspace_service_for_application_root(requested_workspace)
+            .workspace_service_for_project(requested_workspace)
             .ok_or_else(|| {
                 RuntimeCoordinatorError::Supervisor(
                     "application root workspace service is unavailable".into(),
                 )
             })?;
-        let root_mode = root_mode_for(Some(service.as_ref()));
+        // A root never provisions a worktree: it runs in the project directory.
+        let root_mode = ChildWriteMode::ReadOnly;
         let existing = {
             self.repository
                 .lock()
@@ -712,41 +721,23 @@ impl RuntimeCoordinator {
                 .application_root_attachment(idempotency_key)?
         };
         if let Some(existing) = existing {
-            let recorded = {
-                self.repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned")
-                    .task_workspace_optional(&existing.root_task_id)?
-            };
-            let workspace = match recorded {
-                Some(workspace) => {
-                    if !self
-                        .factory
-                        .application_root_workspace_matches(requested_workspace, &workspace)
-                    {
-                        return Err(RuntimeCoordinatorError::Supervisor(
-                            "application root workspace does not match its recorded repository"
-                                .into(),
-                        ));
-                    }
-                    workspace
+            // A root runs in place, so it keeps no workspace row: its project is
+            // validated against the durable attachment record, and the in-place
+            // position is synthesized from the requested project.
+            if let Some(recorded) = existing.workspace_root.as_deref() {
+                if !self
+                    .factory
+                    .project_workspace_matches(requested_workspace, &recorded_workspace(recorded))
+                {
+                    return Err(RuntimeCoordinatorError::Supervisor(
+                        "application root workspace does not match its recorded repository".into(),
+                    ));
                 }
-                // A read-only application root keeps no `task_workspaces` row: it
-                // runs in place. Reattaching it with a git repository is a
-                // mismatch; otherwise synthesize the in-place workspace from the
-                // requested project.
-                None => {
-                    if service.supports_coding() {
-                        return Err(RuntimeCoordinatorError::Supervisor(
-                            "application root workspace does not match its recorded repository"
-                                .into(),
-                        ));
-                    }
-                    service
-                        .prepare_read_only(None, &existing.root_task_id)
-                        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
-                }
-            };
+            }
+            let workspace = service
+                .read_only_workspace(None, &existing.root_task_id)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+            self.remember_task_position(&existing.root_task_id, &workspace);
             if existing.state == "detached" {
                 self.repository
                     .lock()
@@ -810,6 +801,7 @@ impl RuntimeCoordinator {
                 &root_task_id,
                 &capability_digest,
                 &capability,
+                &workspace.repository_root.to_string_lossy(),
             )?;
         Ok(AttachedApplicationRoot {
             session_id,
@@ -841,10 +833,7 @@ impl RuntimeCoordinator {
                 attachment.root_session_id.clone(),
             ));
         }
-        let root_mode = root_mode_for(
-            self.workspace_service_for(&attachment.root_session_id)
-                .as_deref(),
-        );
+        let root_mode = ChildWriteMode::ReadOnly;
         let mut hydrated_supervisor = None;
         for task in tasks {
             let depth = persisted_depth(task.depth)?;
@@ -1026,17 +1015,21 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    // The arguments mirror the IPC spawn request one-for-one; grouping them
+    // would only move the field list.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_application_child(
         &self,
         session: &RootSessionId,
         parent: &TaskId,
         capability: &str,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
+        workdir: Option<PathBuf>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model)
+        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model, workdir)
             .await
     }
 
@@ -1150,7 +1143,8 @@ impl RuntimeCoordinator {
             session,
             parent,
             "Complete the delegated task.".into(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
+            None,
             None,
         )
         .await
@@ -1161,8 +1155,9 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
+        workdir: Option<PathBuf>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1175,27 +1170,20 @@ impl RuntimeCoordinator {
             return Err(RuntimeCoordinatorError::QueueCapacityExceeded);
         }
         let supervisor = self.supervisor(session)?;
+        // A parent names the directory from its own position, so a relative
+        // workdir resolves against the parent's workdir, not the daemon's cwd
+        // (which is unrelated to any task). Resolving before the spawn means the
+        // supervisor stores the absolute path worker start will look up.
+        let workdir = workdir.map(|workdir| self.resolve_parent_workdir(parent, &workdir));
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
-            // A read-only task owns no worktree, so it cannot integrate a coding
-            // child's delivery: reject the escalation outright. Sessions whose
-            // workspace service cannot code at all (non-git) keep their specific
-            // `CodingRequiresGitRepository` provisioning failure instead.
-            let session_supports_coding = self
-                .workspace_service_for(session)
-                .is_some_and(|service| service.supports_coding());
-            if workspace_mode == TaskWorkspaceMode::Coding
-                && session_supports_coding
-                && supervisor.workspace_mode(parent) == TaskWorkspaceMode::ReadOnly
-            {
-                return Err(RuntimeCoordinatorError::Supervisor(
-                    "read-only tasks cannot spawn coding children".into(),
-                ));
-            }
             let child = supervisor.spawn_with_objective(
                 parent.clone(),
-                objective.clone(),
-                workspace_mode,
+                yi_agent_core::subagent::worker::SpawnRequest::new(
+                    objective.clone(),
+                    workspace_mode,
+                    workdir.clone(),
+                ),
             )?;
             let depth = match supervisor
                 .task(&child)
@@ -1228,10 +1216,36 @@ impl RuntimeCoordinator {
                 workspace_mode,
                 model.clone(),
             )?;
+        // Auto-registration: the parent prepares the directory (`git worktree
+        // add`) and hands over its path; the daemon only records that position.
+        // A bad path fails the spawn rather than deferring to worker start, so
+        // the parent learns immediately that its workdir was not usable.
+        if let Some(workdir) = workdir.as_deref() {
+            let registry = self.factory.worker_workspace_registry().ok_or_else(|| {
+                RuntimeCoordinatorError::Supervisor(
+                    "coding child requires a prepared-workspace registry".into(),
+                )
+            })?;
+            let observed = registry
+                .observe_workdir(workdir)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+            registry.register_prepared(&observed);
+        }
         if let Some(model) = model {
             supervisor.lock().await.set_model(&child, model);
         }
         Ok(child)
+    }
+
+    /// Resolves a spawn `workdir` the way the parent meant it: an absolute path
+    /// stands alone, a relative one is taken from the parent task's own workdir.
+    fn resolve_parent_workdir(&self, parent: &TaskId, workdir: &Path) -> PathBuf {
+        if workdir.is_absolute() {
+            return workdir.to_path_buf();
+        }
+        self.remembered_task_position(parent)
+            .map(|position| position.path.join(workdir))
+            .unwrap_or_else(|| workdir.to_path_buf())
     }
 
     /// Performs non-blocking scheduler admission after the task has been
@@ -1243,11 +1257,12 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         parent: &TaskId,
         objective: String,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
         model: Option<String>,
+        workdir: Option<PathBuf>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
-            .spawn_child_with_objective(session, parent, objective, workspace_mode, model)
+            .spawn_child_with_objective(session, parent, objective, workspace_mode, model, workdir)
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {
@@ -1307,12 +1322,7 @@ impl RuntimeCoordinator {
         ) {
             Ok(workspace) => workspace,
             Err(error) => {
-                let reason = match &error {
-                    RuntimeCoordinatorError::CodingRequiresGitRepository => {
-                        "coding_requires_git_repository"
-                    }
-                    _ => "workspace_provision_failed",
-                };
+                let reason = "workspace_provision_failed";
                 let evidence = serde_json::to_string(&serde_json::json!({
                     "reason": reason,
                     "error": error.to_string(),
@@ -1601,7 +1611,7 @@ impl RuntimeCoordinator {
     fn workspace_service_for(
         &self,
         session: &RootSessionId,
-    ) -> Option<Arc<dyn yi_agent_core::subagent::worker::AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn yi_agent_core::subagent::worker::WorkerWorkspaceProvider>> {
         self.application_root_workspace_services
             .lock()
             .expect("runtime application root workspace service mutex poisoned")
@@ -1613,6 +1623,42 @@ impl RuntimeCoordinator {
     /// The nearest ancestor task's workspace, if any, walking `parent_id`
     /// upward. Used as the read-only execution root so a read-only child sees
     /// its parent's current view rather than a clean baseline.
+    /// The workdir a task was given at spawn time, read from its live supervisor.
+    ///
+    /// Best-effort: a supervisor that is busy or gone yields `None` rather than
+    /// blocking, because the only caller renders a review diff.
+    fn supervisor_workdir_for(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<std::path::PathBuf>, RuntimeCoordinatorError> {
+        let session = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository
+                .task_detail(task)?
+                .session_id
+                .parse::<RootSessionId>()
+        };
+        let Ok(session) = session else {
+            return Ok(None);
+        };
+        let supervisor = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .get(&session)
+            .cloned();
+        let Some(supervisor) = supervisor else {
+            return Ok(None);
+        };
+        let Ok(supervisor) = supervisor.try_lock() else {
+            return Ok(None);
+        };
+        Ok(supervisor.spawn_workdir(task))
+    }
+
     fn nearest_ancestor_workspace(
         &self,
         supervisor: &AgentSupervisor,
@@ -1621,13 +1667,12 @@ impl RuntimeCoordinator {
         let mut current = supervisor
             .task(task)
             .and_then(|task| task.parent_id.clone());
-        let repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
         while let Some(ancestor) = current {
-            if let Some(workspace) = repository.task_workspace_optional(&ancestor)? {
-                return Ok(Some(workspace));
+            // A parent's position is the workdir it runs in, remembered in the
+            // supervisor. Nothing is persisted, so an ancestor with no workdir
+            // has simply not run yet.
+            if let Some(workdir) = supervisor.spawn_workdir(&ancestor) {
+                return Ok(Some(in_place_workspace_at(workdir.clone(), workdir)));
             }
             current = supervisor
                 .task(&ancestor)
@@ -1642,80 +1687,60 @@ impl RuntimeCoordinator {
         session: &RootSessionId,
         task: &TaskId,
         attempt: &AttemptId,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
     ) -> Result<Option<WorkerWorkspace>, RuntimeCoordinatorError> {
-        let existing = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .task_workspace_optional(task)?;
-        if let Some(existing) = existing {
-            // A reclaimed worktree keeps its row, so the row can outlive its
-            // directory. Rebuild before handing the path to a worker.
-            if !existing.path.exists() {
-                let Some(service) = self.workspace_service_for(session) else {
-                    return Ok(None);
-                };
-                service
-                    .reattach_workspace(&existing)
-                    .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
-            }
-            supervisor
-                .assign_workspace(task, existing.lease_id.clone())
-                .map_err(RuntimeCoordinatorError::Supervisor)?;
-            return Ok(Some(existing));
-        }
-        let Some(service) = self.workspace_service_for(session) else {
+        let Some(provider) = self.workspace_service_for(session) else {
             return Ok(None);
         };
-        if workspace_mode == TaskWorkspaceMode::ReadOnly {
+        // A coding task runs where its parent prepared it, when the parent handed
+        // over a `workdir`. Without one it runs in place: the runtime resolves a
+        // path, it never creates a directory. A read-only task inherits the
+        // nearest ancestor's path.
+        if workspace_mode == ChildWriteMode::ReadOnly {
+            // A read-only task runs in place: it inherits the nearest ancestor's
+            // path and records no workspace of its own.
             let parent = self.nearest_ancestor_workspace(supervisor, task)?;
-            let workspace = service
-                .prepare_read_only(parent.as_ref(), task)
+            let workspace = provider
+                .read_only_workspace(parent.as_ref(), task)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
             supervisor
                 .assign_workspace(task, workspace.lease_id.clone())
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
+            self.remember_task_position(task, &workspace);
             return Ok(Some(workspace));
         }
-        if !service.supports_coding() {
-            return Err(RuntimeCoordinatorError::CodingRequiresGitRepository);
+        // A coding task runs where its parent prepared it, when the parent handed
+        // over a `workdir`; without one it falls back to an in-place path. Either
+        // way the runtime resolves a path, it never creates a directory.
+        let workspace = match supervisor.spawn_workdir(task) {
+            Some(workdir) => provider.workspace_in(task, &workdir),
+            None => provider.in_place_workspace(session, task, attempt),
         }
-        let task_snapshot = supervisor
-            .task(task)
-            .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?;
-        let workspace = if let Some(parent_id) = task_snapshot.parent_id.as_ref() {
-            let parent = self
-                .repository
-                .lock()
-                .expect("runtime repository mutex poisoned")
-                .task_workspace(parent_id)?;
-            service
-                .prepare_child(&parent, session, task, attempt)
-                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
-        } else {
-            service
-                .prepare_root(session, task, attempt)
-                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
-        };
-        let record_result = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .record_task_workspace(task, attempt, &workspace);
-        if let Err(error) = record_result {
-            if let Err(cleanup) = service.cleanup_prepared(&workspace) {
-                return Err(RuntimeCoordinatorError::WorkspaceRecordingCleanup {
-                    record: error.to_string(),
-                    cleanup: cleanup.to_string(),
-                });
-            }
-            return Err(RuntimeCoordinatorError::Repository(error));
-        }
+        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        // The position lives only in the supervisor: nothing about it is
+        // persisted, so there is no row to write and no worktree to own.
         supervisor
             .assign_workspace(task, workspace.lease_id.clone())
             .map_err(RuntimeCoordinatorError::Supervisor)?;
+        self.remember_task_position(task, &workspace);
         Ok(Some(workspace))
+    }
+
+    /// Remembers where a task runs for this process's lifetime.
+    fn remember_task_position(&self, task: &TaskId, workspace: &WorkerWorkspace) {
+        self.task_positions
+            .lock()
+            .expect("runtime task positions mutex poisoned")
+            .insert(task.clone(), workspace.clone());
+    }
+
+    /// The position a task was last given in this process, if any.
+    fn remembered_task_position(&self, task: &TaskId) -> Option<WorkerWorkspace> {
+        self.task_positions
+            .lock()
+            .expect("runtime task positions mutex poisoned")
+            .get(task)
+            .cloned()
     }
 
     pub async fn retry_task(
@@ -2106,310 +2131,7 @@ impl RuntimeCoordinator {
             .map_err(review_persistence_error)?;
         drop(supervisor);
         self.release_resident_lease(task);
-        self.recycle_accepted_delivery(&session, &parent, task)
-            .await;
         Ok(())
-    }
-
-    /// Best-effort recycling after an accepted review is durable. Never fails
-    /// the accept: a recycle failure leaves the worktree in place for later
-    /// handling and records an event. Git runs as a subprocess, so this is
-    /// deliberately called after every lock is released.
-    async fn recycle_accepted_delivery(
-        &self,
-        session: &RootSessionId,
-        owner: &TaskId,
-        child: &TaskId,
-    ) {
-        let Some(service) = self.workspace_service_for(session) else {
-            return;
-        };
-        let (owner_workspace, child_workspace) = {
-            let repository = self
-                .repository
-                .lock()
-                .expect("runtime repository mutex poisoned");
-            (
-                repository.task_workspace_optional(owner),
-                repository.task_workspace_optional(child),
-            )
-        };
-        let (owner_workspace, child_workspace) = match (owner_workspace, child_workspace) {
-            (Ok(Some(owner_workspace)), Ok(Some(child_workspace))) => {
-                (owner_workspace, child_workspace)
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
-                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
-                return;
-            }
-            // A genuinely absent workspace row is not a recycle failure: nothing to recycle.
-            _ => return,
-        };
-        match service.cleanup_accepted(&owner_workspace, &child_workspace) {
-            Ok(()) => {
-                let deleted = self
-                    .repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned")
-                    .delete_task_workspace(child);
-                match deleted {
-                    Ok(()) => {
-                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycled);
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "yi-agent: failed to delete recycled workspace row for {child}: {error}"
-                        );
-                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
-                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
-            }
-        }
-    }
-
-    /// Reclaims every reclaimable worktree directory in a session.
-    ///
-    /// Removes directories only: branch refs and `task_workspaces` rows survive,
-    /// so nothing is lost and every worktree can be rebuilt by
-    /// `prepare_task_workspace`. Returns the number of directories reclaimed.
-    ///
-    /// Candidates are processed deepest first. A child's merge check runs with
-    /// the owner worktree as its working directory, so reclaiming a parent first
-    /// would break its children.
-    ///
-    /// # Preconditions
-    ///
-    /// The caller must already have established that no live worker owns these
-    /// directories — in practice by detaching the session first. It must call this
-    /// off-thread. A non-terminal child is refused: the state rule is enforced one
-    /// call down in [`Self::reclaim_candidate_directories`]. The session root is
-    /// exempt from that rule, and it is reclaimed with no merge check, because a
-    /// root's `parent_branch` is the main branch, a root branch rarely merges into
-    /// it, and a detached root sits in `paused` rather than a terminal state. The
-    /// rebuild path in `prepare_task_workspace` repairs a reclaimed directory, but
-    /// only at the next worker start.
-    ///
-    /// It is synchronous and runs `git` subprocesses, so it must not be called
-    /// from a request-handling thread or while holding the repository mutex.
-    pub fn reclaim_session_worktrees(&self, session: &RootSessionId) -> usize {
-        let candidates = self.reclaim_candidates_in_session(session);
-        self.reclaim_candidate_directories(session, candidates)
-    }
-
-    /// Reclaims directories for tasks that have been idle past the TTL.
-    ///
-    /// Two candidate sources, because a terminal-only sweep would miss the most
-    /// common leak:
-    ///
-    /// 1. terminal tasks whose `updated_at` is older than the TTL
-    /// 2. the root of a detached session, which sits in `paused` — not a terminal
-    ///    state — and therefore never enters a terminal-only sweep
-    ///
-    /// A task in `awaiting_parent_review` is not terminal and its session is not
-    /// detached, so an un-integrated delivery is never reclaimed.
-    ///
-    /// It is synchronous and runs `git` subprocesses, so it must not be called
-    /// from a request-handling thread or while holding the repository mutex.
-    pub fn reclaim_idle_worktrees(&self, now: DateTime<Utc>) -> usize {
-        let cutoff = now
-            - chrono::Duration::from_std(WORKTREE_RECLAIM_TTL)
-                .unwrap_or_else(|_| chrono::Duration::days(7));
-        let sessions = {
-            let repository = self
-                .repository
-                .lock()
-                .expect("runtime repository mutex poisoned");
-            match repository.detached_application_roots() {
-                Ok(roots) => roots,
-                Err(error) => {
-                    eprintln!("yi-agent: detached root lookup failed: {error}");
-                    Vec::new()
-                }
-            }
-        };
-        let mut reclaimed = 0;
-        for session in sessions {
-            reclaimed += self.reclaim_idle_session(&session, cutoff);
-        }
-        reclaimed
-    }
-
-    /// Reclaims the idle, reclaimable directories of one session.
-    fn reclaim_idle_session(&self, session: &RootSessionId, cutoff: DateTime<Utc>) -> usize {
-        let candidates = self.reclaim_candidates_in_session(session);
-        let idle = candidates
-            .into_iter()
-            .filter(|candidate| {
-                let is_root = candidate.parent_task_id.is_none();
-                // A terminal child is idle-sweepable; a non-terminal child is not.
-                // The root qualifies through the detached-session clause instead,
-                // because a detached root sits in `paused`, which is not terminal.
-                if !is_root && !task_state_is_terminal(&candidate.state) {
-                    return false;
-                }
-                let updated = {
-                    let repository = self
-                        .repository
-                        .lock()
-                        .expect("runtime repository mutex poisoned");
-                    let parsed = candidate.task_id.parse::<TaskId>().ok();
-                    match parsed {
-                        Some(parsed) => repository.task_updated_at(&parsed).ok().flatten(),
-                        None => None,
-                    }
-                };
-                matches!(updated, Some(updated) if updated < cutoff)
-            })
-            .collect::<Vec<_>>();
-        // Hand the filtered set to the shared reclaim so the merge gate,
-        // deepest-first ordering, and event recording stay in one place.
-        self.reclaim_candidate_directories(session, idle)
-    }
-
-    /// Reads the session's reclaim candidates under a short repository lock.
-    ///
-    /// Split out from [`Self::reclaim_session_worktrees`] so the TTL sweep can
-    /// filter the same candidate set without re-reading it.
-    fn reclaim_candidates_in_session(
-        &self,
-        session: &RootSessionId,
-    ) -> Vec<crate::repository::PersistedTaskDetail> {
-        let repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
-        match repository.reclaim_candidates(session) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                eprintln!("yi-agent: reclaim candidate lookup failed for {session}: {error}");
-                Vec::new()
-            }
-        }
-    }
-
-    /// Reclaims the directories of an already-selected candidate set.
-    ///
-    /// This function enforces the state-eligibility rule — a child whose task is
-    /// not terminal is refused, while the root is exempt — in addition to the
-    /// merge check and the directory removal. A caller may narrow the set further
-    /// (the TTL sweep adds the seven-day idle clock) but cannot widen it past the
-    /// state rule. Splitting selection from reclaim means the "reclaim everything"
-    /// path and the "reclaim only idle tasks" path share one implementation of
-    /// ordering, the state gate, the merge gate, and event recording.
-    fn reclaim_candidate_directories(
-        &self,
-        session: &RootSessionId,
-        candidates: Vec<crate::repository::PersistedTaskDetail>,
-    ) -> usize {
-        let Some(service) = self.workspace_service_for(session) else {
-            return 0;
-        };
-        let mut reclaimed = 0;
-        for candidate in candidates {
-            let Some(child_workspace) = candidate.workspace.clone() else {
-                continue;
-            };
-            let Some(task_id) = candidate.task_id.parse::<TaskId>().ok() else {
-                continue;
-            };
-            // Never reclaim a directory a live worker may still own. The design's
-            // Non-Goals exclude tasks that are still running, and a running child
-            // is not meaningfully "merged": a freshly created child worktree
-            // shares its parent's tip, so the ancestry check further down would
-            // report "merged" for a child that has done no work yet. The session
-            // root is the deliberate exception: it sits in `paused` (not a
-            // terminal state) and is reclaimed on detach by design.
-            if candidate.parent_task_id.is_some() && !task_state_is_terminal(&candidate.state) {
-                continue;
-            }
-            // The owner is the parent's workspace when there is a parent, and the
-            // repository root otherwise. A root's `parent_branch` is the main
-            // branch, which a root branch rarely merges into, so the root is
-            // reclaimed without a merge check.
-            let owner_workspace = match candidate.parent_task_id.as_ref() {
-                Some(parent) => {
-                    let resolved = {
-                        let repository = self
-                            .repository
-                            .lock()
-                            .expect("runtime repository mutex poisoned");
-                        let parsed = parent.parse::<TaskId>().ok();
-                        match parsed {
-                            Some(parsed) => {
-                                repository.task_workspace_optional(&parsed).ok().flatten()
-                            }
-                            None => None,
-                        }
-                    };
-                    match resolved {
-                        Some(workspace) => Some(workspace),
-                        None => continue,
-                    }
-                }
-                None => None,
-            };
-            if let Some(owner_workspace) = owner_workspace.as_ref() {
-                // The merge check runs git with a working directory. Prefer the
-                // owner's worktree, but it may already have been reclaimed by an
-                // earlier pass (the exit trigger reclaims the root). Skipping the
-                // child then would strand its directory forever: a terminal task
-                // never starts a worker, so the owner is never rebuilt and the
-                // child can never become reclaimable again. `merge-base
-                // --is-ancestor` resolves both branch names from the ref database,
-                // so the repository root answers the same question.
-                let check_workspace = if owner_workspace.path.exists() {
-                    owner_workspace.clone()
-                } else {
-                    WorkerWorkspace {
-                        path: child_workspace.repository_root.clone(),
-                        ..owner_workspace.clone()
-                    }
-                };
-                match service.is_merged_into(
-                    &check_workspace,
-                    &child_workspace.branch,
-                    &child_workspace.parent_branch,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        eprintln!(
-                            "yi-agent: merge check failed for {task_id}, skipping reclaim: {error}"
-                        );
-                        continue;
-                    }
-                }
-            }
-            if !child_workspace.path.exists() {
-                continue;
-            }
-            match service.reclaim_worktree(&child_workspace) {
-                Ok(()) => {
-                    reclaimed += 1;
-                    self.record_recycle_event(&task_id, RuntimeEvent::TaskWorkspaceRecycled);
-                }
-                Err(error) => {
-                    eprintln!("yi-agent: worktree reclaim failed for {task_id}: {error}");
-                }
-            }
-        }
-        reclaimed
-    }
-
-    fn record_recycle_event(&self, task: &TaskId, event: RuntimeEvent) {
-        if let Err(error) = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .append_event(task, event)
-        {
-            eprintln!("yi-agent: failed to record {event:?} for {task}: {error}");
-        }
     }
 
     /// Captures the current review target and issues a short-lived confirmation
@@ -2429,7 +2151,7 @@ impl RuntimeCoordinator {
             _ => {}
         }
         let (session, _parent, delivery) = self.review_context(task)?;
-        let workspace = {
+        {
             let repository = self
                 .repository
                 .lock()
@@ -2439,8 +2161,10 @@ impl RuntimeCoordinator {
                     "delivery already has a review decision".into(),
                 ));
             }
-            repository.task_workspace_optional(task)?
-        };
+        }
+        // Pinning the position at preview time makes confirm re-inspect the same
+        // directory the reviewer saw.
+        let preview_workspace = self.remembered_task_position(task);
         let supervisor = self.supervisor(&session)?;
         let supervisor = supervisor.lock().await;
         if !matches!(
@@ -2452,7 +2176,7 @@ impl RuntimeCoordinator {
             ));
         }
         let confirmation_token =
-            self.issue_review_confirmation(task, &decision, &delivery, workspace);
+            self.issue_review_confirmation(task, &decision, &delivery, preview_workspace);
         Ok(ReviewPreview {
             task_id: task.clone(),
             delivery_id: delivery.id,
@@ -2482,8 +2206,8 @@ impl RuntimeCoordinator {
                 )
             })?;
         let inspected_commit = if let Some(workspace) = preview_workspace.as_ref() {
-            if let Some(service) = self.workspace_service.as_ref() {
-                service
+            if let Some(registry) = self.factory.worker_workspace_registry() {
+                registry
                     .inspect_delivery(workspace)
                     .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
                     .commit
@@ -2768,6 +2492,9 @@ impl RuntimeCoordinator {
     /// one: no commit, no recorded worktree, or a worktree already reclaimed.
     pub fn delivery_diff(&self, task: &TaskId) -> Result<Option<String>, RuntimeCoordinatorError> {
         let (repository_root, path, delivery) = {
+            let Some(workdir) = self.supervisor_workdir_for(task)? else {
+                return Ok(None);
+            };
             let repository = self
                 .repository
                 .lock()
@@ -2776,10 +2503,7 @@ impl RuntimeCoordinator {
             let Ok(delivery) = serde_json::from_str::<DeliveryReport>(&detail.delivery_json) else {
                 return Ok(None);
             };
-            let Some(workspace) = repository.task_workspace_optional(task)? else {
-                return Ok(None);
-            };
-            (workspace.repository_root, workspace.path, delivery)
+            (workdir.clone(), workdir, delivery)
         };
         if delivery.commit.trim().is_empty() {
             return Ok(None);
@@ -3255,85 +2979,7 @@ impl RuntimeCoordinator {
             }
             self.release_resident_lease(&task_id);
         }
-        self.reconcile_integrated_deliveries().await;
         Ok(())
-    }
-
-    /// Accepts deliveries whose commit a parent has already integrated.
-    ///
-    /// This is the production entry to `accept_review`. It never parses agent
-    /// text: the ancestry of the child's delivered commit in the parent's
-    /// worktree HEAD is the only proof of integration. It runs on every
-    /// reconcile pass because the application root is not a daemon worker, so
-    /// its merge is only observable through git.
-    ///
-    /// Failures are logged, not propagated: reconcile runs on every IPC request
-    /// and a transient mismatch must not fail unrelated traffic.
-    async fn reconcile_integrated_deliveries(&self) {
-        let supervisors = self
-            .supervisors
-            .lock()
-            .expect("runtime supervisor mutex poisoned")
-            .iter()
-            .map(|(session, supervisor)| (session.clone(), Arc::clone(supervisor)))
-            .collect::<Vec<_>>();
-        let mut awaiting: Vec<(RootSessionId, TaskId, TaskId, String)> = Vec::new();
-        for (session, supervisor) in &supervisors {
-            let supervisor = supervisor.lock().await;
-            for child in supervisor.tasks_awaiting_parent_review() {
-                let Some(task) = supervisor.task(&child) else {
-                    continue;
-                };
-                let Some(parent) = task.parent_id.clone() else {
-                    continue;
-                };
-                let Some(commit) = task
-                    .active_attempt()
-                    .delivery
-                    .as_ref()
-                    .map(|delivery| delivery.commit.clone())
-                else {
-                    continue;
-                };
-                awaiting.push((session.clone(), child, parent, commit));
-            }
-        }
-        for (session, child, parent, commit) in awaiting {
-            let Some(service) = self.workspace_service_for(&session) else {
-                continue;
-            };
-            let owner_workspace = {
-                let repository = self
-                    .repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned");
-                repository.task_workspace_optional(&parent)
-            };
-            let owner_workspace = match owner_workspace {
-                Ok(Some(workspace)) => workspace,
-                Ok(None) => continue,
-                Err(error) => {
-                    eprintln!("yi-agent: integration workspace lookup failed for {child}: {error}");
-                    continue;
-                }
-            };
-            match service.contains_commit(&owner_workspace, &commit) {
-                Ok(true) => {
-                    let integration = IntegrationValidation::passed(format!(
-                        "child commit {commit} is an ancestor of parent {parent} HEAD"
-                    ));
-                    if let Err(error) = self.accept_review(&child, integration).await {
-                        eprintln!(
-                            "yi-agent: integrated delivery accept failed for {child}: {error}"
-                        );
-                    }
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    eprintln!("yi-agent: integration ancestry check failed for {child}: {error}");
-                }
-            }
-        }
     }
 
     pub async fn worker_cancellation(
@@ -3640,29 +3286,6 @@ fn review_persistence_error(
         ReviewPersistenceError::Supervisor(error) => RuntimeCoordinatorError::Supervisor(error),
         ReviewPersistenceError::Persistence(error) => error.into(),
     }
-}
-
-/// Whether a persisted task state is one the state machine calls terminal.
-///
-/// The labels are exactly the ones `task_state_label` writes
-/// (`yi-agent-core/src/subagent/supervisor.rs`), which is what lands in
-/// `tasks.state_json`. `paused` and `awaiting_parent_review` are deliberately
-/// absent: a detached root sits in `paused` and an un-integrated delivery sits
-/// in `awaiting_parent_review`, and neither may be reclaimed out from under its
-/// owner.
-fn task_state_is_terminal(state: &str) -> bool {
-    matches!(
-        state,
-        "completed"
-            | "completed_no_changes"
-            | "blocked"
-            | "stalled"
-            | "timed_out"
-            | "budget_exhausted"
-            | "failed"
-            | "cancelled"
-            | "recovery_required"
-    )
 }
 
 fn persisted_depth(depth: u8) -> Result<yi_agent_core::TaskDepth, RuntimeCoordinatorError> {

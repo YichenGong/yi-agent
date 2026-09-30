@@ -1,8 +1,9 @@
 //! Application-owned construction for daemon subagent workers.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -10,12 +11,12 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use yi_agent_core::subagent::task::DeliveryReport;
 use yi_agent_core::subagent::task::{
-    AttemptId, RootSessionId, TaskId, TaskWorkspaceMode, WorkspaceLeaseId,
+    AttemptId, ChildWriteMode, RootSessionId, TaskId, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle,
-    WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult, WorkerStart, WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
+    WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
+    WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_core::{
     Agent, AgentConfig, AgentError, AgentEvent, Provider, ProviderError, ProviderTurnGate, Tool,
@@ -39,6 +40,9 @@ pub struct DaemonAgentWorkerFactory {
     sandbox: yi_agent_tools::SandboxMode,
     sandbox_writable_roots: Vec<PathBuf>,
     workspace_service: Option<Arc<DaemonWorkspaceService>>,
+    /// The single registry instance the coordinator registers into and workers
+    /// read from. Separate from the position provider so both sides share one map.
+    workspace_registry: Option<Arc<DaemonWorkspaceService>>,
     recovery_workspace: Option<PathBuf>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
 }
@@ -58,6 +62,7 @@ impl DaemonAgentWorkerFactory {
             sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
             sandbox_writable_roots: Vec::new(),
             workspace_service: None,
+            workspace_registry: None,
             recovery_workspace: None,
             catalog: None,
         }
@@ -86,7 +91,8 @@ impl DaemonAgentWorkerFactory {
     /// Configures the Git repository from which task worktrees are created.
     pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
         self.recovery_workspace = Some(workspace.clone());
-        self.workspace_service = Some(Arc::new(DaemonWorkspaceService::new(workspace)));
+        self.workspace_service = Some(Arc::new(DaemonWorkspaceService::new(workspace.clone())));
+        self.workspace_registry = Some(Arc::new(DaemonWorkspaceService::new(workspace)));
         self
     }
 
@@ -113,16 +119,16 @@ impl DaemonAgentWorkerFactory {
     fn worker_tool_registry(
         &self,
         workspace: &WorkerWorkspace,
-        workspace_mode: TaskWorkspaceMode,
+        workspace_mode: ChildWriteMode,
     ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
         let (sandbox, writable_roots) = match workspace_mode {
-            TaskWorkspaceMode::Coding => {
+            ChildWriteMode::Coding => {
                 let mut writable_roots = vec![workspace.path.clone()];
                 writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
                 (self.sandbox, writable_roots)
             }
-            TaskWorkspaceMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
+            ChildWriteMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
@@ -203,42 +209,96 @@ impl DaemonAgentWorkerFactory {
 
 pub struct DaemonWorkspaceService {
     repository_root: PathBuf,
-    worktree_root: PathBuf,
-    is_git_repository: bool,
     service: yi_agent_tools::worktree::WorktreeService,
+    /// Workspaces resolved from a parent-chosen workdir.
+    prepared: Mutex<HashMap<PathBuf, WorkerWorkspace>>,
 }
 
 impl DaemonWorkspaceService {
     pub fn new(workspace: PathBuf) -> Self {
-        let git_root = git_output(&workspace, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
-        let is_git_repository = git_root.is_some();
-        let repository_root = git_root.unwrap_or(workspace);
-        let worktree_root = repository_root.join(".worktrees");
+        let repository_root = git_output(&workspace, &["rev-parse", "--show-toplevel"])
+            .map_or(workspace, PathBuf::from);
         Self {
             repository_root,
-            worktree_root,
-            is_git_repository,
             service: yi_agent_tools::worktree::WorktreeService::new(),
+            prepared: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Records the position for a parent-chosen workdir.
+    ///
+    /// The parent prepares the directory itself (`git worktree add`); the daemon
+    /// only observes it. A workdir that does not exist, or that git does not
+    /// recognize as a worktree, is refused so a coding child cannot silently run
+    /// somewhere unprepared.
+    pub fn register_workdir(
+        &self,
+        workdir: &std::path::Path,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let canonical = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        if let Some(existing) = self
+            .prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .get(&canonical)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+        if !canonical.is_dir() {
+            return Err(WorkerError::Startup(format!(
+                "workdir does not exist: {} — create it with `git worktree add` first",
+                workdir.display()
+            )));
+        }
+        let toplevel =
+            git_output(&canonical, &["rev-parse", "--show-toplevel"]).ok_or_else(|| {
+                WorkerError::Startup(format!(
+                    "workdir is not inside a git worktree: {}",
+                    workdir.display()
+                ))
+            })?;
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: PathBuf::from(toplevel),
+            path: canonical.clone(),
+            branch: current_git_branch(&canonical).unwrap_or_default(),
+            parent_branch: String::new(),
+            base_commit: git_output(&canonical, &["rev-parse", "HEAD"]).unwrap_or_default(),
+        };
+        self.prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .insert(canonical, workspace.clone());
+        Ok(workspace)
     }
 
     fn inspect_delivery_report(
         &self,
         workspace: &WorkerWorkspace,
     ) -> Result<DeliveryReport, WorkerError> {
+        // The parent prepared this directory; the daemon only reports on it, so
+        // a plain workdir probe replaces the former daemon-managed-worktree
+        // inspection.
         let delivery = self
             .service
-            .inspect_delivery(&yi_agent_tools::worktree::ChildWorktree {
-                path: workspace.path.clone(),
-                branch: workspace.branch.clone(),
-                parent_branch: workspace.parent_branch.clone(),
-                base_commit: workspace.base_commit.clone(),
-            })
+            .inspect_workdir(&workspace.path, &workspace.base_commit)
             .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
         let head_commit = delivery.head_commit.clone();
+        // The base ref is the branch the workdir is on: a delivery is `that
+        // branch` at `head_commit`. `parent_branch` is empty for an observed
+        // workdir, so using it here would leave the delivery without a base and
+        // the reducer would reject it as invalid evidence.
+        let base_ref = if delivery.branch.trim().is_empty() {
+            workspace.branch.clone()
+        } else {
+            delivery.branch.clone()
+        };
         Ok(DeliveryReport::coding(
             head_commit,
-            workspace.parent_branch.clone(),
+            base_ref,
             workspace.lease_id.clone(),
             serde_json::json!({
                 "kind": "clean_delivery",
@@ -252,12 +312,8 @@ impl DaemonWorkspaceService {
     }
 }
 
-impl AgentWorkspaceService for DaemonWorkspaceService {
-    fn supports_coding(&self) -> bool {
-        self.is_git_repository
-    }
-
-    fn prepare_read_only(
+impl WorkerWorkspaceProvider for DaemonWorkspaceService {
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -275,160 +331,83 @@ impl AgentWorkspaceService for DaemonWorkspaceService {
         })
     }
 
-    fn prepare_root(
+    fn in_place_workspace(
         &self,
-        root_session_id: &RootSessionId,
-        task_id: &TaskId,
+        _root_session_id: &RootSessionId,
+        _task_id: &TaskId,
         _attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        let branch = branch_name(root_session_id, task_id, true);
-        let path = self.worktree_root.join(format!(
-            "yi-agent-{}-root",
-            short(&root_session_id.to_string())
-        ));
-        let root = self
-            .service
-            .create_root(&self.repository_root, &branch, &path)
-            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
+        // A task without a parent-prepared workdir runs in the project directory.
+        // No branch is recorded: an in-place position is not a worktree the
+        // daemon owns.
         Ok(WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: self.repository_root.clone(),
-            path: root.path,
-            branch: root.branch,
-            parent_branch: root.parent_branch,
-            base_commit: root.base_commit,
+            path: self.repository_root.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
         })
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
-        parent: &WorkerWorkspace,
-        root_session_id: &RootSessionId,
         task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        let branch = branch_name(root_session_id, task_id, false);
-        let path = self.worktree_root.join(format!(
-            "yi-agent-{}-{}",
-            short(&root_session_id.to_string()),
-            short(&task_id.to_string())
-        ));
-        let base = git_output(&parent.path, &["rev-parse", "HEAD"]).ok_or_else(|| {
-            WorkerError::Startup("Git workspace error: parent HEAD is unavailable".into())
-        })?;
-        let child = self
-            .service
-            .create_child(&parent.path, &base, &branch, &path)
-            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
-        Ok(WorkerWorkspace {
-            lease_id: WorkspaceLeaseId::new(),
-            repository_root: parent.repository_root.clone(),
-            path: child.path,
-            branch: child.branch,
-            parent_branch: child.parent_branch,
-            base_commit: child.base_commit,
-        })
+        // The parent already created the directory and the coordinator recorded
+        // it; resolve the recorded position, and fall back to probing the workdir
+        // itself when this instance holds no record (a different instance than
+        // the one the spawn registered into). A workdir the parent never created
+        // is still refused.
+        if let Some(workspace) =
+            WorkerWorkspaceRegistry::prepared_workspace_for_workdir(self, workdir)
+        {
+            return Ok(workspace);
+        }
+        let canonical = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        if !canonical.is_dir() {
+            return Err(WorkerError::Startup(format!(
+                "no prepared workspace for workdir {}; the parent must prepare it before spawning {task_id}",
+                workdir.display()
+            )));
+        }
+        self.register_workdir(&canonical)
     }
+}
 
+impl WorkerWorkspaceRegistry for DaemonWorkspaceService {
     fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
         self.inspect_delivery_report(workspace)
     }
 
-    fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        if workspace.branch.is_empty() {
-            // A read-only workspace owns no worktree or branch; its `path` is
-            // the parent's view and must not be removed.
-            return Ok(());
-        }
-        self.service
-            .remove_created(
-                &workspace.repository_root,
-                &workspace.path,
-                &workspace.branch,
-            )
-            .map_err(|error| WorkerError::Startup(format!("Git workspace cleanup error: {error}")))
+    fn observe_workdir(&self, workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
+        self.register_workdir(workdir)
     }
 
-    fn contains_commit(&self, owner: &WorkerWorkspace, commit: &str) -> Result<bool, WorkerError> {
-        self.service
-            .contains_commit(&owner.path, commit)
-            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
+    fn register_prepared(&self, workspace: &WorkerWorkspace) {
+        let canonical = workspace
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.path.clone());
+        self.prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .insert(canonical, workspace.clone());
     }
 
-    fn cleanup_accepted(
-        &self,
-        owner: &WorkerWorkspace,
-        child: &WorkerWorkspace,
-    ) -> Result<(), WorkerError> {
-        self.service
-            .remove_accepted_clean(
-                &owner.path,
-                &yi_agent_tools::worktree::ChildWorktree {
-                    path: child.path.clone(),
-                    branch: child.branch.clone(),
-                    parent_branch: child.parent_branch.clone(),
-                    base_commit: child.base_commit.clone(),
-                },
-            )
-            .map_err(|error| WorkerError::Startup(format!("Git workspace cleanup error: {error}")))
+    fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace> {
+        let canonical = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        self.prepared
+            .lock()
+            .expect("prepared workspace mutex poisoned")
+            .get(&canonical)
+            .cloned()
     }
-
-    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        if workspace.branch.is_empty() {
-            // A read-only workspace owns no worktree; its `path` is the parent's
-            // view and must not be removed.
-            return Ok(());
-        }
-        self.service
-            .reclaim_directory(&workspace.repository_root, &workspace.path)
-            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
-    }
-
-    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        if workspace.branch.is_empty() {
-            return Ok(());
-        }
-        self.service
-            .reattach_worktree(
-                &workspace.repository_root,
-                &workspace.path,
-                &workspace.branch,
-            )
-            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
-    }
-
-    fn is_merged_into(
-        &self,
-        owner: &WorkerWorkspace,
-        branch: &str,
-        parent_branch: &str,
-    ) -> Result<bool, WorkerError> {
-        if branch.is_empty() || parent_branch.is_empty() {
-            return Ok(false);
-        }
-        // Test ancestry against the recorded parent branch, not the owner's
-        // current HEAD: a worker that ran `git checkout` inside the owner
-        // worktree must not change whether a child counts as integrated.
-        self.service
-            .is_ancestor(&owner.path, branch, parent_branch)
-            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
-    }
-}
-
-fn branch_name(session: &RootSessionId, task: &TaskId, root: bool) -> String {
-    if root {
-        format!("feat/yi-agent-{}-root", short(&session.to_string()))
-    } else {
-        format!(
-            "feat/yi-agent-{}-{}",
-            short(&session.to_string()),
-            short(&task.to_string())
-        )
-    }
-}
-
-fn short(value: &str) -> String {
-    value.chars().filter(|ch| *ch != '-').take(8).collect()
 }
 
 fn provider_retry_failure(error: &AgentError) -> Option<RetryFailure> {
@@ -457,22 +436,31 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         Some("daemon-default".into())
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         self.workspace_service
             .as_ref()
-            .map(|service| Arc::clone(service) as Arc<dyn AgentWorkspaceService>)
+            .map(|service| Arc::clone(service) as Arc<dyn WorkerWorkspaceProvider>)
     }
 
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(DaemonWorkspaceService::new(
             workspace.to_path_buf(),
         )))
     }
 
-    fn application_root_workspace_matches(
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
+        // One registry instance for the whole daemon: the coordinator registers a
+        // parent-prepared workdir here, and the worker-start read must reach the
+        // same map. The per-project position provider stays separate.
+        self.workspace_registry
+            .as_ref()
+            .map(|service| service.clone() as Arc<dyn WorkerWorkspaceRegistry>)
+    }
+
+    fn project_workspace_matches(
         &self,
         workspace: &std::path::Path,
         recorded: &WorkerWorkspace,
@@ -686,7 +674,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 assistant_report.clear();
                                                 continue 'run;
                                             }
-                                            if workspace_mode == TaskWorkspaceMode::Coding {
+                                            if workspace_mode == ChildWriteMode::Coding {
                                                 if let Some(service) = workspace_service.as_ref() {
                                                     match service.inspect_delivery(&workspace_for_delivery) {
                                                         Ok(delivery) => reporter.report_delivery(delivery),
@@ -810,6 +798,12 @@ fn git_dir_for_worktree(workspace: &std::path::Path) -> Option<PathBuf> {
     } else {
         Some(workspace.join(git_dir))
     }
+}
+
+/// The checked-out branch of `workdir`, or `None` on a detached HEAD.
+fn current_git_branch(workdir: &std::path::Path) -> Option<String> {
+    let branch = git_output(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    (!branch.trim().is_empty() && branch != "HEAD").then_some(branch)
 }
 
 fn git_output(directory: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -1105,15 +1099,27 @@ fn format_ipc_rejection(action: &str, response: &yi_agent_store::ipc::IpcRespons
 }
 
 /// Resolves the optional `mode` argument for a daemon `spawn_agent` call via the
-/// canonical [`TaskWorkspaceMode::parse`], so the tool, the core tool, and the
+/// canonical [`ChildWriteMode::parse`], so the tool, the core tool, and the
 /// IPC helper agree on the accepted spellings. An omitted mode defaults to
 /// read-only; an explicit unknown or non-string value is rejected.
-fn spawn_mode(args: &Value) -> Result<TaskWorkspaceMode, ToolResult> {
+fn spawn_mode(args: &Value) -> Result<ChildWriteMode, ToolResult> {
     match args.get("mode") {
-        None => Ok(TaskWorkspaceMode::ReadOnly),
-        Some(Value::String(value)) => TaskWorkspaceMode::parse(value)
+        None => Ok(ChildWriteMode::ReadOnly),
+        Some(Value::String(value)) => ChildWriteMode::parse(value)
             .ok_or_else(|| ToolResult::error("mode must be 'coding' or 'read_only'")),
         Some(_) => Err(ToolResult::error("mode must be a string")),
+    }
+}
+
+/// Resolves the optional `workdir` argument for a daemon `spawn_agent` call.
+/// A blank or non-string value is rejected rather than silently ignored; an
+/// omitted workdir means the runtime chooses the child's position.
+fn spawn_workdir(args: &Value) -> Result<Option<String>, ToolResult> {
+    match args.get("workdir") {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) => Err(ToolResult::error("workdir must not be blank")),
+        Some(_) => Err(ToolResult::error("workdir must be a string")),
     }
 }
 
@@ -1203,6 +1209,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model for this child. Omit to inherit yours."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
                 }
             },
             "required": ["task"],
@@ -1225,6 +1235,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(model) => model,
             Err(error) => return error,
         };
+        let workdir = match spawn_workdir(&args) {
+            Ok(workdir) => workdir,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
@@ -1234,6 +1248,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
                 model,
+                workdir,
             },
         );
         match response {
@@ -1524,6 +1539,10 @@ impl Tool for DaemonSpawnAgentTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model for this child. Omit to inherit yours."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
                 }
             },
             "required": ["task"],
@@ -1546,6 +1565,10 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(model) => model,
             Err(error) => return error,
         };
+        let workdir = match spawn_workdir(&args) {
+            Ok(workdir) => workdir,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
@@ -1554,6 +1577,7 @@ impl Tool for DaemonSpawnAgentTool {
                 objective: task.to_string(),
                 mode: Some(mode.as_str().to_string()),
                 model,
+                workdir,
             },
         );
         match response {
@@ -1583,7 +1607,6 @@ mod tests {
     use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
     use yi_agent_store::repository::RuntimeRepository;
     use yi_agent_store::runtime::RuntimeCoordinator;
-    use yi_agent_tools::worktree::WorktreeService;
 
     use super::*;
 
@@ -1771,16 +1794,16 @@ mod tests {
     fn daemon_spawn_mode_uses_the_canonical_parser() {
         assert_eq!(
             spawn_mode(&json!({})).unwrap(),
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             "an omitted mode defaults to read-only"
         );
         assert_eq!(
             spawn_mode(&json!({ "mode": "coding" })).unwrap(),
-            TaskWorkspaceMode::Coding
+            ChildWriteMode::Coding
         );
         assert_eq!(
             spawn_mode(&json!({ "mode": "read_only" })).unwrap(),
-            TaskWorkspaceMode::ReadOnly
+            ChildWriteMode::ReadOnly
         );
 
         let unknown = spawn_mode(&json!({ "mode": "bogus" })).unwrap_err();
@@ -2044,19 +2067,27 @@ mod tests {
         let repository = TempDir::new().unwrap();
         let base_head = initialize_git_repository(repository.path());
         let child_path = repository.path().join(".worktrees/child");
-        let child = WorktreeService::new()
-            .create_root(
-                repository.path(),
-                "feat/yi-agent-child-registry",
-                &child_path,
-            )
-            .unwrap();
+        // The parent prepares the worktree itself; the daemon only observes it.
+        assert!(
+            Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/yi-agent-child-registry",
+                    child_path.to_str().unwrap(),
+                ])
+                .current_dir(repository.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let workspace = WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: repository.path().to_path_buf(),
-            path: child.path,
-            branch: child.branch,
-            parent_branch: child.parent_branch,
+            path: child_path,
+            branch: "feat/yi-agent-child-registry".into(),
+            parent_branch: "main".into(),
             base_commit: base_head,
         };
         let factory = DaemonAgentWorkerFactory::new(
@@ -2066,7 +2097,7 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
+        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -2187,7 +2218,7 @@ mod tests {
             base_commit: String::new(),
         };
 
-        let read_only = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::ReadOnly);
+        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly);
         let read_only_names: Vec<_> = read_only
             .schemas()
             .into_iter()
@@ -2200,7 +2231,7 @@ mod tests {
             "read-only registry must omit write/edit, got {read_only_names:?}"
         );
 
-        let coding = factory.worker_tool_registry(&workspace, TaskWorkspaceMode::Coding);
+        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
         let coding_names: Vec<_> = coding
             .schemas()
             .into_iter()
@@ -2210,6 +2241,71 @@ mod tests {
             coding_names.iter().any(|name| name == "write")
                 && coding_names.iter().any(|name| name == "edit"),
             "coding registry must include write/edit, got {coding_names:?}"
+        );
+    }
+
+    #[test]
+    fn observe_workdir_resolves_a_prepared_directory_and_rejects_a_missing_one() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        initialize_git_repository(&repository);
+        let service = DaemonWorkspaceService::new(repository.clone());
+
+        let observed = service
+            .observe_workdir(&repository)
+            .expect("an existing git checkout is a usable workdir");
+        assert_eq!(observed.path, repository.canonicalize().unwrap());
+        assert_eq!(observed.repository_root, repository.canonicalize().unwrap());
+
+        // A parent only runs `git worktree add`; a workdir that was never
+        // prepared must be refused rather than silently used as the project.
+        let missing = directory.path().join("never-created");
+        let error = service
+            .observe_workdir(&missing)
+            .expect_err("a missing workdir is refused");
+        assert!(
+            error.to_string().contains("workdir does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_workdir_outside_any_repository_is_still_accepted() {
+        // A non-git directory has no repository root to fall back to, yet a
+        // position must still resolve: the workdir itself is the position.
+        let directory = TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+
+        let workspace = service
+            .read_only_workspace(None, &TaskId::new())
+            .expect("a non-git workdir still gets an in-place position");
+
+        assert_eq!(workspace.path, directory.path());
+    }
+
+    #[test]
+    fn registry_round_trips_a_prepared_workdir_to_its_workspace() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        initialize_git_repository(&repository);
+        let service = DaemonWorkspaceService::new(repository.clone());
+
+        let workspace = service.observe_workdir(&repository).unwrap();
+        let registry: Arc<dyn WorkerWorkspaceRegistry> =
+            Arc::new(DaemonWorkspaceService::new(repository.clone()));
+        registry.register_prepared(&workspace);
+
+        assert_eq!(
+            registry
+                .prepared_workspace_for_workdir(&repository)
+                .map(|found| found.path),
+            Some(workspace.path.clone())
+        );
+        assert_eq!(
+            registry.prepared_workspace_for_workdir(&directory.path().join("elsewhere")),
+            None
         );
     }
 
@@ -2287,81 +2383,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_workspace_cleanup_removes_prepared_root_worktree_and_branch() {
-        let directory = TempDir::new().unwrap();
-        initialize_git_repository(directory.path());
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-        let workspace = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
-            .unwrap();
-        assert!(workspace.path.exists());
-        assert!(
-            Command::new("git")
-                .args([
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{}", workspace.branch)
-                ])
-                .current_dir(directory.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        service.cleanup_prepared(&workspace).unwrap();
-
-        assert!(!workspace.path.exists());
-        assert!(
-            !Command::new("git")
-                .args([
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{}", workspace.branch)
-                ])
-                .current_dir(directory.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
-
-    #[test]
-    fn non_git_workspace_service_supports_only_read_only() {
-        let directory = tempfile::TempDir::new().unwrap();
-        if std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(directory.path())
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            eprintln!("skip: temp dir is inside a git repository");
-            return;
-        }
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-
-        assert!(!service.supports_coding());
-
-        let workspace = service
-            .prepare_read_only(None, &TaskId::new())
-            .expect("read-only workspace is always available");
-        assert_eq!(workspace.path, directory.path());
-        assert!(workspace.branch.is_empty());
-        assert!(workspace.base_commit.is_empty());
-    }
-
-    #[test]
-    fn git_workspace_service_supports_coding() {
-        let directory = tempfile::TempDir::new().unwrap();
-        initialize_git_repository(directory.path());
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-
-        assert!(service.supports_coding());
-    }
-
-    #[test]
     fn read_only_workspace_inherits_the_parent_path() {
         let directory = tempfile::TempDir::new().unwrap();
         let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
@@ -2375,235 +2396,9 @@ mod tests {
         };
 
         let workspace = service
-            .prepare_read_only(Some(&parent), &TaskId::new())
+            .read_only_workspace(Some(&parent), &TaskId::new())
             .unwrap();
         assert_eq!(workspace.path, parent.path);
-    }
-
-    #[test]
-    fn daemon_workspace_cleanup_accepted_removes_child_worktree_and_branch() {
-        let directory = TempDir::new().unwrap();
-        initialize_git_repository(directory.path());
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-        let root = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
-            .unwrap();
-        let child = service
-            .prepare_child(
-                &root,
-                &RootSessionId::new(),
-                &TaskId::new(),
-                &AttemptId::new(),
-            )
-            .unwrap();
-
-        std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
-        for args in [
-            vec!["add", "delivery.txt"],
-            vec!["commit", "-m", "child delivery"],
-        ] {
-            assert!(
-                Command::new("git")
-                    .args(args)
-                    .current_dir(&child.path)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-
-        // Not integrated yet: the child head is not an ancestor of the owner,
-        // and refusal is git-level, leaving the worktree in place.
-        assert!(!service.contains_commit(&root, &child.branch).unwrap());
-        let error = service.cleanup_accepted(&root, &child).unwrap_err();
-        assert!(
-            error.to_string().contains("has not been merged"),
-            "unexpected error: {error}"
-        );
-        assert!(child.path.exists());
-
-        assert!(
-            Command::new("git")
-                .args(["merge", "--no-ff", &child.branch, "-m", "integrate"])
-                .current_dir(&root.path)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(service.contains_commit(&root, &child.branch).unwrap());
-
-        service.cleanup_accepted(&root, &child).unwrap();
-        assert!(!child.path.exists());
-        assert!(
-            !Command::new("git")
-                .args([
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{}", child.branch)
-                ])
-                .current_dir(directory.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
-
-    #[test]
-    fn daemon_workspace_reclaim_removes_directory_and_keeps_branch_and_workspace() {
-        let directory = TempDir::new().unwrap();
-        initialize_git_repository(directory.path());
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-        let root = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
-            .unwrap();
-        std::fs::write(root.path.join("delivery.txt"), "ready\n").unwrap();
-        Command::new("git")
-            .args(["add", "delivery.txt"])
-            .current_dir(&root.path)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "root delivery"])
-            .current_dir(&root.path)
-            .status()
-            .unwrap();
-        let delivered = git_output(&root.path, &["rev-parse", "HEAD"]).unwrap();
-
-        service.reclaim_worktree(&root).unwrap();
-
-        assert!(!root.path.exists(), "directory is reclaimed");
-        assert!(
-            Command::new("git")
-                .args([
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{}", root.branch)
-                ])
-                .current_dir(directory.path())
-                .status()
-                .unwrap()
-                .success(),
-            "branch ref survives the reclaim"
-        );
-        assert_eq!(
-            git_output(directory.path(), &["rev-parse", &root.branch]).unwrap(),
-            delivered
-        );
-
-        service.reattach_workspace(&root).unwrap();
-
-        assert!(root.path.exists(), "worktree is rebuilt from the branch");
-        assert_eq!(
-            git_output(&root.path, &["rev-parse", "HEAD"]).unwrap(),
-            delivered,
-            "rebuild restores the delivered tip"
-        );
-    }
-
-    /// The production merge check must answer from the recorded `parent_branch`,
-    /// not from the owner worktree's current `HEAD`. This is the daemon-level
-    /// counterpart of the coordinator's
-    /// `reclaim_uses_the_recorded_parent_branch_not_the_owner_head`, which
-    /// exercises a test double rather than this implementation.
-    #[test]
-    fn daemon_merge_check_uses_the_recorded_parent_branch_not_the_owner_head() {
-        let directory = TempDir::new().unwrap();
-        initialize_git_repository(directory.path());
-        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
-        let root = service
-            .prepare_root(&RootSessionId::new(), &TaskId::new(), &AttemptId::new())
-            .unwrap();
-        let child = service
-            .prepare_child(
-                &root,
-                &RootSessionId::new(),
-                &TaskId::new(),
-                &AttemptId::new(),
-            )
-            .unwrap();
-
-        std::fs::write(child.path.join("delivery.txt"), "ready\n").unwrap();
-        for args in [
-            vec!["add", "delivery.txt"],
-            vec!["commit", "-m", "child delivery"],
-        ] {
-            assert!(
-                Command::new("git")
-                    .args(args)
-                    .current_dir(&child.path)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        // A child with its own unmerged commit is not yet integrated. (A freshly
-        // created child branch points at the parent's HEAD and is trivially an
-        // ancestor, so the commit is what makes this assertion meaningful.)
-        assert!(
-            !service
-                .is_merged_into(&root, &child.branch, &child.parent_branch)
-                .unwrap(),
-            "an unmerged child is not reported as merged"
-        );
-
-        assert!(
-            Command::new("git")
-                .args([
-                    "merge",
-                    "--no-ff",
-                    &child.branch,
-                    "-m",
-                    "integrate the child",
-                ])
-                .current_dir(&root.path)
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        assert!(
-            service
-                .is_merged_into(&root, &child.branch, &child.parent_branch)
-                .unwrap(),
-            "a merged child is reported as merged"
-        );
-
-        // Move the owner off its own branch, onto a commit that predates the
-        // merge. A HEAD-relative check would now answer "not merged"; the
-        // parent_branch-relative check must still answer "merged".
-        let side_track = "owner-side-track";
-        assert!(
-            Command::new("git")
-                .args(["checkout", "-b", side_track, &root.base_commit])
-                .current_dir(&root.path)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert_eq!(
-            git_output(&root.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
-            side_track
-        );
-        assert!(
-            service
-                .is_merged_into(&root, &child.branch, &child.parent_branch)
-                .unwrap(),
-            "the answer does not depend on the owner's current HEAD"
-        );
-
-        // Empty inputs never authorize a reclaim.
-        assert!(
-            !service
-                .is_merged_into(&root, "", &child.parent_branch)
-                .unwrap(),
-            "an empty child branch is never merged"
-        );
-        assert!(
-            !service.is_merged_into(&root, &child.branch, "").unwrap(),
-            "an empty parent branch is never merged"
-        );
     }
 
     #[tokio::test]
@@ -2711,15 +2506,26 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let base_head = initialize_git_repository(directory.path());
         let root_path = directory.path().join(".worktrees/yi-root");
-        let root = WorktreeService::new()
-            .create_root(directory.path(), "feat/yi-agent-dirty-delivery", &root_path)
-            .unwrap();
+        assert!(
+            Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/yi-agent-dirty-delivery",
+                    root_path.to_str().unwrap(),
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let workspace = WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: directory.path().to_path_buf(),
-            path: root.path.clone(),
-            branch: root.branch.clone(),
-            parent_branch: root.parent_branch.clone(),
+            path: root_path.clone(),
+            branch: "feat/yi-agent-dirty-delivery".into(),
+            parent_branch: "main".into(),
             base_commit: base_head,
         };
         let provider = Arc::new(DirtyDeliveryProvider::default());
@@ -2734,7 +2540,7 @@ mod tests {
             .start(
                 WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
                     .with_objective("Create and commit delivery.txt.")
-                    .with_workspace_mode(TaskWorkspaceMode::Coding)
+                    .with_workspace_mode(ChildWriteMode::Coding)
                     .with_workspace(workspace.clone()),
             )
             .await
@@ -2747,8 +2553,8 @@ mod tests {
                     WorkerEvent::Delivered(delivery) => Some(delivery),
                     WorkerEvent::Failed(error) => panic!(
                         "worker failed instead of requesting a commit: {error}; status={:?}; log={:?}",
-                        git_output(&root.path, &["status", "--porcelain"]),
-                        git_output(&root.path, &["log", "-1", "--format=%B"]),
+                        git_output(&root_path, &["status", "--porcelain"]),
+                        git_output(&root_path, &["log", "-1", "--format=%B"]),
                     ),
                     _ => None,
                 }) {
@@ -2762,7 +2568,7 @@ mod tests {
 
         assert_eq!(delivery.workspace, workspace.lease_id);
         assert_eq!(
-            git_output(&root.path, &["status", "--porcelain"]),
+            git_output(&root_path, &["status", "--porcelain"]),
             None,
             "committed delivery must leave the worktree clean",
         );
@@ -2793,27 +2599,38 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let base_head = initialize_git_repository(directory.path());
         let root_path = directory.path().join(".worktrees/yi-root");
-        let root = WorktreeService::new()
-            .create_root(directory.path(), "feat/yi-agent-test-root", &root_path)
-            .unwrap();
-        std::fs::write(root.path.join("delivery.txt"), "ready\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/yi-agent-test-root",
+                    root_path.to_str().unwrap(),
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root_path.join("delivery.txt"), "ready\n").unwrap();
         Command::new("git")
             .args(["add", "delivery.txt"])
-            .current_dir(&root.path)
+            .current_dir(&root_path)
             .status()
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "prepared delivery"])
-            .current_dir(&root.path)
+            .current_dir(&root_path)
             .status()
             .unwrap();
-        let head = git_output(&root.path, &["rev-parse", "HEAD"]).unwrap();
+        let head = git_output(&root_path, &["rev-parse", "HEAD"]).unwrap();
         let workspace = WorkerWorkspace {
             lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
             repository_root: directory.path().to_path_buf(),
-            path: root.path.clone(),
-            branch: root.branch.clone(),
-            parent_branch: root.parent_branch.clone(),
+            path: root_path.clone(),
+            branch: "feat/yi-agent-test-root".into(),
+            parent_branch: "main".into(),
             base_commit: base_head,
         };
         let factory = DaemonAgentWorkerFactory::new(
@@ -2826,7 +2643,7 @@ mod tests {
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Return immediately after one clean provider turn.")
             .with_workspace(workspace.clone())
-            .with_workspace_mode(TaskWorkspaceMode::Coding);
+            .with_workspace_mode(ChildWriteMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let delivery = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2848,7 +2665,9 @@ mod tests {
         .expect("worker should complete and report a delivery");
 
         assert_eq!(delivery.commit, head);
-        assert_eq!(delivery.base_ref, workspace.parent_branch);
+        // The base ref is the workdir's own branch: a workdir the parent
+        // prepared carries no separate parent branch.
+        assert_eq!(delivery.base_ref, workspace.branch);
         assert_eq!(delivery.workspace, workspace.lease_id);
     }
 
@@ -2912,7 +2731,7 @@ mod tests {
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Report whether the sub-agent is healthy.")
             .with_workspace(workspace)
-            .with_workspace_mode(TaskWorkspaceMode::Coding);
+            .with_workspace_mode(ChildWriteMode::Coding);
         let handle = factory.start(request).await.unwrap();
 
         let report = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2965,7 +2784,7 @@ mod tests {
         let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_objective("Report whether the sub-agent is healthy.")
             .with_workspace(workspace)
-            .with_workspace_mode(TaskWorkspaceMode::ReadOnly);
+            .with_workspace_mode(ChildWriteMode::ReadOnly);
         let handle = factory.start(request).await.unwrap();
 
         let report = tokio::time::timeout(Duration::from_secs(1), async {
@@ -3051,6 +2870,7 @@ mod tests {
         } = send_request(
             daemon.socket_path(),
             IpcRequest::SpawnChild {
+                workdir: None,
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),
@@ -3099,6 +2919,7 @@ mod tests {
         } = send_request(
             daemon.socket_path(),
             IpcRequest::SpawnChild {
+                workdir: None,
                 session_id: session_id.clone(),
                 parent_task_id: root_task_id.clone(),
                 objective: "Inspect the target".into(),

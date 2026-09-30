@@ -20,8 +20,12 @@ pub enum WorktreeError {
     ExistingBranch { branch: String },
     #[error("child worktree is dirty: {path}")]
     DirtyChild { path: PathBuf },
+    #[error("child worktree is dirty: {path}")]
+    DirtyWorkdir { path: PathBuf },
     #[error("child delivery has no commits beyond its recorded base {base}")]
     EmptyDelivery { base: String },
+    #[error("child delivery has no commits beyond its recorded base {base}")]
+    NoCommitsBeyond { path: PathBuf, base: String },
     #[error("reviewed child HEAD {reviewed} changed to {current}")]
     ReviewedHeadChanged { reviewed: String, current: String },
     #[error("parent base commit is not available: {base}")]
@@ -39,16 +43,9 @@ pub enum WorktreeError {
 #[derive(Debug, Default)]
 pub struct WorktreeService;
 
+/// The facts a workdir reports about its own delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChildWorktree {
-    pub path: PathBuf,
-    pub branch: String,
-    pub parent_branch: String,
-    pub base_commit: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InspectedDelivery {
+pub struct WorkdirDelivery {
     pub branch: String,
     pub base_commit: String,
     pub head_commit: String,
@@ -60,28 +57,35 @@ impl WorktreeService {
         Self
     }
 
-    pub fn create_root(
+    /// Reads a workdir's delivery facts with plain git probes.
+    ///
+    /// Unlike worktree orchestration, this requires nothing of the directory
+    /// beyond being a git checkout: the parent may have created it by any means.
+    /// An uncommitted change is [`WorktreeError::DirtyWorkdir`] and a HEAD equal
+    /// to `base` is [`WorktreeError::NoCommitsBeyond`]; those are the only two
+    /// conditions a delivery cannot be reviewed with.
+    pub fn inspect_workdir(
         &self,
-        repository_root: &Path,
-        branch: &str,
-        root_path: &Path,
-    ) -> Result<ChildWorktree, WorktreeError> {
-        if same_path(repository_root, root_path) {
-            return Err(WorktreeError::ParentPathReuse {
-                path: root_path.to_path_buf(),
+        workdir: &Path,
+        base: &str,
+    ) -> Result<WorkdirDelivery, WorktreeError> {
+        let head_commit = git(workdir, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if !git(workdir, &["status", "--porcelain"])?.trim().is_empty() {
+            return Err(WorktreeError::DirtyWorkdir {
+                path: workdir.to_path_buf(),
             });
         }
-        self.validate_parent_base(repository_root, "HEAD")?;
-        let parent_branch = current_branch(repository_root)?;
-        let base_commit = self.resolve_parent_base(repository_root, "HEAD")?;
-        ensure_worktree_target_available(repository_root, root_path, branch)?;
-        ensure_worktree_parent_is_ignored(repository_root, root_path)?;
-        add_worktree(repository_root, root_path, branch, &base_commit)?;
-        Ok(ChildWorktree {
-            path: root_path.to_path_buf(),
-            branch: branch.to_owned(),
-            parent_branch,
-            base_commit,
+        if head_commit == base {
+            return Err(WorktreeError::NoCommitsBeyond {
+                path: workdir.to_path_buf(),
+                base: base.to_owned(),
+            });
+        }
+        Ok(WorkdirDelivery {
+            branch: current_branch(workdir).unwrap_or_default(),
+            base_commit: base.to_owned(),
+            head_commit,
+            clean: true,
         })
     }
 
@@ -152,394 +156,6 @@ impl WorktreeService {
         }
         Ok(Some(PathBuf::from(root)))
     }
-
-    /// Rejects uncommitted parent state before a child branch can be derived.
-    pub fn validate_parent_base(
-        &self,
-        parent_worktree: &Path,
-        base: &str,
-    ) -> Result<(), WorktreeError> {
-        let status = git(parent_worktree, &["status", "--porcelain"])?;
-        if !status.trim().is_empty() {
-            return Err(WorktreeError::DirtyParent {
-                path: parent_worktree.to_path_buf(),
-            });
-        }
-        self.resolve_parent_base(parent_worktree, base)?;
-        Ok(())
-    }
-
-    pub fn create_child(
-        &self,
-        parent_worktree: &Path,
-        base: &str,
-        branch: &str,
-        child_path: &Path,
-    ) -> Result<ChildWorktree, WorktreeError> {
-        if same_path(parent_worktree, child_path) {
-            return Err(WorktreeError::ParentPathReuse {
-                path: child_path.to_path_buf(),
-            });
-        }
-        self.validate_parent_base(parent_worktree, base)?;
-        let base_commit = self.resolve_parent_base(parent_worktree, base)?;
-        let parent_branch = current_branch(parent_worktree)?;
-        ensure_worktree_target_available(parent_worktree, child_path, branch)?;
-        ensure_worktree_parent_is_ignored(parent_worktree, child_path)?;
-        add_worktree(parent_worktree, child_path, branch, &base_commit)?;
-        Ok(ChildWorktree {
-            path: child_path.to_path_buf(),
-            branch: branch.to_owned(),
-            parent_branch,
-            base_commit,
-        })
-    }
-
-    /// Capture the exact clean commit that a parent may review and integrate.
-    pub fn inspect_delivery(
-        &self,
-        child: &ChildWorktree,
-    ) -> Result<InspectedDelivery, WorktreeError> {
-        let status = git(&child.path, &["status", "--porcelain"])?;
-        if !status.trim().is_empty() {
-            return Err(WorktreeError::DirtyChild {
-                path: child.path.clone(),
-            });
-        }
-        let branch = current_branch(&child.path)?;
-        if branch != child.branch {
-            return Err(WorktreeError::WrongParentBranch {
-                expected: child.branch.clone(),
-                actual: branch,
-            });
-        }
-        let head_commit = git(&child.path, &["rev-parse", "HEAD"])?.trim().to_owned();
-        let merge_base = git(
-            &child.path,
-            &["merge-base", &child.base_commit, &head_commit],
-        )?;
-        if merge_base.trim() != child.base_commit {
-            return Err(WorktreeError::UnknownBase {
-                base: child.base_commit.clone(),
-            });
-        }
-        if head_commit == child.base_commit {
-            return Err(WorktreeError::EmptyDelivery {
-                base: child.base_commit.clone(),
-            });
-        }
-        Ok(InspectedDelivery {
-            branch: child.branch.clone(),
-            base_commit: child.base_commit.clone(),
-            head_commit,
-            clean: true,
-        })
-    }
-
-    /// Integrate the reviewed delivery into exactly the branch that created it.
-    pub fn merge_accepted(
-        &self,
-        parent_worktree: &Path,
-        child: &ChildWorktree,
-        delivery: &InspectedDelivery,
-        message: &str,
-    ) -> Result<(), WorktreeError> {
-        self.merge_inspected_delivery(parent_worktree, child, delivery, message)
-    }
-
-    /// Merge only a previously inspected commit, never the moving child branch tip.
-    pub fn merge_inspected_delivery(
-        &self,
-        parent_worktree: &Path,
-        child: &ChildWorktree,
-        delivery: &InspectedDelivery,
-        message: &str,
-    ) -> Result<(), WorktreeError> {
-        if !delivery.clean {
-            return Err(WorktreeError::DirtyChild {
-                path: child.path.clone(),
-            });
-        }
-        let parent_branch = current_branch(parent_worktree)?;
-        if parent_branch != child.parent_branch {
-            return Err(WorktreeError::WrongParentBranch {
-                expected: child.parent_branch.clone(),
-                actual: parent_branch,
-            });
-        }
-        if delivery.branch != child.branch || delivery.base_commit != child.base_commit {
-            return Err(WorktreeError::UnknownBase {
-                base: delivery.base_commit.clone(),
-            });
-        }
-        let status = git(&child.path, &["status", "--porcelain"])?;
-        if !status.trim().is_empty() {
-            return Err(WorktreeError::DirtyChild {
-                path: child.path.clone(),
-            });
-        }
-        let child_branch = current_branch(&child.path)?;
-        if child_branch != child.branch {
-            return Err(WorktreeError::WrongParentBranch {
-                expected: child.branch.clone(),
-                actual: child_branch,
-            });
-        }
-        let child_head = git(&child.path, &["rev-parse", "HEAD"])?.trim().to_owned();
-        if child_head != delivery.head_commit {
-            return Err(WorktreeError::ReviewedHeadChanged {
-                reviewed: delivery.head_commit.clone(),
-                current: child_head,
-            });
-        }
-        if delivery.head_commit == child.base_commit {
-            return Err(WorktreeError::EmptyDelivery {
-                base: child.base_commit.clone(),
-            });
-        }
-        let merge_base = git(
-            parent_worktree,
-            &["merge-base", &delivery.head_commit, &parent_branch],
-        )?;
-        if merge_base.trim() != child.base_commit {
-            return Err(WorktreeError::UnknownBase {
-                base: child.base_commit.clone(),
-            });
-        }
-        let output = Command::new("git")
-            .args(["merge", "--no-ff", &delivery.head_commit, "-m", message])
-            .current_dir(parent_worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Remove a delivery only after the recorded parent contains its branch.
-    pub fn remove_accepted_clean(
-        &self,
-        owner_worktree: &Path,
-        child: &ChildWorktree,
-    ) -> Result<(), WorktreeError> {
-        let parent_branch = current_branch(owner_worktree)?;
-        if parent_branch != child.parent_branch {
-            return Err(WorktreeError::WrongParentBranch {
-                expected: child.parent_branch.clone(),
-                actual: parent_branch,
-            });
-        }
-        let merged = Command::new("git")
-            .args(["merge-base", "--is-ancestor", &child.branch, &parent_branch])
-            .current_dir(owner_worktree)
-            .status()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !merged.success() {
-            return Err(WorktreeError::ChildNotMerged {
-                branch: child.branch.clone(),
-                parent: parent_branch,
-            });
-        }
-        self.remove_clean(owner_worktree, &child.path)?;
-        let output = Command::new("git")
-            .args(["branch", "-d", &child.branch])
-            .current_dir(owner_worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Remove only the worktree directory, leaving its branch ref intact.
-    ///
-    /// This is the safe automatic reclaim: the branch still pins every commit,
-    /// so no work is lost and the worktree can be rebuilt later with
-    /// [`Self::reattach_worktree`]. Git itself refuses a worktree that has
-    /// modified or untracked files, which is the "clean" gate.
-    ///
-    /// `repository_root` is used as the working directory rather than the
-    /// owner worktree, because the owner may itself have been reclaimed.
-    pub fn reclaim_directory(
-        &self,
-        repository_root: &Path,
-        path: &Path,
-    ) -> Result<(), WorktreeError> {
-        let status = git(path, &["status", "--porcelain"])?;
-        if !status.trim().is_empty() {
-            return Err(WorktreeError::DirtyChild {
-                path: path.to_path_buf(),
-            });
-        }
-        let output = Command::new("git")
-            .args(["worktree", "remove"])
-            .arg(path)
-            .current_dir(repository_root)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Rebuild a reclaimed worktree from its surviving branch.
-    ///
-    /// `git worktree add -b` cannot be used here: the branch already exists, so
-    /// `-b` fails with "a branch named '<branch>' already exists". Attaching the
-    /// existing branch is the only correct form.
-    pub fn reattach_worktree(
-        &self,
-        repository_root: &Path,
-        path: &Path,
-        branch: &str,
-    ) -> Result<(), WorktreeError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        }
-        let output = Command::new("git")
-            .args(["worktree", "add"])
-            .arg(path)
-            .arg(branch)
-            .current_dir(repository_root)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Whether `ancestor` is contained in `descendant`'s history.
-    ///
-    /// Exit code 0 means ancestor, 1 means not an ancestor, anything else is a
-    /// real git error (for example an unknown revision).
-    pub fn is_ancestor(
-        &self,
-        worktree: &Path,
-        ancestor: &str,
-        descendant: &str,
-    ) -> Result<bool, WorktreeError> {
-        let output = Command::new("git")
-            .args(["merge-base", "--is-ancestor", ancestor, descendant])
-            .current_dir(worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            }),
-        }
-    }
-
-    /// Whether `rev` is already contained in the worktree's current HEAD.
-    ///
-    /// Exit code 0 means ancestor, 1 means not an ancestor, anything else is a
-    /// real git error (for example an unknown revision).
-    pub fn contains_commit(&self, worktree: &Path, rev: &str) -> Result<bool, WorktreeError> {
-        self.is_ancestor(worktree, rev, "HEAD")
-    }
-
-    pub fn remove_clean(
-        &self,
-        owner_worktree: &Path,
-        child_path: &Path,
-    ) -> Result<(), WorktreeError> {
-        self.reclaim_directory(owner_worktree, child_path)
-    }
-
-    pub fn remove_created(
-        &self,
-        owner_worktree: &Path,
-        child_path: &Path,
-        branch: &str,
-    ) -> Result<(), WorktreeError> {
-        let output = Command::new("git")
-            .args(["worktree", "remove", "--force"])
-            .arg(child_path)
-            .current_dir(owner_worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        let output = Command::new("git")
-            .args(["branch", "-D", branch])
-            .current_dir(owner_worktree)
-            .output()
-            .map_err(|error| WorktreeError::Git {
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    fn resolve_parent_base(
-        &self,
-        parent_worktree: &Path,
-        base: &str,
-    ) -> Result<String, WorktreeError> {
-        let resolved_base = git(
-            parent_worktree,
-            &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
-        )
-        .map_err(|_| WorktreeError::UnknownBase {
-            base: base.to_owned(),
-        })?
-        .trim()
-        .to_owned();
-        let parent_head = git(parent_worktree, &["rev-parse", "HEAD"])?
-            .trim()
-            .to_owned();
-        if resolved_base != parent_head {
-            return Err(WorktreeError::BaseIsNotParentHead {
-                base: resolved_base,
-                head: parent_head,
-            });
-        }
-        Ok(parent_head)
-    }
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
 }
 
 fn current_branch(workdir: &Path) -> Result<String, WorktreeError> {
@@ -552,80 +168,6 @@ fn current_branch(workdir: &Path) -> Result<String, WorktreeError> {
         });
     }
     Ok(branch)
-}
-
-fn ensure_worktree_target_available(
-    owner_worktree: &Path,
-    path: &Path,
-    branch: &str,
-) -> Result<(), WorktreeError> {
-    if path.try_exists().map_err(|error| WorktreeError::Git {
-        message: error.to_string(),
-    })? {
-        return Err(WorktreeError::ExistingWorktreePath {
-            path: path.to_path_buf(),
-        });
-    }
-    let branch_ref = format!("refs/heads/{branch}");
-    let status = Command::new("git")
-        .args(["show-ref", "--verify", "--quiet", &branch_ref])
-        .current_dir(owner_worktree)
-        .status()
-        .map_err(|error| WorktreeError::Git {
-            message: error.to_string(),
-        })?;
-    if status.success() {
-        return Err(WorktreeError::ExistingBranch {
-            branch: branch.to_owned(),
-        });
-    }
-    Ok(())
-}
-
-fn add_worktree(
-    owner_worktree: &Path,
-    path: &Path,
-    branch: &str,
-    base_commit: &str,
-) -> Result<(), WorktreeError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| WorktreeError::Git {
-            message: error.to_string(),
-        })?;
-    }
-    let output = Command::new("git")
-        .args(["worktree", "add"])
-        .arg(path)
-        .args(["-b", branch, base_commit])
-        .current_dir(owner_worktree)
-        .output()
-        .map_err(|error| WorktreeError::Git {
-            message: error.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(WorktreeError::Git {
-            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    }
-    Ok(())
-}
-
-fn ensure_worktree_parent_is_ignored(
-    owner_worktree: &Path,
-    worktree_path: &Path,
-) -> Result<(), WorktreeError> {
-    let Ok(relative) = worktree_path.strip_prefix(owner_worktree) else {
-        return Ok(());
-    };
-    if relative
-        .components()
-        .next()
-        .and_then(|component| component.as_os_str().to_str())
-        != Some(".worktrees")
-    {
-        return Ok(());
-    }
-    append_exclude_entry(owner_worktree, "/.worktrees/")
 }
 
 /// Normalizes a repo-relative path into a rooted `.git/info/exclude` entry.

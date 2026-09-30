@@ -172,11 +172,14 @@ File discovery:
   required.
 
 Subagent integration:
-- When a delegated child reports a delivery, integrate it yourself before you
-  finish: run `git merge --no-ff <commit>` in your own worktree, resolve any
-  conflicts, and re-run the relevant verification.
-- A child is only completed, and its worktree only recycled, once its delivered
-  commit is an ancestor of your HEAD. If you never merge it, it stays in review."#
+- A child runs in the `workdir` you pass to `spawn_agent`. When a change needs
+  isolation, create that directory yourself first: `git worktree add <path> -b
+  <branch>`, then pass `<path>` as the child's `workdir`. When it does not, pass
+  the directory the child should work in directly.
+- You are responsible for integrating a delivered commit: run
+  `git merge --no-ff <commit>` yourself, resolve any conflicts, and re-run the
+  relevant verification. The runtime never creates, tracks, or merges a
+  worktree for you."#
             .to_string()
     }
 }

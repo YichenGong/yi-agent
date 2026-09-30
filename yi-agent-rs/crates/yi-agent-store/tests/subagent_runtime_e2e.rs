@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
-use yi_agent_core::subagent::task::{DeliveryReport, WorkspaceLeaseId};
+use yi_agent_core::subagent::task::{DeliveryReport, TaskId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
-    WorkerStart, WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+    WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, IpcReviewDecision, send_request};
 
@@ -17,8 +17,8 @@ struct DeliveryFactory {
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
 }
 
-impl AgentWorkspaceService for DeliveryFactory {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for DeliveryFactory {
+    fn in_place_workspace(
         &self,
         root: &yi_agent_core::RootSessionId,
         task: &yi_agent_core::TaskId,
@@ -26,32 +26,27 @@ impl AgentWorkspaceService for DeliveryFactory {
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(workspace(root, task))
     }
-    fn prepare_child(
+    fn workspace_in(
         &self,
-        _: &WorkerWorkspace,
-        root: &yi_agent_core::RootSessionId,
-        task: &yi_agent_core::TaskId,
-        _: &yi_agent_core::AttemptId,
+        task_id: &TaskId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        Ok(workspace(root, task))
+        Ok(workspace(&yi_agent_core::RootSessionId::new(), task_id))
     }
 
-    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
-        Ok(DeliveryReport::coding(
-            "deadbeef",
-            "main",
-            workspace.lease_id.clone(),
-            "verified",
-        ))
-    }
-
-    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        // Mirror the production service: the rebuild path exists because a
-        // reclaimed worktree keeps its row but loses its directory, so the
-        // directory is what has to come back.
-        std::fs::create_dir_all(&workspace.path).map_err(|error| {
-            WorkerError::Startup(format!("test workspace rebuild failed: {error}"))
-        })
+    fn read_only_workspace(
+        &self,
+        parent: Option<&WorkerWorkspace>,
+        task_id: &TaskId,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        let mut position = parent
+            .cloned()
+            .unwrap_or_else(|| workspace(&yi_agent_core::RootSessionId::new(), task_id));
+        position.branch = String::new();
+        position.parent_branch = String::new();
+        position.base_commit = String::new();
+        position.lease_id = WorkspaceLeaseId::new();
+        Ok(position)
     }
 }
 
@@ -66,8 +61,32 @@ fn workspace(root: &yi_agent_core::RootSessionId, task: &yi_agent_core::TaskId) 
     }
 }
 
+impl WorkerWorkspaceRegistry for DeliveryFactory {
+    fn register_prepared(&self, _workspace: &WorkerWorkspace) {}
+
+    fn prepared_workspace_for_workdir(
+        &self,
+        _workdir: &std::path::Path,
+    ) -> Option<WorkerWorkspace> {
+        None
+    }
+
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        Ok(DeliveryReport::coding(
+            "deadbeef",
+            "main",
+            workspace.lease_id.clone(),
+            "verified",
+        ))
+    }
+}
+
 impl AgentWorkerFactory for DeliveryFactory {
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
         Some(Arc::new(self.clone()))
     }
     fn recovery_context(&self) -> WorkerRecoveryContext {
@@ -444,6 +463,7 @@ fn spawn_child(
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.into(),
             parent_task_id: root_task_id.into(),
             capability: capability.into(),
@@ -498,6 +518,7 @@ fn delivery_review_survives_restart_without_restarting_worker() {
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,

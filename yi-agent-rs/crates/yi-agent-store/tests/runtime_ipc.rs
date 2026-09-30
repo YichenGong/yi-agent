@@ -11,10 +11,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::{MessageId, PermissionRequestId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, AgentWorkspaceService, WorkerError, WorkerHandle, WorkerRecoveryContext,
-    WorkerStart, WorkerWorkspace,
+    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
+    WorkerWorkspace, WorkerWorkspaceProvider,
 };
-use yi_agent_core::{AttemptId, RootSessionId, TaskId, TaskWorkspaceMode};
+use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
     SubscriptionFilters, send_request, send_request_with_version, subscribe,
@@ -74,14 +74,13 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 10);
+    assert_eq!(repository.schema_version().unwrap(), 11);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE task_workspaces;
-             DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10);",
+            "DROP TABLE application_root_attachments;
+             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11);",
         )
         .unwrap();
     database
@@ -96,37 +95,6 @@ fn test_workspace_for_ipc(session: &str, task: &str) -> WorkerWorkspace {
         parent_branch: "main".into(),
         base_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
     }
-}
-
-/// Runs a git command, asserting success. `output()` captures stderr so a
-/// deliberate failure cannot leak git's chatter into the suite log.
-fn git_ok(directory: &std::path::Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(directory)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed in {}: {}",
-        directory.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn git_stdout(directory: &std::path::Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(directory)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed in {}: {}",
-        directory.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 #[derive(Clone, Default)]
@@ -171,10 +139,10 @@ impl AgentWorkerFactory for ApplicationReportingFactory {
         durable_context()
     }
 
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(LiveWorkspaceService {
             repository_root: workspace.to_path_buf(),
         }))
@@ -202,7 +170,7 @@ impl AgentWorkerFactory for ReviewReportingFactory {
 }
 
 impl AgentWorkerFactory for ReportingWorkerFactory {
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(StaticWorkspaceService))
     }
 
@@ -250,8 +218,8 @@ impl LiveWorkspaceService {
     }
 }
 
-impl AgentWorkspaceService for LiveWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for LiveWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -263,12 +231,10 @@ impl AgentWorkspaceService for LiveWorkspaceService {
         Ok(workspace)
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
         task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         let workspace = self.workspace_for(task_id);
         std::fs::create_dir_all(&workspace.path)
@@ -276,12 +242,7 @@ impl AgentWorkspaceService for LiveWorkspaceService {
         Ok(workspace)
     }
 
-    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        std::fs::create_dir_all(&workspace.path)
-            .map_err(|error| WorkerError::Startup(error.to_string()))
-    }
-
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -295,19 +256,10 @@ impl AgentWorkspaceService for LiveWorkspaceService {
         workspace.base_commit = String::new();
         Ok(workspace)
     }
-
-    fn is_merged_into(
-        &self,
-        _owner: &WorkerWorkspace,
-        _branch: &str,
-        _parent_branch: &str,
-    ) -> Result<bool, WorkerError> {
-        Ok(true)
-    }
 }
 
-impl AgentWorkspaceService for ProjectWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for ProjectWorkspaceService {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -326,14 +278,40 @@ impl AgentWorkspaceService for ProjectWorkspaceService {
         })
     }
 
-    fn prepare_child(
+    fn read_only_workspace(
         &self,
-        _parent: &WorkerWorkspace,
-        root_session_id: &RootSessionId,
-        task_id: &TaskId,
-        attempt_id: &AttemptId,
+        parent: Option<&WorkerWorkspace>,
+        _task_id: &TaskId,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        self.prepare_root(root_session_id, task_id, attempt_id)
+        let path = parent
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| self.repository_root.clone());
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        })
+    }
+
+    fn workspace_in(
+        &self,
+        task_id: &TaskId,
+        _workdir: &std::path::Path,
+    ) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: self.repository_root.clone(),
+            path: self
+                .repository_root
+                .join(".worktrees")
+                .join(task_id.to_string()),
+            branch: format!("feat/{task_id}"),
+            parent_branch: "main".into(),
+            base_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+        })
     }
 }
 
@@ -345,16 +323,16 @@ impl AgentWorkerFactory for ProjectWorkspaceFactory {
         durable_context()
     }
 
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(ProjectWorkspaceService {
             repository_root: workspace.to_path_buf(),
         }))
     }
 
-    fn application_root_workspace_matches(
+    fn project_workspace_matches(
         &self,
         workspace: &std::path::Path,
         recorded: &WorkerWorkspace,
@@ -367,8 +345,8 @@ impl AgentWorkerFactory for ProjectWorkspaceFactory {
     }
 }
 
-impl AgentWorkspaceService for StaticWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for StaticWorkspaceService {
+    fn in_place_workspace(
         &self,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
@@ -380,20 +358,15 @@ impl AgentWorkspaceService for StaticWorkspaceService {
         ))
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        root_session_id: &RootSessionId,
         task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        Ok(test_workspace_for_ipc(
-            &root_session_id.to_string(),
-            &task_id.to_string(),
-        ))
+        Ok(test_workspace_for_ipc("resolved", &task_id.to_string()))
     }
 
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
         task_id: &TaskId,
@@ -410,117 +383,9 @@ impl AgentWorkspaceService for StaticWorkspaceService {
     }
 }
 
-/// A workspace service that records every reclaim instead of running git.
-///
-/// It mirrors the production service in the one respect the reclaim path
-/// depends on: `prepare_root` and `prepare_child` really create the worktree
-/// directory, so the caller's `path.exists()` gate is satisfied.
-#[derive(Clone, Default)]
-struct ReclaimRecordingWorkspaceService {
-    reclaimed: Arc<Mutex<Vec<PathBuf>>>,
-}
-
-impl AgentWorkspaceService for ReclaimRecordingWorkspaceService {
-    fn prepare_root(
-        &self,
-        root_session_id: &RootSessionId,
-        task_id: &TaskId,
-        _attempt_id: &AttemptId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
-        std::fs::create_dir_all(&workspace.path)
-            .map_err(|error| WorkerError::Startup(error.to_string()))?;
-        Ok(workspace)
-    }
-
-    fn prepare_child(
-        &self,
-        _parent: &WorkerWorkspace,
-        root_session_id: &RootSessionId,
-        task_id: &TaskId,
-        _attempt_id: &AttemptId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
-        std::fs::create_dir_all(&workspace.path)
-            .map_err(|error| WorkerError::Startup(error.to_string()))?;
-        Ok(workspace)
-    }
-
-    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        self.reclaimed.lock().unwrap().push(workspace.path.clone());
-        Ok(())
-    }
-
-    fn is_merged_into(
-        &self,
-        _owner: &WorkerWorkspace,
-        _branch: &str,
-        _parent_branch: &str,
-    ) -> Result<bool, WorkerError> {
-        Ok(true)
-    }
-}
-
-/// A workspace service whose reclaim signals that it started and then blocks
-/// until the test releases it.
-///
-/// It makes the reclaim's *duration* observable, which is the whole point of the
-/// regression: an embedded daemon dies with the client that detaches, so the
-/// detach response must not be written while the reclaim it seeded is still
-/// running. Without the gate the reclaim finishes too fast to observe the race.
-struct GatedReclaimWorkspaceService {
-    entered: mpsc::Sender<()>,
-    release: Arc<Mutex<mpsc::Receiver<()>>>,
-}
-
-impl AgentWorkspaceService for GatedReclaimWorkspaceService {
-    fn prepare_root(
-        &self,
-        root_session_id: &RootSessionId,
-        task_id: &TaskId,
-        _attempt_id: &AttemptId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
-        std::fs::create_dir_all(&workspace.path)
-            .map_err(|error| WorkerError::Startup(error.to_string()))?;
-        Ok(workspace)
-    }
-
-    fn prepare_child(
-        &self,
-        _parent: &WorkerWorkspace,
-        root_session_id: &RootSessionId,
-        task_id: &TaskId,
-        _attempt_id: &AttemptId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let workspace = test_workspace_for_ipc(&root_session_id.to_string(), &task_id.to_string());
-        std::fs::create_dir_all(&workspace.path)
-            .map_err(|error| WorkerError::Startup(error.to_string()))?;
-        Ok(workspace)
-    }
-
-    fn reclaim_worktree(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        // Announce, then park until the test lets the reclaim complete. A
-        // dropped `release` sender also unblocks, so a panicking test cannot
-        // wedge the daemon's reclaim.
-        let _ = self.entered.send(());
-        let _ = self.release.lock().unwrap().recv();
-        Ok(())
-    }
-
-    fn is_merged_into(
-        &self,
-        _owner: &WorkerWorkspace,
-        _branch: &str,
-        _parent_branch: &str,
-    ) -> Result<bool, WorkerError> {
-        Ok(true)
-    }
-}
-
 #[derive(Clone)]
 struct ApplicationRootFactory {
-    workspace_service: Arc<dyn AgentWorkspaceService>,
+    workspace_service: Arc<dyn WorkerWorkspaceProvider>,
     starts: Arc<Mutex<Vec<WorkerStart>>>,
 }
 
@@ -535,7 +400,7 @@ impl AgentWorkerFactory for TextCompletionFactory {
         durable_context()
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(StaticWorkspaceService))
     }
 
@@ -552,7 +417,7 @@ impl AgentWorkerFactory for ApplicationRootFactory {
         durable_context()
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(self.workspace_service.clone())
     }
 
@@ -604,6 +469,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
     let IpcResponse::TaskSpawned { task_id: child } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -675,6 +541,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -770,6 +637,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -824,7 +692,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 10);
+    assert_eq!(repository.schema_version().unwrap(), 11);
     for table in [
         "sessions",
         "tasks",
@@ -841,7 +709,6 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
         "events",
         "runtime_metadata",
         "resource_admission_cursors",
-        "task_workspaces",
         "application_root_attachments",
     ] {
         assert!(repository.has_table(table).unwrap(), "missing {table}");
@@ -849,16 +716,19 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
 }
 
 #[test]
-fn v6_database_migrates_to_workspace_and_attachment_tables() {
+fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 10);
-    assert!(repository.has_table("task_workspaces").unwrap());
+    assert_eq!(repository.schema_version().unwrap(), 11);
     assert!(
         repository
             .has_table("application_root_attachments")
             .unwrap()
+    );
+    assert!(
+        !repository.has_table("task_workspaces").unwrap(),
+        "the retired table is never recreated"
     );
 }
 
@@ -922,6 +792,7 @@ fn application_roots_use_their_attaching_project_workspace() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -934,15 +805,10 @@ fn application_roots_use_their_attaching_project_workspace() {
     else {
         panic!("expected project B child");
     };
-    let child_task_id: TaskId = child_task_id.parse().unwrap();
-    let child_workspace = RuntimeRepository::open(&database)
-        .unwrap()
-        .task_workspace(&child_task_id)
-        .unwrap();
+    let _child_task_id: TaskId = child_task_id.parse().unwrap();
 
     assert_eq!(first_workspace.repository_root, project_a);
     assert_eq!(second_workspace.repository_root, project_b);
-    assert_eq!(child_workspace.repository_root, project_b);
 }
 
 #[test]
@@ -1033,7 +899,13 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
     assert_eq!(first_session, second_session);
     assert_eq!(first_root, second_root);
     assert_eq!(first_capability, second_capability);
-    assert_eq!(first_workspace, second_workspace);
+    // An in-place (read-only) position carries no branch and a fresh lease each
+    // time it is synthesized; its identity is the project directory itself.
+    assert_eq!(first_workspace.path, second_workspace.path);
+    assert_eq!(
+        first_workspace.repository_root,
+        second_workspace.repository_root
+    );
     assert!(!first_capability.is_empty());
 }
 
@@ -1077,6 +949,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id: first_session,
                 parent_task_id: first_root,
                 capability: second_capability,
@@ -1429,89 +1302,6 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
     );
 }
 
-#[test]
-fn detaching_an_application_root_seeds_a_worktree_reclaim() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let reclaimed = Arc::new(Mutex::new(Vec::new()));
-    let service = Arc::new(ReclaimRecordingWorkspaceService {
-        reclaimed: Arc::clone(&reclaimed),
-    });
-    let daemon = Daemon::start_with_factory(
-        directory.path().join("runtime"),
-        &database,
-        Arc::new(ApplicationRootFactory {
-            workspace_service: service,
-            starts: Arc::new(Mutex::new(Vec::new())),
-        }),
-    )
-    .unwrap();
-    let IpcResponse::ApplicationRootAttached {
-        session_id,
-        root_task_id,
-        message_capability,
-        ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::AttachApplicationRoot {
-            idempotency_key: "tui-reclaim".into(),
-            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected attachment");
-    };
-    assert_eq!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::ActivateApplicationRoot {
-                session_id: session_id.clone(),
-                root_task_id: root_task_id.clone(),
-                capability: message_capability.clone(),
-                objective: "first prompt".into(),
-            },
-        )
-        .unwrap(),
-        IpcResponse::ApplicationRootActivated
-    );
-    send_request(
-        daemon.socket_path(),
-        IpcRequest::StartWorker {
-            session_id: session_id.clone(),
-            task_id: root_task_id.clone(),
-        },
-    )
-    .unwrap();
-
-    assert_eq!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::DetachApplicationRoot {
-                session_id,
-                root_task_id,
-                capability: message_capability,
-            },
-        )
-        .unwrap(),
-        IpcResponse::ApplicationRootDetached,
-        "detach still answers with the same response"
-    );
-
-    // The reclaim runs before the response, so it has already happened by the
-    // time this answer arrives; poll only to keep the assertion robust.
-    for _ in 0..100 {
-        if !reclaimed.lock().unwrap().is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    assert!(
-        !reclaimed.lock().unwrap().is_empty(),
-        "detach seeded a worktree reclaim"
-    );
-}
-
 /// The detach response must not be written while the reclaim it seeds still runs.
 ///
 /// An embedded daemon lives in the client process and dies when the client
@@ -1520,77 +1310,6 @@ fn detaching_an_application_root_seeds_a_worktree_reclaim() {
 /// and the root worktree leaks on every exit. The reclaim must therefore finish
 /// before the answer is written; otherwise "reclaim on exit" is a promise the
 /// IPC layer cannot keep.
-#[test]
-fn detach_does_not_answer_until_the_seeded_reclaim_finishes() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let (entered, entered_rx) = mpsc::channel();
-    let (release, release_rx) = mpsc::channel();
-    let daemon = Daemon::start_with_factory(
-        directory.path().join("runtime"),
-        &database,
-        Arc::new(ApplicationRootFactory {
-            workspace_service: Arc::new(GatedReclaimWorkspaceService {
-                entered,
-                release: Arc::new(Mutex::new(release_rx)),
-            }),
-            starts: Arc::new(Mutex::new(Vec::new())),
-        }),
-    )
-    .unwrap();
-    let IpcResponse::ApplicationRootAttached {
-        session_id,
-        root_task_id,
-        message_capability,
-        ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::AttachApplicationRoot {
-            idempotency_key: "embedded-reclaim".into(),
-            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected attachment");
-    };
-
-    let socket = daemon.socket_path().to_path_buf();
-    let (response_tx, response_rx) = mpsc::channel();
-    let detach = std::thread::spawn(move || {
-        let response = send_request(
-            &socket,
-            IpcRequest::DetachApplicationRoot {
-                session_id,
-                root_task_id,
-                capability: message_capability,
-            },
-        );
-        let _ = response_tx.send(response);
-    });
-
-    // The reclaim has started and is parked; the client must still be waiting.
-    entered_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("detach seeded a reclaim");
-    assert!(
-        matches!(
-            response_rx.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ),
-        "detach answered while its reclaim was still running, so a client exit \
-         would kill the reclaim before it removes the root worktree"
-    );
-
-    // Release the reclaim; only now may the answer arrive.
-    release.send(()).unwrap();
-    let response = response_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("detach answers once its reclaim completes");
-    assert_eq!(response.unwrap(), IpcResponse::ApplicationRootDetached);
-    detach.join().unwrap();
-}
-
 #[test]
 fn application_root_can_spawn_and_send_message_to_its_child() {
     let directory = TempDir::new().unwrap();
@@ -1615,6 +1334,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
     let IpcResponse::TaskSpawned { task_id: child } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -1679,6 +1399,7 @@ fn application_root_can_spawn_multiple_direct_children() {
     let first = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -1691,6 +1412,7 @@ fn application_root_can_spawn_multiple_direct_children() {
     let second = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -1732,6 +1454,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -1749,6 +1472,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -1802,6 +1526,7 @@ fn application_root_rejects_more_than_four_direct_children() {
             send_request(
                 daemon.socket_path(),
                 IpcRequest::SpawnApplicationChild {
+                    workdir: None,
                     session_id: session_id.clone(),
                     parent_task_id: root_task_id.clone(),
                     capability: message_capability.clone(),
@@ -1818,6 +1543,7 @@ fn application_root_rejects_more_than_four_direct_children() {
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -1865,6 +1591,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
             send_request(
                 daemon.socket_path(),
                 IpcRequest::SpawnApplicationChild {
+                    workdir: None,
                     session_id: session_id.clone(),
                     parent_task_id: root_task_id.clone(),
                     capability: message_capability.clone(),
@@ -1897,6 +1624,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id,
                 parent_task_id: root_task_id,
                 capability: message_capability,
@@ -1993,6 +1721,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id: reattached_session,
                 parent_task_id: reattached_root.clone(),
                 capability: reattached_capability,
@@ -2071,6 +1800,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id,
                 parent_task_id: root_task_id,
                 capability: reattached_capability,
@@ -2140,6 +1870,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
         send_request(
             daemon.socket_path(),
             IpcRequest::SpawnApplicationChild {
+                workdir: None,
                 session_id,
                 parent_task_id: root_task_id,
                 capability: message_capability,
@@ -2151,573 +1882,6 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
         .unwrap(),
         IpcResponse::TaskSpawned { .. }
     ));
-}
-
-#[test]
-fn gc_rejects_a_bogus_confirmation_token() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-
-    // A preview issues a real token; the raw status response is deliberately not
-    // one. The confirm call must reject anything the store did not issue, because
-    // that check is the only thing separating a client from removing worktrees.
-    let IpcResponse::GcPreview { entries, .. } =
-        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
-    else {
-        panic!("expected a gc preview");
-    };
-    assert!(entries.is_empty(), "a fresh store has nothing to reclaim");
-
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmGc {
-            confirmation_token: "not-a-token".into(),
-        },
-    )
-    .unwrap();
-    assert!(
-        matches!(
-            response,
-            IpcResponse::Error {
-                code: yi_agent_store::ipc::IpcErrorCode::Validation,
-                ..
-            }
-        ),
-        "a token the store never issued must be rejected, got {response:?}"
-    );
-}
-
-#[test]
-fn gc_rejects_a_token_that_a_cancel_preview_issued() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-
-    let IpcResponse::SessionCreated { root_task_id, .. } =
-        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-    let IpcResponse::CancelPreview {
-        confirmation_token, ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::PreviewCancel {
-            task_id: root_task_id.clone(),
-            recursive: false,
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected a cancel preview");
-    };
-
-    // Scopes are disjoint: a cancel token carries a task id and a cancellation
-    // scope, a gc token carries neither, so one must never satisfy the other.
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmGc { confirmation_token },
-    )
-    .unwrap();
-    assert!(
-        matches!(response, IpcResponse::Error { .. }),
-        "a cancel token must not authorize a gc reclaim, got {response:?}"
-    );
-}
-
-#[test]
-fn gc_confirm_consumes_its_token_exactly_once() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-
-    let IpcResponse::GcPreview {
-        confirmation_token, ..
-    } = send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
-    else {
-        panic!("expected a gc preview");
-    };
-    assert!(matches!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::ConfirmGc {
-                confirmation_token: confirmation_token.clone(),
-            },
-        )
-        .unwrap(),
-        IpcResponse::GcCompleted { .. }
-    ));
-    let replay = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmGc { confirmation_token },
-    )
-    .unwrap();
-    assert!(
-        matches!(replay, IpcResponse::Error { .. }),
-        "a gc token is one-shot and must not be replayable, got {replay:?}"
-    );
-}
-
-#[test]
-fn gc_preview_lists_a_detached_sessions_reclaimable_worktree() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    // The recording service creates the worktree directory in `prepare_root`, the
-    // way the production service really does. The listing reports a candidate only
-    // while its directory exists, so a fixture that never creates one would not be
-    // listable and this test would prove nothing.
-    let daemon = Daemon::start_with_factory(
-        directory.path().join("runtime"),
-        &database,
-        Arc::new(ApplicationRootFactory {
-            workspace_service: Arc::new(ReclaimRecordingWorkspaceService::default()),
-            starts: Arc::new(Mutex::new(Vec::new())),
-        }),
-    )
-    .unwrap();
-    let IpcResponse::ApplicationRootAttached {
-        session_id,
-        root_task_id,
-        message_capability,
-        workspace,
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::AttachApplicationRoot {
-            idempotency_key: "gc-listing".into(),
-            workspace: std::path::PathBuf::from("/tmp/yi-agent-gc-listing"),
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected attachment");
-    };
-
-    // While attached, the session is not detached, so it is not a gc candidate.
-    let IpcResponse::GcPreview { entries, .. } =
-        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
-    else {
-        panic!("expected a gc preview");
-    };
-    assert!(
-        entries.is_empty(),
-        "an attached root is not reclaimable yet"
-    );
-
-    assert_eq!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::DetachApplicationRoot {
-                session_id,
-                root_task_id: root_task_id.clone(),
-                capability: message_capability,
-            },
-        )
-        .unwrap(),
-        IpcResponse::ApplicationRootDetached
-    );
-
-    let IpcResponse::GcPreview { entries, .. } =
-        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
-    else {
-        panic!("expected a gc preview");
-    };
-    assert_eq!(entries.len(), 1, "the detached root is now listable");
-    let entry = &entries[0];
-    assert_eq!(entry.task_id, root_task_id);
-    assert_eq!(entry.branch, workspace.branch);
-    assert_eq!(entry.path, workspace.path.display().to_string());
-    assert!(entry.state.starts_with("paused"), "got {entry:?}");
-    // The listing must not have removed anything: the row survives reattachment.
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert!(
-        repository
-            .task_workspace_optional(&root_task_id.parse().unwrap())
-            .unwrap()
-            .is_some(),
-        "listing a worktree must never delete its workspace row"
-    );
-}
-
-#[test]
-fn gc_preview_merged_and_dirty_match_the_reclaim_semantics() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let repository_root = directory.path().join("repo");
-    std::fs::create_dir_all(&repository_root).unwrap();
-    git_ok(&repository_root, &["init", "-b", "main"]);
-    git_ok(
-        &repository_root,
-        &["config", "user.email", "tests@example.com"],
-    );
-    git_ok(&repository_root, &["config", "user.name", "Runtime Tests"]);
-    std::fs::write(repository_root.join("README.md"), "base\n").unwrap();
-    git_ok(&repository_root, &["add", "README.md"]);
-    git_ok(&repository_root, &["commit", "-m", "base"]);
-
-    let root_task = TaskId::new();
-    let session = RootSessionId::new();
-    let root_attempt = AttemptId::new();
-    let merged_child = TaskId::new();
-    let merged_child_attempt = AttemptId::new();
-    let dirty_child = TaskId::new();
-    let dirty_child_attempt = AttemptId::new();
-
-    let root_branch = format!("feat/root-{root_task}");
-    let root_worktree = directory.path().join("wt-root");
-    let merged_branch = format!("feat/merged-{merged_child}");
-    let merged_worktree = directory.path().join("wt-merged");
-    let dirty_branch = format!("feat/dirty-{dirty_child}");
-    let dirty_worktree = directory.path().join("wt-dirty");
-
-    // The root worktree gets its own branch with one commit on top of main.
-    git_ok(
-        &repository_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &root_branch,
-            root_worktree.to_str().unwrap(),
-            "main",
-        ],
-    );
-    std::fs::write(root_worktree.join("root.txt"), "root\n").unwrap();
-    git_ok(&root_worktree, &["add", "root.txt"]);
-    git_ok(&root_worktree, &["commit", "-m", "root work"]);
-
-    // A child on its own branch, committed and then merged into the root branch.
-    git_ok(
-        &repository_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &merged_branch,
-            merged_worktree.to_str().unwrap(),
-            &root_branch,
-        ],
-    );
-    std::fs::write(merged_worktree.join("merged.txt"), "merged\n").unwrap();
-    git_ok(&merged_worktree, &["add", "merged.txt"]);
-    git_ok(&merged_worktree, &["commit", "-m", "merged work"]);
-    git_ok(&root_worktree, &["merge", "--no-edit", &merged_branch]);
-
-    // A second child, merged the same way but left with an uncommitted edit.
-    git_ok(
-        &repository_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &dirty_branch,
-            dirty_worktree.to_str().unwrap(),
-            &root_branch,
-        ],
-    );
-    std::fs::write(dirty_worktree.join("dirty.txt"), "dirty\n").unwrap();
-    git_ok(&dirty_worktree, &["add", "dirty.txt"]);
-    git_ok(&dirty_worktree, &["commit", "-m", "dirty work"]);
-    git_ok(&root_worktree, &["merge", "--no-edit", &dirty_branch]);
-    std::fs::write(dirty_worktree.join("dirty.txt"), "dirty\nuncommitted\n").unwrap();
-
-    // Move the OWNER worktree's HEAD onto a branch that predates both merges. A
-    // listing that judged merged-ness against this HEAD (the pre-fix behaviour)
-    // would call both children unmerged, while the confirm — which compares
-    // against `parent_branch` — still reclaims them.
-    git_ok(&root_worktree, &["checkout", "-b", "stale-root", "main"]);
-
-    let base_commit = git_stdout(&repository_root, &["rev-parse", "main"]);
-    {
-        let mut repository = RuntimeRepository::open(&database).unwrap();
-        repository
-            .create_task_with_attempt_and_objective(
-                &root_task,
-                &session,
-                &root_attempt,
-                1,
-                "paused",
-                "root",
-                TaskWorkspaceMode::Coding,
-                None,
-            )
-            .unwrap();
-        for (task, attempt, state, objective) in [
-            (
-                &merged_child,
-                &merged_child_attempt,
-                "cancelled",
-                "merged child",
-            ),
-            (
-                &dirty_child,
-                &dirty_child_attempt,
-                "cancelled",
-                "dirty child",
-            ),
-        ] {
-            repository
-                .create_child_task_with_attempt_and_objective(
-                    task,
-                    &session,
-                    &root_task,
-                    1,
-                    attempt,
-                    1,
-                    state,
-                    objective,
-                    TaskWorkspaceMode::Coding,
-                    None,
-                )
-                .unwrap();
-        }
-        for (task, attempt, path, branch, parent_branch) in [
-            (
-                &root_task,
-                &root_attempt,
-                &root_worktree,
-                &root_branch,
-                "main",
-            ),
-            (
-                &merged_child,
-                &merged_child_attempt,
-                &merged_worktree,
-                &merged_branch,
-                root_branch.as_str(),
-            ),
-            (
-                &dirty_child,
-                &dirty_child_attempt,
-                &dirty_worktree,
-                &dirty_branch,
-                root_branch.as_str(),
-            ),
-        ] {
-            repository
-                .record_task_workspace(
-                    task,
-                    attempt,
-                    &WorkerWorkspace {
-                        lease_id: WorkspaceLeaseId::new(),
-                        repository_root: repository_root.clone(),
-                        path: path.clone(),
-                        branch: branch.clone(),
-                        parent_branch: parent_branch.to_owned(),
-                        base_commit: base_commit.clone(),
-                    },
-                )
-                .unwrap();
-        }
-        repository
-            .record_application_root_attachment(
-                "gc-fields",
-                &session,
-                &root_task,
-                "digest",
-                "secret",
-            )
-            .unwrap();
-        repository
-            .detach_application_root(&session, &root_task)
-            .unwrap();
-    }
-
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let preview = |socket: &std::path::Path| {
-        let IpcResponse::GcPreview { entries, .. } =
-            send_request(socket, IpcRequest::PreviewGc).unwrap()
-        else {
-            panic!("expected a gc preview");
-        };
-        entries
-    };
-    let entry = |entries: &[yi_agent_store::ipc::IpcGcEntry], task: &TaskId| {
-        entries
-            .iter()
-            .find(|entry| entry.task_id == task.to_string())
-            .unwrap_or_else(|| panic!("{task} is not listed"))
-            .clone()
-    };
-
-    let entries = preview(daemon.socket_path());
-    assert_eq!(entries.len(), 3, "root plus two children: {entries:?}");
-    // The root branch is not an ancestor of main; the root worktree is clean.
-    let root_entry = entry(&entries, &root_task);
-    assert!(!root_entry.merged, "{root_entry:?}");
-    assert!(!root_entry.dirty, "{root_entry:?}");
-    // Both children are merged into their recorded `parent_branch`, and this must
-    // hold even though the owner worktree's HEAD has moved off that branch.
-    let merged_entry = entry(&entries, &merged_child);
-    assert!(
-        merged_entry.merged,
-        "a merged child must report merged despite the moved owner HEAD: {merged_entry:?}"
-    );
-    assert!(!merged_entry.dirty, "{merged_entry:?}");
-    let dirty_entry = entry(&entries, &dirty_child);
-    assert!(dirty_entry.merged, "{dirty_entry:?}");
-    assert!(
-        dirty_entry.dirty,
-        "an uncommitted edit must report dirty: {dirty_entry:?}"
-    );
-
-    // The preview removes nothing.
-    assert!(root_worktree.exists() && merged_worktree.exists() && dirty_worktree.exists());
-
-    // A candidate whose directory is gone is not reclaimable, so it must not be
-    // listed; the surviving children keep their answer via the repository-root
-    // fallback even though the owner worktree is now gone.
-    std::fs::remove_dir_all(&root_worktree).unwrap();
-    let entries = preview(daemon.socket_path());
-    assert_eq!(entries.len(), 2, "a directory-less root is not listable");
-    assert!(
-        !entries
-            .iter()
-            .any(|entry| entry.task_id == root_task.to_string()),
-        "the reclaimed root must drop out of the listing"
-    );
-    assert!(
-        entry(&entries, &merged_child).merged,
-        "the fallback cwd must still answer the merge question"
-    );
-    assert!(entry(&entries, &dirty_child).dirty);
-}
-
-#[test]
-fn gc_token_gates_the_reclaim_call_not_just_the_response() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let reclaimed = Arc::new(Mutex::new(Vec::new()));
-    let service = Arc::new(ReclaimRecordingWorkspaceService {
-        reclaimed: Arc::clone(&reclaimed),
-    });
-    let daemon = Daemon::start_with_factory(
-        directory.path().join("runtime"),
-        &database,
-        Arc::new(ApplicationRootFactory {
-            workspace_service: service,
-            starts: Arc::new(Mutex::new(Vec::new())),
-        }),
-    )
-    .unwrap();
-    let IpcResponse::ApplicationRootAttached {
-        session_id,
-        root_task_id,
-        message_capability,
-        ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::AttachApplicationRoot {
-            idempotency_key: "gc-token-gate".into(),
-            workspace: std::path::PathBuf::from("/tmp/yi-agent-gc-token-gate"),
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected attachment");
-    };
-    assert_eq!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::ActivateApplicationRoot {
-                session_id: session_id.clone(),
-                root_task_id: root_task_id.clone(),
-                capability: message_capability.clone(),
-                objective: "first prompt".into(),
-            },
-        )
-        .unwrap(),
-        IpcResponse::ApplicationRootActivated
-    );
-    // Activation already drives the foreground root to `running`; a `StartWorker`
-    // here would be an illegal Running -> Running transition. The root's workspace
-    // row and directory exist from activation, which is all a reclaim needs.
-    let root_path = RuntimeRepository::open(&database)
-        .unwrap()
-        .task_workspace_optional(&root_task_id.parse().unwrap())
-        .unwrap()
-        .expect("the activated root owns a workspace row")
-        .path;
-    assert!(
-        reclaimed.lock().unwrap().is_empty(),
-        "starting a worker must not reclaim anything"
-    );
-
-    // Get the directory out of the way for the detach, so the background reclaim
-    // that detach seeds finds nothing. The recorded list then starts empty, which
-    // is what makes the token's effect on the reclaim call observable.
-    std::fs::remove_dir_all(&root_path).unwrap();
-    assert_eq!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::DetachApplicationRoot {
-                session_id: session_id.clone(),
-                root_task_id: root_task_id.clone(),
-                capability: message_capability,
-            },
-        )
-        .unwrap(),
-        IpcResponse::ApplicationRootDetached
-    );
-    // The detach seeds an asynchronous reclaim; give it a moment so it cannot
-    // land mid-assertion below and be mistaken for the confirm's work.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    reclaimed.lock().unwrap().clear();
-
-    // Restore the directory: the row survived the detach, so the session is a gc
-    // candidate again.
-    std::fs::create_dir_all(&root_path).unwrap();
-
-    let IpcResponse::GcPreview { entries, .. } =
-        send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
-    else {
-        panic!("expected a gc preview");
-    };
-    assert_eq!(entries.len(), 1, "the detached root is listable again");
-
-    // A token the store never issued must not reach `reclaim_worktree` at all.
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmGc {
-            confirmation_token: "forged".into(),
-        },
-    )
-    .unwrap();
-    assert!(
-        matches!(response, IpcResponse::Error { .. }),
-        "a forged token is rejected, got {response:?}"
-    );
-    assert!(
-        reclaimed.lock().unwrap().is_empty(),
-        "a rejected confirm must not reclaim anything, got {:?}",
-        reclaimed.lock().unwrap()
-    );
-    assert!(
-        root_path.exists(),
-        "a rejected confirm must leave the directory in place"
-    );
-
-    // The real token does reach it. Same request, same daemon; only the token
-    // differs, so the token is what gates the reclaim call.
-    let IpcResponse::GcPreview {
-        confirmation_token, ..
-    } = send_request(daemon.socket_path(), IpcRequest::PreviewGc).unwrap()
-    else {
-        panic!("expected a gc preview");
-    };
-    assert_eq!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::ConfirmGc { confirmation_token },
-        )
-        .unwrap(),
-        IpcResponse::GcCompleted { removed: 1 }
-    );
-    assert_eq!(
-        reclaimed.lock().unwrap().as_slice(),
-        &[root_path],
-        "an accepted confirm reclaims exactly the listed worktree"
-    );
 }
 
 #[test]
@@ -2829,7 +1993,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 10);
+    assert_eq!(repository.schema_version().unwrap(), 11);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -3752,6 +2916,7 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect child behavior".into(),
@@ -3803,6 +2968,7 @@ fn daemon_rejects_unbound_agent_message_requests_without_persisting_them() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect child behavior".into(),
@@ -3896,6 +3062,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -3974,6 +3141,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4040,6 +3208,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4057,6 +3226,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4128,6 +3298,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4145,6 +3316,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4214,6 +3386,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4289,6 +3462,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
     let IpcResponse::TaskSpawned { .. } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability,
@@ -4348,6 +3522,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4423,6 +3598,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4530,6 +3706,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4615,6 +3792,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -4777,6 +3955,7 @@ fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             objective: "Inspect child behavior".into(),
@@ -4821,6 +4000,7 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Inspect the target".into(),
@@ -4852,165 +4032,6 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
 }
 
 #[test]
-fn inspect_task_includes_the_authoritative_recorded_workspace() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated {
-        session_id,
-        root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-    let IpcResponse::TaskSpawned { task_id } = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnChild {
-            session_id: session_id.clone(),
-            parent_task_id: root_task_id,
-            objective: "Inspect workspace assignment".into(),
-            mode: None,
-            model: None,
-        },
-    )
-    .unwrap() else {
-        panic!("expected a spawned child");
-    };
-    let task: TaskId = task_id.parse().unwrap();
-    let attempt = RuntimeRepository::open(&database)
-        .unwrap()
-        .active_attempt_id(&task)
-        .unwrap();
-    let workspace = test_workspace_for_ipc(&session_id, &task_id);
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .record_task_workspace(&task, &attempt, &workspace)
-        .unwrap();
-
-    let IpcResponse::TaskDetail(detail) = send_request(
-        daemon.socket_path(),
-        IpcRequest::InspectTask {
-            task_id: task_id.clone(),
-        },
-    )
-    .unwrap() else {
-        panic!("expected task detail");
-    };
-
-    assert_eq!(detail.task_id, task_id);
-    assert_eq!(detail.workspace, Some(workspace));
-}
-
-#[test]
-fn inspect_task_omits_workspace_for_unassigned_old_tasks() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated { root_task_id, .. } =
-        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-
-    let IpcResponse::TaskDetail(detail) = send_request(
-        daemon.socket_path(),
-        IpcRequest::InspectTask {
-            task_id: root_task_id,
-        },
-    )
-    .unwrap() else {
-        panic!("expected task detail");
-    };
-
-    assert_eq!(detail.workspace, None);
-}
-
-#[test]
-fn subscription_snapshot_omits_workspace_for_unassigned_old_tasks() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated { root_task_id, .. } =
-        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-
-    let IpcResponse::Subscription(snapshot) = send_request(
-        daemon.socket_path(),
-        IpcRequest::SubscribeEvents {
-            after_event_id: 0,
-            filters: SubscriptionFilters::default(),
-        },
-    )
-    .unwrap() else {
-        panic!("expected subscription snapshot");
-    };
-
-    let task = snapshot
-        .tasks
-        .iter()
-        .find(|task| task.task_id == root_task_id)
-        .expect("snapshot contains the unassigned root task");
-    assert_eq!(task.workspace, None);
-}
-
-#[test]
-fn subscription_snapshot_includes_recorded_task_workspace() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated {
-        session_id,
-        root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-    let IpcResponse::TaskSpawned { task_id } = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnChild {
-            session_id: session_id.clone(),
-            parent_task_id: root_task_id,
-            objective: "Publish workspace assignment".into(),
-            mode: None,
-            model: None,
-        },
-    )
-    .unwrap() else {
-        panic!("expected a spawned child");
-    };
-    let task: TaskId = task_id.parse().unwrap();
-    let attempt = RuntimeRepository::open(&database)
-        .unwrap()
-        .active_attempt_id(&task)
-        .unwrap();
-    let workspace = test_workspace_for_ipc(&session_id, &task_id);
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .record_task_workspace(&task, &attempt, &workspace)
-        .unwrap();
-
-    let IpcResponse::Subscription(snapshot) = send_request(
-        daemon.socket_path(),
-        IpcRequest::SubscribeEvents {
-            after_event_id: 0,
-            filters: SubscriptionFilters::default(),
-        },
-    )
-    .unwrap() else {
-        panic!("expected subscription snapshot");
-    };
-
-    assert!(
-        snapshot
-            .tasks
-            .iter()
-            .any(|task| task.task_id == task_id && task.workspace == Some(workspace.clone()))
-    );
-}
-
-#[test]
 fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -5027,6 +4048,7 @@ fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id.clone(),
             objective: "Unrelated task".into(),
@@ -5186,6 +4208,7 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id.clone(),
             objective: "Child task".into(),
@@ -5403,6 +4426,7 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             objective: "Implement the parser".into(),
@@ -5756,6 +4780,7 @@ fn delivered_child_over_ipc(
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             objective: "Implement the parser".into(),
@@ -5882,7 +4907,7 @@ fn workspace_mode_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 10);
+    assert_eq!(repository.schema_version().unwrap(), 11);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -5895,13 +4920,13 @@ fn workspace_mode_is_persisted_and_recovered() {
             1,
             "queued",
             "root",
-            TaskWorkspaceMode::Coding,
+            ChildWriteMode::Coding,
             None,
         )
         .unwrap();
     assert_eq!(
         repository.task_workspace_mode(&root).unwrap(),
-        TaskWorkspaceMode::Coding
+        ChildWriteMode::Coding
     );
 
     // A recoverable child carries a non-default mode so the `recovered_tasks`
@@ -5918,19 +4943,19 @@ fn workspace_mode_is_persisted_and_recovered() {
             1,
             "recovery_required",
             "child",
-            TaskWorkspaceMode::ReadOnly,
+            ChildWriteMode::ReadOnly,
             None,
         )
         .unwrap();
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
-        TaskWorkspaceMode::ReadOnly
+        ChildWriteMode::ReadOnly
     );
 
     let recovered = repository.recovered_tasks().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].task_id, child);
-    assert_eq!(recovered[0].workspace_mode, TaskWorkspaceMode::ReadOnly);
+    assert_eq!(recovered[0].workspace_mode, ChildWriteMode::ReadOnly);
 
     // The legacy insert omits `workspace_mode`, so it must fall back to the
     // DDL default of 'coding'.
@@ -5940,7 +4965,7 @@ fn workspace_mode_is_persisted_and_recovered() {
         .unwrap();
     assert_eq!(
         repository.task_workspace_mode(&legacy).unwrap(),
-        TaskWorkspaceMode::Coding
+        ChildWriteMode::Coding
     );
 }
 
@@ -5970,6 +4995,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -5987,14 +5013,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
     let repository = RuntimeRepository::open(&database).unwrap();
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
-        TaskWorkspaceMode::Coding
-    );
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_some(),
-        "a coding child must own a recorded worktree workspace"
+        ChildWriteMode::Coding
     );
 }
 
@@ -6024,6 +5043,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
     } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             capability: message_capability,
@@ -6041,14 +5061,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
     let repository = RuntimeRepository::open(&database).unwrap();
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
-        TaskWorkspaceMode::ReadOnly
-    );
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_none(),
-        "a read-only child runs in place and owns no worktree row"
+        ChildWriteMode::ReadOnly
     );
 }
 
@@ -6184,6 +5197,7 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnChild {
+            workdir: None,
             session_id,
             parent_task_id: root_task_id,
             objective: objective.clone(),
@@ -6258,6 +5272,7 @@ fn delivered_application_child_over_ipc(
     let IpcResponse::TaskSpawned { task_id: child } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: message_capability.clone(),
@@ -6368,6 +5383,7 @@ fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
     let sibling_response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
+            workdir: None,
             session_id: session_id.clone(),
             parent_task_id: root_task_id.clone(),
             capability: capability.clone(),

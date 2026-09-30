@@ -6,7 +6,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -60,17 +59,6 @@ struct CancelScope {
     unmerged_deliveries: Vec<IpcCancelDelivery>,
 }
 
-impl CancelScope {
-    /// The scope of an operation that is not tied to any task or lease.
-    fn empty() -> Self {
-        Self {
-            task_ids: Vec::new(),
-            active_leases: Vec::new(),
-            unmerged_deliveries: Vec::new(),
-        }
-    }
-}
-
 #[derive(Default)]
 struct ConfirmationStore {
     pending: Mutex<HashMap<String, PendingConfirmation>>,
@@ -107,20 +95,6 @@ impl ConfirmationStore {
             && pending.task_id == task_id
             && pending.recursive == recursive
             && pending.scope == *scope
-    }
-
-    /// Issues the one-shot token that gates the destructive gc reclaim.
-    ///
-    /// `gc` has no task id and no cancellation scope of its own, so it rides the
-    /// existing store with the literal id `"gc"` and an empty scope. That keeps a
-    /// gc token indistinguishable-in-shape from a cancel token while making it
-    /// impossible for one to satisfy the other's `consume` call.
-    fn issue_gc(&self) -> String {
-        self.issue("gc".into(), false, CancelScope::empty())
-    }
-
-    fn consume_gc(&self, token: &str) -> bool {
-        self.consume(token, "gc", false, &CancelScope::empty())
     }
 }
 
@@ -194,12 +168,6 @@ pub enum IpcRequest {
         root_task_id: String,
         capability: String,
     },
-    /// Lists reclaimable worktrees without removing anything.
-    PreviewGc,
-    /// Removes the reclaimable-directory scope after an explicit confirmation.
-    ConfirmGc {
-        confirmation_token: String,
-    },
     CreateSchedule {
         cron: String,
         objective: String,
@@ -216,6 +184,8 @@ pub enum IpcRequest {
         mode: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        workdir: Option<String>,
     },
     SpawnApplicationChild {
         session_id: String,
@@ -226,6 +196,8 @@ pub enum IpcRequest {
         mode: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        workdir: Option<String>,
     },
     StartWorker {
         session_id: String,
@@ -389,14 +361,6 @@ pub enum IpcResponse {
     },
     ApplicationRootActivated,
     ApplicationRootDetached,
-    GcPreview {
-        entries: Vec<IpcGcEntry>,
-        confirmation_token: String,
-        expires_in_secs: u64,
-    },
-    GcCompleted {
-        removed: usize,
-    },
     ScheduleCreated {
         schedule_id: String,
     },
@@ -580,8 +544,6 @@ pub struct SubscriptionSnapshot {
 pub struct IpcTask {
     pub task_id: String,
     pub state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,19 +551,6 @@ pub struct IpcTaskSummary {
     pub task_id: String,
     pub state: String,
     pub is_root: bool,
-}
-
-/// One reclaimable worktree, as reported by `daemon gc`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IpcGcEntry {
-    pub task_id: String,
-    pub branch: String,
-    pub path: String,
-    pub state: String,
-    /// Whether `branch` is already contained in its parent's HEAD.
-    pub merged: bool,
-    /// Whether the worktree has modified or untracked files.
-    pub dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -622,8 +571,6 @@ pub struct IpcTaskDetail {
     pub delivery_json: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,6 +698,7 @@ impl Daemon {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, IpcError> {
+        raise_file_descriptor_limit();
         let runtime_dir = runtime_dir.as_ref();
         fs::create_dir_all(runtime_dir)?;
         fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700))?;
@@ -797,12 +745,6 @@ impl Daemon {
                     .and_then(|value| value.with_nanosecond(0));
                 if minute != last_schedule_minute {
                     let _ = coordinator.evaluate_schedules(now);
-                    // Reclaim runs on its own thread: git is slow and this loop
-                    // must stay responsive to accept().
-                    let reclaim_coordinator = Arc::clone(&coordinator);
-                    std::thread::spawn(move || {
-                        reclaim_coordinator.reclaim_idle_worktrees(chrono::Utc::now());
-                    });
                     last_schedule_minute = minute;
                 }
                 match listener.accept() {
@@ -887,6 +829,41 @@ pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Resolves the Unix-domain socket for a runtime directory.
 ///
+/// Raises the process soft file-descriptor limit toward the hard limit.
+///
+/// A daemon holds one descriptor per live client, worker, and database handle,
+/// and an embedding test process holds many daemons at once. The default soft
+/// limit (256 on macOS) is easily exhausted, at which point `accept` fails with
+/// `EMFILE` and the listener thread exits, dropping every connection. Raising
+/// the soft limit toward the hard limit lets the daemon keep serving.
+fn raise_file_descriptor_limit() {
+    static RAISED: std::sync::Once = std::sync::Once::new();
+    RAISED.call_once(|| {
+        // Enough headroom for a busy daemon without claiming the whole hard
+        // limit on a machine that allows an enormous one.
+        const TARGET: libc::rlim_t = 4096;
+        // SAFETY: `getrlimit`/`setrlimit` receive a valid pointer to a
+        // zero-initialized `rlimit`. Only the soft limit is raised, and never
+        // above the hard limit the kernel enforces.
+        unsafe {
+            let mut limit = std::mem::zeroed::<libc::rlimit>();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                return;
+            }
+            let target = if limit.rlim_max == libc::RLIM_INFINITY {
+                TARGET
+            } else {
+                limit.rlim_max.min(TARGET)
+            };
+            if limit.rlim_cur >= target {
+                return;
+            }
+            limit.rlim_cur = target;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    });
+}
+
 /// A runtime directory normally owns its socket (`<runtime_dir>/runtime.sock`).
 /// That layout cannot always work: `sun_path` is capped at
 /// [`MAX_SOCKET_PATH_BYTES`], so a deep project path — the default runtime
@@ -1149,19 +1126,6 @@ fn handle_client(
                 Ok(response) => response,
                 Err(error) => error_response(&error),
             },
-            IpcRequest::PreviewGc => match preview_gc(database_path, confirmations) {
-                Ok(response) => response,
-                Err(error) => error_response(&error),
-            },
-            IpcRequest::ConfirmGc { confirmation_token } => match confirm_gc(
-                database_path,
-                coordinator,
-                confirmations,
-                confirmation_token,
-            ) {
-                Ok(response) => response,
-                Err(error) => error_response(&error),
-            },
             request => match respond(database_path, coordinator, request) {
                 Ok(response) => response,
                 Err(error) => error_response(&error),
@@ -1324,151 +1288,6 @@ fn confirm_cancel(
     Ok(IpcResponse::TaskCancelled)
 }
 
-/// Lists reclaimable worktrees and issues the token that authorizes removing them.
-///
-/// Read-only: the listing shells out to git and removes nothing, so it is safe to
-/// call while worktrees are dirty or unmerged.
-fn preview_gc(
-    database_path: &Path,
-    confirmations: &ConfirmationStore,
-) -> Result<IpcResponse, IpcError> {
-    let repository = RuntimeRepository::open(database_path)?;
-    let entries = gc_entries(&repository)?;
-    Ok(IpcResponse::GcPreview {
-        entries,
-        confirmation_token: confirmations.issue_gc(),
-        expires_in_secs: CONFIRMATION_TTL.as_secs(),
-    })
-}
-
-/// Reclaims the automatic-scope directories after consuming a gc token.
-///
-/// Scope is deliberately narrow: this removes worktree DIRECTORIES only. It never
-/// deletes a branch ref and never deletes a `task_workspaces` row, because the row
-/// surviving is what keeps reattachment working. Operations that forfeit
-/// reattachment need their own, separately confirmed surface.
-///
-/// [`RuntimeCoordinator::reclaim_session_worktrees`] is synchronous, takes only
-/// short internal repository locks, and never holds one across git, so it is called
-/// directly rather than through an async runtime.
-fn confirm_gc(
-    database_path: &Path,
-    coordinator: &RuntimeCoordinator,
-    confirmations: &ConfirmationStore,
-    confirmation_token: String,
-) -> Result<IpcResponse, IpcError> {
-    if !confirmations.consume_gc(&confirmation_token) {
-        return Err(IpcError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "gc confirmation token is invalid or expired",
-        )));
-    }
-    let sessions = {
-        let repository = RuntimeRepository::open(database_path)?;
-        let mut sessions = repository.detached_application_roots()?;
-        // No ORDER BY on the query, so duplicates need not be adjacent. `dedup`
-        // alone would miss non-adjacent repeats, so key the sort on the id's
-        // string form (`RootSessionId` is not `Ord` itself).
-        sessions.sort_unstable_by_key(|session| session.to_string());
-        sessions.dedup();
-        sessions
-    };
-    let mut removed = 0;
-    for session in sessions {
-        removed += coordinator.reclaim_session_worktrees(&session);
-    }
-    Ok(IpcResponse::GcCompleted { removed })
-}
-
-/// Lists the reclaimable-but-not-reclaimed worktrees of every detached session.
-///
-/// It reads rows and runs `git status` / `git merge-base` with the relevant
-/// worktree as the working directory. It removes nothing, so a dirty or unmerged
-/// worktree can be reported safely.
-///
-/// Both columns answer the SAME question the reclaim answers, because a preview
-/// that disagrees with the action is worse than no preview on a destructive path:
-///
-/// * `dirty` is `git status --porcelain`, the probe `reclaim_directory` gates on.
-/// * `merged` is `merge-base --is-ancestor <branch> <parent_branch>` against the
-///   recorded `parent_branch`, matching `DaemonWorkspaceService::is_merged_into`.
-///   Judging it against the owner worktree's CURRENT branch would let a worker
-///   that ran `git checkout` in the owner change the answer, and would let the
-///   preview print `merged = false` for a directory the confirm then reclaims.
-///
-/// The probe needs a working directory that exists: the owner worktree when it is
-/// still there, otherwise the repository root. That fallback is deliberate — an
-/// owner reclaimed by an earlier pass makes `git` fail to `chdir`, and
-/// `merge-base --is-ancestor` resolves both refs from the ref database, so any
-/// directory inside the repository answers identically. Do not "simplify" it back
-/// to the owner path alone; that would silently restore a false `merged`.
-///
-/// A candidate whose directory is already gone is skipped: the confirm removes
-/// directories, so listing a directory-less row would promise work it cannot do.
-///
-/// A root is reported with whatever the same probe yields (`parent_branch` is the
-/// main branch). The reclaim applies no merge gate to a root, so the listing does
-/// not pretend a gate ran; it reports the probe rather than inventing a value the
-/// confirm would not honour.
-fn gc_entries(repository: &RuntimeRepository) -> Result<Vec<IpcGcEntry>, IpcError> {
-    let mut entries = Vec::new();
-    let mut sessions = repository.detached_application_roots()?;
-    sessions.sort_unstable_by_key(|session| session.to_string());
-    sessions.dedup();
-    for session in sessions {
-        for candidate in repository.reclaim_candidates(&session)? {
-            let Some(workspace) = candidate.workspace.clone() else {
-                continue;
-            };
-            // The confirm removes a directory, so a row whose directory is gone
-            // must not be advertised as reclaimable.
-            if !workspace.path.exists() {
-                continue;
-            }
-            let dirty = Command::new("git")
-                .args(["status", "--porcelain"])
-                .current_dir(&workspace.path)
-                .output()
-                .map(|output| !output.stdout.is_empty())
-                .unwrap_or(false);
-            let merged = if workspace.branch.is_empty() || workspace.parent_branch.is_empty() {
-                false
-            } else {
-                // Prefer the owner worktree, but it may already have been
-                // reclaimed; fall back to the repository root (see doc comment).
-                let probe_directory = candidate
-                    .parent_task_id
-                    .as_ref()
-                    .and_then(|parent| parent.parse::<TaskId>().ok())
-                    .and_then(|parent| repository.task_workspace_optional(&parent).ok().flatten())
-                    .map(|owner| owner.path)
-                    .filter(|path| path.exists())
-                    .unwrap_or_else(|| workspace.repository_root.clone());
-                Command::new("git")
-                    .args([
-                        "merge-base",
-                        "--is-ancestor",
-                        &workspace.branch,
-                        &workspace.parent_branch,
-                    ])
-                    .current_dir(&probe_directory)
-                    .output()
-                    .map(|output| output.status.success())
-                    .unwrap_or(false)
-            };
-            entries.push(IpcGcEntry {
-                task_id: candidate.task_id.clone(),
-                branch: workspace.branch.clone(),
-                path: workspace.path.display().to_string(),
-                state: candidate.state.clone(),
-                merged,
-                dirty,
-            });
-        }
-    }
-    Ok(entries)
-}
-
 fn prepare_coordinator_for_stop(coordinator: &RuntimeCoordinator) -> Result<(), IpcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1509,7 +1328,6 @@ fn stream_subscription(
                 .map(|task| IpcTask {
                     task_id: task.task_id,
                     state: task.state,
-                    workspace: task.workspace,
                 })
                 .collect(),
             events: snapshot
@@ -2119,7 +1937,6 @@ mod subscription_queue_tests {
                 state: "queued".into(),
                 delivery_json: "x".repeat(MAX_FRAME_BYTES),
                 terminal_json: None,
-                workspace: None,
             }),
         );
 
@@ -2437,7 +2254,6 @@ fn read_incoming_frame<R: BufRead>(reader: &mut R) -> Result<Option<IncomingFram
 fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcErrorCode {
     match error {
         crate::repository::RepositoryError::TaskNotFound { .. }
-        | crate::repository::RepositoryError::TaskWorkspaceNotFound { .. }
         | crate::repository::RepositoryError::MailboxMessageNotFound { .. }
         | crate::repository::RepositoryError::PermissionRequestNotFound { .. } => {
             IpcErrorCode::NotFound
@@ -2460,7 +2276,6 @@ fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcError
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
         | crate::repository::RepositoryError::InvalidAdmissionCursor { .. }
-        | crate::repository::RepositoryError::InvalidTaskWorkspace { .. }
         | crate::repository::RepositoryError::InvalidWatchdogSnapshot { .. }
         | crate::repository::RepositoryError::UnknownEventKind { .. } => IpcErrorCode::Internal,
     }
@@ -2522,10 +2337,6 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::ReviewAccepted => "review_accepted",
         crate::repository::RuntimeEvent::ReviewRework => "review_rework",
         crate::repository::RuntimeEvent::ReviewRejected => "review_rejected",
-        crate::repository::RuntimeEvent::TaskWorkspaceRecycled => "task_workspace_recycled",
-        crate::repository::RuntimeEvent::TaskWorkspaceRecycleFailed => {
-            "task_workspace_recycle_failed"
-        }
     }
 }
 
@@ -2605,20 +2416,6 @@ fn respond(
             // Reclaim BEFORE answering, on this handler thread.
             //
             // Running it on a detached thread looks harmless but is unbounded
-            // harm: an embedded daemon lives inside the client that detaches and
-            // dies with it. The client returns from `send_request` the instant
-            // this response is written and then exits, killing the parked thread
-            // mid-reclaim — so the root worktree leaks on every exit, which is
-            // exactly the leak this reclaim exists to prevent. It only wins when
-            // some *other* daemon outlives the client, which is not the normal
-            // embedded case.
-            //
-            // Waiting here is safe and bounded: the reclaim only removes the
-            // directories of already-clean, already-merged tasks picked by
-            // `reclaim_session_worktrees`, it is idempotent, and every removed
-            // directory is rebuilt by `prepare_task_workspace`. The client sets
-            // no read timeout, so it simply waits for this same answer.
-            coordinator.reclaim_session_worktrees(&session_id);
             Ok(IpcResponse::ApplicationRootDetached)
         }
         IpcRequest::CreateSchedule { cron, objective } => {
@@ -2660,10 +2457,12 @@ fn respond(
             objective,
             mode,
             model,
+            workdir,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
             let workspace_mode = parse_workspace_mode(mode)?;
+            let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -2673,6 +2472,7 @@ fn respond(
                 objective,
                 workspace_mode,
                 model,
+                workdir,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2685,10 +2485,12 @@ fn respond(
             objective,
             mode,
             model,
+            workdir,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
             let workspace_mode = parse_workspace_mode(mode)?;
+            let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -2699,6 +2501,7 @@ fn respond(
                 objective,
                 workspace_mode,
                 model,
+                workdir,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2721,12 +2524,6 @@ fn respond(
             message: None,
         }),
         IpcRequest::PreviewCancel { .. } | IpcRequest::ConfirmCancel { .. } => {
-            Err(IpcError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "confirmation requests require daemon state",
-            )))
-        }
-        IpcRequest::PreviewGc | IpcRequest::ConfirmGc { .. } => {
             Err(IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "confirmation requests require daemon state",
@@ -2961,7 +2758,6 @@ fn respond(
                 state: detail.state,
                 delivery_json: detail.delivery_json,
                 terminal_json: detail.terminal_json,
-                workspace: detail.workspace,
             }))
         }
         IpcRequest::InspectChild {
@@ -2990,7 +2786,6 @@ fn respond(
                 state: detail.state,
                 delivery_json: detail.delivery_json,
                 terminal_json: detail.terminal_json,
-                workspace: detail.workspace,
             }))
         }
         IpcRequest::CancelChild {
@@ -3107,7 +2902,6 @@ fn respond(
                 .map(|task| IpcTask {
                     task_id: task.task_id,
                     state: task.state,
-                    workspace: task.workspace,
                 })
                 .collect();
             let events = snapshot
@@ -3140,12 +2934,10 @@ where
 /// Resolves the requested workspace mode for a spawn request. An omitted mode
 /// defaults to read-only so an existing client cannot accidentally request a
 /// writable worktree; an explicit but unknown value is rejected.
-fn parse_workspace_mode(
-    mode: Option<String>,
-) -> Result<yi_agent_core::TaskWorkspaceMode, IpcError> {
+fn parse_workspace_mode(mode: Option<String>) -> Result<yi_agent_core::ChildWriteMode, IpcError> {
     match mode.as_deref() {
-        None => Ok(yi_agent_core::TaskWorkspaceMode::ReadOnly),
-        Some(value) => yi_agent_core::TaskWorkspaceMode::parse(value).ok_or_else(|| {
+        None => Ok(yi_agent_core::ChildWriteMode::ReadOnly),
+        Some(value) => yi_agent_core::ChildWriteMode::parse(value).ok_or_else(|| {
             IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("mode must be 'coding' or 'read_only', got {value}"),

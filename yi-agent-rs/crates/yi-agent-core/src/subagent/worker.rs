@@ -13,8 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::ProviderTurnGate;
 
 use super::task::{
-    AttemptId, DeliveryReport, MessageId, RootSessionId, TaskId, TaskWorkspaceMode,
-    WorkspaceLeaseId,
+    AttemptId, ChildWriteMode, DeliveryReport, MessageId, RootSessionId, TaskId, WorkspaceLeaseId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +26,42 @@ pub struct WorkerWorkspace {
     pub base_commit: String,
 }
 
+impl WorkerWorkspace {
+    /// Replaces the runtime-assigned lease identity. Used when the position is
+    /// resolved from a path but the identity is carried by a prepared record.
+    pub fn with_lease(mut self, lease_id: WorkspaceLeaseId) -> Self {
+        self.lease_id = lease_id;
+        self
+    }
+}
+
+/// A parent's decision about one spawned task: what to do, whether it may
+/// write, and where it runs. The runtime resolves the workspace from `workdir`;
+/// the parent never names a branch or a lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnRequest {
+    pub objective: String,
+    pub mode: ChildWriteMode,
+    /// The directory the parent asked this task to run in. `None` means "you
+    /// decide", which is what a read-only task and the root both use.
+    pub workdir: Option<PathBuf>,
+}
+
+impl SpawnRequest {
+    pub fn new(objective: String, mode: ChildWriteMode, workdir: Option<PathBuf>) -> Self {
+        Self {
+            objective,
+            mode,
+            workdir,
+        }
+    }
+
+    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+        self.workdir = Some(workdir);
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerStart {
     pub task_id: TaskId,
@@ -37,7 +72,7 @@ pub struct WorkerStart {
     /// Full application-owned workspace assignment for this task, when known.
     pub workspace: Option<WorkerWorkspace>,
     /// Whether this worker owns a writable worktree or runs read-only in place.
-    pub workspace_mode: TaskWorkspaceMode,
+    pub workspace_mode: ChildWriteMode,
     pub cancellation: CancellationToken,
     /// Opaque daemon-issued capability required for worker IPC mutations.
     pub message_capability: String,
@@ -99,7 +134,7 @@ impl WorkerStart {
             root_session_id,
             workspace_lease_id: None,
             workspace: None,
-            workspace_mode: TaskWorkspaceMode::default(),
+            workspace_mode: ChildWriteMode::default(),
             cancellation: CancellationToken::new(),
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
@@ -124,7 +159,7 @@ impl WorkerStart {
         self
     }
 
-    pub fn with_workspace_mode(mut self, workspace_mode: TaskWorkspaceMode) -> Self {
+    pub fn with_workspace_mode(mut self, workspace_mode: ChildWriteMode) -> Self {
         self.workspace_mode = workspace_mode;
         self
     }
@@ -180,11 +215,11 @@ mod tests {
     #[test]
     fn worker_start_defaults_to_read_only_and_accepts_an_override() {
         let default = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new());
-        assert_eq!(default.workspace_mode, TaskWorkspaceMode::ReadOnly);
+        assert_eq!(default.workspace_mode, ChildWriteMode::ReadOnly);
 
         let coding = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
-            .with_workspace_mode(TaskWorkspaceMode::Coding);
-        assert_eq!(coding.workspace_mode, TaskWorkspaceMode::Coding);
+            .with_workspace_mode(ChildWriteMode::Coding);
+        assert_eq!(coding.workspace_mode, ChildWriteMode::Coding);
     }
 }
 
@@ -432,32 +467,26 @@ pub enum WorkerError {
     Startup(String),
 }
 
-pub trait AgentWorkspaceService: Send + Sync {
-    fn prepare_root(
+pub trait WorkerWorkspaceProvider: Send + Sync {
+    fn in_place_workspace(
         &self,
         root_session_id: &RootSessionId,
         task_id: &TaskId,
         attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError>;
 
-    fn prepare_child(
+    /// Resolves the workspace a coding task runs in, from the workdir its parent
+    /// prepared. The provider looks the path up; it never creates a directory.
+    fn workspace_in(
         &self,
-        parent: &WorkerWorkspace,
-        root_session_id: &RootSessionId,
         task_id: &TaskId,
-        attempt_id: &AttemptId,
+        workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError>;
-
-    /// Whether this service can create coding worktrees. A non-git service
-    /// returns `false`, forcing the session into read-only mode.
-    fn supports_coding(&self) -> bool {
-        true
-    }
 
     /// Supplies the in-place execution root for a read-only task. `parent` is
     /// the nearest ancestor workspace, when one exists. The default cannot
     /// invent a path and therefore fails.
-    fn prepare_read_only(
+    fn read_only_workspace(
         &self,
         _parent: Option<&WorkerWorkspace>,
         _task_id: &TaskId,
@@ -466,85 +495,45 @@ pub trait AgentWorkspaceService: Send + Sync {
             "workspace service does not support read-only tasks".into(),
         ))
     }
+}
 
-    fn inspect_delivery(
-        &self,
-        _workspace: &WorkerWorkspace,
-    ) -> Result<DeliveryReport, WorkerError> {
+/// Application-owned lookup from a `spawn_agent` workdir to the workspace the
+/// runtime resolved for it. The runtime asks the registry; it never creates a
+/// directory itself.
+pub trait WorkerWorkspaceRegistry: Send + Sync {
+    /// Remembers a workspace so a later lookup resolves the same lease.
+    fn register_prepared(&self, workspace: &WorkerWorkspace);
+
+    /// Returns the workspace for `workdir`, when one was prepared.
+    fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace>;
+
+    /// Observes a parent-prepared workdir, records it, and returns its position.
+    ///
+    /// The parent prepares the directory itself (`git worktree add`); the daemon
+    /// only observes it. A workdir the provider cannot accept (missing, or not
+    /// inside a git worktree) is refused.
+    fn observe_workdir(&self, _workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
         Err(WorkerError::Startup(
-            "coding workspace service does not support delivery inspection".into(),
+            "workspace registry cannot observe a workdir".into(),
         ))
     }
 
-    fn cleanup_prepared(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        Ok(())
-    }
-
-    /// Whether `commit` is already contained in `owner`'s worktree HEAD. The
-    /// default cannot inspect git and therefore reports "not integrated".
-    fn contains_commit(
-        &self,
-        _owner: &WorkerWorkspace,
-        _commit: &str,
-    ) -> Result<bool, WorkerError> {
-        Ok(false)
-    }
-
-    /// Remove an accepted child's worktree and branch once `owner` provably
-    /// contains its delivery. The default is a no-op for non-git services.
-    fn cleanup_accepted(
-        &self,
-        _owner: &WorkerWorkspace,
-        _child: &WorkerWorkspace,
-    ) -> Result<(), WorkerError> {
-        Ok(())
-    }
-
-    /// Remove a task's worktree directory while keeping its branch ref and its
-    /// `task_workspaces` row. This is the safe automatic reclaim: the branch
-    /// still pins every commit, and the surviving row lets
-    /// [`Self::reattach_workspace`] rebuild the directory on demand.
-    ///
-    /// The default is a no-op for non-git services.
-    fn reclaim_worktree(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        Ok(())
-    }
-
-    /// Rebuild a reclaimed worktree directory from its surviving branch.
-    ///
-    /// The default cannot run git and therefore reports failure, because a
-    /// caller that reaches this point needs a usable directory.
-    fn reattach_workspace(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
+    /// Reads a workspace's delivery, probing its directory rather than a
+    /// daemon-managed worktree. The numbers a review needs (head, branch,
+    /// cleanliness) all come from the workdir itself.
+    fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
+        let _ = workspace;
         Err(WorkerError::Startup(
-            "workspace service cannot rebuild a reclaimed worktree".into(),
+            "workspace registry cannot inspect deliveries".into(),
         ))
-    }
-
-    /// Whether `branch` is already merged into `parent_branch`. Used to refuse
-    /// reclaiming a worktree whose work has not been integrated.
-    ///
-    /// The comparison is against the branch the worktree recorded as its parent,
-    /// never against `owner`'s current `HEAD`: a worker may `git checkout` inside
-    /// the owner worktree, and that must not change whether a child counts as
-    /// integrated. `parent_branch` is passed separately for exactly that reason.
-    ///
-    /// The default cannot inspect git and reports "not merged", which is the safe
-    /// answer.
-    fn is_merged_into(
-        &self,
-        _owner: &WorkerWorkspace,
-        _branch: &str,
-        _parent_branch: &str,
-    ) -> Result<bool, WorkerError> {
-        Ok(false)
     }
 }
 
 #[derive(Debug, Default)]
-pub struct UnavailableWorkspaceService;
+pub struct UnavailableWorkspaceProvider;
 
-impl AgentWorkspaceService for UnavailableWorkspaceService {
-    fn prepare_root(
+impl WorkerWorkspaceProvider for UnavailableWorkspaceProvider {
+    fn in_place_workspace(
         &self,
         _root_session_id: &RootSessionId,
         _task_id: &TaskId,
@@ -555,12 +544,10 @@ impl AgentWorkspaceService for UnavailableWorkspaceService {
         ))
     }
 
-    fn prepare_child(
+    fn workspace_in(
         &self,
-        _parent: &WorkerWorkspace,
-        _root_session_id: &RootSessionId,
         _task_id: &TaskId,
-        _attempt_id: &AttemptId,
+        _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Err(WorkerError::Startup(
             "coding workspace service is unavailable".into(),
@@ -583,23 +570,29 @@ pub trait AgentWorkerFactory: Send + Sync {
         None
     }
 
-    fn workspace_service(&self) -> Option<Arc<dyn AgentWorkspaceService>> {
+    fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
+        None
+    }
+
+    /// The application's prepared-workspace registry, when it has one. The
+    /// runtime uses it to resolve a parent-chosen workdir to its workspace.
+    fn worker_workspace_registry(&self) -> Option<Arc<dyn WorkerWorkspaceRegistry>> {
         None
     }
 
     /// Builds the Git workspace service for one application root attachment.
     /// The daemon invokes this with the client-resolved project workspace rather
     /// than its own startup directory, so concurrent projects stay isolated.
-    fn workspace_service_for_application_root(
+    fn workspace_service_for_project(
         &self,
         _workspace: &std::path::Path,
-    ) -> Option<Arc<dyn AgentWorkspaceService>> {
-        self.workspace_service()
+    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
+        self.default_workspace_service()
     }
 
     /// Verifies that a client reattaching an existing root belongs to the
     /// repository that owns its persisted workspace.
-    fn application_root_workspace_matches(
+    fn project_workspace_matches(
         &self,
         _workspace: &std::path::Path,
         _recorded: &WorkerWorkspace,
