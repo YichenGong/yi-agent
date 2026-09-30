@@ -330,6 +330,32 @@ max_tasks = 5
     }
 
     #[test]
+    fn a_window_excludes_its_own_end_time() {
+        // 单窗口、非 "24:00" 的 end：没有任何后续窗口能遮蔽 `end` 时刻的比较。
+        let config = r#"
+default_max_tasks = 1
+
+[[window]]
+days = "Mon"
+start = "09:00"
+end = "12:00"
+max_tasks = 7
+"#;
+        let calendar = ConcurrencyCalendar::from_toml(config).unwrap();
+        // 2026-10-05 是周一；12:00 落在 [09:00, 12:00) 之外，回落 default_max_tasks。
+        assert_eq!(
+            calendar.limit_at(at(10, 5, 12, 0)),
+            1,
+            "end 是排他的：12:00 不应命中该窗口"
+        );
+        assert_eq!(
+            calendar.limit_at(at(10, 5, 11, 59)),
+            7,
+            "11:59 仍在 [09:00, 12:00) 之内"
+        );
+    }
+
+    #[test]
     fn the_first_matching_window_wins() {
         let config = r#"
 default_max_tasks = 1
