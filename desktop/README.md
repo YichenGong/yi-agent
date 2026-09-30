@@ -97,7 +97,7 @@ desktop/
 
 ## Verification status
 
-Frontend unit tests (`npm test`, 103 tests), the frontend production build
+Frontend unit tests (`npm test`, 142 tests), the frontend production build
 (`npm run build`), and the Rust backend tests (`cd src-tauri && cargo test`) are
 green.
 
@@ -112,6 +112,15 @@ tauri build` produces `src-tauri/target/release/bundle/macos/yi-agent.app` (with
 the sidecar embedded at `Contents/MacOS/yi-agent`) and
 `src-tauri/target/release/bundle/dmg/yi-agent_0.1.0_aarch64.dmg`. Launching the
 `.app` spawns the `yi-agent app-server --listen stdio://` child process.
+
+To refresh the installed copy, rebuild the sidecar and the bundle, then replace
+`/Applications/yi-agent.app` with the freshly bundled `.app`:
+
+```bash
+npm run sidecar:release && npm run tauri build
+rm -rf /Applications/yi-agent.app
+cp -R src-tauri/target/release/bundle/macos/yi-agent.app /Applications/
+```
 
 The **manual end-to-end smoke checklist** (streaming text, tool cards, approval
 allow/deny, Stop interrupt, sidecar-kill banner) still requires human
