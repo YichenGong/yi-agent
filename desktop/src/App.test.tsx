@@ -227,6 +227,78 @@ describe("App YOLO wiring", () => {
   });
 });
 
+describe("App approval focus", () => {
+  it("does not steal focus from an in-progress thread rename", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // A turn is running on t1.
+    state.notifHandlers[0]({
+      method: "thread/status/updated",
+      params: { thread_id: "t1", status: "running" },
+    });
+
+    // The user starts renaming t1 while it runs.
+    fireEvent.doubleClick(screen.getByText("one"));
+    const field = document.querySelector<HTMLInputElement>("input")!;
+    expect(field).not.toBeNull();
+    expect(document.activeElement).toBe(field);
+    fireEvent.change(field, { target: { value: "half-typed" } });
+
+    // The running turn asks for tool approval: the dialog mounts.
+    state.approvalHandlers[0]({
+      id: "perm-1",
+      params: {
+        thread_id: "t1",
+        turn_id: "u1",
+        request_id: 1,
+        tool_name: "bash",
+        tool_input: {},
+        prefix_suggestion: null,
+        kind: "Normal",
+      },
+    });
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    // The dialog must not yank focus out of the rename field: the field's
+    // onBlur commits, so a stolen focus silently keeps a half-typed title and
+    // unmounts the field.
+    const stillThere = document.querySelector<HTMLInputElement>("input");
+    expect(stillThere, "rename field must survive the approval dialog").not.toBeNull();
+    expect(stillThere!.value).toBe("half-typed");
+    expect(document.activeElement).toBe(stillThere);
+    expect(clients[0].requests.some((r) => r.method === "thread/rename")).toBe(false);
+  });
+
+  it("focuses Deny when the user is not editing a text field", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // No text field in play: the dialog keeps its deliberate safe default, so a
+    // reflexive Enter/Space cannot approve a destructive tool call.
+    (document.activeElement as HTMLElement | null)?.blur();
+    state.approvalHandlers[0]({
+      id: "perm-1",
+      params: {
+        thread_id: "t1",
+        turn_id: "u1",
+        request_id: 1,
+        tool_name: "bash",
+        tool_input: {},
+        prefix_suggestion: null,
+        kind: "Normal",
+      },
+    });
+
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    expect((document.activeElement as HTMLElement).textContent).toBe("Deny");
+  });
+});
+
 describe("App parallel threads", () => {
   it("does not re-resume a warm thread when switching back to it", async () => {
     state.threads = [
