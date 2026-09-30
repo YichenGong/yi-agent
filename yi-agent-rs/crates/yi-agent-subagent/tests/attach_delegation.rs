@@ -112,3 +112,55 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
 
     yi_agent_subagent::attach::detach_root(&attached.socket_path, &attached.attached_root);
 }
+
+/// With nothing listening, the runtime must be created rather than reported as
+/// a permanent failure: this is what lets the desktop recover at all.
+#[test]
+fn ensure_owned_starts_a_daemon_when_none_is_listening() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+
+    let owned = yi_agent_subagent::attach::ensure_owned_runtime(&cfg, runtime.path().to_path_buf())
+        .expect("a dead runtime must be replaced with a fresh one");
+
+    assert!(
+        owned.embedded_daemon.is_some(),
+        "this process must own the new daemon"
+    );
+    let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
+    assert_eq!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    );
+}
+
+/// Strategy B: a healthy daemon already serving this project is adopted, never
+/// stolen -- taking it over would break whichever process started it.
+#[test]
+fn ensure_owned_reuses_a_healthy_daemon() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let database = runtime.path().join("runtime.sqlite");
+    let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
+    // The pre-existing daemon must be a real one: `Daemon::start`'s default
+    // factory has no workspace service, so the attach that follows would be
+    // rejected for unrelated reasons and this test could not tell "reused"
+    // from "broken".
+    let factory = yi_agent_subagent::attach::worker_factory(&cfg, socket).expect("factory");
+    let _existing =
+        yi_agent_store::ipc::Daemon::start_with_factory(runtime.path(), &database, factory)
+            .expect("daemon starts");
+
+    let joined =
+        yi_agent_subagent::attach::ensure_owned_runtime(&cfg, runtime.path().to_path_buf())
+            .expect("a healthy runtime must be adopted, not replaced");
+
+    assert!(
+        joined.embedded_daemon.is_none(),
+        "must not steal a healthy daemon"
+    );
+}
