@@ -27,6 +27,11 @@ export type ToolStatus = "running" | "completed" | "failed";
 
 export type Item =
   | { type: "userMessage"; id: string; text: string }
+  /**
+   * 中途追加的用户消息：属于当前 turn，但作为独立 item 渲染，避免与开启该
+   * turn 的那条消息混为一谈。`id` 是服务端在 RPC 入口铸的 `interjection_id`。
+   */
+  | { type: "user_interjection"; id: string; text: string }
   | { type: "agentMessage"; id: string; text: string }
   | {
       type: "toolCall";
@@ -75,6 +80,10 @@ export type Notification =
         cache_creation_input_tokens?: number;
         cache_read_input_tokens?: number;
       };
+    }
+  | {
+      method: "turn/interjectionsReturned";
+      params: { thread_id: string; turn_id: string; items: string[] };
     }
   | { method: "error"; params: { message: string } };
 

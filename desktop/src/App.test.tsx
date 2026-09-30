@@ -265,6 +265,48 @@ describe("App parallel threads", () => {
     expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2);
   });
 
+  it("uses turn/interject instead of turn/start while a turn is running", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // The server is authoritative for "a turn is running".
+    state.notifHandlers[0]({
+      method: "thread/status/updated",
+      params: { thread_id: "t1", status: "running" },
+    });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "follow-up" } });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/interject")).toBe(true),
+    );
+    const methods = clients[0].requests.map((r) => r.method);
+    expect(methods).not.toContain("turn/start");
+    expect(
+      clients[0].requests.find((r) => r.method === "turn/interject")?.params,
+    ).toMatchObject({ threadId: "t1", input: [{ type: "text", text: "follow-up" }] });
+  });
+
+  it("still uses turn/start when the thread is idle", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "fresh" } });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    expect(clients[0].requests.map((r) => r.method)).not.toContain("turn/interject");
+  });
+
   it("does not lose a background thread's timeline when switching", async () => {
     state.threads = [
       { thread_id: "t1", title: "one", permission_mode: "normal" },

@@ -305,16 +305,21 @@ export default function App() {
     const session = store.view(id).session;
     session.addUserMessage(text);
     force((v) => v + 1);
+    // Fold into the running turn when there is one: `turn/start` would be
+    // rejected outright, and the text would take effect only after the whole
+    // cycle finished. The server answers `turn/interject` with the turn it
+    // joined (or -32013 when nothing is running).
+    const method = store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
     try {
-      await c.request("turn/start", {
+      await c.request(method, {
         threadId: id,
         input: [{ type: "text", text }],
       });
       return true;
     } catch (e) {
       session.lastError = formatError(e);
-      // Roll back the optimistic bubble so a rejected turn (e.g. -32012 turn
-      // already in progress) does not leave a phantom user message.
+      // Roll back the optimistic bubble so a rejected send (e.g. -32012 when a
+      // turn started in the meantime) does not leave a phantom user message.
       const last = session.items[session.items.length - 1];
       if (last && last.type === "userMessage" && last.text === text) session.items.pop();
       force((v) => v + 1);

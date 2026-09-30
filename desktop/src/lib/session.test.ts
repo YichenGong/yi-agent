@@ -190,6 +190,59 @@ describe("Session", () => {
     expect(s.retrying).toBeNull();
   });
 
+  it("renders a mid-turn interjection as its own user bubble", () => {
+    const s = new Session();
+    s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
+    s.apply({
+      method: "item/started",
+      params: {
+        thread_id: "t",
+        turn_id: "u1",
+        item: { type: "user_interjection", id: "interject-u1-1", text: "also do X" },
+      },
+    } as never);
+
+    const texts = s.items
+      .filter((i) => i.type === "userMessage")
+      .map((i) => (i as { text: string }).text);
+    expect(texts).toContain("also do X");
+    expect(s.items).toHaveLength(1);
+  });
+
+  it("keeps item/completed from duplicating an interjection bubble", () => {
+    // Both `item/started` and `item/completed` carry the same id, so the second
+    // must replace rather than append (the shared item path handles this).
+    const s = new Session();
+    const params = {
+      thread_id: "t",
+      item: { type: "user_interjection", id: "interject-u1-1", text: "also do X" },
+    };
+    s.apply({ method: "item/started", params } as never);
+    s.apply({ method: "item/completed", params } as never);
+    expect(s.items).toHaveLength(1);
+  });
+
+  it("restores returned interjections to the pending input", () => {
+    const s = new Session();
+    s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
+    s.apply({
+      method: "turn/interjectionsReturned",
+      params: { thread_id: "t", turn_id: "u1", items: ["interject-u1-1"] },
+    } as never);
+
+    expect(s.returnedInterjections).toEqual(["interject-u1-1"]);
+  });
+
+  it("records an empty return list as nothing pending", () => {
+    const s = new Session();
+    s.returnedInterjections = ["stale"];
+    s.apply({
+      method: "turn/interjectionsReturned",
+      params: { thread_id: "t", turn_id: "u1", items: [] },
+    } as never);
+    expect(s.returnedInterjections).toEqual([]);
+  });
+
   it("reset clears all state and starts a fresh items array", () => {
     const s = new Session();
     const before = s.items;
@@ -214,5 +267,6 @@ describe("Session", () => {
     expect(s.lastStatus).toBeNull();
     expect(s.lastError).toBeNull();
     expect(s.usage).toBeNull();
+    expect(s.returnedInterjections).toEqual([]);
   });
 });

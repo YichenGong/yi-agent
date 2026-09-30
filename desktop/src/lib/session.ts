@@ -12,6 +12,13 @@ const nextLocalId = () => `local-${++localSeq}`;
  * agent text to the existing item in place.
  */
 export class Session {
+  /**
+   * 服务端未能消费、已回推的追加消息 id。空数组表示没有待恢复的文本。
+   *
+   * 只存 id：文本仍留在服务端的请求记录与本地输入框草稿里，回推的语义是
+   * "这次追加没生效，请把它还给用户"。渲染层据此提示用户重新提交。
+   */
+  returnedInterjections: string[] = [];
   items: Item[] = [];
   turnActive = false;
   lastStatus: TurnStatus | null = null;
@@ -33,6 +40,7 @@ export class Session {
     this.lastStatus = null;
     this.lastError = null;
     this.usage = null;
+    this.returnedInterjections = [];
   }
 
   addUserMessage(text: string): void {
@@ -44,9 +52,17 @@ export class Session {
       case "item/started":
       case "item/completed": {
         const incoming = notification.params.item;
-        const index = this.items.findIndex((i) => i.id === incoming.id);
-        if (index >= 0) this.items[index] = incoming;
-        else this.items.push(incoming);
+        // A mid-turn interjection is normalised to a user bubble: the transcript
+        // should read as a conversation, and the distinct protocol type exists
+        // so the distinction is visible on the wire, not to require a second
+        // renderer here.
+        const item: Item =
+          incoming.type === "user_interjection"
+            ? { type: "userMessage", id: incoming.id, text: incoming.text }
+            : incoming;
+        const index = this.items.findIndex((i) => i.id === item.id);
+        if (index >= 0) this.items[index] = item;
+        else this.items.push(item);
         break;
       }
       case "item/delta": {
@@ -73,6 +89,11 @@ export class Session {
         this.retrying = null;
         this.lastStatus = notification.params.status;
         this.lastError = notification.params.error ?? null;
+        break;
+      case "turn/interjectionsReturned":
+        // Ordered ahead of `turn/completed` by the server, so the text is
+        // restorable before the turn is marked finished.
+        this.returnedInterjections = [...notification.params.items];
         break;
       case "turn/retry":
         this.retrying = {
