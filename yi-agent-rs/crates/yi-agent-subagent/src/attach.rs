@@ -240,9 +240,61 @@ pub fn detach_root(socket_path: &Path, root: &AttachedRoot) {
     }
 }
 
+/// How reachable and healthy the project runtime is.
+///
+/// `Unknown` is deliberately separate: a permission error or an exhausted file
+/// descriptor table is not "the daemon died", and must never trigger a takeover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeProbe {
+    /// Answered a read-only `Status` normally.
+    Healthy,
+    /// Listening, but answers `internal` -- alive yet unusable (see the TUI's
+    /// `replace_wedged_daemon`), so it must be retired and replaced.
+    Wedged,
+    /// The socket is gone or nobody is accepting on it.
+    Dead,
+    /// Any other outcome. Never taken over; the caller degrades as before.
+    Unknown,
+}
+
+/// Probes a runtime socket with the cheapest read-only request a daemon serves.
+///
+/// `Status` creates no session and writes no attachment, so probing is free of
+/// side effects. A wedged daemon fails it exactly as it fails everything else.
+pub fn probe_runtime(socket_path: &std::path::Path) -> RuntimeProbe {
+    match send_request(socket_path, yi_agent_store::ipc::IpcRequest::Status) {
+        Ok(yi_agent_store::ipc::IpcResponse::Status { .. }) => RuntimeProbe::Healthy,
+        Ok(yi_agent_store::ipc::IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::Internal,
+            ..
+        }) => RuntimeProbe::Wedged,
+        Ok(_) => RuntimeProbe::Unknown,
+        Err(yi_agent_store::ipc::IpcError::Io(error)) if is_dead_io(&error) => RuntimeProbe::Dead,
+        Err(_) => RuntimeProbe::Unknown,
+    }
+}
+
+/// Whether a connect failure means "no live daemon", as opposed to "we were not
+/// allowed to find out".
+fn is_dead_io(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::project_runtime_directory;
+    use super::{RuntimeProbe, probe_runtime, project_runtime_directory};
+    use yi_agent_store::ipc::Daemon;
 
     /// The daemon, the TUI and the app-server must land on one location, so
     /// this is the single place the default is spelled out.
@@ -262,5 +314,26 @@ mod tests {
             project_runtime_directory(std::path::Path::new("/tmp/project-a")),
             project_runtime_directory(std::path::Path::new("/tmp/project-b")),
         );
+    }
+
+    /// Nothing is listening: the socket path does not resolve to a live daemon,
+    /// so the runtime must be reported dead rather than merely unhealthy.
+    #[test]
+    fn probe_reports_dead_without_a_socket() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("runtime.sock");
+        assert_eq!(probe_runtime(&socket), RuntimeProbe::Dead);
+    }
+
+    /// A live daemon answers the read-only `Status` probe. This is the only
+    /// outcome that must lead to reuse rather than replacement.
+    #[test]
+    fn probe_reports_healthy_on_status() {
+        let runtime = tempfile::TempDir::new().unwrap();
+        let database = runtime.path().join("runtime.sqlite");
+        let daemon = Daemon::start(runtime.path(), &database).expect("daemon starts");
+        let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
+        assert_eq!(probe_runtime(&socket), RuntimeProbe::Healthy);
+        drop(daemon);
     }
 }
