@@ -4,4 +4,5 @@
 //! 本 crate 不做 I/O、不依赖 daemon、不做 IPC，因此可独立编译与测试。
 
 pub mod board;
+pub mod calendar;
 pub mod card;
