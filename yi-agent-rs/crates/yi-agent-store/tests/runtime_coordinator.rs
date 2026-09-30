@@ -1979,7 +1979,7 @@ fn due_schedule_creates_a_new_isolated_root_with_its_objective() {
         .unwrap();
     let delivery = serde_json::from_str::<serde_json::Value>(&detail.delivery_json).unwrap();
     assert_eq!(delivery["objective"], "Produce the scheduled report.");
-    assert_eq!(delivery["schedule_policy"]["runtime"]["max_turns"], 30);
+    assert_eq!(delivery["schedule_policy"]["runtime"]["max_turns"], 200);
 }
 
 #[test]
@@ -3411,7 +3411,7 @@ async fn coordinator_seeds_watchdog_snapshots_for_root_and_child_attempts() {
             .attempt_watchdog_snapshot(&attempt)
             .unwrap()
             .expect("new attempts have a watchdog snapshot");
-        assert_eq!(snapshot.limits.max_turns, Some(100));
+        assert_eq!(snapshot.limits.max_turns, Some(200));
         assert_eq!(snapshot.limits.max_wall_time_secs, Some(2_700));
         assert_eq!(snapshot.limits.max_idle_time_secs, Some(300));
         assert_eq!(snapshot.limits.max_provider_retries, Some(3));
@@ -3833,4 +3833,230 @@ async fn non_git_application_root_can_be_reattached() {
     assert_eq!(second.root_task_id, first.root_task_id);
     assert_eq!(second.workspace.path, application_root);
     assert!(second.workspace.branch.is_empty());
+}
+
+/// A task whose owning daemon is gone can never progress: nothing in the
+/// system moves `paused`/`queued`/`running` rows that no live supervisor holds.
+/// These are exactly the rows that pile up across restarts.
+fn seed_orphan(
+    repository: &mut RuntimeRepository,
+    session: &RootSessionId,
+    state: &str,
+    idempotency_key: &str,
+    attachment_state: Option<&str>,
+) -> (TaskId, AttemptId) {
+    let task = TaskId::new();
+    let attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt(&task, session, &attempt, 1, state)
+        .unwrap();
+    if let Some(attachment_state) = attachment_state {
+        repository
+            .record_application_root_attachment(
+                idempotency_key,
+                session,
+                &task,
+                "digest",
+                "secret",
+                "/tmp/project",
+            )
+            .unwrap();
+        if attachment_state == "detached" {
+            repository.detach_application_root(session, &task).unwrap();
+        }
+    }
+    (task, attempt)
+}
+
+#[test]
+fn reclaim_cancels_tasks_whose_application_root_detached() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    let session = RootSessionId::new();
+    let (task, attempt) = seed_orphan(
+        &mut repository,
+        &session,
+        "paused",
+        "detached-project",
+        Some("detached"),
+    );
+
+    assert_eq!(repository.task_state(&task).unwrap(), "paused");
+    assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 1);
+    assert_eq!(repository.task_state(&task).unwrap(), "cancelled");
+    assert_eq!(repository.attempt_state(&attempt).unwrap(), "cancelled");
+    // Idempotent: a second sweep finds nothing left to reclaim.
+    assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 0);
+}
+
+#[test]
+fn reclaim_leaves_tasks_with_a_live_attachment_alone() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    let session = RootSessionId::new();
+    let (task, _) = seed_orphan(
+        &mut repository,
+        &session,
+        "running",
+        "live-project",
+        Some("attached"),
+    );
+
+    assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 0);
+    assert_eq!(repository.task_state(&task).unwrap(), "running");
+}
+
+#[test]
+fn reclaim_respects_the_grace_window_for_attachmentless_tasks() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    // No attachment row at all: a root that is still booting looks like this,
+    // so it must survive the grace window and only lapse once it is old.
+    let session = RootSessionId::new();
+    let (task, _) = seed_orphan(&mut repository, &session, "queued", "booting", None);
+
+    assert_eq!(repository.reclaim_orphaned_tasks(3_600).unwrap(), 0);
+    assert_eq!(repository.task_state(&task).unwrap(), "queued");
+    assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 1);
+    assert_eq!(repository.task_state(&task).unwrap(), "cancelled");
+}
+
+#[test]
+fn reclaim_preserves_the_partial_report_and_releases_leases() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    let session = RootSessionId::new();
+    let (task, attempt) = seed_orphan(
+        &mut repository,
+        &session,
+        "paused",
+        "half-done",
+        Some("detached"),
+    );
+    repository
+        .transition_task_and_attempt_with_terminal(
+            &task,
+            &attempt,
+            "paused",
+            RuntimeEvent::TaskPaused,
+            r#"{"kind":"text_completion","report":"I got halfway through the refactor"}"#,
+        )
+        .unwrap();
+
+    repository.reclaim_orphaned_tasks(0).unwrap();
+
+    let terminal = repository
+        .attempt_terminal_json_for_task(&task)
+        .unwrap()
+        .expect("reclaim records a terminal payload");
+    let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+    assert_eq!(terminal["reason"], "reclaimed_orphan");
+    assert_eq!(terminal["previous_state"], "paused");
+    assert_eq!(
+        terminal["report"], "I got halfway through the refactor",
+        "the truncated report must survive the reclaim"
+    );
+}
+
+#[test]
+fn reclaim_abandons_recovery_required_tasks_with_nothing_to_resume() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    // A detached root parks its interrupted task in `recovery_required`, a
+    // terminal state, with no checkpoint and no workspace lease: nothing can
+    // ever resume it and nothing owns it.
+    let session = RootSessionId::new();
+    let (task, _) = seed_orphan(
+        &mut repository,
+        &session,
+        "running",
+        "empty-recovery",
+        Some("attached"),
+    );
+    repository.recover_inflight_tasks().unwrap();
+    assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
+    repository.detach_application_root(&session, &task).unwrap();
+
+    assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 1);
+    assert_eq!(repository.task_state(&task).unwrap(), "cancelled");
+}
+
+#[test]
+fn reclaim_keeps_recovery_required_tasks_under_a_live_root() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    // The root is still attached, so hydration revives this task and a user can
+    // resume it even though it carries no checkpoint yet.
+    let session = RootSessionId::new();
+    let (task, _) = seed_orphan(
+        &mut repository,
+        &session,
+        "running",
+        "live-recovery",
+        Some("attached"),
+    );
+    repository.recover_inflight_tasks().unwrap();
+    assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
+
+    assert_eq!(
+        repository.reclaim_orphaned_tasks(0).unwrap(),
+        0,
+        "an attached root's recovery row is still the session's own task"
+    );
+    assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
+}
+
+#[test]
+fn reclaim_keeps_recovery_required_tasks_that_can_still_resume() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    let session = RootSessionId::new();
+    let task = TaskId::new();
+    let attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+        .unwrap();
+    repository
+        .record_application_root_attachment(
+            "resumable",
+            &session,
+            &task,
+            "digest",
+            "secret",
+            "/tmp/project",
+        )
+        .unwrap();
+    repository
+        .record_recovery_context(
+            &task,
+            &attempt,
+            "workspace:project",
+            "worktree:feature/recovery",
+            r#"{"checkpoint":"before restart"}"#,
+            r#"{"tool":"git","status":"clean"}"#,
+        )
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
+
+    assert_eq!(
+        repository.reclaim_orphaned_tasks(0).unwrap(),
+        0,
+        "a task with a checkpoint and a workspace lease is still resumable"
+    );
+    assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
 }

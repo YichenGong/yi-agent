@@ -112,7 +112,7 @@ impl Default for AgentConfig {
         Self {
             model: "claude-sonnet-4-5".to_string(),
             system_prompt: Some(Self::default_system_prompt()),
-            max_turns: Some(100),
+            max_turns: Some(200),
             gen_params: Default::default(),
             compact_threshold: Some(100_000),
             compact_user_budget_tokens: crate::compact::DEFAULT_COMPACT_USER_BUDGET_TOKENS,
@@ -2447,6 +2447,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_agent_budget_allows_a_real_task_to_finish() {
+        // A delegated coding task routinely runs past a hundred turns. The old
+        // default of 20 cut children off mid-sentence, so this floor is a
+        // regression guard, not a tuning knob: raising it is fine, lowering it
+        // silently truncates reports again.
+        let agent_config = AgentConfig::default();
+        assert!(
+            agent_config.max_turns.unwrap_or(u32::MAX) >= 200,
+            "the default turn ceiling must leave room for a real task, got {:?}",
+            agent_config.max_turns
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_respects_max_turns() {
         // Provider always emits a tool call -> would infinite loop without cap.
@@ -3533,7 +3547,7 @@ mod tests {
     fn agent_config_default_model() {
         let config = AgentConfig::default();
         assert_eq!(config.model, "claude-sonnet-4-5");
-        assert_eq!(config.max_turns, Some(100));
+        assert_eq!(config.max_turns, Some(200));
     }
 
     #[test]

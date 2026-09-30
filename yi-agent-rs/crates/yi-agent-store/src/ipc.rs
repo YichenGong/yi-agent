@@ -24,7 +24,7 @@ use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerStart, WorkerWorkspace,
 };
 
-use crate::repository::RuntimeRepository;
+use crate::repository::{DEFAULT_ORPHAN_GRACE_SECS, RuntimeRepository};
 use crate::runtime::{
     ReviewDecision, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions,
 };
@@ -713,6 +713,14 @@ impl Daemon {
         remove_if_exists(&socket_path)?;
         let mut repository = RuntimeRepository::open(database_path.as_ref())?;
         repository.recover_inflight_tasks()?;
+        // The sweep above parks interrupted work in `recovery_required`, which
+        // is a terminal state, so anything that cannot actually resume would sit
+        // there forever and pin its session's supervisor. Reclaim those, plus
+        // tasks whose owning root has detached, before the coordinator hydrates.
+        let reclaimed = repository.reclaim_orphaned_tasks(DEFAULT_ORPHAN_GRACE_SECS)?;
+        if reclaimed > 0 {
+            eprintln!("yi-agent runtime: reclaimed {reclaimed} orphaned task(s)");
+        }
         drop(repository);
         let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
         let listener = UnixListener::bind(&socket_path)?;

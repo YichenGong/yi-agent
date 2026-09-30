@@ -5519,3 +5519,94 @@ fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
         "a refused review leaves the delivery untouched"
     );
 }
+
+/// The restart path is where ghosts accumulate: a killed daemon leaves rows in
+/// `running`/`paused`/`queued` that no live supervisor owns, and the startup
+/// sweep alone would only park them in the terminal `recovery_required` pen.
+#[test]
+fn daemon_start_drains_tasks_whose_owning_root_is_gone() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+
+    // A root that detached: its owner is provably gone.
+    let detached_session = RootSessionId::new();
+    let detached_task = TaskId::new();
+    repository
+        .create_task(&detached_task, &detached_session, "paused")
+        .unwrap();
+    repository
+        .record_application_root_attachment(
+            "detached-project",
+            &detached_session,
+            &detached_task,
+            "digest",
+            "secret",
+            "/tmp/project",
+        )
+        .unwrap();
+    repository
+        .detach_application_root(&detached_session, &detached_task)
+        .unwrap();
+
+    // A task with no attachment and no recent activity: nothing owns it.
+    let orphan_session = RootSessionId::new();
+    let orphan_task = TaskId::new();
+    repository
+        .create_task(&orphan_task, &orphan_session, "queued")
+        .unwrap();
+    // Backdate it past the startup grace window: `CURRENT_TIMESTAMP` is UTC, so
+    // the literal must be too.
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET updated_at = datetime('now', '-1 day') WHERE id = ?1",
+            params![orphan_task.to_string()],
+        )
+        .unwrap();
+
+    // A live root attachment must survive the sweep untouched. `paused` is used
+    // deliberately: the pre-existing inflight sweep only rewrites `running` and
+    // the `waiting_*` family, so this isolates the reclaim itself.
+    let live_session = RootSessionId::new();
+    let live_task = TaskId::new();
+    repository
+        .create_task(&live_task, &live_session, "paused")
+        .unwrap();
+    repository
+        .record_application_root_attachment(
+            "live-project",
+            &live_session,
+            &live_task,
+            "digest",
+            "secret",
+            "/tmp/project",
+        )
+        .unwrap();
+    drop(repository);
+
+    let daemon = Daemon::start_with_factory(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(RecordingWorkerFactory),
+    )
+    .unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.task_state(&detached_task).unwrap(),
+        "cancelled",
+        "a detached root's task can never progress"
+    );
+    assert_eq!(
+        repository.task_state(&orphan_task).unwrap(),
+        "cancelled",
+        "an unowned task past its grace window can never progress"
+    );
+    assert_eq!(
+        repository.task_state(&live_task).unwrap(),
+        "paused",
+        "a live root's task must not be touched"
+    );
+    drop(daemon);
+}

@@ -295,6 +295,14 @@ pub enum WorkerEvent {
     Completed {
         report: String,
     },
+    /// The child stopped because it exhausted its turn allowance.
+    ///
+    /// Kept apart from [`Self::Completed`]: the transcript is truncated
+    /// mid-work, so reporting it as a completion handed the parent a
+    /// half-finished sentence as if it were the child's findings.
+    BudgetExhausted {
+        report: String,
+    },
     CompletedWithoutDelivery,
     Paused,
     Cancelled,
@@ -357,6 +365,14 @@ impl WorkerHandle {
 
     pub fn report_completed(&self, report: impl Into<String>) {
         self.report(WorkerEvent::Completed {
+            report: report.into(),
+        });
+    }
+
+    /// The child's agent loop stopped at its turn ceiling, so `report` is a
+    /// partial transcript rather than a finished answer.
+    pub fn report_budget_exhausted(&self, report: impl Into<String>) {
+        self.report(WorkerEvent::BudgetExhausted {
             report: report.into(),
         });
     }

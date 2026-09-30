@@ -62,6 +62,34 @@ async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
     );
 }
 
+/// A child cut off at its turn ceiling must reach the parent as an exhausted
+/// budget carrying its partial transcript, never as a clean completion: the
+/// report is a half-finished sentence, and a parent that merges on sight would
+/// treat it as the child's findings.
+#[tokio::test]
+async fn budget_exhausted_child_reports_exhaustion_with_its_partial_transcript() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+
+    handle.report_budget_exhausted("I got as far as rewriting the lexer");
+    supervisor.reconcile_worker_events().unwrap();
+
+    let (_, reports) = supervisor.child_completion_snapshot(&root);
+    assert_eq!(
+        reports[0].state, "budget_exhausted",
+        "the parent must be told the child ran out of turns"
+    );
+    assert_eq!(
+        reports[0].report.as_deref(),
+        Some("I got as far as rewriting the lexer"),
+        "the partial transcript still reaches the parent"
+    );
+}
+
 /// A. A parent that already holds its child's completion message must still be
 /// able to see the delivered commit through wait_agent.
 #[tokio::test]

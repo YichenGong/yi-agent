@@ -727,6 +727,24 @@ impl AgentSupervisor {
                     .map_err(|error| error.to_string())?;
                     self.completion_reports.insert(task_id.clone(), report);
                 }
+                WorkerEvent::BudgetExhausted { report } => {
+                    let task = self
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("worker task was checked above");
+                    let attempt_id = task.active_attempt_id().clone();
+                    task.reduce(
+                        TaskEvent::WorkerBudgetExhausted {
+                            attempt_id,
+                            kind: BudgetKind::Turns,
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    // Keep the partial transcript: a truncated report is still
+                    // the parent's only window into what the child managed.
+                    self.completion_reports.insert(task_id.clone(), report);
+                }
                 WorkerEvent::Paused => {
                     let task = self
                         .tasks

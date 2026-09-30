@@ -222,7 +222,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
-            .unwrap_or(20);
+            .unwrap_or(200);
 
         let workdir = resolve_workdir(overrides)?;
 
@@ -679,7 +679,11 @@ mod tests {
         let config = RuntimeConfig::load(&overrides).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
         assert_eq!(config.model, "claude-sonnet-4-20250514");
-        assert_eq!(config.max_turns, 20);
+        assert_eq!(
+            config.max_turns, 200,
+            "an interactive session must not be capped at a turn count a real \
+             task exhausts; YI_AGENT_MAX_TURNS still overrides this"
+        );
         assert!(config.system_prompt.is_none());
     }
 

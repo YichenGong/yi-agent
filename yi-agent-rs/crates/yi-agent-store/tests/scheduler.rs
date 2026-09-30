@@ -27,7 +27,7 @@ fn schedule_definition_embeds_conservative_defaults() {
     assert!(definition.policy.runtime.read_only);
     assert!(!definition.policy.runtime.allow_coding);
     assert_eq!(definition.policy.runtime.max_resident_subagents, 4);
-    assert_eq!(definition.policy.runtime.max_turns, 30);
+    assert_eq!(definition.policy.runtime.max_turns, 200);
     assert_eq!(definition.policy.runtime.max_wall_time_secs, 900);
     assert_eq!(definition.policy.priority, SchedulePriority::Background);
     assert_eq!(definition.policy.overlap_policy, OverlapPolicy::Skip);
@@ -209,7 +209,7 @@ fn scheduled_policy_defaults_to_read_only_background_without_overlap_or_catch_up
     assert!(policy.runtime.read_only);
     assert!(!policy.runtime.allow_coding);
     assert_eq!(policy.runtime.max_resident_subagents, 4);
-    assert_eq!(policy.runtime.max_turns, 30);
+    assert_eq!(policy.runtime.max_turns, 200);
     assert_eq!(policy.runtime.max_wall_time_secs, 900);
     assert_eq!(policy.overlap_policy, OverlapPolicy::Skip);
     assert_eq!(policy.priority, SchedulePriority::Background);
