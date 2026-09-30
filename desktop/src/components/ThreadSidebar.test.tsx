@@ -55,6 +55,25 @@ const newThreadTrigger = (container: HTMLElement) =>
   container.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
 
 describe("ThreadSidebar", () => {
+  it("keeps the rename field open when Enter confirms an IME candidate", () => {
+    const onRename = vi.fn();
+    const { container } = renderSidebar({ onRename });
+
+    fireEvent.doubleClick(screen.getByText("alpha-thread"));
+    const field = container.querySelector<HTMLInputElement>("input")!;
+    fireEvent.change(field, { target: { value: "中文名" } });
+
+    // macOS WKWebView rebuilds the committing keydown after tearing down the
+    // composition: isComposing is false by then, keyCode is forced to 229.
+    fireEvent.keyDown(field, { key: "Enter", keyCode: 229 });
+    expect(onRename).not.toHaveBeenCalled();
+    expect(container.querySelector("input")).not.toBeNull();
+
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(onRename).toHaveBeenCalledWith("1", "中文名");
+    expect(container.querySelector("input")).toBeNull();
+  });
+
   it("renders each group's basename and its thread rows", () => {
     const { container } = renderSidebar();
     expect(container.textContent).toContain("projA");

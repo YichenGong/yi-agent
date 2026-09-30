@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ModeChip } from "./ModeChip";
+import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import type { ThreadMode } from "../lib/threadPermissionMode";
 
 export function MessageInput({
@@ -17,6 +18,9 @@ export function MessageInput({
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  // Enter that confirms an IME candidate must not send the message; see
+  // `isImeCompositionKey` for why keyCode 229 is the load-bearing check here.
+  const ime = useImeGuard();
 
   const handleSend = async () => {
     if (!text.trim() || sending) return;
@@ -36,13 +40,19 @@ export function MessageInput({
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
+        onCompositionStart={ime.onCompositionStart}
+        onCompositionEnd={ime.onCompositionEnd}
         onKeyDown={(e) => {
           if (e.key === "Enter" && !e.shiftKey) {
+            // Confirming a candidate with Enter is the IME's key, not the user's:
+            // let the composition land in the box and wait for the next Enter.
+            if (isImeEnter(e, ime.composing.current)) return;
             e.preventDefault();
             if (turnActive) onInterrupt();
             else void handleSend();
           }
         }}
+        onBlur={ime.resetComposition}
         disabled={sending}
         rows={3}
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"

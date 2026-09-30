@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
+import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 
 /** Compact relative time, e.g. "3m", "2h", "5d". */
 function relativeTime(ms: number): string {
@@ -62,6 +63,9 @@ export function ThreadSidebar({
   const [width, setWidth] = useState(loadSidebarWidth);
   const widthRef = useRef(width);
   const cleanupDrag = useRef<(() => void) | null>(null);
+  // The rename field is a plain text input, so an IME confirm-Enter must not
+  // commit the draft (and unmount the field) mid-composition.
+  const ime = useImeGuard();
 
   const onHandleDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -163,9 +167,14 @@ export function ThreadSidebar({
             autoFocus
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            onBlur={() => commit(t.thread_id)}
+            onCompositionStart={ime.onCompositionStart}
+            onCompositionEnd={ime.onCompositionEnd}
+            onBlur={() => {
+              ime.resetComposition();
+              commit(t.thread_id);
+            }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") commit(t.thread_id);
+              if (e.key === "Enter" && !isImeEnter(e, ime.composing.current)) commit(t.thread_id);
               if (e.key === "Escape") setEditingId(null);
             }}
             className="w-full rounded bg-neutral-950 px-1 py-0.5 text-sm text-neutral-100 outline-none"
