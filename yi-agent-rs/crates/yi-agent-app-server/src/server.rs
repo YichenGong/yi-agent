@@ -1090,6 +1090,54 @@ where
                             .await?,
                         }
                     }
+                    "thread/compact" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let Some(session) = threads.get(&thread_id) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 压缩会重写整段历史,turn 进行中不接受。
+                        if session.active_turn_id.is_some() {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::turn_in_progress(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        if session
+                            .session_tx
+                            .send(SessionCommand::Compact { reply: reply_tx })
+                            .await
+                            .is_err()
+                        {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::internal("thread driver is gone")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // compact 要调一次 provider 生成摘要,属于长请求;不设短超时。
+                        let result = match reply_rx.await {
+                            Ok(CompactOutcome::Compacted) => json!({"status": "compacted"}),
+                            Ok(CompactOutcome::NotReduced) => json!({"status": "not_reduced"}),
+                            Ok(CompactOutcome::Failed(message)) => {
+                                json!({"status": "failed", "error": message})
+                            }
+                            Err(_) => json!({"status": "failed", "error": "thread driver dropped"}),
+                        };
+                        write_response(&writer, ok_response(id, result)).await?;
+                    }
                     "turn/start" => {
                         // `id` 后续响应仍需使用,故传 clone。
                         let Some(thread_id) =
@@ -2260,6 +2308,24 @@ mod tests {
                 ))
             });
             Ok(events.boxed())
+        }
+    }
+
+    /// 每次调用都返回 provider 错误:用于测试 `/compact` 的 `failed` 三态。
+    struct ErroringProvider;
+
+    #[async_trait]
+    impl yi_agent_core::Provider for ErroringProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            Err(yi_agent_core::provider::ProviderError::Network(
+                "boom".into(),
+            ))
         }
     }
 
@@ -4493,6 +4559,161 @@ mod tests {
             .await;
         let v = h.read_value().await;
         assert_eq!(v["error"]["code"], -32011, "expected unknown thread: {v}");
+        h.shutdown().await;
+    }
+
+    /// 构造一份「可压缩」的测试 agent 工厂:初始 session 有 3 条消息
+    /// (user/assistant/user),压缩后会变成 2 条。
+    ///
+    /// 注意只放 1 条 user 消息是**不可压缩**的:`plan_compaction` 会把历史里
+    /// 所有 user 消息合并成一条,消息数不减少即返回 `None`(→ `not_reduced`)。
+    fn compactable_factory(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let session = session.unwrap_or_else(|| {
+            let mut s = yi_agent_core::Session::new();
+            s.replace_messages(vec![
+                yi_agent_core::Message::user("first"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "reply".into(),
+                )]),
+                yi_agent_core::Message::user("second"),
+            ]);
+            s
+        });
+        Ok(BuiltAgent {
+            agent: yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            )
+            .with_session(session),
+            provider,
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+        })
+    }
+
+    /// 起一个 thread,然后调 `thread/compact`,返回响应的信封。
+    async fn compact_thread(h: &mut Harness, tid: &str) -> serde_json::Value {
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/compact","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            // 跳过沿线可能出现的通知(thread/status/updated 等),只等响应。
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                return v;
+            }
+        }
+        panic!("thread/compact must respond");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_compact_reports_compacted_when_history_shrinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, compactable_factory, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        let v = compact_thread(&mut h, &tid).await;
+        assert_eq!(
+            v["result"]["status"], "compacted",
+            "expected compaction: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_compact_reports_not_reduced_for_a_short_history() {
+        let mut h = Harness::new(); // build_test_agent 的 session 为空
+        let tid = start_thread(&mut h).await;
+        let v = compact_thread(&mut h, &tid).await;
+        assert_eq!(v["result"]["status"], "not_reduced", "expected no-op: {v}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_compact_reports_failure_without_breaking_the_connection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let build = |session: Option<yi_agent_core::Session>,
+                     _cwd: &std::path::Path,
+                     _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(ErroringProvider);
+            let config = yi_agent_core::AgentConfig::default();
+            let mut session = session.unwrap_or_default();
+            session.replace_messages(vec![
+                yi_agent_core::Message::user("first"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "reply".into(),
+                )]),
+                yi_agent_core::Message::user("second"),
+            ]);
+            Ok(BuiltAgent {
+                agent: yi_agent_core::Agent::new(
+                    provider.clone(),
+                    Arc::new(yi_agent_core::ToolRegistry::new()),
+                    config.clone(),
+                )
+                .with_session(session),
+                provider,
+                config,
+                decision_tx: None,
+                decision_rx: None,
+                catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        let v = compact_thread(&mut h, &tid).await;
+        assert_eq!(v["result"]["status"], "failed", "expected failure: {v}");
+        assert!(
+            v["result"]["error"].is_string(),
+            "must carry the reason: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_compact_is_rejected_while_a_turn_is_running() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/started") {
+                break;
+            }
+        }
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/compact","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        // slow provider 期间会持续推 item/delta 通知,必须按 id 找到响应本身。
+        let mut rejected = None;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                rejected = Some(v);
+                break;
+            }
+        }
+        let v = rejected.expect("thread/compact must respond");
+        assert_eq!(v["error"]["code"], -32012, "expected turn in progress: {v}");
         h.shutdown().await;
     }
 
