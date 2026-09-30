@@ -40,7 +40,17 @@ pub const TRACE_TERMINAL_RETENTION_SECS: i64 = 86_400;
 ///
 /// `RecoveryRequired` is included on purpose: it is a holding pen for explicit
 /// resume, not a live task, and `TaskState::is_terminal` agrees.
-const TERMINAL_TASK_STATES: [&str; 9] = [
+///
+/// The two other persisted spellings of that state belong here too. Runtime
+/// hydration folds `recovery_gated` and `recovery_attested` into
+/// `TaskState::RecoveryRequired` (`runtime.rs:3410`), so a task parked at either
+/// one is terminal for the same reason `recovery_required` is.
+/// `recovery_gated` is written by `activate_successor_attempt` and
+/// `recovery_attested` by `attest_recovery_gate`. Leaving them out made those
+/// rows permanently uncollectable — the exact unbounded growth the retention
+/// window exists to stop — so the behaviour is pinned by
+/// `tasks_parked_in_recovery_states_have_their_traces_pruned`.
+const TERMINAL_TASK_STATES: [&str; 11] = [
     "completed",
     "completed_no_changes",
     "blocked",
@@ -50,6 +60,8 @@ const TERMINAL_TASK_STATES: [&str; 9] = [
     "failed",
     "cancelled",
     "recovery_required",
+    "recovery_gated",
+    "recovery_attested",
 ];
 
 /// A single persisted row of a task's observation trace.
@@ -4926,6 +4938,10 @@ mod tests {
             "failed",
             "cancelled",
             "recovery_required",
+            // Terminal spellings of the same held state: hydration folds these
+            // into `TaskState::RecoveryRequired`, which is terminal.
+            "recovery_gated",
+            "recovery_attested",
         ];
         let live = [
             "running",
@@ -4971,6 +4987,52 @@ mod tests {
                 "state {state} kept the wrong number of trace rows"
             );
         }
+    }
+
+    /// The pin above compares the constant against a hand-written list, so it
+    /// can only catch a name the author also forgot here. This test asks the
+    /// database instead: the retention window must actually delete the trace
+    /// rows of a task parked in each recovery state. That is the property the
+    /// constant exists to serve, and it is the one that catches an omission.
+    #[test]
+    fn tasks_parked_in_recovery_states_have_their_traces_pruned() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let session = RootSessionId::new();
+
+        // `recovery_gated` and `recovery_attested` are written by production
+        // paths (`activate_successor_attempt`, `attest_recovery_gate`), so the
+        // rows below are shapes the store really persists.
+        let mut gated = None;
+        let mut attested = None;
+        for state in ["recovery_gated", "recovery_attested"] {
+            let task = TaskId::new();
+            let attempt = AttemptId::new();
+            repository
+                .create_task_with_attempt(&task, &session, &attempt, 1, state)
+                .unwrap();
+            repository
+                .append_trace(&task, "state_note", r#"{"note":"parked"}"#)
+                .unwrap();
+            if state == "recovery_gated" {
+                gated = Some(task);
+            } else {
+                attested = Some(task);
+            }
+        }
+        let gated = gated.unwrap();
+        let attested = attested.unwrap();
+
+        // A task parked in recovery is terminal, so past the window its rows go.
+        let removed = repository
+            .prune_terminal_traces(
+                Utc::now() + chrono::Duration::seconds(TRACE_TERMINAL_RETENTION_SECS + 1),
+            )
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(repository.trace_row_count(&gated).unwrap(), 0);
+        assert_eq!(repository.trace_row_count(&attested).unwrap(), 0);
     }
 
     #[test]
