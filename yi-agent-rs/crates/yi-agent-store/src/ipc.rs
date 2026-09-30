@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, Timelike};
+use chrono::{Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -764,6 +764,16 @@ impl Daemon {
                     .and_then(|value| value.with_nanosecond(0));
                 if minute != last_schedule_minute {
                     let _ = coordinator.evaluate_schedules(now);
+                    // Trace retention is cleanup, not work: a failure here must
+                    // never wedge the accept loop, but a wedged database must be
+                    // visible rather than silent.
+                    match coordinator.prune_terminal_traces(Utc::now()) {
+                        Ok(pruned) => tracing::debug!(pruned, "pruned terminal task traces"),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "terminal trace pruning failed; retrying next minute"
+                        ),
+                    }
                     last_schedule_minute = minute;
                 }
                 match listener.accept() {

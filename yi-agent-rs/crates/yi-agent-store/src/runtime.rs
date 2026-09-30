@@ -29,6 +29,7 @@ use yi_agent_core::subagent::task::{
     PermissionRequestId, RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState,
     TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence, WorkspaceLeaseId,
 };
+use yi_agent_core::subagent::trace::TraceFact;
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
     WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
@@ -68,6 +69,21 @@ pub enum RuntimeCoordinatorError {
     QueueCapacityExceeded,
     #[error("runtime is draining and rejects new admissions")]
     Draining,
+}
+
+/// The `kind` column for a trace fact.
+///
+/// The store holds no trace vocabulary of its own: the serialized fact is the
+/// whole payload, and this tag names the row for readers that index by kind
+/// instead of parsing every JSON body. The payload repeats the tag inside
+/// `"type"`, which is harmless and expected.
+fn trace_fact_kind(fact: &TraceFact) -> &'static str {
+    match fact {
+        TraceFact::AssistantText { .. } => "assistant_text",
+        TraceFact::ToolCall { .. } => "tool_call",
+        TraceFact::ToolResult { .. } => "tool_result",
+        TraceFact::StateNote { .. } => "state_note",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1041,6 +1057,23 @@ impl RuntimeCoordinator {
             .root_task_id()
             .clone();
         Ok(root_id)
+    }
+
+    /// Deletes the trace rows of terminal tasks past the retention window and
+    /// returns how many rows went away.
+    ///
+    /// This is the daemon's maintenance entry point, called from the minute
+    /// tick. The count is observability only: a wedged database is a caller
+    /// concern, not a result this method can hide.
+    pub fn prune_terminal_traces(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize, RuntimeCoordinatorError> {
+        Ok(self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .prune_terminal_traces(now)?)
     }
 
     /// Fires all schedules due at `now` into newly isolated root sessions.
@@ -2863,8 +2896,14 @@ impl RuntimeCoordinator {
         let mut deliveries = Vec::new();
         let mut consumed_overrides = Vec::new();
         let mut watchdog_updates = Vec::new();
+        let mut trace_updates = Vec::new();
         for supervisor in &supervisors {
             let mut supervisor = supervisor.lock().await;
+            // Drain trace facts before the reducer runs. A terminal or paused
+            // transition removes the worker from `workers`, taking every fact
+            // it still buffers with it, so a later drain would silently drop
+            // the terminal note that explains why the worker stopped.
+            trace_updates.extend(supervisor.take_worker_trace_events());
             watchdog_updates.extend(supervisor.take_worker_watchdog_events());
             let changed = supervisor
                 .reconcile_worker_events()
@@ -2921,6 +2960,19 @@ impl RuntimeCoordinator {
                 updates.push((task_id, attempt, state, event, terminal_json));
             }
             consumed_overrides.extend(supervisor.pending_user_override_acks().iter().cloned());
+        }
+        // Persist drained facts before the state transitions below. The writes
+        // are independent: a trace failure must not discard a transition, and
+        // a transition failure must not discard the facts that explain it.
+        {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            for (task_id, fact) in &trace_updates {
+                let payload = serde_json::to_string(fact).map_err(RepositoryError::from)?;
+                repository.append_trace(task_id, trace_fact_kind(fact), &payload)?;
+            }
         }
         for (task_id, update) in watchdog_updates {
             let mut repository = self
