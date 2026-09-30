@@ -73,6 +73,7 @@ pub fn run_tui(
     mut agent_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::Sender<String>,
     interrupt_tx: tokio::sync::mpsc::Sender<()>,
+    kill_tx: tokio::sync::mpsc::Sender<String>,
     control_tx: tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -101,6 +102,7 @@ pub fn run_tui(
         &mut input,
         &input_tx,
         &interrupt_tx,
+        &kill_tx,
         &control_tx,
         &decision_tx,
         &is_running,
@@ -167,6 +169,7 @@ pub fn run_tui_with_backend<B: Backend>(
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -181,6 +184,7 @@ pub fn run_tui_with_backend<B: Backend>(
         &mut input,
         input_tx,
         interrupt_tx,
+        kill_tx,
         control_tx,
         decision_tx,
         is_running,
@@ -203,6 +207,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -217,6 +222,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         &mut input,
         input_tx,
         interrupt_tx,
+        kill_tx,
         control_tx,
         decision_tx,
         is_running,
@@ -275,6 +281,7 @@ fn run_loop<B: Backend, E: EventSource>(
     input: &mut InputLine,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -561,6 +568,7 @@ fn run_loop<B: Backend, E: EventSource>(
                         key,
                         &mut runtime_popup,
                         &task_registry,
+                        kill_tx,
                         &process_snapshots,
                         &process_outputs,
                         layout.chunks[0].width,
@@ -642,6 +650,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     &cost_tracker,
                     input_tx,
                     interrupt_tx,
+                    kill_tx,
                     control_tx,
                     decision_tx,
                     is_running,
@@ -949,15 +958,27 @@ fn handle_runtime_popup_key_for_test(
     }
     let registry = RunningTaskRegistry::new();
     let outputs = std::collections::HashMap::new();
-    let _ = handle_runtime_popup_key(key, runtime_popup, &registry, processes, &outputs, 80, 24);
+    let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let _ = handle_runtime_popup_key(
+        key,
+        runtime_popup,
+        &registry,
+        &kill_tx,
+        processes,
+        &outputs,
+        80,
+        24,
+    );
 }
 
 /// Route a key to the active runtime popup. Returns `Some(process_id)` when the
 /// user confirms a kill in the managed-processes tab.
+#[allow(clippy::too_many_arguments)]
 fn handle_runtime_popup_key(
     key: KeyEvent,
     runtime_popup: &mut RuntimePopup,
     task_registry: &RunningTaskRegistry,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
     processes: &[yi_agent_tools::ManagedProcessSnapshot],
     process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
     detail_width: u16,
@@ -969,7 +990,7 @@ fn handle_runtime_popup_key(
             if key.code == KeyCode::Tab {
                 switch_runtime_tab(runtime_popup, task_registry);
             } else {
-                handle_bash_popup_key(key, bash_popup, task_registry, detail_width);
+                handle_bash_popup_key(key, bash_popup, task_registry, kill_tx, detail_width);
                 if matches!(bash_popup, BashPopup::None) {
                     *runtime_popup = RuntimePopup::None;
                 }
@@ -1072,6 +1093,7 @@ fn handle_bash_popup_key(
     key: KeyEvent,
     bash_popup: &mut BashPopup,
     task_registry: &RunningTaskRegistry,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
     detail_width: u16,
 ) {
     match bash_popup {
@@ -1127,10 +1149,27 @@ fn handle_bash_popup_key(
         },
         BashPopup::ConfirmKill(ck) => match key.code {
             KeyCode::Char('y') => {
-                // TODO: wire a kill channel from TUI → agent → call_stream.
-                // For now, mark the task as failed in the registry and close.
-                // The real kill requires a channel in main.rs + oneshot in agent.rs.
-                let _ = ck.task_id; // placeholder
+                // Ask the agent driver to cancel this one tool call. Cancelling
+                // the call drops the bash tool's future, which is what reaps the
+                // command's whole process group — so this stops the command, not
+                // just our wait for it. The driver answers by emitting a
+                // `ToolExit` and an error `ToolResult`, which flips the registry
+                // entry out of `Running` on its own.
+                //
+                // A failed send means the driver is gone (run over / app
+                // shutting down); the task cannot be running then either, so the
+                // entry is finalized directly to stop the timer.
+                if kill_tx.try_send(ck.task_id.clone()).is_err() {
+                    // `try_send` can only fail for a full or closed channel; a
+                    // full one means the driver is busy and will drain it, so
+                    // only the closed case needs the local fallback.
+                    if kill_tx.is_closed() {
+                        tracing::warn!(
+                            tool_call = %ck.task_id,
+                            "kill request dropped: the agent driver is gone"
+                        );
+                    }
+                }
                 let ids: Vec<String> = task_registry.list().iter().map(|t| t.id.clone()).collect();
                 if ids.is_empty() {
                     *bash_popup = BashPopup::None;
@@ -1345,6 +1384,7 @@ fn handle_key(
     cost_tracker: &CostTracker,
     input_tx: &tokio::sync::mpsc::Sender<String>,
     interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1517,6 +1557,7 @@ fn handle_key(
                             cost_tracker,
                             input_tx,
                             interrupt_tx,
+                            kill_tx,
                             control_tx,
                             workdir,
                             queued,
@@ -1597,6 +1638,7 @@ fn handle_key(
                         cost_tracker,
                         input_tx,
                         interrupt_tx,
+                        kill_tx,
                         control_tx,
                         workdir,
                         queued,
@@ -1753,6 +1795,7 @@ fn execute_slash_command(
     cost: &CostTracker,
     _input_tx: &tokio::sync::mpsc::Sender<String>,
     _interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    _kill_tx: &tokio::sync::mpsc::Sender<String>,
     control_tx: &tokio::sync::mpsc::Sender<crate::ControlCommand>,
     workdir: &std::path::Path,
     queued: &mut crate::tui::queued::DeliveredInterjections,
@@ -4460,6 +4503,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4488,6 +4532,7 @@ mod tests {
             &mut input,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -4541,6 +4586,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4568,6 +4614,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -4607,6 +4654,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4625,6 +4673,7 @@ mod tests {
             &mut input,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -4665,6 +4714,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4693,6 +4743,7 @@ mod tests {
             &mut input,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -4783,6 +4834,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4803,6 +4855,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -4847,6 +4900,7 @@ mod tests {
             .unwrap();
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4870,6 +4924,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -4897,6 +4952,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4917,6 +4973,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -4951,6 +5008,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -4971,6 +5029,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5059,6 +5118,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5081,6 +5141,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5114,6 +5175,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5137,6 +5199,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5169,6 +5232,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5187,6 +5251,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5212,6 +5277,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5228,6 +5294,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5249,6 +5316,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5295,6 +5363,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5348,6 +5417,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5367,6 +5437,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5394,6 +5465,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5410,6 +5482,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5431,6 +5504,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5451,6 +5525,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5486,6 +5561,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5512,6 +5588,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5543,6 +5620,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5569,6 +5647,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5637,6 +5716,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5659,6 +5739,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5758,6 +5839,73 @@ mod tests {
         assert!(popup.is_none());
     }
 
+    /// The bash panel's kill must reach the agent driver as a request to stop
+    /// that specific tool call. This used to be a `// TODO` placeholder that
+    /// only marked the local registry entry failed and left the process running.
+    #[test]
+    fn bash_panel_kill_sends_the_tool_call_id_to_the_driver() {
+        let mut registry = RunningTaskRegistry::new();
+        registry.on_tool_call("call_1", "bash", "sleep 300", 120);
+        let mut popup = RuntimePopup::Bash(BashPopup::Detail(DetailPopup::new("call_1".into())));
+        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+
+        // `k` -> confirm prompt
+        handle_runtime_popup_key_for_test(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut popup,
+            &["call_1".into()],
+            &[],
+        );
+        // `y` -> send. Re-dispatch through the real handler so the channel is exercised.
+        let mut popup = RuntimePopup::Bash(BashPopup::ConfirmKill(ConfirmKill {
+            task_id: "call_1".into(),
+        }));
+        handle_bash_popup_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            match &mut popup {
+                RuntimePopup::Bash(b) => b,
+                _ => unreachable!(),
+            },
+            &registry,
+            &kill_tx,
+            80,
+        );
+
+        assert_eq!(
+            kill_rx.try_recv().as_deref(),
+            Ok("call_1"),
+            "confirming the kill must ask the driver to cancel that tool call"
+        );
+    }
+
+    /// `n`/Esc must back out without killing anything.
+    #[test]
+    fn bash_panel_kill_cancel_does_not_send_a_request() {
+        let mut registry = RunningTaskRegistry::new();
+        registry.on_tool_call("call_1", "bash", "sleep 300", 120);
+        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let mut bash_popup = BashPopup::ConfirmKill(ConfirmKill {
+            task_id: "call_1".into(),
+        });
+
+        handle_bash_popup_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut bash_popup,
+            &registry,
+            &kill_tx,
+            80,
+        );
+
+        assert!(
+            kill_rx.try_recv().is_err(),
+            "declining the kill must not send anything"
+        );
+        assert!(
+            matches!(bash_popup, BashPopup::Detail(_)),
+            "declining returns to the detail view"
+        );
+    }
+
     #[test]
     fn ctrl_p_process_tab_kill_confirmation_sends_process_id() {
         let mut runtime_popup = RuntimePopup::Processes(ProcessPopup::Detail(
@@ -5799,6 +5947,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5815,6 +5964,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5838,6 +5988,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5855,6 +6006,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5886,6 +6038,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5905,6 +6058,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5927,6 +6081,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5947,6 +6102,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -5974,6 +6130,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -5999,6 +6156,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6023,6 +6181,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6041,6 +6200,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6073,6 +6233,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6092,6 +6253,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6119,6 +6281,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6140,6 +6303,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6172,6 +6336,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6190,6 +6355,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6214,6 +6380,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6235,6 +6402,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6268,6 +6436,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6285,6 +6454,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6314,6 +6484,7 @@ mod tests {
         let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6335,6 +6506,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6456,6 +6628,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6493,6 +6666,7 @@ mod tests {
             &mut InputLine::new(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6538,6 +6712,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6561,6 +6736,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6583,6 +6759,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6604,6 +6781,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6626,6 +6804,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6647,6 +6826,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6672,6 +6852,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6693,6 +6874,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6715,6 +6897,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6736,6 +6919,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6758,6 +6942,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6779,6 +6964,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6803,6 +6989,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6827,6 +7014,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6858,6 +7046,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6880,6 +7069,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6920,6 +7110,7 @@ mod tests {
     fn normal_navigation_keys_route_to_history_without_affecting_shift_selection() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -6953,6 +7144,7 @@ mod tests {
                 &CostTracker::default(),
                 &input_tx,
                 &interrupt_tx,
+                &kill_tx,
                 &control_tx,
                 &decision_tx,
                 &is_running,
@@ -6977,6 +7169,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -6997,6 +7190,7 @@ mod tests {
     fn esc_interrupts_active_agent_without_arming_quit() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7017,6 +7211,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7038,6 +7233,7 @@ mod tests {
     fn esc_when_idle_does_nothing() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7058,6 +7254,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7079,6 +7276,7 @@ mod tests {
     fn ctrl_c_when_running_sends_interrupt() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7099,6 +7297,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7117,6 +7316,7 @@ mod tests {
     fn repeated_esc_does_not_quit_from_handle_key() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7137,6 +7337,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7156,6 +7357,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7174,6 +7376,7 @@ mod tests {
     fn submit_multi_segment_absolute_path_sends_to_agent() {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7198,6 +7401,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7220,6 +7424,7 @@ mod tests {
     fn submit_single_segment_absolute_path_shows_unknown_command() {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7243,6 +7448,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7265,6 +7471,7 @@ mod tests {
     fn submit_while_running_is_delivered_not_held_in_history() {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7291,6 +7498,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7316,6 +7524,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7354,6 +7563,7 @@ mod tests {
         use crate::tui::queued::SubmitOutcome;
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7383,6 +7593,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7525,6 +7736,7 @@ mod tests {
     fn submit_while_idle_goes_to_history_not_queue() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7548,6 +7760,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7575,6 +7788,7 @@ mod tests {
     fn full_queue_rejects_and_restores_input_without_blocking() {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7598,6 +7812,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7623,6 +7838,7 @@ mod tests {
                 &CostTracker::default(),
                 &input_tx,
                 &interrupt_tx,
+                &kill_tx,
                 &control_tx,
                 &decision_tx,
                 &is_running,
@@ -7662,6 +7878,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -7695,6 +7912,7 @@ mod tests {
     fn delivered_messages_are_not_re_held_until_turn_end() {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -7718,6 +7936,7 @@ mod tests {
                 &CostTracker::default(),
                 &input_tx,
                 &interrupt_tx,
+                &kill_tx,
                 &control_tx,
                 &decision_tx,
                 // The driver has NOT yet cleared this flag: this mirrors the
@@ -7754,6 +7973,7 @@ mod tests {
     fn clear_command_drops_pending_queue_and_resets_in_flight() {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut history = HistoryState::new();
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
@@ -7772,6 +7992,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
@@ -7803,6 +8024,7 @@ mod tests {
         );
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let outcome = execute_slash_command(
@@ -7813,6 +8035,7 @@ mod tests {
             &cost,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
@@ -7841,6 +8064,7 @@ mod tests {
         let cost = CostTracker::default();
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let outcome = execute_slash_command(
@@ -7851,6 +8075,7 @@ mod tests {
             &cost,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
@@ -7876,6 +8101,7 @@ mod tests {
         let mut history = HistoryState::new();
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mcp = yi_agent_mcp::McpManager::empty();
@@ -7889,6 +8115,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
@@ -7908,6 +8135,7 @@ mod tests {
         let mut history = HistoryState::new();
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mcp = yi_agent_mcp::McpManager::empty();
@@ -7920,6 +8148,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
@@ -7948,6 +8177,7 @@ mod tests {
         let mut history = HistoryState::new();
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let mcp = yi_agent_mcp::McpManager::empty();
@@ -7960,6 +8190,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &std::env::temp_dir(),
             &mut queued,
@@ -7985,6 +8216,7 @@ mod tests {
         let mut history = HistoryState::new();
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
 
@@ -7996,6 +8228,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             project.path(),
             &mut queued,
@@ -8021,6 +8254,7 @@ mod tests {
         let mut history = HistoryState::new();
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
 
@@ -8032,6 +8266,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             project.path(),
             &mut queued,
@@ -8059,6 +8294,7 @@ mod tests {
         let mut history = HistoryState::new();
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
 
@@ -8070,6 +8306,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             project.path(),
             &mut queued,
@@ -8384,6 +8621,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(128);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -8415,6 +8653,7 @@ mod tests {
             &mut agent_rx,
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -8448,6 +8687,7 @@ mod tests {
     fn permission_key_e_toggles_expanded() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, mut decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -8470,6 +8710,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
@@ -8496,6 +8737,7 @@ mod tests {
     fn scroll_keys_work_while_permission_pending() {
         let (input_tx, _input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (control_tx, _control_rx) = mpsc::channel::<crate::ControlCommand>(8);
         let (decision_tx, _decision_rx) =
             mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -8522,6 +8764,7 @@ mod tests {
             &CostTracker::default(),
             &input_tx,
             &interrupt_tx,
+            &kill_tx,
             &control_tx,
             &decision_tx,
             &is_running,
