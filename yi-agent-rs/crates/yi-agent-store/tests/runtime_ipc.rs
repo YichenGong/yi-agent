@@ -5608,6 +5608,14 @@ fn daemon_start_drains_tasks_whose_owning_root_is_gone() {
         "paused",
         "a live root's task must not be touched"
     );
+    // The sweep is the daemon's own work, so it must hand the count back to the
+    // caller. It used to announce itself on stderr, which corrupted a TUI frame:
+    // an embedded daemon shares the terminal with the front end that started it.
+    assert_eq!(
+        daemon.reclaimed_orphans(),
+        2,
+        "the daemon must report the two tasks the sweep reclaimed"
+    );
     drop(daemon);
 }
 
