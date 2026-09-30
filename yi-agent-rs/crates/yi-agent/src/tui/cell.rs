@@ -70,6 +70,8 @@ impl HistoryCell {
 
     /// Render this cell into ratatui Lines for display at the given width.
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        #[cfg(test)]
+        note_line_render();
         match self {
             Self::UserMessage { text } => render_user_message(text, width),
             Self::Markdown { text } => super::markdown::render_markdown(text, width),
@@ -141,6 +143,30 @@ impl HistoryCell {
             markdown.push_str(more);
         }
     }
+}
+
+// Test-only counter of how many times a cell was actually re-rendered. The
+// render path is memoized (see `HistoryState::ensure_cache`); this counter is
+// how tests prove the memoization holds and that a frame does not re-render the
+// whole scrollback.
+#[cfg(test)]
+thread_local! {
+    static LINES_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_lines_call_count() {
+    LINES_CALLS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn lines_call_count() -> usize {
+    LINES_CALLS.with(|count| count.get())
+}
+
+#[cfg(test)]
+fn note_line_render() {
+    LINES_CALLS.with(|count| count.set(count.get() + 1));
 }
 
 // --- Renderers ---

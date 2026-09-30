@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -18,6 +20,76 @@ fn has_spacer_after(cell: &HistoryCell, next_cell: Option<&HistoryCell>) -> bool
                     Some(HistoryCell::AssistantMessage { .. })
                 )
             ))
+}
+
+/// Hash of everything that can change a cell's rendered output *in place*.
+///
+/// The hot path calls this once per cell per frame, so it must not do real work:
+/// serializing a `ToolCall`'s JSON here cost as much as re-rendering the cell
+/// and dominated the frame. The fields that actually mutate after a cell is
+/// pushed are the streamed `AssistantMessage` text, the `ToolCall` state, the
+/// permission `resolved` flag and the `expanded` flags, and those are hashed in
+/// full. Everything else can only change by the cell being replaced, which the
+/// cache already notices because a replacement lands at a new index, so a length
+/// proxy is enough to detect it.
+///
+/// `rows` is the cell's own rendered height, which the cache compares against
+/// the cached lines' length: it is a free and authoritative check that the entry
+/// matches the cell it was rendered from.
+fn cell_fingerprint(cell: &HistoryCell) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(cell).hash(&mut hasher);
+    match cell {
+        HistoryCell::UserMessage { text } | HistoryCell::Markdown { text } => {
+            text.len().hash(&mut hasher);
+        }
+        HistoryCell::AssistantMessage { markdown } => {
+            markdown.len().hash(&mut hasher);
+        }
+        HistoryCell::ToolCall {
+            id,
+            name,
+            input,
+            state,
+            expanded,
+        } => {
+            id.hash(&mut hasher);
+            name.len().hash(&mut hasher);
+            // `input` is never mutated in place, only replaced with the cell.
+            input.to_string().len().hash(&mut hasher);
+            (*state as u8).hash(&mut hasher);
+            expanded.hash(&mut hasher);
+        }
+        HistoryCell::ToolResult {
+            result_text,
+            is_error,
+            expanded,
+            ..
+        } => {
+            result_text.len().hash(&mut hasher);
+            is_error.hash(&mut hasher);
+            expanded.hash(&mut hasher);
+        }
+        HistoryCell::Separator { label } => label.as_ref().map(String::len).hash(&mut hasher),
+        HistoryCell::PermissionRequest {
+            summary,
+            prefix_suggestion,
+            resolved,
+            expanded,
+            ..
+        } => {
+            summary.len().hash(&mut hasher);
+            prefix_suggestion
+                .as_ref()
+                .map(String::len)
+                .hash(&mut hasher);
+            resolved.hash(&mut hasher);
+            expanded.hash(&mut hasher);
+        }
+        HistoryCell::PermissionResolved { .. } => {}
+    }
+    hasher.finish()
 }
 
 /// Compact one-line description of a permission request.
@@ -61,6 +133,64 @@ enum AnchorPosition {
     AfterCellSpacer,
 }
 
+/// One history cell's rendered output at a specific width.
+///
+/// `fingerprint` detects in-place mutation (a streamed `AssistantText` chunk, a
+/// fold toggle) without cloning the cell to compare against. `lines` is `None`
+/// only until the entry has been rendered for this width, or after a mutation
+/// dropped it; a `None` entry is always re-rendered before it is read.
+pub(in crate::tui) struct CachedCell {
+    fingerprint: u64,
+    lines: Option<Vec<ratatui::text::Line<'static>>>,
+}
+
+/// Flattened, memoized rendering of the history at one width.
+///
+/// A frame reads the line count and the visible window many times; without this
+/// the cells were re-parsed (markdown) and re-wrapped on every read, so a long
+/// session burned CPU proportional to the whole transcript on every frame. The
+/// cache turns that into one rebuild per content or width change.
+pub(in crate::tui) struct HistoryCache {
+    width: u16,
+    entries: Vec<CachedCell>,
+    /// `cumulative[i]` = lines in entries `0..i`, spacers included.
+    cumulative: Vec<usize>,
+    /// Absolute line index at which each entry starts, spacer included.
+    part_offsets: Vec<usize>,
+    /// The `HistoryState::content_generation` these entries were built from.
+    ///
+    /// Deliberately *not* tied to the width: the draw renders at the area width
+    /// while `text_width` probes the area minus the scrollbar column, so keying
+    /// the memoized `decision` on the width would throw it away every frame and
+    /// the fit case would re-wrap the whole history forever.
+    reflected_generation: u64,
+    /// Last `text_width` verdict, keyed by the area it was made for.
+    ///
+    /// Without this the fit case would ping-pong: `text_width` probes the area
+    /// minus the scrollbar column and returns the full area, so the draw would
+    /// re-wrap every cell at the wider width, and the next frame would probe
+    /// back at the narrower one. Remembering the verdict keeps a settled frame
+    /// from re-wrapping the whole scrollback even when nothing is overflowing.
+    decision: Option<(u16, u16, u16, u64)>,
+}
+
+impl HistoryCache {
+    fn new(width: u16) -> Self {
+        Self {
+            width,
+            entries: Vec::new(),
+            cumulative: vec![0],
+            part_offsets: Vec::new(),
+            reflected_generation: 0,
+            decision: None,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.cumulative.last().copied().unwrap_or(0)
+    }
+}
+
 /// State for the scrollable history area.
 pub struct HistoryState {
     pub cells: Vec<HistoryCell>,
@@ -68,6 +198,19 @@ pub struct HistoryState {
     pub selected: Option<usize>,
     /// Vertical scroll offset in lines (0 = bottom).
     pub scroll_offset: usize,
+    /// Memoized rendering of `cells` at the last requested width.
+    ///
+    /// `RefCell` because the read paths (`text_width`,
+    /// `flattened_line_count`, ...) take `&self` but must be able to render and
+    /// store a cell on first access.
+    cache: RefCell<HistoryCache>,
+    /// Bumped by every mutation of `cells`.
+    ///
+    /// This is what lets an idle frame skip the per-cell fingerprint scan
+    /// entirely: if the generation matches what the cache reflected, nothing can
+    /// have changed, and the number of cells stops mattering for a frame.
+    /// `Cell` because the read paths only hold `&self`.
+    content_generation: Cell<u64>,
 }
 
 impl HistoryState {
@@ -76,6 +219,21 @@ impl HistoryState {
             cells: Vec::new(),
             selected: None,
             scroll_offset: 0,
+            cache: RefCell::new(HistoryCache::new(0)),
+            content_generation: Cell::new(0),
+        }
+    }
+
+    /// Build a state from an explicit cell list, for tests that need to start
+    /// from pre-rendered history instead of a sequence of events.
+    #[cfg(test)]
+    pub(crate) fn from_cells(cells: Vec<HistoryCell>, scroll_offset: usize) -> Self {
+        Self {
+            cells,
+            selected: None,
+            scroll_offset,
+            cache: RefCell::new(HistoryCache::new(0)),
+            content_generation: Cell::new(0),
         }
     }
 
@@ -84,6 +242,7 @@ impl HistoryState {
         let was_scrolled = self.scroll_offset != 0;
         let lines_before = self.flattened_line_count(width);
         self.cells.push(cell);
+        self.note_content_change();
         self.apply_scroll_delta(was_scrolled, lines_before, width);
     }
 
@@ -92,38 +251,195 @@ impl HistoryState {
         self.cells.clear();
         self.selected = None;
         self.scroll_offset = 0;
+        let cache = self.cache.get_mut();
+        cache.entries.clear();
+        cache.part_offsets.clear();
+        cache.cumulative.truncate(1);
+        cache.decision = None;
+        self.content_generation
+            .set(self.content_generation.get().wrapping_add(1));
+    }
+
+    /// Bring the memoized render in line with `cells` at `width`.
+    ///
+    /// A frame that changed nothing returns immediately. A resize drops every
+    /// rendered cell, because the wrap is width-specific. Otherwise the entries
+    /// that are still up to date are kept and only the differing ones are
+    /// re-rendered, which during a turn is just the streaming tail.
+    fn ensure_cache(&self, width: u16) {
+        // Two phases on purpose. Rendering a cell takes `&self`, and holding a
+        // `RefCell` borrow across it would panic the moment a renderer touched
+        // the cache, so jobs are collected first and rendered with the guard
+        // dropped.
+        if self.cache_is_current(width) {
+            return;
+        }
+
+        let (changed, rebuild_tables) = {
+            let mut cache = self.cache.borrow_mut();
+            // The tables have to be rebuilt only when the entries themselves
+            // change; a read of unchanged history must not touch them.
+            let mut rebuild_tables = false;
+            if cache.width != width {
+                // A wrap is width-specific, so a resize invalidates everything.
+                cache.entries.clear();
+                cache.cumulative.truncate(1);
+                cache.part_offsets.clear();
+                cache.width = width;
+                rebuild_tables = true;
+            }
+
+            let mut changed = Vec::new();
+            for index in 0..self.cells.len() {
+                let fingerprint = cell_fingerprint(&self.cells[index]);
+                // `lines.is_some()` matters: invalidation drops the rendered
+                // lines without touching the fingerprint, so a matching
+                // fingerprint alone does not mean the entry is usable.
+                let unchanged = cache
+                    .entries
+                    .get(index)
+                    .map(|entry| entry.fingerprint == fingerprint && entry.lines.is_some())
+                    .unwrap_or(false);
+                if !unchanged {
+                    changed.push((index, fingerprint));
+                }
+            }
+            if !changed.is_empty() || cache.entries.len() > self.cells.len() {
+                rebuild_tables = true;
+            }
+            (changed, rebuild_tables)
+        };
+
+        if !changed.is_empty() {
+            let rendered: Vec<Option<Vec<ratatui::text::Line<'static>>>> = changed
+                .iter()
+                .map(|(index, _)| Some(self.cells[*index].lines(width)))
+                .collect();
+
+            let mut cache = self.cache.borrow_mut();
+            for ((index, fingerprint), lines) in changed.into_iter().zip(rendered) {
+                let lines = lines.expect("every collected job was rendered");
+                match cache.entries.get_mut(index) {
+                    Some(entry) => {
+                        entry.fingerprint = fingerprint;
+                        entry.lines = Some(lines);
+                    }
+                    None => cache.entries.push(CachedCell {
+                        fingerprint,
+                        lines: Some(lines),
+                    }),
+                }
+            }
+            cache.entries.truncate(self.cells.len());
+        }
+
+        if rebuild_tables {
+            self.recompute_cache_accelerators();
+        }
+        self.cache.borrow_mut().reflected_generation = self.content_generation.get();
+    }
+
+    /// Whether the cache already reflects `cells` at `width`.
+    fn cache_is_current(&self, width: u16) -> bool {
+        let cache = self.cache.borrow();
+        cache.width == width
+            && cache.reflected_generation == self.content_generation.get()
+            && cache.entries.len() == self.cells.len()
+    }
+
+    fn recompute_cache_accelerators(&self) {
+        #[cfg(test)]
+        perf_counters::note_rebuild();
+        let mut cache = self.cache.borrow_mut();
+        let count = cache.entries.len();
+
+        let mut offsets = Vec::with_capacity(count);
+        let mut cumulative = Vec::with_capacity(count + 1);
+        cumulative.push(0usize);
+        let mut total = 0usize;
+
+        for index in 0..count {
+            offsets.push(total);
+            total += cache.entries[index]
+                .lines
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0);
+            if has_spacer_after(&self.cells[index], self.cells.get(index + 1)) {
+                total += 1;
+            }
+            cumulative.push(total);
+        }
+
+        cache.cumulative = cumulative;
+        cache.part_offsets = offsets;
     }
 
     /// Total number of display lines across all cells at given width.
+    ///
+    /// Counts cell content only, without the semantic blank spacers.
     #[allow(dead_code)]
     pub fn total_lines(&self, width: u16) -> usize {
-        self.cells.iter().map(|c| c.line_count(width)).sum()
+        self.ensure_cache(width);
+        self.cache
+            .borrow()
+            .entries
+            .iter()
+            .map(|entry| entry.lines.as_ref().map(Vec::len).unwrap_or(0))
+            .sum()
     }
 
     /// Number of display lines including semantic blank spacers. This matches
     /// the line count used by `HistoryView::flattened_lines` / `render`.
     pub fn flattened_line_count(&self, width: u16) -> usize {
-        let mut count = 0usize;
-        for (i, cell) in self.cells.iter().enumerate() {
-            count += cell.line_count(width);
-            if has_spacer_after(cell, self.cells.get(i + 1)) {
-                count += 1;
-            }
-        }
-        count
+        self.ensure_cache(width);
+        self.cache.borrow().total()
     }
 
     /// Width available to history text after reserving a scrollbar column
     /// when the content overflows the viewport.
     pub fn text_width(&self, area_width: u16, viewport_height: u16) -> u16 {
         let candidate_width = area_width.saturating_sub(1);
-        if candidate_width > 0
-            && self.flattened_line_count(candidate_width) > viewport_height as usize
-        {
-            candidate_width
-        } else {
-            area_width
+        if candidate_width == 0 {
+            return area_width;
         }
+
+        // Consult the memo before touching the cache. Re-deriving the width
+        // would first have to render at the candidate width and might have to
+        // render again at the width we return, so a settled frame must not get
+        // here at all.
+        let generation = self.content_generation.get();
+        {
+            let cache = self.cache.borrow();
+            if let Some((area, height, width, decided_at)) = cache.decision {
+                if area == area_width && height == viewport_height && decided_at == generation {
+                    // `width` shadows the narrowing, so bind it out before the
+                    // borrow is released and the cache is re-aligned.
+                    let decided = width;
+                    drop(cache);
+                    self.ensure_cache(decided);
+                    return decided;
+                }
+            }
+        }
+
+        self.ensure_cache(candidate_width);
+        let text_width = {
+            let cache = self.cache.borrow();
+            if cache.total() > viewport_height as usize {
+                candidate_width
+            } else {
+                area_width
+            }
+        };
+        self.cache.borrow_mut().decision =
+            Some((area_width, viewport_height, text_width, generation));
+        // Leave the cache at the width the caller is about to render at: the
+        // probe above ran at `candidate_width`, and without this the draw would
+        // re-wrap every cell at `area_width` and the next probe would flip it
+        // back, so a settled history would re-render once per frame.
+        self.ensure_cache(text_width);
+        text_width
     }
 
     /// Maximum meaningful `scroll_offset` for the current content at the given
@@ -150,7 +466,9 @@ impl HistoryState {
         text_width: u16,
         viewport_height: u16,
     ) -> Option<ViewportAnchor> {
-        let total = self.flattened_line_count(text_width);
+        self.ensure_cache(text_width);
+        let cache = self.cache.borrow();
+        let total = cache.total();
         let effective_offset = self
             .scroll_offset
             .min(total.saturating_sub(viewport_height as usize));
@@ -161,7 +479,11 @@ impl HistoryState {
         let anchor_top = total.saturating_sub(viewport_height as usize + effective_offset);
         let mut lines_before = 0;
         for (cell_index, cell) in self.cells.iter().enumerate() {
-            let cell_lines = cell.line_count(text_width);
+            let cell_lines = cache.entries[cell_index]
+                .lines
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0);
             if anchor_top < lines_before + cell_lines {
                 return Some(ViewportAnchor {
                     cell_index,
@@ -191,30 +513,43 @@ impl HistoryState {
         text_width: u16,
         viewport_height: u16,
     ) {
-        let Some(anchor_cell) = self.cells.get(anchor.cell_index) else {
+        let Some(_anchor_cell) = self.cells.get(anchor.cell_index) else {
             self.reconcile_scroll_offset(text_width, viewport_height);
             return;
         };
+
+        self.ensure_cache(text_width);
+        let cache = self.cache.borrow();
+        let cell_lines = |index: usize| -> usize {
+            cache.entries[index]
+                .lines
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0)
+        };
+        let anchor_cell_lines = cell_lines(anchor.cell_index);
 
         let mut anchor_top = 0;
         for (cell_index, cell) in self.cells.iter().enumerate() {
             if cell_index == anchor.cell_index {
                 anchor_top += match anchor.position {
                     AnchorPosition::ContentLine(line_in_cell) => {
-                        line_in_cell.min(anchor_cell.line_count(text_width).saturating_sub(1))
+                        line_in_cell.min(anchor_cell_lines.saturating_sub(1))
                     }
-                    AnchorPosition::AfterCellSpacer => anchor_cell.line_count(text_width),
+                    AnchorPosition::AfterCellSpacer => anchor_cell_lines,
                 };
                 break;
             }
 
-            anchor_top += cell.line_count(text_width);
+            anchor_top += cell_lines(cell_index);
             if has_spacer_after(cell, self.cells.get(cell_index + 1)) {
                 anchor_top += 1;
             }
         }
 
-        let total = self.flattened_line_count(text_width);
+        let total = cache.total();
+        // `max_scroll_offset` borrows the cache again, so the guard has to go.
+        drop(cache);
         self.scroll_offset = total
             .saturating_sub(viewport_height as usize)
             .saturating_sub(anchor_top)
@@ -244,7 +579,75 @@ impl HistoryState {
         if let Some(i) = self.selected {
             if let Some(cell) = self.cells.get_mut(i) {
                 cell.toggle_fold();
+                self.invalidate_cell(i);
             }
+        }
+    }
+
+    /// Record that `cells` changed, so the memoized `text_width` verdict is
+    /// re-derived instead of being served from a stale key.
+    fn note_content_change(&self) {
+        self.content_generation
+            .set(self.content_generation.get().wrapping_add(1));
+        self.cache.borrow_mut().decision = None;
+    }
+
+    /// Drop the cached render for one cell.
+    ///
+    /// Callers pass the index they just mutated. The cache also catches this
+    /// through the fingerprint, but dropping the lines here keeps a long
+    /// collapsed body from being held in memory after it is folded away.
+    fn invalidate_cell(&self, index: usize) {
+        if let Some(entry) = self.cache.borrow_mut().entries.get_mut(index) {
+            entry.lines = None;
+        }
+        self.note_content_change();
+    }
+
+    /// Drop cached renders for any cell an event mutates in place.
+    ///
+    /// Streamed assistant text mutates the last cell; permission resolution
+    /// mutates the matching request cell.
+    fn invalidate_mutated_cells(&self, event: &AgentEvent) {
+        match event {
+            AgentEvent::AssistantText(text) => {
+                if !text.is_empty() {
+                    if let Some(last) = self.cells.len().checked_sub(1) {
+                        self.invalidate_cell(last);
+                    }
+                }
+            }
+            AgentEvent::ToolResult { id, .. } => {
+                let hit = self
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, cell)| match cell {
+                        HistoryCell::ToolCall { id: cell_id, .. } if cell_id == id => Some(index),
+                        _ => None,
+                    });
+                if let Some(index) = hit {
+                    self.invalidate_cell(index);
+                }
+            }
+            AgentEvent::PermissionResolved { request_id, .. } => {
+                let hit = self
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, cell)| match cell {
+                        HistoryCell::PermissionRequest {
+                            request_id: cell_id,
+                            resolved: false,
+                            ..
+                        } if cell_id == request_id => Some(index),
+                        _ => None,
+                    });
+                if let Some(index) = hit {
+                    self.invalidate_cell(index);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -325,18 +728,22 @@ impl HistoryState {
     /// Toggle the expanded state of the most recent unresolved permission
     /// request. Returns `false` when no request is pending.
     pub fn toggle_pending_permission_expanded(&mut self) -> bool {
-        for cell in self.cells.iter_mut().rev() {
-            if let HistoryCell::PermissionRequest {
-                resolved: false,
-                expanded,
-                ..
-            } = cell
-            {
-                *expanded = !*expanded;
-                return true;
-            }
+        let Some(index) = self.cells.iter().rposition(|cell| {
+            matches!(
+                cell,
+                HistoryCell::PermissionRequest {
+                    resolved: false,
+                    ..
+                }
+            )
+        }) else {
+            return false;
+        };
+        if let HistoryCell::PermissionRequest { expanded, .. } = &mut self.cells[index] {
+            *expanded = !*expanded;
         }
-        false
+        self.invalidate_cell(index);
+        true
     }
 }
 
@@ -361,6 +768,7 @@ impl HistoryState {
     pub fn push_event(&mut self, event: AgentEvent, width: u16) {
         let was_scrolled = self.scroll_offset != 0;
         let lines_before = self.flattened_line_count(width);
+        self.invalidate_mutated_cells(&event);
 
         match event {
             AgentEvent::Start => {}
@@ -553,6 +961,7 @@ impl HistoryState {
             }
         }
 
+        self.note_content_change();
         self.apply_scroll_delta(was_scrolled, lines_before, width);
     }
 }
@@ -573,17 +982,66 @@ pub struct HistoryView<'a> {
 impl<'a> HistoryView<'a> {
     /// Flatten all cells into display lines, inserting blank spacers at
     /// semantic boundaries while keeping tool work compact.
-    fn flattened_lines(&self, text_width: u16) -> Vec<(usize, ratatui::text::Line<'static>)> {
-        let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
-        for (i, cell) in self.state.cells.iter().enumerate() {
-            for line in cell.lines(text_width) {
-                all_lines.push((i, line));
+    ///
+    /// The lines come from the memoized cache, so the markdown parse and the
+    /// wrapping happen once per content or width change instead of per frame.
+    /// A spacer is stitched in cloned at the boundaries, because it is not part
+    /// of any cell's cached lines. Tests assert the flattened structure through
+    /// this; `render` reads the cache directly and clones nothing.
+    #[cfg(test)]
+    pub(crate) fn flattened_lines(
+        &self,
+        text_width: u16,
+    ) -> Vec<(usize, ratatui::text::Line<'static>)> {
+        self.state.ensure_cache(text_width);
+        let cache = self.state.cache.borrow();
+        let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> =
+            Vec::with_capacity(cache.total());
+        for (index, cell) in self.state.cells.iter().enumerate() {
+            if let Some(lines) = cache.entries[index].lines.as_ref() {
+                for line in lines {
+                    all_lines.push((index, line.clone()));
+                }
             }
-            if has_spacer_after(cell, self.state.cells.get(i + 1)) {
-                all_lines.push((i, ratatui::text::Line::raw("")));
+            if has_spacer_after(cell, self.state.cells.get(index + 1)) {
+                all_lines.push((index, ratatui::text::Line::raw("")));
             }
         }
         all_lines
+    }
+
+    /// The half-open range of absolute line indexes visible for `scroll_offset`.
+    fn visible_range(&self, total: usize, viewport_height: u16, offset: usize) -> (usize, usize) {
+        let visible_height = viewport_height as usize;
+        let effective_offset = offset.min(total.saturating_sub(visible_height));
+        let start = total.saturating_sub(visible_height + effective_offset);
+        (start, (start + visible_height).min(total))
+    }
+}
+
+/// The blank line rendered at a semantic boundary. Shared so the render loop
+/// can borrow it instead of rebuilding one per frame.
+static SPACER_LINE: ratatui::text::Line<'static> = ratatui::text::Line {
+    spans: Vec::new(),
+    style: Style::new(),
+    alignment: None,
+};
+
+/// Renders one line using either a borrowed or an owned `Line`.
+///
+/// Borrowing is what keeps the steady-state draw cheap: a long session must not
+/// clone every visible line on every frame just to hand them to ratatui.
+enum LineRef<'a> {
+    Borrowed(&'a ratatui::text::Line<'static>),
+    Owned(ratatui::text::Line<'static>),
+}
+
+impl LineRef<'_> {
+    fn line(&self) -> &ratatui::text::Line<'static> {
+        match self {
+            Self::Borrowed(line) => line,
+            Self::Owned(line) => line,
+        }
     }
 }
 
@@ -591,31 +1049,43 @@ impl<'a> Widget for HistoryView<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let text_width = self.state.text_width(area.width, area.height);
         let show_scrollbar = text_width < area.width;
-        let all_lines = self.flattened_lines(text_width);
+        self.state.ensure_cache(text_width);
+        let cache = self.state.cache.borrow();
 
         let visible_height = area.height as usize;
-        let total = all_lines.len();
+        let total = cache.total();
         // Clamp the scroll offset defensively: even if the state's
         // `scroll_offset` is larger than the maximum (e.g. content was
         // removed after scrolling, or the caller didn't clamp), the render
         // must still fill the whole viewport without leaving stale blank
         // rows at the bottom.
+        let (start, end) = self.visible_range(total, area.height, self.state.scroll_offset);
         let effective_offset = self
             .state
             .scroll_offset
             .min(total.saturating_sub(visible_height));
-        let start = total.saturating_sub(visible_height + effective_offset);
-        let end = (start + visible_height).min(total);
-        let visible = &all_lines[start..end];
 
-        for (row, (cell_idx, line)) in visible.iter().enumerate() {
+        for (row, line_index) in (start..end).enumerate() {
+            let Some((cell_index, cell_line, _is_spacer)) =
+                locate_line(&cache, &self.state.cells, line_index)
+            else {
+                continue;
+            };
             let y = area.y + row as u16;
             let x = area.x;
-            let is_selected = self.state.selected == Some(*cell_idx);
-            let mut line = line.clone();
+            let is_selected = self.state.selected == Some(cell_index);
+            let mut owned: Option<ratatui::text::Line<'static>> = None;
             if is_selected {
-                line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+                owned = Some(
+                    cell_line
+                        .clone()
+                        .style(Style::new().add_modifier(Modifier::REVERSED)),
+                );
             }
+            let line = match owned {
+                Some(line) => LineRef::Owned(line),
+                None => LineRef::Borrowed(cell_line),
+            };
             // ratatui truncates an over-wide `Line` on the right instead of
             // wrapping it (see `Line::render_with_alignment`), and this rect is
             // one row tall, so any overflow is permanently invisible. Every
@@ -624,15 +1094,16 @@ impl<'a> Widget for HistoryView<'a> {
             // A zero-width viewport renders nothing (ratatui ignores an empty
             // rect), so there is no width to satisfy.
             debug_assert!(
-                text_width == 0 || line.width() <= text_width as usize,
+                text_width == 0 || line.line().width() <= text_width as usize,
                 "history line wider than the viewport: {} > {text_width}: {:?}",
-                line.width(),
-                line.spans
+                line.line().width(),
+                line.line()
+                    .spans
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect::<String>()
             );
-            line.render(
+            line.line().render(
                 Rect {
                     x,
                     y,
@@ -657,6 +1128,84 @@ impl<'a> Widget for HistoryView<'a> {
     }
 }
 
+/// Resolve an absolute line index to its owning cell and line.
+///
+/// Returns the cell index, the rendered line, and whether the line is the
+/// semantic blank spacer that follows a cell. The spacer is synthesised here
+/// rather than stored, so it stays out of the per-cell cache.
+fn locate_line<'a>(
+    cache: &'a HistoryCache,
+    cells: &'a [HistoryCell],
+    line_index: usize,
+) -> Option<(usize, &'a ratatui::text::Line<'static>, bool)> {
+    // `part_offsets` is sorted, so this finds the owning entry in log time
+    // instead of walking every cell of a long transcript.
+    let entry = cache
+        .part_offsets
+        .partition_point(|offset| *offset <= line_index)
+        .checked_sub(1)?;
+    let line_count = cache.entries.get(entry)?.lines.as_ref()?.len();
+    let line_in_entry = line_index - cache.part_offsets[entry];
+    if line_in_entry < line_count {
+        return Some((
+            entry,
+            &cache.entries[entry].lines.as_ref()?[line_in_entry],
+            false,
+        ));
+    }
+    // Past the entry's own lines: the only line left in its slice is the
+    // semantic spacer. `part_offsets` distinguishes entries by their start, so
+    // a previous entry that rendered zero lines (which would make it share a
+    // start with this one) never steals the lookup.
+    if has_spacer_after(&cells[entry], cells.get(entry + 1)) {
+        Some((entry, &SPACER_LINE, true))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod perf_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static REBUILDS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_rebuild() {
+        REBUILDS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+/// Number of times the flattened history has been rebuilt from scratch.
+///
+/// A frame must do this at most once no matter how long the conversation is;
+/// the number of cells must not affect it.
+#[cfg(test)]
+pub(crate) fn reset_rebuild_count() {
+    perf_counters::REBUILDS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn rebuild_count() -> usize {
+    perf_counters::REBUILDS.with(|count| count.get())
+}
+
+/// SHA-free equality check over the rendered lines, used by tests to prove the
+/// memoized output is identical to a from-scratch render.
+#[cfg(test)]
+fn lines_equal(a: &[ratatui::text::Line<'static>], b: &[ratatui::text::Line<'static>]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.style == y.style
+                && x.spans.len() == y.spans.len()
+                && x.spans
+                    .iter()
+                    .zip(y.spans.iter())
+                    .all(|(p, q)| p.content == q.content && p.style == q.style)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,7 +1224,594 @@ mod tests {
             ],
             selected: None,
             scroll_offset: 0,
+            ..HistoryState::new()
         }
+    }
+
+    /// A frame walks the history several times (`text_width`,
+    /// `reconcile_scroll_offset`, `capture_viewport_anchor`, then the draw
+    /// itself). Once a history that overflows the viewport has settled, none of
+    /// those walks may re-render cells: the per-frame cost must not depend on
+    /// how many cells exist. This is the long-session case that made the TUI
+    /// lag.
+    #[test]
+    fn settled_frame_does_not_re_render_every_cell() {
+        const VIEWPORT_HEIGHT: u16 = 5;
+
+        fn cell_renders_for_one_frame(cell_count: usize) -> (usize, usize) {
+            let mut state = HistoryState::new();
+            for index in 0..cell_count {
+                state.push(
+                    HistoryCell::AssistantMessage {
+                        markdown: format!("answer {index} with some words in it"),
+                    },
+                    80,
+                );
+                state.push(HistoryCell::Separator { label: None }, 80);
+            }
+
+            // Settle exactly like a frame does, so the measured frame is the
+            // steady-state idle frame the user actually experiences.
+            let warm_text_width = state.text_width(80, VIEWPORT_HEIGHT);
+            state.reconcile_scroll_offset(warm_text_width, VIEWPORT_HEIGHT);
+            state.capture_viewport_anchor(warm_text_width, VIEWPORT_HEIGHT);
+            let _ = HistoryView {
+                state: &state,
+                width: 80,
+            }
+            .flattened_lines(warm_text_width);
+
+            crate::tui::cell::reset_lines_call_count();
+            reset_rebuild_count();
+
+            // --- one idle frame, mirroring app.rs `run_loop` ---
+            let text_width = state.text_width(80, VIEWPORT_HEIGHT);
+            state.reconcile_scroll_offset(text_width, VIEWPORT_HEIGHT);
+            state.capture_viewport_anchor(text_width, VIEWPORT_HEIGHT);
+            let _ = HistoryView {
+                state: &state,
+                width: 80,
+            }
+            .flattened_lines(text_width);
+
+            (crate::tui::cell::lines_call_count(), rebuild_count())
+        }
+
+        let (small_renders, small_rebuilds) = cell_renders_for_one_frame(10);
+        let (large_renders, large_rebuilds) = cell_renders_for_one_frame(200);
+
+        assert_eq!(small_renders, 0, "an idle frame must re-render no cells");
+        assert_eq!(
+            small_rebuilds, 0,
+            "a settled frame must not rebuild the cache"
+        );
+        assert_eq!(
+            large_renders, 0,
+            "per-frame cost must not scale with history size; 200 cells cost {large_renders} cell renders"
+        );
+        assert_eq!(
+            large_rebuilds, 0,
+            "a settled frame must not rebuild the cache"
+        );
+    }
+
+    /// The cache must not grow the per-frame cost with the number of cells even
+    /// when the history fits the viewport (where `text_width` probes a narrower
+    /// width than it renders at). The bound has to be a constant, not `N`.
+    #[test]
+    fn fitting_frame_work_is_bounded_regardless_of_size() {
+        const VIEWPORT_HEIGHT: u16 = 60;
+
+        fn cell_renders_for_one_frame(cell_count: usize) -> usize {
+            let mut state = HistoryState::new();
+            for index in 0..cell_count {
+                state.push(
+                    HistoryCell::AssistantMessage {
+                        markdown: format!("short {index}"),
+                    },
+                    80,
+                );
+            }
+            let warm_text_width = state.text_width(80, VIEWPORT_HEIGHT);
+            state.reconcile_scroll_offset(warm_text_width, VIEWPORT_HEIGHT);
+            let _ = HistoryView {
+                state: &state,
+                width: 80,
+            }
+            .flattened_lines(warm_text_width);
+
+            crate::tui::cell::reset_lines_call_count();
+            let text_width = state.text_width(80, VIEWPORT_HEIGHT);
+            state.reconcile_scroll_offset(text_width, VIEWPORT_HEIGHT);
+            let _ = HistoryView {
+                state: &state,
+                width: 80,
+            }
+            .flattened_lines(text_width);
+            crate::tui::cell::lines_call_count()
+        }
+
+        let small = cell_renders_for_one_frame(10);
+        let large = cell_renders_for_one_frame(50);
+        assert!(
+            large <= 2 * small + 4,
+            "fitting-frame work must not scale with cell count: 10 cells -> {small} renders, 50 cells -> {large} renders"
+        );
+    }
+
+    /// The memoized flattening must produce exactly the same lines as rendering
+    /// every cell from scratch, otherwise the optimization changes what the user
+    /// sees.
+    #[test]
+    fn cached_flatten_matches_naive_render() {
+        let mut state = HistoryState::new();
+        let width = 46u16;
+        state.push_event(
+            AgentEvent::AssistantText("first reply\n\nwith a second paragraph".into()),
+            width,
+        );
+        state.push_event(
+            AgentEvent::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "echo hello && ls -la"}),
+            },
+            width,
+        );
+        state.push_event(
+            AgentEvent::ToolResult {
+                id: "1".into(),
+                result: yi_agent_core::ToolResult::text("output line one\noutput line two"),
+            },
+            width,
+        );
+        state.push(
+            HistoryCell::UserMessage {
+                text: "next question".into(),
+            },
+            width,
+        );
+        state.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            width,
+        );
+
+        let cached = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+
+        crate::tui::cell::reset_lines_call_count();
+        let cached_again = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+        assert_eq!(
+            crate::tui::cell::lines_call_count(),
+            0,
+            "re-flattening an unchanged history must hit the cache, not re-render cells"
+        );
+
+        let mut naive: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
+        for (index, cell) in state.cells.iter().enumerate() {
+            for line in cell.lines(width) {
+                naive.push((index, line));
+            }
+            if has_spacer_after(cell, state.cells.get(index + 1)) {
+                naive.push((index, ratatui::text::Line::raw("")));
+            }
+        }
+
+        let cached_lines: Vec<_> = cached.iter().map(|(_, line)| line.clone()).collect();
+        let cached_again_lines: Vec<_> =
+            cached_again.iter().map(|(_, line)| line.clone()).collect();
+        assert!(
+            lines_equal(&cached_lines, &cached_again_lines),
+            "a cache hit must return the same lines as the first render"
+        );
+        let naive_lines: Vec<_> = naive.iter().map(|(_, line)| line.clone()).collect();
+        assert!(
+            lines_equal(&cached_lines, &naive_lines),
+            "memoized output must equal the from-scratch render\ncached={cached_lines:?}\nnaive={naive_lines:?}"
+        );
+        let cached_indexes: Vec<_> = cached.iter().map(|(index, _)| *index).collect();
+        let naive_indexes: Vec<_> = naive.iter().map(|(index, _)| *index).collect();
+        assert_eq!(cached_indexes, naive_indexes);
+    }
+
+    /// A resize must drop the cache and re-wrap at the new width, otherwise the
+    /// user sees stale line breaks. This is the failure mode a naive
+    /// "cache forever" implementation would have.
+    #[test]
+    fn cache_re_wraps_after_width_change() {
+        let mut state = HistoryState::new();
+        let sentence = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        state.push(
+            HistoryCell::UserMessage {
+                text: sentence.into(),
+            },
+            40,
+        );
+
+        let narrow = HistoryView {
+            state: &state,
+            width: 40,
+        }
+        .flattened_lines(40);
+        let wide = HistoryView {
+            state: &state,
+            width: 120,
+        }
+        .flattened_lines(120);
+
+        assert!(
+            narrow.len() > wide.len(),
+            "narrow width must wrap into more lines: narrow={} wide={}",
+            narrow.len(),
+            wide.len()
+        );
+
+        crate::tui::cell::reset_lines_call_count();
+        let wide_again = HistoryView {
+            state: &state,
+            width: 120,
+        }
+        .flattened_lines(120);
+        assert_eq!(
+            crate::tui::cell::lines_call_count(),
+            0,
+            "re-rendering at the width already cached must not re-wrap the cells again"
+        );
+        let wide_text: Vec<_> = wide.iter().map(|(_, line)| line.clone()).collect();
+        let wide_again_text: Vec<_> = wide_again.iter().map(|(_, line)| line.clone()).collect();
+        assert!(
+            lines_equal(&wide_text, &wide_again_text),
+            "a second render at the same width must return the wrapped lines, not stale narrow ones"
+        );
+    }
+
+    /// A streamed assistant token mutates a cell in place; the next frame must
+    /// reflect the new text instead of a cached copy of the old one.
+    #[test]
+    fn cache_invalidates_when_a_cell_mutates_in_place() {
+        let mut state = HistoryState::new();
+        let width = 60u16;
+        state.push_event(AgentEvent::AssistantText("hello".into()), width);
+
+        let before = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+
+        state.push_event(AgentEvent::AssistantText(" world".into()), width);
+
+        let after = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+
+        let before_text: String = before
+            .iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after_text: String = after
+            .iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(before_text.contains("hello"), "before={before_text:?}");
+        assert!(
+            after_text.contains("hello world"),
+            "the appended token must be visible; got {after_text:?}"
+        );
+    }
+
+    /// Toggling a fold mutates a cell; the next frame must show the expanded
+    /// body rather than the cached folded preview.
+    #[test]
+    fn cache_invalidates_when_a_fold_toggles() {
+        let mut state = HistoryState::new();
+        let width = 60u16;
+        state.push_event(
+            AgentEvent::ToolResult {
+                id: "1".into(),
+                result: yi_agent_core::ToolResult::text("first line\nsecond line\nthird line"),
+            },
+            width,
+        );
+
+        let folded = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+        state.selected = Some(0);
+        state.toggle_fold_selected();
+        let expanded = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+
+        assert!(
+            expanded.len() > folded.len(),
+            "expanding a cell must add lines: folded={} expanded={}",
+            folded.len(),
+            expanded.len()
+        );
+    }
+
+    /// Expanding a pending permission request mutates the cell in place; the
+    /// next render must show the full body, not the cached collapsed preview.
+    #[test]
+    fn cache_invalidates_when_a_permission_request_expands() {
+        let mut state = HistoryState::new();
+        let width = 60u16;
+        state.push_event(
+            AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({"command": "ls -la"}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            width,
+        );
+
+        let collapsed = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+        assert!(state.toggle_pending_permission_expanded());
+        let expanded = HistoryView {
+            state: &state,
+            width,
+        }
+        .flattened_lines(width);
+
+        let collapsed_text = collapsed
+            .iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expanded_text = expanded
+            .iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            expanded.len() > collapsed.len(),
+            "expanding must reveal more lines:\ncollapsed={collapsed_text}\nexpanded={expanded_text}"
+        );
+    }
+
+    /// While a reply streams, a token arrives before each frame. That must
+    /// re-render only the cell it changed, not the scrollback: measuring a
+    /// streamed token is the case users actually sit in.
+    #[test]
+    fn streamed_token_re_renders_only_the_tail() {
+        const VIEWPORT_HEIGHT: u16 = 5;
+
+        // The area is 80 wide; overflowing content reserves one column, so the
+        // resolved width is 79. The app applies events at this resolved width
+        // (`run_loop`), which is what keeps the cache from flip-flopping.
+        const AREA_WIDTH: u16 = 80;
+        const TEXT_WIDTH: u16 = 79;
+
+        fn renders_for_one_token(cell_count: usize) -> usize {
+            let mut state = HistoryState::new();
+            for index in 0..cell_count {
+                state.push_event(
+                    AgentEvent::AssistantText(format!("answer {index} with some words")),
+                    TEXT_WIDTH,
+                );
+                state.push_event(
+                    AgentEvent::Done {
+                        reason: DoneReason::EndTurn,
+                    },
+                    TEXT_WIDTH,
+                );
+            }
+            // Settle so the history overflows the viewport at a stable width.
+            assert_eq!(
+                state.text_width(AREA_WIDTH, VIEWPORT_HEIGHT),
+                TEXT_WIDTH,
+                "the fixture must overflow, otherwise no column is reserved"
+            );
+            state.reconcile_scroll_offset(TEXT_WIDTH, VIEWPORT_HEIGHT);
+            let _ = HistoryView {
+                state: &state,
+                width: AREA_WIDTH,
+            }
+            .flattened_lines(TEXT_WIDTH);
+            let _ = state.capture_viewport_anchor(TEXT_WIDTH, VIEWPORT_HEIGHT);
+
+            // One streamed token, then the frame that would show it.
+            crate::tui::cell::reset_lines_call_count();
+            state.push_event(AgentEvent::AssistantText(" more".into()), TEXT_WIDTH);
+            let width = state.text_width(AREA_WIDTH, VIEWPORT_HEIGHT);
+            state.reconcile_scroll_offset(width, VIEWPORT_HEIGHT);
+            let _ = state.capture_viewport_anchor(width, VIEWPORT_HEIGHT);
+            let _ = HistoryView {
+                state: &state,
+                width: AREA_WIDTH,
+            }
+            .flattened_lines(width);
+            crate::tui::cell::lines_call_count()
+        }
+
+        let small = renders_for_one_token(10);
+        let large = renders_for_one_token(200);
+        assert!(
+            large <= small.max(2),
+            "a streamed token must not scale with history size: 10 cells -> {small} renders, 200 cells -> {large} renders"
+        );
+    }
+
+    /// Differential test: drive a long, mixed sequence of mutations, resizes
+    /// and viewport changes, and after every step require the memoized output
+    /// to be identical to a from-scratch render of the same cells.
+    ///
+    /// This is the property the whole cache rests on, and a fixed script would
+    /// only cover the cases its author thought of, so the sequence is
+    /// pseudo-random (deterministic seed) over the mutation kinds that actually
+    /// exist.
+    #[test]
+    fn memoized_output_matches_naive_render_over_long_sequence() {
+        fn naive(state: &HistoryState, width: u16) -> Vec<(usize, ratatui::text::Line<'static>)> {
+            let mut all: Vec<(usize, ratatui::text::Line<'static>)> = Vec::new();
+            for (index, cell) in state.cells.iter().enumerate() {
+                for line in cell.lines(width) {
+                    all.push((index, line));
+                }
+                if has_spacer_after(cell, state.cells.get(index + 1)) {
+                    all.push((index, ratatui::text::Line::raw("")));
+                }
+            }
+            all
+        }
+
+        fn compare(state: &HistoryState, width: u16, step: usize) {
+            let cached = HistoryView { state, width }.flattened_lines(width);
+            let expected = naive(state, width);
+            assert_eq!(
+                cached.len(),
+                expected.len(),
+                "line count diverged at step {step}, width {width}"
+            );
+            assert_eq!(
+                state.flattened_line_count(width),
+                expected.len(),
+                "flattened_line_count diverged from the naive count at step {step}, width {width}"
+            );
+            let cached_lines: Vec<_> = cached.iter().map(|(_, line)| line.clone()).collect();
+            let expected_lines: Vec<_> = expected.iter().map(|(_, line)| line.clone()).collect();
+            assert!(
+                lines_equal(&cached_lines, &expected_lines),
+                "rendered content diverged at step {step}, width {width}"
+            );
+            let cached_indexes: Vec<_> = cached.iter().map(|(index, _)| *index).collect();
+            let expected_indexes: Vec<_> = expected.iter().map(|(index, _)| *index).collect();
+            assert_eq!(
+                cached_indexes, expected_indexes,
+                "cell attribution diverged at step {step}, width {width}"
+            );
+        }
+
+        let widths = [20u16, 33, 61, 120];
+        let mut state = HistoryState::new();
+        // Deterministic LCG so a failure is reproducible.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+
+        const STEPS: usize = 240;
+        for step in 0..STEPS {
+            let width = widths[next() % widths.len()];
+            match next() % 11 {
+                0 => state.push_event(
+                    AgentEvent::AssistantText(format!("assistant reply number {step}")),
+                    width,
+                ),
+                1 => state.push_event(
+                    AgentEvent::AssistantText(format!("\n\nmore prose for step {step}")),
+                    width,
+                ),
+                2 => state.push_event(
+                    AgentEvent::ToolCall {
+                        id: format!("call-{step}"),
+                        name: "bash".into(),
+                        input: serde_json::json!({"command": format!("echo {step}")}),
+                    },
+                    width,
+                ),
+                3 => state.push_event(
+                    AgentEvent::ToolResult {
+                        id: format!("call-{}", step.saturating_sub(1)),
+                        result: yi_agent_core::ToolResult::text(format!(
+                            "output for the call made before step {step}"
+                        )),
+                    },
+                    width,
+                ),
+                4 => state.push_event(
+                    AgentEvent::Done {
+                        reason: DoneReason::EndTurn,
+                    },
+                    width,
+                ),
+                5 => state.push(
+                    HistoryCell::UserMessage {
+                        text: format!("user question {step}"),
+                    },
+                    width,
+                ),
+                6 => state.push(HistoryCell::Separator { label: None }, width),
+                7 => {
+                    state.push_event(
+                        AgentEvent::PermissionRequest {
+                            request_id: step as u64,
+                            tool_name: "bash".into(),
+                            tool_input: serde_json::json!({"command": format!("rm -rf /tmp/{step}")}),
+                            prefix_suggestion: None,
+                            kind: yi_agent_core::permission::PermissionKind::Normal,
+                        },
+                        width,
+                    );
+                }
+                8 => {
+                    let _ = state.toggle_pending_permission_expanded();
+                }
+                9 => {
+                    if !state.cells.is_empty() {
+                        state.selected = Some(state.cells.len() - 1);
+                        state.toggle_fold_selected();
+                    }
+                }
+                _ => {
+                    state.scroll_offset = next() % 25;
+                    state.reconcile_scroll_offset(width, 7);
+                }
+            }
+
+            // Every step is checked at every width, so a stale cache left behind
+            // by one width is caught by the next.
+            for probe in widths {
+                compare(&state, probe, step);
+            }
+            let _ = state.capture_viewport_anchor(width, 7);
+            let anchor = state
+                .capture_viewport_anchor(width, 7)
+                .unwrap_or(ViewportAnchor {
+                    cell_index: 0,
+                    position: AnchorPosition::ContentLine(0),
+                });
+            state.restore_viewport_anchor(anchor, width, 7);
+        }
+    }
+
+    /// Instrumentation sanity check: without it, the two counter-based tests
+    /// above could pass vacuously.
+    #[test]
+    fn render_counters_are_live() {
+        let cell = HistoryCell::AssistantMessage {
+            markdown: "counted".into(),
+        };
+        crate::tui::cell::reset_lines_call_count();
+        let _ = cell.lines(40);
+        assert_eq!(crate::tui::cell::lines_call_count(), 1);
     }
 
     /// The render layer asserts every line fits `text_width`, because ratatui
@@ -831,6 +1967,7 @@ mod tests {
             ],
             selected: None,
             scroll_offset: 0,
+            ..HistoryState::new()
         };
         let old_user_lines = state.cells[0].line_count(old_width);
         state.scroll_offset = state
@@ -1827,6 +2964,7 @@ mod tests {
             }],
             selected: None,
             scroll_offset: 0,
+            ..HistoryState::new()
         };
 
         for area in [Rect::new(0, 0, 0, 5), Rect::new(0, 0, 1, 5)] {
