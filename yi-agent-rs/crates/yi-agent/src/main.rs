@@ -613,11 +613,8 @@ fn build_headless_root_tools(
     let setup =
         build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
     let mut registry = (*setup.tools).clone();
-    crate::tui::subagents::register_attached_root_tools(
-        &mut registry,
-        runtime_socket,
-        attached_root,
-    );
+    let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
+    crate::tui::subagents::register_attached_root_tools(&mut registry, binding);
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
         catalog: setup.catalog,
@@ -718,11 +715,8 @@ fn build_tui_root_tools(
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
-    crate::tui::subagents::register_attached_root_tools(
-        &mut registry,
-        runtime_socket,
-        attached_root,
-    );
+    let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
+    crate::tui::subagents::register_attached_root_tools(&mut registry, binding);
     registry
 }
 
@@ -806,31 +800,9 @@ fn runtime_attached_root_rejection(response: &yi_agent_store::ipc::IpcResponse) 
 /// including a `Stop` that could not be delivered, because that daemon is not
 /// ours to replace.
 fn replace_wedged_daemon(socket_path: &std::path::Path) -> bool {
-    let wedged = matches!(
-        yi_agent_store::ipc::send_request(socket_path, yi_agent_store::ipc::IpcRequest::Status),
-        Ok(yi_agent_store::ipc::IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::Internal,
-            ..
-        })
-    );
-    if !wedged {
-        return false;
-    }
-    tracing::warn!(
-        socket = %socket_path.display(),
-        "local runtime answered `internal`; retiring it so this session can start a working one"
-    );
-    match yi_agent_store::ipc::send_request(socket_path, yi_agent_store::ipc::IpcRequest::Stop) {
-        Ok(yi_agent_store::ipc::IpcResponse::Stopping) => true,
-        other => {
-            tracing::warn!(
-                socket = %socket_path.display(),
-                response = ?other,
-                "could not retire the wedged runtime; leaving it in place"
-            );
-            false
-        }
-    }
+    // One rule, shared with the desktop's self-heal: retire only a daemon that
+    // answers `internal`, and only when it accepts the `Stop`.
+    yi_agent_subagent::attach::retire_if_wedged(socket_path)
 }
 
 /// Builds the notice emitted when subagent-runtime bring-up fails after the
