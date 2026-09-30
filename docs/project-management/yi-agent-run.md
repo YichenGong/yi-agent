@@ -17,6 +17,7 @@
 
 **不做什么：**
 - 不做交互式 TUI（默认无子命令时进入 TUI，由 yi-agent-tui 负责）
+- 不做跳平台信号语义统一（非 unix 只处理 Ctrl+C；`SIGTERM` 的整组回收是 unix 专属）
 - 不做流式 SSE 对接（由 provider 层负责）
 - 不做会话持久化（YAGNI）
 
@@ -31,3 +32,4 @@
 - [x] headless 工具集与 TUI 对齐 — `yi-agent-runtime/src/bootstrap.rs::build_tool_setup_in` 注册内置工具 + 进程工具 + `SkillTool`（`--naked` 除外，`--subagents` 时改用 `build_headless_root_tools`）；验证：`cargo test -p yi-agent --bin yi-agent build_headless_setup_`
 - [x] 真实 LLM 端到端测试 — `crates/yi-agent/tests/e2e_real.rs` 用 `#[ignore]` gate — [设计](../plans/2026-07-26-real-llm-testing-design.md)
 - [x] 复杂 one-shot 任务测试(Tier 3)— `crates/yi-agent/tests/e2e_complex.rs` 4 个场景 — [设计](../plans/2026-07-26-graded-test-system-design.md)
+- [x] 信号中断会回收 bash 进程组 — `SIGINT` / `SIGTERM` 不再走默认处置（那会让 CLI 在工具 future 被丢弃前就退出，`bash` 的 `ProcessGroupGuard::drop` / `kill_on_drop` 都不执行，整组被 init 收养成孤儿且永不回收）。改为经 `shutdown_signal` 转入与 TUI / app-server 同一条取消路径：`agent.cancel()` → 继续 drain 到 `Cancelled` → 工具 future 被丢弃 → 整组被 SIGKILL，退出码 130（`--json` 与人读格式一致）。`main.rs::drain_with_signals` / `shutdown_signal` / `event_exit_code`；第二次信号仍走默认处置，用于「连按两次 Ctrl+C 立即终止」。验证：`cargo test -p yi-agent --test headless_signal_reap`（`SIGINT` / `SIGTERM` 各一，移除修复即两者同时失败）、`cargo test -p yi-agent --bin yi-agent drain_stream`
