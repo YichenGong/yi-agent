@@ -10,6 +10,9 @@
 
 ## Global Constraints
 
+- **Toolchain PATH (every shell):** this environment does not put cargo or node on PATH. Prefix every command:
+  `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH"`.
+- **Cargo runs from `yi-agent-rs/`** (the worktree root has no `Cargo.toml`).
 - Spec: `docs/superpowers/specs/2026-09-30-tool-call-narration-and-card-summary-design.md`.
 - Work in the worktree `.worktrees/feat/tool-card-summary-and-narration` (branch `feat/tool-card-summary-and-narration`). Never commit to `main` directly.
 - No protocol change: do NOT add fields to `Item::ToolCall` (`yi-agent-rs/crates/yi-agent-app-server/src/protocol.rs`), and do NOT touch `translate.rs`.
@@ -66,7 +69,7 @@ Add next to the existing `default_system_prompt_contains_identity_and_strategy` 
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p yi-agent-core --lib agent::tests::default_system_prompt_requires_progress_narration -- --exact`
+Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::default_system_prompt_requires_progress_narration -- --exact`
 Expected: FAIL — `prompt must name the narration section so a reviewer can find it`.
 
 - [ ] **Step 3: Add the prompt section**
@@ -89,15 +92,15 @@ The result must read, in order: identity paragraph, tool-use strategy paragraph,
 
 - [ ] **Step 4: Run the prompt tests**
 
-Run: `cargo test -p yi-agent-core --lib agent::tests::default_system_prompt`
+Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::default_system_prompt`
 Expected: PASS — `default_system_prompt_requires_progress_narration`, `default_system_prompt_contains_identity_and_strategy` (still contains `minimizing round-trips` and `MULTIPLE tool calls`), `default_system_prompt_discourages_unbounded_glob`.
 
 - [ ] **Step 5: Run the crate and the two prompt-asserting call sites**
 
-Run: `cargo test -p yi-agent-core --lib`
+Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib`
 Expected: all pass.
 
-Run: `cargo test -p yi-agent --bin yi-agent`
+Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent`
 Expected: all pass (`yi-agent/src/main.rs` asserts on this same prompt: `default_system_prompt_requires_a_workdir_for_isolation`).
 
 - [ ] **Step 6: Sync project docs**
@@ -105,13 +108,13 @@ Expected: all pass (`yi-agent/src/main.rs` asserts on this same prompt: `default
 In `docs/project-management/yi-agent-core.md`, add a Features bullet after the batch-tool-call one:
 
 ```markdown
-- [x] 工具调用进度叙述提示词 — `crates/yi-agent-core/src/agent.rs::default_system_prompt()` 的 `Progress narration:` 段：每条带工具调用的响应先说 1-2 句在做什么，至少每约 10 次工具调用汇报一次，明确叙述不意味着拆分调用；验证：`cargo test -p yi-agent-core --lib agent::tests::default_system_prompt_requires_progress_narration -- --exact`
+- [x] 工具调用进度叙述提示词 — `crates/yi-agent-core/src/agent.rs::default_system_prompt()` 的 `Progress narration:` 段：每条带工具调用的响应先说 1-2 句在做什么，至少每约 10 次工具调用汇报一次，明确叙述不意味着拆分调用；验证：`cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::default_system_prompt_requires_progress_narration -- --exact`
 ```
 
 In `docs/bug-list.md`, append a done entry:
 
 ```markdown
-- [x] 桌面端大量 bash 块之间没有文字讲解（根因：`default_system_prompt()` 只约束"最小化往返 / 合并 bash"，没有任何叙述要求，模型于是长期静默；实测 55.3% 的 tool 往返无文本块，app-server 会话第 1 步达 69%）。修复：新增 `Progress narration:` 段（四要点：默认 1-2 句导语 / 至少每约 10 次工具调用汇报 / 叙述不增加往返 / 跟随用户语言）。见 [设计](../superpowers/specs/2026-09-30-tool-call-narration-and-card-summary-design.md)。验证：`cargo test -p yi-agent-core --lib agent::tests::default_system_prompt_requires_progress_narration`。注：纯提示词方案，属软约束
+- [x] 桌面端大量 bash 块之间没有文字讲解（根因：`default_system_prompt()` 只约束"最小化往返 / 合并 bash"，没有任何叙述要求，模型于是长期静默；实测 55.3% 的 tool 往返无文本块，app-server 会话第 1 步达 69%）。修复：新增 `Progress narration:` 段（四要点：默认 1-2 句导语 / 至少每约 10 次工具调用汇报 / 叙述不增加往返 / 跟随用户语言）。见 [设计](../superpowers/specs/2026-09-30-tool-call-narration-and-card-summary-design.md)。验证：`cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::default_system_prompt_requires_progress_narration`。注：纯提示词方案，属软约束
 ```
 
 - [ ] **Step 7: Format and commit**
@@ -390,7 +393,7 @@ Expected: PASS (5 tests).
 - [ ] **Step 5: Run the whole frontend suite**
 
 Run: `cd desktop && npx vitest run && npx tsc --noEmit`
-Expected: all pass (142 existing + 9 from Task 2 + 5 from this task = 156).
+Expected: all pass (baseline is 144 existing; + 9 from Task 2 + 5 from this task = 158).
 
 - [ ] **Step 6: Sync project docs**
 
@@ -400,7 +403,7 @@ In `docs/project-management/desktop.md`, add a Features bullet after the tool-ca
 - [x] 工具卡片折叠态显示"在做什么"摘要（bash/process_start 取 `command`，read/write/edit/view_image/Skill 取 `path`，grep/glob 取 `pattern`，web_search 取 `query`，web_fetch 取 `url`；取不到只显示工具名，绝不把任意 payload 塞进标题）— `desktop/src/lib/toolSummary.ts:43`（`toolCallSummary`）/ `desktop/src/components/ToolCallCard.tsx:27`（头部摘要 + `title` 悬停）；验证 `cd desktop && npx vitest run src/lib/toolSummary.test.ts src/components/ToolCallCard.test.tsx`
 ```
 
-Update the `**验证命令：**` line's counts: `142 个前端单测` → `156 个前端单测`, append ` + desktop/src/lib/toolSummary.test.ts 9` before ` + desktop/src/components/MarkdownText.test.tsx 5`, and append ` + desktop/src/components/ToolCallCard.test.tsx 5` after the `MarkdownText` entry.
+Update the `**验证命令：**` line's counts: `142 个前端单测` → `158 个前端单测`（实际基线为 144：`App.test.tsx` 已增至 15）, append ` + desktop/src/lib/toolSummary.test.ts 9` before ` + desktop/src/components/MarkdownText.test.tsx 5`, and append ` + desktop/src/components/ToolCallCard.test.tsx 5` after the `MarkdownText` entry.
 
 In `docs/bug-list.md`, append a done entry:
 
@@ -433,10 +436,10 @@ Expected: `clean` (or only this agent's own processes). Kill any leftovers befor
 
 - [ ] **Step 2: Full Rust gate**
 
-Run: `cargo test -p yi-agent-core --lib`
+Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib`
 Expected: all pass.
 
-Run: `cargo test -p yi-agent --bin yi-agent`
+Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent`
 Expected: all pass.
 
 Run: `cargo test -p yi-agent-app-server`
@@ -448,7 +451,7 @@ Expected: no diff.
 - [ ] **Step 3: Full frontend gate**
 
 Run: `cd desktop && npx vitest run`
-Expected: 156 passed.
+Expected: 158 passed.
 
 Run: `cd desktop && npx tsc --noEmit`
 Expected: no errors.

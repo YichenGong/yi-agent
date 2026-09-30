@@ -149,6 +149,16 @@ Example: instead of 3 turns (mkdir, write, test), use one bash call:
 
 Style: Never use emoji in any response. All communication must be plain text only.
 
+Progress narration:
+- Say what you are doing while you do it: a response that issues tool calls
+  opens with 1-2 sentences of prose saying what you are about to do and why.
+- Never let a long run of tool calls go silent. At least every ~10 tool calls,
+  stop and narrate where you are, what you found so far, and what is next;
+  narrating more often is fine.
+- Narration rides along with the tool call in the same response. It never means
+  splitting one tool call into several.
+- Narrate in the language the user writes in.
+
 Task execution:
 - Keep working until the user's request is fully resolved. Only end your
   turn when you are confident the task is complete.
@@ -3543,6 +3553,31 @@ mod tests {
         assert!(prompt.contains("rg --files"));
         assert!(prompt.contains("target/"));
         assert!(prompt.contains(".worktrees/"));
+    }
+
+    #[test]
+    fn default_system_prompt_requires_progress_narration() {
+        let prompt = AgentConfig::default_system_prompt();
+        assert!(
+            prompt.contains("Progress narration:"),
+            "prompt must name the narration section so a reviewer can find it"
+        );
+        assert!(
+            prompt.contains("1-2 sentences"),
+            "prompt must ask for a short prose lead-in on tool-calling responses"
+        );
+        assert!(
+            prompt.contains("At least every ~10 tool calls"),
+            "prompt must bound how long the agent may stay silent"
+        );
+        assert!(
+            prompt.contains("Narration rides along with the tool call in the same response"),
+            "narration must not be readable as a reason to split tool calls"
+        );
+        assert!(
+            prompt.contains("in the language the user writes in"),
+            "narration must follow the user's language"
+        );
     }
 
     #[test]
