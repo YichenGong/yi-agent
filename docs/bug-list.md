@@ -1,6 +1,8 @@
 # Bug 列表
 
-- [ ] bash 执行过程中，如何停止当前的 bash 进程方式不明确
+- [ ] bash 执行过程中，如何停止当前的 bash 进程方式不明确（现状核实：机制已可用，缺的是「可发现性」——TUI 按 Esc、桌面端点 Stop 都会把整组真正杀掉，但界面无任何提示告诉用户这一点。另有两处**真的停不掉**，见紧邻的两条）（现状核实：机制已可用，缺的是「可发现性」——TUI 按 Esc、桌面端点 Stop 都会把整组真正杀掉，但界面无任何提示告诉用户这一点；另有两处真的停不掉，见紧邻两条）
+- [x] headless `yi-agent run` 被 Ctrl+C / `kill` 打断时不回收 bash 进程组（修复：`SIGINT`/`SIGTERM` 原先走默认处置，进程在工具 future 被丢弃之前就退出，`bash` 的 `ProcessGroupGuard::drop` / `kill_on_drop` 均未执行，命令整组（含 `while :; do :; done` 之类死循环）被 init 收养并**无限期存活**；`SIGINT` 实测退出码 -2、stderr 无任何输出。改为 `main.rs::drain_with_signals` 把信号转入与 TUI / app-server 同一取消路径：`agent.cancel()` → drain 到 `Cancelled` → 工具 future 被丢弃 → 整组 SIGKILL，退出码 130，stderr 打印 `[interrupted:received SIGINT, stopping the current run]`。`--json` 取消同样返回 130（此前恒为 0，自动化会把取消读成成功）。第二次信号仍走默认处置以支持连按两次 Ctrl+C。验证：`cargo test -p yi-agent --test headless_signal_reap`（未修复时 `SIGINT` 与 `SIGTERM` 两个用例都失败，报 `left the bash tool's process group (pgid …) alive`）、`cargo test -p yi-agent --bin yi-agent drain_stream`（含新增 `--json` 用例）、实机：`sleep 300` 整组由「按 Ctrl+C 后仍在跑」变为 `reaped`、退出码 130）
+- [ ] TUI 的 Bash 任务面板按 `k` 杀不掉正在跑的 bash（`tui/app.rs` `BashPopup::ConfirmKill` 的 `y` 分支仍是 `// TODO: wire a kill channel` 占位：只把注册表里的任务标记为失败并关闭面板，进程组毫发无损），缺少 `TUI → driver → agent → call_stream` 的 kill 通道
 - [ ] 当前一些测试需要手工测试验证，无法自动化验证
 - [ ] 显示内容太密集，user 和 system 的内容之间加空行
 - [ ] bash 目前没有后台模式

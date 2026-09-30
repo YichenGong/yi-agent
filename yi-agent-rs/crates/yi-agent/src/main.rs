@@ -1057,121 +1057,182 @@ fn run_agent(cli: Cli) -> Result<()> {
 /// line.
 ///
 /// ToolCall / ToolResult / Done / Cancelled / Error are routed to `err`.
-async fn drain_stream_human<W: std::io::Write, E: std::io::Write>(
+/// Drain the stream while staying interruptible from the terminal.
+///
+/// Without this, a `SIGINT` (Ctrl+C) during `yi-agent run` hit the default
+/// disposition: the process died on the spot, before the in-flight bash tool's
+/// future was dropped. The bash tool reaps its process group only from
+/// `ProcessGroupGuard::drop` / tokio's `kill_on_drop`, so nothing ran and the
+/// command's whole group was **reparented to init and kept running forever** —
+/// invisible to the user who had just pressed Ctrl+C. `SIGTERM` (`kill`, a
+/// supervisor, a CI timeout) behaved the same way.
+///
+/// Here a signal takes the same path the TUI and the app-server already use:
+/// cancel the agent, keep draining until the run loop emits `Cancelled` (which
+/// drops the tool future and so reaps the group), then exit 130 like a shell
+/// job killed by Ctrl+C. A second signal means the user is insisting, so it
+/// falls through to the default disposition.
+async fn drain_with_signals<W: std::io::Write, E: std::io::Write>(
     stream: futures::stream::BoxStream<'static, yi_agent_core::AgentEvent>,
     out: &mut W,
     err: &mut E,
+    json: bool,
+    agent: &yi_agent_core::Agent,
 ) -> i32 {
     use futures::StreamExt;
 
-    let mut stream = Box::pin(stream);
+    let mut stream = std::pin::pin!(stream);
+    let mut signal = std::pin::pin!(shutdown_signal());
+    let mut interrupted = false;
     let mut exit_code = 0;
-    // True when the last bytes written to `out` did NOT end with '\n'.
-    // Used to ensure we terminate assistant text before returning so the
-    // shell prompt starts on a fresh line.
+    // Mirrors `drain_stream_human`: text deltas are written inline, and a single
+    // trailing newline is emitted at the end only when the last one lacked it.
     let mut mid_line = false;
 
-    while let Some(event) = stream.next().await {
-        match &event {
-            yi_agent_core::AgentEvent::AssistantText(t) => {
-                let _ = out.write_all(t.as_bytes());
-                mid_line = !t.ends_with('\n');
-            }
-            yi_agent_core::AgentEvent::ToolCall { name, input, .. } => {
-                let _ = writeln!(err, "[tool:{name}] {input}");
-            }
-            yi_agent_core::AgentEvent::ToolResult { id, result } => {
-                let _ = writeln!(
-                    err,
-                    "[result:{id}] error={} content={:?}",
-                    result.is_error, result.content
-                );
-            }
-            yi_agent_core::AgentEvent::ToolRetry { id } => {
-                let _ = writeln!(err, "[tool-retry:{id}]");
-            }
-            yi_agent_core::AgentEvent::ProviderRetry {
-                attempt,
-                max,
-                cause,
-                ..
-            } => {
-                // The stall line keeps its historical shape (no suffix) so
-                // existing log scrapers stay valid; a timeout adds one.
-                match cause {
-                    yi_agent_core::RetryCause::IdleStall => {
-                        let _ = writeln!(err, "[provider-retry:{attempt}/{max}]");
-                    }
-                    yi_agent_core::RetryCause::RequestTimeout => {
-                        let _ = writeln!(err, "[provider-retry:{attempt}/{max} timeout]");
-                    }
+    loop {
+        tokio::select! {
+            biased;
+            name = &mut signal, if !interrupted => {
+                if let Some(name) = name {
+                    eprintln!("[interrupted:received {name}, stopping the current run]");
+                    interrupted = true;
+                    agent.cancel();
                 }
             }
-            yi_agent_core::AgentEvent::Done { reason } => match reason {
-                // Normal completion is already signaled by exit code 0; the
-                // [done:EndTurn] line is noise on stderr and is suppressed
-                // to match the TUI, which renders EndTurn as a silent
-                // separator. Only abnormal non-error terminations emit a
-                // diagnostic line.
-                yi_agent_core::DoneReason::EndTurn => {}
-                yi_agent_core::DoneReason::MaxTurns => {
-                    let _ = writeln!(err, "[done:{reason:?}]");
+            event = stream.next() => {
+                let Some(event) = event else { break };
+                if json {
+                    let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+                    let _ = writeln!(out, "{line}");
+                } else {
+                    record_human(&event, out, err, &mut mid_line);
                 }
-                yi_agent_core::DoneReason::Interrupted { reason } => {
-                    let _ = writeln!(err, "[interrupted:{reason}]");
-                    exit_code = 1;
+                // Both output modes report the same outcome: a cancelled run is
+                // 130 and a failed one is 1, in `--json` as much as in the human
+                // rendering. A silent 0 would make automation read a cancelled
+                // run as a success.
+                exit_code = exit_code.max(event_exit_code(&event));
+                if is_terminal(&event) {
+                    break;
                 }
-            },
-            yi_agent_core::AgentEvent::Cancelled => {
-                let _ = writeln!(err, "[cancelled]");
-                exit_code = 130;
             }
-            yi_agent_core::AgentEvent::Error(e) => {
-                let _ = writeln!(err, "[error:{e}]");
-                exit_code = 1;
-            }
-            _ => {}
-        }
-        if matches!(
-            event,
-            yi_agent_core::AgentEvent::Done { .. }
-                | yi_agent_core::AgentEvent::Cancelled
-                | yi_agent_core::AgentEvent::Error(_)
-        ) {
-            break;
         }
     }
 
-    if mid_line {
+    if !json && mid_line {
         let _ = out.write_all(b"\n");
     }
-
     exit_code
 }
 
-/// Drain an `AgentEvent` stream to the provided writer as JSONL (one JSON
-/// object per line). Returns the process exit code.
-async fn drain_stream_json<W: std::io::Write>(
-    stream: futures::stream::BoxStream<'static, yi_agent_core::AgentEvent>,
-    out: &mut W,
-) -> i32 {
-    use futures::StreamExt;
+/// The exit code an event implies once the stream reaches it.
+fn event_exit_code(event: &yi_agent_core::AgentEvent) -> i32 {
+    match event {
+        yi_agent_core::AgentEvent::Cancelled => 130,
+        yi_agent_core::AgentEvent::Error(_) => 1,
+        yi_agent_core::AgentEvent::Done {
+            reason: yi_agent_core::DoneReason::Interrupted { .. },
+        } => 1,
+        _ => 0,
+    }
+}
 
-    let mut stream = Box::pin(stream);
-    let exit_code = 0;
-    while let Some(event) = stream.next().await {
-        let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
-        let _ = writeln!(out, "{line}");
-        if matches!(
-            event,
-            yi_agent_core::AgentEvent::Done { .. }
-                | yi_agent_core::AgentEvent::Cancelled
-                | yi_agent_core::AgentEvent::Error(_)
-        ) {
-            break;
+/// Render one event in the human format. Returns the exit code it implies and
+/// leaves the trailing-newline bookkeeping to the caller.
+fn record_human<W: std::io::Write, E: std::io::Write>(
+    event: &yi_agent_core::AgentEvent,
+    out: &mut W,
+    err: &mut E,
+    mid_line: &mut bool,
+) {
+    match event {
+        yi_agent_core::AgentEvent::AssistantText(t) => {
+            let _ = out.write_all(t.as_bytes());
+            *mid_line = !t.ends_with('\n');
+        }
+        yi_agent_core::AgentEvent::ToolCall { name, input, .. } => {
+            let _ = writeln!(err, "[tool:{name}] {input}");
+        }
+        yi_agent_core::AgentEvent::ToolResult { id, result } => {
+            let _ = writeln!(
+                err,
+                "[result:{id}] error={} content={:?}",
+                result.is_error, result.content
+            );
+        }
+        yi_agent_core::AgentEvent::ToolRetry { id } => {
+            let _ = writeln!(err, "[tool-retry:{id}]");
+        }
+        yi_agent_core::AgentEvent::ProviderRetry {
+            attempt,
+            max,
+            cause,
+            ..
+        } => match cause {
+            // The stall line keeps its historical shape (no suffix) so existing
+            // log scrapers stay valid; a timeout adds one.
+            yi_agent_core::RetryCause::IdleStall => {
+                let _ = writeln!(err, "[provider-retry:{attempt}/{max}]");
+            }
+            yi_agent_core::RetryCause::RequestTimeout => {
+                let _ = writeln!(err, "[provider-retry:{attempt}/{max} timeout]");
+            }
+        },
+        yi_agent_core::AgentEvent::Done { reason } => match reason {
+            // Normal completion is already signaled by exit code 0; the
+            // [done:EndTurn] line is noise on stderr and is suppressed to match
+            // the TUI, which renders EndTurn as a silent separator.
+            yi_agent_core::DoneReason::EndTurn => {}
+            yi_agent_core::DoneReason::MaxTurns => {
+                let _ = writeln!(err, "[done:{reason:?}]");
+            }
+            yi_agent_core::DoneReason::Interrupted { reason } => {
+                let _ = writeln!(err, "[interrupted:{reason}]");
+            }
+        },
+        yi_agent_core::AgentEvent::Cancelled => {
+            let _ = writeln!(err, "[cancelled]");
+        }
+        yi_agent_core::AgentEvent::Error(e) => {
+            let _ = writeln!(err, "[error:{e}]");
+        }
+        _ => {}
+    }
+}
+
+fn is_terminal(event: &yi_agent_core::AgentEvent) -> bool {
+    matches!(
+        event,
+        yi_agent_core::AgentEvent::Done { .. }
+            | yi_agent_core::AgentEvent::Cancelled
+            | yi_agent_core::AgentEvent::Error(_)
+    )
+}
+
+/// Watcher for the signals that mean "stop this run": `SIGINT` (Ctrl+C) and
+/// `SIGTERM` (`kill`, supervisor shutdown, CI timeout). Yields the signal name
+/// once; the caller stops listening afterwards, leaving a second signal to the
+/// default disposition so `Ctrl+C Ctrl+C` still terminates immediately.
+async fn shutdown_signal() -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut int), Ok(mut term)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = int.recv() => Some("SIGINT"),
+            _ = term.recv() => Some("SIGTERM"),
         }
     }
-    exit_code
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok()?;
+        Some("Ctrl+C")
+    }
 }
 
 /// 根据 `naked` flag 构建 headless 模式用的工具集和 system prompt。
@@ -1271,11 +1332,7 @@ fn run_headless(
         let stderr = std::io::stderr();
         let mut out = stdout.lock();
         let mut err = stderr.lock();
-        if json {
-            drain_stream_json(stream, &mut out).await
-        } else {
-            drain_stream_human(stream, &mut out, &mut err).await
-        }
+        drain_with_signals(stream, &mut out, &mut err, json, &agent).await
     });
 
     // Close MCP server connections on a running reactor so the child processes
@@ -1997,6 +2054,23 @@ mod tests {
 
     // Sync wrapper around `drain_stream_human` so tests can drive the async
     // stream without spinning up a multi-thread runtime.
+    /// Drive the production drain path with no agent attached: the signal
+    /// branch is inert (no real signal is delivered in a unit test), so these
+    /// assertions pin the event rendering that the human/JSON formats guarantee.
+    #[test]
+    fn drain_stream_json_emits_one_line_per_event_and_reports_cancelled() {
+        let stream = scripted_stream(vec![
+            AgentEvent::AssistantText("hi".into()),
+            AgentEvent::Cancelled,
+        ]);
+        let mut out = Vec::new();
+        let code = drain_stream_json_sync(stream, &mut out);
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        assert_eq!(lines.len(), 2, "one JSONL line per event, got {lines:?}");
+        assert!(lines[0].contains("hi"), "first line: {}", lines[0]);
+        assert_eq!(code, 130, "a cancelled --json run still reports 130");
+    }
+
     fn drain_stream_human_sync<W: std::io::Write, E: std::io::Write>(
         stream: BoxStream<'static, AgentEvent>,
         out: &mut W,
@@ -2006,7 +2080,44 @@ mod tests {
             .enable_all()
             .build()
             .expect("build runtime");
-        rt.block_on(drain_stream_human(stream, out, err))
+        let agent = test_agent();
+        rt.block_on(drain_with_signals(stream, out, err, false, &agent))
+    }
+
+    fn drain_stream_json_sync<W: std::io::Write>(
+        stream: BoxStream<'static, AgentEvent>,
+        out: &mut W,
+    ) -> i32 {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let agent = test_agent();
+        let mut err = Vec::new();
+        rt.block_on(drain_with_signals(stream, out, &mut err, true, &agent))
+    }
+
+    /// A real `Agent` over a provider that is never called. `drain_with_signals`
+    /// only ever uses it to cancel, and no prompt is run.
+    fn test_agent() -> yi_agent_core::Agent {
+        struct NeverCalled;
+        #[async_trait::async_trait]
+        impl yi_agent_core::Provider for NeverCalled {
+            async fn call_stream(
+                &self,
+                _req: yi_agent_core::ProviderRequest,
+            ) -> Result<
+                BoxStream<'static, yi_agent_core::ProviderEvent>,
+                yi_agent_core::ProviderError,
+            > {
+                Ok(futures::stream::iter(Vec::new()).boxed())
+            }
+        }
+        yi_agent_core::Agent::new(
+            Arc::new(NeverCalled),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        )
     }
 
     #[test]
