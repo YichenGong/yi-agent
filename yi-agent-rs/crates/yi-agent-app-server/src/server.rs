@@ -27,6 +27,7 @@ use crate::session::{InterjectionRequest, ThreadSession, TurnPrompt};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
+use yi_agent_subagent::binding::RuntimeBinding;
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -66,16 +67,12 @@ struct RuntimeTooling {
 ///
 /// 失败也缓存(存 `Err(原因)`):否则纯目录下每开一个 thread 都会重跑一遍注定失败的
 /// bring-up(git 检查 + daemon 起停尝试)。
-type ProjectRuntimes = Arc<
-    StdMutex<
-        HashMap<PathBuf, Result<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>, String>>,
-    >,
->;
+type ProjectRuntimes = Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
 
 /// 一次 attach 的结果:可能被换过工具集的 agent,以及该 thread 首个 turn 要激活的 runtime。
 struct Activation {
     built: BuiltAgent,
-    runtime: Option<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>>,
+    runtime: Option<Arc<RuntimeBinding>>,
 }
 
 /// 为该 cwd 的 agent 接上委派能力。失败即降级:保留原 agent,只记 trace。
@@ -132,13 +129,17 @@ fn attach_cwd_runtime(
     runtimes: &ProjectRuntimes,
     runtime_dir: &Path,
     cfg: &RuntimeConfig,
-) -> Result<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>, String> {
+) -> Result<Arc<RuntimeBinding>, String> {
     let key = std::fs::canonicalize(&cfg.workdir).unwrap_or_else(|_| cfg.workdir.clone());
     if let Some(existing) = runtimes.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return existing.clone();
     }
-    let outcome = yi_agent_subagent::attach::attach_project_runtime(cfg, runtime_dir.to_path_buf())
-        .map(Arc::new)
+    // Own a *usable* runtime: adopt a healthy daemon, replace a dead or wedged
+    // one. The binding it returns heals itself on later calls, so a daemon that
+    // dies after this point (e.g. its terminal closes) no longer strands the
+    // thread's delegation tools.
+    let outcome = yi_agent_subagent::attach::ensure_owned_runtime(cfg, runtime_dir.to_path_buf())
+        .map(|attached| RuntimeBinding::managed(cfg, runtime_dir.to_path_buf(), Arc::new(attached)))
         .map_err(|failure| format!("{}: {}", failure.stage, failure.cause));
     runtimes
         .lock()
@@ -154,21 +155,19 @@ fn attach_cwd_runtime(
 /// 项目里的**一个** thread 不会连带废掉同项目其它 thread 的委派(daemon 对重复 detach
 /// 幂等,但被断开后那个 driver 不会再激活第二次,故不能多断)。
 fn detach_unused_runtimes(runtimes: &ProjectRuntimes, live_cwds: &[String]) {
-    for runtime in attached_runtimes(runtimes) {
+    for binding in attached_runtimes(runtimes) {
         if live_cwds
             .iter()
-            .any(|cwd| Path::new(cwd) == runtime.project_root)
+            .any(|cwd| Path::new(cwd) == binding.project_root())
         {
             continue;
         }
-        yi_agent_subagent::attach::detach_root(&runtime.socket_path, &runtime.attached_root);
+        binding.detach();
     }
 }
 
 /// 本进程已 attach 的 runtime(只看成功项)。
-fn attached_runtimes(
-    runtimes: &ProjectRuntimes,
-) -> Vec<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>> {
+fn attached_runtimes(runtimes: &ProjectRuntimes) -> Vec<Arc<RuntimeBinding>> {
     runtimes
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -184,23 +183,19 @@ fn attached_runtimes(
 /// 与权限层会脱钩。
 fn build_runtime_tooling(
     cfg: &RuntimeConfig,
-    attached: &yi_agent_subagent::attach::AttachedProjectRuntime,
+    binding: &Arc<RuntimeBinding>,
     yolo: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<RuntimeTooling, String> {
-    let setup =
-        yi_agent_runtime::bootstrap::build_tool_setup_in(cfg, false, &attached.workspace_root)
-            .map_err(|error| error.to_string())?;
+    // The tools get the binding itself, not its snapshot: they re-resolve the
+    // live socket and root on every call.
+    let workspace_root = binding.current()?.workspace_root;
+    let setup = yi_agent_runtime::bootstrap::build_tool_setup_in(cfg, false, &workspace_root)
+        .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
-    yi_agent_subagent::register_attached_root_tools(
-        &mut registry,
-        attached.socket_path.clone(),
-        &attached.attached_root,
-    );
-    let permission = yi_agent_runtime::bootstrap::load_permission_checker_with_switch(
-        &attached.workspace_root,
-        yolo,
-    )
-    .map_err(|error| error.to_string())?;
+    yi_agent_subagent::register_attached_root_tools(&mut registry, Arc::clone(binding));
+    let permission =
+        yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
+            .map_err(|error| error.to_string())?;
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
         permission,
@@ -345,10 +340,7 @@ where
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
-    let mut pending_activation: HashMap<
-        String,
-        Option<Arc<yi_agent_subagent::attach::AttachedProjectRuntime>>,
-    > = HashMap::new();
+    let mut pending_activation: HashMap<String, Option<Arc<RuntimeBinding>>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1219,8 +1211,8 @@ where
     }
 
     // 进程退出前断开所有项目 root。同步调用:已经不在热路径上,而进程即将结束。
-    for runtime in attached_runtimes(&runtimes) {
-        yi_agent_subagent::attach::detach_root(&runtime.socket_path, &runtime.attached_root);
+    for binding in attached_runtimes(&runtimes) {
+        binding.detach();
     }
 
     Ok(())
@@ -1429,15 +1421,13 @@ async fn run_thread_driver<W>(
     {
         if !activation_attempted {
             activation_attempted = true;
-            if let Some(runtime) = activate {
-                let socket = runtime.socket_path.clone();
-                let root = runtime.attached_root.clone();
+            if let Some(binding) = activate {
                 let objective = prompt.clone();
                 // 同步调用放到阻塞线程池:driver 是 async 任务,直接调用会占住 executor。
-                let outcome = tokio::task::spawn_blocking(move || {
-                    yi_agent_subagent::attach::activate_root(&socket, &root, &objective)
-                })
-                .await;
+                // `activate` 先探活、必要时重建 runtime,所以即便 daemon 在这轮之前
+                // 已经死掉(例如承载它的终端被关掉),这里也能自愈后再激活。
+                let outcome =
+                    tokio::task::spawn_blocking(move || binding.activate(&objective)).await;
                 match outcome {
                     Ok(Ok(())) => {}
                     Ok(Err(cause)) => tracing::warn!(
@@ -1806,13 +1796,16 @@ mod tests {
         let mut cfg = test_config();
         cfg.workdir = repo.path().to_path_buf();
 
-        let attached =
+        let attached = Arc::new(
             yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
-                .expect("a clean git repo must attach");
+                .expect("a clean git repo must attach"),
+        );
+        let binding =
+            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
 
         let tooling = build_runtime_tooling(
             &cfg,
-            &attached,
+            &binding,
             yi_agent_core::autonomy::YoloSwitch::new(false),
         )
         .expect("tooling");
@@ -1867,14 +1860,16 @@ mod tests {
         let outcome =
             yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf());
 
-        let attached = outcome.expect("a plain directory attaches as an in-place root");
+        let attached = Arc::new(outcome.expect("a plain directory attaches as an in-place root"));
         assert_eq!(
             attached.workspace_root, attached.project_root,
             "a non-git project has no checkout to move the root into"
         );
+        let binding =
+            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
         let names = build_runtime_tooling(
             &cfg,
-            &attached,
+            &binding,
             yi_agent_core::autonomy::YoloSwitch::new(false),
         )
         .expect("tooling")
@@ -1946,6 +1941,44 @@ mod tests {
             "a second thread in the same cwd must reuse the attached runtime"
         );
         assert_eq!(runtimes.lock().unwrap().len(), 1);
+    }
+
+    /// A runtime whose daemon died (its owning terminal was closed, say) must
+    /// come back on the next call instead of being cached as a failure forever.
+    ///
+    /// The first half is the exact desktop failure: a daemon started by another
+    /// process exits, and the socket it left behind answers nothing.
+    #[test]
+    fn a_dead_runtime_is_repaired_on_the_next_tool_call() {
+        let repo = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let runtime = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+        let binding =
+            attach_cwd_runtime(&runtimes, runtime.path(), &cfg).expect("a git project must attach");
+        let socket = binding.current().unwrap().socket_path.clone();
+
+        // Simulate the owning process exiting: drop every handle to the runtime
+        // (this binding and the cached one) so its embedded daemon is dropped too.
+        drop(binding);
+        runtimes.lock().unwrap().clear();
+        assert_eq!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Dead,
+            "the daemon must be gone before we test recovery"
+        );
+
+        // Asking again must replace the dead runtime rather than cache the miss.
+        let repaired = attach_cwd_runtime(&runtimes, runtime.path(), &cfg)
+            .expect("a dead runtime must be replaced, not cached as a failure");
+        assert_eq!(
+            yi_agent_subagent::attach::probe_runtime(&repaired.current().unwrap().socket_path),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy,
+            "the repaired runtime must be reachable"
+        );
     }
 
     use async_trait::async_trait;
