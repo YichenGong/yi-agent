@@ -19,7 +19,8 @@
 - 提交信息用 conventional commits，**不写** `Co-Authored-By`。
 - 每个任务结束跑 `cd yi-agent-rs && cargo fmt --all && cargo test -p <crate>`。
 
-> **依赖：** 本计划不依赖 Plan 1。Plan 3 依赖本计划的 `RunBoardCard`。
+> **依赖：** 本计划不依赖 Plan 1。Plan 3a 依赖本计划的 `CreateAutonomousSession`（以及既有
+> 的 `ListTaskSummaries`）来驱动卡片会话；Plan 3a 负责在调用前**预建** worktree 并把路径传进来。
 
 ---
 ## 文件结构

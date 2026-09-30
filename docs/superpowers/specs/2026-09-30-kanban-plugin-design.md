@@ -238,14 +238,34 @@ max_tasks = 10
 
 插件为卡片 root 注入 objective 模板，约束执行者遵循 Superpowers 规范：
 
-1. 用 `superpowers:using-git-worktrees` 自建隔离 worktree（`.worktrees/<branch>`），
-   分支名 `kanban/<卡号>-<slug>`；
+1. 在**插件已预建好**的隔离 worktree（`.worktrees/kanban/<卡号>-<slug>`，
+   分支 `kanban/<卡号>-<slug>`）中工作——见下方「worktree 归属」；
 2. 用 `superpowers:executing-plans` / `superpowers:subagent-driven-development` 执行
    spec + plan；
 3. 结束时用 `superpowers:finishing-a-development-branch` **呈现选项**，**绝不自动合并**；
 4. 遇到无法解决的阻塞 → 报告 BLOCKED（插件将其映射为 `needs_you`）。
 
-**worktree 由执行者自建**（符合 Superpowers 规范与用户要求），插件不代劳。
+**worktree 归属（按「插件预建」落地）：** 插件在启动一张卡片前，用**纯 `git worktree add`**
+（本地操作，**不消耗任何模型调用**）建好 `.worktrees/kanban/<卡号>-<slug>`，把该路径作为
+`workdir` 传给 daemon 的自主会话，并写入 `Card::workdir` 供控制面展示。
+
+为什么不让执行者自建：并发启动多张卡片时，若由模型自己建 worktree，每次都要花一轮模型调用
+去执行 `using-git-worktrees`；在建 worktree 这种纯机械步骤上消耗额度，与「打满机器但限流」
+的目标冲突。插件预建让并发启动只需本地 git 操作，额度全部留给真正的编码工作。
+执行者仍**必须**在该 worktree 内工作，并**仍然遵守** `superpowers:using-git-worktrees` 的
+其余规范（分支命名、隔离要求、结束时呈现选项而非自动合并）。daemon 侧保持「只观察、不创建目录」。
+
+**控制面数据来源：`board.json`（文件即契约）。**
+
+插件每个调度 tick 结束后，把队列状态原子写入插件自己的状态目录
+`<state-dir>/board.json`（临时文件 + rename）。TUI 与 desktop **只读这个文件**渲染看板：
+
+- 卡片行：`id`、`state`、`workdir`（即「跑在哪里」）、队列顺序；
+- 文件缺失/损坏/字段缺失 → 控制面回退为空列表，**绝不 panic**，也**绝不**因此让前端不可用。
+
+这样选择的理由：控制面是**宿主**的一部分（spec §13），而看板数据属于**插件**。用文件做契约，
+两边不需要新增 IPC、不需要互相链接，插件删掉即卸载，控制面只是「读不到文件 → 空看板」。
+daemon 的 runtime 库完全不知情（§13 数据分离）。
 
 **进度可观测（不需要询问模型）：**
 

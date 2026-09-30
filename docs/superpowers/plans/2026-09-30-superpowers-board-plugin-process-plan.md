@@ -4,7 +4,7 @@
 
 **Goal:** 让看板成为一个**独立进程**：它自带队列与推进循环，通过**自实现的极小 IPC 客户端**（不依赖 `yi-agent-store`）驱动 daemon 创建自主会话，并把卡片推进到 `awaiting_merge` / `needs_you`。
 
-**Architecture:** 三个新层，全部在插件自己的独立 workspace（`plugins/superpowers-board/`）内：(1) `board-ipc`——按线格式手写的客户端（新行分隔 JSON over Unix socket，`protocol_version` 校验，1 MiB 帧上限）；(2) `board-daemon-client`——把线格式封装成「创建自主会话 / 读任务摘要」两个语义操作；(3) `board-runner`——推进循环：读日历上限 → `Board::start_due` → 逐卡请求创建会话 → 轮询状态 → 迁移卡片状态。**插件不链接任何 `yi-agent-*` crate**，因此删除目录即等于卸载。
+**Architecture:** 三个新层，全部在插件自己的独立 workspace（`plugins/superpowers-board/`）内：(1) `board-ipc`——按线格式手写的客户端（新行分隔 JSON over Unix socket，`protocol_version` 校验，1 MiB 帧上限）；(2) `board-daemon-client`——把线格式封装成「创建自主会话 / 读任务摘要」两个语义操作；(3) `board-runner`——推进循环：加载队列 → 读日历上限 → 为待启动卡片预建 worktree → 请求创建会话 → 轮询状态 → 迁移卡片状态 → 原子落盘 `board.json`。**插件不链接任何 `yi-agent-*` crate**，因此删除目录即等于卸载。
 
 **Tech Stack:** Rust 2024、`tokio`（UnixStream + 定时器）、`serde`/`serde_json`（线格式）、`chrono`。复用 Plan 1 的 `board-core`。
 
@@ -18,6 +18,14 @@
   - 任何 `protocol_version` 不等于 `1` 或在响应中与请求不匹配 → 报错，不做兼容猜测。
 - socket 路径：`<runtime_dir>/runtime.sock`。
 - 推进循环**只改 `Queued` 卡片的状态**；`NeedsYou` / `AwaitingMerge` / 终态一律不动。
+- **worktree 由插件预建**：启动一张卡片前，插件用纯 `git worktree add`（不消耗任何模型调用）
+  在 `<workdir>/.worktrees/kanban/<卡号>-<slug>` 建好隔离 worktree，再把该路径传给 daemon 的
+  `create_session`。daemon 仍然只观察、绝不创建目录；执行者会话在这个已存在的 worktree 里工作。
+  路径同时写入 `Card::workdir`，让控制面能看到这张卡跑在哪里。
+- **队列落盘是控制面的契约**：每个 tick 结束后把 `Board` 序列化写入
+  `<state-dir>/board.json`（temp 文件 + rename 原子替换）。TUI 与 desktop 读同一个文件渲染看板，
+  因此**不新增任何 IPC 或服务端**。写失败只记 warning，绝不让推进循环停下。
+- 状态文件位于插件自己的 `--state-dir`，**不在** daemon 的 runtime 目录内（解耦边界，spec §13）。
 - 关闭开关时（Plan 1 的 `resolve`）推进循环**立即停止**，且**不取消**已创建的会话。
 - 提交信息用 conventional commits，**不写** `Co-Authored-By`。
 - 每个任务结束跑 `cd plugins/superpowers-board && cargo fmt --all && cargo test`。
@@ -34,6 +42,8 @@
 | `plugins/superpowers-board/crates/board-ipc/src/wire.rs` | 请求/响应信封与变体（手写，镜像协议） |
 | `plugins/superpowers-board/crates/board-ipc/src/client.rs` | UnixStream 连接、帧读写、版本校验 |
 | `plugins/superpowers-board/crates/board-runner/Cargo.toml` | 推进循环 crate |
+| `plugins/superpowers-board/crates/board-runner/src/worktree.rs` | 预建隔离 worktree（纯 `git worktree add`） |
+| `plugins/superpowers-board/crates/board-runner/src/persist.rs` | 队列落盘：原子写/读 `board.json` |
 | `plugins/superpowers-board/crates/board-runner/src/lib.rs` | 导出 |
 | `plugins/superpowers-board/crates/board-runner/src/client.rs` | 语义层：`create_autonomous_session` / `list_task_summaries` |
 | `plugins/superpowers-board/crates/board-runner/src/runner.rs` | 推进循环（纯函数式决策 + I/O 外壳） |
@@ -871,7 +881,10 @@ board-ipc = { path = "../board-ipc" }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 ```
+
+> `toml` 用于读同目录下的 `kanban.toml`（时段并发日历，Plan 1 的 `ConcurrencyCalendar::load_or_default`）。
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -893,7 +906,320 @@ git commit -m "feat(board-runner): map daemon task states to card states and pla
 
 ---
 
-### Task 4: 推进循环与插件入口
+### Task 4: worktree 预建与队列落盘
+
+**Files:**
+- Create: `plugins/superpowers-board/crates/board-runner/src/worktree.rs`
+- Create: `plugins/superpowers-board/crates/board-runner/src/persist.rs`
+- Modify: `plugins/superpowers-board/crates/board-runner/src/lib.rs`
+- Modify: `plugins/superpowers-board/crates/board-runner/Cargo.toml`
+
+**Interfaces:**
+- Consumes: Plan 1 的 `Board`、`CardId`（`Board` 现在实现了 `Serialize`/`Deserialize`）
+- Produces:
+  - `board_runner::worktree::slugify(id: &CardId) -> String`
+  - `board_runner::worktree::worktree_path(project_root: &Path, id: &CardId) -> PathBuf`
+  - `board_runner::worktree::ensure_worktree(project_root: &Path, id: &CardId, branch: &str) -> Result<PathBuf, WorktreeError>`
+  - `board_runner::persist::load_board(path: &Path) -> Board`
+  - `board_runner::persist::save_board(path: &Path, board: &Board) -> Result<(), PersistError>`
+
+> 这两个模块是「控制面契约」的插件侧：`board.json` 是 TUI / desktop 唯一的数据来源，
+> worktree 路径被写进 `Card::workdir` 后也随之出现在看板上。
+> **`ensure_worktree` 是纯本地 `git worktree add`，不消耗任何模型调用**（这正是「插件预建
+> worktree」相对「让模型自己建」的优势：并发启动多张卡时不占额度）。
+
+- [ ] **Step 1: 写失败的测试**
+
+`worktree.rs` 的测试：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_keeps_letters_digits_and_collapses_the_rest() {
+        assert_eq!(slugify(&CardId::new("card-1")), "card-1");
+        assert_eq!(slugify(&CardId::new("Card 2 foo/bar")), "card-2-foo-bar");
+        assert_eq!(slugify(&CardId::new("///")), "card", "never collapses to empty");
+    }
+
+    #[test]
+    fn the_worktree_lives_under_the_project_root() {
+        assert_eq!(
+            worktree_path(Path::new("/proj"), &CardId::new("card-1")),
+            PathBuf::from("/proj/.worktrees/kanban/card-1")
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_creates_a_real_git_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "board@example.test"]);
+        git(&["config", "user.name", "Board Test"]);
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        let id = CardId::new("card-1");
+        let path = ensure_worktree(root, &id, "kanban/card-1-demo").unwrap();
+        assert!(path.join(".git").exists(), "a real worktree was created");
+
+        // 幂等：第二次调用不再建，直接返回同一路径。
+        let again = ensure_worktree(root, &id, "kanban/card-1-demo").unwrap();
+        assert_eq!(again, path);
+    }
+}
+```
+```
+
+`persist.rs` 的测试：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use board_core::card::CardId;
+    use chrono::{Local, TimeZone};
+
+    fn seeded() -> Board {
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("a"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            Local.with_ymd_and_hms(2026, 10, 1, 9, 0, 0).single().unwrap(),
+        );
+        board
+    }
+
+    #[test]
+    fn a_missing_file_yields_an_empty_board_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_board(&dir.path().join("nope.json")).is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_file_yields_an_empty_board_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(load_board(&path).is_empty());
+    }
+
+    #[test]
+    fn a_saved_board_reads_back_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.json");
+        save_board(&path, &seeded()).unwrap();
+        let restored = load_board(&path);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored.get(&CardId::new("a")).unwrap().plan_path,
+            std::path::PathBuf::from("a.plan.md")
+        );
+    }
+
+    #[test]
+    fn saving_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.json");
+        save_board(&path, &seeded()).unwrap();
+        assert!(!path.with_extension("json.tmp").exists(), "temp file was renamed away");
+    }
+}
+```
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd plugins/superpowers-board && cargo test -p board-runner worktree:: persist::`
+Expected: 编译失败，`worktree` / `persist` 模块未定义。
+
+- [ ] **Step 3: 实现最小代码**
+
+`worktree.rs`：
+
+```rust
+```rust
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use board_core::card::CardId;
+
+#[derive(Debug)]
+pub enum WorktreeError {
+    /// `git worktree add` 退出码非零。
+    GitFailed(String),
+    /// 无法启动 git（未安装等）。
+    Spawn(std::io::Error),
+}
+
+impl std::fmt::Display for WorktreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorktreeError::GitFailed(message) => write!(f, "git worktree add failed: {message}"),
+            WorktreeError::Spawn(error) => write!(f, "could not run git: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WorktreeError {}
+
+/// 分支名与目录名都要求是文件系统友好的：只保留 ASCII 字母数字和 `-`，
+/// 其余字符折叠为 `-`。卡号本身通常是 `card-1` 这类，slug 主要防意外字符。
+pub fn slugify(id: &CardId) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in id.0.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "card".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// 插件预建的隔离 worktree 落点：`<project>/.worktrees/kanban/<slug>`。
+pub fn worktree_path(project_root: &Path, id: &CardId) -> PathBuf {
+    project_root
+        .join(".worktrees")
+        .join("kanban")
+        .join(slugify(id))
+}
+
+/// 若该 worktree 已存在则直接返回（幂等：重启后不重复建）；否则
+/// `git worktree add <path> -b <branch>`。**纯本地操作，不消耗模型调用。**
+pub fn ensure_worktree(
+    project_root: &Path,
+    id: &CardId,
+    branch: &str,
+) -> Result<PathBuf, WorktreeError> {
+    let path = worktree_path(project_root, id);
+    if path.join(".git").exists() {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(WorktreeError::Spawn)?;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("add")
+        .arg(&path)
+        .arg("-b")
+        .arg(branch)
+        .output()
+        .map_err(WorktreeError::Spawn)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(WorktreeError::GitFailed(stderr.trim().to_string()));
+    }
+    Ok(path)
+}
+```
+
+`persist.rs`：
+
+```rust
+```rust
+use std::io::Write;
+use std::path::Path;
+
+use board_core::board::Board;
+
+#[derive(Debug)]
+pub enum PersistError {
+    Io(std::io::Error),
+    Encode(serde_json::Error),
+}
+
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PersistError::Io(error) => write!(f, "board state i/o error: {error}"),
+            PersistError::Encode(error) => write!(f, "board state encode error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PersistError {}
+
+/// 读队列状态。文件缺失或损坏一律回退为**空队列**并继续——绝不 panic，
+/// 也绝不因为一次坏读写就停掉推进循环。
+pub fn load_board(path: &Path) -> Board {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// 原子写：先写同目录的临时文件再 rename，读者永远看不到半个文件。
+pub fn save_board(path: &Path, board: &Board) -> Result<(), PersistError> {
+    let json = serde_json::to_vec_pretty(board).map_err(PersistError::Encode)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(PersistError::Io)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::File::create(&temp).map_err(PersistError::Io)?;
+        file.write_all(&json).map_err(PersistError::Io)?;
+        file.sync_all().map_err(PersistError::Io)?;
+    }
+    std::fs::rename(&temp, path).map_err(PersistError::Io)
+}
+```
+
+`crates/board-runner/src/lib.rs` 追加：
+
+```rust
+pub mod persist;
+pub mod worktree;
+```
+
+`crates/board-runner/Cargo.toml` 的 `[dev-dependencies]` 追加：
+
+```toml
+[dev-dependencies]
+tempfile.workspace = true
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd plugins/superpowers-board && cargo test -p board-runner worktree:: persist::`
+Expected: PASS（7 个测试：3 worktree + 4 persist）。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd plugins/superpowers-board && cargo fmt --all
+git add plugins/superpowers-board
+git commit -m "feat(board-runner): pre-create card worktrees and persist the queue atomically"
+```
+
+---
+
+### Task 5: 推进循环与插件入口
 
 **Files:**
 - Create: `plugins/superpowers-board/crates/board-runner/src/tick.rs`
@@ -907,6 +1233,9 @@ git commit -m "feat(board-runner): map daemon task states to card states and pla
   - `board_runner::tick::run_once(board: &mut Board, daemon: &BoardDaemon, limit: u16, launch: &mut dyn FnMut(&CardId) -> Option<PathBuf>) -> Vec<TickOutcome>`
   - `board_runner::tick::TickOutcome { card_id: CardId, action: TickAction }`
   - `board_runner::tick::TickAction { Launched { session_id: String, root_task_id: String }, Transitioned(CardState), Failed(String) }`
+  - 可执行入口 `board-runner`：`--runtime-dir`（含 `runtime.sock` 的目录）、`--state-dir`
+    （插件自己的状态目录：`board.json` / `kanban.toml` / `preferences.json`）、
+    `--project-root`（预建 worktree 的落点，缺省为当前目录）、`--interval-secs`（默认 60）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -956,9 +1285,6 @@ mod tests {
         assert_eq!(board.running_count(), 1);
         assert_eq!(board.get(&CardId::new("b")).unwrap().state, CardState::Queued);
     }
-
-    fn the_objective_carries_the_plan_spec_and_constraints() {
-        let board = board_with(&["a"]);
 
     #[test]
     fn the_objective_carries_the_plan_spec_and_constraints() {
@@ -1022,9 +1348,11 @@ pub struct TickOutcome {
 
 /// Runs one scheduling pass.
 ///
-/// `launch` supplies the workdir for a card (the caller owns where worktrees
-/// live, because that is environment policy, not board policy). Returning
-/// `None` means "skip this card this tick" and leaves it queued.
+/// `launch` supplies the workdir for a card by pre-creating its worktree. It
+/// owns where worktrees live because that is environment policy, not board
+/// policy. Returning `None` means "could not prepare a workdir": the card stays
+/// queued and is reported as `TickAction::Failed` so the board surfaces the
+/// problem instead of silently spinning on the same card forever.
 pub fn run_once(
     board: &mut Board,
     daemon: &BoardDaemon,
@@ -1034,6 +1362,10 @@ pub fn run_once(
     let mut outcomes = Vec::new();
     for card_id in crate::runner::plan_launches(board, limit) {
         let Some(workdir) = launch(&card_id) else {
+            outcomes.push(TickOutcome {
+                card_id,
+                action: TickAction::Failed("could not prepare a worktree".to_string()),
+            });
             continue;
         };
         let objective = board
@@ -1092,7 +1424,7 @@ pub mod tick;
 ```rust
 //! Superpowers 看板插件进程入口。
 //!
-//! 用法：`board-runner --runtime-dir <dir> --state-dir <dir> [--interval-secs 60]`
+//! 用法：`board-runner --runtime-dir <dir> --state-dir <dir> [--project-root <dir>] [--interval-secs 60]`
 //! 它只做一件事：周期性推进队列。安装 = 放这个二进制；卸载 = 删掉它。
 
 use std::path::PathBuf;
@@ -1106,18 +1438,22 @@ use board_runner::client::BoardDaemon;
 struct Args {
     runtime_dir: PathBuf,
     state_dir: PathBuf,
+    /// 预建 worktree 的落点。缺省为进程当前目录。
+    project_root: PathBuf,
     interval: Duration,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut runtime_dir = None;
     let mut state_dir = None;
+    let mut project_root = None;
     let mut interval_secs = 60_u64;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--runtime-dir" => runtime_dir = args.next().map(PathBuf::from),
             "--state-dir" => state_dir = args.next().map(PathBuf::from),
+            "--project-root" => project_root = args.next().map(PathBuf::from),
             "--interval-secs" => {
                 let value = args
                     .next()
@@ -1132,6 +1468,11 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         runtime_dir: runtime_dir.ok_or_else(|| "--runtime-dir is required".to_string())?,
         state_dir: state_dir.ok_or_else(|| "--state-dir is required".to_string())?,
+        project_root: match project_root {
+            Some(root) => root,
+            None => std::env::current_dir()
+                .map_err(|error| format!("could not read the current directory: {error}"))?,
+        },
         interval: Duration::from_secs(interval_secs),
     })
 }
@@ -1164,15 +1505,50 @@ fn main() {
     let calendar = ConcurrencyCalendar::load_or_default(&args.state_dir.join("kanban.toml"));
     let socket = board_ipc::client::socket_path(&args.runtime_dir);
     let daemon = BoardDaemon::new(socket);
+    let board_path = args.state_dir.join("board.json");
+
     loop {
         if !board_switch(&args).is_enabled() {
+            // 关掉开关只停止推进，绝不取消已在 daemon 中运行的会话。
             std::thread::sleep(args.interval);
             continue;
         }
-        let now = chrono::Local::now();
-        let limit = calendar.limit_at(now);
-        // 队列与卡片状态的持久化由 Plan 3b 落地；本次循环只做决策与推进。
-        let _ = (limit, &daemon, now);
+
+        let mut board = board_runner::persist::load_board(&board_path);
+        let limit = calendar.limit_at(chrono::Local::now());
+
+        // 启动前为每张待启动卡片预建 worktree（纯本地 git，不消耗模型调用）。
+        let project_root = args.project_root.clone();
+        let mut launch = |card_id: &board_core::card::CardId| {
+            let branch = format!("kanban/{}", board_runner::worktree::slugify(card_id));
+            match board_runner::worktree::ensure_worktree(&project_root, card_id, &branch) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    eprintln!("board-runner: worktree for {} failed: {error}", card_id.0);
+                    None
+                }
+            }
+        };
+
+        let outcomes = board_runner::tick::run_once(&mut board, &daemon, limit, &mut launch);
+        for outcome in &outcomes {
+            // 把预建好的 worktree 记进卡片，控制面据此显示「跑在哪里」。
+            if let board_runner::tick::TickAction::Launched { .. } = &outcome.action {
+                let branch = format!("kanban/{}", board_runner::worktree::slugify(&outcome.card_id));
+                if let Ok(path) =
+                    board_runner::worktree::ensure_worktree(&project_root, &outcome.card_id, &branch)
+                {
+                    let _ = board.set_workdir(&outcome.card_id, path);
+                }
+            }
+            eprintln!("board-runner: {} -> {:?}", outcome.card_id.0, outcome.action);
+        }
+
+        if let Err(error) = board_runner::persist::save_board(&board_path, &board) {
+            // 落盘失败只记 warning：控制面会看到旧数据，但推进循环不停。
+            eprintln!("board-runner: could not persist {}: {error}", board_path.display());
+        }
+
         std::thread::sleep(args.interval);
     }
 }
@@ -1205,7 +1581,7 @@ git commit -m "feat(board-runner): add the scheduling tick and the plugin proces
 
 ## 完成判据
 
-- `cd plugins/superpowers-board && cargo test` 全绿（Plan 1 的 37 个 + 本计划新增 26 个）。
+- `cd plugins/superpowers-board && cargo test` 全绿（Plan 1 的 39 个 + 本计划新增 33 个：ipc 14 + runner 19）。
 - `cargo tree -p board-ipc | grep -E "^[│├└─ ]*yi-agent-"` 与同一命令用于 `board-runner` **均为空**（零依赖硬约束；注意路径噪声，见 Task 2 Step 5 的说明）。
 - `cargo build -p board-runner` 产出可执行文件 `board-runner`。
 - 未知 daemon 状态与未知响应变体都不会让插件崩溃或误动作（有专门测试）。

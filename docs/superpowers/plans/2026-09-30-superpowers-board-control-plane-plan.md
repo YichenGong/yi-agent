@@ -23,7 +23,9 @@
   且每个测试文件必须 `afterEach(() => cleanup())`，否则多次 `render` 会累积 DOM，
   导致 `Found multiple elements`。
 
-> **依赖：** Plan 2（IPC 能力）与 Plan 3a（插件进程与状态来源）已合并。本计划的 UI 只读 Plan 3a 的看板状态。
+> **依赖：** Plan 2（IPC 能力）与 Plan 3a（插件进程）已合并。看板状态来自 Plan 3a 每 tick
+> 原子写出的 `<state-dir>/board.json`——**文件即契约**：控制面只读该文件，不新增 IPC，
+> 也不感知插件内部。Task 5 落地这条读取通路。
 
 ---
 ## 文件结构
@@ -39,6 +41,8 @@
 | `desktop/src/components/BoardView.tsx` | desktop 看板视图 |
 | `desktop/src/components/SettingsPanel.tsx` | desktop 设置入口（含开关） |
 | `desktop/src/lib/boardSwitch.ts` | 前端开关读写与格式化 |
+| `yi-agent-rs/crates/yi-agent-board-ui/src/state.rs` | 读 `board.json` → `CardRow`（控制面数据源） |
+| `desktop/src/lib/boardState.ts` | 前端读 `board.json` → `BoardCard[]`（同构映射） |
 
 ---
 
@@ -1035,11 +1039,301 @@ git commit -m "feat(desktop): add the superpowers board view and its settings sw
 
 ---
 
+### Task 5: 控制面读取看板状态（board.json → 卡片行）
+
+**Files:**
+- Create: `yi-agent-rs/crates/yi-agent-board-ui/src/state.rs`
+- Create: `yi-agent-rs/crates/yi-agent-board-ui/tests/state.rs`
+- Modify: `yi-agent-rs/crates/yi-agent-board-ui/src/lib.rs`
+- Create: `desktop/src/lib/boardState.ts`
+- Create: `desktop/src/lib/boardState.test.ts`
+
+**Interfaces:**
+- Consumes: Task 2 的 `CardRow`；Plan 3a 写出的 `board.json`（`Board` 的 serde 形状）
+- Produces:
+  - `yi_agent_board_ui::state::board_state_path(state_dir: &Path) -> PathBuf`
+  - `yi_agent_board_ui::state::load_cards(state_dir: &Path) -> Vec<CardRow>`
+  - `desktop/src/lib/boardState.ts`：`parseBoard(json: string): BoardCard[]`、
+    `boardJsonPath(stateDir: string): string`
+
+> `board.json` 的形状由 Plan 1 的 `Board` 决定：
+> `{"cards":[{"id":..,"spec_path":..,"plan_path":..,"state":"Running","enqueued_at":..,"order":0,"workdir":"/x"}],"next_order":1}`。
+> `state` 是 serde 的变体名（`Queued`/`Running`/…），`workdir` 可能缺省。
+> **两端对同一份文件的解析必须一致**，所以 Rust 与 TS 各有一组同构测试。
+
+- [ ] **Step 1: 写失败的测试**
+
+`yi-agent-rs/crates/yi-agent-board-ui/tests/state.rs`：
+
+```rust
+use std::path::Path;
+
+use yi_agent_board_ui::state::{board_state_path, load_cards};
+
+fn write_board(dir: &Path, body: &str) {
+    std::fs::write(board_state_path(dir), body).unwrap();
+}
+
+#[test]
+fn the_state_file_sits_beside_the_other_plugin_state() {
+    assert_eq!(
+        board_state_path(Path::new("/proj/.yi-agent")),
+        Path::new("/proj/.yi-agent/board.json")
+    );
+}
+
+#[test]
+fn cards_are_mapped_with_state_progress_and_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    write_board(
+        dir.path(),
+        r#"{"cards":[{"id":"card-1","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Running","enqueued_at":"2026-10-01T09:00:00+08:00","order":0,"workdir":"/w/card-1"}],"next_order":1}"#,
+    );
+    let cards = load_cards(dir.path());
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].id, "card-1");
+    assert_eq!(cards[0].state, "running", "state is shown in lowercase for the UI");
+    assert_eq!(cards[0].detail, "/w/card-1", "detail shows where the card runs");
+}
+
+#[test]
+fn a_card_without_a_workdir_still_maps() {
+    let dir = tempfile::tempdir().unwrap();
+    write_board(
+        dir.path(),
+        r#"{"cards":[{"id":"card-2","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":0}],"next_order":1}"#,
+    );
+    let cards = load_cards(dir.path());
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].state, "queued");
+    assert_eq!(cards[0].detail, "a.plan.md", "falls back to the plan path");
+}
+
+#[test]
+fn a_missing_or_corrupt_file_yields_no_cards_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(load_cards(dir.path()).is_empty(), "missing file");
+    write_board(dir.path(), "{ not json");
+    assert!(load_cards(dir.path()).is_empty(), "corrupt file");
+}
+
+#[test]
+fn cards_are_ordered_by_their_queue_order() {
+    let dir = tempfile::tempdir().unwrap();
+    write_board(
+        dir.path(),
+        r#"{"cards":[
+            {"id":"b","spec_path":"b.spec.md","plan_path":"b.plan.md","state":"Queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":5},
+            {"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":1}
+        ],"next_order":6}"#,
+    );
+    let cards = load_cards(dir.path());
+    assert_eq!(cards[0].id, "a", "order 1 comes first");
+    assert_eq!(cards[1].id, "b");
+}
+```
+
+`desktop/src/lib/boardState.test.ts`：
+
+```typescript
+import { describe, expect, it } from "vitest";
+import { boardJsonPath, parseBoard } from "./boardState";
+
+describe("boardJsonPath", () => {
+  it("points at board.json inside the state directory", () => {
+    expect(boardJsonPath("/proj/.yi-agent")).toBe("/proj/.yi-agent/board.json");
+  });
+});
+
+describe("parseBoard", () => {
+  it("maps cards in queue order", () => {
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [
+          { id: "b", plan_path: "b.plan.md", state: "Queued", order: 5 },
+          { id: "a", plan_path: "a.plan.md", state: "Queued", order: 1 },
+        ],
+        next_order: 6,
+      }),
+    );
+    expect(cards.map((card) => card.id)).toEqual(["a", "b"]);
+  });
+
+  it("lowercases the state the way the Rust side does", () => {
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [{ id: "a", plan_path: "a.plan.md", state: "Running", order: 0, workdir: "/w" }],
+        next_order: 1,
+      }),
+    );
+    expect(cards[0].state).toBe("running");
+    expect(cards[0].detail).toBe("/w");
+  });
+
+  it("falls back to the plan path when there is no workdir", () => {
+    const cards = parseBoard(
+      JSON.stringify({ cards: [{ id: "a", plan_path: "a.plan.md", state: "Queued", order: 0 }] }),
+    );
+    expect(cards[0].detail).toBe("a.plan.md");
+  });
+
+  it("returns nothing for corrupt input instead of throwing", () => {
+    expect(parseBoard("{ not json")).toEqual([]);
+    expect(parseBoard(JSON.stringify({ cards: [] }))).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd yi-agent-rs && cargo test -p yi-agent-board-ui --test state`（Expected: 编译失败，`state` 模块未定义）；
+`cd desktop && npx vitest run src/lib/boardState.test.ts`（Expected: 找不到模块）。
+
+- [ ] **Step 3: 实现最小代码**
+
+`yi-agent-rs/crates/yi-agent-board-ui/src/state.rs`：
+
+```rust
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::view::CardRow;
+
+/// 插件原子写出的看板状态文件。
+pub fn board_state_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("board.json")
+}
+
+/// `board.json` 里我们真正需要的部分。其余字段（`spec_path` / `enqueued_at` /
+/// `next_order`）故意不收——控制面不依赖它们，插件便可自由演进。
+#[derive(Debug, Deserialize)]
+struct RawBoard {
+    #[serde(default)]
+    cards: Vec<RawCard>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCard {
+    id: String,
+    plan_path: String,
+    state: String,
+    #[serde(default)]
+    order: i64,
+    #[serde(default)]
+    workdir: Option<String>,
+}
+
+/// 读看板状态并映射成可渲染的卡片行。
+///
+/// 文件缺失、损坏或字段缺失一律**回退为空列表**：看板空着也好过整个前端崩掉。
+/// 卡片按 `order` 升序（与队列顺序一致）。
+pub fn load_cards(state_dir: &Path) -> Vec<CardRow> {
+    let Ok(text) = std::fs::read_to_string(board_state_path(state_dir)) else {
+        return Vec::new();
+    };
+    let Ok(board) = serde_json::from_str::<RawBoard>(&text) else {
+        return Vec::new();
+    };
+    let mut cards: Vec<RawCard> = board.cards;
+    cards.sort_by_key(|card| card.order);
+    cards
+        .into_iter()
+        .map(|card| CardRow {
+            id: card.id,
+            // 与 TS 侧保持同一约定：UI 展示小写状态名。
+            state: card.state.to_ascii_lowercase(),
+            progress: None,
+            detail: card.workdir.unwrap_or(card.plan_path),
+        })
+        .collect()
+}
+```
+
+`yi-agent-rs/crates/yi-agent-board-ui/src/lib.rs` 追加：
+
+```rust
+pub mod state;
+```
+
+`desktop/src/lib/boardState.ts`：
+
+```typescript
+import type { BoardCard } from "../components/BoardView";
+
+export function boardJsonPath(stateDir: string): string {
+  return `${stateDir}/board.json`;
+}
+
+/**
+ * Mirrors the Rust `yi_agent_board_ui::state::load_cards` mapping: queue order,
+ * lowercased state, and `detail` falling back from workdir to the plan path.
+ * Corrupt or unexpected input yields no cards rather than throwing.
+ */
+export function parseBoard(json: string): BoardCard[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return [];
+  }
+  const cards = (parsed as { cards?: unknown }).cards;
+  if (!Array.isArray(cards)) return [];
+
+  return cards
+    .filter((card): card is Record<string, unknown> => typeof card === "object" && card !== null)
+    .map((card) => ({
+      id: String(card.id ?? ""),
+      state: String(card.state ?? "").toLowerCase(),
+      progress: null,
+      detail: String(card.workdir ?? card.plan_path ?? ""),
+    }))
+    .filter((card) => card.id !== "")
+    .sort((left, right) => {
+      const leftOrder = orderOf(cards, left.id);
+      const rightOrder = orderOf(cards, right.id);
+      return leftOrder - rightOrder;
+    });
+}
+
+function orderOf(cards: unknown[], id: string): number {
+  for (const card of cards) {
+    if (typeof card === "object" && card !== null) {
+      const record = card as Record<string, unknown>;
+      if (String(record.id ?? "") === id) {
+        return typeof record.order === "number" ? record.order : 0;
+      }
+    }
+  }
+  return 0;
+}
+```
+
+> `BoardCard` 的 `progress` 字段类型是 `string | null`（Task 4 定义），此处填 `null`：
+> 进度（`3/7 tasks`）来自 SDD 账本，属后续增强，本任务只接通状态与位置。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd yi-agent-rs && cargo test -p yi-agent-board-ui --test state`（Expected: PASS，5 个测试）；
+`cd desktop && npx tsc --noEmit && npx vitest run src/lib/boardState.test.ts`（Expected: PASS，5 个测试）。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd yi-agent-rs && cargo fmt --all
+cd ../desktop && npx tsc --noEmit
+git add yi-agent-rs/crates/yi-agent-board-ui desktop/src/lib
+git commit -m "feat(board-ui): read the plugin's board state and map it to card rows"
+```
+
+---
+
 ## 完成判据
 
 - `cd yi-agent-rs && cargo test -p yi-agent-board-ui` 全绿（15 个测试：9 switch + 6 view）。
 - `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent kanban` 全绿（6 个测试）。
 - `cd desktop && npx tsc --noEmit && npm test` 全绿。
+- `cd yi-agent-rs && cargo test -p yi-agent-board-ui` 追加 `--test state`（5 个）+ `src/state.rs` 单测；两端对同一份 `board.json` 的映射一致（Rust 与 TS 各有一组同构测试，覆盖缺 `workdir` 与损坏文件）。
 - `/kanban` 在开关关闭时**拒绝执行**并指出开关位置（有专门测试）。
 - 写入 `preferences.json` 保留其他键，且不留 `.tmp` 文件（有专门测试）。
 - 两端对「项目覆盖全局、默认关闭」的解析一致（Rust 与 TS 各有一组同构测试）。

@@ -60,7 +60,8 @@
   - `CardState::occupies_slot(self) -> bool`
   - `CardState::is_terminal(self) -> bool`
   - `CardState::can_transition_to(self, next: CardState) -> bool`
-  - `board_core::card::Card { id, spec_path, plan_path, state, enqueued_at, order }`
+  - `board_core::card::Card { id, spec_path, plan_path, state, enqueued_at, order, workdir }`
+    （`workdir: Option<PathBuf>`，serde `default`；由插件在启动卡片前用 `git worktree add` 预建后写入）
 
 - [ ] **Step 1: 建独立 workspace 与内核 crate 骨架**
 
@@ -101,6 +102,7 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 ```
 
@@ -287,6 +289,10 @@ pub struct Card {
     pub enqueued_at: DateTime<Local>,
     /// 排序键：越小越靠前。手动插队会把它压到当前最小值之下（因此可为负）。
     pub order: i64,
+    /// 该卡片会话要跑在哪个 worktree。入队时为 `None`；插件在启动前用
+    /// `git worktree add` 预建好目录再填入。旧状态文件没有此字段 → 反序列化为 `None`。
+    #[serde(default)]
+    pub workdir: Option<PathBuf>,
 }
 ```
 
@@ -445,6 +451,37 @@ mod tests {
         board.transition(&CardId::new("a"), CardState::Queued).unwrap();
         assert_eq!(board.start_due(1), vec![CardId::new("a")]);
     }
+
+    #[test]
+    fn a_board_survives_a_serialization_round_trip() {
+        // 控制面靠这个文件渲染看板：队列必须能完整地写出去再读回来。
+        let mut board = board_with(&["a", "b"]);
+        board.start_due(1);
+        board
+            .set_workdir(&CardId::new("a"), PathBuf::from("/w/a"))
+            .unwrap();
+        let json = serde_json::to_string(&board).unwrap();
+        let restored: Board = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored.get(&CardId::new("a")).unwrap().state,
+            CardState::Running
+        );
+        assert_eq!(
+            restored.get(&CardId::new("a")).unwrap().workdir,
+            Some(PathBuf::from("/w/a"))
+        );
+        assert_eq!(restored.running_count(), 1);
+    }
+
+    #[test]
+    fn a_card_without_a_workdir_field_still_deserializes() {
+        // 前向兼容：早期落盘的 board.json 没有 workdir 字段，读回时必须是 None，
+        // 而不是整份状态解析失败。
+        let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],"next_order":1}"#;
+        let board: Board = serde_json::from_str(json).unwrap();
+        assert_eq!(board.get(&CardId::new("a")).unwrap().workdir, None);
+    }
 }
 ```
 
@@ -485,7 +522,10 @@ impl std::fmt::Display for TransitionError {
 impl std::error::Error for TransitionError {}
 
 /// 卡片队列。槽位只由 `CardState::Running` 占用。
-#[derive(Debug, Default)]
+///
+/// `Serialize`/`Deserialize` 让插件进程能把队列原子落盘到 `<state-dir>/board.json`，
+/// 控制面（TUI / desktop）再读同一个文件渲染看板——文件即契约，无需新增 IPC。
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Board {
     cards: Vec<Card>,
     next_order: i64,
@@ -513,6 +553,7 @@ impl Board {
             state: CardState::Queued,
             enqueued_at: now,
             order,
+            workdir: None,
         });
         &self.cards[index]
     }
@@ -539,6 +580,21 @@ impl Board {
     /// 当前还有多少空槽位。`limit` 已由并发日历按时段算好。
     pub fn free_slots(&self, limit: u16) -> usize {
         (limit as usize).saturating_sub(self.running_count())
+    }
+
+    /// 记下某张卡片会话要跑在哪个 worktree。插件在启动前调用。
+    pub fn set_workdir(
+        &mut self,
+        id: &CardId,
+        workdir: PathBuf,
+    ) -> Result<(), TransitionError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        card.workdir = Some(workdir);
+        Ok(())
     }
 
     /// 队首（`order` 最小）的排队卡片。
@@ -617,7 +673,7 @@ pub mod board;
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd plugins/superpowers-board && cargo test -p board-core board::`
-Expected: PASS（8 个测试）。
+Expected: PASS（10 个测试）。
 
 - [ ] **Step 5: 提交**
 
@@ -1373,7 +1429,7 @@ git commit -m "feat(board): validate spec/plan pairs before promotion"
 
 ## 完成判据
 
-- `cd plugins/superpowers-board && cargo test` 全绿（37 个测试：7 + 8 + 11 + 6 + 5）。
+- `cd plugins/superpowers-board && cargo test` 全绿（39 个测试：7 + 10 + 11 + 6 + 5）。
 - `cargo clippy --all-targets -- -D warnings` 无警告。
 - `plugins/superpowers-board` **不在** `yi-agent-rs/Cargo.toml` 的 members 中（可独立编译）。
 - 内核四个模块各自职责单一，均无 I/O 副作用（`load_or_default` 是唯一的文件读取，且失败回退）。
