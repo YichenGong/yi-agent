@@ -1431,7 +1431,7 @@ git commit -m "feat(board): validate spec/plan pairs before promotion"
 
 ## 完成判据
 
-- `cd plugins/superpowers-board && cargo test` 全绿（39 个测试：7 + 10 + 11 + 6 + 5）。
+- `cd plugins/superpowers-board && cargo test` 全绿（42 个测试：card 7 + board 10 + calendar 12 + switch 8 + promotion 5）。
 - `cargo clippy --all-targets -- -D warnings` 无警告。
 - `plugins/superpowers-board` **不在** `yi-agent-rs/Cargo.toml` 的 members 中（可独立编译）。
 - 内核四个模块各自职责单一，均无 I/O 副作用（`load_or_default` 是唯一的文件读取，且失败回退）。
