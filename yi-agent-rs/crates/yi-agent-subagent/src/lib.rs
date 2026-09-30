@@ -1,4 +1,11 @@
-//! Application-owned construction for daemon subagent workers.
+//! Application-owned construction for daemon subagent workers, plus the client
+//! half of the local runtime: attaching an application root and giving it the
+//! six delegation tools.
+//!
+//! The TUI and the desktop app-server both drive the same daemon contract, so
+//! both build their runtime wiring here rather than each keeping a copy.
+
+pub mod attach;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1037,6 +1044,33 @@ impl Tool for DaemonSendMessageTool {
             Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
         }
     }
+}
+
+/// The application root a client attached to, plus what it takes to reach it.
+///
+/// A root is per project: it names the session, the task the daemon schedules
+/// children under, and the capability that proves this client owns the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedRoot {
+    pub session_id: String,
+    pub task_id: String,
+    pub capability: String,
+    pub workspace: WorkerWorkspace,
+}
+
+/// Adds the six delegation tools to a root agent's registry.
+pub fn register_attached_root_tools(
+    registry: &mut ToolRegistry,
+    runtime_socket: PathBuf,
+    root: &AttachedRoot,
+) {
+    register_application_subagent_tools(
+        registry,
+        runtime_socket,
+        root.session_id.clone(),
+        root.task_id.clone(),
+        root.capability.clone(),
+    );
 }
 
 pub fn register_application_subagent_tools(
