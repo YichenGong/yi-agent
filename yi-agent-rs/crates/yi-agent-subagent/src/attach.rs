@@ -226,3 +226,28 @@ pub fn detach_root(socket_path: &Path, root: &AttachedRoot) {
         tracing::warn!(%error, "could not detach the application root");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::project_runtime_directory;
+
+    /// The daemon, the TUI and the app-server must land on one location, so
+    /// this is the single place the default is spelled out.
+    #[test]
+    fn a_project_runtime_directory_is_workdir_local() {
+        assert_eq!(
+            project_runtime_directory(std::path::Path::new("/tmp/project-a")),
+            std::path::PathBuf::from("/tmp/project-a/.yi-agent/runtime"),
+        );
+    }
+
+    /// Two projects must never share a runtime: the socket and the SQLite store
+    /// both hang off this path.
+    #[test]
+    fn two_projects_get_distinct_runtime_directories() {
+        assert_ne!(
+            project_runtime_directory(std::path::Path::new("/tmp/project-a")),
+            project_runtime_directory(std::path::Path::new("/tmp/project-b")),
+        );
+    }
+}

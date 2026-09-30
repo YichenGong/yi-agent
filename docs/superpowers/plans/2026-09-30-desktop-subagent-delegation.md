@@ -1541,15 +1541,20 @@ git add docs && git commit -m "docs: record desktop subagent delegation parity"
 4. **`BuiltAgent` 不必保留被替换的 `tools` / `permission`**：计划 Step 4 让 `wrap_for_delegation`
    把它们回填进 `BuiltAgent`，clippy 报 `fields are never read`。实测无任何读取方，故删除，
    只保留重建必须沿用的 provider / config / 决定通道 / session / catalog / yolo。
+5. **`main.rs` 的 `runtime_directory_from` 与它的 5 个测试删除**：任务 2 把解析逻辑委托给
+   `project_runtime_directory` 后，这个本地函数只剩测试在用（clippy `never used`），而它的
+   5 个测试断言的是一个手写副本、比较的是常量而非被测逻辑。改为在
+   `crates/yi-agent-subagent/src/attach.rs` 直接测 `project_runtime_directory`
+   （默认位置 + 两项目互不相同），App 侧因此少一个"看起来有用"的死函数。
 
 **验证结果**（逐步实测，未并行跑 cargo）：
 
 | 命令 | 结果 |
 |---|---|
-| `cargo test -p yi-agent-subagent` | 28 + 1 通过 |
+| `cargo test -p yi-agent-subagent` | 30 + 1 通过 |
 | `cargo test -p yi-agent-app-server` | 157 通过（本次新增 3 个；app-server 模块文档此前记的 148 已过期，一并更正为实测 157） |
 | `cargo test -p yi-agent-runtime` | 64 通过 |
-| `cargo test -p yi-agent --bin yi-agent` | 486 通过 |
+| `cargo test -p yi-agent --bin yi-agent` | 481 通过 |
 | `cargo test -p yi-agent-store --test runtime_ipc` | 98 通过 |
 | `cd desktop && npx tsc --noEmit && npm test` | 158 通过（前端零改动） |
 | `cargo clippy -p yi-agent-app-server -p yi-agent-subagent --all-targets` | 无告警 |

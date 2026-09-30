@@ -41,11 +41,12 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   `src/lib.rs:1062`）；平移前该文件在 `crates/yi-agent/src/subagent_runtime.rs`，无
   `crate::` 内部引用，故可整块搬移；验证：`cargo test -p yi-agent-subagent`
 - [x] 共享 attach 客户端 — `src/attach.rs`：`attach_project_runtime(cfg, runtime_dir)`
-  `src/attach.rs:115`（收 **runtime 目录**而非 socket 路径，测试因此能隔离单个项目的
-  runtime 而不动进程级环境变量）、`activate_root` `src/attach.rs:193`（幂等）、
-  `detach_root` `src/attach.rs:216`（best-effort，失败只记 trace）；`AttachFailure`
-  `src/attach.rs:18` 的 `stage`（`runtime directory` / `worker factory` / `daemon start`
-  / `attach`）让降级路径能说清是哪一步断了；验证：`cargo test -p yi-agent-subagent --test attach_delegation`
+  （收 **runtime 目录**而非 socket 路径，测试因此能隔离单个项目的 runtime 而不动进程级
+  环境变量）、`activate_root`（幂等）、`detach_root`（best-effort，失败只记 trace）；
+  `AttachFailure` 的 `stage`（`runtime directory` / `worker factory` / `daemon start`
+  / `attach`）让降级路径能说清是哪一步断了；`project_runtime_directory` 的默认位置由本
+  crate 的单测钉住（daemon、TUI、app-server 必须落在同一处）；验证：
+  `cargo test -p yi-agent-subagent --test attach_delegation`
 - [x] 端到端装配契约 — `tests/attach_delegation.rs`：干净 git 项目 attach → 激活两次
   （证明幂等）→ 注册的委派工具存在 → `SpawnApplicationChild` 被 daemon 接纳并返回
   child task id → detach；这是 TUI 与 app-server 共用的那条链路的可执行说明
@@ -56,4 +57,4 @@ git 目录原地成 root，`workspace_root == project_root`），真正需要仓
 app-server 侧的钉法是 `cargo test -p yi-agent-app-server
 a_non_git_cwd_attaches_in_place_with_the_delegation_tools`。
 
-**验证命令：** `cargo test -p yi-agent-subagent`（28 个单元测试 + 1 个集成测试）
+**验证命令：** `cargo test -p yi-agent-subagent`（30 个单元测试 + 1 个集成测试）

@@ -535,17 +535,6 @@ pub(crate) fn runtime_directory_for(workdir: &std::path::Path) -> std::path::Pat
     yi_agent_subagent::attach::project_runtime_directory(workdir)
 }
 
-/// The runtime directory given an explicit override, resolved the same way the
-/// shared client resolves it. Kept as a local function because the daemon and
-/// the attachment must agree on one location, and the regression tests below
-/// pin that agreement.
-fn runtime_directory_from(
-    override_path: Option<std::path::PathBuf>,
-    workdir: &std::path::Path,
-) -> std::path::PathBuf {
-    override_path.unwrap_or_else(|| workdir.join(".yi-agent/runtime"))
-}
-
 /// Single source of truth for the runtime database filename. The daemon and the
 /// embedded TUI/headless runtimes must share one store, so they all resolve the
 /// path here instead of hardcoding a name that can drift apart.
@@ -2326,58 +2315,6 @@ mod tests {
         };
         assert_eq!(idempotency_key, "test-key");
         assert_eq!(workspace, std::path::PathBuf::from("/projects/b"));
-    }
-
-    #[test]
-    fn runtime_directory_uses_workdir_local_default() {
-        assert_eq!(
-            runtime_directory_from(None, std::path::Path::new("/tmp/project-a")),
-            std::path::PathBuf::from("/tmp/project-a/.yi-agent/runtime"),
-        );
-    }
-
-    #[test]
-    fn runtime_directory_prefers_a_nonempty_explicit_override() {
-        assert_eq!(
-            runtime_directory_from(
-                Some(std::path::PathBuf::from("/tmp/shared-runtime")),
-                std::path::Path::new("/tmp/project-a"),
-            ),
-            std::path::PathBuf::from("/tmp/shared-runtime"),
-        );
-    }
-
-    #[test]
-    fn runtime_directory_isolated_between_workdirs() {
-        let first = runtime_directory_from(None, std::path::Path::new("/tmp/project-a"));
-        let second = runtime_directory_from(None, std::path::Path::new("/tmp/project-b"));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn runtime_directory_for_workdir_uses_the_same_project_path_for_daemon_and_attachment() {
-        let workdir = std::path::PathBuf::from("/tmp/isolated-project");
-        let daemon_runtime = runtime_directory_from(None, &workdir);
-        let attachment_runtime = runtime_directory_from(None, &workdir);
-
-        assert_eq!(daemon_runtime, attachment_runtime);
-        assert_eq!(
-            daemon_runtime,
-            std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime"),
-        );
-    }
-
-    #[test]
-    fn runtime_database_path_is_shared_by_daemon_and_attachment() {
-        let workdir = std::path::PathBuf::from("/tmp/isolated-project");
-        let daemon_database = runtime_database_path(&runtime_directory_from(None, &workdir));
-        let attachment_database = runtime_database_path(&runtime_directory_from(None, &workdir));
-
-        assert_eq!(daemon_database, attachment_database);
-        assert_eq!(
-            daemon_database,
-            std::path::PathBuf::from("/tmp/isolated-project/.yi-agent/runtime/runtime.sqlite"),
-        );
     }
 
     #[test]
