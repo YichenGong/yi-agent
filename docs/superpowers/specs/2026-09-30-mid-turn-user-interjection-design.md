@@ -13,8 +13,8 @@ API 请求之前**就进入上下文，而不是等整个周期跑完、`Done` �
 
 ### 1.1 现状：追加输入必须等整个周期结束
 
-一次 `agent.run()`（`yi-agent-core/src/agent.rs:382`）内部是一个
-`run_loop`（`:511`），循环里可以发生任意多次 provider 请求（`let req =
+一次 `agent.run()`（`yi-agent-core/src/agent.rs:394`）内部是一个
+`run_loop`（`:523`），循环里可以发生任意多次 provider 请求（`let req =
 ProviderRequest`，`agent.rs:590`）。这个循环**没有任何用户输入入口**：
 在 `agent.rs` 内检索 `input_rx` / `user_input` / `pending_input` / `interject`，
 **零匹配**。消息向量 `messages` 只由模型自身输出推动增长
@@ -24,7 +24,7 @@ ProviderRequest`，`agent.rs:590`）。这个循环**没有任何用户输入入
 
 | 前端 | 位置 | 行为 | 后果 |
 |---|---|---|---|
-| TUI | `main.rs:1321` 通道 + `main.rs:1600` | driver 的 `input_rx.recv()`（`main.rs:1365`）在 `agent.run(text).await`（`main.rs:1600`）**之外**；运行中不消费任何输入 | 忙时提交只能缓冲，等 `Done` 后转正 |
+| TUI | `main.rs:1321` 通道 + `main.rs:1600` | driver 的 `input_rx.recv()`（`main.rs:1381`）在 `agent.run(text).await`（`main.rs:1600`）**之外**；运行中不消费任何输入 | 忙时提交只能缓冲，等 `Done` 后转正 |
 | TUI（缓存） | `tui/app.rs:398`、`tui/app.rs:1613` | 忙时 `PendingQueue::submit` 返回 `Queued`，**只进预览**，发送推迟到回合结束 | 见 `docs/superpowers/specs/2026-09-27-tui-pending-queue-design.md` §3.2 |
 | desktop | `app-server/src/server.rs:837` | 活跃时第二个 `turn/start` 被拒绝：`RpcError::turn_in_progress` = `-32012`（`protocol.rs:99-100`）；desktop 侧回滚乐观气泡（`desktop/src/App.tsx:311-316`） | 用户必须等本轮结束 |
 
@@ -52,7 +52,7 @@ ProviderRequest`，`agent.rs:590`）。这个循环**没有任何用户输入入
 竞态：否则输入若在模型给出无工具调用的回复之后到达，仍会退化为新轮。
 
 **排除**"到达即打断流/工具"方案：需处理 partial 丢弃、工具半途中断、会话配对回滚
-（`safe_cancel_truncate_len`，`agent.rs:452`），风险面最大。
+（`safe_cancel_truncate_len`，`agent.rs:464`），风险面最大。
 
 ### D2 / D10 / D11 TUI 忙时缓冲：单一职责
 
@@ -76,7 +76,7 @@ ProviderRequest`，`agent.rs:590`）。这个循环**没有任何用户输入入
 2. 把 `inbox`/`cancel_token` 放进同一个 `tokio::select!`（`main.rs:1606` 的
    `event = stream.next()` 与 `main.rs:1616` 的 `_ = interrupt_rx.recv()` 旁边）；
 3. **整个 loop 必须改成 `while let Some(ev) = ...` 并持有 `agent`**：今天
-   `agent.cancel()` 在 `select!` 分支内被调用（`main.rs:1622`），说明该处本来就持有
+   `agent.cancel()` 在 `select!` 分支内被调用（`main.rs:1618`），说明该处本来就持有
    `&mut agent`，不需要额外借用技巧。
 
 若 `inbox_handle()` 返回 `None`，该条走 `Rejected` 并复用现有提示行。
@@ -165,7 +165,7 @@ TUI 塞回输入框、desktop 按 tag 精确撤回乐观气泡。零丢失，且
 
 ### D12 / D13 drain 位置：compact 之后、计入 turn
 
-- **D12**：drain 放在 auto-compact 块（`agent.rs:553-559`）**之后**。否则注入文本会被
+- **D12**：drain 放在 auto-compact 块（`agent.rs:553-558`）**之后**。否则注入文本会被
   `maybe_auto_compact`（定义 `agent.rs:1175`）的 `replace_messages`
   （调用 `agent.rs:1195`）整体替换掉——用户刚打的字只剩摘要，不可接受。
 - **D13**：drain 放在 `turn += 1`（`agent.rs:560`）**之后**，即注入消耗一个 turn。
@@ -211,7 +211,7 @@ impl Agent {
 1. `Inbox` 有界（容量与 TUI 现有 `PendingQueue::CAPACITY` = 16 对齐，`queued.rs:28`），
    FIFO，满则 `Full`。
 2. `seq` 单调递增，永不复用；前端以 `seq` 为唯一对账键。
-3. **句柄的生命周期就是一次 `run()`**（这是 D10 的落法）：`start_run`（`agent.rs:397`）
+3. **句柄的生命周期就是一次 `run()`**（这是 D10 的落法）：`start_run`（`agent.rs:409`）
    每次重建 cancel token（`agent.rs:409`），`InboxHandle` 与它同生命周期。driver 在
    `agent.run()` 返回后取句柄（`main.rs:1602` 之后），交给转发循环使用；`run()` 结束
    即失效，下一次 `run()` 重新取。**因此不存在"句柄陈旧/需在 5 处重建点轮换"的问题**——
@@ -407,7 +407,7 @@ cd desktop && npm test
 2. **运行循环改动的借用复杂度**：TUI 侧要把 `inbox_handle()` 与 `cancel_token` 一起放进
    转发 `select!`（`main.rs:1606`/`:1616`），app-server 侧要在两处内层 `select!`
    （`server.rs:1191`/`:1246`）各加一路。**【已核实】** 两处 `select!` 的分支内**都已在
-   调用 `agent` 的方法**（TUI 的 `main.rs:1622` `agent.cancel()`；app-server 的
+   调用 `agent` 的方法**（TUI 的 `main.rs:1618` `agent.cancel()`；app-server 的
    `cancel_token.cancel()`），因此"循环里持有 `agent`"不是新增约束，而是现状。实现时
    仍需确认 `while let Some(ev) = stream.next().await` 的写法不影响既有 break 语义。
 3. **语义 vs 计数的取舍**：`DeliveredInterjections` 会保留一个"名字→语义"的转换成本；
@@ -418,8 +418,33 @@ cd desktop && npm test
 
 ## 10. 附：本设计引用的行号如何取得
 
-§1–§6 中所有 `file:line` 均以 worktree 基点 `656673c` 为准，经 `sed`/`grep` 原样读出
-核对（agent.rs 的 87/114/269/313/315/452/535/547/549/553/560/561/587/590/612/669/726/
-841/842/843/1062/1073/1175/1195；main.rs 的 1320/1321/1600/1602/1606/1616；queued.rs 的
-22/28/102/115；app.rs 的 398/1613；protocol.rs 的 99/206；server.rs 的 837/1261；
-session.rs 的 23）。行号会随代码演进漂移，引用时应以符号名（函数名、常量名）为准。
+§1–§6 中所有行号均以 worktree 基点 `656673c` 为准，且**逐条经 `sed`/`grep` 原样读出并
+对照**。已核验的行号如下（每条都确认输出与引用内容一致）：
+
+- **core `agent.rs`**：82（`run`）、87（`max_turns`）、114（默认 100）、269（`Cancelled`）、
+  313/315（两个常量）、394（`pub async fn run`）、409（`start_run`）、414（重建 cancel
+  token）、464（`safe_cancel_truncate_len`）、523（`run_loop`）、535（`turn`）、547（cancel
+  关）、549/612/669/726/1062（五处 cancel 点）、553（compact 关）、560（`turn += 1`）、
+  561（max_turns 关）、587（`last_logged`）、590（`req`）、841（`tool_uses.is_empty()`）、
+  842/843（审计关卡）、1073（`verification_pending = true`）、1175（`maybe_auto_compact`
+  定义）、1195（`replace_messages` 调用）；测试断言 2225/2425/2527/2656/3047。
+- **TUI `main.rs`**：1320（`agent_tx` 容量 256）、1321（`input_tx` 容量 16）、1381
+  （`input_rx.recv()` 分支）、1600（`agent.run`）、1602（`Box::pin(stream)`）、1606
+  （`stream.next()`）、1616（`interrupt_rx.recv()`）、1618（`agent.cancel()`）；
+  `Agent::new` 的 5 处：1367/1389/1411/1437/1498。
+- **TUI `queued.rs`**：22（`PendingQueue`）、28（`CAPACITY`）、102（渲染函数）、115（标题
+  行）；14 个测试按行切分：渲染类 167/188/286/293/306/314/328，语义类 204/212/221/238/
+  252/261/274。
+- **TUI `app.rs`**：355/374/1280（三处 `Done | Cancelled | Error` 判据）、398 与 1613
+  （两处 `input_tx.try_send`）、3873（测试构造）、队列测试 4490/7006/7089/7139/7246/7297。
+- **app-server**：`protocol.rs` 99（`turn_in_progress`）、206（`Item`）；`session.rs` 23
+  （`active_turn_id`）、27（`prompt_tx`）、29（`interrupt_tx`）；`server.rs` 451/459 与
+  608/616（`driver_turn_tx`，说明"主循环持有通往 driver 的发送端"已成惯例）、837
+  （`-32012`）、1084（`run_thread_driver` 签名）、1191 与 1246（两处内层 `select!`）、
+  1261（`user-{turn_id}` 落盘）、2138（`-32012` 唯一测试）；`translate.rs` 122（item id
+  命名空间）、308（`Cancelled` 分支）。
+- **desktop**：`App.tsx` 311-316（乐观气泡回滚）。
+- **subagent**：`subagent_runtime.rs` 620-626（mailbox 取消）、735（`retrying_provider`）。
+
+行号会随代码演进漂移，引用时应以符号名（函数名、常量名）为准；本清单的作用是让
+实现阶段能快速判断"引用是否已过期"。
