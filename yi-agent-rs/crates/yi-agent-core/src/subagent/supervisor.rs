@@ -355,6 +355,19 @@ impl AgentSupervisor {
         self.workspace_modes.insert(task_id.clone(), mode);
     }
 
+    /// Binds a directory to a task. A root has no workdir by default, so this is
+    /// how an autonomous session is told to run in an isolated worktree instead of
+    /// in the project directory. The directory must already exist: the runtime
+    /// resolves a path, it never creates one.
+    pub fn set_workdir(&mut self, task_id: &TaskId, workdir: PathBuf) -> Result<(), String> {
+        if !self.tasks.contains_key(task_id) {
+            return Err("task does not exist".into());
+        }
+        self.workdirs.insert(task_id.clone(), Some(workdir));
+        self.notify_update();
+        Ok(())
+    }
+
     /// The task's workspace mode. A registered entry wins; otherwise the root
     /// defaults to `Coding` (it owns session isolation) and any other task to
     /// `ReadOnly`. The root's implicit `Coding` is a default pending persisted
@@ -2259,5 +2272,43 @@ impl Tool for SendMessageTool {
             Ok(()) => ToolResult::text("message delivered"),
             Err(error) => ToolResult::error(error.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn set_workdir_binds_a_directory_to_the_root() {
+        let session = RootSessionId::new();
+        let mut supervisor = AgentSupervisor::new_with_objective(session, "objective".into());
+        let root = supervisor.root_task_id().clone();
+        assert_eq!(
+            supervisor.spawn_workdir(&root),
+            None,
+            "a root starts with no workdir"
+        );
+
+        supervisor
+            .set_workdir(&root, PathBuf::from("/tmp/example-worktree"))
+            .unwrap();
+
+        assert_eq!(
+            supervisor.spawn_workdir(&root),
+            Some(PathBuf::from("/tmp/example-worktree"))
+        );
+    }
+
+    #[test]
+    fn set_workdir_rejects_an_unknown_task() {
+        let session = RootSessionId::new();
+        let mut supervisor = AgentSupervisor::new_with_objective(session, "objective".into());
+        let unknown = TaskId::new();
+        let error = supervisor
+            .set_workdir(&unknown, PathBuf::from("/tmp/example-worktree"))
+            .unwrap_err();
+        assert_eq!(error, "task does not exist");
     }
 }
