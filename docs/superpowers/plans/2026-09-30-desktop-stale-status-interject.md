@@ -4,7 +4,7 @@
 
 **Goal:** Make the desktop app recover from `-32013 no turn is running` (and its mirror `-32012`) instead of surfacing it and dropping the user's message, and stop the cached thread status from being permanently corrupted by a stale `thread/listAll` snapshot.
 
-**Architecture:** `send()` gains a bounded two-hop self-heal loop keyed on the RPC error code, and picks its first method from the session's own `turnActive` (the same source the input button uses). `ThreadStore.seed()` stops overwriting a status that the live push stream already authoritative-ly wrote.
+**Architecture:** `send()` gains a bounded two-hop self-heal loop keyed on the RPC error code; its first method stays the cached thread status (the input's Send button is only reachable when no turn is active, so the cache is the right first guess). `ThreadStore.seed()` stops overwriting a status the live push stream already wrote.
 
 **Tech Stack:** React 19 + TypeScript, Vite, Vitest + @testing-library/react (jsdom).
 
@@ -235,19 +235,22 @@ In `desktop/src/App.tsx`, add a module-level helper above `export default functi
 
 ```ts
 /**
- * Pick the send RPC from what the UI is showing, so the button and the wire
- * agree: while a turn is active the button says "Stop" and the message is
- * folded into it; otherwise it says "Send" and opens a new turn.
+ * `-32013` means `turn/interject` arrived with no turn running; `-32012` means
+ * `turn/start` arrived while one was. Both say "the other method was the right
+ * one" — the server resolves the disagreement, so the code is read from the raw
+ * rejection (`formatError` would drop it).
  */
-function preferredSendMethod(turnActive: boolean): "turn/interject" | "turn/start" {
-  return turnActive ? "turn/interject" : "turn/start";
-}
-
-/** The `-32013`/`-32012` codes both mean "the other method was the right one". */
-function isMethodMismatchCode(code: unknown): code is number {
-  return code === -32013 || code === -32012;
+function sendMethodMismatchCode(e: unknown): number | null {
+  const code = (e as { code?: unknown } | null)?.code;
+  return code === -32013 || code === -32012 ? code : null;
 }
 ```
+
+**Do not** add a `preferredSendMethod(turnActive)` helper. `MessageInput` renders
+"Stop" and binds `onInterrupt` whenever `turnActive` is true, so the send path is
+only reachable with `turnActive === false`; making that the first guess would send
+`turn/start` in the very case the cache says `running`, breaking mid-turn folding
+and the existing `uses turn/interject ...` test.
 
 Replace `send` with:
 
@@ -259,13 +262,14 @@ Replace `send` with:
     const session = store.view(id).session;
     session.addUserMessage(text);
     force((v) => v + 1);
-    // The status the UI renders and the status the server holds can disagree:
-    // `turn/completed` reaches us before the server flips the thread back to
-    // idle, and a listing read inside that window keeps us on the old value.
-    // So send the method the UI implies, then let the server's own error code
-    // tell us where it disagreed — each direction is tried at most once.
+    // The cached status can be stale: `turn/completed` reaches us before the
+    // server flips the thread back to idle, and a listing read inside that
+    // window keeps the old value. Send the method the cache implies, then let
+    // the server's error code say where it disagreed and switch to the other
+    // one. Each direction is tried once, so two mismatches cannot ping-pong.
     const params = { threadId: id, input: [{ type: "text", text }] };
-    let method = preferredSendMethod(session.turnActive);
+    let method: "turn/interject" | "turn/start" =
+      store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
     let lastError: unknown = null;
     for (let hop = 0; hop < 2; hop += 1) {
       try {
@@ -273,16 +277,13 @@ Replace `send` with:
         return true;
       } catch (e) {
         lastError = e;
-        const code = (e as { code?: unknown } | null)?.code;
-        if (!isMethodMismatchCode(code)) break;
-        const fallback = method === "turn/interject" ? "turn/start" : "turn/interject";
-        // Learn from the rejection so the very next send picks correctly.
-        const status: ThreadStatus = fallback === "turn/interject" ? "running" : "idle";
+        const code = sendMethodMismatchCode(e);
+        if (code === null) break;
+        // Adopt the server's view so the next send (and the button) is right.
+        method = method === "turn/interject" ? "turn/start" : "turn/interject";
+        session.turnActive = method === "turn/interject";
         const view = store.peek(id);
-        if (view) view.status = status;
-        if (code === -32013) session.turnActive = false;
-        else session.turnActive = true;
-        method = fallback;
+        if (view) view.status = method === "turn/interject" ? "running" : "idle";
       }
     }
     session.lastError = formatError(lastError);
@@ -295,7 +296,8 @@ Replace `send` with:
   };
 ```
 
-`ThreadStatus` is already imported at `desktop/src/App.tsx:11`.
+`ThreadStatus` is already imported at `desktop/src/App.tsx:11` (still needed by
+the sidebar `statuses` map even though `send` no longer names it).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -350,10 +352,14 @@ git commit -m "docs: record the desktop stale-status send recovery"
 **Spec coverage**
 - §2.1 (C, self-heal) → Task 2.
 - §2.2 (B, snapshot no rollback) → Task 1.
-- §2.3 (A, input/first-method alignment on session status) → Task 2 Step 3 (`preferredSendMethod(session.turnActive)`).
+- §2.3 (A) → resolved during implementation: the first-method source stays the cached status, documented in Task 2 Step 3 and in the spec §2.3.
 - §2.4 tests 1-4 → Task 2 Step 1; tests 5-7 → Task 1 Step 1 (7 is covered by the pre-existing "seeds status and cwd/model from a listing snapshot" case, which must stay green).
 - §3 docs row → Task 3.
 
 **Type consistency:** `preferredSendMethod` returns `"turn/interject" | "turn/start"`; the fallback ternary mirrors it; `ThreadStatus` is the imported union; `isMethodMismatchCode` narrows to `number` and both call sites compare against the exact codes used by the server (`server.rs` `not_running` = -32013, `turn_in_progress` = -32012).
 
-**Known risk to verify in Task 2 Step 4:** the pre-existing test drives `thread/status/updated: running` but not `turn/started`. If `turnActive` and `statuses` were both consulted before, that test may now pick `turn/start`. If so, update that test to also fire `turn/started` (the honest arrangement: a running turn always emits both) rather than reintroducing `statuses` into the decision.
+**Test-arrangement note (resolved):** the recovery tests must make the cache say
+`running` by seeding `thread/listAll` with `status: "running"` (add a
+`state.listStatus` knob, reset to `"idle"` in `beforeEach`). Firing
+`turn/started` instead flips the button to "Stop" and there is no Send button
+left to click. The helper may match `/^(send|stop)$/i` defensively.
