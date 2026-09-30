@@ -2675,7 +2675,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(paired, vec!["done"], "the completed tool_result is retained");
+        assert_eq!(
+            paired,
+            vec!["done"],
+            "the completed tool_result is retained"
+        );
         assert!(
             !session.messages().iter().any(|m| m.role == Role::Assistant
                 && m.content.iter().any(|b| matches!(
