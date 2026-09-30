@@ -21,6 +21,11 @@ const { clients, state } = vi.hoisted(() => ({
     threads: null as ThreadSeed[] | null,
     notifHandlers: [] as Array<(n: unknown) => void>,
     approvalHandlers: [] as Array<(r: unknown) => void>,
+    // Method -> error code. When a request matches, reject with that code, so a
+    // test can force the `-32013` / `-32012` disagreement the server can report.
+    rejectCode: {} as Record<string, number>,
+    // Status reported by `thread/listAll` for every seeded thread.
+    listStatus: "idle" as "idle" | "running" | "awaiting_approval",
   },
 }));
 
@@ -44,6 +49,8 @@ vi.mock("./lib/rpc", () => ({
     }
     async request(method: string, params: unknown) {
       this.requests.push({ method, params });
+      const forced = state.rejectCode[method];
+      if (forced !== undefined) throw { code: forced, message: `forced ${forced}` };
       if (method === "thread/listAll") {
         this.listCalls += 1;
         if (state.failList) throw { code: -1, message: "list failed" };
@@ -66,7 +73,7 @@ vi.mock("./lib/rpc", () => ({
                 updated_at: 0,
                 title: t.title,
                 permission_mode: t.permission_mode,
-                status: "idle",
+                status: state.listStatus,
               })),
             },
           ],
@@ -103,6 +110,8 @@ beforeEach(() => {
   state.threads = null;
   state.notifHandlers.length = 0;
   state.approvalHandlers.length = 0;
+  state.rejectCode = {};
+  state.listStatus = "idle";
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -428,5 +437,112 @@ describe("App parallel threads", () => {
     fireEvent.click(screen.getByRole("button", { name: /jump/i }));
     // 跳到 t1 后显示其审批模态。
     await waitFor(() => expect(screen.getByText(/bash/)).toBeTruthy());
+  });
+});
+
+/**
+ * The server and the client can disagree about whether a turn is active:
+ * `turn/completed` reaches the client before the server flips the thread back
+ * to idle, so a send can pick the wrong method. The server answers with a
+ * specific code (`-32013` for `turn/interject` with nothing running, `-32012`
+ * for `turn/start` while one is), and the client must read it, switch method,
+ * and still deliver the text.
+ */
+describe("App send recovery from a status disagreement", () => {
+  const sendFromInput = async (text: string) => {
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: text } });
+    // While a turn is active the button reads "Stop"; this harness clicks it
+    // either way, since Enter would take the same branch.
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+  };
+
+  /**
+   * Make `thread/listAll` report t1 as running, so the very first listing the
+   * app does puts the cached status into the disagreed state. (Firing
+   * `turn/started` instead would flip the button to "Stop" and there would be
+   * no Send button left to click.)
+   */
+  const seedRunning = () => {
+    state.listStatus = "running";
+  };
+
+  it("falls back to turn/start when turn/interject answers -32013", async () => {
+    seedRunning();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    state.rejectCode = { "turn/interject": -32013 };
+
+    await sendFromInput("late message");
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    expect(clients[0].requests.map((r) => r.method)).toContain("turn/interject");
+    // The text was delivered, not dropped on the error.
+    expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toMatchObject({
+      threadId: "t1",
+      input: [{ type: "text", text: "late message" }],
+    });
+    expect(screen.queryByText(/no turn is running/i)).toBeNull();
+  });
+
+  it("falls back to turn/interject when turn/start answers -32012", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // The client believes the thread is idle; the server already started a turn.
+    state.rejectCode = { "turn/start": -32012 };
+
+    await sendFromInput("raced message");
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/interject")).toBe(true),
+    );
+    expect(clients[0].requests.map((r) => r.method)).toContain("turn/start");
+    expect(clients[0].requests.find((r) => r.method === "turn/interject")?.params).toMatchObject({
+      threadId: "t1",
+      input: [{ type: "text", text: "raced message" }],
+    });
+  });
+
+  it("does not ping-pong when both methods fail, and surfaces the error", async () => {
+    seedRunning();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    state.rejectCode = { "turn/interject": -32013, "turn/start": -32012 };
+
+    await sendFromInput("doomed");
+
+    await waitFor(() => expect(screen.getByText(/forced -32012/)).toBeTruthy());
+    const methods = clients[0].requests.map((r) => r.method);
+    expect(methods.filter((m) => m === "turn/interject")).toHaveLength(1);
+    expect(methods.filter((m) => m === "turn/start")).toHaveLength(1);
+    // Nothing was accepted, so the draft is kept for a retry rather than
+    // silently dropped.
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("doomed");
+  });
+
+  it("picks the method the UI is showing after the turn completes", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    state.notifHandlers[0]({
+      method: "turn/completed",
+      params: { thread_id: "t1", turn_id: "u1", status: "completed" },
+    });
+
+    await sendFromInput("follow-up");
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    expect(clients[0].requests.map((r) => r.method)).not.toContain("turn/interject");
   });
 });

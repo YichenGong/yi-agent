@@ -22,6 +22,14 @@ export interface ThreadView {
  */
 export class ThreadStore {
   private views = new Map<string, ThreadView>();
+  /**
+   * Which source last wrote each thread's `status`: `"live"` for the
+   * `thread/status/updated` push stream (authoritative), `"snapshot"` for a
+   * `thread/listAll` listing (a point-in-time read that can be stale), or
+   * absent when no status has been learned yet. `seed` uses this to avoid
+   * rolling a live status back.
+   */
+  private statusSource = new Map<string, "live" | "snapshot">();
   currentId: string | null = null;
 
   private create(): ThreadView {
@@ -66,14 +74,25 @@ export class ThreadStore {
   }
 
   /**
-   * 用 `thread/listAll` 快照播种状态与 cwd/model。**不改动会话内容**——
-   * 会话只由通知累积。快照覆盖状态是安全的：服务端既是快照也是实时流的权威，
-   * 且每次 `turn/completed` 后都会重新拉取快照。
+   * Seeds status and cwd/model from a `thread/listAll` snapshot. **Does not
+   * touch session content** — sessions are accumulated from notifications only.
+   *
+   * The snapshot is a point-in-time read that can be stale: the server writes
+   * `turn/completed` *before* it persists the turn and flips the thread back to
+   * `idle`, and the app re-lists the moment it sees `turn/completed`. A listing
+   * issued inside that window still reports `running`. So the snapshot only
+   * *seeds* a status the client has never had one for; once the push stream has
+   * written one, the snapshot must not roll it back. A default `idle` from a
+   * merely-created view is not "written by the push stream" — `statusSource`
+   * records which it is.
    */
   seed(threads: ThreadSummary[]): void {
     for (const t of threads) {
       const v = this.view(t.thread_id);
-      v.status = t.status ?? "idle";
+      if (this.statusSource.get(t.thread_id) !== "live") {
+        v.status = t.status ?? "idle";
+        this.statusSource.set(t.thread_id, "snapshot");
+      }
       v.info = { cwd: t.cwd, model: t.model };
     }
   }
@@ -83,6 +102,7 @@ export class ThreadStore {
     if (n.method === "thread/status/updated") {
       const v = this.view(n.params.thread_id);
       v.status = n.params.status;
+      this.statusSource.set(n.params.thread_id, "live");
       // 离开 awaiting_approval（决定 / 超时 / 中断）即清掉可能残留的审批框，
       // 否则超时后前端会留下一个点不掉的模态。
       if (n.params.status !== "awaiting_approval") v.approval = null;
@@ -121,6 +141,7 @@ export class ThreadStore {
   /** 删除某 thread 的全部客户端状态。 */
   drop(id: string): void {
     this.views.delete(id);
+    this.statusSource.delete(id);
     if (this.currentId === id) this.currentId = null;
   }
 }

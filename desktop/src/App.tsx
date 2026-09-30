@@ -37,6 +37,17 @@ function modeForThread(groups: WorkspaceGroup[], id: string): ThreadMode | null 
   return t ? (t.permission_mode ?? "normal") : null;
 }
 
+/**
+ * `-32013` means `turn/interject` arrived with no turn running; `-32012` means
+ * `turn/start` arrived while one was. Both say "the other method was the right
+ * one" — the server resolves the disagreement, so the code is read from the raw
+ * rejection (`formatError` would drop it).
+ */
+function sendMethodMismatchCode(e: unknown): number | null {
+  const code = (e as { code?: unknown } | null)?.code;
+  return code === -32013 || code === -32012 ? code : null;
+}
+
 export default function App() {
   // Per-thread state lives in a mutable store; the `force` tick is how React
   // learns that a view changed (the views are mutated in place, not setState'd).
@@ -305,26 +316,37 @@ export default function App() {
     const session = store.view(id).session;
     session.addUserMessage(text);
     force((v) => v + 1);
-    // Fold into the running turn when there is one: `turn/start` would be
-    // rejected outright, and the text would take effect only after the whole
-    // cycle finished. The server answers `turn/interject` with the turn it
-    // joined (or -32013 when nothing is running).
-    const method = store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
-    try {
-      await c.request(method, {
-        threadId: id,
-        input: [{ type: "text", text }],
-      });
-      return true;
-    } catch (e) {
-      session.lastError = formatError(e);
-      // Roll back the optimistic bubble so a rejected send (e.g. -32012 when a
-      // turn started in the meantime) does not leave a phantom user message.
-      const last = session.items[session.items.length - 1];
-      if (last && last.type === "userMessage" && last.text === text) session.items.pop();
-      force((v) => v + 1);
-      return false;
+    // The cached status can be stale: `turn/completed` reaches us before the
+    // server flips the thread back to idle, and a listing read inside that
+    // window keeps the old value. Send the method the cache implies, then let
+    // the server's error code say where it disagreed and switch to the other
+    // one. Each direction is tried once, so two mismatches cannot ping-pong.
+    const params = { threadId: id, input: [{ type: "text", text }] };
+    let method: "turn/interject" | "turn/start" =
+      store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
+    let lastError: unknown = null;
+    for (let hop = 0; hop < 2; hop += 1) {
+      try {
+        await c.request(method, params);
+        return true;
+      } catch (e) {
+        lastError = e;
+        const code = sendMethodMismatchCode(e);
+        if (code === null) break;
+        // Adopt the server's view so the next send (and the button) is right.
+        method = method === "turn/interject" ? "turn/start" : "turn/interject";
+        session.turnActive = method === "turn/interject";
+        const view = store.peek(id);
+        if (view) view.status = method === "turn/interject" ? "running" : "idle";
+      }
     }
+    session.lastError = formatError(lastError);
+    // Roll back the optimistic bubble so a rejected send does not leave a
+    // phantom user message.
+    const last = session.items[session.items.length - 1];
+    if (last && last.type === "userMessage" && last.text === text) session.items.pop();
+    force((v) => v + 1);
+    return false;
   };
 
   const interrupt = () => {
