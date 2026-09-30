@@ -127,7 +127,7 @@ pub fn save(workdir: &Path, pref: RuntimePreference) -> io::Result<()>;
 - 唯一来源是偏好文件；缺失或非法一律 `ask`（§3.1）。
 - `<workdir>` 取 `config.workdir`，与 runtime 目录共用同一解析基准（`main.rs:558`
   `runtime_directory_for`），保证"读偏好"与"起 runtime"看的是同一个项目。
-- 不提供 CLI / env 覆盖（见 §2.1）。
+- 不提供 CLI / env 覆盖（见 §2.1）。若要临时改偏好，用 `/runtime`（§3.6）。
 
 ### 3.3 启动意图（TUI 侧）
 
@@ -222,10 +222,15 @@ if pref == RuntimePreference::Always {
 `spawn_agent` 工具"（这正是 `runtime_unavailable_reason` 当初存在的理由，`main.rs:789`）：
 
 ```
-subagent delegation disabled (.yi-agent/preferences.json: never); use /runtime to enable
+已禁用子 Agent 委派（.yi-agent/preferences.json: never）；用 /runtime 开启
 ```
 
 在 `run_loop` 首次渲染时 push 一条 `HistoryCell::Separator` 即可（纯 TUI 本地，driver 无感）。
+
+**语言一致性：** TUI 上面向用户的行一律用中文——既有先例见 `/mcp` 的
+`MCP server '{name}' 已开启` 与 `/clear` 的 `对话已清空`（`app.rs:1699-1704`、
+`app.rs:1568-1572`）。英文只用于 `runtime_unavailable_reason`（`main.rs:789`）这类**内部
+诊断**字符串（它们经 `tracing` 或错误行输出）。§3.6 的 `/runtime` 回显同理用中文。
 
 ---
 
@@ -235,7 +240,7 @@ subagent delegation disabled (.yi-agent/preferences.json: never); use /runtime t
 | --- | --- |
 | `crates/yi-agent/src/tui/runtime_prefs.rs` | **新增**：`RuntimePreference` + `load`/`save`（原子写）+ 单测 |
 | `crates/yi-agent/src/tui/mod.rs` | 注册 `pub mod runtime_prefs;` |
-| `crates/yi-agent/src/tui/subagents.rs` | 新增 `RuntimeStartupIntent`；既有 `RuntimeBootstrapModel` 若仍无生产用途则评估删除（避免留下"看着像在用"的死代码） |
+| `crates/yi-agent/src/tui/subagents.rs` | 新增 `RuntimeStartupIntent`；**删除**零引用的死代码 `RuntimeBootstrapModel` / `RuntimeBootstrapState` / `TuiRuntimeMode`（见 §5.5） |
 | `crates/yi-agent/src/main.rs` | 读偏好决定 intent；`always` 预置 `Start`；构造 `RuntimeStartupIntent` 传入 `run_tui` |
 | `crates/yi-agent/src/tui/app.rs` | `run_tui` / `run_loop` 参数改为 `Option<RuntimeStartupIntent>`（含 `run_tui_with_backend` 的 `None` 传参，`app.rs:191`）；弹窗文案与 `box_h`；按键写偏好；`/runtime` 执行分支 |
 | `crates/yi-agent/src/tui/slash.rs` | `SlashCommand::Runtime` + `parse_runtime_args` |
@@ -273,6 +278,32 @@ subagent delegation disabled (.yi-agent/preferences.json: never); use /runtime t
 弹窗原文即 `[y] 启动并启用子 Agent`，用户按 `y` 就是显式同意；记住它只是免除重复同意，
 不是"静默启动"。`always` **仅**由用户按键或 `/runtime` 显式设置产生（无 CLI/env 捷径，
 §2.1），Agent 的任何委派尝试都不会触发它。
+
+### 5.5 删除死代码（已核实为零引用）
+
+`crates/yi-agent/src/tui/subagents.rs` 顶部有 `#![allow(dead_code)]`，掩盖了三项从未在
+生产路径使用的类型。外部引用计数（`grep -rn` 排除 `subagents.rs` 自身）：
+
+| 类型 | 外部引用 |
+| --- | --- |
+| `TuiRuntimeMode` | 0 |
+| `RuntimeBootstrapModel` | 0 |
+| `RuntimeBootstrapState` | 0 |
+| （对照）`RuntimeStartupChoice` | 10 |
+| （对照）`AttachedRoot` | 11 |
+| （对照）`register_attached_root_tools` | 2 |
+
+因此：**删除** `TuiRuntimeMode`、`RuntimeBootstrapModel`、`RuntimeBootstrapState` 及其
+两个专属单测（`disconnected_state_only_prompts_before_user_confirms_runtime_start`、
+`user_can_continue_without_starting_runtime`）。本设计中 `runtime_prefs` 与
+`RuntimeStartupIntent` 取代了它们的职责。
+
+保留 `RuntimeStartupChoice`（两态不变，§3.4）、`AttachedRoot`、
+`register_attached_root_tools`、`set_current_attached_root`、`current_attached_root`
+——这些仍在生产路径使用。
+
+删除后应能移除 `subagents.rs` 顶部的 `#![allow(dead_code)]`；若编译器仍报未使用项，
+逐个核对后一并清理，**不得**用新增 `allow` 掩盖。
 
 ---
 
