@@ -9,6 +9,7 @@ pub mod input;
 pub mod markdown;
 pub mod process_popup;
 pub mod queued;
+pub mod runtime_prefs;
 pub mod slash;
 pub mod state;
 pub mod statusbar;

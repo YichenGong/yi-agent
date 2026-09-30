@@ -1,0 +1,139 @@
+//! Project-level TUI preferences persisted under `<workdir>/.yi-agent/`.
+
+// Scaffolding: nothing consumes this module yet. Tasks 2/4/5 wire it into the
+// TUI; remove this allow when the last consumer lands. Same pattern as
+// `tui/subagents.rs`.
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Whether the TUI should offer to start the local subagent runtime on launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimePreference {
+    #[default]
+    Ask,
+    Always,
+    Never,
+}
+
+/// On-disk shape. A wrapper object (not a bare string) so more preferences can
+/// be added later without breaking existing files.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PreferencesFile {
+    #[serde(default)]
+    subagent_runtime: RuntimePreference,
+}
+
+/// Path of the project-level preference file: `<workdir>/.yi-agent/preferences.json`.
+pub fn preferences_path(workdir: &Path) -> PathBuf {
+    workdir.join(".yi-agent").join("preferences.json")
+}
+
+/// Load the preference.
+///
+/// A missing, unreadable, or malformed file yields `Ask`: a broken preference
+/// must never block startup or silently disable delegation.
+pub fn load(workdir: &Path) -> RuntimePreference {
+    let path = preferences_path(workdir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RuntimePreference::Ask;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "could not read TUI preferences; using defaults"
+            );
+            return RuntimePreference::Ask;
+        }
+    };
+    match serde_json::from_str::<PreferencesFile>(&text) {
+        Ok(file) => file.subagent_runtime,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "invalid TUI preferences; using defaults"
+            );
+            RuntimePreference::Ask
+        }
+    }
+}
+
+/// Persist the preference atomically: write a sibling temp file, then rename.
+///
+/// Mirrors `yi-agent-core/src/permission.rs` (`permissions.toml`), where rename
+/// within one filesystem is atomic — a crash cannot leave a half-written file.
+pub fn save(workdir: &Path, pref: RuntimePreference) -> std::io::Result<()> {
+    let dir = workdir.join(".yi-agent");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("preferences.json");
+    let body = PreferencesFile {
+        subagent_runtime: pref,
+    };
+    let text = serde_json::to_string_pretty(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp_path = dir.join("preferences.json.tmp");
+    std::fs::write(&tmp_path, &text)?;
+    std::fs::rename(&tmp_path, &path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_defaults_to_ask() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(load(dir.path()), RuntimePreference::Ask);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_every_state() {
+        for pref in [
+            RuntimePreference::Ask,
+            RuntimePreference::Always,
+            RuntimePreference::Never,
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            save(dir.path(), pref).unwrap();
+            assert_eq!(load(dir.path()), pref);
+        }
+    }
+
+    #[test]
+    fn malformed_and_unknown_values_fall_back_to_ask() {
+        for body in [
+            "not json at all",
+            "{\"subagent_runtime\":\"bogus\"}",
+            "[]",
+            "{\"subagent_runtime\":5}",
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+            std::fs::write(preferences_path(dir.path()), body).unwrap();
+            assert_eq!(load(dir.path()), RuntimePreference::Ask, "body: {body}");
+        }
+    }
+
+    #[test]
+    fn empty_object_defaults_to_ask() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(preferences_path(dir.path()), "{}").unwrap();
+        assert_eq!(load(dir.path()), RuntimePreference::Ask);
+    }
+
+    #[test]
+    fn save_creates_directory_and_leaves_no_temp_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save(dir.path(), RuntimePreference::Never).unwrap();
+        assert!(dir.path().join(".yi-agent/preferences.json").exists());
+        assert!(!dir.path().join(".yi-agent/preferences.json.tmp").exists());
+    }
+}
