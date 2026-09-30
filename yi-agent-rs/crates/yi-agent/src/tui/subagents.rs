@@ -1,7 +1,5 @@
 //! TUI-facing subagent runtime attachment model.
 
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -16,6 +14,20 @@ use crate::tui::slash::SlashCommand;
 pub enum RuntimeStartupChoice {
     Start,
     ContinueWithoutDelegation,
+}
+
+/// What the TUI should do about the local subagent runtime on launch.
+///
+/// Chosen by `main.rs` from the persisted preference (§`runtime_prefs`), so the
+/// UI layer never reads the preference file itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeStartupIntent {
+    /// Show the yes/no dialog and wait for the user.
+    Prompt,
+    /// Do not start; show one separator line explaining why.
+    DisabledNotice { reason: String },
+    /// Start without asking; `main.rs` pre-seeds `RuntimeStartupChoice::Start`.
+    AutoStart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,76 +55,6 @@ pub fn current_attached_root() -> Option<AttachedRoot> {
         .clone()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TuiRuntimeMode {
-    Attached(AttachedRoot),
-    Disabled { reason: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum RuntimeBootstrapState {
-    #[default]
-    Disconnected,
-    Prompting,
-    Attached(AttachedRoot),
-    Disabled {
-        reason: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeStartPrompt {
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Debug, Default)]
-pub struct RuntimeBootstrapModel {
-    state: RuntimeBootstrapState,
-}
-
-impl RuntimeBootstrapModel {
-    pub fn disconnected_prompt(&mut self) -> Option<RuntimeStartPrompt> {
-        match self.state {
-            RuntimeBootstrapState::Disconnected => {
-                self.state = RuntimeBootstrapState::Prompting;
-                Some(RuntimeStartPrompt {
-                    title: "启动本地 Agent Runtime?".into(),
-                    body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
-                })
-            }
-            _ => None,
-        }
-    }
-
-    pub fn apply_choice<F>(&mut self, choice: RuntimeStartupChoice, mut attach: F) -> TuiRuntimeMode
-    where
-        F: FnMut() -> Result<AttachedRoot, String>,
-    {
-        match choice {
-            RuntimeStartupChoice::Start => match attach() {
-                Ok(root) => {
-                    self.state = RuntimeBootstrapState::Attached(root.clone());
-                    TuiRuntimeMode::Attached(root)
-                }
-                Err(reason) => {
-                    self.state = RuntimeBootstrapState::Disabled {
-                        reason: reason.clone(),
-                    };
-                    TuiRuntimeMode::Disabled { reason }
-                }
-            },
-            RuntimeStartupChoice::ContinueWithoutDelegation => {
-                let reason = "用户选择不启动本地 Agent Runtime".to_string();
-                self.state = RuntimeBootstrapState::Disabled {
-                    reason: reason.clone(),
-                };
-                TuiRuntimeMode::Disabled { reason }
-            }
-        }
-    }
-}
-
 pub fn register_attached_root_tools(
     registry: &mut ToolRegistry,
     runtime_socket: PathBuf,
@@ -129,8 +71,6 @@ pub fn register_attached_root_tools(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use yi_agent_core::subagent::task::WorkspaceLeaseId;
 
     use super::*;
@@ -153,42 +93,6 @@ mod tests {
             capability: "capability-1".into(),
             workspace: worker_workspace(),
         }
-    }
-
-    #[test]
-    fn disconnected_state_only_prompts_before_user_confirms_runtime_start() {
-        let launches = Arc::new(Mutex::new(0));
-        let mut model = RuntimeBootstrapModel::default();
-
-        let prompt = model
-            .disconnected_prompt()
-            .expect("disconnected state prompts for runtime startup");
-
-        assert!(prompt.title.contains("Runtime"));
-        assert_eq!(*launches.lock().unwrap(), 0);
-        let launches_for_attach = Arc::clone(&launches);
-        let mode = model.apply_choice(RuntimeStartupChoice::Start, || {
-            *launches_for_attach.lock().unwrap() += 1;
-            Ok(attached_root())
-        });
-        assert!(matches!(mode, TuiRuntimeMode::Attached(_)));
-        assert_eq!(*launches.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn user_can_continue_without_starting_runtime() {
-        let launches = Arc::new(Mutex::new(0));
-        let launches_for_attach = Arc::clone(&launches);
-        let mut model = RuntimeBootstrapModel::default();
-        let _ = model.disconnected_prompt();
-
-        let mode = model.apply_choice(RuntimeStartupChoice::ContinueWithoutDelegation, || {
-            *launches_for_attach.lock().unwrap() += 1;
-            Ok(attached_root())
-        });
-
-        assert!(matches!(mode, TuiRuntimeMode::Disabled { .. }));
-        assert_eq!(*launches.lock().unwrap(), 0);
     }
 
     #[test]

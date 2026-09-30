@@ -1007,6 +1007,25 @@ git commit -m "feat(tui): honour persisted runtime preference and add /runtime"
         assert!(reason.contains("/runtime"), "reason: {reason}");
         assert!(reason.contains("已禁用"), "reason: {reason}");
     }
+
+    #[test]
+    fn reading_the_intent_does_not_create_the_preference_directory() {
+        use crate::tui::runtime_prefs::preferences_path;
+        use crate::tui::subagents::RuntimeStartupIntent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // A project that never opted in has no `.yi-agent/`. Deriving the
+        // startup intent must stay read-only: creating the directory would
+        // dirty every project the user merely launched the TUI in.
+        assert!(matches!(
+            startup_intent_for(dir.path()),
+            Some(RuntimeStartupIntent::Prompt)
+        ));
+        assert!(
+            !preferences_path(dir.path()).exists(),
+            "deriving the startup intent must not create .yi-agent/"
+        );
+    }
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1094,8 +1113,15 @@ fn startup_intent_for(
 ```bash
 cargo test -p yi-agent --bin yi-agent -- preference_maps_to_startup_intent 2>&1 | tail -10
 cargo test -p yi-agent --bin yi-agent -- never_notice 2>&1 | tail -10
+cargo test -p yi-agent --bin yi-agent -- reading_the_intent_does_not_create_the_preference_directory 2>&1 | tail -10
 ```
-预期：2 passed。
+预期：3 passed。
+
+**为什么需要第三条测试**：`startup_intent_for` 在 `Ask`/`Always`/`Never` 三条路径上都会经过
+`load`，而 `load` 只读不写。但如果将来有人为了"顺手建目录"或"写默认值"而在读路径里调用
+`save` / `create_dir_all`，**每次启动 TUI 都会在每个项目里凭空创建 `.yi-agent/`**，弄脏用户
+仓库，而现有断言"返回 `Prompt`"照样通过。第三条测试断言"读 intent 不产生目录"，用一条断言
+钉住这个副作用。
 
 - [ ] **Step 6: 全量回归、格式化、提交**
 
@@ -1131,7 +1157,7 @@ git commit -m "feat(tui): derive runtime startup intent from the stored preferen
 追加一条，问题行写：
 
 ```
-- [x] TUI 每次启动都弹「启动本地 Agent Runtime?」，且按 n 后本会话与后续会话都无法再启用子 Agent（修复：偏好持久化到项目级 `.yi-agent/preferences.json`（`ask`/`always`/`never`，缺失或损坏一律 `ask`，原子写，见 `yi-agent.rs/crates/yi-agent/src/tui/runtime_prefs.rs`）；启动时由 `main.rs` `startup_intent_for` 折算为 `RuntimeStartupIntent`（`Prompt`/`AutoStart`/`DisabledNotice`），`always` 复用既有 attach 路径——预置 `RuntimeStartupChoice::Start` 到 `runtime_choice_tx`，driver 与 daemon 零改动；`y`/`n` 落盘、`Esc` 仅本次不落盘；新增 `/runtime [ask|always|never]` 逆转选择；弹窗文案改为区分三者且 `box_h` 6→8；删除零引用死代码 `RuntimeBootstrapModel`/`RuntimeBootstrapState`/`TuiRuntimeMode`。见 [设计](../superpowers/specs/2026-09-30-tui-subagent-runtime-preference-design.md)、[计划](../superpowers/plans/2026-09-30-tui-subagent-runtime-preference-impl.md)。验证：`cargo test -p yi-agent --bin yi-agent`）
+- [x] TUI 每次启动都弹「启动本地 Agent Runtime?」，且按 n 后本会话与后续会话都无法再启用子 Agent（修复：偏好持久化到项目级 `.yi-agent/preferences.json`（`ask`/`always`/`never`，缺失或损坏一律 `ask`，原子写，见 `yi-agent-rs/crates/yi-agent/src/tui/runtime_prefs.rs`）；启动时由 `main.rs` `startup_intent_for` 折算为 `RuntimeStartupIntent`（`Prompt`/`AutoStart`/`DisabledNotice`），`always` 复用既有 attach 路径——预置 `RuntimeStartupChoice::Start` 到 `runtime_choice_tx`，driver 与 daemon 零改动；`y`/`n` 落盘、`Esc` 仅本次不落盘；新增 `/runtime [ask|always|never]` 逆转选择；弹窗文案改为区分三者且 `box_h` 6→10；删除零引用死代码 `RuntimeBootstrapModel`/`RuntimeBootstrapState`/`TuiRuntimeMode`。见 [设计](../superpowers/specs/2026-09-30-tui-subagent-runtime-preference-design.md)、[计划](../superpowers/plans/2026-09-30-tui-subagent-runtime-preference-impl.md)。验证：`cargo test -p yi-agent --bin yi-agent`）
 ```
 
 > 实现时请把这条的单行内容写成与仓库现有条目一致的一行；上面用多行只是为了可读。
@@ -1173,8 +1199,9 @@ TMP=$(mktemp -d) && cd "$TMP" && git init -q && echo ok > README.md \
 然后在该目录运行目标二进制，逐条确认：
 
 1. 无 `.yi-agent/preferences.json` → 弹窗（与今天一致）。
-2. 按 `y` → 子 Agent 启用；`cat .yi-agent/preferences.json` 应为
-   `{"subagent_runtime": "always"}`；重启不再弹窗。
+2. 按 `y` → 子 Agent 启用；`cat .yi-agent/preferences.json` 应含
+   `"subagent_runtime": "always"`（`save` 用 `to_string_pretty`，所以是多行 JSON；判定
+   标准是"能被 `serde_json` 读回 `always`"，不是逐字节匹配）；重启不再弹窗。
 3. `/runtime` → 显示 `子 Agent runtime 偏好: always`；`/runtime never` → 提示"重启后生效"。
 4. 重启（此时为 `never`）→ 不弹窗、无委派、且首屏有一行中文禁用提示。
 5. `/runtime ask` → 重启后重新弹窗。

@@ -816,6 +816,28 @@ fn runtime_attached_root_rejection(response: &yi_agent_store::ipc::IpcResponse) 
     }
 }
 
+/// Maps the persisted runtime preference to what the TUI should do on launch.
+///
+/// The preference file is the single source of truth: a missing or malformed
+/// file reads as `Ask`, so existing users keep today's behaviour.
+fn startup_intent_for(
+    workdir: &std::path::Path,
+) -> Option<crate::tui::subagents::RuntimeStartupIntent> {
+    use crate::tui::runtime_prefs::{self, RuntimePreference};
+    use crate::tui::subagents::RuntimeStartupIntent;
+
+    Some(match runtime_prefs::load(workdir) {
+        RuntimePreference::Ask => RuntimeStartupIntent::Prompt,
+        RuntimePreference::Always => RuntimeStartupIntent::AutoStart,
+        RuntimePreference::Never => RuntimeStartupIntent::DisabledNotice {
+            reason: format!(
+                "已禁用子 Agent 委派（{}: never）；用 /runtime 开启",
+                runtime_prefs::preferences_path(workdir).display()
+            ),
+        },
+    })
+}
+
 fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
@@ -1291,6 +1313,18 @@ fn run_tui_agent(
         )>));
         let is_running = Arc::new(AtomicBool::new(false));
 
+        // `always` reuses the existing attach path by pre-seeding the choice the
+        // driver would otherwise wait for. Capacity is 1 and nothing has been
+        // sent yet, so `try_send` cannot fail here.
+        let runtime_intent = startup_intent_for(&workdir);
+        if matches!(
+            runtime_intent,
+            Some(crate::tui::subagents::RuntimeStartupIntent::AutoStart)
+        ) {
+            let _ = runtime_choice_tx
+                .try_send(crate::tui::subagents::RuntimeStartupChoice::Start);
+        }
+
         enum DriverInput {
             Prompt(Option<String>),
             Control(Option<ControlCommand>),
@@ -1597,10 +1631,9 @@ fn run_tui_agent(
                 decision_tx,
                 is_running,
                 agent_config.model.clone(),
-                Some(crate::tui::subagents::RuntimeStartPrompt {
-                    title: "启动本地 Agent Runtime?".into(),
-                    body: "启动后可以直接用自然语言创建和管理子 Agent。按 y 启动，按 n 跳过。".into(),
-                }),
+                runtime_intent,
+                // The driver's `RuntimeChoice(None) => break` means this sender
+                // must outlive the session: dropping it would end the run.
                 Some(runtime_choice_tx),
                 process_manager,
                 workdir.clone(),
@@ -2334,5 +2367,65 @@ mod tests {
         ignore_project_local_runtime_state(directory.path());
 
         assert!(!directory.path().join(".git").exists());
+    }
+
+    #[test]
+    fn preference_maps_to_startup_intent() {
+        use crate::tui::runtime_prefs::{RuntimePreference, save};
+        use crate::tui::subagents::RuntimeStartupIntent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+
+        save(dir.path(), RuntimePreference::Ask).unwrap();
+        assert!(matches!(
+            startup_intent_for(dir.path()),
+            Some(RuntimeStartupIntent::Prompt)
+        ));
+
+        save(dir.path(), RuntimePreference::Always).unwrap();
+        assert!(matches!(
+            startup_intent_for(dir.path()),
+            Some(RuntimeStartupIntent::AutoStart)
+        ));
+
+        save(dir.path(), RuntimePreference::Never).unwrap();
+        assert!(matches!(
+            startup_intent_for(dir.path()),
+            Some(RuntimeStartupIntent::DisabledNotice { .. })
+        ));
+    }
+
+    #[test]
+    fn never_notice_is_chinese_and_points_at_the_command() {
+        use crate::tui::runtime_prefs::{RuntimePreference, save};
+        use crate::tui::subagents::RuntimeStartupIntent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        save(dir.path(), RuntimePreference::Never).unwrap();
+        let Some(RuntimeStartupIntent::DisabledNotice { reason }) = startup_intent_for(dir.path())
+        else {
+            panic!("never must produce a disabled notice");
+        };
+        assert!(reason.contains("/runtime"), "reason: {reason}");
+        assert!(reason.contains("已禁用"), "reason: {reason}");
+    }
+
+    #[test]
+    fn reading_the_intent_does_not_create_the_preference_directory() {
+        use crate::tui::runtime_prefs::preferences_path;
+        use crate::tui::subagents::RuntimeStartupIntent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // A project that never opted in has no `.yi-agent/`. Deriving the
+        // startup intent must stay read-only: creating the directory would
+        // dirty every project the user merely launched the TUI in.
+        assert!(matches!(
+            startup_intent_for(dir.path()),
+            Some(RuntimeStartupIntent::Prompt)
+        ));
+        assert!(
+            !preferences_path(dir.path()).exists(),
+            "deriving the startup intent must not create .yi-agent/"
+        );
     }
 }
