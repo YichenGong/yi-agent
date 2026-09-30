@@ -30,6 +30,13 @@ export function ApprovalDialog({
   );
 
   useEffect(() => {
+    // Never steal focus from a text field the user is typing in. The approval
+    // arrives mid-turn, so it can land while the sidebar's rename input holds a
+    // half-typed title: focusing Deny would blur that field, whose onBlur
+    // commits the draft and unmounts it. Escape still denies, so the dialog
+    // keeps a safe default while the user finishes typing.
+    const active = document.activeElement;
+    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
     denyRef.current?.focus();
   }, []);
 
