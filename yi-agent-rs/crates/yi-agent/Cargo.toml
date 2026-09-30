@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 clap = { workspace = true }
+clap_complete = { workspace = true }
 crossterm = { workspace = true }
 
 dirs = "5"
