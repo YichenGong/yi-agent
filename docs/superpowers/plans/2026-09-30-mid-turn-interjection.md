@@ -33,7 +33,7 @@
 - Consumes: nothing (foundation task).
 - Produces: `Interjection { seq: u64, text: String, tag: Option<String> }` (Clone, Debug, PartialEq, Serialize); `InterjectError { Full, NotRunning }`; `Agent::interject(&self, text: String, tag: Option<String>) -> Result<u64, InterjectError>`; `Agent::inbox_handle(&self) -> Option<InboxHandle>`; `AgentEvent::InterjectionAccepted { seq: u64, text: String, tag: Option<String> }`; `AgentEvent::InterjectionsReturned { items: Vec<Interjection> }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append inside `mod tests` in `agent.rs`:
 
@@ -92,12 +92,12 @@ Append inside `mod tests` in `agent.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::inbox_assigns_monotonic_seq_and_rejects_when_full agent::tests::interject_`
 Expected: FAIL to compile — `cannot find type Inbox`, `cannot find function interject`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `agent.rs`, next to the existing constants (`CONTINUE_AFTER_TRUNCATION` at `:313`, `COMPLETION_AUDIT_PROMPT` at `:315`), add:
 
@@ -284,12 +284,12 @@ pub use agent::{
 };
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::inbox_ agent::tests::interject_`
 Expected: PASS (3 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -391,7 +391,7 @@ git commit -m "feat(core): add the interjection inbox and its two events"
     }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[tokio::test(flavor = "multi_thread")]
@@ -443,12 +443,12 @@ git commit -m "feat(core): add the interjection inbox and its two events"
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::interjection_lands_in_context_before_the_next_request`
 Expected: FAIL — assertion "expected InterjectionAccepted" fails (nothing drains the inbox yet).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add the helper above `run_loop`:
 
@@ -492,12 +492,12 @@ In `run_loop`, insert the drain **after** `turn += 1;` (`:560`) and the `max_tur
         inject_pending(&tx, &inbox, &mut messages, &session).await;
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::interjection_lands_in_context_before_the_next_request`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -517,7 +517,7 @@ git commit -m "feat(core): drain the interjection inbox before each request"
 - Consumes: `inject_pending` from Task 2 (signature is unchanged).
 - Produces: no new API. Behaviour: when an interjection arrives after the model's final text but before the loop decides to finish, the loop injects it and continues instead of emitting `Done`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 This test must isolate the **`EndTurn` drain** from Task 2's loop-top drain. It does so by
 driving the provider's response item-by-item from the test: the interjection is delivered
@@ -645,12 +645,12 @@ reason.
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::interjection_before_end_turn_keeps_the_turn_alive`
 Expected: FAIL — `provider.seen` has only 1 entry (the turn ended without a second request).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `run_loop`, in the `if tool_uses.is_empty() {` block at `:841`, insert the drain **before** the audit check at `:842`:
 
@@ -665,12 +665,12 @@ In `run_loop`, in the `if tool_uses.is_empty() {` block at `:841`, insert the dr
             if verification_pending && !audit_attempted {
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::interjection_before_end_turn_keeps_the_turn_alive`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -690,7 +690,7 @@ git commit -m "fix(core): check for interjections before deciding the turn ended
 - Consumes: `Inbox`, `InboxHandle`, `Interjection`, `AgentEvent::InterjectionsReturned` from Task 1.
 - Produces: `async fn flush_unconsumed(tx: &EventTx, inbox: &Option<InboxHandle>)`; emits `AgentEvent::InterjectionsReturned { items }` when (and only when) the inbox is non-empty. The ordering contract — returned **before** the terminal event — is what Task 9 and Task 10 rely on.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[tokio::test(flavor = "multi_thread")]
@@ -735,12 +735,12 @@ git commit -m "fix(core): check for interjections before deciding the turn ended
 
 Note: `collect_events_async` already exists in `mod tests` (`fn collect_events_async`). Reuse it.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::cancel_returns_unconsumed_interjections_before_cancelled`
 Expected: FAIL — "the unconsumed interjection must come back" (nothing emits `InterjectionsReturned`).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add the helper above `run_loop`:
 
@@ -782,17 +782,17 @@ For example, the first one becomes:
         }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::cancel_returns_unconsumed_interjections_before_cancelled`
 Expected: PASS.
 
-- [ ] **Step 5: Run the whole core crate to catch regressions**
+- [x] **Step 5: Run the whole core crate to catch regressions**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core`
 Expected: PASS. The five existing `AgentEvent::Cancelled` assertions (`:2225`, `:2425`, `:2527`, `:2656`, `:3047`) must stay green — `Cancelled` itself is unchanged.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -814,7 +814,7 @@ git commit -m "fix(core): return unconsumed interjections before ending a turn"
 - Consumes: `Agent::interject` from Task 1.
 - Produces: `RpcError::not_running() -> Self` (code `-32013`); `pub(crate) struct InterjectionRequest { pub turn_id: String, pub interjection_id: String, pub text: String }`; `ThreadSession.interject_tx: mpsc::Sender<InterjectionRequest>`; the `turn/interject` method responding `{ "turn_id": <active turn>, "interjection_id": <new id> }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `mod tests` in `server.rs`:
 
@@ -875,12 +875,12 @@ Add to `mod tests` in `server.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::turn_interject`
 Expected: FAIL — both cases get `-32601 method not found`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `protocol.rs`, after `turn_in_progress` (`:99`):
 
@@ -1031,17 +1031,17 @@ Add the import at the top of `server.rs`:
 use crate::session::{InterjectionRequest, ThreadSession, TurnPrompt};
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::turn_interject`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Verify the `-32012` contract is intact**
+- [x] **Step 5: Verify the `-32012` contract is intact**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::turn_start_while_turn_in_progress_returns_turn_in_progress`
 Expected: PASS. `turn/start` still refuses a concurrent turn.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1062,7 +1062,7 @@ git commit -m "feat(app-server): add turn/interject folding into the active turn
 - Consumes: `AgentEvent::InterjectionAccepted { seq, text, tag }` and `AgentEvent::InterjectionsReturned { items }` from Task 1; `tag` is the `interjection_id` minted in Task 5.
 - Produces: `Item::UserInterjection { id: String, text: String }` in the protocol.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `mod tests` in `translate.rs`:
 
@@ -1114,12 +1114,12 @@ Add to `mod tests` in `translate.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib translate::tests::interjection`
 Expected: FAIL to compile — no `Item::UserInterjection`, no `Notification::InterjectionsReturned`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `protocol.rs`, extend `Item` (`:206`) with a fourth variant:
 
@@ -1177,12 +1177,12 @@ Note: `Notification::ItemStarted` / `ItemCompleted` carry **only** `thread_id` a
 (`protocol.rs:122`, `:130`) — do not add a `turn_id` field to them. Reuse the existing
 `alloc_item_id` helper (`translate.rs:121`) rather than introducing a second id minter.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib translate::`
 Expected: PASS, including the three pre-existing `Cancelled` tests (`:725`, `:1090`, `:1142`).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1204,7 +1204,7 @@ git commit -m "feat(app-server): surface mid-turn interjections as their own ite
 - Consumes: `Agent::inbox_handle` / `Agent::interject` from Task 1.
 - Produces: `DeliveredInterjections` with the same `submit -> SubmitOutcome`, `on_turn_end`, `len`, `is_empty`, `items`, `clear` surface as `PendingQueue`, plus `CAPACITY = 16`. `SubmitOutcome::{Sent, Queued, Rejected}` keeps its three states, but `Queued` now means "handed to the driver, awaiting receipt" instead of "buffered locally".
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `queued.rs`'s `mod tests`, rename the existing tests that reference `PendingQueue` and add:
 
@@ -1303,12 +1303,12 @@ In `app.rs`'s `mod tests`, add (copy the harness shape from
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent -- tui::queued::tests::busy_submit_is_reported tui::app::tests::busy_submit_reaches_the_agent_channel`
 Expected: FAIL to compile — `DeliveredInterjections` does not exist.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `queued.rs`, rename the type and add the two receipt operations, keeping `submit`/`on_turn_end`/`len`/`is_empty`/`items`/`clear` behaviour identical:
 
@@ -1406,12 +1406,12 @@ In `main.rs`, inside the run forwarding loop, take the handle after `run()` retu
                     }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent -- tui::`
 Expected: PASS. The six existing queue tests in `app.rs` (`:4490`, `:7006`, `:7089`, `:7139`, `:7246`, `:7297`) need their expectations updated for "busy submit now delivers"; update their assertions rather than deleting them, and keep the `full_queue_rejects_and_restores_input_without_blocking` intent by asserting the restore path.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1433,7 +1433,7 @@ git commit -m "feat(tui): deliver busy submits into the running turn"
 - Consumes: `AgentEvent::InterjectionAccepted` / `InterjectionsReturned` (Task 1), `DeliveredInterjections::on_receipt` / `take_returned` (Task 7).
 - Produces: no new API. Behaviour: the preview count falls as receipts arrive; returned text is restored to the input box and reported in history.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `queued.rs`:
 
@@ -1475,12 +1475,12 @@ In `app.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent -- tui::queued::tests::header_says tui::app::tests::returned_interjection`
 Expected: FAIL — header still reads `排队中`, and `apply_interjection_event` does not exist.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `queued.rs`, change the header and its doc comment:
 
@@ -1562,12 +1562,12 @@ In `history.rs`, add an arm next to `AgentEvent::Cancelled` (`:452`) so the acce
             AgentEvent::InterjectionsReturned { .. } => {}
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent -- tui::`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1589,7 +1589,7 @@ git commit -m "feat(tui): show interjection receipts and restore returned text"
 - Consumes: RPC `turn/interject` (Task 5) and notifications `Item::UserInterjection` / `turn/interjectionsReturned` (Task 6).
 - Produces: `Session.apply` handles `user_interjection` items and restores returned text into `session.pendingInput` (a `string` field the input component reads to re-seed its draft).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `desktop/src/lib/session.test.ts`:
 
@@ -1636,12 +1636,12 @@ In `desktop/src/App.test.tsx`:
 
 Copy the harness/arrangement from the existing `App.test.tsx` cases that assert on `turn/start` and on the `-32012` rollback, and adapt them.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd desktop && npm test -- session App`
 Expected: FAIL — unknown item type / unknown notification, and `turn/start` is still the only method called.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `desktop/src/lib/protocol.ts`: add to the item union
 
@@ -1712,17 +1712,17 @@ and in the item-applying branch, treat `user_interjection` exactly like `userMes
   };
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd desktop && npm test`
 Expected: PASS.
 
-- [ ] **Step 5: Build the desktop app**
+- [x] **Step 5: Build the desktop app**
 
 Run: `cd desktop && npm run build`
 Expected: exit 0.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add desktop/src/lib/protocol.ts desktop/src/lib/session.ts desktop/src/App.tsx desktop/src/lib/session.test.ts desktop/src/App.test.tsx
@@ -1745,7 +1745,7 @@ git commit -m "feat(desktop): fold follow-up input into the running turn"
 - Consumes: everything above.
 - Produces: no code. A closed loop proving the reported symptom is gone, plus the documentation CLAUDE.md requires.
 
-- [ ] **Step 1: Run every affected test suite**
+- [x] **Step 1: Run every affected test suite**
 
 ```bash
 cd yi-agent-rs && ps aux | grep -v grep | grep -c cargo   # must be 0
@@ -1757,14 +1757,14 @@ cd ../desktop && npm test
 
 Expected: all PASS. Record the counts.
 
-- [ ] **Step 2: Prove the original symptom is fixed end to end**
+- [x] **Step 2: Prove the original symptom is fixed end to end**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-core --lib agent::tests::interjection_ -- --nocapture
 ```
 Expected: 3 PASS, and the `interjection_lands_in_context_before_the_next_request` case shows the interjection in the **second** request's messages — that is the reported bug, inverted.
 
-- [ ] **Step 3: Update the module files**
+- [x] **Step 3: Update the module files**
 
 Add one line per module recording the capability with its verification command, following the existing format in those files (each bullet ends with `验证：<command>`):
 
@@ -1779,11 +1779,11 @@ Add one line per module recording the capability with its verification command, 
 - `desktop.md`: active-turn follow-up via `turn/interject`, with `验证：cd desktop && npm test`.
 - `README.md`: bump each affected module's `完成 / 总计` count.
 
-- [ ] **Step 4: Close the bug entry**
+- [x] **Step 4: Close the bug entry**
 
 In `docs/bug-list.md`, change the user-input entry from `[ ]` to `[x]` and record: root cause (no drain point inside `run_loop`), the fix (inbox drained before each request, before the `EndTurn` decision, and returned on every terminal exit), and the verification commands from Step 1. Do not touch any other entry in that file.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1819,6 +1819,49 @@ Every spec decision maps to a task. Use this to check the plan against
 | Spec §8 non-goals | Deferred section below |
 
 ---
+
+## Completion status
+
+All ten tasks are implemented and verified on branch `docs/mid-turn-interjection`.
+
+| Task | Commit | Evidence |
+|---|---|---|
+| 1 core inbox + events | `65398d8` | `cargo test -p yi-agent-core --lib agent::tests::inbox_` / `interjection_before_first_run` / `interject_after_run_starts` |
+| 2+3 the two drain points | `43d032b` | `cargo test -p yi-agent-core --lib agent::tests::interjection_` (2 cases; isolated red/green per drain point) |
+| 4 return on every exit | `20e762c` | `cargo test -p yi-agent-core --lib agent::tests::cancel_returns_unconsumed_interjections_before_cancelled` |
+| 5+6 app-server RPC + item | `a1b3b56` | `cargo test -p yi-agent-app-server --lib server::tests::turn_interject` + `translate::tests::interjection` |
+| 7+8 TUI delivery + rendering | `5e135a9` | `cargo test -p yi-agent --bin yi-agent -- tui::` (400) |
+| 9 desktop | `ecb59bf` | `cd desktop && npm test` (131) + `npm run build` |
+| 10 docs sync | `857bc00` | suites re-run: core 221 lib, app-server 154 lib, yi-agent 502, desktop 131 |
+
+### Where the implementation diverged from this plan
+
+Two plan steps could not be followed literally. Both are recorded here rather than
+silently worked around.
+
+1. **Task 7's `DeliveredInterjections` tests contradicted each other.** Step 1's
+   first test asserted that a `Sent` message is untracked (`q.len() == 1` after
+   one `Sent` plus one `Queued`), while its second and third tests assumed the
+   `Sent` message *was* tracked (expecting `["first", "second"]`). Only one
+   reading can hold. The implementation takes the first: the message that opens
+   a turn goes out via `Agent::run`, which never emits `InterjectionAccepted`, so
+   tracking it would strand a phantom entry in the preview forever, and it would
+   also break `on_turn_end`'s promotion contract. `items` therefore holds
+   mid-turn deliveries only. The tests were written to that semantics.
+
+2. **Task 8's ordering claim is not observable in the TUI.** The plan says a
+   turn-end branch running first "would skip it and lose the text". That is true
+   for a batch processed within one frame, but `run_loop` drains `agent_rx` once
+   per iteration, so `InterjectionsReturned` and `Cancelled` normally arrive in
+   separate iterations and the relative order of the two statements does not
+   change the outcome. The call is still placed before the turn-end handling
+   (correct, and robust if events are ever batched), but the comment and test
+   say what is actually true: the test fails when `apply_interjection_event` is
+   absent from the event loop, not when it merely runs later.
+
+Also corrected from the plan text: `feed_to` must clear its sender on
+`ProviderEvent::Stop` or the stream never ends, and the test provider is wrapped
+once (`provider.clone()`), not twice.
 
 ## Deferred (do not implement in this plan)
 
