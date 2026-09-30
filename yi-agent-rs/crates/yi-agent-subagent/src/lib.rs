@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -20,18 +20,23 @@ use yi_agent_core::subagent::task::DeliveryReport;
 use yi_agent_core::subagent::task::{
     AttemptId, ChildWriteMode, RootSessionId, TaskId, WorkspaceLeaseId,
 };
+use yi_agent_core::subagent::trace::TraceAggregator;
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_core::{
-    Agent, AgentConfig, AgentError, AgentEvent, Provider, ProviderError, ProviderTurnGate, Tool,
-    ToolRegistry, ToolResult,
+    Agent, AgentConfig, AgentError, AgentEvent, ContentBlock, Provider, ProviderError,
+    ProviderTurnGate, Tool, ToolRegistry, ToolResult,
 };
 use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
 
 const DEFAULT_PROVIDER_RETRY_LIMIT: u16 = 3;
+
+/// Names a tool result whose originating tool call was not seen. The trace
+/// schema requires a name, and this is never a plausible tool name.
+const UNKNOWN_TOOL_NAME: &str = "unknown";
 #[cfg(not(test))]
 const TUI_WAIT_AGENT_TIMEOUT_MS: u64 = 120_000;
 #[cfg(test)]
@@ -601,6 +606,21 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                         if let Some(gate) = provider_turn_gate {
                             agent = agent.with_provider_turn_gate(gate);
                         }
+                        let mut aggregator = TraceAggregator::new();
+                        // Tool call names, kept so a result can be labelled
+                        // even though the result event carries only the id.
+                        let mut trace_tool_results: HashMap<String, String> = HashMap::new();
+                        // Releases buffered text and then states why the child
+                        // stopped, so the trace ends with the child's own last
+                        // words followed by the reason. Callers run this before
+                        // the terminal `reporter.report_*` for that ordering.
+                        let end_trace = |aggregator: &mut TraceAggregator, note: &str| {
+                            let mut facts = aggregator.flush(Instant::now());
+                            facts.extend(aggregator.push_state_note(note, Instant::now()));
+                            for fact in facts {
+                                reporter.report_trace(fact);
+                            }
+                        };
                         let mut prompt = objective;
                         let mut provider_retries = 0;
                         let mut requested_delivery_commit = false;
@@ -613,6 +633,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                             } {
                                 Ok(stream) => stream,
                                 Err(error) => {
+                                    end_trace(&mut aggregator, &format!("failed: {error}"));
                                     reporter.report_failure(error.to_string());
                                     return;
                                 }
@@ -623,10 +644,20 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                             let mut pause_forwarded = false;
                             let mut message_prompt = None;
                             let mut assistant_report = String::new();
+                            trace_tool_results.clear();
                             loop {
+                                // A silent stretch must still release buffered
+                                // text, so the window is checked every pass.
+                                for fact in aggregator.due(Instant::now()) {
+                                    reporter.report_trace(fact);
+                                }
                                 tokio::select! {
                                     message = mailbox.recv(), if message_prompt.is_none() => {
                                         let Some(message) = message else {
+                                            end_trace(
+                                                &mut aggregator,
+                                                "failed: worker mailbox closed",
+                                            );
                                             reporter.report_failure("worker mailbox closed");
                                             break 'run;
                                         };
@@ -658,6 +689,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                         }
                                         Some(AgentEvent::AssistantText(text)) => {
                                             assistant_report.push_str(&text);
+                                            for fact in aggregator.push_text(&text, Instant::now()) {
+                                                reporter.report_trace(fact);
+                                            }
                                         }
                                         Some(AgentEvent::ToolRetry { .. }) => {
                                             reporter.report_tool_retry();
@@ -665,10 +699,27 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                         Some(AgentEvent::ProviderRetry { .. }) => {
                                             reporter.report_provider_retry();
                                         }
-                                        Some(AgentEvent::ToolResult { result, .. }) if !result.is_error => {
-                                            // A successful tool result is external, durable progress;
-                                            // generated text and streamed stdout are intentionally excluded.
-                                            reporter.report_meaningful_progress();
+                                        Some(AgentEvent::ToolResult { id, result }) => {
+                                            // Recorded before the success-only
+                                            // watchdog signal below, so a failed
+                                            // result still reaches the trace.
+                                            let name = trace_tool_results
+                                                .remove(&id)
+                                                .unwrap_or_else(|| UNKNOWN_TOOL_NAME.to_string());
+                                            let facts = aggregator.push_tool_result(
+                                                &name,
+                                                result.is_error,
+                                                &trace_tool_result_summary(&result),
+                                                Instant::now(),
+                                            );
+                                            for fact in facts {
+                                                reporter.report_trace(fact);
+                                            }
+                                            if !result.is_error {
+                                                // A successful tool result is external, durable progress;
+                                                // generated text and streamed stdout are intentionally excluded.
+                                                reporter.report_meaningful_progress();
+                                            }
                                         }
                                         done @ (Some(AgentEvent::Done { .. }) | None) => {
                                             // `None` is the stream ending, which is
@@ -679,6 +730,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 _ => None,
                                             };
                                             if pause_forwarded {
+                                                end_trace(&mut aggregator, "paused");
                                                 reporter.report_paused();
                                                 break 'run;
                                             }
@@ -698,6 +750,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                         {
                                                             // Real work landed; the
                                                             // delivery is the result.
+                                                            end_trace(&mut aggregator, "completed");
                                                             reporter
                                                                 .report_completed_without_delivery();
                                                             break 'run;
@@ -705,6 +758,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                         _ => {}
                                                     }
                                                 }
+                                                end_trace(&mut aggregator, "budget_exhausted");
                                                 reporter.report_budget_exhausted(
                                                     assistant_report.trim(),
                                                 );
@@ -719,7 +773,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                             if workspace_mode == ChildWriteMode::Coding {
                                                 if let Some(service) = workspace_service.as_ref() {
                                                     match service.inspect_delivery(&workspace_for_delivery) {
-                                                        Ok(delivery) => reporter.report_delivery(delivery),
+                                                        Ok(delivery) => {
+                                                            end_trace(&mut aggregator, "completed");
+                                                            reporter.report_delivery(delivery)
+                                                        }
                                                         Err(error)
                                                             if !requested_delivery_commit
                                                                 && is_dirty_delivery_error(&error) =>
@@ -734,20 +791,30 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                             if !assistant_report.trim().is_empty()
                                                                 && is_empty_delivery_error(&error) =>
                                                         {
+                                                            end_trace(&mut aggregator, "completed");
                                                             reporter.report_completed(assistant_report.trim())
                                                         }
-                                                        Err(error) => reporter.report_failure(error.to_string()),
+                                                        Err(error) => {
+                                                            end_trace(
+                                                                &mut aggregator,
+                                                                &format!("failed: {error}"),
+                                                            );
+                                                            reporter.report_failure(error.to_string())
+                                                        }
                                                     }
                                                 } else {
+                                                    end_trace(&mut aggregator, "completed");
                                                     reporter.report_completed(assistant_report.trim());
                                                 }
                                             } else {
+                                                end_trace(&mut aggregator, "completed");
                                                 reporter.report_completed(assistant_report.trim());
                                             }
                                             break 'run;
                                         }
                                         Some(AgentEvent::Cancelled) => {
                                             if pause_forwarded {
+                                                end_trace(&mut aggregator, "paused");
                                                 reporter.report_paused();
                                                 break 'run;
                                             }
@@ -757,6 +824,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 assistant_report.clear();
                                                 continue 'run;
                                             }
+                                            end_trace(&mut aggregator, "cancelled");
                                             reporter.report_cancelled();
                                             break 'run;
                                         }
@@ -779,17 +847,31 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                                 tokio::select! {
                                                     _ = tokio::time::sleep(delay) => continue 'run,
                                                     _ = cancellation.cancelled() => {
+                                                        end_trace(&mut aggregator, "cancelled");
                                                         reporter.report_cancelled();
                                                         break 'run;
                                                     }
                                                     _ = pause.requested() => {
+                                                        end_trace(&mut aggregator, "paused");
                                                         reporter.report_paused();
                                                         break 'run;
                                                     }
                                                 }
                                             }
+                                            end_trace(&mut aggregator, &format!("failed: {error}"));
                                             reporter.report_failure(error.to_string());
                                             break 'run;
+                                        }
+                                        Some(AgentEvent::ToolCall { id, name, input }) => {
+                                            trace_tool_results.insert(id, name.clone());
+                                            let facts = aggregator.push_tool_call(
+                                                &name,
+                                                &trace_tool_call_summary(&input),
+                                                Instant::now(),
+                                            );
+                                            for fact in facts {
+                                                reporter.report_trace(fact);
+                                            }
                                         }
                                         Some(_) => {}
                                     }
@@ -804,6 +886,32 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             Ok(handle)
         })
     }
+}
+
+/// A short rendering of a tool call's input for the trace: `bash` shows the
+/// command it was asked to run, everything else falls back to its JSON. The
+/// aggregator truncates long summaries.
+fn trace_tool_call_summary(input: &Value) -> String {
+    input
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| input.to_string())
+}
+
+/// The text a tool produced, joined across its content blocks. Images and other
+/// non-text blocks contribute nothing to the trace.
+fn trace_tool_result_summary(result: &ToolResult) -> String {
+    let mut summary = String::new();
+    for block in &result.content {
+        if let ContentBlock::Text(text) = block {
+            if !summary.is_empty() {
+                summary.push('\n');
+            }
+            summary.push_str(text);
+        }
+    }
+    summary
 }
 
 fn is_dirty_delivery_error(error: &WorkerError) -> bool {
@@ -1669,6 +1777,7 @@ mod tests {
     use futures::stream::BoxStream;
     use tempfile::TempDir;
     use yi_agent_core::subagent::task::{AttemptId, MessageId, RootSessionId, TaskId};
+    use yi_agent_core::subagent::trace::TraceFact;
     use yi_agent_core::subagent::worker::{
         AgentWorkerFactory, WorkerEvent, WorkerMessage, WorkerStart, WorkerWatchdogEvent,
     };
@@ -3147,5 +3256,158 @@ mod tests {
             result.content.as_slice(),
             [yi_agent_core::ContentBlock::Text(text)] if text.contains("rejected") || text.contains("unavailable")
         ));
+    }
+
+    /// Runs one assistant turn with visible text, a real tool call through the
+    /// production registry, and then a second turn that ends the run. Both
+    /// turns are served immediately, so nothing here waits on a timer.
+    struct TranscriptProvider {
+        turns: Mutex<u8>,
+    }
+
+    #[async_trait]
+    impl Provider for TranscriptProvider {
+        async fn call_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let mut turns = self.turns.lock().unwrap();
+            let events = match *turns {
+                0 => vec![
+                    ProviderEvent::TextDelta("reviewing ".into()),
+                    ProviderEvent::TextDelta("the change".into()),
+                    ProviderEvent::ToolUseStart {
+                        id: "probe".into(),
+                        name: "noop".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "probe".into(),
+                        partial_json: "{}".into(),
+                    },
+                    ProviderEvent::ToolUseEnd { id: "probe".into() },
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                1 => vec![
+                    ProviderEvent::TextDelta("done".into()),
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                turn => {
+                    return Err(ProviderError::InvalidRequest(format!(
+                        "unexpected provider turn {turn}"
+                    )));
+                }
+            };
+            *turns += 1;
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    /// Drives the worker loop to a terminal outcome and returns every trace
+    /// fact `reporter.report_trace` queued on the handle.
+    async fn run_child_and_collect_trace() -> Vec<TraceFact> {
+        let directory = TempDir::new().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(NoopTool));
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(TranscriptProvider {
+                turns: Mutex::new(0),
+            }),
+            Arc::new(tools),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Review the pending change.")
+            .with_workspace(worker_workspace(directory.path()))
+            .with_workspace_mode(ChildWriteMode::ReadOnly);
+        let handle = factory.start(request).await.unwrap();
+
+        // The worker runs on its own thread, so wait for the terminal event
+        // before draining: a fact can only be observed after it is reported.
+        let events = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let events = handle.take_events();
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WorkerEvent::Completed { .. }
+                            | WorkerEvent::BudgetExhausted { .. }
+                            | WorkerEvent::CompletedWithoutDelivery
+                            | WorkerEvent::Failed(_)
+                    )
+                }) {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker should report a terminal outcome");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Completed { .. })),
+            "the fixture must reach a normal completion, got {events:?}"
+        );
+
+        handle.take_trace_events()
+    }
+
+    #[tokio::test]
+    async fn a_child_transcript_reaches_the_trace_buffer() {
+        let facts = run_child_and_collect_trace().await;
+
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact, TraceFact::AssistantText { .. })),
+            "the child's visible text must become a trace fact, got {facts:?}"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact, TraceFact::ToolCall { .. })),
+            "the child's tool call must become a trace fact, got {facts:?}"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact, TraceFact::ToolResult { .. })),
+            "the child's tool result must become a trace fact, got {facts:?}"
+        );
+        // Two streamed deltas in one turn must merge instead of landing as one
+        // row per fragment.
+        assert!(
+            facts
+                .iter()
+                .filter(|fact| matches!(fact, TraceFact::AssistantText { .. }))
+                .count()
+                < 3,
+            "assistant text fragments must be merged, got {facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_state_always_ends_the_trace_with_a_note() {
+        let facts = run_child_and_collect_trace().await;
+
+        assert!(
+            matches!(facts.last(), Some(TraceFact::StateNote { .. })),
+            "the trace must explain why the child stopped, got {facts:?}"
+        );
+        // A note the reader cannot decode would not explain anything, so the
+        // harness's normal completion must name its own terminal state.
+        assert_eq!(
+            facts.last(),
+            Some(&TraceFact::StateNote {
+                note: "completed".into()
+            }),
+            "a clean completion must be labelled as such, got {facts:?}"
+        );
     }
 }
