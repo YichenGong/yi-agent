@@ -144,9 +144,6 @@ fn platform_command(
         policy.push_str("(deny file-write*)\n");
     } else {
         policy.push_str("(deny file-write* (subpath \"/\"))\n");
-        // Git opens this device while creating commits. It is not repository
-        // state, and allowing it does not broaden workspace write access.
-        policy.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         for root in writable_roots {
             policy.push_str(&format!(
                 "(allow file-write* (subpath \"{}\"))\n",
@@ -154,6 +151,15 @@ fn platform_command(
             ));
         }
     }
+    // Git opens this device for reading *and* writing on every invocation,
+    // including purely read-only ones, so without the allowance even `git log`
+    // dies with `could not open '/dev/null' for reading and writing: Operation
+    // not permitted`. `/dev/null` is not repository state and granting it does
+    // not broaden write access to anything that persists, so it is allowed in
+    // read-only mode too. Written last so it overrides the `deny file-write*`
+    // above (SBPL is last-match-wins).
+    policy.push_str("(allow file-write* (literal \"/dev/null\"))\n");
+
     Ok((
         SANDBOX_EXEC.into(),
         vec![
