@@ -14,7 +14,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - 多行自动换行（unicode-width + CJK 宽度感知）
 - Slash 命令弹窗（自动补全 + 中文描述 + Up/Down/Tab/Enter 导航）
 - 两步退出确认（仅 Ctrl+C 两次退出）
-- 输入排队（agent 运行期间粘贴的输入进队列，结束后回放）
+- 中途追加投递（agent 运行期间粘贴的输入立即折进当前轮次，下一次请求前生效）
 - 状态栏（实时 token 计数 + 模型名 + 运行中任务指示）
 - 运行时全屏弹窗（Ctrl+P 打开，Bash Tasks / Processes 两个 tab；Bash tab 查看运行中/已完成 bash 实时输出 + exit code，Processes tab 查看托管进程状态并支持 kill 确认）
 
@@ -34,7 +34,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 - [x] 两步退出确认 — `tui/app.rs` Ctrl+C 两次才退出；Esc 只打断运行中的 agent 或命令，不退出进程；验证：`cargo test -p yi-agent --bin yi-agent tui::app::tests::repeated_esc_does_not_quit` — [设计](../plans/2026-07-24-yi-agent-tui-features-design.md)
 - [x] Slash 命令弹窗 — `tui/slash.rs` 实现自动补全 + 中文描述 — [设计](../plans/2026-07-25-tui-slash-commands-design.md)
 - [x] 输入框光标可见 — `tui/input.rs` 反色显示（白底黑字）
-- [x] 输入排队 — 单一 `PendingQueue`（`tui/queued.rs`）持有待发队列与 `in_flight`，同时至多 1 条在途，`try_send` 不阻塞；满队列拒收并退回输入框 — [设计](../superpowers/specs/2026-09-27-tui-pending-queue-design.md)
+- [x] 中途追加投递 — `PendingQueue` 更名 `DeliveredInterjections`（`tui/queued.rs`）：忙时提交**立即投出**（`input_tx.try_send`），由 driver 在运行中调 `agent.interject` 折进当前轮次，不再攒到轮次结束才发；该类型只做**记账**（已投递、未见回执），预览标题据此改为 `⌛ 已送达，待生效 (N)`；`InterjectionAccepted` 经 `on_receipt` 冲销最旧一条，`InterjectionsReturned` 经 `take_returned` 把文本退回输入框并写提示行（`tui/app.rs::apply_interjection_event`，在回合结束分支**之前**调用）；开启轮次的那条 prompt 不入账（它走 `run()`，永远没有回执）；投递失败（通道满 / `inbox_handle()` 为 `None` 的窗口）仍退回输入框，沿用 `Rejected` 语义 — [设计](../superpowers/specs/2026-09-30-mid-turn-user-interjection-design.md)（取代 [排队设计](../superpowers/specs/2026-09-27-tui-pending-queue-design.md)）
 - [x] 状态栏 — `tui/statusbar.rs` 显示实时 token + 模型名 + 运行中任务 — [设计](../plans/2026-07-25-task-perception-design.md)
 - [x] Bash 全屏弹窗 — `tui/app.rs::RuntimePopup` Ctrl+P 打开默认 Bash tab，`tui/bash_popup.rs` 显示实时输出 + exit code — [设计](../plans/2026-07-25-task-perception-design.md)
 - [x] Ctrl+P managed process tab — `tui/process_popup.rs` and `tui/app.rs` add a `Processes` tab beside Bash Tasks, showing managed process status/output and kill confirmation; verification: `cargo test -p yi-agent --bin yi-agent tui::process_popup::tests` and `cargo test -p yi-agent --bin yi-agent runtime_popup`
