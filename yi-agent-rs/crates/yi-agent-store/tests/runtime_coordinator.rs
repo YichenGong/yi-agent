@@ -2737,6 +2737,49 @@ async fn reconcile_persists_the_terminal_note_of_a_finishing_worker() {
 }
 
 #[tokio::test]
+async fn drained_trace_facts_survive_a_later_reducer_error() {
+    // Persistence is independent of the transition bookkeeping: the drain
+    // commits a worker's facts before the reducer runs, so a `?` from a later
+    // stage of the same pass cannot take back rows already drained.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
+    let handle = factory.handles.lock().unwrap()[0].clone();
+    handle.report_trace(TraceFact::StateNote {
+        note: "drained before the reducer tripped".into(),
+    });
+    // No pause was ever requested, so `PauseAcknowledged` makes the reducer
+    // return `Err` and the reconcile pass aborts.
+    handle.report_paused();
+
+    let error = coordinator
+        .reconcile_worker_events()
+        .await
+        .expect_err("the reducer must reject an unsolicited pause acknowledgement");
+    let message = error.to_string();
+    assert!(
+        message.contains("illegal task state transition"),
+        "the pass must abort in the reducer stage, not somewhere else: {message}"
+    );
+
+    let rows = RuntimeRepository::open(&database)
+        .unwrap()
+        .trace_after(&child, 0)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "facts drained and committed before the failing reducer must survive"
+    );
+    assert!(
+        rows[0]
+            .payload_json
+            .contains("drained before the reducer tripped")
+    );
+}
+
+#[tokio::test]
 async fn coordinator_prunes_the_trace_of_a_worker_that_ended() {
     // This is the daemon minute tick's call. It ties the two halves together:
     // reconcile persisted the ended worker's note, and the prune that follows

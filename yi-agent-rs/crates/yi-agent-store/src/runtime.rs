@@ -2896,14 +2896,18 @@ impl RuntimeCoordinator {
         let mut deliveries = Vec::new();
         let mut consumed_overrides = Vec::new();
         let mut watchdog_updates = Vec::new();
-        let mut trace_updates = Vec::new();
         for supervisor in &supervisors {
             let mut supervisor = supervisor.lock().await;
-            // Drain trace facts before the reducer runs. A terminal or paused
-            // transition removes the worker from `workers`, taking every fact
-            // it still buffers with it, so a later drain would silently drop
-            // the terminal note that explains why the worker stopped.
-            trace_updates.extend(supervisor.take_worker_trace_events());
+            // Drain and persist trace facts before the reducer runs. Two
+            // orderings are load-bearing here. Draining first is required
+            // because a terminal or paused transition removes the worker from
+            // `workers`, taking every fact it still buffers with it, so a
+            // later drain would silently drop the terminal note that explains
+            // why the worker stopped. Persisting in the same step, ahead of
+            // the reducer and the transition collection below, keeps the
+            // writes independent: a `?` in either later stage can no longer
+            // discard facts that this drain already took off the worker.
+            self.persist_worker_trace_facts(supervisor.take_worker_trace_events())?;
             watchdog_updates.extend(supervisor.take_worker_watchdog_events());
             let changed = supervisor
                 .reconcile_worker_events()
@@ -2960,19 +2964,6 @@ impl RuntimeCoordinator {
                 updates.push((task_id, attempt, state, event, terminal_json));
             }
             consumed_overrides.extend(supervisor.pending_user_override_acks().iter().cloned());
-        }
-        // Persist drained facts before the state transitions below. The writes
-        // are independent: a trace failure must not discard a transition, and
-        // a transition failure must not discard the facts that explain it.
-        {
-            let mut repository = self
-                .repository
-                .lock()
-                .expect("runtime repository mutex poisoned");
-            for (task_id, fact) in &trace_updates {
-                let payload = serde_json::to_string(fact).map_err(RepositoryError::from)?;
-                repository.append_trace(task_id, trace_fact_kind(fact), &payload)?;
-            }
         }
         for (task_id, update) in watchdog_updates {
             let mut repository = self
@@ -3037,6 +3028,31 @@ impl RuntimeCoordinator {
                 repository.transition_task_and_attempt(&task_id, &attempt, state, event)?;
             }
             self.release_resident_lease(&task_id);
+        }
+        Ok(())
+    }
+
+    /// Persists drained worker trace facts in one repository transaction.
+    ///
+    /// Kept apart from the reducer and transition bookkeeping so that draining
+    /// a worker's facts and committing them are a single step: a later `?` in
+    /// the reconcile pass cannot lose facts already taken off a worker, and
+    /// every supervisor's facts are committed before the reducer runs over the
+    /// next supervisor.
+    fn persist_worker_trace_facts(
+        &self,
+        facts: Vec<(TaskId, TraceFact)>,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if facts.is_empty() {
+            return Ok(());
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        for (task_id, fact) in facts {
+            let payload = serde_json::to_string(&fact).map_err(RepositoryError::from)?;
+            repository.append_trace(&task_id, trace_fact_kind(&fact), &payload)?;
         }
         Ok(())
     }
