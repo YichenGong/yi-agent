@@ -42,6 +42,14 @@ use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 
 const REVIEW_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 
+/// A root session created to run a single objective autonomously in its own
+/// worktree. Generic on purpose: nothing here knows what the objective is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomousSession {
+    pub session_id: RootSessionId,
+    pub root_task_id: TaskId,
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
     #[error(transparent)]
@@ -684,6 +692,47 @@ impl RuntimeCoordinator {
             .expect("runtime supervisor mutex poisoned")
             .insert(session_id.clone(), Arc::new(AsyncMutex::new(supervisor)));
         Ok(session_id)
+    }
+
+    /// Creates an autonomous root session bound to `workdir` and starts its
+    /// worker. The directory must already exist and be a git worktree; the
+    /// runtime observes it and never creates it.
+    ///
+    /// Idempotency lives one level down (`start_worker` refuses a task that
+    /// already owns a worker), so a repeated call for the same session is safe
+    /// but a repeated call creates a *new* session — callers de-duplicate on
+    /// their own key.
+    pub async fn create_autonomous_session(
+        &self,
+        objective: String,
+        workdir: std::path::PathBuf,
+    ) -> Result<AutonomousSession, RuntimeCoordinatorError> {
+        if objective.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "autonomous session objective must not be empty".into(),
+            ));
+        }
+        if !workdir.is_dir() {
+            return Err(RuntimeCoordinatorError::Supervisor(format!(
+                "workdir does not exist: {}",
+                workdir.display()
+            )));
+        }
+        let session_id =
+            self.create_session_with_objective_and_mode(objective, ChildWriteMode::Coding)?;
+        let root_task_id = self.root_task_id(&session_id)?;
+        {
+            let handle = self.supervisor(&session_id)?;
+            let mut supervisor = handle.lock().await;
+            supervisor
+                .set_workdir(&root_task_id, workdir.clone())
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+        }
+        self.start_worker(&session_id, &root_task_id).await?;
+        Ok(AutonomousSession {
+            session_id,
+            root_task_id,
+        })
     }
 
     // This synchronous guard serializes the durable idempotency check and root

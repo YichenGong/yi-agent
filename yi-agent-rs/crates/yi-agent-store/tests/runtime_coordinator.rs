@@ -4060,3 +4060,67 @@ fn reclaim_keeps_recovery_required_tasks_that_can_still_resume() {
     );
     assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
 }
+
+#[tokio::test]
+async fn an_autonomous_session_runs_in_the_given_worktree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let worktree = directory.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let session = coordinator
+        .create_autonomous_session("implement the plan".into(), worktree.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        coordinator.root_task_id(&session.session_id).unwrap(),
+        session.root_task_id
+    );
+    let starts = factory.starts.lock().unwrap();
+    let root_start = starts
+        .iter()
+        .find(|start| start.task_id == session.root_task_id)
+        .expect("the root worker must have been started");
+    assert_eq!(root_start.root_session_id, session.session_id);
+}
+
+#[tokio::test]
+async fn an_autonomous_session_rejects_a_missing_directory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let error = coordinator
+        .create_autonomous_session(
+            "implement the plan".into(),
+            directory.path().join("does-not-exist"),
+        )
+        .await
+        .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("does not exist") || message.contains("not inside a git worktree"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_objective_is_rejected() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let worktree = directory.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+
+    let error = coordinator
+        .create_autonomous_session("   ".into(), worktree)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("objective"), "{error}");
+}
