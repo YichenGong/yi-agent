@@ -1009,25 +1009,21 @@ git commit -m "feat(tui): honour persisted runtime preference and add /runtime"
     }
 
     #[test]
-    fn never_does_not_touch_the_preference_file() {
-        use crate::tui::runtime_prefs::{preferences_path, save, RuntimePreference};
+    fn reading_the_intent_does_not_create_the_preference_directory() {
+        use crate::tui::runtime_prefs::preferences_path;
         use crate::tui::subagents::RuntimeStartupIntent;
 
         let dir = tempfile::TempDir::new().unwrap();
-        save(dir.path(), RuntimePreference::Never).unwrap();
-        // Remove the file but keep the directory, so a stray `load` in the
-        // Never path cannot recreate anything silently.
-        std::fs::remove_file(preferences_path(dir.path())).unwrap();
-
+        // A project that never opted in has no `.yi-agent/`. Deriving the
+        // startup intent must stay read-only: creating the directory would
+        // dirty every project the user merely launched the TUI in.
         assert!(matches!(
             startup_intent_for(dir.path()),
-            Some(RuntimeStartupIntent::DisabledNotice { .. })
+            Some(RuntimeStartupIntent::Prompt)
         ));
-        // A `never` run must fail closed and not create `.yi-agent/` in projects
-        // that never opted in.
         assert!(
             !preferences_path(dir.path()).exists(),
-            "Never must not read or write the preference file"
+            "deriving the startup intent must not create .yi-agent/"
         );
     }
 ```
@@ -1117,15 +1113,15 @@ fn startup_intent_for(
 ```bash
 cargo test -p yi-agent --bin yi-agent -- preference_maps_to_startup_intent 2>&1 | tail -10
 cargo test -p yi-agent --bin yi-agent -- never_notice 2>&1 | tail -10
-cargo test -p yi-agent --bin yi-agent -- never_does_not_touch_the_preference_file 2>&1 | tail -10
+cargo test -p yi-agent --bin yi-agent -- reading_the_intent_does_not_create_the_preference_directory 2>&1 | tail -10
 ```
 预期：3 passed。
 
-**为什么需要第三条测试**（防一个静默失效模式）：`Never` 分支**不**调用 `load`，所以它读不出
-用户实际保存的值。若把 `startup_intent_for` 误改成无条件调用 `load`（例如为了日志或"顺手
-取一下 path"），该函数就会**对每个项目都创建 `<workdir>/.yi-agent/`**——即使用户选的是
-`never`。这会静默弄脏没有忽略它的仓库，而现有断言全部照旧通过。第三条测试断言"函数不
-凭空创建目录"，用一条断言钉住这一行为。
+**为什么需要第三条测试**：`startup_intent_for` 在 `Ask`/`Always`/`Never` 三条路径上都会经过
+`load`，而 `load` 只读不写。但如果将来有人为了"顺手建目录"或"写默认值"而在读路径里调用
+`save` / `create_dir_all`，**每次启动 TUI 都会在每个项目里凭空创建 `.yi-agent/`**，弄脏用户
+仓库，而现有断言"返回 `Prompt`"照样通过。第三条测试断言"读 intent 不产生目录"，用一条断言
+钉住这个副作用。
 
 - [ ] **Step 6: 全量回归、格式化、提交**
 
