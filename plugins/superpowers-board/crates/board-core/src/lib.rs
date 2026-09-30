@@ -6,3 +6,4 @@
 pub mod board;
 pub mod calendar;
 pub mod card;
+pub mod switch;
