@@ -243,6 +243,7 @@ fn runtime_prompt_lines() -> Vec<ratatui::text::Line<'static>> {
     vec![
         ratatui::text::Line::raw("启动后可以直接用自然语言创建和管理子 Agent。"),
         ratatui::text::Line::raw("此选择会被记住，可用 /runtime 修改。"),
+        ratatui::text::Line::raw("若未能启用，重启 yi-agent 后可用。"),
         ratatui::text::Line::raw(""),
         ratatui::text::Line::raw("[y] 启动并记住"),
         ratatui::text::Line::raw("[n] 跳过并记住    [Esc] 本次跳过（不记住）"),
@@ -294,6 +295,11 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
     let mut runtime_popup: RuntimePopup = RuntimePopup::None;
+    // A one-shot alert shown when the runtime the user asked for fails to come
+    // up. It must be a popup, not only a history line: the failure can land
+    // many turns into a long session, where a separator appended to the
+    // transcript appears off-screen and is never seen.
+    let mut runtime_notice_popup: Option<&'static str> = None;
     let mut runtime_intent = runtime_intent;
     // `DisabledNotice` prints exactly one line, on the first frame, once the
     // history width is known.
@@ -367,6 +373,17 @@ fn run_loop<B: Backend, E: EventSource>(
                 event,
                 AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
             );
+            if let AgentEvent::SubagentRuntimeUnavailable { stage, cause } = &event {
+                // The raw stage/cause pair is logged by the emitter; the user
+                // only needs the remedy, which never varies. See
+                // `runtime_restart_notice`.
+                tracing::warn!(
+                    stage = %stage,
+                    cause = %cause,
+                    "subagent runtime unavailable for this session"
+                );
+                runtime_notice_popup = Some(crate::tui::subagents::RUNTIME_RESTART_NOTICE);
+            }
             route_event(
                 &mut task_registry,
                 &mut statusbar_state,
@@ -491,6 +508,10 @@ fn run_loop<B: Backend, E: EventSource>(
                 );
             }
 
+            if let Some(text) = runtime_notice_popup {
+                render_runtime_notice_popup(f, text, chunks[0]);
+            }
+
             render_runtime_popup(
                 f,
                 &runtime_popup,
@@ -543,6 +564,12 @@ fn run_loop<B: Backend, E: EventSource>(
                     }
                     continue;
                 }
+                // Dismiss the failure notice on any key. Deliberately no
+                // `continue`: a popup that consumed the first character typed
+                // would silently corrupt what the user was writing, far worse
+                // than the nuisance it reports, so the key clears the alert and
+                // still reaches the input handling below.
+                runtime_notice_popup = None;
                 if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -725,6 +752,39 @@ fn refresh_process_snapshots(
             }
         }
     }
+}
+
+/// Renders the one-shot "runtime could not start" alert over the transcript.
+///
+/// Deliberately the same shape as the startup dialog: the two report the same
+/// subject (the local runtime) and the user should not have to learn two
+/// visual grammars for it.
+fn render_runtime_notice_popup(
+    f: &mut ratatui::Frame<'_>,
+    text: &str,
+    area: ratatui::layout::Rect,
+) {
+    let box_w = 58u16.min(area.width.saturating_sub(4));
+    let box_h = 5u16.min(area.height.max(1));
+    let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
+    let box_y = area.y + (area.height.saturating_sub(box_h)) / 3;
+    let box_area = ratatui::layout::Rect {
+        x: box_x,
+        y: box_y,
+        width: box_w,
+        height: box_h,
+    };
+    f.render_widget(Clear, box_area);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(ratatui::text::Line::raw(text.to_string()))
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .title("子 Agent runtime 未启用（按任意键继续）"),
+            ),
+        box_area,
+    );
 }
 
 fn render_runtime_popup(
@@ -4606,6 +4666,66 @@ mod tests {
         );
     }
 
+    /// The alert must not eat the keystroke that dismisses it. A popup that
+    /// consumed the first character typed would silently corrupt what the user
+    /// was writing -- far worse than the nuisance it reports -- so the key both
+    /// clears the alert and still reaches the input line.
+    #[test]
+    fn runtime_failure_alert_does_not_swallow_the_dismissing_key() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        agent_tx
+            .try_send(AgentEvent::SubagentRuntimeUnavailable {
+                stage: "runtime attach".into(),
+                cause: "file is not a database".into(),
+            })
+            .unwrap();
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            // `ScriptedEvents::poll` pops from the back, so this is the
+            // order the keys are delivered in.
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            &input_tx,
+            &interrupt_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            "hi",
+            "the dismiss key was swallowed instead of reaching the input line"
+        );
+    }
+
     #[test]
     fn runtime_start_prompt_can_continue_without_delegation() {
         let backend = TestBackend::new(80, 24);
@@ -7958,6 +8078,66 @@ mod tests {
         assert_eq!(
             history.scroll_offset, 1,
             "Up should scroll history while a permission is pending"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_restart_notice_tests {
+    use super::*;
+
+    /// The failure can land many turns into a long session, where a
+    /// transcript separator is appended off-screen and never seen. The alert
+    /// is a popup so it is guaranteed to be on the visible screen.
+    #[test]
+    fn the_failure_alert_is_rendered_into_the_viewport() {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_runtime_notice_popup(
+                    f,
+                    crate::tui::subagents::RUNTIME_RESTART_NOTICE,
+                    ratatui::layout::Rect::new(0, 0, 100, 30),
+                );
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let screen: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            screen.contains("重启yi-agent后即可用"),
+            "the restart remedy is not on screen: {screen}"
+        );
+    }
+
+    /// The startup dialog is the only place a first-time user learns what
+    /// happens after pressing `y`. Starting the runtime costs a daemon spawn,
+    /// and a session that cannot start one cannot delegate at all until the
+    /// process is restarted -- so the dialog must say so up front instead of
+    /// leaving the user staring at a bare error afterwards.
+    #[test]
+    fn startup_prompt_states_that_a_restart_is_needed() {
+        let text: String = runtime_prompt_lines()
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("重启"),
+            "the dialog never mentions a restart: {text}"
         );
     }
 }
