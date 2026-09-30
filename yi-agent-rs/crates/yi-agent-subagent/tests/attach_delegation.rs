@@ -82,11 +82,16 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
     // The tools the applications register over this runtime are exactly the ones
     // the model calls, so exercise the spawn they share.
     let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_subagent::register_attached_root_tools(
-        &mut registry,
-        attached.socket_path.clone(),
-        &attached.attached_root,
+    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
+        yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: attached.socket_path.clone(),
+            workspace_root: attached.workspace_root.clone(),
+            session_id: attached.attached_root.session_id.clone(),
+            task_id: attached.attached_root.task_id.clone(),
+            capability: attached.attached_root.capability.clone(),
+        },
     );
+    yi_agent_subagent::register_attached_root_tools(&mut registry, binding);
     assert!(
         registry.names().contains(&"spawn_agent".to_string()),
         "an attached root exposes the delegation tools, got {:?}",
