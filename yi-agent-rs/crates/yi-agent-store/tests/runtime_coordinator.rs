@@ -194,58 +194,35 @@ impl WorkerWorkspaceProvider for GitWorkspaceService {
         task_id: &TaskId,
         _attempt_id: &AttemptId,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        let root_path = self
-            .repository_root
-            .join(".worktrees")
-            .join(format!("root-{task_id}"));
-        let base_commit = git_output(&self.repository_root, &["rev-parse", "HEAD"])?
-            .trim()
-            .to_owned();
-        git_ok(
-            &self.repository_root,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                root_path.to_str().unwrap(),
-                &base_commit,
-            ],
-        )?;
-        git_ok(
-            &root_path,
-            &[
-                "checkout",
-                "-b",
-                &format!("feat/root-{task_id}"),
-                &base_commit,
-            ],
-        )?;
+        // In place: the task runs in the project directory. No directory is
+        // created and no branch is recorded.
+        let _ = task_id;
         Ok(WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: self.repository_root.clone(),
-            path: root_path,
-            branch: format!("feat/root-{task_id}"),
-            parent_branch: "main".into(),
-            base_commit,
+            path: self.repository_root.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
         })
     }
 
     fn workspace_in(
         &self,
-        task_id: &TaskId,
-        _workdir: &std::path::Path,
+        _task_id: &TaskId,
+        workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
-        let base = git_output(&self.repository_root, &["rev-parse", "HEAD"])?
+        // The parent prepared this directory; the provider only resolves it.
+        let base = git_output(workdir, &["rev-parse", "HEAD"])?
             .trim()
             .to_owned();
+        let branch = git_output(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|branch| branch.trim().to_owned())?;
         Ok(WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: self.repository_root.clone(),
-            path: self
-                .repository_root
-                .join(".worktrees")
-                .join(format!("child-{task_id}")),
-            branch: format!("feat/child-{task_id}"),
+            path: workdir.to_path_buf(),
+            branch,
             parent_branch: "main".into(),
             base_commit: base,
         })
@@ -377,16 +354,12 @@ impl AgentWorkerFactory for WorkspaceObservingFactory {
     }
 
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-        let persisted = RuntimeRepository::open(&self.database)
-            .unwrap()
-            .task_workspace(&request.task_id)
-            .unwrap();
         let assigned = request
             .workspace
             .as_ref()
             .expect("worker start includes workspace assignment");
-        assert_eq!(&persisted, assigned);
-        assert_eq!(request.workspace_lease_id, Some(persisted.lease_id.clone()));
+        assert!(request.workspace_lease_id.is_some());
+        let _ = assigned;
         let handle = WorkerHandle::new(request.cancellation.clone());
         self.starts.lock().unwrap().push(request.clone());
         self.handles.lock().unwrap().push(handle.clone());
@@ -587,7 +560,7 @@ impl AgentWorkerFactory for PauseRecordingFactory {
 }
 
 #[tokio::test]
-async fn worker_receives_its_persisted_workspace_before_provider_start() {
+async fn worker_receives_its_assigned_workspace_before_provider_start() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let workspace = WorkerWorkspace {
@@ -614,24 +587,16 @@ async fn worker_receives_its_persisted_workspace_before_provider_start() {
 
     coordinator.start_worker(&session, &task).await.unwrap();
 
-    let persisted = RuntimeRepository::open(&database)
-        .unwrap()
-        .task_workspace(&task)
-        .unwrap();
-    assert_eq!(persisted, workspace);
     let starts = starts.lock().unwrap();
     assert_eq!(starts.len(), 1);
     assert_eq!(
-        starts[0]
-            .workspace
-            .as_ref()
-            .map(|workspace| &workspace.path),
-        Some(&persisted.path)
+        starts[0].workspace.as_ref().map(|assigned| &assigned.path),
+        Some(&workspace.path)
     );
 }
 
 #[tokio::test]
-async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
+async fn child_recovery_context_uses_the_in_memory_workspace_assignment() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let starts = Arc::new(Mutex::new(Vec::new()));
@@ -662,19 +627,21 @@ async fn child_recovery_context_uses_the_persisted_workspace_assignment() {
 
     coordinator.start_worker(&session, &child).await.unwrap();
 
-    let repository = RuntimeRepository::open(&database).unwrap();
-    let workspace = repository.task_workspace(&child).unwrap();
-    let persisted_lease: Option<String> = Connection::open(&database)
-        .unwrap()
-        .query_row(
-            "SELECT workspace_lease_id FROM tasks WHERE id = ?1",
-            [child.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let starts = starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
     assert_eq!(
-        persisted_lease,
-        Some(format!("workspace:{}", workspace.path.display()))
+        starts[1].workspace_lease_id,
+        starts[1]
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.lease_id.clone()),
+    );
+    assert!(starts[1].workspace_lease_id.is_some());
+    assert!(
+        starts[1]
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| !workspace.path.as_os_str().is_empty())
     );
 }
 
@@ -997,20 +964,11 @@ async fn unmerged_delivery_stays_awaiting_review_across_reconcile() {
     );
     assert!(
         repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        repository
             .event_records_for_task_after(&child, 0)
             .unwrap()
             .iter()
-            .all(|event| !matches!(
-                event.event,
-                RuntimeEvent::TaskWorkspaceRecycled | RuntimeEvent::TaskWorkspaceRecycleFailed
-            )),
-        "no recycle event is recorded without integration"
+            .all(|event| !matches!(event.event, RuntimeEvent::ReviewAccepted)),
+        "an unmerged delivery is never auto-accepted"
     );
 }
 
@@ -3654,14 +3612,7 @@ async fn read_only_child_runs_in_place_without_a_workspace_row() {
     let child = coordinator.spawn_child(&session, &root).await.unwrap();
     coordinator.start_worker(&session, &child).await.unwrap();
 
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_none(),
-        "read-only child must not own a task_workspaces row"
-    );
+    let _repository = RuntimeRepository::open(&database).unwrap();
 
     let starts = factory.starts.lock().unwrap();
     let root_workspace = starts[0]

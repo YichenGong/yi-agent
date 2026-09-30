@@ -143,6 +143,9 @@ pub struct RuntimeCoordinator {
     provider_profile_id: Option<String>,
     recovery_contexts: Mutex<HashMap<TaskId, RecoveryContext>>,
     review_confirmations: Mutex<HashMap<String, PendingReviewConfirmation>>,
+    /// Where a task last ran, remembered for as long as the coordinator lives.
+    /// Nothing durable owns it: this replaces the retired `task_workspaces` row.
+    task_positions: Mutex<HashMap<TaskId, WorkerWorkspace>>,
     application_root_attach_lock: Mutex<()>,
     draining: AtomicBool,
 }
@@ -208,6 +211,21 @@ fn new_application_root_capability() -> String {
 fn digest_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// An in-place position: a task running directly in `path`, owning no branch.
+fn in_place_workspace_at(
+    repository_root: std::path::PathBuf,
+    path: std::path::PathBuf,
+) -> WorkerWorkspace {
+    WorkerWorkspace {
+        lease_id: WorkspaceLeaseId::new(),
+        repository_root,
+        path,
+        branch: String::new(),
+        parent_branch: String::new(),
+        base_commit: String::new(),
+    }
 }
 
 /// The minimum recorded position `project_workspace_matches` needs: it compares
@@ -610,6 +628,7 @@ impl RuntimeCoordinator {
             provider_profile_id,
             recovery_contexts: Mutex::new(recovery_contexts),
             review_confirmations: Mutex::new(HashMap::new()),
+            task_positions: Mutex::new(HashMap::new()),
             application_root_attach_lock: Mutex::new(()),
             draining: AtomicBool::new(false),
         })
@@ -702,46 +721,23 @@ impl RuntimeCoordinator {
                 .application_root_attachment(idempotency_key)?
         };
         if let Some(existing) = existing {
-            let recorded = {
-                self.repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned")
-                    .task_workspace_optional(&existing.root_task_id)?
-            };
-            let workspace = match recorded {
-                Some(workspace) => {
-                    if !self
-                        .factory
-                        .project_workspace_matches(requested_workspace, &workspace)
-                    {
-                        return Err(RuntimeCoordinatorError::Supervisor(
-                            "application root workspace does not match its recorded repository"
-                                .into(),
-                        ));
-                    }
-                    workspace
+            // A root runs in place, so it keeps no workspace row: its project is
+            // validated against the durable attachment record, and the in-place
+            // position is synthesized from the requested project.
+            if let Some(recorded) = existing.workspace_root.as_deref() {
+                if !self
+                    .factory
+                    .project_workspace_matches(requested_workspace, &recorded_workspace(recorded))
+                {
+                    return Err(RuntimeCoordinatorError::Supervisor(
+                        "application root workspace does not match its recorded repository".into(),
+                    ));
                 }
-                // A read-only application root keeps no `task_workspaces` row:
-                // it runs in place, so its project is validated against the
-                // durable attachment record instead, and the in-place position is
-                // synthesized from the requested project.
-                None => {
-                    if let Some(recorded) = existing.workspace_root.as_deref() {
-                        if !self.factory.project_workspace_matches(
-                            requested_workspace,
-                            &recorded_workspace(recorded),
-                        ) {
-                            return Err(RuntimeCoordinatorError::Supervisor(
-                                "application root workspace does not match its recorded repository"
-                                    .into(),
-                            ));
-                        }
-                    }
-                    service
-                        .read_only_workspace(None, &existing.root_task_id)
-                        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?
-                }
-            };
+            }
+            let workspace = service
+                .read_only_workspace(None, &existing.root_task_id)
+                .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+            self.remember_task_position(&existing.root_task_id, &workspace);
             if existing.state == "detached" {
                 self.repository
                     .lock()
@@ -1608,6 +1604,42 @@ impl RuntimeCoordinator {
     /// The nearest ancestor task's workspace, if any, walking `parent_id`
     /// upward. Used as the read-only execution root so a read-only child sees
     /// its parent's current view rather than a clean baseline.
+    /// The workdir a task was given at spawn time, read from its live supervisor.
+    ///
+    /// Best-effort: a supervisor that is busy or gone yields `None` rather than
+    /// blocking, because the only caller renders a review diff.
+    fn supervisor_workdir_for(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<std::path::PathBuf>, RuntimeCoordinatorError> {
+        let session = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository
+                .task_detail(task)?
+                .session_id
+                .parse::<RootSessionId>()
+        };
+        let Ok(session) = session else {
+            return Ok(None);
+        };
+        let supervisor = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .get(&session)
+            .cloned();
+        let Some(supervisor) = supervisor else {
+            return Ok(None);
+        };
+        let Ok(supervisor) = supervisor.try_lock() else {
+            return Ok(None);
+        };
+        Ok(supervisor.spawn_workdir(task))
+    }
+
     fn nearest_ancestor_workspace(
         &self,
         supervisor: &AgentSupervisor,
@@ -1616,13 +1648,12 @@ impl RuntimeCoordinator {
         let mut current = supervisor
             .task(task)
             .and_then(|task| task.parent_id.clone());
-        let repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
         while let Some(ancestor) = current {
-            if let Some(workspace) = repository.task_workspace_optional(&ancestor)? {
-                return Ok(Some(workspace));
+            // A parent's position is the workdir it runs in, remembered in the
+            // supervisor. Nothing is persisted, so an ancestor with no workdir
+            // has simply not run yet.
+            if let Some(workdir) = supervisor.spawn_workdir(&ancestor) {
+                return Ok(Some(in_place_workspace_at(workdir.clone(), workdir)));
             }
             current = supervisor
                 .task(&ancestor)
@@ -1639,19 +1670,6 @@ impl RuntimeCoordinator {
         attempt: &AttemptId,
         workspace_mode: ChildWriteMode,
     ) -> Result<Option<WorkerWorkspace>, RuntimeCoordinatorError> {
-        let existing = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .task_workspace_optional(task)?;
-        if let Some(existing) = existing {
-            // A recorded position is reused across restarts rather than
-            // re-resolved.
-            supervisor
-                .assign_workspace(task, existing.lease_id.clone())
-                .map_err(RuntimeCoordinatorError::Supervisor)?;
-            return Ok(Some(existing));
-        }
         let Some(provider) = self.workspace_service_for(session) else {
             return Ok(None);
         };
@@ -1669,6 +1687,7 @@ impl RuntimeCoordinator {
             supervisor
                 .assign_workspace(task, workspace.lease_id.clone())
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
+            self.remember_task_position(task, &workspace);
             return Ok(Some(workspace));
         }
         // A coding task runs where its parent prepared it, when the parent handed
@@ -1679,21 +1698,30 @@ impl RuntimeCoordinator {
             None => provider.in_place_workspace(session, task, attempt),
         }
         .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
-        // Only a branch-backed position gets a `task_workspaces` row. An in-place
-        // position (no branch) is a view of a parent directory, not a worktree
-        // the daemon owns, so recording it would claim an ownership it has none of.
-        if !workspace.branch.is_empty() {
-            // The daemon did not create this directory, so a failed record has
-            // nothing to clean up: it simply fails the start.
-            self.repository
-                .lock()
-                .expect("runtime repository mutex poisoned")
-                .record_task_workspace(task, attempt, &workspace)?;
-        }
+        // The position lives only in the supervisor: nothing about it is
+        // persisted, so there is no row to write and no worktree to own.
         supervisor
             .assign_workspace(task, workspace.lease_id.clone())
             .map_err(RuntimeCoordinatorError::Supervisor)?;
+        self.remember_task_position(task, &workspace);
         Ok(Some(workspace))
+    }
+
+    /// Remembers where a task runs for this process's lifetime.
+    fn remember_task_position(&self, task: &TaskId, workspace: &WorkerWorkspace) {
+        self.task_positions
+            .lock()
+            .expect("runtime task positions mutex poisoned")
+            .insert(task.clone(), workspace.clone());
+    }
+
+    /// The position a task was last given in this process, if any.
+    fn remembered_task_position(&self, task: &TaskId) -> Option<WorkerWorkspace> {
+        self.task_positions
+            .lock()
+            .expect("runtime task positions mutex poisoned")
+            .get(task)
+            .cloned()
     }
 
     pub async fn retry_task(
@@ -2104,7 +2132,7 @@ impl RuntimeCoordinator {
             _ => {}
         }
         let (session, _parent, delivery) = self.review_context(task)?;
-        let workspace = {
+        {
             let repository = self
                 .repository
                 .lock()
@@ -2114,8 +2142,10 @@ impl RuntimeCoordinator {
                     "delivery already has a review decision".into(),
                 ));
             }
-            repository.task_workspace_optional(task)?
-        };
+        }
+        // Pinning the position at preview time makes confirm re-inspect the same
+        // directory the reviewer saw.
+        let preview_workspace = self.remembered_task_position(task);
         let supervisor = self.supervisor(&session)?;
         let supervisor = supervisor.lock().await;
         if !matches!(
@@ -2127,7 +2157,7 @@ impl RuntimeCoordinator {
             ));
         }
         let confirmation_token =
-            self.issue_review_confirmation(task, &decision, &delivery, workspace);
+            self.issue_review_confirmation(task, &decision, &delivery, preview_workspace);
         Ok(ReviewPreview {
             task_id: task.clone(),
             delivery_id: delivery.id,
@@ -2443,6 +2473,9 @@ impl RuntimeCoordinator {
     /// one: no commit, no recorded worktree, or a worktree already reclaimed.
     pub fn delivery_diff(&self, task: &TaskId) -> Result<Option<String>, RuntimeCoordinatorError> {
         let (repository_root, path, delivery) = {
+            let Some(workdir) = self.supervisor_workdir_for(task)? else {
+                return Ok(None);
+            };
             let repository = self
                 .repository
                 .lock()
@@ -2451,10 +2484,7 @@ impl RuntimeCoordinator {
             let Ok(delivery) = serde_json::from_str::<DeliveryReport>(&detail.delivery_json) else {
                 return Ok(None);
             };
-            let Some(workspace) = repository.task_workspace_optional(task)? else {
-                return Ok(None);
-            };
-            (workspace.repository_root, workspace.path, delivery)
+            (workdir.clone(), workdir, delivery)
         };
         if delivery.commit.trim().is_empty() {
             return Ok(None);

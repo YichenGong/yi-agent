@@ -79,8 +79,7 @@ fn legacy_v6_database() -> PathBuf {
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE task_workspaces;
-             DROP TABLE application_root_attachments;
+            "DROP TABLE application_root_attachments;
              DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11);",
         )
         .unwrap();
@@ -710,7 +709,6 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
         "events",
         "runtime_metadata",
         "resource_admission_cursors",
-        "task_workspaces",
         "application_root_attachments",
     ] {
         assert!(repository.has_table(table).unwrap(), "missing {table}");
@@ -718,16 +716,19 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
 }
 
 #[test]
-fn v6_database_migrates_to_workspace_and_attachment_tables() {
+fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
     assert_eq!(repository.schema_version().unwrap(), 11);
-    assert!(repository.has_table("task_workspaces").unwrap());
     assert!(
         repository
             .has_table("application_root_attachments")
             .unwrap()
+    );
+    assert!(
+        !repository.has_table("task_workspaces").unwrap(),
+        "the retired table is never recreated"
     );
 }
 
@@ -804,15 +805,10 @@ fn application_roots_use_their_attaching_project_workspace() {
     else {
         panic!("expected project B child");
     };
-    let child_task_id: TaskId = child_task_id.parse().unwrap();
-    let child_workspace = RuntimeRepository::open(&database)
-        .unwrap()
-        .task_workspace(&child_task_id)
-        .unwrap();
+    let _child_task_id: TaskId = child_task_id.parse().unwrap();
 
     assert_eq!(first_workspace.repository_root, project_a);
     assert_eq!(second_workspace.repository_root, project_b);
-    assert_eq!(child_workspace.repository_root, project_b);
 }
 
 #[test]
@@ -4036,167 +4032,6 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
 }
 
 #[test]
-fn inspect_task_includes_the_authoritative_recorded_workspace() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated {
-        session_id,
-        root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-    let IpcResponse::TaskSpawned { task_id } = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnChild {
-            workdir: None,
-            session_id: session_id.clone(),
-            parent_task_id: root_task_id,
-            objective: "Inspect workspace assignment".into(),
-            mode: None,
-            model: None,
-        },
-    )
-    .unwrap() else {
-        panic!("expected a spawned child");
-    };
-    let task: TaskId = task_id.parse().unwrap();
-    let attempt = RuntimeRepository::open(&database)
-        .unwrap()
-        .active_attempt_id(&task)
-        .unwrap();
-    let workspace = test_workspace_for_ipc(&session_id, &task_id);
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .record_task_workspace(&task, &attempt, &workspace)
-        .unwrap();
-
-    let IpcResponse::TaskDetail(detail) = send_request(
-        daemon.socket_path(),
-        IpcRequest::InspectTask {
-            task_id: task_id.clone(),
-        },
-    )
-    .unwrap() else {
-        panic!("expected task detail");
-    };
-
-    assert_eq!(detail.task_id, task_id);
-    assert_eq!(detail.workspace, Some(workspace));
-}
-
-#[test]
-fn inspect_task_omits_workspace_for_unassigned_old_tasks() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated { root_task_id, .. } =
-        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-
-    let IpcResponse::TaskDetail(detail) = send_request(
-        daemon.socket_path(),
-        IpcRequest::InspectTask {
-            task_id: root_task_id,
-        },
-    )
-    .unwrap() else {
-        panic!("expected task detail");
-    };
-
-    assert_eq!(detail.workspace, None);
-}
-
-#[test]
-fn subscription_snapshot_omits_workspace_for_unassigned_old_tasks() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated { root_task_id, .. } =
-        send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-
-    let IpcResponse::Subscription(snapshot) = send_request(
-        daemon.socket_path(),
-        IpcRequest::SubscribeEvents {
-            after_event_id: 0,
-            filters: SubscriptionFilters::default(),
-        },
-    )
-    .unwrap() else {
-        panic!("expected subscription snapshot");
-    };
-
-    let task = snapshot
-        .tasks
-        .iter()
-        .find(|task| task.task_id == root_task_id)
-        .expect("snapshot contains the unassigned root task");
-    assert_eq!(task.workspace, None);
-}
-
-#[test]
-fn subscription_snapshot_includes_recorded_task_workspace() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
-    let IpcResponse::SessionCreated {
-        session_id,
-        root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-    let IpcResponse::TaskSpawned { task_id } = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnChild {
-            workdir: None,
-            session_id: session_id.clone(),
-            parent_task_id: root_task_id,
-            objective: "Publish workspace assignment".into(),
-            mode: None,
-            model: None,
-        },
-    )
-    .unwrap() else {
-        panic!("expected a spawned child");
-    };
-    let task: TaskId = task_id.parse().unwrap();
-    let attempt = RuntimeRepository::open(&database)
-        .unwrap()
-        .active_attempt_id(&task)
-        .unwrap();
-    let workspace = test_workspace_for_ipc(&session_id, &task_id);
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .record_task_workspace(&task, &attempt, &workspace)
-        .unwrap();
-
-    let IpcResponse::Subscription(snapshot) = send_request(
-        daemon.socket_path(),
-        IpcRequest::SubscribeEvents {
-            after_event_id: 0,
-            filters: SubscriptionFilters::default(),
-        },
-    )
-    .unwrap() else {
-        panic!("expected subscription snapshot");
-    };
-
-    assert!(
-        snapshot
-            .tasks
-            .iter()
-            .any(|task| task.task_id == task_id && task.workspace == Some(workspace.clone()))
-    );
-}
-
-#[test]
 fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -5180,13 +5015,6 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
         repository.task_workspace_mode(&child).unwrap(),
         ChildWriteMode::Coding
     );
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_some(),
-        "a coding child must own a recorded worktree workspace"
-    );
 }
 
 #[test]
@@ -5234,13 +5062,6 @@ fn daemon_spawn_agent_defaults_to_read_only() {
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
         ChildWriteMode::ReadOnly
-    );
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_none(),
-        "a read-only child runs in place and owns no worktree row"
     );
 }
 

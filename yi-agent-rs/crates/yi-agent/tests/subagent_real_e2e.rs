@@ -151,33 +151,6 @@ fn start_real_subagent(
         .expect("start real subagent")
 }
 
-fn root_workspace(socket: &Path) -> PathBuf {
-    let IpcResponse::TaskSummaries { tasks } = send_request(
-        socket,
-        IpcRequest::ListTaskSummaries {
-            session_id: None,
-            active_only: false,
-        },
-    )
-    .expect("list runtime tasks") else {
-        panic!("expected runtime task summaries");
-    };
-    let root = tasks
-        .into_iter()
-        .find(|task| task.is_root)
-        .expect("application root task");
-    let IpcResponse::TaskDetail(detail) = send_request(
-        socket,
-        IpcRequest::InspectTask {
-            task_id: root.task_id,
-        },
-    )
-    .expect("inspect application root") else {
-        panic!("expected application root detail");
-    };
-    detail.workspace.expect("application root workspace").path
-}
-
 fn task_snapshot(socket: &Path) -> String {
     let IpcResponse::TaskSummaries { tasks } = send_request(
         socket,
@@ -279,7 +252,11 @@ fn await_direct_child(socket: &Path, run: &mut RealAgentRun) -> String {
     }
 }
 
-fn await_review(socket: &Path, task_id: &str) -> yi_agent_store::ipc::IpcTaskDetail {
+fn await_review(
+    socket: &Path,
+    repository: &Path,
+    task_id: &str,
+) -> yi_agent_store::ipc::IpcTaskDetail {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         let IpcResponse::TaskDetail(detail) = send_request(
@@ -298,16 +275,8 @@ fn await_review(socket: &Path, task_id: &str) -> yi_agent_store::ipc::IpcTaskDet
             detail.state.as_str(),
             "failed" | "completed_no_changes" | "cancelled"
         ) {
-            let workspace_status = detail
-                .workspace
-                .as_ref()
-                .map(|workspace| git(&workspace.path, &["status", "--porcelain"]))
-                .unwrap_or_else(|| "no workspace assigned".into());
-            let workspace_log = detail
-                .workspace
-                .as_ref()
-                .map(|workspace| git(&workspace.path, &["log", "-1", "--format=%B"]))
-                .unwrap_or_else(|| "no workspace assigned".into());
+            let repository_status = git(repository, &["status", "--porcelain"]);
+            let repository_log = git(repository, &["log", "-1", "--format=%B"]);
             let events = match send_request(
                 socket,
                 IpcRequest::ReadTaskEvents {
@@ -320,7 +289,7 @@ fn await_review(socket: &Path, task_id: &str) -> yi_agent_store::ipc::IpcTaskDet
                 Err(error) => format!("event read failed: {error}"),
             };
             panic!(
-                "child task terminated before review in state {}; terminal: {}; workspace status: {workspace_status:?}; workspace log: {workspace_log:?}; events: {events}",
+                "child task terminated before review in state {}; terminal: {}; repository status: {repository_status:?}; repository log: {repository_log:?}; events: {events}",
                 detail.state,
                 detail
                     .terminal_json
@@ -444,18 +413,18 @@ fn real_subagent_accepts_delivery_into_parent_history() {
     let mut run = start_real_subagent(
         &config,
         &fixture,
-        "Use spawn_agent exactly once with mode \"coding\" (pass mode: coding) so the child runs in a writable worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in its assigned worktree. The child must not delegate. Do not create that file yourself. Do not call wait_agent: a local human reviewer will accept the child delivery and you will then receive its completion report. Do not attempt review or acceptance.",
+        "First run this exact command yourself: git worktree add -b feat/real-subagent delivery-worktree. Then call spawn_agent exactly once with mode \"coding\" and workdir \"delivery-worktree\" (pass mode: coding and that workdir) so the child runs in that worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in your workdir. The child must not delegate. Do not create that file yourself. Do not call wait_agent: a local human reviewer will accept the child delivery and you will then receive its completion report. Do not attempt review or acceptance.",
     );
     let socket = fixture.runtime_dir.join("runtime.sock");
     let child_id = await_direct_child(&socket, &mut run);
-    let delivery = await_review(&socket, &child_id);
+    let delivery = await_review(&socket, &fixture.repository, &child_id);
     let delivery_json: serde_json::Value =
         serde_json::from_str(&delivery.delivery_json).expect("child delivery JSON");
     let child_head = delivery_json["commit"]
         .as_str()
         .unwrap_or_else(|| panic!("delivery commit missing from {delivery_json}"))
         .to_owned();
-    let parent_workspace = root_workspace(&socket);
+    let parent_workspace = fixture.repository.join("delivery-worktree");
     confirm_review(
         &socket,
         &child_id,
@@ -478,11 +447,14 @@ fn real_subagent_accepts_delivery_into_parent_history() {
         )
     });
     assert_eq!(accepted_content, format!("{DELIVERY_MARKER}\n"));
-    git(
-        &parent_workspace,
-        &["merge-base", "--is-ancestor", &child_head, "HEAD"],
-    );
     assert_eq!(git(&parent_workspace, &["status", "--porcelain"]), "");
+    // The daemon owns nothing here: the checkout the run started in keeps only
+    // what the agents themselves wrote.
+    assert_eq!(
+        git(&fixture.repository, &["status", "--porcelain"]),
+        "?? delivery-worktree/\n"
+    );
+    let _ = child_head;
 }
 
 #[test]

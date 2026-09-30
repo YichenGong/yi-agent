@@ -544,8 +544,6 @@ pub struct SubscriptionSnapshot {
 pub struct IpcTask {
     pub task_id: String,
     pub state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,8 +571,6 @@ pub struct IpcTaskDetail {
     pub delivery_json: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1332,7 +1328,6 @@ fn stream_subscription(
                 .map(|task| IpcTask {
                     task_id: task.task_id,
                     state: task.state,
-                    workspace: task.workspace,
                 })
                 .collect(),
             events: snapshot
@@ -1942,7 +1937,6 @@ mod subscription_queue_tests {
                 state: "queued".into(),
                 delivery_json: "x".repeat(MAX_FRAME_BYTES),
                 terminal_json: None,
-                workspace: None,
             }),
         );
 
@@ -2260,7 +2254,6 @@ fn read_incoming_frame<R: BufRead>(reader: &mut R) -> Result<Option<IncomingFram
 fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcErrorCode {
     match error {
         crate::repository::RepositoryError::TaskNotFound { .. }
-        | crate::repository::RepositoryError::TaskWorkspaceNotFound { .. }
         | crate::repository::RepositoryError::MailboxMessageNotFound { .. }
         | crate::repository::RepositoryError::PermissionRequestNotFound { .. } => {
             IpcErrorCode::NotFound
@@ -2283,7 +2276,6 @@ fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcError
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
         | crate::repository::RepositoryError::InvalidAdmissionCursor { .. }
-        | crate::repository::RepositoryError::InvalidTaskWorkspace { .. }
         | crate::repository::RepositoryError::InvalidWatchdogSnapshot { .. }
         | crate::repository::RepositoryError::UnknownEventKind { .. } => IpcErrorCode::Internal,
     }
@@ -2345,10 +2337,6 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::ReviewAccepted => "review_accepted",
         crate::repository::RuntimeEvent::ReviewRework => "review_rework",
         crate::repository::RuntimeEvent::ReviewRejected => "review_rejected",
-        crate::repository::RuntimeEvent::TaskWorkspaceRecycled => "task_workspace_recycled",
-        crate::repository::RuntimeEvent::TaskWorkspaceRecycleFailed => {
-            "task_workspace_recycle_failed"
-        }
     }
 }
 
@@ -2770,7 +2758,6 @@ fn respond(
                 state: detail.state,
                 delivery_json: detail.delivery_json,
                 terminal_json: detail.terminal_json,
-                workspace: detail.workspace,
             }))
         }
         IpcRequest::InspectChild {
@@ -2799,7 +2786,6 @@ fn respond(
                 state: detail.state,
                 delivery_json: detail.delivery_json,
                 terminal_json: detail.terminal_json,
-                workspace: detail.workspace,
             }))
         }
         IpcRequest::CancelChild {
@@ -2916,7 +2902,6 @@ fn respond(
                 .map(|task| IpcTask {
                     task_id: task.task_id,
                     state: task.state,
-                    workspace: task.workspace,
                 })
                 .collect();
             let events = snapshot

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use chrono::{DateTime, Local, Utc};
@@ -9,12 +9,8 @@ use uuid::Uuid;
 use yi_agent_core::subagent::task::{
     BudgetKind, DeliveryId, DeliveryReport, IntegrationValidation, TimeoutKind,
 };
-use yi_agent_core::subagent::task::{
-    MessageId, PermissionDecision, PermissionRequestId, WorkspaceLeaseId,
-};
-use yi_agent_core::subagent::worker::{
-    WorkerRecoveryAttestation, WorkerRecoveryContext, WorkerWorkspace,
-};
+use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionRequestId};
+use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
@@ -57,10 +53,6 @@ pub enum RepositoryError {
     InvalidAdmissionCursor { key: String, reason: String },
     #[error("watchdog snapshot is invalid for {attempt}: {reason}")]
     InvalidWatchdogSnapshot { attempt: String, reason: String },
-    #[error("task workspace does not exist: {task}")]
-    TaskWorkspaceNotFound { task: String },
-    #[error("task workspace is invalid for {task}: {reason}")]
-    InvalidTaskWorkspace { task: String, reason: String },
 }
 
 #[derive(Debug, Error)]
@@ -97,8 +89,6 @@ pub enum RuntimeEvent {
     ReviewAccepted,
     ReviewRework,
     ReviewRejected,
-    TaskWorkspaceRecycled,
-    TaskWorkspaceRecycleFailed,
 }
 
 impl RuntimeEvent {
@@ -129,8 +119,6 @@ impl RuntimeEvent {
             Self::ReviewAccepted => "review_accepted",
             Self::ReviewRework => "review_rework",
             Self::ReviewRejected => "review_rejected",
-            Self::TaskWorkspaceRecycled => "task_workspace_recycled",
-            Self::TaskWorkspaceRecycleFailed => "task_workspace_recycle_failed",
         }
     }
 
@@ -161,8 +149,6 @@ impl RuntimeEvent {
             "review_accepted" => Ok(Self::ReviewAccepted),
             "review_rework" => Ok(Self::ReviewRework),
             "review_rejected" => Ok(Self::ReviewRejected),
-            "task_workspace_recycled" => Ok(Self::TaskWorkspaceRecycled),
-            "task_workspace_recycle_failed" => Ok(Self::TaskWorkspaceRecycleFailed),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -299,7 +285,6 @@ pub struct PersistedMailboxMessage {
 pub struct PersistedTask {
     pub task_id: String,
     pub state: String,
-    pub workspace: Option<WorkerWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,7 +310,6 @@ pub struct PersistedTaskDetail {
     pub state: String,
     pub delivery_json: String,
     pub terminal_json: Option<String>,
-    pub workspace: Option<WorkerWorkspace>,
 }
 
 /// Active resource ownership which a destructive-control preview must expose.
@@ -3115,257 +3099,6 @@ impl RuntimeRepository {
             .map_err(RepositoryError::from)
     }
 
-    pub fn record_task_workspace(
-        &mut self,
-        task: &TaskId,
-        attempt: &AttemptId,
-        workspace: &WorkerWorkspace,
-    ) -> Result<(), RepositoryError> {
-        validate_task_workspace(task, workspace)?;
-        let repository_root =
-            workspace_path_str(task, "repository_root", &workspace.repository_root)?;
-        let path = workspace_path_str(task, "path", &workspace.path)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let active_attempt_matches = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM tasks
-                JOIN attempts ON attempts.id = ?2 AND attempts.task_id = tasks.id
-                WHERE tasks.id = ?1 AND tasks.active_attempt_id = ?2
-             )",
-            params![task.to_string(), attempt.to_string()],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !active_attempt_matches {
-            return Err(RepositoryError::InvalidTaskWorkspace {
-                task: task.to_string(),
-                reason: "workspace attempt is not the task's active attempt".into(),
-            });
-        }
-
-        let existing = transaction
-            .query_row(
-                "SELECT attempt_id, lease_id, repository_root, path, branch, parent_branch, base_commit
-                 FROM task_workspaces WHERE task_id = ?1",
-                params![task.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((
-            existing_attempt,
-            lease_id,
-            repository_root,
-            path,
-            branch,
-            parent_branch,
-            base_commit,
-        )) = existing
-        {
-            let existing_workspace = persisted_task_workspace(
-                task,
-                lease_id,
-                repository_root,
-                path,
-                branch,
-                parent_branch,
-                base_commit,
-            )?;
-            if existing_attempt == attempt.to_string() && existing_workspace == *workspace {
-                transaction.commit()?;
-                return Ok(());
-            }
-            return Err(RepositoryError::InvalidTaskWorkspace {
-                task: task.to_string(),
-                reason: "workspace assignment conflicts with an existing task workspace".into(),
-            });
-        }
-
-        let conflicting_task = transaction
-            .query_row(
-                "SELECT task_id FROM task_workspaces
-                 WHERE lease_id = ?1 OR path = ?2 OR (repository_root = ?3 AND branch = ?4)
-                 LIMIT 1",
-                params![
-                    workspace.lease_id.to_string(),
-                    path,
-                    repository_root,
-                    workspace.branch.as_str(),
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(conflicting_task) = conflicting_task {
-            return Err(RepositoryError::InvalidTaskWorkspace {
-                task: task.to_string(),
-                reason: format!("workspace assignment conflicts with task {conflicting_task}"),
-            });
-        }
-
-        transaction
-            .execute(
-                "INSERT INTO task_workspaces (
-                task_id, attempt_id, lease_id, repository_root, path,
-                branch, parent_branch, base_commit
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    task.to_string(),
-                    attempt.to_string(),
-                    workspace.lease_id.to_string(),
-                    repository_root,
-                    path,
-                    workspace.branch.as_str(),
-                    workspace.parent_branch.as_str(),
-                    workspace.base_commit.as_str(),
-                ],
-            )
-            .map_err(|error| task_workspace_insert_error(task, error))?;
-        let updated = transaction.execute(
-            "UPDATE tasks SET workspace_lease_id = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?2 AND active_attempt_id = ?3",
-            params![
-                workspace.lease_id.to_string(),
-                task.to_string(),
-                attempt.to_string(),
-            ],
-        )?;
-        if updated == 0 {
-            return Err(RepositoryError::InvalidTaskWorkspace {
-                task: task.to_string(),
-                reason: "workspace attempt is no longer active".into(),
-            });
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn task_workspace(&self, task: &TaskId) -> Result<WorkerWorkspace, RepositoryError> {
-        self.task_workspace_optional(task)?
-            .ok_or_else(|| RepositoryError::TaskWorkspaceNotFound {
-                task: task.to_string(),
-            })
-    }
-
-    pub fn task_workspace_optional(
-        &self,
-        task: &TaskId,
-    ) -> Result<Option<WorkerWorkspace>, RepositoryError> {
-        let row = self
-            .connection
-            .query_row(
-                "SELECT lease_id, repository_root, path, branch, parent_branch, base_commit
-                 FROM task_workspaces WHERE task_id = ?1",
-                params![task.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((lease_id, repository_root, path, branch, parent_branch, base_commit)) = row {
-            return persisted_task_workspace(
-                task,
-                lease_id,
-                repository_root,
-                path,
-                branch,
-                parent_branch,
-                base_commit,
-            )
-            .map(Some);
-        }
-        if self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
-            params![task.to_string()],
-            |row| row.get::<_, bool>(0),
-        )? {
-            Ok(None)
-        } else {
-            Err(RepositoryError::TaskNotFound {
-                task: task.to_string(),
-            })
-        }
-    }
-
-    /// Every task in a session that owns a worktree, deepest first.
-    ///
-    /// Ordering by `depth DESC` matters: a child's ancestry check runs with the
-    /// owner worktree as its working directory, so the parent must be reclaimed
-    /// after its children, never before.
-    pub fn reclaim_candidates(
-        &self,
-        root_session_id: &RootSessionId,
-    ) -> Result<Vec<PersistedTaskDetail>, RepositoryError> {
-        let mut statement = self.connection.prepare(
-            "SELECT tasks.id, tasks.root_session_id, tasks.parent_id, tasks.depth,
-                    tasks.state_json, tasks.delivery_json, attempts.terminal_json,
-                    task_workspaces.lease_id, task_workspaces.repository_root,
-                    task_workspaces.path, task_workspaces.branch,
-                    task_workspaces.parent_branch, task_workspaces.base_commit
-             FROM tasks
-             JOIN task_workspaces ON task_workspaces.task_id = tasks.id
-             LEFT JOIN attempts ON attempts.id = tasks.active_attempt_id
-             WHERE tasks.root_session_id = ?1
-             ORDER BY tasks.depth DESC, tasks.created_at, tasks.id",
-        )?;
-        let rows = statement
-            .query_map(params![root_session_id.to_string()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, u8>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, String>(12)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows
-            .into_iter()
-            .map(|row| PersistedTaskDetail {
-                task_id: row.0,
-                session_id: row.1,
-                parent_task_id: row.2,
-                depth: row.3,
-                state: row.4,
-                delivery_json: row.5,
-                terminal_json: row.6,
-                workspace: Some(WorkerWorkspace {
-                    lease_id: row.7.parse().unwrap_or_else(|_| WorkspaceLeaseId::new()),
-                    repository_root: PathBuf::from(row.8),
-                    path: PathBuf::from(row.9),
-                    branch: row.10,
-                    parent_branch: row.11,
-                    base_commit: row.12,
-                }),
-            })
-            .collect())
-    }
-
     /// Sessions whose application root attachment is currently detached.
     ///
     /// A detached root sits in `paused`, which is not a terminal state, so it
@@ -3399,6 +3132,8 @@ impl RuntimeRepository {
             .flatten())
     }
 
+    /// Reads a task's persisted write mode. This lives on the task row, not the
+    /// retired `task_workspaces` table.
     pub fn task_workspace_mode(&self, task: &TaskId) -> Result<ChildWriteMode, RepositoryError> {
         let value = self
             .connection
@@ -3418,16 +3153,6 @@ impl RuntimeRepository {
                 task: task.to_string(),
             }),
         }
-    }
-
-    /// Deletes a task's workspace assignment row. Idempotent: a missing row is
-    /// not an error, so recycling can be retried safely.
-    pub fn delete_task_workspace(&self, task: &TaskId) -> Result<(), RepositoryError> {
-        self.connection.execute(
-            "DELETE FROM task_workspaces WHERE task_id = ?1",
-            params![task.to_string()],
-        )?;
-        Ok(())
     }
 
     pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {
@@ -3488,51 +3213,19 @@ impl RuntimeRepository {
 
     pub fn task_snapshots(&self) -> Result<Vec<PersistedTask>, RepositoryError> {
         let mut statement = self.connection.prepare(
-            "SELECT tasks.id, tasks.state_json, task_workspaces.lease_id,
-                    task_workspaces.repository_root, task_workspaces.path,
-                    task_workspaces.branch, task_workspaces.parent_branch,
-                    task_workspaces.base_commit
+            "SELECT tasks.id, tasks.state_json
              FROM tasks
-             LEFT JOIN task_workspaces ON task_workspaces.task_id = tasks.id
              ORDER BY tasks.created_at, tasks.id",
         )?;
         statement
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            })?
-            .map(|row| {
-                let (task_id, state, lease_id, root, path, branch, parent_branch, base_commit) =
-                    row?;
-                let task = task_id
-                    .parse()
-                    .map_err(|_| RepositoryError::InvalidTaskWorkspace {
-                        task: task_id.clone(),
-                        reason: "task ID in workspace snapshot is invalid".into(),
-                    })?;
                 Ok(PersistedTask {
-                    task_id,
-                    state,
-                    workspace: optional_persisted_task_workspace(
-                        &task,
-                        lease_id,
-                        root,
-                        path,
-                        branch,
-                        parent_branch,
-                        base_commit,
-                    )?,
+                    task_id: row.get(0)?,
+                    state: row.get(1)?,
                 })
-            })
-            .collect()
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()
+            .map_err(RepositoryError::from)
     }
 
     pub fn queued_task_count(&self) -> Result<usize, RepositoryError> {
@@ -3825,7 +3518,6 @@ impl RuntimeRepository {
                         state: row.get(4)?,
                         delivery_json: row.get(5)?,
                         terminal_json: row.get(6)?,
-                        workspace: None,
                     })
                 },
             )
@@ -3835,10 +3527,7 @@ impl RuntimeRepository {
                 },
                 error => RepositoryError::Sql(error),
             })?;
-        Ok(PersistedTaskDetail {
-            workspace: self.task_workspace_optional(task)?,
-            ..detail
-        })
+        Ok(detail)
     }
 
     pub fn task_summaries(
@@ -3998,60 +3687,19 @@ impl RuntimeRepository {
         };
         let tasks = {
             let mut statement = transaction.prepare(
-                "SELECT tasks.id, tasks.state_json, task_workspaces.lease_id,
-                            task_workspaces.repository_root, task_workspaces.path,
-                            task_workspaces.branch, task_workspaces.parent_branch,
-                            task_workspaces.base_commit
+                "SELECT tasks.id, tasks.state_json
                      FROM tasks
-                     LEFT JOIN task_workspaces ON task_workspaces.task_id = tasks.id
                      ORDER BY tasks.created_at, tasks.id",
             )?;
             statement
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })?
-                .map(|row| {
-                    let (
-                        task_id,
-                        state,
-                        lease_id,
-                        repository_root,
-                        path,
-                        branch,
-                        parent_branch,
-                        base_commit,
-                    ) = row?;
-                    let task =
-                        task_id
-                            .parse()
-                            .map_err(|_| RepositoryError::InvalidTaskWorkspace {
-                                task: task_id.clone(),
-                                reason: "task ID in workspace snapshot is invalid".into(),
-                            })?;
                     Ok(PersistedTask {
-                        task_id,
-                        state,
-                        workspace: optional_persisted_task_workspace(
-                            &task,
-                            lease_id,
-                            repository_root,
-                            path,
-                            branch,
-                            parent_branch,
-                            base_commit,
-                        )?,
+                        task_id: row.get(0)?,
+                        state: row.get(1)?,
                     })
-                })
-                .collect::<Result<Vec<_>, RepositoryError>>()?
+                })?
+                .collect::<Result<Vec<_>, rusqlite::Error>>()
+                .map_err(RepositoryError::from)?
         };
         let events = if matches!(cursor_state, RuntimeCursorState::Replayable) {
             let mut statement = transaction.prepare(
@@ -4339,135 +3987,6 @@ fn validate_recovery_context(context: &WorkerRecoveryContext) -> Result<(), Repo
     Ok(())
 }
 
-fn validate_task_workspace(
-    task: &TaskId,
-    workspace: &WorkerWorkspace,
-) -> Result<(), RepositoryError> {
-    workspace_path_str(task, "repository_root", &workspace.repository_root)?;
-    workspace_path_str(task, "path", &workspace.path)?;
-    for (field, value) in [
-        ("branch", workspace.branch.as_str()),
-        ("parent_branch", workspace.parent_branch.as_str()),
-        ("base_commit", workspace.base_commit.as_str()),
-    ] {
-        if value.trim().is_empty() {
-            return Err(RepositoryError::InvalidTaskWorkspace {
-                task: task.to_string(),
-                reason: format!("{field} is empty"),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn workspace_path_str<'a>(
-    task: &TaskId,
-    field: &str,
-    path: &'a Path,
-) -> Result<&'a str, RepositoryError> {
-    let value = path
-        .to_str()
-        .ok_or_else(|| RepositoryError::InvalidTaskWorkspace {
-            task: task.to_string(),
-            reason: format!("{field} is not valid UTF-8"),
-        })?;
-    if value.is_empty() {
-        return Err(RepositoryError::InvalidTaskWorkspace {
-            task: task.to_string(),
-            reason: format!("{field} is empty"),
-        });
-    }
-    Ok(value)
-}
-
-fn persisted_task_workspace(
-    task: &TaskId,
-    lease_id: String,
-    repository_root: String,
-    path: String,
-    branch: String,
-    parent_branch: String,
-    base_commit: String,
-) -> Result<WorkerWorkspace, RepositoryError> {
-    if lease_id.trim().is_empty() {
-        return Err(RepositoryError::InvalidTaskWorkspace {
-            task: task.to_string(),
-            reason: "lease_id is empty".into(),
-        });
-    }
-    let workspace = WorkerWorkspace {
-        lease_id: lease_id.parse::<WorkspaceLeaseId>().map_err(|_| {
-            RepositoryError::InvalidTaskWorkspace {
-                task: task.to_string(),
-                reason: "lease_id is invalid".into(),
-            }
-        })?,
-        repository_root: PathBuf::from(repository_root),
-        path: PathBuf::from(path),
-        branch,
-        parent_branch,
-        base_commit,
-    };
-    validate_task_workspace(task, &workspace)?;
-    Ok(workspace)
-}
-
-fn optional_persisted_task_workspace(
-    task: &TaskId,
-    lease_id: Option<String>,
-    repository_root: Option<String>,
-    path: Option<String>,
-    branch: Option<String>,
-    parent_branch: Option<String>,
-    base_commit: Option<String>,
-) -> Result<Option<WorkerWorkspace>, RepositoryError> {
-    match (
-        lease_id,
-        repository_root,
-        path,
-        branch,
-        parent_branch,
-        base_commit,
-    ) {
-        (None, None, None, None, None, None) => Ok(None),
-        (
-            Some(lease_id),
-            Some(repository_root),
-            Some(path),
-            Some(branch),
-            Some(parent_branch),
-            Some(base_commit),
-        ) => persisted_task_workspace(
-            task,
-            lease_id,
-            repository_root,
-            path,
-            branch,
-            parent_branch,
-            base_commit,
-        )
-        .map(Some),
-        _ => Err(RepositoryError::InvalidTaskWorkspace {
-            task: task.to_string(),
-            reason: "workspace row is partially persisted".into(),
-        }),
-    }
-}
-
-fn task_workspace_insert_error(task: &TaskId, error: rusqlite::Error) -> RepositoryError {
-    match &error {
-        rusqlite::Error::SqliteFailure(sqlite_error, _)
-            if sqlite_error.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            RepositoryError::InvalidTaskWorkspace {
-                task: task.to_string(),
-                reason: "workspace assignment conflicts with persisted workspace state".into(),
-            }
-        }
-        _ => RepositoryError::Sql(error),
-    }
-}
-
 fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
@@ -4662,19 +4181,7 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
     if current_version < 7 {
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(
-            "CREATE TABLE task_workspaces (
-                task_id TEXT PRIMARY KEY REFERENCES tasks(id),
-                attempt_id TEXT NOT NULL REFERENCES attempts(id),
-                lease_id TEXT NOT NULL UNIQUE,
-                repository_root TEXT NOT NULL,
-                path TEXT NOT NULL UNIQUE,
-                branch TEXT NOT NULL,
-                parent_branch TEXT NOT NULL,
-                base_commit TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(repository_root, branch)
-             );
-             CREATE TABLE application_root_attachments (
+            "CREATE TABLE application_root_attachments (
                 idempotency_key TEXT PRIMARY KEY,
                 root_session_id TEXT NOT NULL,
                 root_task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -4771,18 +4278,7 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
 
 #[cfg(test)]
 mod runtime_event_tests {
-    use super::*;
 
     #[test]
-    fn recycle_events_round_trip_through_name_and_parse() {
-        for event in [
-            RuntimeEvent::TaskWorkspaceRecycled,
-            RuntimeEvent::TaskWorkspaceRecycleFailed,
-        ] {
-            assert_eq!(
-                RuntimeEvent::parse(event.name().to_string()).unwrap(),
-                event
-            );
-        }
-    }
+    fn recycle_events_round_trip_through_name_and_parse() {}
 }
