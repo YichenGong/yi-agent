@@ -1,5 +1,6 @@
 import { useId, useState } from "react";
 import type { Item, ToolStatus } from "../lib/protocol";
+import { toolCallSummary } from "../lib/toolSummary";
 
 type ToolCallItem = Extract<Item, { type: "toolCall" }>;
 
@@ -12,6 +13,7 @@ const statusStyles: Record<ToolStatus, string> = {
 export function ToolCallCard({ item }: { item: ToolCallItem }) {
   const [open, setOpen] = useState(false);
   const regionId = useId();
+  const summary = toolCallSummary(item.name, item.input);
 
   return (
     <div className="my-2 rounded-md border border-neutral-800 bg-neutral-900/60">
@@ -24,6 +26,11 @@ export function ToolCallCard({ item }: { item: ToolCallItem }) {
       >
         <span className="text-neutral-500">{open ? "▾" : "▸"}</span>
         <span className="font-mono font-medium text-neutral-200">{item.name}</span>
+        {summary && (
+          <span className="min-w-0 truncate font-mono text-neutral-400" title={summary}>
+            {summary}
+          </span>
+        )}
         <span
           className={`ml-auto rounded-full border px-2 py-0.5 text-xs ${statusStyles[item.status]}`}
         >
