@@ -4126,6 +4126,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "yi-agent-core",
 ]

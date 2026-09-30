@@ -625,6 +625,10 @@ fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<Headles
     // Record the project-local state before the daemon creates it, otherwise
     // root worktree provisioning sees a checkout dirtied by our own store.
     ignore_project_local_runtime_state(&config.workdir);
+    // A daemon wedged before this launch must not be adopted: its socket lives
+    // in the project directory, so it would outlive any restart. Retire it so
+    // the `start_with_factory` below replaces it with a working one.
+    replace_wedged_daemon(&socket_path);
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
         &database,
@@ -756,6 +760,55 @@ fn runtime_attached_root_rejection(response: &yi_agent_store::ipc::IpcResponse) 
     }
 }
 
+/// Retires a *wedged* local daemon so the caller can replace it.
+///
+/// A daemon can be alive and listening while answering every ordinary request
+/// with a bare `internal` (its per-request repository connection fails before it
+/// can read anything, while `Stop` still succeeds because `graceful_stop` works
+/// from in-memory state). Because the socket, database, and instance lock live
+/// in the project directory rather than in the process, "restart yi-agent" then
+/// reconnects to the same dud forever.
+///
+/// The probe is `Status`: it is read-only (no session or attachment is created),
+/// it is the cheapest request a daemon can serve, and the wedged daemon failed
+/// it exactly as it failed everything else. `internal` is the signal -- it means
+/// the daemon could not read its own store, which is never a legitimate answer
+/// to `Status` (a healthy daemon always reports its high-water mark), whereas
+/// `InvalidState`/`Validation` etc. are legitimate rejections that must still be
+/// reported, not "fixed" by a restart.
+///
+/// Returns `true` when a wedged daemon was retired (its files are gone, so a
+/// fresh `Daemon::start` can take over), `false` for every other outcome --
+/// including a `Stop` that could not be delivered, because that daemon is not
+/// ours to replace.
+fn replace_wedged_daemon(socket_path: &std::path::Path) -> bool {
+    let wedged = matches!(
+        yi_agent_store::ipc::send_request(socket_path, yi_agent_store::ipc::IpcRequest::Status),
+        Ok(yi_agent_store::ipc::IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::Internal,
+            ..
+        })
+    );
+    if !wedged {
+        return false;
+    }
+    tracing::warn!(
+        socket = %socket_path.display(),
+        "local runtime answered `internal`; retiring it so this session can start a working one"
+    );
+    match yi_agent_store::ipc::send_request(socket_path, yi_agent_store::ipc::IpcRequest::Stop) {
+        Ok(yi_agent_store::ipc::IpcResponse::Stopping) => true,
+        other => {
+            tracing::warn!(
+                socket = %socket_path.display(),
+                response = ?other,
+                "could not retire the wedged runtime; leaving it in place"
+            );
+            false
+        }
+    }
+}
+
 /// Builds the notice emitted when subagent-runtime bring-up fails after the
 /// user asked for it (`y`, or a remembered `always`).
 ///
@@ -801,6 +854,10 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
     // Record the project-local state before the daemon creates it, otherwise
     // root worktree provisioning sees a checkout dirtied by our own store.
     ignore_project_local_runtime_state(&config.workdir);
+    // A daemon wedged before this launch must not be adopted: its socket lives
+    // in the project directory, so it would outlive any restart. Retire it so
+    // the `start_with_factory` below replaces it with a working one.
+    replace_wedged_daemon(&socket_path);
     let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
         &runtime_dir,
         &database,
@@ -2545,5 +2602,210 @@ mod tests {
             !preferences_path(dir.path()).exists(),
             "deriving the startup intent must not create .yi-agent/"
         );
+    }
+    // --- a wedged daemon must not survive a restart ---
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    /// A stand-in for the daemon that wedged in the field: a live listener that
+    /// answers ordinary requests with a bare `internal`, but whose `Stop` path
+    /// still works (the real one's did -- `graceful_stop` uses in-memory state,
+    /// while every other request opens a fresh repository connection first).
+    ///
+    /// It never touches a database, so the only thing under test is the client's
+    /// decision to retire a wedged daemon and start a fresh one.
+    struct InternalErrorDaemon {
+        socket: PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        non_status_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        listener: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl InternalErrorDaemon {
+        fn start(socket: &std::path::Path) -> Self {
+            let listener = UnixListener::bind(socket).expect("probe socket binds");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_stop = std::sync::Arc::clone(&stop);
+            let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let thread_requests = std::sync::Arc::clone(&requests);
+            let non_status_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let thread_non_status = std::sync::Arc::clone(&non_status_requests);
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let Ok(stream) = stream else { break };
+                    let _ = answer_like_a_wedged_daemon(
+                        stream,
+                        &thread_stop,
+                        &thread_requests,
+                        &thread_non_status,
+                    );
+                }
+            });
+            Self {
+                socket: socket.to_path_buf(),
+                stop,
+                requests,
+                non_status_requests,
+                listener: Some(handle),
+            }
+        }
+
+        fn socket_path(&self) -> &std::path::Path {
+            &self.socket
+        }
+
+        /// How many requests reached the probe, and how many asked for anything
+        /// other than a read-only `Status`. The wedge fix must never write.
+        fn request_counts(&self) -> (usize, usize) {
+            (
+                self.requests.load(std::sync::atomic::Ordering::Acquire),
+                self.non_status_requests
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        }
+    }
+
+    impl Drop for InternalErrorDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            // Wake the accept loop so shutdown does not wait for its sleep.
+            let _ = UnixStream::connect(&self.socket);
+            if let Some(handle) = self.listener.take() {
+                let _ = handle.join();
+            }
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    /// A bare `internal` for everything except `Stop`, which stops the probe --
+    /// exactly how the field daemon behaved.
+    fn answer_like_a_wedged_daemon(
+        mut stream: UnixStream,
+        stop: &std::sync::atomic::AtomicBool,
+        requests: &std::sync::atomic::AtomicUsize,
+        non_status_requests: &std::sync::atomic::AtomicUsize,
+    ) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        let request_id = request
+            .get("request_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let kind = request
+            .get("command")
+            .and_then(|command| command.get("type"))
+            .and_then(|kind| kind.as_str())
+            .unwrap_or_default();
+        requests.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if kind != "Status" {
+            non_status_requests.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let result = if kind == "Stop" {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            serde_json::json!({"type": "Stopping"})
+        } else {
+            serde_json::json!({"type": "Error", "code": "internal"})
+        };
+        let body = serde_json::json!({
+            "protocol_version": 1,
+            "request_id": request_id,
+            "result": result,
+        });
+        writeln!(stream, "{body}")?;
+        stream.flush()
+    }
+
+    /// A daemon that answers `internal` is *unhealthy*, but it still looks
+    /// "already running". Adopting it is exactly the field bug: the user
+    /// restarts yi-agent, and the restart reconnects to the same wedged daemon
+    /// and reports the same failure forever.
+    #[test]
+    fn an_existing_daemon_that_answers_internal_is_retired_not_adopted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = dir.path().join(".yi-agent/runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let probe = InternalErrorDaemon::start(&runtime_dir.join("runtime.sock"));
+
+        assert!(
+            replace_wedged_daemon(probe.socket_path()),
+            "an `internal` Status answer must retire the daemon, not adopt it"
+        );
+        let (requests, non_status) = probe.request_counts();
+        assert!(
+            requests >= 2,
+            "retirement must probe and then stop, saw {requests} request(s)"
+        );
+        assert_eq!(
+            non_status, 1,
+            "the only non-Status request may be the `Stop`; a health probe must not write"
+        );
+    }
+
+    /// The healthy case must stay cheap: one probe round trip and no stop.
+    #[test]
+    fn a_daemon_that_answers_status_is_not_retired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = dir.path().join(".yi-agent/runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let database = runtime_dir.join("runtime.sqlite");
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(&runtime_dir, &database).expect("daemon starts");
+        let socket = daemon.socket_path().to_path_buf();
+
+        assert!(
+            !replace_wedged_daemon(&socket),
+            "a healthy daemon must never be retired"
+        );
+        assert!(
+            yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Status)
+                .is_ok(),
+            "a healthy daemon must remain reachable"
+        );
+    }
+
+    /// The recovery the notice promises -- "restart yi-agent" -- only works if a
+    /// wedged daemon is actually stopped and replaced. This drives the real
+    /// retirement path, then proves the next launch serves the request that used
+    /// to fail.
+    #[test]
+    fn retiring_a_wedged_daemon_lets_the_next_launch_start_a_working_runtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = dir.path().join(".yi-agent/runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let database = runtime_dir.join("runtime.sqlite");
+        let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
+
+        let probe = InternalErrorDaemon::start(&socket);
+        assert!(
+            replace_wedged_daemon(&socket),
+            "the run must retire the wedged daemon"
+        );
+        // The retirement itself sends `Stop`; the probe only exits its accept
+        // loop once it sees it, so a bug that skips the stop shows up here.
+        assert!(
+            probe.stop.load(std::sync::atomic::Ordering::Acquire),
+            "the wedged daemon must actually receive `Stop`"
+        );
+        drop(probe);
+
+        let daemon =
+            yi_agent_store::ipc::Daemon::start(&runtime_dir, &database).expect("fresh daemon");
+        let response =
+            yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Status)
+                .expect("the replacement daemon answers");
+        assert!(
+            matches!(response, yi_agent_store::ipc::IpcResponse::Status { .. }),
+            "a restarted runtime must delegate again, got {response:?}"
+        );
+        drop(daemon);
     }
 }
