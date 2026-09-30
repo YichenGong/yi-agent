@@ -158,12 +158,13 @@ worker。以 daemon 持久化状态为准（复用 `has_worker` 检查），而�
 
 ```
 queued ──▶ running ──▶ awaiting_merge ──▶ done
-              │  ▲
-              ▼  │
-          needs_you
-              │
-              ▼
-           failed
+   │          │  ▲
+   │          ▼  │
+   │      needs_you ──▶ failed
+   │
+   ├──▶ paused ──▶ cancelled
+   │
+   └────────────────▶ cancelled
 ```
 
 | 状态 | 含义 | 占用槽位 |
@@ -174,12 +175,22 @@ queued ──▶ running ──▶ awaiting_merge ──▶ done
 | `awaiting_merge` | 执行完成，分支上有 commit，等用户决定集成 | 否 |
 | `failed` | 终止性失败 | 否 |
 | `done` | 已集成 | 否 |
+| `paused` | 用户主动暂停，保留位置但不再被推进 | 否 |
+| `cancelled` | 用户主动取消（终态） | 否 |
+
+**`paused` / `cancelled` 的由来：** 看板是用户的管理界面，用户必须能「叫停」一张排在队伍里
+的卡片而不必删除它（`paused`），以及在确定不做时彻底移除（`cancelled`）。二者都**不是**
+执行结果，只由用户操作产生；`cancelled` 是终态，`paused` 可被用户重新放回 `queued`。
 
 **不变量：**
 
 - 任意时刻 `running` 卡片数 ≤ 当前时段上限。
-- 任何非 `running` 状态都不占用槽位。
+- **只有 `running` 占用槽位**（`queued` / `needs_you` / `awaiting_merge` / `failed` /
+  `done` / `paused` / `cancelled` 都不占用）。
 - 卡片进入 `needs_you` 或 `awaiting_merge` 后，队列立即推进下一张。
+- 卡片进入 `needs_you` / `awaiting_merge` / `failed` / `done` / `paused` / `cancelled`
+  时若正持有槽位，必须**立即释放**，队列不得空转。
+- 关闭看板开关**不改变**任何卡片状态，也不取消已在 daemon 中运行的会话（§12）。
 
 ---
 
