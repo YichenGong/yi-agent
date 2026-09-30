@@ -444,10 +444,10 @@ cargo test -p yi-agent --bin yi-agent -- runtime 2>&1 | tail -20
 - Modify: `yi-agent-rs/crates/yi-agent/src/tui/subagents.rs`
 
 **Interfaces:**
-- Consumes: `RuntimeStartPrompt`（保留）、`RuntimeStartupChoice`（保留两态）。
+- Consumes: `RuntimeStartupChoice`（保留两态）。
 - Produces:
-  - `pub enum RuntimeStartupIntent { Prompt(RuntimeStartPrompt), DisabledNotice { reason: String }, AutoStart }`
-  - 删除 `TuiRuntimeMode`、`RuntimeBootstrapState`、`RuntimeBootstrapModel`
+  - `pub enum RuntimeStartupIntent { Prompt, DisabledNotice { reason: String }, AutoStart }`
+  - 删除 `RuntimeStartPrompt`、`TuiRuntimeMode`、`RuntimeBootstrapState`、`RuntimeBootstrapModel`
 
 - [ ] **Step 1: 确认零引用（改之前先复核）**
 
@@ -471,14 +471,21 @@ done
 - 测试模块顶部的 `use std::sync::{Arc, Mutex};`（删掉两个用例后它变成未使用，
   而 `-D warnings` 会因此失败）
 
+**同时删除 `RuntimeStartPrompt`**：改造后它的 `title` / `body` 两个字段
+（`subagents.rs:64-67`）将不再被任何代码读取——弹窗文案改由 `app.rs` 的
+`runtime_prompt_lines()` 渲染，`title` 硬编码在渲染处。`yi-agent` 是**二进制 crate**，
+`pub` 字段不会被自动豁免 `dead_code`，留着会直接让
+`clippy -D warnings`（计划 Global Constraints）失败。
+
 删除后 `subagents.rs` 应保留：`RuntimeStartupChoice`、`AttachedRoot`、
 `CURRENT_ATTACHED_ROOT`、`set_current_attached_root`、`current_attached_root`、
-`RuntimeStartPrompt`、`register_attached_root_tools`，以及测试
+`register_attached_root_tools`，以及测试
 `attached_tui_root_exposes_subagent_tools_without_a_delegate_command`。
 
 - [ ] **Step 3: 新增 intent 枚举**
 
-在 `RuntimeStartPrompt` 定义之后插入：
+在 `RuntimeStartupPrompt` 原位置插入（`Prompt` 无载荷：文案与标题由 `app.rs` 渲染，
+`main.rs` 无需再传递它们）：
 
 ```rust
 /// What the TUI should do about the local subagent runtime on launch.
@@ -488,7 +495,7 @@ done
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeStartupIntent {
     /// Show the yes/no dialog and wait for the user.
-    Prompt(RuntimeStartPrompt),
+    Prompt,
     /// Do not start; show one separator line explaining why.
     DisabledNotice { reason: String },
     /// Start without asking; `main.rs` pre-seeds `RuntimeStartupChoice::Start`.
@@ -508,8 +515,17 @@ cargo test -p yi-agent --bin yi-agent -- subagents 2>&1 | tail -20
 ```bash
 cargo clippy -p yi-agent --all-targets --all-features -- -D warnings 2>&1 | tail -20
 ```
-预期：无 `unused` 相关报错。（此时 `app.rs`/`main.rs` 仍可用，因为
-`RuntimeStartPrompt` 与 `RuntimeStartupChoice` 未变。）
+预期：无 `unused` 相关报错。（`RuntimeStartupChoice` 未变。**注意**：`app.rs` 与
+`main.rs` 此时仍引用已删除的 `RuntimeStartPrompt`，所以
+`cargo build -p yi-agent` 与 `clippy` 将在 Task 4 完成后才恢复通过——见下方"任务耦合"。）
+
+> **任务耦合（必须知悉）**：本任务删除了 `RuntimeStartPrompt`，而 `app.rs:706` 与
+> `main.rs:1049` 仍在引用它，因此本任务结束时 **`cargo test -- subagents` 能通过，但
+> `clippy` 会因未定义类型而失败**。这是刻意的拆分选择：Task 4 负责把这两处换成
+> `RuntimeStartupIntent::Prompt`。
+> 因此 **Task 3 与 Task 4 必须一起评审**（Task 4 的 review 包 BASE 取 Task 3 之前的
+> commit），不要在 Task 3 单独跑 clippy 门禁——那是 Task 4 的完成条件。若你更希望
+> 每个任务都能独立过 clippy，就把 Task 3 与 Task 4 合并成一个任务。
 
 - [ ] **Step 6: 格式化并提交**
 
@@ -560,12 +576,7 @@ git commit -m "refactor(tui): drop unused runtime bootstrap model, add startup i
             &is_running,
             &events,
             "test-model",
-            Some(crate::tui::subagents::RuntimeStartupIntent::Prompt(
-                crate::tui::subagents::RuntimeStartPrompt {
-                    title: "启动本地 Agent Runtime?".into(),
-                    body: "启动后可以直接用自然语言创建和管理子 Agent。此选择会被记住，可用 /runtime 修改。".into(),
-                },
-            )),
+            Some(crate::tui::subagents::RuntimeStartupIntent::Prompt),
             Some(runtime_choice_tx),
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
@@ -625,12 +636,7 @@ git commit -m "refactor(tui): drop unused runtime bootstrap model, add startup i
             &is_running,
             &events,
             "test-model",
-            Some(crate::tui::subagents::RuntimeStartupIntent::Prompt(
-                crate::tui::subagents::RuntimeStartPrompt {
-                    title: "启动本地 Agent Runtime?".into(),
-                    body: "启动后可以直接用自然语言创建和管理子 Agent。此选择会被记住，可用 /runtime 修改。".into(),
-                },
-            )),
+            Some(crate::tui::subagents::RuntimeStartupIntent::Prompt),
             Some(runtime_choice_tx),
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
@@ -703,7 +709,7 @@ cargo test -p yi-agent --bin yi-agent -- runtime_start_prompt escape_skips 2>&1 
 
 `run_tui`：把
 ```rust
-    runtime_start_prompt: Option<crate::tui::subagents::RuntimeStartPrompt>,
+    runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
 ```
 改为
 ```rust
@@ -731,7 +737,7 @@ cargo test -p yi-agent --bin yi-agent -- runtime_start_prompt escape_skips 2>&1 
 4a. 把 `app.rs:415-435` 的弹窗块替换为对 intent 的分支，并把文案抽成函数（供测试复用）：
 
 ```rust
-            if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt(_)) = &runtime_intent {
+            if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
                 let box_w = 58u16.min(chunks[0].width.saturating_sub(4));
                 let box_h = 10u16.min(chunks[0].height.max(1));
                 let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
@@ -816,7 +822,7 @@ fn runtime_prompt_lines() -> Vec<ratatui::text::Line<'static>> {
 4c. 把 `app.rs:494-513` 的按键块替换为（注意 `Esc` 不再落盘）：
 
 ```rust
-                if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt(_)) = &runtime_intent {
+                if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             persist_runtime_choice(
@@ -971,7 +977,7 @@ git commit -m "feat(tui): honour persisted runtime preference and add /runtime"
         save(dir.path(), RuntimePreference::Ask).unwrap();
         assert!(matches!(
             startup_intent_for(dir.path()),
-            Some(RuntimeStartupIntent::Prompt(_))
+            Some(RuntimeStartupIntent::Prompt)
         ));
 
         save(dir.path(), RuntimePreference::Always).unwrap();
@@ -1023,13 +1029,11 @@ fn startup_intent_for(
     workdir: &std::path::Path,
 ) -> Option<crate::tui::subagents::RuntimeStartupIntent> {
     use crate::tui::runtime_prefs::{self, RuntimePreference};
-    use crate::tui::subagents::{RuntimeStartPrompt, RuntimeStartupIntent};
+    use crate::tui::subagents::RuntimeStartupIntent;
+    use crate::tui::runtime_prefs::{self, RuntimePreference};
 
     Some(match runtime_prefs::load(workdir) {
-        RuntimePreference::Ask => RuntimeStartupIntent::Prompt(RuntimeStartPrompt {
-            title: "启动本地 Agent Runtime?".into(),
-            body: "启动后可以直接用自然语言创建和管理子 Agent。".into(),
-        }),
+        RuntimePreference::Ask => RuntimeStartupIntent::Prompt,
         RuntimePreference::Always => RuntimeStartupIntent::AutoStart,
         RuntimePreference::Never => RuntimeStartupIntent::DisabledNotice {
             reason: format!(

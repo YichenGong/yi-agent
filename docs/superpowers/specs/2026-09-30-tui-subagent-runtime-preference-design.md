@@ -138,11 +138,16 @@ pub fn save(workdir: &Path, pref: RuntimePreference) -> io::Result<()>;
 
 ```rust
 pub enum RuntimeStartupIntent {
-    Prompt(RuntimeStartPrompt),       // ask
+    Prompt,                            // ask（文案由 app.rs 渲染）
     DisabledNotice { reason: String },// never
     AutoStart,                        // always
 }
 ```
+
+`Prompt` **不携带载荷**：对话框文案由 `app.rs` 的 `runtime_prompt_lines()` 渲染，标题
+硬编码在渲染处。`main.rs` 因此无需传递文案，原 `RuntimeStartPrompt`（其 `title`/`body`
+字段将无人读取）一并删除——`yi-agent` 是二进制 crate，留着会触发 `dead_code` 并使
+`clippy -D warnings` 失败。
 
 `run_loop` 据此分支：
 
@@ -250,7 +255,7 @@ if pref == RuntimePreference::Always {
 | --- | --- |
 | `crates/yi-agent/src/tui/runtime_prefs.rs` | **新增**：`RuntimePreference` + `load`/`save`（原子写）+ 单测 |
 | `crates/yi-agent/src/tui/mod.rs` | 注册 `pub mod runtime_prefs;` |
-| `crates/yi-agent/src/tui/subagents.rs` | 新增 `RuntimeStartupIntent`；**删除**零引用的死代码 `RuntimeBootstrapModel` / `RuntimeBootstrapState` / `TuiRuntimeMode`（见 §5.5） |
+| `crates/yi-agent/src/tui/subagents.rs` | 新增 `RuntimeStartupIntent`；**删除** `RuntimeBootstrapModel` / `RuntimeBootstrapState` / `TuiRuntimeMode`（§5.5）与 `RuntimeStartPrompt`（§3.3） |
 | `crates/yi-agent/src/main.rs` | 读偏好决定 intent；`always` 预置 `Start`；构造 `RuntimeStartupIntent` 传入 `run_tui` |
 | `crates/yi-agent/src/tui/app.rs` | `run_tui` / `run_loop` 参数改为 `Option<RuntimeStartupIntent>`（含 `run_tui_with_backend` 的 `None` 传参，`app.rs:191`）；弹窗文案与 `box_h`；按键写偏好；`/runtime` 执行分支 |
 | `crates/yi-agent/src/tui/slash.rs` | `SlashCommand::Runtime` + `parse_runtime_args` |
@@ -302,6 +307,11 @@ if pref == RuntimePreference::Always {
 | （对照）`RuntimeStartupChoice` | 10 |
 | （对照）`AttachedRoot` | 11 |
 | （对照）`register_attached_root_tools` | 2 |
+
+此外 **`RuntimeStartPrompt` 也必须删除**，但理由不同：它并非"零引用"，而是**改造后其
+`title` / `body` 字段将无人读取**（弹窗文案移到 `app.rs::runtime_prompt_lines()`）。
+`yi-agent` 是二进制 crate，`pub` 字段不被自动豁免 `dead_code`，留着会直接使
+`clippy -D warnings` 失败。§3.3 的 `Prompt` 变体因此不携带载荷。
 
 因此：**删除** `TuiRuntimeMode`、`RuntimeBootstrapModel`、`RuntimeBootstrapState` 及其
 两个专属单测（`disconnected_state_only_prompts_before_user_confirms_runtime_start`、
