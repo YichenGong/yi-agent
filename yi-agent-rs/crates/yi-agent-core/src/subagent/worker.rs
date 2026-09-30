@@ -483,24 +483,6 @@ pub trait WorkerWorkspaceProvider: Send + Sync {
         workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError>;
 
-    /// Whether this service can create coding worktrees. A non-git service
-    /// returns `false`, forcing the session into read-only mode.
-    fn supports_coding(&self) -> bool {
-        true
-    }
-
-    /// Observes a parent-prepared workdir and returns the workspace for it.
-    ///
-    /// The runtime calls this when a parent hands over a `workdir`; it is how a
-    /// worktree's lease identity reaches the registry without the daemon ever
-    /// creating the directory. The default reports that the provider cannot
-    /// observe a workdir, which keeps non-git providers honest.
-    fn observe_workdir(&self, _workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
-        Err(WorkerError::Startup(
-            "workspace provider cannot observe a workdir".into(),
-        ))
-    }
-
     /// Supplies the in-place execution root for a read-only task. `parent` is
     /// the nearest ancestor workspace, when one exists. The default cannot
     /// invent a path and therefore fails.
@@ -513,69 +495,6 @@ pub trait WorkerWorkspaceProvider: Send + Sync {
             "workspace service does not support read-only tasks".into(),
         ))
     }
-
-    fn cleanup_prepared(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        Ok(())
-    }
-
-    /// Whether `commit` is already contained in `owner`'s worktree HEAD. The
-    /// default cannot inspect git and therefore reports "not integrated".
-    fn contains_commit(
-        &self,
-        _owner: &WorkerWorkspace,
-        _commit: &str,
-    ) -> Result<bool, WorkerError> {
-        Ok(false)
-    }
-
-    /// Remove an accepted child's worktree and branch once `owner` provably
-    /// contains its delivery. The default is a no-op for non-git services.
-    fn cleanup_accepted(
-        &self,
-        _owner: &WorkerWorkspace,
-        _child: &WorkerWorkspace,
-    ) -> Result<(), WorkerError> {
-        Ok(())
-    }
-
-    /// Remove a task's worktree directory while keeping its branch ref and its
-    /// `task_workspaces` row. This is the safe automatic reclaim: the branch
-    /// still pins every commit, and the surviving row lets
-    /// [`Self::reattach_workspace`] rebuild the directory on demand.
-    ///
-    /// The default is a no-op for non-git services.
-    fn reclaim_worktree(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        Ok(())
-    }
-
-    /// Rebuild a reclaimed worktree directory from its surviving branch.
-    ///
-    /// The default cannot run git and therefore reports failure, because a
-    /// caller that reaches this point needs a usable directory.
-    fn reattach_workspace(&self, _workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        Err(WorkerError::Startup(
-            "workspace service cannot rebuild a reclaimed worktree".into(),
-        ))
-    }
-
-    /// Whether `branch` is already merged into `parent_branch`. Used to refuse
-    /// reclaiming a worktree whose work has not been integrated.
-    ///
-    /// The comparison is against the branch the worktree recorded as its parent,
-    /// never against `owner`'s current `HEAD`: a worker may `git checkout` inside
-    /// the owner worktree, and that must not change whether a child counts as
-    /// integrated. `parent_branch` is passed separately for exactly that reason.
-    ///
-    /// The default cannot inspect git and reports "not merged", which is the safe
-    /// answer.
-    fn is_merged_into(
-        &self,
-        _owner: &WorkerWorkspace,
-        _branch: &str,
-        _parent_branch: &str,
-    ) -> Result<bool, WorkerError> {
-        Ok(false)
-    }
 }
 
 /// Application-owned lookup from a `spawn_agent` workdir to the workspace the
@@ -587,6 +506,17 @@ pub trait WorkerWorkspaceRegistry: Send + Sync {
 
     /// Returns the workspace for `workdir`, when one was prepared.
     fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace>;
+
+    /// Observes a parent-prepared workdir, records it, and returns its position.
+    ///
+    /// The parent prepares the directory itself (`git worktree add`); the daemon
+    /// only observes it. A workdir the provider cannot accept (missing, or not
+    /// inside a git worktree) is refused.
+    fn observe_workdir(&self, _workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
+        Err(WorkerError::Startup(
+            "workspace registry cannot observe a workdir".into(),
+        ))
+    }
 
     /// Reads a workspace's delivery, probing its directory rather than a
     /// daemon-managed worktree. The numbers a review needs (head, branch,

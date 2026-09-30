@@ -32,7 +32,6 @@ use yi_agent_core::subagent::task::{
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
     WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
-    WorkerWorkspaceProvider,
 };
 
 use crate::repository::{
@@ -42,13 +41,6 @@ use crate::repository::{
 use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 
 const REVIEW_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
-
-/// How long a task must be idle before its worktree directory is reclaimed.
-///
-/// Conservative by default: reclaim removes only the directory, keeps the branch
-/// and the workspace row, and is therefore reversible via
-/// `prepare_task_workspace`'s rebuild path.
-pub const WORKTREE_RECLAIM_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
@@ -62,10 +54,6 @@ pub enum RuntimeCoordinatorError {
         cleanup: Option<String>,
         recovery: Option<String>,
     },
-    #[error(
-        "record_task_workspace failed and cleanup_prepared failed: record={record}; cleanup={cleanup}"
-    )]
-    WorkspaceRecordingCleanup { record: String, cleanup: String },
     #[error("session does not exist: {0}")]
     SessionNotFound(RootSessionId),
     #[error("supervisor error: {0}")]
@@ -1234,10 +1222,7 @@ impl RuntimeCoordinator {
                     "coding child requires a prepared-workspace registry".into(),
                 )
             })?;
-            let provider = self.workspace_service_for(session).ok_or_else(|| {
-                RuntimeCoordinatorError::Supervisor("no workspace provider for session".into())
-            })?;
-            let observed = provider
+            let observed = registry
                 .observe_workdir(workdir)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
             registry.register_prepared(&observed);
@@ -1661,16 +1646,7 @@ impl RuntimeCoordinator {
             .task_workspace_optional(task)?;
         if let Some(existing) = existing {
             // A recorded position is reused across restarts rather than
-            // re-resolved: a reclaimed directory is rebuilt from its branch, and
-            // any other path is taken as already correct.
-            if !existing.path.exists() {
-                match self.workspace_service_for(session) {
-                    Some(provider) => provider
-                        .reattach_workspace(&existing)
-                        .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?,
-                    None => return Ok(None),
-                }
-            }
+            // re-resolved.
             supervisor
                 .assign_workspace(task, existing.lease_id.clone())
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
@@ -1707,20 +1683,12 @@ impl RuntimeCoordinator {
         // position (no branch) is a view of a parent directory, not a worktree
         // the daemon owns, so recording it would claim an ownership it has none of.
         if !workspace.branch.is_empty() {
-            let record_result = self
-                .repository
+            // The daemon did not create this directory, so a failed record has
+            // nothing to clean up: it simply fails the start.
+            self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
-                .record_task_workspace(task, attempt, &workspace);
-            if let Err(error) = record_result {
-                if let Err(cleanup) = provider.cleanup_prepared(&workspace) {
-                    return Err(RuntimeCoordinatorError::WorkspaceRecordingCleanup {
-                        record: error.to_string(),
-                        cleanup: cleanup.to_string(),
-                    });
-                }
-                return Err(RuntimeCoordinatorError::Repository(error));
-            }
+                .record_task_workspace(task, attempt, &workspace)?;
         }
         supervisor
             .assign_workspace(task, workspace.lease_id.clone())
@@ -2116,310 +2084,7 @@ impl RuntimeCoordinator {
             .map_err(review_persistence_error)?;
         drop(supervisor);
         self.release_resident_lease(task);
-        self.recycle_accepted_delivery(&session, &parent, task)
-            .await;
         Ok(())
-    }
-
-    /// Best-effort recycling after an accepted review is durable. Never fails
-    /// the accept: a recycle failure leaves the worktree in place for later
-    /// handling and records an event. Git runs as a subprocess, so this is
-    /// deliberately called after every lock is released.
-    async fn recycle_accepted_delivery(
-        &self,
-        session: &RootSessionId,
-        owner: &TaskId,
-        child: &TaskId,
-    ) {
-        let Some(service) = self.workspace_service_for(session) else {
-            return;
-        };
-        let (owner_workspace, child_workspace) = {
-            let repository = self
-                .repository
-                .lock()
-                .expect("runtime repository mutex poisoned");
-            (
-                repository.task_workspace_optional(owner),
-                repository.task_workspace_optional(child),
-            )
-        };
-        let (owner_workspace, child_workspace) = match (owner_workspace, child_workspace) {
-            (Ok(Some(owner_workspace)), Ok(Some(child_workspace))) => {
-                (owner_workspace, child_workspace)
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
-                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
-                return;
-            }
-            // A genuinely absent workspace row is not a recycle failure: nothing to recycle.
-            _ => return,
-        };
-        match service.cleanup_accepted(&owner_workspace, &child_workspace) {
-            Ok(()) => {
-                let deleted = self
-                    .repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned")
-                    .delete_task_workspace(child);
-                match deleted {
-                    Ok(()) => {
-                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycled);
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "yi-agent: failed to delete recycled workspace row for {child}: {error}"
-                        );
-                        self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("yi-agent: accepted worktree recycle failed for {child}: {error}");
-                self.record_recycle_event(child, RuntimeEvent::TaskWorkspaceRecycleFailed);
-            }
-        }
-    }
-
-    /// Reclaims every reclaimable worktree directory in a session.
-    ///
-    /// Removes directories only: branch refs and `task_workspaces` rows survive,
-    /// so nothing is lost and every worktree can be rebuilt by
-    /// `prepare_task_workspace`. Returns the number of directories reclaimed.
-    ///
-    /// Candidates are processed deepest first. A child's merge check runs with
-    /// the owner worktree as its working directory, so reclaiming a parent first
-    /// would break its children.
-    ///
-    /// # Preconditions
-    ///
-    /// The caller must already have established that no live worker owns these
-    /// directories — in practice by detaching the session first. It must call this
-    /// off-thread. A non-terminal child is refused: the state rule is enforced one
-    /// call down in [`Self::reclaim_candidate_directories`]. The session root is
-    /// exempt from that rule, and it is reclaimed with no merge check, because a
-    /// root's `parent_branch` is the main branch, a root branch rarely merges into
-    /// it, and a detached root sits in `paused` rather than a terminal state. The
-    /// rebuild path in `prepare_task_workspace` repairs a reclaimed directory, but
-    /// only at the next worker start.
-    ///
-    /// It is synchronous and runs `git` subprocesses, so it must not be called
-    /// from a request-handling thread or while holding the repository mutex.
-    pub fn reclaim_session_worktrees(&self, session: &RootSessionId) -> usize {
-        let candidates = self.reclaim_candidates_in_session(session);
-        self.reclaim_candidate_directories(session, candidates)
-    }
-
-    /// Reclaims directories for tasks that have been idle past the TTL.
-    ///
-    /// Two candidate sources, because a terminal-only sweep would miss the most
-    /// common leak:
-    ///
-    /// 1. terminal tasks whose `updated_at` is older than the TTL
-    /// 2. the root of a detached session, which sits in `paused` — not a terminal
-    ///    state — and therefore never enters a terminal-only sweep
-    ///
-    /// A task in `awaiting_parent_review` is not terminal and its session is not
-    /// detached, so an un-integrated delivery is never reclaimed.
-    ///
-    /// It is synchronous and runs `git` subprocesses, so it must not be called
-    /// from a request-handling thread or while holding the repository mutex.
-    pub fn reclaim_idle_worktrees(&self, now: DateTime<Utc>) -> usize {
-        let cutoff = now
-            - chrono::Duration::from_std(WORKTREE_RECLAIM_TTL)
-                .unwrap_or_else(|_| chrono::Duration::days(7));
-        let sessions = {
-            let repository = self
-                .repository
-                .lock()
-                .expect("runtime repository mutex poisoned");
-            match repository.detached_application_roots() {
-                Ok(roots) => roots,
-                Err(error) => {
-                    eprintln!("yi-agent: detached root lookup failed: {error}");
-                    Vec::new()
-                }
-            }
-        };
-        let mut reclaimed = 0;
-        for session in sessions {
-            reclaimed += self.reclaim_idle_session(&session, cutoff);
-        }
-        reclaimed
-    }
-
-    /// Reclaims the idle, reclaimable directories of one session.
-    fn reclaim_idle_session(&self, session: &RootSessionId, cutoff: DateTime<Utc>) -> usize {
-        let candidates = self.reclaim_candidates_in_session(session);
-        let idle = candidates
-            .into_iter()
-            .filter(|candidate| {
-                let is_root = candidate.parent_task_id.is_none();
-                // A terminal child is idle-sweepable; a non-terminal child is not.
-                // The root qualifies through the detached-session clause instead,
-                // because a detached root sits in `paused`, which is not terminal.
-                if !is_root && !task_state_is_terminal(&candidate.state) {
-                    return false;
-                }
-                let updated = {
-                    let repository = self
-                        .repository
-                        .lock()
-                        .expect("runtime repository mutex poisoned");
-                    let parsed = candidate.task_id.parse::<TaskId>().ok();
-                    match parsed {
-                        Some(parsed) => repository.task_updated_at(&parsed).ok().flatten(),
-                        None => None,
-                    }
-                };
-                matches!(updated, Some(updated) if updated < cutoff)
-            })
-            .collect::<Vec<_>>();
-        // Hand the filtered set to the shared reclaim so the merge gate,
-        // deepest-first ordering, and event recording stay in one place.
-        self.reclaim_candidate_directories(session, idle)
-    }
-
-    /// Reads the session's reclaim candidates under a short repository lock.
-    ///
-    /// Split out from [`Self::reclaim_session_worktrees`] so the TTL sweep can
-    /// filter the same candidate set without re-reading it.
-    fn reclaim_candidates_in_session(
-        &self,
-        session: &RootSessionId,
-    ) -> Vec<crate::repository::PersistedTaskDetail> {
-        let repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
-        match repository.reclaim_candidates(session) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                eprintln!("yi-agent: reclaim candidate lookup failed for {session}: {error}");
-                Vec::new()
-            }
-        }
-    }
-
-    /// Reclaims the directories of an already-selected candidate set.
-    ///
-    /// This function enforces the state-eligibility rule — a child whose task is
-    /// not terminal is refused, while the root is exempt — in addition to the
-    /// merge check and the directory removal. A caller may narrow the set further
-    /// (the TTL sweep adds the seven-day idle clock) but cannot widen it past the
-    /// state rule. Splitting selection from reclaim means the "reclaim everything"
-    /// path and the "reclaim only idle tasks" path share one implementation of
-    /// ordering, the state gate, the merge gate, and event recording.
-    fn reclaim_candidate_directories(
-        &self,
-        session: &RootSessionId,
-        candidates: Vec<crate::repository::PersistedTaskDetail>,
-    ) -> usize {
-        let Some(service) = self.workspace_service_for(session) else {
-            return 0;
-        };
-        let mut reclaimed = 0;
-        for candidate in candidates {
-            let Some(child_workspace) = candidate.workspace.clone() else {
-                continue;
-            };
-            let Some(task_id) = candidate.task_id.parse::<TaskId>().ok() else {
-                continue;
-            };
-            // Never reclaim a directory a live worker may still own. The design's
-            // Non-Goals exclude tasks that are still running, and a running child
-            // is not meaningfully "merged": a freshly created child worktree
-            // shares its parent's tip, so the ancestry check further down would
-            // report "merged" for a child that has done no work yet. The session
-            // root is the deliberate exception: it sits in `paused` (not a
-            // terminal state) and is reclaimed on detach by design.
-            if candidate.parent_task_id.is_some() && !task_state_is_terminal(&candidate.state) {
-                continue;
-            }
-            // The owner is the parent's workspace when there is a parent, and the
-            // repository root otherwise. A root's `parent_branch` is the main
-            // branch, which a root branch rarely merges into, so the root is
-            // reclaimed without a merge check.
-            let owner_workspace = match candidate.parent_task_id.as_ref() {
-                Some(parent) => {
-                    let resolved = {
-                        let repository = self
-                            .repository
-                            .lock()
-                            .expect("runtime repository mutex poisoned");
-                        let parsed = parent.parse::<TaskId>().ok();
-                        match parsed {
-                            Some(parsed) => {
-                                repository.task_workspace_optional(&parsed).ok().flatten()
-                            }
-                            None => None,
-                        }
-                    };
-                    match resolved {
-                        Some(workspace) => Some(workspace),
-                        None => continue,
-                    }
-                }
-                None => None,
-            };
-            if let Some(owner_workspace) = owner_workspace.as_ref() {
-                // The merge check runs git with a working directory. Prefer the
-                // owner's worktree, but it may already have been reclaimed by an
-                // earlier pass (the exit trigger reclaims the root). Skipping the
-                // child then would strand its directory forever: a terminal task
-                // never starts a worker, so the owner is never rebuilt and the
-                // child can never become reclaimable again. `merge-base
-                // --is-ancestor` resolves both branch names from the ref database,
-                // so the repository root answers the same question.
-                let check_workspace = if owner_workspace.path.exists() {
-                    owner_workspace.clone()
-                } else {
-                    WorkerWorkspace {
-                        path: child_workspace.repository_root.clone(),
-                        ..owner_workspace.clone()
-                    }
-                };
-                match service.is_merged_into(
-                    &check_workspace,
-                    &child_workspace.branch,
-                    &child_workspace.parent_branch,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        eprintln!(
-                            "yi-agent: merge check failed for {task_id}, skipping reclaim: {error}"
-                        );
-                        continue;
-                    }
-                }
-            }
-            if !child_workspace.path.exists() {
-                continue;
-            }
-            match service.reclaim_worktree(&child_workspace) {
-                Ok(()) => {
-                    reclaimed += 1;
-                    self.record_recycle_event(&task_id, RuntimeEvent::TaskWorkspaceRecycled);
-                }
-                Err(error) => {
-                    eprintln!("yi-agent: worktree reclaim failed for {task_id}: {error}");
-                }
-            }
-        }
-        reclaimed
-    }
-
-    fn record_recycle_event(&self, task: &TaskId, event: RuntimeEvent) {
-        if let Err(error) = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .append_event(task, event)
-        {
-            eprintln!("yi-agent: failed to record {event:?} for {task}: {error}");
-        }
     }
 
     /// Captures the current review target and issues a short-lived confirmation
@@ -3265,85 +2930,7 @@ impl RuntimeCoordinator {
             }
             self.release_resident_lease(&task_id);
         }
-        self.reconcile_integrated_deliveries().await;
         Ok(())
-    }
-
-    /// Accepts deliveries whose commit a parent has already integrated.
-    ///
-    /// This is the production entry to `accept_review`. It never parses agent
-    /// text: the ancestry of the child's delivered commit in the parent's
-    /// worktree HEAD is the only proof of integration. It runs on every
-    /// reconcile pass because the application root is not a daemon worker, so
-    /// its merge is only observable through git.
-    ///
-    /// Failures are logged, not propagated: reconcile runs on every IPC request
-    /// and a transient mismatch must not fail unrelated traffic.
-    async fn reconcile_integrated_deliveries(&self) {
-        let supervisors = self
-            .supervisors
-            .lock()
-            .expect("runtime supervisor mutex poisoned")
-            .iter()
-            .map(|(session, supervisor)| (session.clone(), Arc::clone(supervisor)))
-            .collect::<Vec<_>>();
-        let mut awaiting: Vec<(RootSessionId, TaskId, TaskId, String)> = Vec::new();
-        for (session, supervisor) in &supervisors {
-            let supervisor = supervisor.lock().await;
-            for child in supervisor.tasks_awaiting_parent_review() {
-                let Some(task) = supervisor.task(&child) else {
-                    continue;
-                };
-                let Some(parent) = task.parent_id.clone() else {
-                    continue;
-                };
-                let Some(commit) = task
-                    .active_attempt()
-                    .delivery
-                    .as_ref()
-                    .map(|delivery| delivery.commit.clone())
-                else {
-                    continue;
-                };
-                awaiting.push((session.clone(), child, parent, commit));
-            }
-        }
-        for (session, child, parent, commit) in awaiting {
-            let Some(service) = self.workspace_service_for(&session) else {
-                continue;
-            };
-            let owner_workspace = {
-                let repository = self
-                    .repository
-                    .lock()
-                    .expect("runtime repository mutex poisoned");
-                repository.task_workspace_optional(&parent)
-            };
-            let owner_workspace = match owner_workspace {
-                Ok(Some(workspace)) => workspace,
-                Ok(None) => continue,
-                Err(error) => {
-                    eprintln!("yi-agent: integration workspace lookup failed for {child}: {error}");
-                    continue;
-                }
-            };
-            match service.contains_commit(&owner_workspace, &commit) {
-                Ok(true) => {
-                    let integration = IntegrationValidation::passed(format!(
-                        "child commit {commit} is an ancestor of parent {parent} HEAD"
-                    ));
-                    if let Err(error) = self.accept_review(&child, integration).await {
-                        eprintln!(
-                            "yi-agent: integrated delivery accept failed for {child}: {error}"
-                        );
-                    }
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    eprintln!("yi-agent: integration ancestry check failed for {child}: {error}");
-                }
-            }
-        }
     }
 
     pub async fn worker_cancellation(
@@ -3650,29 +3237,6 @@ fn review_persistence_error(
         ReviewPersistenceError::Supervisor(error) => RuntimeCoordinatorError::Supervisor(error),
         ReviewPersistenceError::Persistence(error) => error.into(),
     }
-}
-
-/// Whether a persisted task state is one the state machine calls terminal.
-///
-/// The labels are exactly the ones `task_state_label` writes
-/// (`yi-agent-core/src/subagent/supervisor.rs`), which is what lands in
-/// `tasks.state_json`. `paused` and `awaiting_parent_review` are deliberately
-/// absent: a detached root sits in `paused` and an un-integrated delivery sits
-/// in `awaiting_parent_review`, and neither may be reclaimed out from under its
-/// owner.
-fn task_state_is_terminal(state: &str) -> bool {
-    matches!(
-        state,
-        "completed"
-            | "completed_no_changes"
-            | "blocked"
-            | "stalled"
-            | "timed_out"
-            | "budget_exhausted"
-            | "failed"
-            | "cancelled"
-            | "recovery_required"
-    )
 }
 
 fn persisted_depth(depth: u8) -> Result<yi_agent_core::TaskDepth, RuntimeCoordinatorError> {

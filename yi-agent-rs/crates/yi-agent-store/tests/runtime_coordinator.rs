@@ -179,26 +179,11 @@ impl WorkerWorkspaceRegistry for StaticWorkspaceService {
 
 struct GitWorkspaceService {
     repository_root: std::path::PathBuf,
-    accepted: Arc<Mutex<Vec<(WorkerWorkspace, WorkerWorkspace)>>>,
-    cleanup_error: Option<&'static str>,
-    /// Every `is_merged_into` call, as `(child branch, parent branch)`. Lets a
-    /// test prove that a merge check was *not* attempted, which is otherwise
-    /// invisible.
-    merge_checks: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl GitWorkspaceService {
     fn new(repository_root: std::path::PathBuf) -> Self {
-        Self {
-            repository_root,
-            accepted: Arc::new(Mutex::new(Vec::new())),
-            cleanup_error: None,
-            merge_checks: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn merge_checks(&self) -> Arc<Mutex<Vec<(String, String)>>> {
-        Arc::clone(&self.merge_checks)
+        Self { repository_root }
     }
 }
 
@@ -283,90 +268,6 @@ impl WorkerWorkspaceProvider for GitWorkspaceService {
             base_commit: String::new(),
         })
     }
-
-    fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        let _ = Command::new("git")
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                workspace.path.to_str().unwrap(),
-            ])
-            .current_dir(&workspace.repository_root)
-            .status();
-        let _ = Command::new("git")
-            .args(["branch", "-D", &workspace.branch])
-            .current_dir(&workspace.repository_root)
-            .status();
-        Ok(())
-    }
-
-    fn cleanup_accepted(
-        &self,
-        owner: &WorkerWorkspace,
-        child: &WorkerWorkspace,
-    ) -> Result<(), WorkerError> {
-        self.accepted
-            .lock()
-            .unwrap()
-            .push((owner.clone(), child.clone()));
-        if let Some(error) = self.cleanup_error {
-            return Err(WorkerError::Startup(error.into()));
-        }
-        Ok(())
-    }
-
-    fn reclaim_worktree(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        let _ = Command::new("git")
-            .args(["worktree", "remove", workspace.path.to_str().unwrap()])
-            .current_dir(&workspace.repository_root)
-            .status();
-        Ok(())
-    }
-
-    fn reattach_workspace(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        Command::new("git")
-            .args(["worktree", "add"])
-            .arg(&workspace.path)
-            .arg(&workspace.branch)
-            .current_dir(&workspace.repository_root)
-            .status()
-            .map_err(|error| WorkerError::Startup(format!("git worktree add failed: {error}")))?;
-        Ok(())
-    }
-
-    fn is_merged_into(
-        &self,
-        owner: &WorkerWorkspace,
-        branch: &str,
-        parent_branch: &str,
-    ) -> Result<bool, WorkerError> {
-        self.merge_checks
-            .lock()
-            .unwrap()
-            .push((branch.to_owned(), parent_branch.to_owned()));
-        if branch.is_empty() || parent_branch.is_empty() {
-            return Ok(false);
-        }
-        // Ancestry is tested against the recorded parent branch, never the
-        // owner's current HEAD, so a `git checkout` in the owner cannot change
-        // the answer.
-        let output = Command::new("git")
-            .args(["merge-base", "--is-ancestor", branch, parent_branch])
-            .current_dir(&owner.path)
-            .status()
-            .map_err(|error| WorkerError::Startup(format!("git merge-base failed: {error}")))?;
-        Ok(output.success())
-    }
-
-    fn contains_commit(&self, owner: &WorkerWorkspace, commit: &str) -> Result<bool, WorkerError> {
-        let output = Command::new("git")
-            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
-            .current_dir(&owner.path)
-            .output()
-            .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
-        Ok(output.status.success())
-    }
 }
 
 /// Models a non-git application root: read-only provisioning works in place,
@@ -414,10 +315,6 @@ struct NonGitWorkspaceService {
 }
 
 impl WorkerWorkspaceProvider for NonGitWorkspaceService {
-    fn supports_coding(&self) -> bool {
-        false
-    }
-
     fn read_only_workspace(
         &self,
         parent: Option<&WorkerWorkspace>,
@@ -449,7 +346,7 @@ impl WorkerWorkspaceProvider for NonGitWorkspaceService {
 
     fn workspace_in(
         &self,
-        task_id: &TaskId,
+        _task_id: &TaskId,
         _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Err(WorkerError::Startup(
@@ -544,40 +441,6 @@ impl WorkerWorkspaceProvider for DerivedWorkspaceService {
     }
 }
 
-#[derive(Clone)]
-struct CleanupRecordingWorkspaceService {
-    workspace: WorkerWorkspace,
-    cleaned: Arc<Mutex<Vec<WorkerWorkspace>>>,
-    cleanup_error: Option<&'static str>,
-}
-
-impl WorkerWorkspaceProvider for CleanupRecordingWorkspaceService {
-    fn in_place_workspace(
-        &self,
-        _root_session_id: &RootSessionId,
-        _task_id: &TaskId,
-        _attempt_id: &AttemptId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        Ok(self.workspace.clone())
-    }
-
-    fn workspace_in(
-        &self,
-        task_id: &TaskId,
-        _workdir: &std::path::Path,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        Ok(self.workspace.clone())
-    }
-
-    fn cleanup_prepared(&self, workspace: &WorkerWorkspace) -> Result<(), WorkerError> {
-        self.cleaned.lock().unwrap().push(workspace.clone());
-        if let Some(error) = self.cleanup_error {
-            return Err(WorkerError::Startup(error.into()));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Default)]
 struct FailingWorkspaceService;
 
@@ -593,7 +456,7 @@ impl WorkerWorkspaceProvider for FailingWorkspaceService {
 
     fn workspace_in(
         &self,
-        task_id: &TaskId,
+        _task_id: &TaskId,
         _workdir: &std::path::Path,
     ) -> Result<WorkerWorkspace, WorkerError> {
         Err(WorkerError::Startup("Git workspace error: boom".into()))
@@ -897,99 +760,6 @@ async fn workspace_provisioning_failure_is_terminal_before_provider_start() {
 }
 
 #[tokio::test]
-async fn workspace_record_failure_cleans_up_prepared_assignment_before_provider_start() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let starts = Arc::new(Mutex::new(Vec::new()));
-    let handles = Arc::new(Mutex::new(Vec::new()));
-    let cleaned = Arc::new(Mutex::new(Vec::new()));
-    let workspace = WorkerWorkspace {
-        lease_id: WorkspaceLeaseId::new(),
-        repository_root: directory.path().join("repo"),
-        path: directory.path().join("repo/.worktrees/bad"),
-        branch: "feat/yi-agent-bad".into(),
-        parent_branch: "main".into(),
-        base_commit: "".into(),
-    };
-    let factory = Arc::new(WorkspaceObservingFactory {
-        database: database.clone(),
-        starts: Arc::clone(&starts),
-        handles,
-        workspace_service: Arc::new(CleanupRecordingWorkspaceService {
-            workspace: workspace.clone(),
-            cleaned: Arc::clone(&cleaned),
-            cleanup_error: None,
-        }),
-    });
-    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
-    let session = coordinator.create_session().unwrap();
-    let task = coordinator.root_task_id(&session).unwrap();
-
-    assert!(coordinator.start_worker(&session, &task).await.is_err());
-
-    assert!(starts.lock().unwrap().is_empty());
-    assert_eq!(cleaned.lock().unwrap().as_slice(), [workspace]);
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&task)
-            .unwrap(),
-        "failed"
-    );
-}
-
-#[tokio::test]
-async fn workspace_record_failure_surfaces_cleanup_failure_in_terminal_evidence() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let starts = Arc::new(Mutex::new(Vec::new()));
-    let handles = Arc::new(Mutex::new(Vec::new()));
-    let cleaned = Arc::new(Mutex::new(Vec::new()));
-    let workspace = WorkerWorkspace {
-        lease_id: WorkspaceLeaseId::new(),
-        repository_root: directory.path().join("repo"),
-        path: directory.path().join("repo/.worktrees/bad-cleanup"),
-        branch: "feat/yi-agent-bad-cleanup".into(),
-        parent_branch: "main".into(),
-        base_commit: "".into(),
-    };
-    let factory = Arc::new(WorkspaceObservingFactory {
-        database: database.clone(),
-        starts: Arc::clone(&starts),
-        handles,
-        workspace_service: Arc::new(CleanupRecordingWorkspaceService {
-            workspace: workspace.clone(),
-            cleaned: Arc::clone(&cleaned),
-            cleanup_error: Some("injected workspace cleanup failure"),
-        }),
-    });
-    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
-    let session = coordinator.create_session().unwrap();
-    let task = coordinator.root_task_id(&session).unwrap();
-
-    let error = coordinator
-        .start_worker(&session, &task)
-        .await
-        .expect_err("record and cleanup failures must surface together");
-
-    assert!(error.to_string().contains("record_task_workspace"));
-    assert!(
-        error
-            .to_string()
-            .contains("injected workspace cleanup failure")
-    );
-    assert!(starts.lock().unwrap().is_empty());
-    assert_eq!(cleaned.lock().unwrap().as_slice(), [workspace]);
-    let terminal = RuntimeRepository::open(&database)
-        .unwrap()
-        .attempt_terminal_json_for_task(&task)
-        .unwrap()
-        .expect("workspace failure is terminal evidence");
-    assert!(terminal.contains("workspace_provision_failed"));
-    assert!(terminal.contains("injected workspace cleanup failure"));
-}
-
-#[tokio::test]
 async fn coordinator_starts_root_worker_and_cancels_its_tree() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -1205,166 +975,14 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
 }
 
 #[tokio::test]
-async fn recycle_failure_does_not_fail_the_accept() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let repository_root = directory.path().join("repo");
-    std::fs::create_dir(&repository_root).unwrap();
-    initialize_git_repository(&repository_root);
-    let accepted = Arc::new(Mutex::new(Vec::new()));
-    let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::new(GitWorkspaceService {
-            repository_root: repository_root.clone(),
-            accepted: Arc::clone(&accepted),
-            cleanup_error: Some("injected recycle failure"),
-            merge_checks: Arc::new(Mutex::new(Vec::new())),
-        })),
-        ..Default::default()
-    });
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-
-    coordinator
-        .accept_review(&child, IntegrationValidation::passed("integrated"))
-        .await
-        .expect("a recycle failure must not fail the accept");
-
-    assert_eq!(accepted.lock().unwrap().len(), 1);
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.task_state(&child).unwrap(), "completed");
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_some(),
-        "a failed recycle leaves the child's workspace row for later handling"
-    );
-    let events = repository.event_records_for_task_after(&child, 0).unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycleFailed),
-        "a recycle-failure event is recorded"
-    );
-    assert!(
-        events
-            .iter()
-            .all(|event| event.event != RuntimeEvent::TaskWorkspaceRecycled),
-        "a failed recycle must not record a success event"
-    );
-}
-
-#[tokio::test]
-async fn integrated_delivery_is_accepted_and_recycled_on_reconcile() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let repository_root = directory.path().join("repo");
-    std::fs::create_dir(&repository_root).unwrap();
-    initialize_git_repository(&repository_root);
-    let accepted = Arc::new(Mutex::new(Vec::new()));
-    let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::new(GitWorkspaceService {
-            repository_root: repository_root.clone(),
-            accepted: Arc::clone(&accepted),
-            cleanup_error: None,
-            merge_checks: Arc::new(Mutex::new(Vec::new())),
-        })),
-        ..Default::default()
-    });
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-    let parent_workspace = factory.starts.lock().unwrap()[0].workspace.clone().unwrap();
-    let child_workspace = factory.starts.lock().unwrap()[1].workspace.clone().unwrap();
-
-    // The parent (application root) integrates the child by merging its branch.
-    git_ok(
-        &parent_workspace.path,
-        &[
-            "merge",
-            "--no-ff",
-            &child_workspace.branch,
-            "-m",
-            "integrate",
-        ],
-    )
-    .unwrap();
-
-    coordinator.reconcile_worker_events().await.unwrap();
-
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "completed"
-    );
-    let recorded = accepted.lock().unwrap().clone();
-    assert_eq!(
-        recorded.len(),
-        1,
-        "the sweep triggers exactly one accepted cleanup"
-    );
-    assert_eq!(recorded[0].1.branch, child_workspace.branch);
-    assert_eq!(
-        recorded[0].0.branch, parent_workspace.branch,
-        "the sweep probes and cleans up against the parent (owner) workspace"
-    );
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert!(
-        repository
-            .task_workspace_optional(&child)
-            .unwrap()
-            .is_none(),
-        "the child's workspace row is deleted after the sweep recycles it"
-    );
-    assert!(
-        repository
-            .event_records_for_task_after(&child, 0)
-            .unwrap()
-            .iter()
-            .any(|event| event.event == RuntimeEvent::TaskWorkspaceRecycled),
-        "a recycle-success event is recorded"
-    );
-
-    // A second reconcile pass must not double-accept an already-recycled child.
-    coordinator.reconcile_worker_events().await.unwrap();
-    assert_eq!(
-        accepted.lock().unwrap().len(),
-        1,
-        "a second reconcile does not accept the child again"
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "completed"
-    );
-}
-
-#[tokio::test]
 async fn unmerged_delivery_stays_awaiting_review_across_reconcile() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let repository_root = directory.path().join("repo");
     std::fs::create_dir(&repository_root).unwrap();
     initialize_git_repository(&repository_root);
-    let accepted = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::new(GitWorkspaceService {
-            repository_root: repository_root.clone(),
-            accepted: Arc::clone(&accepted),
-            cleanup_error: None,
-            merge_checks: Arc::new(Mutex::new(Vec::new())),
-        })),
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
         ..Default::default()
     });
     let (coordinator, _session, _parent, child, _delivery) =
@@ -1382,10 +1000,6 @@ async fn unmerged_delivery_stays_awaiting_review_across_reconcile() {
             .task_workspace_optional(&child)
             .unwrap()
             .is_some()
-    );
-    assert!(
-        accepted.lock().unwrap().is_empty(),
-        "no cleanup without integration"
     );
     assert!(
         repository
@@ -3935,15 +3549,15 @@ impl WorkerWorkspaceProvider for PreparedWorkdirService {
     ) -> Result<WorkerWorkspace, WorkerError> {
         Ok(self.prepared.clone())
     }
-
-    fn observe_workdir(&self, _workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
-        Ok(self.prepared.clone())
-    }
 }
 
 impl WorkerWorkspaceRegistry for PreparedWorkdirService {
     fn register_prepared(&self, workspace: &WorkerWorkspace) {
         let _ = workspace;
+    }
+
+    fn observe_workdir(&self, _workdir: &std::path::Path) -> Result<WorkerWorkspace, WorkerError> {
+        Ok(self.prepared.clone())
     }
 
     fn prepared_workspace_for_workdir(&self, workdir: &std::path::Path) -> Option<WorkerWorkspace> {
