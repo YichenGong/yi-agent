@@ -3996,6 +3996,7 @@ dependencies = [
  "yi-agent-mcp",
  "yi-agent-runtime",
  "yi-agent-store",
+ "yi-agent-subagent",
  "yi-agent-tools",
  "yi-agent-web",
 ]
@@ -4125,6 +4126,25 @@ dependencies = [
  "toml",
  "uuid",
  "yi-agent-core",
+]
+
+[[package]]
+name = "yi-agent-subagent"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "yi-agent-core",
+ "yi-agent-runtime",
+ "yi-agent-store",
+ "yi-agent-tools",
 ]
 
 [[package]]

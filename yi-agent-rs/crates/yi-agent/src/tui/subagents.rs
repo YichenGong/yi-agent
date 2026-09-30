@@ -5,8 +5,8 @@ use std::sync::{Mutex, OnceLock};
 
 use yi_agent_core::ToolRegistry;
 use yi_agent_core::subagent::worker::WorkerWorkspace;
+use yi_agent_subagent::register_application_subagent_tools;
 
-use crate::subagent_runtime::register_application_subagent_tools;
 #[cfg(test)]
 use crate::tui::slash::SlashCommand;
 

@@ -4,7 +4,6 @@ mod config;
 mod control_commands;
 mod llm_prefix;
 mod schedule_intent;
-mod subagent_runtime;
 mod tracing_init;
 mod tui;
 
@@ -532,7 +531,7 @@ fn build_daemon_worker_factory(
     let agent_config =
         yi_agent_runtime::bootstrap::build_agent_config(&config, prompt.system_prompt);
     Ok(Arc::new(
-        subagent_runtime::DaemonAgentWorkerFactory::new(
+        yi_agent_subagent::DaemonAgentWorkerFactory::new(
             provider,
             Arc::new(registry),
             agent_config,
