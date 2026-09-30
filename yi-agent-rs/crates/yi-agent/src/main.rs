@@ -31,7 +31,15 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let _trace_guard = tracing_init::init(cli.debug);
+
+    // Completion scripts are pure stdout. Skip tracing for them so no log or
+    // warning line can ever pollute the script a user redirects into their
+    // shell config.
+    let _trace_guard = if matches!(cli.command, Some(Command::Completions { .. })) {
+        None
+    } else {
+        Some(tracing_init::init(cli.debug))
+    };
 
     match cli.command {
         Some(Command::Web { ref host, ref port }) => {
@@ -64,6 +72,7 @@ fn main() -> Result<()> {
             let listen = listen.clone();
             run_app_server(cli, &listen)
         }
+        Some(Command::Completions { shell }) => print_completion(shell),
         None => run_agent(cli),
     }
 }
@@ -74,6 +83,16 @@ fn ensure_stdio_listen(listen: &str) -> Result<()> {
     if listen != "stdio://" {
         anyhow::bail!("unsupported app-server transport `{listen}`: only `stdio://` is supported");
     }
+    Ok(())
+}
+
+/// Emit a clap-generated shell completion script for `shell` on stdout.
+///
+/// The registered name is the binary name the script completes, not the clap
+/// `name` attribute, so `yi-agent <TAB>` is what a shell expands.
+fn print_completion(shell: clap_complete::Shell) -> Result<()> {
+    let mut command = <Cli as clap::CommandFactory>::command();
+    clap_complete::generate(shell, &mut command, "yi-agent", &mut std::io::stdout());
     Ok(())
 }
 
