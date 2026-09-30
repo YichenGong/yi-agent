@@ -6,6 +6,7 @@
 //! both build their runtime wiring here rather than each keeping a copy.
 
 pub mod attach;
+pub mod binding;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
