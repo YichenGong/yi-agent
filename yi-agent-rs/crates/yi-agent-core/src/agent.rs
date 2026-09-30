@@ -153,9 +153,8 @@ Task execution:
   turn when you are confident the task is complete.
 - Verify your work before declaring done: for code changes, run the
   relevant build/test commands; for factual claims, cite the source.
-- After writing or editing a file, inspect the changed result and run the
-  most relevant check before giving a final answer. Prefer write/edit tools
-  for file changes; use bash primarily for checks and batch operations.
+- After writing or editing a file, prefer write/edit tools for file changes; use
+  bash primarily for checks or batch mechanical operations.
 - If a tool call fails, diagnose the error and retry with a fix rather
   than reporting failure and stopping.
 - When information is missing, make a reasonable assumption, state it
@@ -312,8 +311,6 @@ pub enum DoneReason {
 
 const CONTINUE_AFTER_TRUNCATION: &str =
     "Continue the interrupted task from where you stopped. Do not repeat completed work.";
-const COMPLETION_AUDIT_PROMPT: &str =
-    "Before you finish, verify the changed result using an appropriate read, diff, build, or test.";
 
 #[derive(Debug, Clone, thiserror::Error, Serialize)]
 pub enum AgentError {
@@ -533,8 +530,6 @@ async fn run_loop(
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
-    let mut verification_pending = false;
-    let mut audit_attempted = false;
     // Cursor for incremental request logging: only log messages[last_logged..] each turn.
     let mut last_logged = 0usize;
 
@@ -839,15 +834,6 @@ async fn run_loop(
             .collect();
 
         if tool_uses.is_empty() {
-            if verification_pending && !audit_attempted {
-                audit_attempted = true;
-                messages.push(Message::user(COMPLETION_AUDIT_PROMPT));
-                session
-                    .lock()
-                    .unwrap()
-                    .push(Message::user(COMPLETION_AUDIT_PROMPT));
-                continue;
-            }
             info!(turn, "agent loop done: end_turn");
             tracing::info!(turn, "emitting AgentEvent::Done(EndTurn)");
             if tx
@@ -1037,16 +1023,6 @@ async fn run_loop(
             })
             .collect();
 
-        let mutating_tool_ids: std::collections::HashSet<String> = checked_uses
-            .iter()
-            .filter(|(_, name, _)| {
-                tools
-                    .get(name)
-                    .is_some_and(|tool| !tool.metadata().read_only)
-            })
-            .map(|(id, _, _)| id.clone())
-            .collect();
-
         // Check 3: ACT 中 — select! between join_all and cancel
         let results = tokio::select! {
             r = futures::future::join_all(futures) => r,
@@ -1068,15 +1044,10 @@ async fn run_loop(
         let mut tool_results: Vec<ContentBlock> = results
             .into_iter()
             .filter_map(|(id, result)| {
-                result.map(|r| {
-                    if !r.is_error && mutating_tool_ids.contains(&id) {
-                        verification_pending = true;
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content: r.content,
-                        is_error: r.is_error,
-                    }
+                result.map(|r| ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content: r.content,
+                    is_error: r.is_error,
                 })
             })
             .collect();
@@ -1358,24 +1329,6 @@ mod tests {
         }
     }
 
-    struct MutatingTool;
-
-    #[async_trait]
-    impl Tool for MutatingTool {
-        fn name(&self) -> &str {
-            "mutate"
-        }
-        fn schema(&self) -> serde_json::Value {
-            serde_json::json!({"type":"object"})
-        }
-        fn description(&self) -> &str {
-            "Mutates a file"
-        }
-        async fn call(&self, _args: serde_json::Value) -> ToolResult {
-            ToolResult::text("changed")
-        }
-    }
-
     fn collect_events(stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
         futures::executor::block_on_stream(stream).collect()
     }
@@ -1576,53 +1529,6 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn agent_audits_unverified_mutation_before_end_turn() {
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ProviderEvent::ToolUseStart {
-                    id: "t1".into(),
-                    name: "mutate".into(),
-                },
-                ProviderEvent::ToolUseDelta {
-                    id: "t1".into(),
-                    partial_json: "{}".into(),
-                },
-                ProviderEvent::ToolUseEnd { id: "t1".into() },
-                ProviderEvent::Stop {
-                    reason: StopReason::EndTurn,
-                },
-            ],
-            vec![
-                ProviderEvent::TextDelta("done".into()),
-                ProviderEvent::Stop {
-                    reason: StopReason::EndTurn,
-                },
-            ],
-            vec![
-                ProviderEvent::TextDelta("verified".into()),
-                ProviderEvent::Stop {
-                    reason: StopReason::EndTurn,
-                },
-            ],
-        ]);
-        let mut tools = ToolRegistry::new();
-        tools.register(Arc::new(MutatingTool));
-        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
-
-        let events = collect_events(agent.run("change file".into()).await.unwrap());
-
-        assert!(agent.session().messages().iter().any(|message| matches!(
-            message.content.first(),
-            Some(ContentBlock::Text(text)) if text.contains("verify the changed result")
-        )));
-        assert!(
-            events.iter().any(
-                |event| matches!(event, AgentEvent::AssistantText(text) if text == "verified")
-            )
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

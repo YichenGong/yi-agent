@@ -4,10 +4,7 @@
 //! 配置源:父进程环境变量(由 justfile recipe 从 .env 加载)。
 
 mod common;
-use common::{
-    has_normal_end_turn, has_verification_after_last_mutation, parse_events,
-    run_agent_with_timeout, skip_if_no_key,
-};
+use common::{has_normal_end_turn, parse_events, run_agent_with_timeout, skip_if_no_key};
 
 const PROMPT_WEBSITE: &str = "Create a single-page personal website. Write the complete HTML (with inline CSS) to output/index.html. The page should include a header, an 'About' section, and a footer. Use the write tool to create the file.";
 
@@ -35,10 +32,6 @@ fn complex_personal_website() {
     assert!(
         has_normal_end_turn(&events),
         "no normal EndTurn, stdout: {stdout}"
-    );
-    assert!(
-        has_verification_after_last_mutation(&events),
-        "no verification after final mutation, stdout: {stdout}"
     );
 
     // 结构性断言
@@ -83,10 +76,6 @@ fn complex_python_script() {
     assert!(
         has_normal_end_turn(&events),
         "no normal EndTurn, stdout: {stdout}"
-    );
-    assert!(
-        has_verification_after_last_mutation(&events),
-        "no verification after final mutation, stdout: {stdout}"
     );
 
     // 结构性断言(不执行产出代码)
@@ -142,10 +131,6 @@ fn complex_data_transformation() {
         has_normal_end_turn(&events),
         "no normal EndTurn, stdout: {stdout}"
     );
-    assert!(
-        has_verification_after_last_mutation(&events),
-        "no verification after final mutation, stdout: {stdout}"
-    );
 
     // 结构性断言
     let results_path = tmp.path().join("output/results.json");
@@ -199,10 +184,6 @@ fn complex_bug_fix() {
     assert!(
         has_normal_end_turn(&events),
         "no normal EndTurn, stdout: {stdout}"
-    );
-    assert!(
-        has_verification_after_last_mutation(&events),
-        "no verification after final mutation, stdout: {stdout}"
     );
 
     // 结构性断言

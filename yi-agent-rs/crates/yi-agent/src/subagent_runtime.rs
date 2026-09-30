@@ -1880,10 +1880,7 @@ mod tests {
                 1 => vec![ProviderEvent::Stop {
                     reason: yi_agent_core::StopReason::EndTurn,
                 }],
-                2 => vec![ProviderEvent::Stop {
-                    reason: yi_agent_core::StopReason::EndTurn,
-                }],
-                3 => vec![
+                2 => vec![
                     ProviderEvent::ToolUseStart {
                         id: "commit-delivery".into(),
                         name: "bash".into(),
@@ -1901,7 +1898,7 @@ mod tests {
                         reason: yi_agent_core::StopReason::EndTurn,
                     },
                 ],
-                4 | 5 => vec![ProviderEvent::Stop {
+                3 => vec![ProviderEvent::Stop {
                     reason: yi_agent_core::StopReason::EndTurn,
                 }],
                 call => {
@@ -2575,10 +2572,10 @@ mod tests {
         let requests = provider.requests.lock().unwrap();
         assert_eq!(
             requests.len(),
-            6,
+            4,
             "the worker must continue through write, dirty inspection, recovery commit, and post-commit turns",
         );
-        let recovery_prompt = requests[3]
+        let recovery_prompt = requests[2]
             .messages
             .iter()
             .flat_map(|message| message.content.iter())
@@ -2590,7 +2587,7 @@ mod tests {
         assert!(
             recovery_prompt.is_some(),
             "the commit turn must be prompted by dirty-delivery recovery: {:?}",
-            requests[3].messages,
+            requests[2].messages,
         );
     }
 
