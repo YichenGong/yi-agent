@@ -158,14 +158,37 @@ worker。以 daemon 持久化状态为准（复用 `has_worker` 检查），而�
 
 ```
 queued ──▶ running ──▶ awaiting_merge ──▶ done
-   │          │  ▲
-   │          ▼  │
-   │      needs_you ──▶ failed
+   ▲          │
+   │          ├──▶ needs_you
+   │          │
+   │          └──▶ failed
+   │          │
+   ├──────────┴──▶ paused ──▶ queued
    │
-   ├──▶ paused ──▶ cancelled
-   │
-   └────────────────▶ cancelled
+   └──────────────▶ cancelled   （任意非终态都可取消）
 ```
+
+**合法迁移（实现中 `can_transition_to` 的逐条对应，无其他边）：**
+
+| 从 | 到 | 触发者 |
+|----|----|--------|
+| `queued` | `running` | 调度器（拿到槽位） |
+| `running` | `awaiting_merge` | 调度器（会话跑完，有交付） |
+| `running` | `needs_you` | 调度器（BLOCKED / plan 冲突 / 预算耗尽） |
+| `running` | `failed` | 调度器（终止性失败） |
+| `running` | `paused` | 用户 |
+| `paused` | `queued` | 用户（恢复） |
+| `needs_you` | `queued` | 用户（补完决策后放回队列） |
+| `awaiting_merge` | `done` | 用户（集成完成） |
+| 任意非终态 | `cancelled` | 用户 |
+
+**不允许的迁移（易被误以为合法，特此写明）：**
+
+- **自迁移**：`X → X` 一律非法（包含 `paused → paused`、`running → running`）。
+- **回到运行态的直接边**：`needs_you → running`、`paused → running`、`awaiting_merge → running`
+  都**不合法**。恢复必须经由 `queued`，这样重新排队时会**重新参与优先级排序并重新抢槽位**，
+  不会绕过并发上限直接复活。
+- **从终态出发的任何边**：`done` / `failed` / `cancelled` 都不再有出边。
 
 | 状态 | 含义 | 占用槽位 |
 |------|------|----------|

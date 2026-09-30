@@ -44,6 +44,27 @@ pub fn runtime_restart_notice() -> crate::tui::cell::HistoryCell {
     }
 }
 
+/// The transcript line reporting that the runtime's startup sweep reclaimed
+/// orphaned tasks.
+///
+/// This is information, not a failure, so it belongs in the transcript rather
+/// than in `RUNTIME_RESTART_NOTICE`'s alert popup: delegation still works, the
+/// children that died with their root were the ones that could never finish.
+/// The count is kept because it is the only way to tell "your session lost
+/// work" from "the sweep tidied up someone else's leftovers".
+///
+/// The daemon used to announce this itself with an `eprintln!`. That write
+/// landed in the middle of a live TUI frame -- the daemon shares the process,
+/// and the terminal, with the TUI -- and smeared the input box's styling, which
+/// is exactly why the notice now travels as an event and is drawn here.
+pub fn orphaned_reclaim_notice(count: usize) -> crate::tui::cell::HistoryCell {
+    crate::tui::cell::HistoryCell::Separator {
+        label: Some(format!(
+            "runtime 已回收 {count} 个孤儿任务（所属 root 已退出）"
+        )),
+    }
+}
+
 static CURRENT_ATTACHED_ROOT: OnceLock<Mutex<Option<AttachedRoot>>> = OnceLock::new();
 
 pub fn set_current_attached_root(root: AttachedRoot) {
@@ -139,6 +160,20 @@ mod restart_notice_tests {
             assert!(
                 !label.contains(leak),
                 "leaked {leak:?} to the user: {label}"
+            );
+        }
+    }
+
+    /// The reclaim line must name the count and never read as a failure: the
+    /// session is fully usable, only the dead children were tidied up.
+    #[test]
+    fn the_reclaim_notice_states_the_count_without_sounding_like_a_failure() {
+        let label = label_of(orphaned_reclaim_notice(3));
+        assert!(label.contains('3'), "the count must be visible: {label}");
+        for leak in ["Error", "error", "{", "code:", "unavailable", "failed"] {
+            assert!(
+                !label.contains(leak),
+                "leaked {leak:?} into an informational notice: {label}"
             );
         }
     }

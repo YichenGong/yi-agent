@@ -884,6 +884,13 @@ impl HistoryState {
                 self.cells
                     .push(crate::tui::subagents::runtime_restart_notice());
             }
+            // Reported as a transcript line, never as a raw terminal write: the
+            // daemon that reclaims the orphans runs in this same process while
+            // the TUI paints, so a stray `eprintln!` smudged the input box.
+            AgentEvent::OrphanedTasksReclaimed { count } => {
+                self.cells
+                    .push(crate::tui::subagents::orphaned_reclaim_notice(count));
+            }
             AgentEvent::PermissionRequest {
                 request_id,
                 tool_name,
@@ -3195,6 +3202,23 @@ mod tests {
             &history.cells[0],
             HistoryCell::Separator { label: Some(label) }
                 if label == "压缩失败：provider unavailable"
+        ));
+    }
+
+    /// The reclaimed children belong in the transcript, with the count, and
+    /// through the same `push_event` path as every other notice. The daemon used
+    /// to announce this itself with a raw write, which smeared the input box
+    /// while the TUI was painting; the event is now the only channel.
+    #[test]
+    fn orphaned_reclaim_is_rendered_as_a_transcript_notice() {
+        let mut history = HistoryState::new();
+
+        history.push_event(AgentEvent::OrphanedTasksReclaimed { count: 2 }, 80);
+
+        assert!(matches!(
+            &history.cells[0],
+            HistoryCell::Separator { label: Some(label) }
+                if label == "runtime 已回收 2 个孤儿任务（所属 root 已退出）"
         ));
     }
 

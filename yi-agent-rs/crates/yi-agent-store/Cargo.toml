@@ -24,6 +24,10 @@ toml = "0.8"
 sha2 = "0.10"
 # Advisory file locking for the daemon instance lock (`flock`).
 libc = "0.2"
+# The daemon records why a request failed; `error_response` drops that detail to
+# keep the wire contract stable, so without a log the cause is unrecoverable.
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }

@@ -375,6 +375,14 @@ impl Translator {
             AgentEvent::SubagentRuntimeUnavailable { .. } => {
                 tracing::warn!("subagent runtime unavailable for this session");
             }
+            // The desktop side has no reclaim notice of its own: only the CLI
+            // emits this event (the shared attach path used by the app-server
+            // stays silent and logs instead), so the arm is defensive rather
+            // than reachable. It logs rather than vanishing, so a future
+            // producer's notice cannot be swallowed without a trace.
+            AgentEvent::OrphanedTasksReclaimed { count } => {
+                tracing::info!(count, "reclaimed orphaned subagent tasks");
+            }
             AgentEvent::Start
             | AgentEvent::ToolRetry { .. }
             | AgentEvent::EstimatedPrefill(_)

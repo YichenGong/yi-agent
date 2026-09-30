@@ -313,6 +313,16 @@ pub enum AgentEvent {
         stage: String,
         cause: String,
     },
+    /// The subagent runtime's startup sweep reclaimed `count` orphaned tasks
+    /// (children whose owning root was gone).
+    ///
+    /// Emitted by whoever started the daemon, not by the store: the store can
+    /// only say how many it reclaimed, and a raw write from it would land in
+    /// the middle of a live TUI frame. Consumers with a terminal of their own
+    /// print it; the TUI renders it as a transcript notice.
+    OrphanedTasksReclaimed {
+        count: usize,
+    },
     Error(AgentError),
     PermissionRequest {
         request_id: u64,
