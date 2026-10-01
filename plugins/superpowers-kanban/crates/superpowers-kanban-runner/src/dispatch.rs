@@ -36,13 +36,13 @@ pub fn dispatch_with_global(
         })),
         "enqueue" => {
             let spec = params
-                .get("spec")
+                .get("spec_path")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "enqueue needs a `spec` path".to_string())?;
+                .ok_or_else(|| "enqueue needs a `spec_path`".to_string())?;
             let plan = params
-                .get("plan")
+                .get("plan_path")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "enqueue needs a `plan` path".to_string())?;
+                .ok_or_else(|| "enqueue needs a `plan_path`".to_string())?;
             // 校验先做：拒绝的投递必须一个字节都不落盘，否则 runner 会替调用方
             // 把一张注定失败的卡片排进队列。
             validate_promotion(Path::new(spec), Path::new(plan))
@@ -63,14 +63,14 @@ pub fn dispatch_with_global(
                 "default"
             };
             let resolved = resolve(global, project);
-            Ok(json!({ "enabled": resolved.is_enabled(), "scope": scope }))
+            Ok(json!({ "on": resolved.is_enabled(), "source": scope }))
         }
         "switch.write" => {
-            let enabled = params
-                .get("enabled")
+            let on = params
+                .get("on")
                 .and_then(Value::as_bool)
-                .ok_or_else(|| "switch.write needs an `enabled` boolean".to_string())?;
-            let value = if enabled {
+                .ok_or_else(|| "switch.write needs an `on` boolean".to_string())?;
+            let value = if on {
                 SwitchValue::Enabled
             } else {
                 SwitchValue::Disabled
@@ -78,7 +78,7 @@ pub fn dispatch_with_global(
             let path = project_preferences_path(state_dir);
             write_layer(&path, value)
                 .map_err(|error| format!("could not write {}: {error}", path.display()))?;
-            Ok(json!({ "enabled": enabled }))
+            Ok(json!({ "on": on }))
         }
         other => Err(format!("unknown method: {other}")),
     }
@@ -142,7 +142,7 @@ mod tests {
             dir.path(),
             None,
             "enqueue",
-            &json!({"spec": dir.path().join("missing.spec.md"), "plan": plan}),
+            &json!({"spec_path": dir.path().join("missing.spec.md"), "plan_path": plan}),
         )
         .unwrap_err();
         assert!(error.contains("missing.spec.md"), "the error must name the file: {error}");
@@ -161,7 +161,7 @@ mod tests {
             dir.path(),
             None,
             "enqueue",
-            &json!({"spec": spec, "plan": plan}),
+            &json!({"spec_path": spec, "plan_path": plan}),
         )
         .unwrap();
         let id = result.get("id").and_then(Value::as_str).expect("enqueue must return an id");
@@ -181,15 +181,15 @@ mod tests {
         let state = state_dir(workdir.path());
         // 两层都没设 -> 默认关闭，来源是 default。
         let result = dispatch_with_global(&state, None, "switch.read", &json!({})).unwrap();
-        assert_eq!(result["enabled"], false);
-        assert_eq!(result["scope"], "default");
+        assert_eq!(result["on"], false);
+        assert_eq!(result["source"], "default");
 
         // 只有全局层 -> 来源是 global。
         let result =
             dispatch_with_global(&state, Some(SwitchValue::Enabled), "switch.read", &json!({}))
                 .unwrap();
-        assert_eq!(result["enabled"], true);
-        assert_eq!(result["scope"], "global");
+        assert_eq!(result["on"], true);
+        assert_eq!(result["source"], "global");
 
         // 项目层压过全局层 -> 来源是 project。
         write_layer(
@@ -200,8 +200,8 @@ mod tests {
         let result =
             dispatch_with_global(&state, Some(SwitchValue::Enabled), "switch.read", &json!({}))
                 .unwrap();
-        assert_eq!(result["enabled"], false);
-        assert_eq!(result["scope"], "project");
+        assert_eq!(result["on"], false);
+        assert_eq!(result["source"], "project");
     }
 
     #[test]
@@ -209,8 +209,8 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let state = state_dir(workdir.path());
         let result =
-            dispatch_with_global(&state, None, "switch.write", &json!({"enabled": true})).unwrap();
-        assert_eq!(result["enabled"], true);
+            dispatch_with_global(&state, None, "switch.write", &json!({"on": true})).unwrap();
+        assert_eq!(result["on"], true);
         let path = superpowers_kanban_core::layout::project_preferences_path(&state);
         assert_eq!(read_layer(&path), Some(SwitchValue::Enabled));
         assert!(

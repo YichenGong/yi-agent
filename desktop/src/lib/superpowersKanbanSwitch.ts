@@ -32,29 +32,57 @@ export interface BoardCardDto {
 
 type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
 
-/** 经 app-server 读看板卡片（宿主侧读 board.json）。 */
+/**
+ * The plugin the kanban panel talks to. The host only forwards the query; no
+ * board meaning lives above this line, so the plugin can be installed or
+ * removed without the app learning a new RPC.
+ */
+export const KANBAN_PLUGIN = "superpowers-kanban";
+
+/** One query through the generic channel, tagged with the plugin it is meant for. */
+async function queryPlugin<T>(
+  rpc: BoardRpc,
+  method: string,
+  params: unknown,
+): Promise<T> {
+  return rpc<T>("plugin/query", { plugin: KANBAN_PLUGIN, method, params });
+}
+
+/**
+ * Whether the plugin is installed, judged by whether it answered at all.
+ *
+ * The daemon refuses the query when the plugin is not running or never declared
+ * a query socket, which is exactly the case the panel has to name. This stays
+ * string-based because the failure crosses a JSON-RPC boundary as a message.
+ */
+export function pluginIsUnavailable(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? "");
+  return text.includes("PluginUnavailable") || text.includes("is not running");
+}
+
+/** 经插件读看板卡片。 */
 export async function fetchBoard(rpc: BoardRpc): Promise<BoardCardDto[]> {
-  const result = await rpc<{ cards?: BoardCardDto[] }>("superpowers-kanban/list", {});
+  const result = await queryPlugin<{ cards?: BoardCardDto[] }>(rpc, "list", {});
   return result?.cards ?? [];
 }
 
-/** 经 app-server 读两层解析后的开关与来源。 */
+/** 经插件读两层解析后的开关与来源。 */
 export async function readBoardSwitch(
   rpc: BoardRpc,
 ): Promise<{ on: boolean; source: SwitchSource }> {
-  return rpc<{ on: boolean; source: SwitchSource }>("superpowers-kanban/switch/read", {});
+  return queryPlugin<{ on: boolean; source: SwitchSource }>(rpc, "switch.read", {});
 }
 
-/** 经 app-server 写项目层开关。 */
+/** 经插件写项目层开关。 */
 export async function setBoardSwitch(rpc: BoardRpc, on: boolean): Promise<void> {
-  await rpc("superpowers-kanban/switch/write", { on });
+  await queryPlugin(rpc, "switch.write", { on });
 }
 
-/** 经 app-server 投递一张卡片。 */
+/** 经插件投递一张卡片。 */
 export async function enqueueBoardCard(
   rpc: BoardRpc,
   specPath: string,
   planPath: string,
 ): Promise<void> {
-  await rpc("superpowers-kanban/enqueue", { spec_path: specPath, plan_path: planPath });
+  await queryPlugin(rpc, "enqueue", { spec_path: specPath, plan_path: planPath });
 }

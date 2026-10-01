@@ -39,4 +39,14 @@ describe("SuperpowersKanbanView", () => {
     render(<SuperpowersKanbanView switchOn source="project" cards={[]} />);
     expect(screen.getByText(/empty/i)).toBeTruthy();
   });
+
+  it("names the missing plugin instead of showing an empty board", () => {
+    // The plugin answers every board question, so an unanswered query means it
+    // is not installed. That is a different state than "installed, no cards".
+    render(
+      <SuperpowersKanbanView switchOn source="project" cards={[]} pluginMissing />,
+    );
+    expect(screen.getByText(/插件未安装/)).toBeTruthy();
+    expect(screen.queryByText(/empty/i)).toBeNull();
+  });
 });
