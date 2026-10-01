@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/yi-agent",
+    "crates/yi-agent-app-server",
+    "crates/yi-agent-boards",
     "crates/yi-agent-core",
     "crates/yi-agent-llm",
     "crates/yi-agent-tools",
