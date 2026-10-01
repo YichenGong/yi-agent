@@ -32,6 +32,9 @@ use super::slash::{
 };
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
+use super::trace::{
+    SubagentListState, TraceDetailPopup, TraceListPopup, TracePopup, render_subagent_list,
+};
 
 const HISTORY_WHEEL_LINES: usize = 3;
 
@@ -302,6 +305,7 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut task_registry = RunningTaskRegistry::new();
     let mut cost_tracker = CostTracker::default();
     let mut runtime_popup: RuntimePopup = RuntimePopup::None;
+    let mut subagent_children = SubagentListState::default();
     // A one-shot alert shown when the runtime the user asked for fails to come
     // up. It must be a popup, not only a history line: the failure can land
     // many turns into a long session, where a separator appended to the
@@ -559,6 +563,9 @@ fn run_loop<B: Backend, E: EventSource>(
                     );
                     let ids: Vec<String> =
                         task_registry.list().iter().map(|t| t.id.clone()).collect();
+                    if let Ok(socket) = crate::runtime_socket_for(&workdir) {
+                        subagent_children = subagent_children_at(&socket);
+                    }
                     runtime_popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(ids)));
                     continue;
                 }
@@ -571,6 +578,7 @@ fn run_loop<B: Backend, E: EventSource>(
                         kill_tx,
                         &process_snapshots,
                         &process_outputs,
+                        &subagent_children,
                         layout.chunks[0].width,
                         layout.chunks[0].height,
                     );
@@ -708,6 +716,26 @@ enum RuntimePopup {
     None,
     Bash(BashPopup),
     Processes(ProcessPopup),
+    Agents(AgentsPopup),
+}
+
+/// The subagent tab: the child list, plus whatever a later task renders once a
+/// child is opened.
+#[derive(Debug, Clone)]
+struct AgentsPopup {
+    list: TraceListPopup,
+    detail: Option<TracePopup>,
+    children: SubagentListState,
+}
+
+impl AgentsPopup {
+    fn new(children: SubagentListState) -> Self {
+        Self {
+            list: TraceListPopup::new(),
+            detail: None,
+            children,
+        }
+    }
 }
 
 impl RuntimePopup {
@@ -719,12 +747,13 @@ impl RuntimePopup {
         !matches!(self, Self::None)
     }
 
-    fn switch_tab(&mut self, process_ids: Vec<String>) {
+    fn switch_tab(&mut self, process_ids: Vec<String>, children: SubagentListState) {
         *self = match self.tab().map(RuntimeTab::next) {
             Some(RuntimeTab::Processes) => {
                 Self::Processes(ProcessPopup::List(ProcessListPopup::new()))
             }
             Some(RuntimeTab::BashTasks) => Self::Bash(BashPopup::List(ListPopup::new(process_ids))),
+            Some(RuntimeTab::Agents) => Self::Agents(AgentsPopup::new(children)),
             None => Self::None,
         };
     }
@@ -734,17 +763,26 @@ impl RuntimePopup {
             Self::None => None,
             Self::Bash(_) => Some(RuntimeTab::BashTasks),
             Self::Processes(_) => Some(RuntimeTab::Processes),
+            Self::Agents(_) => Some(RuntimeTab::Agents),
         }
     }
 }
 
-fn switch_runtime_tab(runtime_popup: &mut RuntimePopup, task_registry: &RunningTaskRegistry) {
+fn switch_runtime_tab(
+    runtime_popup: &mut RuntimePopup,
+    task_registry: &RunningTaskRegistry,
+    children: &SubagentListState,
+) {
     let ids = task_registry.list().iter().map(|t| t.id.clone()).collect();
-    runtime_popup.switch_tab(ids);
+    runtime_popup.switch_tab(ids, children.clone());
 }
 
 #[cfg(test)]
-fn switch_runtime_tab_for_test(runtime_popup: &mut RuntimePopup, bash_ids: &[String]) {
+fn switch_runtime_tab_for_test(
+    runtime_popup: &mut RuntimePopup,
+    bash_ids: &[String],
+    children: SubagentListState,
+) {
     *runtime_popup = match runtime_popup.tab().map(RuntimeTab::next) {
         Some(RuntimeTab::Processes) => {
             RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()))
@@ -752,6 +790,7 @@ fn switch_runtime_tab_for_test(runtime_popup: &mut RuntimePopup, bash_ids: &[Str
         Some(RuntimeTab::BashTasks) => {
             RuntimePopup::Bash(BashPopup::List(ListPopup::new(bash_ids.to_vec())))
         }
+        Some(RuntimeTab::Agents) => RuntimePopup::Agents(AgentsPopup::new(children)),
         None => RuntimePopup::None,
     };
 }
@@ -845,6 +884,23 @@ fn render_runtime_popup(
                     ),
                     area,
                 );
+            }
+        }
+        RuntimePopup::Agents(agents) => {
+            f.render_widget(Clear, area);
+            match &agents.detail {
+                None => {
+                    f.render_widget(
+                        render_subagent_list(&agents.list, &agents.children, area),
+                        area,
+                    );
+                }
+                Some(TracePopup::Detail(detail)) => {
+                    f.render_widget(
+                        super::trace::render_subagent_detail(detail, &agents.children, area),
+                        area,
+                    );
+                }
             }
         }
         RuntimePopup::Processes(ProcessPopup::ConfirmKill(ck)) => {
@@ -953,7 +1009,7 @@ fn handle_runtime_popup_key_for_test(
     processes: &[yi_agent_tools::ManagedProcessSnapshot],
 ) {
     if key.code == KeyCode::Tab {
-        switch_runtime_tab_for_test(runtime_popup, bash_ids);
+        switch_runtime_tab_for_test(runtime_popup, bash_ids, SubagentListState::default());
         return;
     }
     let registry = RunningTaskRegistry::new();
@@ -966,6 +1022,7 @@ fn handle_runtime_popup_key_for_test(
         &kill_tx,
         processes,
         &outputs,
+        &SubagentListState::default(),
         80,
         24,
     );
@@ -981,6 +1038,7 @@ fn handle_runtime_popup_key(
     kill_tx: &tokio::sync::mpsc::Sender<String>,
     processes: &[yi_agent_tools::ManagedProcessSnapshot],
     process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
+    children: &SubagentListState,
     detail_width: u16,
     detail_height: u16,
 ) -> Option<String> {
@@ -988,7 +1046,7 @@ fn handle_runtime_popup_key(
         RuntimePopup::None => {}
         RuntimePopup::Bash(bash_popup) => {
             if key.code == KeyCode::Tab {
-                switch_runtime_tab(runtime_popup, task_registry);
+                switch_runtime_tab(runtime_popup, task_registry, children);
             } else {
                 handle_bash_popup_key(key, bash_popup, task_registry, kill_tx, detail_width);
                 if matches!(bash_popup, BashPopup::None) {
@@ -998,7 +1056,7 @@ fn handle_runtime_popup_key(
         }
         RuntimePopup::Processes(ProcessPopup::List(p)) => match key.code {
             KeyCode::Tab => {
-                switch_runtime_tab(runtime_popup, task_registry);
+                switch_runtime_tab(runtime_popup, task_registry, children);
             }
             KeyCode::Up => p.move_up(),
             KeyCode::Down => p.move_down(processes.len()),
@@ -1014,7 +1072,7 @@ fn handle_runtime_popup_key(
         },
         RuntimePopup::Processes(ProcessPopup::Detail(d)) => match key.code {
             KeyCode::Tab => {
-                switch_runtime_tab(runtime_popup, task_registry);
+                switch_runtime_tab(runtime_popup, task_registry, children);
             }
             KeyCode::Char('k') => {
                 *runtime_popup =
@@ -1063,6 +1121,36 @@ fn handle_runtime_popup_key(
             }
             _ => {}
         },
+        RuntimePopup::Agents(agents) => {
+            if key.code == KeyCode::Tab {
+                switch_runtime_tab(runtime_popup, task_registry, children);
+                return None;
+            }
+            if let Some(TracePopup::Detail(detail)) = &mut agents.detail {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        if !detail.pop() {
+                            agents.detail = None;
+                        }
+                    }
+                    _ => {}
+                }
+                return None;
+            }
+            match key.code {
+                KeyCode::Up => agents.list.move_up(),
+                KeyCode::Down => agents.list.move_down(agents.children.len()),
+                KeyCode::Enter => {
+                    if let Some(task_id) = agents.list.selected_id(&agents.children.items) {
+                        agents.detail = Some(TracePopup::Detail(TraceDetailPopup::new(
+                            task_id.to_string(),
+                        )));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => *runtime_popup = RuntimePopup::None,
+                _ => {}
+            }
+        }
     }
     None
 }
@@ -2740,6 +2828,52 @@ fn daemon_agents_summary_at(
         excluded_task_id.as_deref(),
         empty_label,
     ))
+}
+
+/// The children of the root this TUI is attached to, for the subagent tab.
+///
+/// A list is navigation, not a work surface: an unreachable daemon or a
+/// detached root yields an empty list rather than an error the user has to
+/// dismiss, so Ctrl+P keeps working in every runtime state.
+fn subagent_children_at(socket: &std::path::Path) -> SubagentListState {
+    let Some(root) = crate::tui::subagents::current_attached_root() else {
+        return SubagentListState::default();
+    };
+    let response = match yi_agent_store::ipc::send_request(
+        socket,
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id: Some(root.session_id),
+            active_only: false,
+        },
+    ) {
+        Ok(response) => response,
+        Err(_) => return SubagentListState::default(),
+    };
+    let yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } = response else {
+        return SubagentListState::default();
+    };
+    SubagentListState::new(
+        tasks
+            .into_iter()
+            .filter(|task| !task.is_root && task.task_id != root.task_id)
+            .map(|task| super::trace::SubagentListItem {
+                active: !is_terminal_task_state(&task.state),
+                task_id: task.task_id,
+                objective: None,
+                state: task.state,
+                last_step: None,
+            })
+            .collect(),
+    )
+}
+
+/// Whether a task can no longer make progress. Mirrors the daemon's own
+/// terminal vocabulary so the tab agrees with `/agents`.
+fn is_terminal_task_state(state: &str) -> bool {
+    matches!(
+        state,
+        "completed" | "completed_no_changes" | "failed" | "cancelled"
+    )
 }
 
 fn format_agents_summary(
@@ -5921,11 +6055,117 @@ mod tests {
         ));
     }
 
+    fn subagent_items() -> SubagentListState {
+        SubagentListState::new(vec![
+            super::super::trace::SubagentListItem {
+                task_id: "task-1".into(),
+                objective: Some("first child".into()),
+                state: "running".into(),
+                last_step: None,
+                active: true,
+            },
+            super::super::trace::SubagentListItem {
+                task_id: "task-2".into(),
+                objective: Some("second child".into()),
+                state: "completed".into(),
+                last_step: None,
+                active: false,
+            },
+        ])
+    }
+
+    fn agents_key(
+        key: KeyEvent,
+        popup: &mut RuntimePopup,
+        children: &SubagentListState,
+    ) -> Option<String> {
+        let registry = RunningTaskRegistry::new();
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        handle_runtime_popup_key(
+            key,
+            popup,
+            &registry,
+            &kill_tx,
+            &[],
+            &std::collections::HashMap::new(),
+            children,
+            80,
+            24,
+        )
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_runtime_popup_cycles_bash_processes_and_agents() {
+        assert_eq!(RuntimeTab::BashTasks.next(), RuntimeTab::Processes);
+        assert_eq!(RuntimeTab::Processes.next(), RuntimeTab::Agents);
+        assert_eq!(RuntimeTab::Agents.next(), RuntimeTab::BashTasks);
+    }
+
+    #[test]
+    fn switching_to_the_agents_tab_builds_the_list_from_the_children() {
+        let children = subagent_items();
+        let mut popup = RuntimePopup::Processes(ProcessPopup::List(ProcessListPopup::new()));
+
+        popup.switch_tab(Vec::new(), children.clone());
+
+        let RuntimePopup::Agents(agents) = popup else {
+            panic!("expected the agents tab");
+        };
+        assert_eq!(agents.children.len(), 2);
+        assert_eq!(agents.children.items[0].task_id, "task-1");
+        assert!(agents.detail.is_none());
+    }
+
+    #[test]
+    fn enter_on_a_list_row_opens_that_agents_detail() {
+        let children = subagent_items();
+        let mut popup = RuntimePopup::Agents(AgentsPopup::new(children.clone()));
+
+        agents_key(key(KeyCode::Down), &mut popup, &children);
+        agents_key(key(KeyCode::Enter), &mut popup, &children);
+
+        let RuntimePopup::Agents(agents) = popup else {
+            panic!("expected the agents tab");
+        };
+        let Some(super::super::trace::TracePopup::Detail(detail)) = agents.detail else {
+            panic!("expected a detail view");
+        };
+        assert_eq!(detail.task_id(), "task-2", "the row under the cursor opens");
+    }
+
+    #[test]
+    fn esc_in_a_detail_returns_to_the_list_before_closing_the_popup() {
+        let children = subagent_items();
+        let mut popup = RuntimePopup::Agents(AgentsPopup::new(children.clone()));
+        agents_key(key(KeyCode::Enter), &mut popup, &children);
+
+        agents_key(key(KeyCode::Esc), &mut popup, &children);
+
+        let RuntimePopup::Agents(agents) = popup else {
+            panic!("the popup must stay open on the first Esc");
+        };
+        assert!(agents.detail.is_none(), "back to the list");
+    }
+
+    #[test]
+    fn esc_on_the_agent_list_closes_the_popup() {
+        let children = subagent_items();
+        let mut popup = RuntimePopup::Agents(AgentsPopup::new(children.clone()));
+
+        agents_key(key(KeyCode::Esc), &mut popup, &children);
+
+        assert!(matches!(popup, RuntimePopup::None));
+    }
+
     #[test]
     fn runtime_popup_tab_switches_between_bash_and_processes() {
         let mut popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(vec!["bash_1".into()])));
 
-        popup.switch_tab(Vec::new());
+        popup.switch_tab(Vec::new(), SubagentListState::default());
 
         assert!(matches!(
             popup,

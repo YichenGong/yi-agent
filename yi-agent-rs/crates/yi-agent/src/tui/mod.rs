@@ -14,4 +14,5 @@ pub mod slash;
 pub mod state;
 pub mod statusbar;
 pub mod subagents;
+pub mod trace;
 pub mod wrap;
