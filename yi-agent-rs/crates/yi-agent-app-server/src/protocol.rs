@@ -174,8 +174,46 @@ pub enum Notification {
         cache_creation_input_tokens: u32,
         cache_read_input_tokens: u32,
     },
+    /// 一条子 agent 轨迹行,推给订阅了该 thread 那个任务的客户端。
+    #[serde(rename = "agent/trace/event", rename_all = "camelCase")]
+    AgentTraceEvent {
+        thread_id: String,
+        task_id: String,
+        row: AgentTraceRow,
+    },
+    /// 该 thread 的子 agent 列表发生了变化,整表推给客户端就地替换。
+    ///
+    /// 推整表而非增量:列表是模型可能在任何时刻改变的小集合(每次 spawn 一个
+    /// 新行),整表让客户端无需对账顺序,也让"错过一帧"不会留下永久残影。
+    #[serde(rename = "agent/children/updated", rename_all = "camelCase")]
+    AgentChildrenUpdated {
+        thread_id: String,
+        children: Vec<AgentChild>,
+    },
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+/// 一条子 agent 的列表项。字段沿用 JSON-RPC 的 camelCase。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentChild {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_step: Option<String>,
+}
+
+/// 一条轨迹行,原样透传 daemon 的 `IpcTraceRow`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTraceRow {
+    pub event_id: i64,
+    pub task_id: String,
+    pub kind: String,
+    pub payload_json: String,
 }
 
 /// 服务端 → 客户端通知的 JSON-RPC 2.0 信封。
