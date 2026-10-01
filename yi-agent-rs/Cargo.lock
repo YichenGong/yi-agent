@@ -4182,6 +4182,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yi-agent-supervisors"
+version = "0.1.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "yi-agent-tools"
 version = "0.1.3"
 dependencies = [

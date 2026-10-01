@@ -13,6 +13,7 @@ members = [
     "crates/yi-agent-app-server",
     "crates/yi-agent-subagent",
     "crates/yi-agent-board-ui",
+    "crates/yi-agent-supervisors",
 ]
 
 [workspace.package]

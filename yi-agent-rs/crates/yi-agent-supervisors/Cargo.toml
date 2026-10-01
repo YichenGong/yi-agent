@@ -1,0 +1,17 @@
+[package]
+name = "yi-agent-supervisors"
+description = "Generic switch-driven child-process supervision for the yi-agent daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
