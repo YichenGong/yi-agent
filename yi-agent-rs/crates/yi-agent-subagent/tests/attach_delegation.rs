@@ -179,3 +179,100 @@ fn ensure_owned_reuses_a_healthy_daemon() {
         "must not steal a healthy daemon"
     );
 }
+
+/// 一个把 pid 写进 marker 后睡到被杀的假子进程。
+///
+/// 用假的而不是真插件二进制：这条测试要证明的是**接线**
+/// （谁拥有 daemon → 谁监督 → 子进程被拉起 → 路由被登记），
+/// 而不是插件本身能不能跑；用真二进制会把 cargo 构建顺序变成测试前提。
+fn write_fake_child(dir: &Path, marker: &Path) -> std::path::PathBuf {
+    let script = dir.join("plugin-child.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", marker.display()),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    script
+}
+
+/// 就位"清单 + 开关打开"，让监督者有事可做。
+fn arm_plugin(repo: &Path, marker: &Path) -> std::path::PathBuf {
+    let child = write_fake_child(repo, marker);
+    let manifests = repo.join(".yi-agent/supervisors");
+    std::fs::create_dir_all(&manifests).unwrap();
+    std::fs::write(
+        manifests.join("demo.json"),
+        format!(
+            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
+            child.display()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join(".yi-agent")).unwrap();
+    std::fs::write(
+        repo.join(".yi-agent/preferences.json"),
+        r#"{"demo_on":true}"#,
+    )
+    .unwrap();
+    child
+}
+
+/// 拥有 daemon 的进程必须监督插件。
+///
+/// 这是修掉的那个缺口：内嵌 daemon（TUI 与桌面共用本路径）过去不监督，
+/// 于是"装了看板却永远 pending"。断言落在可观测的两端——子进程被拉起、
+/// 且 daemon 的转发表里出现它的路由。
+#[test]
+fn a_process_that_owns_the_daemon_supervises_its_plugins() {
+    use std::time::{Duration, Instant};
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let marker = repo.path().join("plugin.pid");
+    arm_plugin(repo.path(), &marker);
+    let cfg = config_for(repo.path());
+
+    let attached =
+        yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime_dir.path().to_path_buf())
+            .expect("a clean git project must attach");
+    assert!(
+        attached.embedded_daemon.is_some(),
+        "this test needs the process to own the daemon"
+    );
+
+    // 子进程被拉起（监督循环 500ms 一轮，给足余量）。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut started = false;
+    while Instant::now() < deadline {
+        if marker.exists() {
+            started = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        started,
+        "owning the daemon means spawning the switched-on plugin"
+    );
+
+    // 且它可被路由：转发表里出现 demo（清单声明了 query_socket）。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut routable = false;
+    while Instant::now() < deadline {
+        if yi_agent_store::ipc::plugin_socket_for("demo").is_some() {
+            routable = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        routable,
+        "a running plugin that declares a query socket must become routable"
+    );
+}
