@@ -57,12 +57,17 @@ struct BuiltAgent {
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
     /// 该 agent 的运行时 yolo 开关;`ThreadSession` 存它以便 RPC 即时切换。
     yolo: yi_agent_core::autonomy::YoloSwitch,
+    /// 支撑该 agent 工具集里的进程工具的 manager。**与生效的工具集同行**：
+    /// `build_runtime_tooling` 换掉工具集时必须一并替换它。
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
 }
 
 /// 一个 cwd 的工具集与其权限检查器。
 struct RuntimeTooling {
     registry: Arc<yi_agent_core::ToolRegistry>,
     permission: Arc<yi_agent_core::permission::PermissionChecker>,
+    /// 这一份注册表对应的 manager(与 registry 同源)。
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
 }
 
 /// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目
@@ -614,6 +619,7 @@ fn build_runtime_tooling(
     )
     .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
+    let process_manager = Arc::clone(&setup.process_manager);
     // The conversation marker is bound here, not inferred later: the model that
     // calls `spawn_agent` never sees a thread id, so each thread's tools carry
     // their own so every child they spawn is tagged with this conversation.
@@ -629,6 +635,7 @@ fn build_runtime_tooling(
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
         permission,
+        process_manager,
     })
 }
 
@@ -659,6 +666,8 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         decision_rx,
         catalog,
         yolo,
+        // 注册表换了,manager 必须跟着换:否则面板查的是被丢弃的那一份。
+        process_manager: tooling.process_manager,
     }
 }
 
@@ -737,6 +746,7 @@ where
                 decision_rx: built.decision_rx,
                 catalog: built.catalog,
                 yolo: built.yolo,
+                process_manager: built.process_manager,
             })
         },
     )
@@ -1105,8 +1115,16 @@ where
                             &thread_id,
                             built,
                         );
-                        let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
-                            activation.built;
+                        let BuiltAgent {
+                            agent,
+                            provider,
+                            config,
+                            decision_tx,
+                            catalog,
+                            yolo,
+                            process_manager,
+                            ..
+                        } = activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
@@ -1154,6 +1172,7 @@ where
                                 model: model.clone(),
                                 active_turn_id: None,
                                 yolo,
+                                process_manager: Arc::clone(&process_manager),
                                 prompt_tx,
                                 interrupt_tx,
                                 interject_tx,
@@ -1315,8 +1334,16 @@ where
                             &thread_id,
                             built,
                         );
-                        let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
-                            activation.built;
+                        let BuiltAgent {
+                            agent,
+                            provider,
+                            config,
+                            decision_tx,
+                            catalog,
+                            yolo,
+                            process_manager,
+                            ..
+                        } = activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
@@ -1335,6 +1362,7 @@ where
                                 model: model.clone(),
                                 active_turn_id: None,
                                 yolo,
+                                process_manager: Arc::clone(&process_manager),
                                 prompt_tx,
                                 interrupt_tx,
                                 interject_tx,
@@ -3448,6 +3476,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -3473,6 +3502,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -3498,6 +3528,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -4883,6 +4914,7 @@ mod tests {
             decision_rx: Some(rx_arc),
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -5698,6 +5730,7 @@ mod tests {
                 decision_rx: None,
                 catalog: None,
                 yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             })
         };
         let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -5931,6 +5964,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -6005,6 +6039,7 @@ mod tests {
                 decision_rx: None,
                 catalog: None,
                 yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             })
         };
         let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
