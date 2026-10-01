@@ -43,6 +43,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "board-runner"
+version = "0.1.0"
+dependencies = [
+ "board-core",
+ "board-ipc",
+ "chrono",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

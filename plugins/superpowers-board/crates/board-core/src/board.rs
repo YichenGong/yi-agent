@@ -106,6 +106,17 @@ impl Board {
             .map(|card| card.id.clone())
     }
 
+    /// All queued cards in start order, without mutating the board.
+    pub fn queued_in_order(&self) -> Vec<CardId> {
+        let mut queued: Vec<&Card> = self
+            .cards
+            .iter()
+            .filter(|card| card.state == CardState::Queued)
+            .collect();
+        queued.sort_by_key(|card| card.order);
+        queued.into_iter().map(|card| card.id.clone()).collect()
+    }
+
     /// 在 `limit` 之内启动尽可能多的排队卡片，返回本次启动的卡片（按启动顺序）。
     pub fn start_due(&mut self, limit: u16) -> Vec<CardId> {
         let mut started = Vec::new();

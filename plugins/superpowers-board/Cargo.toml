@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/board-core", "crates/board-ipc"]
+members = ["crates/board-core", "crates/board-ipc", "crates/board-runner"]
 
 [workspace.package]
 version = "0.1.0"
