@@ -161,4 +161,17 @@ mod tests {
             "saving the runtime preference must not drop the board switch"
         );
     }
+
+    #[test]
+    fn saving_over_a_corrupt_file_replaces_it_with_a_valid_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(preferences_path(dir.path()), "{ not json").unwrap();
+        save(dir.path(), RuntimePreference::Always).unwrap();
+        assert_eq!(
+            load(dir.path()),
+            RuntimePreference::Always,
+            "a corrupt file must not block the save"
+        );
+    }
 }
