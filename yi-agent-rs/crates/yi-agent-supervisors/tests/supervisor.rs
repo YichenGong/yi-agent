@@ -192,3 +192,84 @@ fn the_layout_state_dir_uses_the_superpowers_kanban_name() {
         dir.path().join(".yi-agent/superpowers-kanban")
     );
 }
+
+/// 深项目路径下，转发表必须给出**插件真正 bind 的那个位置**。
+///
+/// 这条把两端串起来：宿主按契约规则解析，插件在同一位置 bind。
+/// 只要有一侧规则漂移，这里就对不上——比两端各自单测更有价值。
+#[test]
+fn a_deep_workdir_publishes_the_path_the_plugin_actually_binds() {
+    let dir = tempfile::tempdir().unwrap();
+    // 构造一个足够深的 workdir，让 <state_dir>/superpowers-kanban.sock 越界。
+    let long = "a-rather-long-segment".repeat(3);
+    let workdir = dir.path().join(long).join("deep-project");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(&workdir, &marker);
+    let layout = layout_for(&workdir);
+    let state_dir = layout.state_dir.clone();
+
+    // 清单声明查询 socket（与真实清单同款模板），并打开开关。
+    std::fs::create_dir_all(layout.manifests_dir()).unwrap();
+    std::fs::write(
+        layout.manifests_dir().join("superpowers-kanban.json"),
+        format!(
+            r#"{{"name":"superpowers-kanban","command":"{}","args":[],"switch_key":"superpowers_kanban","query_socket":"{{state_dir}}/superpowers-kanban.sock"}}"#,
+            child.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        workdir.join(".yi-agent/preferences.json"),
+        r#"{"superpowers_kanban":true}"#,
+    )
+    .unwrap();
+
+    let direct = state_dir.join("superpowers-kanban.sock");
+    assert!(
+        direct.as_os_str().len() > 103,
+        "precondition: 直接路径必须越界，实际 {} 字节：{}",
+        direct.as_os_str().len(),
+        direct.display()
+    );
+
+    let mut supervisor = Supervisor::new(layout_for(&workdir));
+    supervisor.reconcile();
+    if !wait_for(&marker, Duration::from_secs(5)) {
+        supervisor.stop_all();
+        panic!("子进程没起来");
+    }
+
+    let sockets = supervisor.query_sockets();
+    supervisor.stop_all();
+
+    let (name, path) = sockets
+        .iter()
+        .find(|(name, _)| name == "superpowers-kanban")
+        .unwrap_or_else(|| panic!("转发表里没有这个插件：{sockets:?}"));
+
+    assert_eq!(name, "superpowers-kanban");
+    assert!(
+        path.as_os_str().len() <= 103,
+        "转发表的路径必须能 bind，实际 {} 字节：{}",
+        path.as_os_str().len(),
+        path.display()
+    );
+    assert!(
+        !path.starts_with(&state_dir),
+        "深路径下必须挪出 state_dir，否则插件 bind 不上"
+    );
+    // 从第一性原理独立推导期望名（不复用被测代码）：纯 sha256 + 前缀。
+    // 这是第三种实现，任一侧漂移都会与它对不上。
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(direct.as_os_str().as_encoded_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let expected = format!("plugin-{}.sock", &hex[..16]);
+
+    assert_eq!(
+        path.file_name().unwrap().to_string_lossy(),
+        expected,
+        "宿主转发表与插件的规则不一致"
+    );
+}

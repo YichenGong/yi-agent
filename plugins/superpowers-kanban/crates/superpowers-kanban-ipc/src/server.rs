@@ -199,6 +199,58 @@ mod tests {
     }
 
     #[test]
+    fn a_deep_state_dir_still_binds_and_answers() {
+        // 这是本 spec 存在的理由：深项目路径下，查询 socket 必须在**回退位置**
+        // 真的 bind 成功、并能应答。只断言"路径变短了"不够——路径短但 bind 不上
+        // 正是原来的病灶。
+        let deep_parent = tempfile::tempdir().unwrap();
+        let deep_state = deep_parent
+            .path()
+            .join("a-very-long-project-name-that-overflows-sun-path/.yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&deep_state).unwrap();
+
+        let direct = deep_state.join("superpowers-kanban.sock");
+        assert!(
+            direct.as_os_str().len() > crate::socket::MAX_SOCKET_PATH_BYTES,
+            "precondition: 直接路径必须越界，否则这个测试没测到回退"
+        );
+
+        let socket = socket_path(&deep_state).expect("falls back, does not fail");
+        assert!(!socket.starts_with(&deep_state), "socket 必须已挪出深目录");
+
+        let dispatch = fake();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let path = socket.clone();
+        let handle = std::thread::spawn(move || {
+            serve_with(&path, dispatch, || !flag.load(std::sync::atomic::Ordering::SeqCst))
+                .expect("bind 必须成功——这正是深路径下原来失败的那一步")
+        });
+
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(socket.exists(), "socket 没建起来：{}", socket.display());
+
+        let mut stream = UnixStream::connect(&socket).expect("回退位置必须可连");
+        stream
+            .write_all(br#"{"type":"plugin.query","method":"list","params":{}}"#)
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["type"], "plugin.result", "{reply}");
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn a_client_that_connects_and_leaves_does_not_stop_serving() {
         let dir = tempfile::tempdir().unwrap();
         let socket = socket_path(dir.path()).expect("temp dir fits");
