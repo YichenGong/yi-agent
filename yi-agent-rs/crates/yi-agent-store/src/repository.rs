@@ -354,6 +354,9 @@ pub struct PersistedTaskSummary {
     pub task_id: String,
     pub state: String,
     pub is_root: bool,
+    /// The task's parent, absent for a root task. Lets a reader rebuild the
+    /// task tree without a second query.
+    pub parent_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3913,22 +3916,22 @@ impl RuntimeRepository {
     ) -> Result<Vec<PersistedTaskSummary>, RepositoryError> {
         let (sql, parameters): (&str, Vec<String>) = match (root_session_id, active_only) {
             (Some(session), false) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                "SELECT id, state_json, parent_id IS NULL, parent_id FROM tasks
                  WHERE root_session_id = ?1 ORDER BY created_at, id",
                 vec![session.to_string()],
             ),
             (None, true) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                "SELECT id, state_json, parent_id IS NULL, parent_id FROM tasks
                  WHERE state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
                  ORDER BY created_at, id",
                 Vec::new(),
             ),
             (None, false) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks ORDER BY created_at, id",
+                "SELECT id, state_json, parent_id IS NULL, parent_id FROM tasks ORDER BY created_at, id",
                 Vec::new(),
             ),
             (Some(session), true) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                "SELECT id, state_json, parent_id IS NULL, parent_id FROM tasks
                  WHERE root_session_id = ?1
                    AND state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
                  ORDER BY created_at, id",
@@ -3942,6 +3945,7 @@ impl RuntimeRepository {
                     task_id: row.get(0)?,
                     state: row.get(1)?,
                     is_root: row.get(2)?,
+                    parent_task_id: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()

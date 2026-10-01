@@ -592,6 +592,8 @@ pub struct IpcTaskSummary {
     pub task_id: String,
     pub state: String,
     pub is_root: bool,
+    /// The task's parent, absent for a root task.
+    pub parent_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1212,6 +1214,39 @@ pub struct TraceSubscription {
 impl TraceSubscription {
     pub fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    /// Make the underlying socket non-blocking.
+    ///
+    /// A UI that must keep repainting cannot afford to block in `next_row`, so
+    /// it puts the stream in non-blocking mode and calls [`Self::try_row`]
+    /// instead: each read returns immediately and a `WouldBlock` means "no row
+    /// yet", which the caller turns into another frame. The mode is a property
+    /// of the socket, so it applies to the reads `next_row` also performs.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), IpcError> {
+        self.reader.get_ref().set_nonblocking(nonblocking)?;
+        Ok(())
+    }
+
+    /// A row if one is buffered right now, `None` if none has arrived.
+    ///
+    /// Only meaningful on a non-blocking subscription; on a blocking one the
+    /// read waits for the next frame, which is exactly what `next_row` does.
+    /// The end of the stream is still reported as `None`, indistinguishable
+    /// from "nothing yet" by design: the caller can keep its last view.
+    pub fn try_row(&mut self) -> Result<Option<IpcTraceRow>, IpcError> {
+        match self.next_row() {
+            Ok(row) => Ok(row),
+            Err(IpcError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Reads one frame and checks its correlation, mirroring `Subscription`.
@@ -3381,6 +3416,7 @@ fn respond(
                     task_id: task.task_id,
                     state: task.state,
                     is_root: task.is_root,
+                    parent_task_id: task.parent_task_id,
                 })
                 .collect();
             Ok(IpcResponse::TaskSummaries { tasks })
