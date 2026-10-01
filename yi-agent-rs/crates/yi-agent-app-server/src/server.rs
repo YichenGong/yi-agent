@@ -71,6 +71,42 @@ struct RuntimeTooling {
 /// bring-up(git 检查 + daemon 起停尝试)。
 type ProjectRuntimes = Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
 
+/// The key that identifies one project directory across this process.
+///
+/// Runtime attach and every later lookup must agree on this value, so it is
+/// computed in exactly one place. A path that exists canonicalizes whole, which
+/// resolves symlinks and, on macOS, `/tmp` -> `/private/tmp`. A path that does
+/// not exist yet still has to key the *same* before and after it is created, so
+/// the deepest existing ancestor is canonicalized and the remaining components
+/// are appended unchanged. Without that second half an absent directory keys as
+/// its literal spelling while the same directory keys as its canonical path once
+/// it exists -- two keys for one project, which makes delegation silently
+/// disappear (attach stores one key, the lookup misses it) whenever the two
+/// spellings differ.
+fn project_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        if let Some(name) = cursor.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if let Ok(canonical) = std::fs::canonicalize(parent) {
+            let mut key = canonical;
+            for part in suffix.iter().rev() {
+                key.push(part);
+            }
+            return key;
+        }
+        cursor = parent;
+    }
+}
+
 /// 一次 attach 的结果:可能被换过工具集的 agent,以及该 thread 首个 turn 要激活的 runtime。
 struct Activation {
     built: BuiltAgent,
@@ -159,7 +195,7 @@ fn socket_for_thread(
     thread_id: &str,
 ) -> Option<PathBuf> {
     let cwd = threads.get(thread_id)?.cwd.clone();
-    let key = std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(&cwd));
+    let key = project_key(Path::new(&cwd));
     let entry = runtimes
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -428,7 +464,7 @@ fn attach_cwd_runtime(
     runtime_dir: &Path,
     cfg: &RuntimeConfig,
 ) -> Result<Arc<RuntimeBinding>, String> {
-    let key = std::fs::canonicalize(&cfg.workdir).unwrap_or_else(|_| cfg.workdir.clone());
+    let key = project_key(&cfg.workdir);
     if let Some(existing) = runtimes.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return existing.clone();
     }
@@ -456,7 +492,7 @@ fn detach_unused_runtimes(runtimes: &ProjectRuntimes, live_cwds: &[String]) {
     for binding in attached_runtimes(runtimes) {
         if live_cwds
             .iter()
-            .any(|cwd| Path::new(cwd) == binding.project_root())
+            .any(|cwd| project_key(Path::new(cwd)) == project_key(&binding.project_root()))
         {
             continue;
         }
@@ -3055,6 +3091,52 @@ mod tests {
         );
     }
 
+    /// One directory must never key two ways depending on whether it exists yet.
+    ///
+    /// Attach runs while the project exists, but a lookup can be asked to key a
+    /// path that is momentarily absent; if the two disagree the map misses and
+    /// delegation goes silently dark. `/tmp` vs `/private/tmp` on macOS is the
+    /// everyday case: canonicalizing resolved it only once the directory was
+    /// there, so an absent path used to key as its literal spelling.
+    #[test]
+    fn a_project_directory_keys_the_same_before_and_after_it_exists() {
+        // Reach the directory through a symlinked parent so its literal spelling
+        // and its canonical path genuinely differ -- this is the shape of the
+        // macOS `/tmp` -> `/private/tmp` divergence.
+        let real = tempfile::TempDir::new().unwrap();
+        let link_holder = tempfile::TempDir::new().unwrap();
+        let link = link_holder.path().join("linked");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let child = link.join("project");
+
+        let absent_key = project_key(&child);
+        std::fs::create_dir_all(&child).unwrap();
+        let present_key = project_key(&child);
+
+        assert_eq!(
+            absent_key, present_key,
+            "keying an absent directory must match keying it once it exists"
+        );
+        assert_eq!(
+            present_key,
+            child.canonicalize().unwrap(),
+            "an existing directory must key as its canonical path"
+        );
+    }
+
+    /// A path whose ancestor is a symlink keys identically whether reached
+    /// through the link or the target, so two spellings of one project share a
+    /// runtime instead of attaching two.
+    #[test]
+    fn a_symlinked_project_keys_by_its_target() {
+        let target = tempfile::TempDir::new().unwrap();
+        let link_parent = tempfile::TempDir::new().unwrap();
+        let link = link_parent.path().join("link");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+
+        assert_eq!(project_key(&link), project_key(target.path()));
+    }
+
     /// A second thread in one cwd reuses the attached runtime: the app-server is
     /// one long-lived process, but a runtime is per project.
     #[test]
@@ -3632,7 +3714,25 @@ mod tests {
     /// pretending to queue: there is no daemon to queue it on.
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_message_without_a_runtime_is_an_error() {
-        let mut h = Harness::new();
+        // "Unattached" has to be arranged, not assumed: bring-up provisions the
+        // runtime at `<workdir>/.yi-agent/runtime`, and a freshly made directory
+        // is perfectly attachable. The shared `/tmp/yi-agent-app-server-test`
+        // workdir made this test pass only by accident -- the attach key and the
+        // lookup key used to disagree for a directory that did not exist yet
+        // (`/tmp` versus `/private/tmp`), so the entry missed and the thread read
+        // as unattached. `project_key` now keys both the same way, so that
+        // accident is gone and any attachable workdir would reach a real daemon
+        // and answer `-32603` instead of the `-32011` asserted here.
+        //
+        // Occupy `<workdir>/.yi-agent` with a regular file instead: the runtime
+        // directory can never be created, bring-up fails deterministically, and
+        // the conversation is unattached for the reason this test is about --
+        // independent of `/tmp` state or of any daemon running elsewhere.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".yi-agent"), b"not a directory").unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
         let thread_id = start_thread(&mut h).await;
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":9,"method":"agent/message","params":{{"threadId":"{thread_id}","taskId":"task-1","message":"hello"}}}}"#
