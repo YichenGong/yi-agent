@@ -32,7 +32,7 @@
     每轮 `reconcile()` 后 `register_plugin_sockets(supervisor.query_sockets())`；
     停止时 `clear_plugin_sockets()` 再 `stop_all()`；线程体 `catch_unwind`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 // 1. 清单 + 开关就位 → serve() 后假子进程被拉起（沿用 supervisors 测试里的
@@ -41,10 +41,10 @@
 // 3. 清单不存在的目录：serve() 不 panic，is_supervising() 仍为 true（线程在跑、无事可做）。
 ```
 
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**（把 `main.rs::serve_supervisor` 的逻辑搬来，签名与语义保持一致）
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**（把 `main.rs::serve_supervisor` 的逻辑搬来，签名与语义保持一致）
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -58,9 +58,9 @@
 - Produces: 删除 `main.rs` 里重复的 `serve_supervisor`/`SupervisorHandle`，
   `DaemonAction::Serve` 改调 `yi_agent_runtime::supervise::serve(&workdir)`。
 
-- [ ] **Step 1: 现有测试必须继续通过**（`main.rs` 里那个"清单 + 开关 → marker 文件"的测试即是回归网）
-- [ ] **Step 2: 替换实现，确认既有测试仍 PASS**（行为不变，只是换了落点）
-- [ ] **Step 3: Commit**
+- [x] **Step 1: 现有测试必须继续通过**（`main.rs` 里那个"清单 + 开关 → marker 文件"的测试即是回归网）
+- [x] **Step 2: 替换实现，确认既有测试仍 PASS**（行为不变，只是换了落点）
+- [x] **Step 3: Commit**
 
 ---
 
@@ -74,12 +74,12 @@
 - Produces: `AttachedTuiRuntime` 增 `supervisor: Option<SuperviseHandle>`；
   仅当 `embedded_daemon.is_some()` 时启动；会话结束时停止。
 
-- [ ] **Step 1: 写失败测试**——`embedded_daemon = Some` 时 `is_supervising()` 为真；
+- [x] **Step 1: 写失败测试**——`embedded_daemon = Some` 时 `is_supervising()` 为真；
   `AlreadyRunning`（模拟：先把 daemon 起在别处）时 `is_supervising()` 为假。
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -94,11 +94,11 @@
 - Produces: `AttachedProjectRuntime` 增 `supervisor: Option<SuperviseHandle>`；
   仅当 `embedded_daemon.is_some()` 时启动；binding 停止时一并停止。
 
-- [ ] **Step 1: 写失败测试**——同上两条（拥有的监督 / 借用的不监督）。
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 1: 写失败测试**——同上两条（拥有的监督 / 借用的不监督）。
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
