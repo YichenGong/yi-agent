@@ -156,6 +156,11 @@ pub enum Command {
         #[arg(long, default_value = "stdio://")]
         listen: String,
     },
+    /// Generate a shell completion script on stdout (bash, zsh, fish, powershell).
+    Completions {
+        /// Target shell.
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

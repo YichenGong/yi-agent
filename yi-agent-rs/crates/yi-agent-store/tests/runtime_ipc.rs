@@ -14,7 +14,7 @@ use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider,
 };
-use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
     SubscriptionFilters, send_request, send_request_with_version, subscribe,
@@ -74,13 +74,13 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
             "DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12);",
+             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13);",
         )
         .unwrap();
     database
@@ -477,6 +477,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
             mode: Some("read_only".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -550,6 +551,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
             mode: Some("read_only".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -647,6 +649,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
             mode: Some("read_only".into()),
             model: Some("small-model".into()),
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -695,7 +698,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     for table in [
         "sessions",
         "tasks",
@@ -724,7 +727,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     // Rebuild the pre-v11 shape of the attachment table and roll the schema
@@ -742,7 +745,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                  detached_at TEXT
              );
-             DELETE FROM schema_migrations WHERE version IN (11, 12);",
+             DELETE FROM schema_migrations WHERE version >= 11;",
         )
         .unwrap();
     database
@@ -750,14 +753,14 @@ fn v10_database_without_workspace_root() -> PathBuf {
 
 #[test]
 fn a_version_10_database_is_migrated_to_the_current_schema() {
-    // Regression: a database written by the previous release reports schema
-    // version 10, which equals LATEST_SCHEMA_VERSION. The migration gate then
-    // returns early and the v11 `workspace_root` column is never added, so the
-    // first attach fails with `no such column: workspace_root`.
+    // Regression: a database written by the previous release reported a schema
+    // version the migration gate took for current, so it returned early and the
+    // v11 `workspace_root` column was never added; the first attach then failed
+    // with `no such column: workspace_root`.
     let database = v10_database_without_workspace_root();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     let has_column: bool = Connection::open(&database)
         .unwrap()
         .query_row(
@@ -813,7 +816,7 @@ fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     assert!(
         repository
             .has_table("application_root_attachments")
@@ -893,6 +896,7 @@ fn application_roots_use_their_attaching_project_workspace() {
             mode: Some("coding".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -1051,6 +1055,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
                 mode: None,
                 model: None,
                 thread_id: None,
+                sandbox: None,
             },
         )
         .unwrap(),
@@ -1437,6 +1442,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -1503,6 +1509,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap();
@@ -1517,6 +1524,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap();
@@ -1560,6 +1568,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -1579,6 +1588,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap();
@@ -1634,6 +1644,7 @@ fn application_root_rejects_more_than_four_direct_children() {
                     mode: None,
                     model: None,
                     thread_id: None,
+                    sandbox: None,
                 },
             )
             .unwrap(),
@@ -1652,6 +1663,7 @@ fn application_root_rejects_more_than_four_direct_children() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap();
@@ -1701,6 +1713,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                     mode: None,
                     model: None,
                     thread_id: None,
+                    sandbox: None,
                 },
             )
             .unwrap(),
@@ -1735,6 +1748,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                 mode: None,
                 model: None,
                 thread_id: None,
+                sandbox: None,
             },
         )
         .unwrap(),
@@ -1833,6 +1847,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
                 mode: None,
                 model: None,
                 thread_id: None,
+                sandbox: None,
             },
         )
         .unwrap(),
@@ -1913,6 +1928,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
                 mode: None,
                 model: None,
                 thread_id: None,
+                sandbox: None,
             },
         )
         .unwrap(),
@@ -1984,6 +2000,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
                 mode: None,
                 model: None,
                 thread_id: None,
+                sandbox: None,
             },
         )
         .unwrap(),
@@ -2100,7 +2117,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -3299,6 +3316,8 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap()
@@ -3351,6 +3370,8 @@ fn daemon_rejects_unbound_agent_message_requests_without_persisting_them() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap()
@@ -3447,6 +3468,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -3527,6 +3549,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -3595,6 +3618,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -3614,6 +3638,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -3687,6 +3712,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -3706,6 +3732,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -3777,6 +3804,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -3854,6 +3882,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -3915,6 +3944,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -3992,6 +4022,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -4101,6 +4132,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -4188,6 +4220,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -4350,6 +4383,8 @@ fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -4395,6 +4430,8 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
             objective: "Inspect the target".into(),
             mode: None,
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -4443,6 +4480,8 @@ fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
             objective: "Unrelated task".into(),
             mode: None,
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap()
@@ -4603,6 +4642,8 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
             objective: "Child task".into(),
             mode: None,
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap()
@@ -4821,6 +4862,8 @@ fn review_ipc_accept_records_user_approval_without_completing_integration() {
             objective: "Implement the parser".into(),
             mode: Some("coding".into()),
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5175,6 +5218,8 @@ fn delivered_child_over_ipc(
             objective: "Implement the parser".into(),
             mode: Some("coding".into()),
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5296,7 +5341,7 @@ fn workspace_mode_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -5310,6 +5355,7 @@ fn workspace_mode_is_persisted_and_recovered() {
             "queued",
             "root",
             ChildWriteMode::Coding,
+            None,
             None,
         )
         .unwrap();
@@ -5333,6 +5379,7 @@ fn workspace_mode_is_persisted_and_recovered() {
             "recovery_required",
             "child",
             ChildWriteMode::ReadOnly,
+            None,
             None,
             None,
         )
@@ -5393,6 +5440,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
             mode: Some("coding".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5442,6 +5490,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5493,6 +5542,7 @@ fn a_child_records_the_thread_that_spawned_it() {
             mode: None,
             model: None,
             thread_id: Some("thread-a".into()),
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5549,6 +5599,7 @@ fn a_grandchild_inherits_its_parents_thread() {
             mode: None,
             model: None,
             thread_id: Some("thread-a".into()),
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5567,6 +5618,7 @@ fn a_grandchild_inherits_its_parents_thread() {
             objective: "a descendant that names no conversation".into(),
             mode: None,
             model: None,
+            sandbox: None,
         },
     )
     .unwrap();
@@ -5629,6 +5681,7 @@ fn an_explicit_thread_overrides_the_inherited_one() {
             mode: None,
             model: None,
             thread_id: Some("thread-b".into()),
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5682,6 +5735,7 @@ fn a_child_with_no_thread_and_no_parent_thread_has_none() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap()
@@ -5838,6 +5892,8 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
             objective: objective.clone(),
             mode: None,
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -5915,6 +5971,7 @@ fn delivered_application_child_over_ipc(
             mode: Some("coding".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -6027,6 +6084,7 @@ fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
             mode: Some("read_only".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap();
@@ -6204,6 +6262,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
             mode: None,
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap() else {
@@ -6286,4 +6345,71 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
         Some("I got as far as rewriting the lexer"),
         "the partial transcript must survive the restart"
     );
+}
+
+#[test]
+fn inherited_sandbox_is_persisted_and_recovered() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 13);
+
+    let session = RootSessionId::new();
+    let root = TaskId::new();
+    let root_attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt_and_objective(
+            &root,
+            &session,
+            &root_attempt,
+            1,
+            "queued",
+            "root",
+            ChildWriteMode::Coding,
+            None,
+            None,
+        )
+        .unwrap();
+    // A root with no recorded inheritance reads back as `None`.
+    assert_eq!(repository.task_inherited_sandbox(&root).unwrap(), None);
+
+    // A recoverable child carries a value so both the getter and the
+    // `recovered_tasks` column read and parse path are exercised.
+    let child = TaskId::new();
+    let child_attempt = AttemptId::new();
+    repository
+        .create_child_task_with_attempt_and_objective(
+            &child,
+            &session,
+            &root,
+            1,
+            &child_attempt,
+            1,
+            "recovery_required",
+            "child",
+            ChildWriteMode::Coding,
+            None,
+            None,
+            Some(InheritedSandbox::DangerFullAccess),
+        )
+        .unwrap();
+    assert_eq!(
+        repository.task_inherited_sandbox(&child).unwrap(),
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+
+    let recovered = repository.recovered_tasks().unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].task_id, child);
+    assert_eq!(
+        recovered[0].inherited_sandbox,
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+
+    // The legacy insert omits `inherited_sandbox`, so the column stays NULL.
+    let legacy = TaskId::new();
+    repository
+        .create_child_task(&legacy, &session, &root, 1, "queued")
+        .unwrap();
+    assert_eq!(repository.task_inherited_sandbox(&legacy).unwrap(), None);
 }

@@ -14,7 +14,14 @@
 - **不改**既有 IPC 请求的行为与语义；只**新增**请求变体与转换分支。
 - `IpcRequest` 使用 `#[serde(tag = "type", deny_unknown_fields)]`，新变体必须同步更新协议测试。
 - workdir 必须已存在且是 git worktree；**daemon 只观察，绝不创建目录**（沿用现有约定）。
-- 启动必须**幂等**：同一任务已有 worker 时返回既有结果，不创建第二个 worker。
+- 启动必须**幂等**：同一个 **root task** 重复调用 `start_worker` 不得创建第二个 worker（该幂等由
+  `start_worker` 内部的 `has_worker` 检查保证，本计划不重复实现）。
+- **去重语义的归属（已裁决）：** `create_autonomous_session` **每次调用都新建会话**，签名里没有去重键。
+  一张卡片不会被重复启动，靠的是 Plan 3a 的卡片状态机（只对 `Queued` 卡片调用），而不是这一层。
+  因此不要给签名或 IPC 加去重键；文档注释必须如实说明这一点，不得暗示本方法自身去重。
+- **非 git 目录的拒绝（已裁决）：** git 校验由下游 `yi-agent-subagent`（`prepare_task_workspace`
+  → workspace service）负责，生产 daemon 始终挂载该 service。本层只检查目录存在（`is_dir`），
+  **不重复实现** git 校验；但必须有测试证明下游确实会拒绝非 git 目录。
 - 非 git 项目或不存在的 workdir → 明确报错，绝不静默原地跑。
 - 提交信息用 conventional commits，**不写** `Co-Authored-By`。
 - 每个任务结束跑 `cd yi-agent-rs && cargo fmt --all && cargo test -p <crate>`。

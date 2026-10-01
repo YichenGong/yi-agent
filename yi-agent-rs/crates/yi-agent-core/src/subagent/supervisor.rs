@@ -13,9 +13,9 @@ use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority,
 use super::scheduler::AdmissionPriority;
 use super::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
-    IntegrationValidation, MessageId, PauseReason, PermissionDecision, PermissionRequestId,
-    RecoveryEvidence, RootSessionId, TaskAttempt, TaskEvent, TaskFailure, TaskId, TaskState,
-    TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
+    InheritedSandbox, IntegrationValidation, MessageId, PauseReason, PermissionDecision,
+    PermissionRequestId, RecoveryEvidence, RootSessionId, TaskAttempt, TaskEvent, TaskFailure,
+    TaskId, TaskState, TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::trace::TraceFact;
 use super::worker::{
@@ -88,6 +88,7 @@ pub struct AgentSupervisor {
     tasks: HashMap<TaskId, AgentTask>,
     objectives: HashMap<TaskId, String>,
     workspace_modes: HashMap<TaskId, ChildWriteMode>,
+    inherited_sandboxes: HashMap<TaskId, InheritedSandbox>,
     workdirs: HashMap<TaskId, Option<PathBuf>>,
     models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
@@ -129,6 +130,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            inherited_sandboxes: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -167,6 +169,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            inherited_sandboxes: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -220,6 +223,7 @@ impl AgentSupervisor {
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
+            inherited_sandboxes: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -252,6 +256,7 @@ impl AgentSupervisor {
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
+        self.inherited_sandboxes.remove(&task_id);
         if let Some(model) = model {
             self.models.insert(task_id.clone(), model);
         }
@@ -323,6 +328,7 @@ impl AgentSupervisor {
         self.mailboxes.insert(task_id.clone(), Mailbox::default());
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
+        self.inherited_sandboxes.remove(&task_id);
         if let Some(model) = model {
             self.models.insert(task_id.clone(), model);
         }
@@ -354,6 +360,14 @@ impl AgentSupervisor {
 
     pub fn set_workspace_mode(&mut self, task_id: &TaskId, mode: ChildWriteMode) {
         self.workspace_modes.insert(task_id.clone(), mode);
+    }
+
+    pub fn set_inherited_sandbox(&mut self, task_id: &TaskId, sandbox: InheritedSandbox) {
+        self.inherited_sandboxes.insert(task_id.clone(), sandbox);
+    }
+
+    pub fn inherited_sandbox(&self, task_id: &TaskId) -> Option<InheritedSandbox> {
+        self.inherited_sandboxes.get(task_id).copied()
     }
 
     /// The task's workspace mode. A registered entry wins; otherwise the root
@@ -580,6 +594,7 @@ impl AgentSupervisor {
         )
         .with_objective(objective)
         .with_workspace_mode(self.workspace_mode(task_id))
+        .maybe_with_inherited_sandbox(self.inherited_sandbox(task_id))
         .with_model(self.model(task_id).unwrap_or_default().to_string())
         .with_message_capability(Uuid::new_v4().to_string())
         .with_initial_user_messages(
@@ -1095,6 +1110,9 @@ impl AgentSupervisor {
         self.objectives
             .insert(child_id.clone(), request.objective.clone());
         self.workspace_modes.insert(child_id.clone(), request.mode);
+        // A child starts with no recorded inheritance; the caller (coordinator)
+        // seeds it from the persisted task row before the worker starts.
+        self.inherited_sandboxes.remove(&child_id);
         self.workdirs.insert(child_id.clone(), request.workdir);
         self.mailboxes.insert(child_id.clone(), Mailbox::default());
         self.children

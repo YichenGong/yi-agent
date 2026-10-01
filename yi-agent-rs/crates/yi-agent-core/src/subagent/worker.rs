@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::ProviderTurnGate;
 
 use super::task::{
-    AttemptId, ChildWriteMode, DeliveryReport, MessageId, RootSessionId, TaskId, WorkspaceLeaseId,
+    AttemptId, ChildWriteMode, DeliveryReport, InheritedSandbox, MessageId, RootSessionId, TaskId,
+    WorkspaceLeaseId,
 };
 use super::trace::TraceFact;
 
@@ -74,6 +75,9 @@ pub struct WorkerStart {
     pub workspace: Option<WorkerWorkspace>,
     /// Whether this worker owns a writable worktree or runs read-only in place.
     pub workspace_mode: ChildWriteMode,
+    /// The OS sandbox this task inherits from its parent at spawn time. `None`
+    /// means "no inheritance": the factory falls back to its configured mode.
+    pub inherited_sandbox: Option<InheritedSandbox>,
     pub cancellation: CancellationToken,
     /// Opaque daemon-issued capability required for worker IPC mutations.
     pub message_capability: String,
@@ -136,6 +140,7 @@ impl WorkerStart {
             workspace_lease_id: None,
             workspace: None,
             workspace_mode: ChildWriteMode::default(),
+            inherited_sandbox: None,
             cancellation: CancellationToken::new(),
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
@@ -162,6 +167,16 @@ impl WorkerStart {
 
     pub fn with_workspace_mode(mut self, workspace_mode: ChildWriteMode) -> Self {
         self.workspace_mode = workspace_mode;
+        self
+    }
+
+    pub fn with_inherited_sandbox(mut self, inherited_sandbox: InheritedSandbox) -> Self {
+        self.inherited_sandbox = Some(inherited_sandbox);
+        self
+    }
+
+    pub fn maybe_with_inherited_sandbox(mut self, value: Option<InheritedSandbox>) -> Self {
+        self.inherited_sandbox = value;
         self
     }
 

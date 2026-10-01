@@ -31,7 +31,15 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let _trace_guard = tracing_init::init(cli.debug);
+
+    // Completion scripts are pure stdout. Skip tracing for them so no log or
+    // warning line can ever pollute the script a user redirects into their
+    // shell config.
+    let _trace_guard = if matches!(cli.command, Some(Command::Completions { .. })) {
+        None
+    } else {
+        Some(tracing_init::init(cli.debug))
+    };
 
     match cli.command {
         Some(Command::Web { ref host, ref port }) => {
@@ -64,6 +72,7 @@ fn main() -> Result<()> {
             let listen = listen.clone();
             run_app_server(cli, &listen)
         }
+        Some(Command::Completions { shell }) => print_completion(shell),
         None => run_agent(cli),
     }
 }
@@ -74,6 +83,16 @@ fn ensure_stdio_listen(listen: &str) -> Result<()> {
     if listen != "stdio://" {
         anyhow::bail!("unsupported app-server transport `{listen}`: only `stdio://` is supported");
     }
+    Ok(())
+}
+
+/// Emit a clap-generated shell completion script for `shell` on stdout.
+///
+/// The registered name is the binary name the script completes, not the clap
+/// `name` attribute, so `yi-agent <TAB>` is what a shell expands.
+fn print_completion(shell: clap_complete::Shell) -> Result<()> {
+    let mut command = <Cli as clap::CommandFactory>::command();
+    clap_complete::generate(shell, &mut command, "yi-agent", &mut std::io::stdout());
     Ok(())
 }
 
@@ -594,10 +613,16 @@ fn build_headless_root_tools(
     let setup =
         build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
     let mut registry = (*setup.tools).clone();
+    let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
+    let delegation_controller = yi_agent_tools::SandboxController::new(
+        yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+        config.sandbox,
+        config.sandbox_promotable,
+    );
     crate::tui::subagents::register_attached_root_tools(
         &mut registry,
-        runtime_socket,
-        attached_root,
+        binding,
+        delegation_controller,
     );
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
@@ -699,10 +724,16 @@ fn build_tui_root_tools(
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
+    let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
+    let delegation_controller = yi_agent_tools::SandboxController::new(
+        yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+        config.sandbox,
+        config.sandbox_promotable,
+    );
     crate::tui::subagents::register_attached_root_tools(
         &mut registry,
-        runtime_socket,
-        attached_root,
+        binding,
+        delegation_controller,
     );
     registry
 }
@@ -787,31 +818,9 @@ fn runtime_attached_root_rejection(response: &yi_agent_store::ipc::IpcResponse) 
 /// including a `Stop` that could not be delivered, because that daemon is not
 /// ours to replace.
 fn replace_wedged_daemon(socket_path: &std::path::Path) -> bool {
-    let wedged = matches!(
-        yi_agent_store::ipc::send_request(socket_path, yi_agent_store::ipc::IpcRequest::Status),
-        Ok(yi_agent_store::ipc::IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::Internal,
-            ..
-        })
-    );
-    if !wedged {
-        return false;
-    }
-    tracing::warn!(
-        socket = %socket_path.display(),
-        "local runtime answered `internal`; retiring it so this session can start a working one"
-    );
-    match yi_agent_store::ipc::send_request(socket_path, yi_agent_store::ipc::IpcRequest::Stop) {
-        Ok(yi_agent_store::ipc::IpcResponse::Stopping) => true,
-        other => {
-            tracing::warn!(
-                socket = %socket_path.display(),
-                response = ?other,
-                "could not retire the wedged runtime; leaving it in place"
-            );
-            false
-        }
-    }
+    // One rule, shared with the desktop's self-heal: retire only a daemon that
+    // answers `internal`, and only when it accepts the `Stop`.
+    yi_agent_subagent::attach::retire_if_wedged(socket_path)
 }
 
 /// Builds the notice emitted when subagent-runtime bring-up fails after the

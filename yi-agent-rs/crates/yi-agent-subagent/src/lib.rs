@@ -6,6 +6,7 @@
 //! both build their runtime wiring here rather than each keeping a copy.
 
 pub mod attach;
+pub mod binding;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -132,13 +133,17 @@ impl DaemonAgentWorkerFactory {
         &self,
         workspace: &WorkerWorkspace,
         workspace_mode: ChildWriteMode,
+        inherited: Option<yi_agent_core::InheritedSandbox>,
     ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
         let (sandbox, writable_roots) = match workspace_mode {
             ChildWriteMode::Coding => {
                 let mut writable_roots = vec![workspace.path.clone()];
                 writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
-                (self.sandbox, writable_roots)
+                (
+                    resolve_effective_sandbox(self.sandbox, inherited),
+                    writable_roots,
+                )
             }
             ChildWriteMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
@@ -531,7 +536,17 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             });
         };
         let workspace_mode = request.workspace_mode;
-        let worker_tools = Arc::new(self.worker_tool_registry(&workspace, workspace_mode));
+        let effective_sandbox = match workspace_mode {
+            ChildWriteMode::Coding => {
+                resolve_effective_sandbox(self.sandbox, request.inherited_sandbox)
+            }
+            ChildWriteMode::ReadOnly => yi_agent_tools::SandboxMode::ReadOnly,
+        };
+        let worker_tools = Arc::new(self.worker_tool_registry(
+            &workspace,
+            workspace_mode,
+            request.inherited_sandbox,
+        ));
         let mut config = self.config.clone();
         config.model = self.worker_config_model(&request.model);
         if let Some(catalog) = &self.catalog {
@@ -558,41 +573,40 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             let mut mailbox = handle.subscribe_messages();
             let mut pause = handle.subscribe_pause();
             let mut worker_tools = (*worker_tools).clone();
-            worker_tools.register(Arc::new(DaemonSpawnAgentTool {
-                runtime_socket: runtime_socket.clone(),
-                session_id: request.root_session_id.to_string(),
-                caller_task_id: request.task_id.to_string(),
-            }));
-            worker_tools.register(Arc::new(DaemonSendMessageTool {
-                runtime_socket: runtime_socket.clone(),
-                session_id: request.root_session_id.to_string(),
-                caller_task_id: request.task_id.to_string(),
-                worker_capability: request.message_capability.clone(),
-            }));
-            worker_tools.register(Arc::new(DaemonWaitAgentTool {
-                runtime_socket: runtime_socket.clone(),
-                session_id: request.root_session_id.to_string(),
-                caller_task_id: request.task_id.to_string(),
-                caller_capability: request.message_capability.clone(),
-            }));
-            worker_tools.register(Arc::new(DaemonInspectAgentTool {
-                runtime_socket: runtime_socket.clone(),
-                session_id: request.root_session_id.to_string(),
-                caller_task_id: request.task_id.to_string(),
-                caller_capability: request.message_capability.clone(),
-            }));
-            worker_tools.register(Arc::new(DaemonCancelAgentTool {
-                runtime_socket: runtime_socket.clone(),
-                session_id: request.root_session_id.to_string(),
-                caller_task_id: request.task_id.to_string(),
-                caller_capability: request.message_capability.clone(),
-            }));
-            worker_tools.register(Arc::new(DaemonReviewAgentTool {
-                runtime_socket: runtime_socket.clone(),
-                session_id: request.root_session_id.to_string(),
-                caller_task_id: request.task_id.to_string(),
-                caller_capability: request.message_capability.clone(),
-            }));
+            // A worker is a short-lived child of the daemon that admitted it, so
+            // nothing can replace that daemon underneath it: a fixed binding keeps
+            // today's behaviour -- one frozen socket and root for the worker's life.
+            let worker_binding =
+                crate::binding::RuntimeBinding::fixed(crate::binding::RuntimeHandle {
+                    socket_path: runtime_socket.clone(),
+                    workspace_root: workspace.path.clone(),
+                    session_id: request.root_session_id.to_string(),
+                    task_id: request.task_id.to_string(),
+                    capability: request.message_capability.clone(),
+                });
+            for tool in [
+                Arc::new(DaemonSpawnAgentTool {
+                    binding: Arc::clone(&worker_binding),
+                    sandbox: effective_sandbox,
+                }) as Arc<dyn Tool>,
+                Arc::new(DaemonSendMessageTool {
+                    binding: Arc::clone(&worker_binding),
+                }),
+                Arc::new(DaemonWaitAgentTool {
+                    binding: Arc::clone(&worker_binding),
+                }),
+                Arc::new(DaemonInspectAgentTool {
+                    binding: Arc::clone(&worker_binding),
+                }),
+                Arc::new(DaemonCancelAgentTool {
+                    binding: Arc::clone(&worker_binding),
+                }),
+                Arc::new(DaemonReviewAgentTool {
+                    binding: Arc::clone(&worker_binding),
+                }),
+            ] {
+                worker_tools.register(tool);
+            }
             let worker_tools = Arc::new(worker_tools);
             std::thread::Builder::new()
                 .name("yi-agent-subagent-worker".into())
@@ -924,6 +938,40 @@ fn is_empty_delivery_error(error: &WorkerError) -> bool {
         .contains("child delivery has no commits beyond")
 }
 
+fn sandbox_mode_from(inherited: yi_agent_core::InheritedSandbox) -> yi_agent_tools::SandboxMode {
+    use yi_agent_core::InheritedSandbox;
+    use yi_agent_tools::SandboxMode;
+    match inherited {
+        InheritedSandbox::ReadOnly => SandboxMode::ReadOnly,
+        InheritedSandbox::WorkspaceWrite => SandboxMode::WorkspaceWrite,
+        InheritedSandbox::DangerFullAccess => SandboxMode::DangerFullAccess,
+    }
+}
+
+/// Coding children clamp up to at least `WorkspaceWrite` so they can always
+/// write their worktree and commit; a `ReadOnly` inheritance cannot make a
+/// coding child unable to deliver.
+fn resolve_effective_sandbox(
+    base: yi_agent_tools::SandboxMode,
+    inherited: Option<yi_agent_core::InheritedSandbox>,
+) -> yi_agent_tools::SandboxMode {
+    use yi_agent_tools::SandboxMode;
+    let target = inherited.map(sandbox_mode_from).unwrap_or(base);
+    match target {
+        SandboxMode::ReadOnly => SandboxMode::WorkspaceWrite,
+        other => other,
+    }
+}
+
+fn sandbox_mode_str(mode: yi_agent_tools::SandboxMode) -> &'static str {
+    use yi_agent_tools::SandboxMode;
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::WorkspaceWrite => "workspace-write",
+        SandboxMode::DangerFullAccess => "danger-full-access",
+    }
+}
+
 fn git_writable_roots_for_worktree(workspace: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(git_dir) = git_dir_for_worktree(workspace) {
@@ -1071,17 +1119,11 @@ fn validate_recovery_context(
 }
 
 struct DaemonApplicationSendMessageTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    application_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
 }
 
 struct DaemonSendMessageTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    worker_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
 }
 
 #[async_trait]
@@ -1116,14 +1158,15 @@ impl Tool for DaemonApplicationSendMessageTool {
         if message.trim().is_empty() {
             return ToolResult::error("message must be non-empty");
         }
-        match yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
-                session_id: self.session_id.clone(),
-                sender_task_id: self.caller_task_id.clone(),
-                capability: self.application_capability.clone(),
-                recipient_task_id: recipient.to_owned(),
-                message: message.to_owned(),
+        let recipient = recipient.to_owned();
+        let message = message.to_owned();
+        match self.binding.send(
+            |h| yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
+                session_id: h.session_id.clone(),
+                sender_task_id: h.task_id.clone(),
+                capability: h.capability.clone(),
+                recipient_task_id: recipient.clone(),
+                message: message.clone(),
             },
         ) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
@@ -1170,16 +1213,17 @@ impl Tool for DaemonSendMessageTool {
         if message.trim().is_empty() {
             return ToolResult::error("message must be non-empty");
         }
-        match yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::SendMessage {
-                session_id: self.session_id.clone(),
-                sender_task_id: self.caller_task_id.clone(),
-                worker_capability: self.worker_capability.clone(),
-                recipient_task_id: recipient.to_owned(),
-                message: message.to_owned(),
-            },
-        ) {
+        let recipient = recipient.to_owned();
+        let message = message.to_owned();
+        match self
+            .binding
+            .send(|h| yi_agent_store::ipc::IpcRequest::SendMessage {
+                session_id: h.session_id.clone(),
+                sender_task_id: h.task_id.clone(),
+                worker_capability: h.capability.clone(),
+                recipient_task_id: recipient.clone(),
+                message: message.clone(),
+            }) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
@@ -1204,10 +1248,10 @@ pub struct AttachedRoot {
 /// Adds the six delegation tools to a root agent's registry.
 pub fn register_attached_root_tools(
     registry: &mut ToolRegistry,
-    runtime_socket: PathBuf,
-    root: &AttachedRoot,
+    binding: Arc<crate::binding::RuntimeBinding>,
+    controller: yi_agent_tools::SandboxController,
 ) {
-    register_attached_root_tools_in_thread(registry, runtime_socket, root, None);
+    register_attached_root_tools_in_thread(registry, binding, controller, None);
 }
 
 /// Register the delegation tools with a conversation marker.
@@ -1219,81 +1263,46 @@ pub fn register_attached_root_tools(
 /// through them is tagged with the conversation that asked for it.
 pub fn register_attached_root_tools_in_thread(
     registry: &mut ToolRegistry,
-    runtime_socket: PathBuf,
-    root: &AttachedRoot,
+    binding: Arc<crate::binding::RuntimeBinding>,
+    controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
 ) {
-    register_application_subagent_tools_in_thread(
-        registry,
-        runtime_socket,
-        root.session_id.clone(),
-        root.task_id.clone(),
-        root.capability.clone(),
-        thread_id,
-    );
+    register_application_subagent_tools_in_thread(registry, binding, controller, thread_id);
 }
 
 pub fn register_application_subagent_tools(
     registry: &mut ToolRegistry,
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    application_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
+    controller: yi_agent_tools::SandboxController,
 ) {
-    register_application_subagent_tools_in_thread(
-        registry,
-        runtime_socket,
-        session_id,
-        caller_task_id,
-        application_capability,
-        None,
-    );
+    register_application_subagent_tools_in_thread(registry, binding, controller, None);
 }
 
 pub fn register_application_subagent_tools_in_thread(
     registry: &mut ToolRegistry,
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    application_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
+    controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
 ) {
     registry.register(Arc::new(DaemonApplicationSpawnAgentTool {
-        runtime_socket: runtime_socket.clone(),
-        session_id: session_id.clone(),
-        caller_task_id: caller_task_id.clone(),
-        application_capability: application_capability.clone(),
-        thread_id: thread_id.clone(),
+        binding: Arc::clone(&binding),
+        controller,
+        thread_id,
     }));
     registry.register(Arc::new(DaemonApplicationSendMessageTool {
-        runtime_socket: runtime_socket.clone(),
-        session_id: session_id.clone(),
-        caller_task_id: caller_task_id.clone(),
-        application_capability: application_capability.clone(),
+        binding: Arc::clone(&binding),
     }));
     registry.register(Arc::new(DaemonWaitAgentTool {
-        runtime_socket: runtime_socket.clone(),
-        session_id: session_id.clone(),
-        caller_task_id: caller_task_id.clone(),
-        caller_capability: application_capability.clone(),
+        binding: Arc::clone(&binding),
     }));
     registry.register(Arc::new(DaemonInspectAgentTool {
-        runtime_socket: runtime_socket.clone(),
-        session_id: session_id.clone(),
-        caller_task_id: caller_task_id.clone(),
-        caller_capability: application_capability.clone(),
+        binding: Arc::clone(&binding),
     }));
     registry.register(Arc::new(DaemonCancelAgentTool {
-        runtime_socket: runtime_socket.clone(),
-        session_id: session_id.clone(),
-        caller_task_id: caller_task_id.clone(),
-        caller_capability: application_capability.clone(),
+        binding: Arc::clone(&binding),
     }));
     registry.register(Arc::new(DaemonReviewAgentTool {
-        runtime_socket,
-        session_id,
-        caller_task_id,
-        caller_capability: application_capability,
+        binding: Arc::clone(&binding),
     }));
 }
 
@@ -1348,20 +1357,30 @@ fn spawn_model(args: &Value) -> Result<Option<String>, ToolResult> {
     }
 }
 
+/// The `sandbox` IPC field for a spawn: only a coding child inherits the
+/// caller's effective sandbox; a read-only child carries nothing.
+fn spawn_sandbox(
+    args: &Value,
+    effective: yi_agent_tools::SandboxMode,
+) -> Result<Option<String>, ToolResult> {
+    match spawn_mode(args)? {
+        ChildWriteMode::Coding => Ok(Some(sandbox_mode_str(effective).to_string())),
+        ChildWriteMode::ReadOnly => Ok(None),
+    }
+}
+
 struct DaemonSpawnAgentTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
+    sandbox: yi_agent_tools::SandboxMode,
 }
 
 struct DaemonApplicationSpawnAgentTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    application_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
+    controller: yi_agent_tools::SandboxController,
     /// The conversation this tool belongs to, captured at assembly time. Every
     /// child it spawns is tagged with it so a client can scope children to the
-    /// conversation that asked for them.
+    /// conversation that asked for them. An older caller leaves it `None` and
+    /// the daemon inherits the parent task's marker instead.
     thread_id: Option<String>,
 }
 
@@ -1376,31 +1395,19 @@ fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
 }
 
 struct DaemonInspectAgentTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    caller_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
 }
 
 struct DaemonCancelAgentTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    caller_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
 }
 
 struct DaemonReviewAgentTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    caller_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
 }
 
 struct DaemonWaitAgentTool {
-    runtime_socket: PathBuf,
-    session_id: String,
-    caller_task_id: String,
-    caller_capability: String,
+    binding: Arc<crate::binding::RuntimeBinding>,
 }
 
 #[async_trait]
@@ -1456,19 +1463,26 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(workdir) => workdir,
             Err(error) => return error,
         };
-        let response = yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-                session_id: self.session_id.clone(),
-                parent_task_id: self.caller_task_id.clone(),
-                capability: self.application_capability.clone(),
-                objective: task.to_string(),
-                mode: Some(mode.as_str().to_string()),
-                model,
-                workdir,
-                thread_id: self.thread_id.clone(),
-            },
-        );
+        let sandbox = match spawn_sandbox(&args, self.controller.effective()) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return error,
+        };
+        let mode = mode.as_str().to_string();
+        let objective = task.to_string();
+        let thread_id = self.thread_id.clone();
+        let response =
+            self.binding
+                .send(|h| yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                    session_id: h.session_id.clone(),
+                    parent_task_id: h.task_id.clone(),
+                    capability: h.capability.clone(),
+                    objective: objective.clone(),
+                    mode: Some(mode.clone()),
+                    model: model.clone(),
+                    workdir: workdir.clone(),
+                    thread_id: thread_id.clone(),
+                    sandbox: sandbox.clone(),
+                });
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
@@ -1516,15 +1530,15 @@ impl Tool for DaemonInspectAgentTool {
             .get("include_diff")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let response = yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::InspectChild {
-                session_id: self.session_id.clone(),
-                caller_task_id: self.caller_task_id.clone(),
-                capability: self.caller_capability.clone(),
-                task_id: task_id.to_owned(),
-            },
-        );
+        let task_id = task_id.to_owned();
+        let response = self
+            .binding
+            .send(|h| yi_agent_store::ipc::IpcRequest::InspectChild {
+                session_id: h.session_id.clone(),
+                caller_task_id: h.task_id.clone(),
+                capability: h.capability.clone(),
+                task_id: task_id.clone(),
+            });
         let detail = match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskDetail(detail)) => detail,
             Ok(other) => return ToolResult::error(format_ipc_rejection("inspect request", &other)),
@@ -1539,12 +1553,11 @@ impl Tool for DaemonInspectAgentTool {
             "report": report,
         });
         if include_diff {
-            let diff = yi_agent_store::ipc::send_request(
-                &self.runtime_socket,
-                yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
-                    task_id: task_id.to_owned(),
-                },
-            );
+            let diff = self
+                .binding
+                .send(|_| yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+                    task_id: task_id.clone(),
+                });
             if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { diff, .. }) = diff {
                 payload["diff"] = json!(diff);
             }
@@ -1590,16 +1603,16 @@ impl Tool for DaemonCancelAgentTool {
             .get("recursive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let response = yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::CancelChild {
-                session_id: self.session_id.clone(),
-                caller_task_id: self.caller_task_id.clone(),
-                capability: self.caller_capability.clone(),
-                task_id: task_id.to_owned(),
+        let task_id = task_id.to_owned();
+        let response = self
+            .binding
+            .send(|h| yi_agent_store::ipc::IpcRequest::CancelChild {
+                session_id: h.session_id.clone(),
+                caller_task_id: h.task_id.clone(),
+                capability: h.capability.clone(),
+                task_id: task_id.clone(),
                 recursive,
-            },
-        );
+            });
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskCancelled) => {
                 ToolResult::text(json!({ "task_id": task_id, "status": "cancelled" }).to_string())
@@ -1664,16 +1677,16 @@ impl Tool for DaemonReviewAgentTool {
             }
             None => return ToolResult::error("decision is required"),
         };
-        let response = yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::ReviewChild {
-                session_id: self.session_id.clone(),
-                caller_task_id: self.caller_task_id.clone(),
-                capability: self.caller_capability.clone(),
-                task_id: task_id.to_owned(),
-                decision,
-            },
-        );
+        let task_id = task_id.to_owned();
+        let response = self
+            .binding
+            .send(|h| yi_agent_store::ipc::IpcRequest::ReviewChild {
+                session_id: h.session_id.clone(),
+                caller_task_id: h.task_id.clone(),
+                capability: h.capability.clone(),
+                task_id: task_id.clone(),
+                decision: decision.clone(),
+            });
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::ChildReviewAccepted) => ToolResult::text(
                 json!({ "task_id": task_id, "status": "review_recorded" }).to_string(),
@@ -1710,16 +1723,16 @@ impl Tool for DaemonWaitAgentTool {
         if !matches!(mode, "one" | "any" | "all") {
             return ToolResult::error("mode must be one, any, or all");
         }
-        let response = yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::WaitAgent {
-                session_id: self.session_id.clone(),
-                caller_task_id: self.caller_task_id.clone(),
-                capability: self.caller_capability.clone(),
-                mode: mode.to_owned(),
+        let mode = mode.to_owned();
+        let response = self
+            .binding
+            .send(|h| yi_agent_store::ipc::IpcRequest::WaitAgent {
+                session_id: h.session_id.clone(),
+                caller_task_id: h.task_id.clone(),
+                capability: h.capability.clone(),
+                mode: mode.clone(),
                 timeout_ms: Some(TUI_WAIT_AGENT_TIMEOUT_MS),
-            },
-        );
+            });
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::WaitCompleted {
                 status,
@@ -1787,17 +1800,23 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(workdir) => workdir,
             Err(error) => return error,
         };
-        let response = yi_agent_store::ipc::send_request(
-            &self.runtime_socket,
-            yi_agent_store::ipc::IpcRequest::SpawnChild {
-                session_id: self.session_id.clone(),
-                parent_task_id: self.caller_task_id.clone(),
-                objective: task.to_string(),
-                mode: Some(mode.as_str().to_string()),
-                model,
-                workdir,
-            },
-        );
+        let sandbox = match spawn_sandbox(&args, self.sandbox) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return error,
+        };
+        let mode = mode.as_str().to_string();
+        let objective = task.to_string();
+        let response = self
+            .binding
+            .send(|h| yi_agent_store::ipc::IpcRequest::SpawnChild {
+                session_id: h.session_id.clone(),
+                parent_task_id: h.task_id.clone(),
+                objective: objective.clone(),
+                mode: Some(mode.clone()),
+                model: model.clone(),
+                workdir: workdir.clone(),
+                sandbox: sandbox.clone(),
+            });
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
@@ -1810,6 +1829,54 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
+    /// The whole point of the binding refactor: the six application delegation
+    /// tools share one live binding instead of freezing their own socket.
+    #[test]
+    fn application_tools_share_one_binding() {
+        let binding = test_binding(
+            PathBuf::from("/tmp/unused.sock"),
+            "s".into(),
+            "t".into(),
+            "c".into(),
+        );
+        let mut registry = ToolRegistry::new();
+        register_attached_root_tools(
+            &mut registry,
+            binding,
+            yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                false,
+            ),
+        );
+        for name in [
+            "spawn_agent",
+            "wait_agent",
+            "send_message",
+            "inspect_agent",
+            "cancel_agent",
+            "review_agent",
+        ] {
+            assert!(registry.get(name).is_some(), "{name} must be registered");
+        }
+    }
+
+    /// A fixed binding over literals, for tools exercised without a live daemon.
+    fn test_binding(
+        socket: PathBuf,
+        session: String,
+        task: String,
+        capability: String,
+    ) -> Arc<crate::binding::RuntimeBinding> {
+        crate::binding::RuntimeBinding::fixed(crate::binding::RuntimeHandle {
+            socket_path: socket,
+            workspace_root: PathBuf::from("/tmp/unused-ws"),
+            session_id: session,
+            task_id: task,
+            capability,
+        })
+    }
+
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1910,10 +1977,12 @@ mod tests {
     #[tokio::test]
     async fn review_agent_validates_its_arguments_before_touching_the_daemon() {
         let tool = DaemonReviewAgentTool {
-            runtime_socket: PathBuf::from("/tmp/unused.sock"),
-            session_id: "s".into(),
-            caller_task_id: "c".into(),
-            caller_capability: "k".into(),
+            binding: test_binding(
+                PathBuf::from("/tmp/unused.sock"),
+                "s".into(),
+                "c".into(),
+                "k".into(),
+            ),
         };
         let uuid = "00000000-0000-0000-0000-000000000001";
         assert!(tool.call(json!({})).await.is_error, "task_id is required");
@@ -1946,10 +2015,12 @@ mod tests {
     #[tokio::test]
     async fn cancel_agent_requires_a_task_id_and_a_valid_uuid() {
         let tool = DaemonCancelAgentTool {
-            runtime_socket: PathBuf::from("/tmp/unused.sock"),
-            session_id: "s".into(),
-            caller_task_id: "c".into(),
-            caller_capability: "k".into(),
+            binding: test_binding(
+                PathBuf::from("/tmp/unused.sock"),
+                "s".into(),
+                "c".into(),
+                "k".into(),
+            ),
         };
         assert!(tool.call(json!({})).await.is_error, "task_id is required");
         assert!(
@@ -1963,10 +2034,12 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         let socket = directory.path().join("runtime.sock");
         let tool = DaemonInspectAgentTool {
-            runtime_socket: socket.clone(),
-            session_id: "session".into(),
-            caller_task_id: "caller".into(),
-            caller_capability: "capability".into(),
+            binding: test_binding(
+                socket.clone(),
+                "session".into(),
+                "caller".into(),
+                "capability".into(),
+            ),
         };
 
         let missing = tool.call(json!({})).await;
@@ -1982,10 +2055,12 @@ mod tests {
     #[test]
     fn inspect_agent_schema_defaults_include_diff_to_false() {
         let schema = DaemonInspectAgentTool {
-            runtime_socket: PathBuf::from("/tmp/unused.sock"),
-            session_id: "s".into(),
-            caller_task_id: "c".into(),
-            caller_capability: "k".into(),
+            binding: test_binding(
+                PathBuf::from("/tmp/unused.sock"),
+                "s".into(),
+                "c".into(),
+                "k".into(),
+            ),
         }
         .schema();
         assert_eq!(schema["properties"]["include_diff"]["default"], false);
@@ -2042,7 +2117,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingProvider {
+    pub(crate) struct RecordingProvider {
         requests: Mutex<Vec<ProviderRequest>>,
     }
 
@@ -2313,7 +2388,7 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
+        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -2434,7 +2509,7 @@ mod tests {
             base_commit: String::new(),
         };
 
-        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly);
+        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly, None);
         let read_only_names: Vec<_> = read_only
             .schemas()
             .into_iter()
@@ -2447,7 +2522,7 @@ mod tests {
             "read-only registry must omit write/edit, got {read_only_names:?}"
         );
 
-        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
+        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
         let coding_names: Vec<_> = coding
             .schemas()
             .into_iter()
@@ -3206,6 +3281,8 @@ mod tests {
                 objective: "Inspect the target".into(),
                 mode: None,
                 model: None,
+
+                sandbox: None,
             },
         )
         .unwrap()
@@ -3214,10 +3291,12 @@ mod tests {
         };
 
         let tool = DaemonSendMessageTool {
-            runtime_socket: daemon.socket_path().to_path_buf(),
-            session_id,
-            caller_task_id: child_task_id,
-            worker_capability: "forged".into(),
+            binding: test_binding(
+                daemon.socket_path().to_path_buf(),
+                session_id,
+                child_task_id,
+                "forged".into(),
+            ),
         };
         let result = tool
             .call(json!({
@@ -3255,6 +3334,8 @@ mod tests {
                 objective: "Inspect the target".into(),
                 mode: None,
                 model: None,
+
+                sandbox: None,
             },
         )
         .unwrap()
@@ -3285,10 +3366,12 @@ mod tests {
         .unwrap();
 
         let tool = DaemonWaitAgentTool {
-            runtime_socket: daemon.socket_path().to_path_buf(),
-            session_id,
-            caller_task_id: root_task_id,
-            caller_capability: "forged".into(),
+            binding: test_binding(
+                daemon.socket_path().to_path_buf(),
+                session_id,
+                root_task_id,
+                "forged".into(),
+            ),
         };
         let result = tool.call(json!({ "mode": "all" })).await;
 
@@ -3449,6 +3532,145 @@ mod tests {
                 note: "completed".into()
             }),
             "a clean completion must be labelled as such, got {facts:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_inheritance_tests {
+    use super::{
+        DaemonAgentWorkerFactory, resolve_effective_sandbox, sandbox_mode_str, spawn_sandbox,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+    use yi_agent_core::ToolRegistry;
+    use yi_agent_core::subagent::task::ChildWriteMode;
+    use yi_agent_core::subagent::worker::WorkerWorkspace;
+
+    fn factory_with_sandbox(mode: yi_agent_tools::SandboxMode) -> DaemonAgentWorkerFactory {
+        let dir = std::env::temp_dir();
+        DaemonAgentWorkerFactory::new(
+            Arc::new(crate::tests::RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+            dir.join("runtime.sock"),
+        )
+        .with_sandbox(mode, Vec::new())
+    }
+
+    fn workspace() -> WorkerWorkspace {
+        let dir = std::env::temp_dir();
+        WorkerWorkspace {
+            lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+            repository_root: dir.clone(),
+            path: dir,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        }
+    }
+
+    /// The user-facing contract: a coding child's registered `bash` sandbox is
+    /// its inherited value clamped up to at least workspace-write, and a
+    /// read-only child stays read-only regardless of inheritance.
+    #[test]
+    fn coding_child_bash_sandbox_tracks_the_inherited_value() {
+        use yi_agent_core::InheritedSandbox;
+        use yi_agent_tools::SandboxMode;
+
+        let factory = factory_with_sandbox(SandboxMode::WorkspaceWrite);
+        let workspace = workspace();
+
+        // Inheriting danger-full-access (the YOLO case) reaches the child bash.
+        let tools = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            Some(InheritedSandbox::DangerFullAccess),
+        );
+        assert_eq!(
+            tools.get("bash").unwrap().sandbox_mode(),
+            Some("danger-full-access")
+        );
+
+        // A read-only inheritance cannot stop a coding child from delivering:
+        // it is clamped up to workspace-write.
+        let tools = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            Some(InheritedSandbox::ReadOnly),
+        );
+        assert_eq!(
+            tools.get("bash").unwrap().sandbox_mode(),
+            Some("workspace-write")
+        );
+
+        // No inheritance: the factory's configured mode stands.
+        let tools = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        assert_eq!(
+            tools.get("bash").unwrap().sandbox_mode(),
+            Some("workspace-write")
+        );
+
+        // A read-only child ignores inheritance entirely.
+        let tools = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::ReadOnly,
+            Some(InheritedSandbox::DangerFullAccess),
+        );
+        assert_eq!(tools.get("bash").unwrap().sandbox_mode(), Some("read-only"));
+    }
+
+    #[test]
+    fn effective_sandbox_clamps_read_only_up_to_workspace_write() {
+        use yi_agent_core::InheritedSandbox;
+        use yi_agent_tools::SandboxMode;
+        assert_eq!(
+            resolve_effective_sandbox(
+                SandboxMode::WorkspaceWrite,
+                Some(InheritedSandbox::ReadOnly)
+            ),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            resolve_effective_sandbox(
+                SandboxMode::WorkspaceWrite,
+                Some(InheritedSandbox::DangerFullAccess)
+            ),
+            SandboxMode::DangerFullAccess
+        );
+        assert_eq!(
+            resolve_effective_sandbox(SandboxMode::WorkspaceWrite, None),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            resolve_effective_sandbox(
+                SandboxMode::DangerFullAccess,
+                Some(InheritedSandbox::WorkspaceWrite)
+            ),
+            SandboxMode::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn spawn_sandbox_only_carries_for_a_coding_child() {
+        use yi_agent_tools::SandboxMode;
+        assert_eq!(
+            spawn_sandbox(&json!({"mode": "coding"}), SandboxMode::DangerFullAccess).unwrap(),
+            Some("danger-full-access".to_string())
+        );
+        // Read-only children never carry a sandbox: the runtime pins them.
+        assert_eq!(
+            spawn_sandbox(&json!({"mode": "read_only"}), SandboxMode::DangerFullAccess).unwrap(),
+            None
+        );
+        // An omitted mode defaults to read-only, so no sandbox travels.
+        assert_eq!(
+            spawn_sandbox(&json!({}), SandboxMode::DangerFullAccess).unwrap(),
+            None
+        );
+        assert_eq!(
+            sandbox_mode_str(SandboxMode::WorkspaceWrite),
+            "workspace-write"
         );
     }
 }

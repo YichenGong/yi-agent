@@ -19,6 +19,11 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   sandbox、项目 workspace、per-child model）
 - daemon 客户端：`attach_project_runtime` / `activate_root` / `detach_root`
   （`AttachFailure` 带失败阶段，供降级路径记录）
+- 运行时的探活与归属决策：`probe_runtime`（只读 `Status` 判 `Healthy` / `Wedged` /
+  `Dead` / `Unknown`）、`ensure_owned_runtime`（策略 B：健康复用、死或卡死才接管）、
+  `retire_if_wedged`（只退休回 `internal` 的 daemon）
+- 活绑定 `RuntimeBinding`：工具不再把 socket 与 root 三元组冻结进自身，而是每次调用
+  解析当届句柄；连接失效（`is_liveness_error`）时单飞 `repair` 并重试一次
 - 六个委派工具的注册：`register_attached_root_tools`（application root 版）与
   `register_application_subagent_tools`
 - `AttachedRoot`（session id / root task id / capability / workspace）
@@ -47,6 +52,13 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   / `attach`）让降级路径能说清是哪一步断了；`project_runtime_directory` 的默认位置由本
   crate 的单测钉住（daemon、TUI、app-server 必须落在同一处）；验证：
   `cargo test -p yi-agent-subagent --test attach_delegation`
+- [x] 运行时归属与自愈原语 — `src/attach.rs` 的 `probe_runtime` / `ensure_owned_runtime` /
+  `retire_if_wedged`，与 `src/binding.rs` 的 `RuntimeBinding`（`managed` / `fixed`）：
+  委派工具持 `Arc<RuntimeBinding>`，每次调用经 `current_or_repair` 解析当届 socket 与
+  root，`send` 遇 liveness 失败时先 `repair`（单飞，避免并发起两个 daemon）再重试一次；
+  `activate` 走同一条通道。判据：启动该 runtime 的进程退出后，下一次委派调用仍能自愈。
+  `fixed` 绑定（TUI 整个会话自己持有 daemon）行为与过去完全一致。验证：
+  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent-app-server --lib a_dead_runtime_is_repaired`
 - [x] 端到端装配契约 — `tests/attach_delegation.rs`：干净 git 项目 attach → 激活两次
   （证明幂等）→ 注册的委派工具存在 → `SpawnApplicationChild` 被 daemon 接纳并返回
   child task id → detach；这是 TUI 与 app-server 共用的那条链路的可执行说明
@@ -57,4 +69,6 @@ git 目录原地成 root，`workspace_root == project_root`），真正需要仓
 app-server 侧的钉法是 `cargo test -p yi-agent-app-server
 a_non_git_cwd_attaches_in_place_with_the_delegation_tools`。
 
-**验证命令：** `cargo test -p yi-agent-subagent`（30 个单元测试 + 1 个集成测试）
+**验证命令：** `cargo test -p yi-agent-subagent`（含 `binding::` 单测与
+`application_tools_share_one_binding`；依赖真 socket 的 `probe_reports_healthy_on_status`
+需在可 bind Unix socket 的环境运行）

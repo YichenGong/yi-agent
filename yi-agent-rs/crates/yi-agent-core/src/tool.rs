@@ -112,6 +112,13 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// The OS sandbox mode this tool currently enforces, when it runs commands
+    /// under one. `None` for tools that are not sandboxed (the default). Used
+    /// by tests to observe that a live YOLO switch drives the effective mode.
+    fn sandbox_mode(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Streaming variant. Default implementation just calls `call` with no stream events.
     /// Tools that produce incremental output should override this.
     async fn call_stream(

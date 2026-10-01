@@ -23,6 +23,8 @@ import type {
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
+import { renderHelp } from "./lib/slash";
+import { estimateCost, formatCost } from "./lib/pricing";
 
 /**
  * RPC rejections are `RpcError` objects, so `String(e)` would render
@@ -405,6 +407,81 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Run a slash command. Commands never reach the agent: their output is a
+   * `notice` on the current session, mirroring the TUI's Separator cells.
+   */
+  const onSlashCommand = async (name: string, args: string | null) => {
+    const id = store.currentId;
+    const c = clientRef.current;
+    if (!id || !c) return;
+    const view = store.view(id);
+    const session = view.session;
+    switch (name) {
+      case "help":
+        session.notice(renderHelp(args));
+        break;
+      case "cost": {
+        const u = session.usage;
+        if (!u) {
+          session.notice("暂无用量数据");
+          break;
+        }
+        const cost = estimateCost(u);
+        session.notice(
+          [
+            `model: ${u.model}`,
+            `input: ${u.input}  output: ${u.output}`,
+            `cache read: ${u.cacheRead}  cache write: ${u.cacheWrite}`,
+            `估算成本: ${formatCost(cost)}`,
+          ].join("\n"),
+        );
+        break;
+      }
+      case "model":
+        session.notice(`当前模型: ${view.info?.model ?? "未知"}`);
+        break;
+      case "config":
+        try {
+          const cfg = await c.request<Record<string, unknown>>("config/read", {});
+          session.notice(
+            Object.entries(cfg)
+              .map(([k, v]) => `${k}: ${String(v)}`)
+              .join("\n"),
+          );
+        } catch (e) {
+          session.notice(`读取配置失败: ${formatError(e)}`);
+        }
+        break;
+      case "clear":
+        try {
+          await c.request("thread/clear", { threadId: id });
+          session.reset();
+          session.notice("对话已清空");
+        } catch (e) {
+          // 失败绝不清界面:否则会出现"看着清了、服务端还记得"的假象。
+          session.notice(`清空失败: ${formatError(e)}`);
+        }
+        break;
+      case "compact":
+        try {
+          const r = await c.request<{ status?: string; error?: string }>("thread/compact", {
+            threadId: id,
+          });
+          if (r.status === "compacted") session.notice("对话已压缩");
+          else if (r.status === "not_reduced") session.notice("无需压缩：历史太短");
+          else session.notice(`压缩失败: ${r.error ?? "未知结果"}`);
+        } catch (e) {
+          session.notice(`压缩失败: ${formatError(e)}`);
+        }
+        break;
+      default:
+        session.notice(`未知命令: /${name}\n${renderHelp()}`);
+        break;
+    }
+    force((v) => v + 1);
+  };
+
   const send = async (text: string): Promise<boolean> => {
     const id = store.currentId;
     const c = clientRef.current;
@@ -516,6 +593,7 @@ export default function App() {
             onInterrupt={interrupt}
             mode={current?.mode ?? null}
             onModeChange={setThreadMode}
+            onSlashCommand={(name, args) => void onSlashCommand(name, args)}
           />
           {currentId && openSubagent && (
             <SubagentTrace

@@ -11,11 +11,11 @@ use yi_agent_core::subagent::task::{
 };
 use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionRequestId};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
-use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 12;
+const LATEST_SCHEMA_VERSION: i64 = 13;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -419,6 +419,7 @@ pub struct PersistedRecoveredTask {
     pub recovery_gated: bool,
     pub recovery_attested: bool,
     pub workspace_mode: ChildWriteMode,
+    pub inherited_sandbox: Option<InheritedSandbox>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -960,6 +961,7 @@ impl RuntimeRepository {
             // wrapper keeps the coding mode.
             ChildWriteMode::Coding,
             None,
+            None,
         )
     }
 
@@ -974,6 +976,7 @@ impl RuntimeRepository {
         objective: &str,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        inherited_sandbox: Option<InheritedSandbox>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
@@ -982,8 +985,8 @@ impl RuntimeRepository {
             params![root.to_string()],
         )?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model)
-             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, inherited_sandbox)
+             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6, ?7, ?8)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -992,6 +995,7 @@ impl RuntimeRepository {
                 delivery_json,
                 workspace_mode.as_str(),
                 model,
+                inherited_sandbox.map(|value| value.as_str()),
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -1050,6 +1054,9 @@ impl RuntimeRepository {
             // read-only child go through `create_child_task_with_attempt_and_objective`.
             ChildWriteMode::Coding,
             None,
+            // No conversation marker and no inherited sandbox: this legacy
+            // wrapper predates both.
+            None,
             None,
         )
     }
@@ -1068,12 +1075,13 @@ impl RuntimeRepository {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         thread_id: Option<&str>,
+        inherited_sandbox: Option<InheritedSandbox>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, thread_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, thread_id, inherited_sandbox)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -1085,6 +1093,7 @@ impl RuntimeRepository {
                 workspace_mode.as_str(),
                 model,
                 thread_id,
+                inherited_sandbox.map(|value| value.as_str()),
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -3537,6 +3546,31 @@ impl RuntimeRepository {
         }
     }
 
+    /// Reads a task's inherited sandbox. `None` means no inheritance was
+    /// recorded (old rows, or a task spawned before this feature).
+    pub fn task_inherited_sandbox(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<InheritedSandbox>, RepositoryError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT inherited_sandbox FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        match value {
+            Some(value) => InheritedSandbox::parse(&value).map(Some).ok_or_else(|| {
+                RepositoryError::UnknownEventKind {
+                    kind: format!("invalid inherited_sandbox in store: {value}"),
+                }
+            }),
+            None => Ok(None),
+        }
+    }
+
     pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT state FROM attempts WHERE id = ?1",
@@ -3626,7 +3660,7 @@ impl RuntimeRepository {
                      WHERE task_id = tasks.id AND state = 'active' AND resource_key LIKE 'worktree:%'
                      ORDER BY acquired_at DESC, id DESC LIMIT 1),
                     attempts.checkpoint_json, attempts.usage_json, tasks.state_json, tasks.delivery_json,
-                    tasks.workspace_mode
+                    tasks.workspace_mode, tasks.inherited_sandbox
              FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.state_json IN ('recovery_required', 'recovery_gated', 'recovery_attested')
              ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
@@ -3647,6 +3681,7 @@ impl RuntimeRepository {
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             })?
             .map(|row| {
@@ -3664,6 +3699,7 @@ impl RuntimeRepository {
                     task_state,
                     delivery_json,
                     workspace_mode,
+                    inherited_sandbox,
                 ) = row?;
                 Ok(PersistedRecoveredTask {
                     session_id: session_id.parse().map_err(|_| {
@@ -3714,6 +3750,16 @@ impl RuntimeRepository {
                             kind: format!("invalid workspace_mode in store: {workspace_mode}"),
                         }
                     })?,
+                    inherited_sandbox: inherited_sandbox
+                        .as_deref()
+                        .map(|value| {
+                            InheritedSandbox::parse(value).ok_or_else(|| {
+                                RepositoryError::UnknownEventKind {
+                                    kind: format!("invalid inherited_sandbox in store: {value}"),
+                                }
+                            })
+                        })
+                        .transpose()?,
                 })
             })
             .collect()
@@ -4680,6 +4726,28 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
 
     if current_version < 12 {
         let transaction = connection.unchecked_transaction()?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tasks')
+                WHERE name = 'inherited_sandbox'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // NULL means "no inheritance recorded": the worker factory falls
+            // back to its configured sandbox, preserving pre-change behavior.
+            transaction.execute_batch("ALTER TABLE tasks ADD COLUMN inherited_sandbox TEXT;")?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
+        transaction.commit()?;
+    }
+
+    // v13 rather than a widened v12: a database that already recorded v12 for
+    // the inherited sandbox would never re-run v12, so folding the trace table
+    // into it would leave those installations without `task_trace_events`.
+    if current_version < 13 {
+        let transaction = connection.unchecked_transaction()?;
         // A worker's trace lives apart from the audit `events` table: it is
         // high-volume, prunable observation data, not durable history.
         transaction.execute_batch(
@@ -4704,7 +4772,7 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             // every task that predates this column.
             transaction.execute_batch("ALTER TABLE tasks ADD COLUMN thread_id TEXT;")?;
         }
-        transaction.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
         transaction.commit()?;
     }
     Ok(())
@@ -4735,7 +4803,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_twelve_adds_the_trace_table_and_thread_id() {
+    fn schema_thirteen_adds_the_trace_table_and_thread_id() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("runtime.sqlite");
         let repository = RuntimeRepository::open(&path).unwrap();
@@ -4758,14 +4826,16 @@ mod tests {
             )
             .unwrap();
         assert!(has_thread_id);
-        assert_eq!(LATEST_SCHEMA_VERSION, 12);
+        assert_eq!(LATEST_SCHEMA_VERSION, 13);
     }
 
     #[test]
-    fn a_version_eleven_database_gains_the_trace_table_and_thread_id() {
+    fn a_version_twelve_database_gains_the_trace_table_and_thread_id() {
         // The fresh-open test above never exercises the upgrade an existing
-        // install performs, so roll a database back to exactly the v11 shape
-        // and reopen it.
+        // install performs, so roll a database back to exactly the v12 shape
+        // and reopen it. v12 is the shape a store already has once the
+        // inherited-sandbox migration has run, which is exactly the case that
+        // would break if the trace table had been folded into v12.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("runtime.sqlite");
         RuntimeRepository::open(&path).unwrap();
@@ -4774,13 +4844,13 @@ mod tests {
             .execute_batch(
                 "DROP TABLE task_trace_events;
                  ALTER TABLE tasks DROP COLUMN thread_id;
-                 DELETE FROM schema_migrations WHERE version = 12;",
+                 DELETE FROM schema_migrations WHERE version = 13;",
             )
             .unwrap();
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 12);
+        assert_eq!(repository.schema_version().unwrap(), 13);
         let connection = repository.connection_for_test();
         assert!(
             connection
@@ -4790,7 +4860,7 @@ mod tests {
                     |row| row.get::<_, bool>(0),
                 )
                 .unwrap(),
-            "a v11 database must gain the trace table"
+            "a v12 database must gain the trace table"
         );
         assert!(
             connection
@@ -4800,8 +4870,53 @@ mod tests {
                     |row| row.get::<_, bool>(0),
                 )
                 .unwrap(),
-            "a v11 database must gain tasks.thread_id"
+            "a v12 database must gain tasks.thread_id"
         );
+    }
+
+    #[test]
+    fn a_version_eleven_database_gains_both_later_migrations() {
+        // Renumbering the trace work to v13 must not strand a v11 database: it
+        // has neither the sandbox column nor the trace, so one open has to run
+        // both migrations in order.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_trace_events;
+                 ALTER TABLE tasks DROP COLUMN thread_id;
+                 ALTER TABLE tasks DROP COLUMN inherited_sandbox;
+                 DELETE FROM schema_migrations WHERE version IN (12, 13);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 13);
+        let connection = repository.connection_for_test();
+        for (probe, what) in [
+            (
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_trace_events')",
+                "the trace table",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id')",
+                "tasks.thread_id",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'inherited_sandbox')",
+                "tasks.inherited_sandbox",
+            ),
+        ] {
+            assert!(
+                connection
+                    .query_row(probe, [], |row| row.get::<_, bool>(0))
+                    .unwrap(),
+                "a v11 database must gain {what}"
+            );
+        }
     }
 
     /// Builds a `running` root task through the production insert path, so the

@@ -1057,8 +1057,10 @@ git commit -m "feat(desktop): add the superpowers board view and its settings sw
     `boardJsonPath(stateDir: string): string`
 
 > `board.json` 的形状由 Plan 1 的 `Board` 决定：
-> `{"cards":[{"id":..,"spec_path":..,"plan_path":..,"state":"Running","enqueued_at":..,"order":0,"workdir":"/x"}],"next_order":1}`。
-> `state` 是 serde 的变体名（`Queued`/`Running`/…），`workdir` 可能缺省。
+> `{"cards":[{"id":..,"spec_path":..,"plan_path":..,"state":"running","enqueued_at":..,"order":0,"workdir":"/x"}],"next_order":1}`。
+> **`state` 是 snake_case 的字符串**（`"queued"` / `"running"` / `"needs_you"` /
+> `"awaiting_merge"` / `"failed"` / `"done"` / `"paused"` / `"cancelled"`）——因为 Plan 1 的
+> `CardState` 带 `#[serde(rename_all = "snake_case")]`。`workdir` 可能缺省。
 > **两端对同一份文件的解析必须一致**，所以 Rust 与 TS 各有一组同构测试。
 
 - [ ] **Step 1: 写失败的测试**
@@ -1087,7 +1089,7 @@ fn cards_are_mapped_with_state_progress_and_detail() {
     let dir = tempfile::tempdir().unwrap();
     write_board(
         dir.path(),
-        r#"{"cards":[{"id":"card-1","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Running","enqueued_at":"2026-10-01T09:00:00+08:00","order":0,"workdir":"/w/card-1"}],"next_order":1}"#,
+        r#"{"cards":[{"id":"card-1","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"running","enqueued_at":"2026-10-01T09:00:00+08:00","order":0,"workdir":"/w/card-1"}],"next_order":1}"#,
     );
     let cards = load_cards(dir.path());
     assert_eq!(cards.len(), 1);
@@ -1101,7 +1103,7 @@ fn a_card_without_a_workdir_still_maps() {
     let dir = tempfile::tempdir().unwrap();
     write_board(
         dir.path(),
-        r#"{"cards":[{"id":"card-2","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":0}],"next_order":1}"#,
+        r#"{"cards":[{"id":"card-2","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":0}],"next_order":1}"#,
     );
     let cards = load_cards(dir.path());
     assert_eq!(cards.len(), 1);
@@ -1123,8 +1125,8 @@ fn cards_are_ordered_by_their_queue_order() {
     write_board(
         dir.path(),
         r#"{"cards":[
-            {"id":"b","spec_path":"b.spec.md","plan_path":"b.plan.md","state":"Queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":5},
-            {"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":1}
+            {"id":"b","spec_path":"b.spec.md","plan_path":"b.plan.md","state":"queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":5},
+            {"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T09:00:00+08:00","order":1}
         ],"next_order":6}"#,
     );
     let cards = load_cards(dir.path());
@@ -1241,7 +1243,8 @@ pub fn load_cards(state_dir: &Path) -> Vec<CardRow> {
         .into_iter()
         .map(|card| CardRow {
             id: card.id,
-            // 与 TS 侧保持同一约定：UI 展示小写状态名。
+            // 线格式已是 snake_case 小写（见 CardState 的 serde 属性），
+            // 这里归一化只为防御手写/异构的 board.json。
             state: card.state.to_ascii_lowercase(),
             progress: None,
             detail: card.workdir.unwrap_or(card.plan_path),

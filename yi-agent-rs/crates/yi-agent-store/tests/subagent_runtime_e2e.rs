@@ -471,6 +471,7 @@ fn spawn_child(
             mode: Some("coding".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap();
@@ -527,6 +528,7 @@ fn delivery_review_survives_restart_without_restarting_worker() {
             mode: Some("coding".into()),
             model: None,
             thread_id: None,
+            sandbox: None,
         },
     )
     .unwrap();

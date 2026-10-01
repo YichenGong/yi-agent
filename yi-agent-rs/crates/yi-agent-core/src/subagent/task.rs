@@ -467,6 +467,40 @@ impl Default for ChildWriteMode {
     }
 }
 
+/// The OS sandbox a task inherits from its parent at spawn time.
+///
+/// Lives in `core` so `yi-agent-store` (which does not depend on
+/// `yi-agent-tools`) can carry it across IPC as an opaque string and the
+/// `yi-agent-subagent` layer can resolve it into a `SandboxMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InheritedSandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl InheritedSandbox {
+    /// Kebab-case, matching `SandboxMode`'s `ValueEnum` names and the CLI
+    /// spellings (`--sandbox danger-full-access`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read-only" => Some(Self::ReadOnly),
+            "workspace-write" => Some(Self::WorkspaceWrite),
+            "danger-full-access" => Some(Self::DangerFullAccess),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTask {
     pub id: TaskId,
@@ -1682,5 +1716,28 @@ mod workspace_mode_tests {
             assert_eq!(ChildWriteMode::parse(mode.as_str()), Some(mode));
         }
         assert_eq!(ChildWriteMode::parse("writable"), None);
+    }
+}
+
+#[cfg(test)]
+mod inherited_sandbox_tests {
+    use super::InheritedSandbox;
+
+    #[test]
+    fn round_trips_every_variant() {
+        for variant in [
+            InheritedSandbox::ReadOnly,
+            InheritedSandbox::WorkspaceWrite,
+            InheritedSandbox::DangerFullAccess,
+        ] {
+            assert_eq!(InheritedSandbox::parse(variant.as_str()), Some(variant));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_snake_case_spellings() {
+        assert_eq!(InheritedSandbox::parse("read_only"), None);
+        assert_eq!(InheritedSandbox::parse("nope"), None);
+        assert_eq!(InheritedSandbox::parse(""), None);
     }
 }

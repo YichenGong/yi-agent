@@ -269,4 +269,30 @@ describe("Session", () => {
     expect(s.usage).toBeNull();
     expect(s.returnedInterjections).toEqual([]);
   });
+
+  describe("notices", () => {
+    it("appends a notice that is not an agent message", () => {
+      const s = new Session();
+      s.notice("对话已清空");
+      expect(s.items).toHaveLength(1);
+      const item = s.items[0];
+      expect(item.type).toBe("notice");
+      expect((item as { text: string }).text).toBe("对话已清空");
+    });
+
+    it("gives each notice a distinct id", () => {
+      const s = new Session();
+      s.notice("a");
+      s.notice("b");
+      const ids = s.items.map((i) => i.id);
+      expect(new Set(ids).size).toBe(2);
+    });
+
+    it("drops notices on reset", () => {
+      const s = new Session();
+      s.notice("x");
+      s.reset();
+      expect(s.items).toHaveLength(0);
+    });
+  });
 });

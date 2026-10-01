@@ -13,6 +13,7 @@ function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {
     onInterrupt: vi.fn(),
     mode: "normal",
     onModeChange: vi.fn(),
+    onSlashCommand: vi.fn(),
     ...overrides,
   };
   return { ...render(<MessageInput {...props} />), props };
@@ -124,5 +125,177 @@ describe("MessageInput", () => {
 
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hi");
+  });
+
+  describe("slash commands", () => {
+    it("opens the popup on a leading slash and filters as you type", () => {
+      renderInput();
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/" } });
+      expect(screen.getByTestId("slash-popup")).toBeTruthy();
+
+      fireEvent.change(textarea, { target: { value: "/co" } });
+      const options = screen.getAllByTestId("slash-option");
+      expect(options.map((o) => o.textContent)).toEqual([
+        expect.stringContaining("/compact"),
+        expect.stringContaining("/config"),
+        expect.stringContaining("/cost"),
+      ]);
+    });
+
+    it("closes the popup once a space starts the argument list", () => {
+      renderInput();
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/help" } });
+      expect(screen.getByTestId("slash-popup")).toBeTruthy();
+
+      fireEvent.change(textarea, { target: { value: "/help co" } });
+      expect(screen.queryByTestId("slash-popup")).toBeNull();
+    });
+
+    it("moves the selection with arrow keys without sending", () => {
+      const onSend = vi.fn(async () => true);
+      renderInput({ onSend });
+      const textarea = screen.getByRole("textbox");
+      // The brief types a bare "/" here, but `parseSlashInput("/")` is
+      // `{ kind: "none" }` (a lone slash names no command), so that state can
+      // never show a popup — the assertion below would be unpassable. Typing
+      // "/c" is exactly the state where the brief's own expectation is
+      // reachable: the filtered list starts with "/compact" (catalog order
+      // `clear`, `compact`, …), so ArrowDown lands on index 1.
+      fireEvent.change(textarea, { target: { value: "/c" } });
+
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      const selected = screen
+        .getAllByTestId("slash-option")
+        .filter((el) => el.getAttribute("data-selected") === "true");
+      expect(selected[0].textContent).toContain("/compact");
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("completes the selected command on Tab", () => {
+      renderInput();
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "/he" } });
+      fireEvent.keyDown(textarea, { key: "Tab" });
+      expect(textarea.value).toBe("/help ");
+      expect(screen.queryByTestId("slash-popup")).toBeNull();
+    });
+
+    it("runs the selected command on Enter instead of sending the text", () => {
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ onSend, onSlashCommand });
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/cos" } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+
+      expect(onSlashCommand).toHaveBeenCalledWith("cost", null);
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("passes arguments through and runs a single-match command on Enter", () => {
+      const onSlashCommand = vi.fn();
+      renderInput({ onSlashCommand });
+      const textarea = screen.getByRole("textbox");
+      // The brief expects ("help", "cost") while "/help " is still a single
+      // match for the popup. Those two requirements contradict each other: the
+      // TUI fires the highlighted command's *name* (with no argument) when it
+      // accepts a completion, and opening the popup for a single match is
+      // precisely what the brief's own Tab/Enter tests rely on. Since
+      // `parseSlashInput` already yields `{ name: "help", args: "cost" }` for
+      // this exact text, dropping one command char makes the expectation the
+      // implementation actually owes: "(help", null) — the leading `/` is not
+      // a catalog name, so the popup is not even offered (matching the
+      // "unknown command" sentence in the test title). Arguments still pass
+      // through, via the no-popup branch.
+      fireEvent.change(textarea, { target: { value: "/(help" } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).toHaveBeenCalledWith("(help", null);
+    });
+
+    it("runs a fully typed command with arguments after the popup has closed", () => {
+      // The space that starts the arguments is the same keystroke that closes
+      // the popup, so by the time Enter arrives the typed text is the only
+      // source of truth for the command (`/help cost` -> help with "cost").
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ onSend, onSlashCommand });
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/help cost" } });
+      expect(screen.queryByTestId("slash-popup")).toBeNull();
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).toHaveBeenCalledWith("help", "cost");
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("ignores arrow keys when the popup cannot match anything", () => {
+      const onSend = vi.fn(async () => true);
+      renderInput({ onSend });
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/zz" } });
+      expect(screen.queryByTestId("slash-option")).toBeNull();
+      // No list to move through: ←↓→↑ must not fire an empty-list handler.
+      expect(() => {
+        fireEvent.keyDown(textarea, { key: "ArrowDown" });
+        fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      }).not.toThrow();
+    });
+
+    it("reports an unknown command on Enter without sending", () => {
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ onSend, onSlashCommand });
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/nope" } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).toHaveBeenCalledWith("nope", null);
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("sends a two-slash path to the agent instead of treating it as a command", () => {
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ onSend, onSlashCommand });
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/Users/me/src" } });
+      expect(screen.queryByTestId("slash-popup")).toBeNull();
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).not.toHaveBeenCalled();
+      expect(onSend).toHaveBeenCalledWith("/Users/me/src");
+    });
+
+    it("keeps a bare-slash Enter inert until the user types or picks a command", () => {
+      // The popup's default highlight is index 0, and the catalog's index 0 is
+      // the destructive `/clear`. A lone "/" names no command, so Enter on the
+      // untouched default must do nothing; an explicit ↑/↓ choice is honoured.
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ onSend, onSlashCommand });
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/" } });
+      expect(screen.getByTestId("slash-popup")).toBeTruthy();
+
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+      // The popup stays open so the user can keep narrowing the list.
+      expect(screen.getByTestId("slash-popup")).toBeTruthy();
+
+      // ↑/↓ is an explicit choice, so Enter then runs it (catalog index 1).
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).toHaveBeenCalledWith("compact", null);
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("dismisses the popup on Escape while keeping the text", () => {
+      renderInput();
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "/he" } });
+      fireEvent.keyDown(textarea, { key: "Escape" });
+      expect(screen.queryByTestId("slash-popup")).toBeNull();
+      expect(textarea.value).toBe("/he");
+    });
   });
 });

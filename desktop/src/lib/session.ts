@@ -4,6 +4,17 @@ let localSeq = 0;
 const nextLocalId = () => `local-${++localSeq}`;
 
 /**
+ * A slash-command output line. Not part of the wire protocol: the app-server
+ * knows nothing about it. It mirrors the TUI's `HistoryCell::Separator`, which
+ * is how the TUI renders command output without pretending the agent said it.
+ */
+export interface NoticeItem {
+  type: "notice";
+  id: string;
+  text: string;
+}
+
+/**
  * Accumulates the client-side view of one app-server thread.
  *
  * `apply` folds each incoming notification into `items` / turn / usage state.
@@ -19,7 +30,7 @@ export class Session {
    * "这次追加没生效，请把它还给用户"。渲染层据此提示用户重新提交。
    */
   returnedInterjections: string[] = [];
-  items: Item[] = [];
+  items: (Item | NoticeItem)[] = [];
   turnActive = false;
   lastStatus: TurnStatus | null = null;
   lastError: string | null = null;
@@ -45,6 +56,11 @@ export class Session {
 
   addUserMessage(text: string): void {
     this.items.push({ type: "userMessage", id: nextLocalId(), text });
+  }
+
+  /** Append a command-output line (never sent to the agent). */
+  notice(text: string): void {
+    this.items.push({ type: "notice", id: nextLocalId(), text });
   }
 
   apply(notification: Notification): void {

@@ -25,7 +25,26 @@ pub enum RuntimeStartupIntent {
     AutoStart,
 }
 
+pub use yi_agent_subagent::binding::{RuntimeBinding, RuntimeHandle};
 pub use yi_agent_subagent::{AttachedRoot, register_attached_root_tools};
+
+/// A fixed binding for a runtime this process owns for the whole session.
+///
+/// The TUI starts (or joins) its daemon once at launch and keeps it for the
+/// session, so its tools need no repair plan: a fixed handle is exactly the old
+/// behaviour, expressed through the binding the delegation tools now take.
+pub fn root_binding(
+    socket_path: std::path::PathBuf,
+    attached_root: &AttachedRoot,
+) -> std::sync::Arc<RuntimeBinding> {
+    RuntimeBinding::fixed(RuntimeHandle {
+        socket_path,
+        workspace_root: attached_root.workspace.path.clone(),
+        session_id: attached_root.session_id.clone(),
+        task_id: attached_root.task_id.clone(),
+        capability: attached_root.capability.clone(),
+    })
+}
 
 /// The Chinese line shown when the runtime the user asked for (`y`, or a
 /// remembered `always`) could not be started or activated.
@@ -111,9 +130,38 @@ mod tests {
     }
 
     #[test]
+    fn tui_registers_delegation_tools_with_a_controller() {
+        use yi_agent_core::autonomy::YoloSwitch;
+        use yi_agent_tools::{SandboxController, SandboxMode};
+
+        // The controller the TUI passes is derived from the launch-time yolo
+        // switch; asserting its effective mode proves the wiring is live, and
+        // the `register_attached_root_tools` call below must compile with it.
+        let controller =
+            SandboxController::new(YoloSwitch::new(true), SandboxMode::WorkspaceWrite, true);
+        assert_eq!(controller.effective(), SandboxMode::DangerFullAccess);
+
+        let root = attached_root();
+        let binding = root_binding("/tmp/runtime.sock".into(), &root);
+        let mut registry = ToolRegistry::new();
+        register_attached_root_tools(&mut registry, binding, controller);
+        assert!(registry.names().contains(&"spawn_agent".to_string()));
+    }
+
+    #[test]
     fn attached_tui_root_exposes_subagent_tools_without_a_delegate_command() {
         let mut registry = ToolRegistry::new();
-        register_attached_root_tools(&mut registry, "/tmp/runtime.sock".into(), &attached_root());
+        let root = attached_root();
+        let binding = root_binding("/tmp/runtime.sock".into(), &root);
+        register_attached_root_tools(
+            &mut registry,
+            binding,
+            yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                false,
+            ),
+        );
         let names = registry
             .schemas()
             .into_iter()

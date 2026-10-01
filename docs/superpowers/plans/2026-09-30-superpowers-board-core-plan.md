@@ -478,7 +478,9 @@ mod tests {
     fn a_card_without_a_workdir_field_still_deserializes() {
         // 前向兼容：早期落盘的 board.json 没有 workdir 字段，读回时必须是 None，
         // 而不是整份状态解析失败。
-        let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"Queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],"next_order":1}"#;
+        // 注意：CardState 带 `#[serde(rename_all = "snake_case")]`（见 card.rs），
+        // 所以线格式里的状态值是 `"queued"`，不是 `"Queued"`。
+        let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],"next_order":1}"#;
         let board: Board = serde_json::from_str(json).unwrap();
         assert_eq!(board.get(&CardId::new("a")).unwrap().workdir, None);
     }
@@ -1093,7 +1095,7 @@ pub mod calendar;
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd plugins/superpowers-board && cargo test -p board-core calendar::`
-Expected: PASS（11 个测试）。
+Expected: PASS（12 个测试）。
 
 - [ ] **Step 5: 提交**
 
@@ -1254,7 +1256,7 @@ pub mod switch;
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd plugins/superpowers-board && cargo test -p board-core switch::`
-Expected: PASS（6 个测试）。
+Expected: PASS（8 个测试）。
 
 - [ ] **Step 5: 提交**
 
@@ -1429,7 +1431,7 @@ git commit -m "feat(board): validate spec/plan pairs before promotion"
 
 ## 完成判据
 
-- `cd plugins/superpowers-board && cargo test` 全绿（39 个测试：7 + 10 + 11 + 6 + 5）。
+- `cd plugins/superpowers-board && cargo test` 全绿（42 个测试：card 7 + board 10 + calendar 12 + switch 8 + promotion 5）。
 - `cargo clippy --all-targets -- -D warnings` 无警告。
 - `plugins/superpowers-board` **不在** `yi-agent-rs/Cargo.toml` 的 members 中（可独立编译）。
 - 内核四个模块各自职责单一，均无 I/O 副作用（`load_or_default` 是唯一的文件读取，且失败回退）。

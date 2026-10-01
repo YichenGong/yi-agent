@@ -313,6 +313,30 @@ impl ThreadStore {
         }
         Ok(existed)
     }
+
+    /// 清空一个 thread 的**对话记录**，保留它的身份。
+    ///
+    /// 只删 `.jsonl`，保留 `.meta.json`：thread 仍在 `list()` 里、仍能 `resume`
+    /// （回放为空），标题 / cwd / 权限模式不变。这是 `/clear` 的持久化语义——
+    /// 若只清内存而不删日志，`resume` 会把旧消息回放回来，用户以为清空了实则没有。
+    pub fn truncate(&self, id: &str) -> io::Result<bool> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        // 与 `delete` 一样持锁：避免与并发 `update_meta` 交错。
+        let _guard = self
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let log = self.log_path(id);
+        let existed = log.exists();
+        match std::fs::remove_file(&log) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(existed)
+    }
 }
 
 fn io_err(e: serde_json::Error) -> io::Error {
@@ -467,6 +491,40 @@ mod tests {
         let loaded = s.load("thread-a").unwrap().unwrap();
         assert_eq!(loaded.items.len(), 1);
         assert_eq!(loaded.messages, messages);
+    }
+
+    #[test]
+    fn truncate_drops_the_log_but_keeps_the_thread_identity() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn(
+            "thread-a",
+            &turn(
+                vec![Item::UserMessage {
+                    id: "user-turn-1".into(),
+                    text: "hi".into(),
+                }],
+                vec![Message::user("hi")],
+            ),
+        )
+        .unwrap();
+
+        let existed = s.truncate("thread-a").unwrap();
+        assert!(existed, "truncate must report the thread existed");
+        // 身份仍在（meta 保留 → list 仍能列出该 thread）。
+        assert!(s.exists("thread-a"), "meta must survive truncate");
+        assert_eq!(s.list().unwrap().len(), 1, "thread must stay listed");
+        // 但对话内容已清空。
+        let loaded = s.load("thread-a").unwrap().expect("thread must load");
+        assert!(loaded.messages.is_empty(), "messages must be dropped");
+        assert!(loaded.items.is_empty(), "items must be dropped");
+    }
+
+    #[test]
+    fn truncate_rejects_an_invalid_id() {
+        let (_d, s) = store();
+        let err = s.truncate("../escape").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
