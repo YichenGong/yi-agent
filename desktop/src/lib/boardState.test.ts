@@ -43,4 +43,35 @@ describe("parseBoard", () => {
     expect(parseBoard("{ not json")).toEqual([]);
     expect(parseBoard(JSON.stringify({ cards: [] }))).toEqual([]);
   });
+
+  it("returns nothing when the root is not an object", () => {
+    // Rust serde also rejects these; neither side may throw.
+    expect(parseBoard("null")).toEqual([]);
+    expect(parseBoard('"just a string"')).toEqual([]);
+    expect(parseBoard(JSON.stringify({ cards: {} }))).toEqual([]);
+  });
+
+  it("skips a bad card without dropping the good ones", () => {
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [
+          { id: "good", plan_path: "g.plan.md", state: "Queued", order: 0 },
+          { id: "missing-plan", state: "Queued", order: 1 },
+          { id: "", plan_path: "e.plan.md", state: "Queued", order: 2 },
+        ],
+        next_order: 3,
+      }),
+    );
+    expect(cards.map((card) => card.id)).toEqual(["good"]);
+  });
+
+  it("falls back to the plan path when the workdir is an empty string", () => {
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [{ id: "c", plan_path: "c.plan.md", state: "Queued", order: 0, workdir: "" }],
+        next_order: 1,
+      }),
+    );
+    expect(cards[0].detail).toBe("c.plan.md");
+  });
 });

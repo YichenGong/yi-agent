@@ -5,9 +5,13 @@ export function boardJsonPath(stateDir: string): string {
 }
 
 /**
- * Mirrors the Rust `yi_agent_board_ui::state::load_cards` mapping: queue order,
- * lowercased state, and `detail` falling back from workdir to the plan path.
- * Corrupt or unexpected input yields no cards rather than throwing.
+ * Mirrors the Rust `yi_agent_board_ui::state::load_cards` mapping line for line:
+ * a non-object root or non-array `cards` yields no cards, each card is validated
+ * individually (a card missing id / plan_path / state is skipped, the rest are
+ * kept), `state` is lowercased, `detail` falls back from workdir to the plan
+ * path (including when workdir is an empty string), and cards are sorted by
+ * `order` ascending with ties keeping file order. Corrupt or unexpected input
+ * yields no cards rather than throwing.
  */
 export function parseBoard(json: string): BoardCard[] {
   let parsed: unknown;
@@ -16,33 +20,30 @@ export function parseBoard(json: string): BoardCard[] {
   } catch {
     return [];
   }
+  if (typeof parsed !== "object" || parsed === null) return [];
   const cards = (parsed as { cards?: unknown }).cards;
   if (!Array.isArray(cards)) return [];
 
-  return cards
-    .filter((card): card is Record<string, unknown> => typeof card === "object" && card !== null)
-    .map((card) => ({
-      id: String(card.id ?? ""),
-      state: String(card.state ?? "").toLowerCase(),
-      progress: null,
-      detail: String(card.workdir ?? card.plan_path ?? ""),
-    }))
-    .filter((card) => card.id !== "")
-    .sort((left, right) => {
-      const leftOrder = orderOf(cards, left.id);
-      const rightOrder = orderOf(cards, right.id);
-      return leftOrder - rightOrder;
+  const mapped: Array<{ card: BoardCard; order: number }> = [];
+  for (const raw of cards) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const record = raw as Record<string, unknown>;
+    const id = typeof record.id === "string" ? record.id : "";
+    const planPath = typeof record.plan_path === "string" ? record.plan_path : "";
+    const state = typeof record.state === "string" ? record.state : "";
+    const workdir = typeof record.workdir === "string" ? record.workdir : "";
+    const order = typeof record.order === "number" ? record.order : 0;
+    if (id === "" || planPath === "" || state === "") continue;
+    mapped.push({
+      card: {
+        id,
+        state: state.toLowerCase(),
+        progress: null,
+        detail: workdir !== "" ? workdir : planPath,
+      },
+      order,
     });
-}
-
-function orderOf(cards: unknown[], id: string): number {
-  for (const card of cards) {
-    if (typeof card === "object" && card !== null) {
-      const record = card as Record<string, unknown>;
-      if (String(record.id ?? "") === id) {
-        return typeof record.order === "number" ? record.order : 0;
-      }
-    }
   }
-  return 0;
+
+  return mapped.sort((left, right) => left.order - right.order).map((entry) => entry.card);
 }
