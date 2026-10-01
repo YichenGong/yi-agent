@@ -21,6 +21,7 @@ import type {
   WorkspaceGroup,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
+import { formatError } from "./lib/errorMessage";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanCollapsedStrip } from "./components/SuperpowersKanbanCollapsedStrip";
@@ -41,14 +42,6 @@ import { estimateCost, formatCost } from "./lib/pricing";
  * `[object Object]`. Prefer the `message` field when present, falling back to
  * the default coercion for primitives and other shapes.
  */
-function formatError(e: unknown): string {
-  if (e && typeof e === "object" && "message" in e) {
-    const m = (e as { message?: unknown }).message;
-    if (typeof m === "string") return m;
-  }
-  return String(e);
-}
-
 /**
  * Read the persisted permission mode for a thread from the `thread/listAll`
  * groups. `thread/resume`/`thread/start` responses do not carry the mode, so it
