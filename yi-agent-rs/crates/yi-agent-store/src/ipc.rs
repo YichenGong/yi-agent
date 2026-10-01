@@ -239,6 +239,19 @@ pub enum IpcRequest {
         task_id: String,
         recursive: bool,
     },
+    /// Cancels every live child a conversation owns.
+    ///
+    /// A conversation shares one attached root with its directory siblings, so
+    /// routing a deletion through the root would cancel work belonging to the
+    /// other conversations. The conversation marker is the only thing that
+    /// separates their children, so this request takes the marker, not a task
+    /// id, and the daemon resolves the set itself. Confirmation is the caller's
+    /// own decision to delete: no preview token is required, unlike
+    /// `CancelTask`/`ConfirmCancel`.
+    CancelThreadTasks {
+        session_id: String,
+        thread_id: String,
+    },
     PreviewCancel {
         task_id: String,
         recursive: bool,
@@ -439,6 +452,13 @@ pub enum IpcResponse {
     },
     TaskStarted,
     TaskCancelled,
+    /// The children a conversation-scoped cancellation actually cancelled.
+    ///
+    /// An empty `task_ids` is a success, not an error: the conversation may
+    /// have finished everything already, and the caller is deleting anyway.
+    ThreadTasksCancelled {
+        task_ids: Vec<String>,
+    },
     CancelPreview {
         confirmation_token: String,
         task_ids: Vec<String>,
@@ -2983,6 +3003,16 @@ pub fn clear_plugin_sockets() {
     register_plugin_sockets(Vec::new());
 }
 
+/// The socket currently registered for `plugin`, if any.
+///
+/// The read side of the forwarding table. It exists so a caller can assert that
+/// a route is present (or gone) without issuing a request — the supervision
+/// contract says a stopped supervisor leaves no routes behind, and that has to
+/// be checkable from outside this module.
+pub fn plugin_socket_for(plugin: &str) -> Option<PathBuf> {
+    plugin_socket(plugin)
+}
+
 fn plugin_socket(plugin: &str) -> Option<PathBuf> {
     PLUGIN_SOCKETS
         .lock()
@@ -3266,6 +3296,23 @@ fn respond(
             Ok(IpcResponse::AutonomousSessionCreated {
                 session_id: created.session_id.to_string(),
                 root_task_id: created.root_task_id.to_string(),
+            })
+        }
+        IpcRequest::CancelThreadTasks {
+            session_id,
+            thread_id,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let cancelled = runtime
+                .block_on(coordinator.cancel_thread_tasks(&session_id, &thread_id))?
+                .into_iter()
+                .map(|task| task.to_string())
+                .collect();
+            Ok(IpcResponse::ThreadTasksCancelled {
+                task_ids: cancelled,
             })
         }
         IpcRequest::CancelTask { .. } => Ok(IpcResponse::Error {

@@ -4113,6 +4113,8 @@ dependencies = [
  "yi-agent-llm",
  "yi-agent-mcp",
  "yi-agent-skills",
+ "yi-agent-store",
+ "yi-agent-supervisors",
  "yi-agent-tools",
 ]
 
