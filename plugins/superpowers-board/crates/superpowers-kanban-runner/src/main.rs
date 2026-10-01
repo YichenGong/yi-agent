@@ -1,6 +1,6 @@
 //! Superpowers 看板插件进程入口。
 //!
-//! 用法：`superpowers-kanban --runtime-dir <dir> --state-dir <dir> [--project-root <dir>] [--interval-secs 60]`
+//! 用法：`superpowers-kanban run --runtime-dir <dir> --state-dir <dir> [--project-root <dir>] [--interval-secs 60]`
 //! 它只做一件事：周期性推进队列。安装 = 放这个二进制；卸载 = 删掉它。
 
 use std::path::PathBuf;
@@ -20,11 +20,28 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// Parsed from an explicit iterator so tests can drive it without a process.
+///
+/// The first token must be `run`: the binary is also meant to expose
+/// `add|list|on|off` later, so the daemon loop needs its own verb rather than
+/// being the implicit default.
+fn parse_args_from<I>(tokens: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut runtime_dir = None;
     let mut state_dir = None;
     let mut project_root = None;
     let mut interval_secs = 60_u64;
-    let mut args = std::env::args().skip(1);
+    let mut args = tokens.into_iter();
+    match args.next().as_deref() {
+        Some("run") => {}
+        Some(other) => return Err(format!("unknown subcommand: {other}")),
+        None => return Err("usage: superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]".to_string()),
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--runtime-dir" => runtime_dir = args.next().map(PathBuf::from),
@@ -150,6 +167,34 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_args_from;
+
+    /// `run` is required: without it the daemon loop would be the implicit
+    /// default and a future `add`/`list` verb could not be added safely.
+    #[test]
+    fn run_is_the_only_accepted_subcommand_for_the_daemon_loop() {
+        let ok = parse_args_from(
+            ["run", "--runtime-dir", "/r", "--state-dir", "/s"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+
+        let missing = parse_args_from(
+            ["--runtime-dir", "/r", "--state-dir", "/s"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert!(missing.is_err(), "a bare flag list must be refused");
+
+        let wrong = parse_args_from(
+            ["serve", "--runtime-dir", "/r", "--state-dir", "/s"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert!(wrong.is_err(), "an unknown subcommand must be refused");
+    }
+
     #[test]
     fn the_sample_calendar_expresses_the_three_and_ten_windows() {
         use superpowers_kanban_core::calendar::ConcurrencyCalendar;
