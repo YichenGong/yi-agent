@@ -30,6 +30,7 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         api_key: String::new(),
         model: "test-model".into(),
         max_turns: 4,
+        max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
         workdir: repo.to_path_buf(),
         system_prompt: None,
         compact_threshold: 160_000,

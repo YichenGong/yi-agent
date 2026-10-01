@@ -1996,6 +1996,7 @@ mod tests {
             api_key: "test-key".into(),
             model: "claude-sonnet-4-5".into(),
             max_turns: 50,
+            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             workdir: PathBuf::from("/tmp"),
             system_prompt: None,
             compact_threshold: 160_000,

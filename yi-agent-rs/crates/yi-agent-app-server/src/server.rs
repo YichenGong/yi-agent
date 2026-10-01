@@ -3400,6 +3400,7 @@ mod tests {
             api_key: String::new(),
             model: "test-model".to_string(),
             max_turns: 20,
+            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
             system_prompt: None,
             compact_threshold: 160_000,

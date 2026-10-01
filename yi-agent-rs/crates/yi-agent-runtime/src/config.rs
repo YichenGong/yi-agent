@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+/// Default resident subagent capacity, mirrored by
+/// `AgentWorkerFactory::max_resident_subagents`'s default so a factory that does
+/// not override it and a config that does not set it agree.
+pub const RESIDENT_SUBAGENTS_DEFAULT: u16 = 64;
+
 /// 运行时配置,由调用方覆盖项和环境变量合并而来。
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -16,6 +21,9 @@ pub struct RuntimeConfig {
     pub api_key: String,
     pub model: String,
     pub max_turns: u32,
+    /// Resident subagent capacity for the daemon this config starts. Roots do not
+    /// consume it. Defaults to [`RESIDENT_SUBAGENTS_DEFAULT`].
+    pub max_resident_subagents: u16,
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
     pub compact_threshold: u32, // computed: context_length * ratio / 100
@@ -224,6 +232,11 @@ impl RuntimeConfig {
             })
             .unwrap_or(200);
 
+        let max_resident_subagents = std::env::var("YI_AGENT_MAX_RESIDENT_SUBAGENTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(RESIDENT_SUBAGENTS_DEFAULT);
+
         let workdir = resolve_workdir(overrides)?;
 
         let system_prompt = overrides
@@ -322,6 +335,7 @@ impl RuntimeConfig {
             api_key,
             model,
             max_turns,
+            max_resident_subagents,
             workdir,
             system_prompt,
             compact_threshold,
@@ -344,6 +358,7 @@ impl RuntimeConfig {
             "api_key": if self.api_key.is_empty() { "" } else { "***" },
             "model": self.model,
             "max_turns": self.max_turns,
+            "max_resident_subagents": self.max_resident_subagents,
             "workdir": self.workdir.display().to_string(),
             "sandbox": format!("{:?}", self.sandbox),
             "sandbox_promotable": self.sandbox_promotable,
@@ -365,6 +380,7 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         api_key: "sk-secret".to_string(),
         model: "test-model".to_string(),
         max_turns: 20,
+        max_resident_subagents: RESIDENT_SUBAGENTS_DEFAULT,
         workdir: PathBuf::from("/tmp/test-workdir"),
         system_prompt: None,
         compact_threshold: 160_000,
@@ -450,6 +466,7 @@ mod tests {
             "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
             "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
+            "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
         ]);
         for key in [
             "MODEL_API_KEY",
@@ -467,6 +484,7 @@ mod tests {
             "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
             "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
+            "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
         ] {
             env.remove(key);
         }
@@ -1320,5 +1338,38 @@ mod tests {
         let mut cfg = sample_config();
         cfg.api_key = String::new();
         assert_eq!(cfg.redacted_view()["api_key"], "");
+    }
+
+    #[test]
+    fn max_resident_subagents_defaults_to_sixty_four() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let overrides = ConfigOverrides {
+            api_key: Some("sk-test".into()),
+            workdir: Some(temp.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        };
+        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        assert_eq!(config.max_resident_subagents, 64);
+    }
+
+    #[test]
+    fn the_environment_can_lower_the_resident_capacity() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_MAX_RESIDENT_SUBAGENTS", "8");
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let overrides = ConfigOverrides {
+            api_key: Some("sk-test".into()),
+            workdir: Some(temp.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        };
+        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        assert_eq!(config.max_resident_subagents, 8);
     }
 }

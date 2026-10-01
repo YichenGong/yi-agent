@@ -623,6 +623,15 @@ pub trait AgentWorkerFactory: Send + Sync {
         None
     }
 
+    /// Resident subagent capacity this factory's runtime should admit. A factory
+    /// that does not care inherits the shared default.
+    ///
+    /// The literal mirrors `yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT`;
+    /// core must not depend on the runtime crate, so the two cannot be shared.
+    fn max_resident_subagents(&self) -> u16 {
+        64
+    }
+
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         None
     }

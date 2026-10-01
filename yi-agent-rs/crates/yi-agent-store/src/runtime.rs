@@ -333,7 +333,8 @@ impl RuntimeCoordinator {
         // count an abandoned request against the new process's capacity.
         repository.release_provider_turn_leases()?;
         let resident_cursor = repository.admission_cursor("resident:global")?;
-        let mut resource_coordinator = ResourceCoordinator::new();
+        let mut resource_coordinator =
+            ResourceCoordinator::with_resident_capacity(factory.max_resident_subagents());
         if let Some(cursor) = resident_cursor {
             resource_coordinator.restore_admission_cursor(
                 "resident:global",
@@ -1127,6 +1128,15 @@ impl RuntimeCoordinator {
             inherited_sandbox,
         )
         .await
+    }
+
+    /// The live resident subagent capacity. Exists so tests assert the value
+    /// actually reached the coordinator instead of re-asserting the constant.
+    pub fn resident_capacity(&self) -> Option<u16> {
+        self.resource_coordinator
+            .lock()
+            .expect("resource coordinator mutex poisoned")
+            .capacity("resident:global")
     }
 
     pub fn root_task_id(&self, session: &RootSessionId) -> Result<TaskId, RuntimeCoordinatorError> {
@@ -4286,6 +4296,47 @@ mod provider_turn_admission_tests {
         );
         drop(coordination);
         drop(regular_leases);
+    }
+
+    /// A factory that reports a specific resident capacity, so the test can
+    /// prove the value survives the trip into the coordinator.
+    struct CapacityFactory {
+        units: u16,
+    }
+
+    impl AgentWorkerFactory for CapacityFactory {
+        fn is_available(&self) -> bool {
+            false
+        }
+        fn max_resident_subagents(&self) -> u16 {
+            self.units
+        }
+        fn start(
+            &self,
+            _request: yi_agent_core::subagent::worker::WorkerStart,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<WorkerHandle, yi_agent_core::subagent::worker::WorkerError>,
+        > {
+            Box::pin(async {
+                Err(yi_agent_core::subagent::worker::WorkerError::Startup(
+                    "unused".into(),
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn the_factorys_resident_capacity_reaches_the_coordinator() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let coordinator =
+            RuntimeCoordinator::open(&database, Arc::new(CapacityFactory { units: 128 })).unwrap();
+        assert_eq!(
+            coordinator.resident_capacity(),
+            Some(128),
+            "the configured capacity must reach the coordinator, not just the constant"
+        );
     }
 
     #[test]
