@@ -127,13 +127,17 @@ impl DaemonAgentWorkerFactory {
         &self,
         workspace: &WorkerWorkspace,
         workspace_mode: ChildWriteMode,
+        inherited: Option<yi_agent_core::InheritedSandbox>,
     ) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
         let (sandbox, writable_roots) = match workspace_mode {
             ChildWriteMode::Coding => {
                 let mut writable_roots = vec![workspace.path.clone()];
                 writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
-                (self.sandbox, writable_roots)
+                (
+                    resolve_effective_sandbox(self.sandbox, inherited),
+                    writable_roots,
+                )
             }
             ChildWriteMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
@@ -526,7 +530,17 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             });
         };
         let workspace_mode = request.workspace_mode;
-        let worker_tools = Arc::new(self.worker_tool_registry(&workspace, workspace_mode));
+        let effective_sandbox = match workspace_mode {
+            ChildWriteMode::Coding => {
+                resolve_effective_sandbox(self.sandbox, request.inherited_sandbox)
+            }
+            ChildWriteMode::ReadOnly => yi_agent_tools::SandboxMode::ReadOnly,
+        };
+        let worker_tools = Arc::new(self.worker_tool_registry(
+            &workspace,
+            workspace_mode,
+            request.inherited_sandbox,
+        ));
         let mut config = self.config.clone();
         config.model = self.worker_config_model(&request.model);
         if let Some(catalog) = &self.catalog {
@@ -557,6 +571,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 runtime_socket: runtime_socket.clone(),
                 session_id: request.root_session_id.to_string(),
                 caller_task_id: request.task_id.to_string(),
+                sandbox: effective_sandbox,
             }));
             worker_tools.register(Arc::new(DaemonSendMessageTool {
                 runtime_socket: runtime_socket.clone(),
@@ -814,6 +829,40 @@ fn is_empty_delivery_error(error: &WorkerError) -> bool {
     error
         .to_string()
         .contains("child delivery has no commits beyond")
+}
+
+fn sandbox_mode_from(inherited: yi_agent_core::InheritedSandbox) -> yi_agent_tools::SandboxMode {
+    use yi_agent_core::InheritedSandbox;
+    use yi_agent_tools::SandboxMode;
+    match inherited {
+        InheritedSandbox::ReadOnly => SandboxMode::ReadOnly,
+        InheritedSandbox::WorkspaceWrite => SandboxMode::WorkspaceWrite,
+        InheritedSandbox::DangerFullAccess => SandboxMode::DangerFullAccess,
+    }
+}
+
+/// Coding children clamp up to at least `WorkspaceWrite` so they can always
+/// write their worktree and commit; a `ReadOnly` inheritance cannot make a
+/// coding child unable to deliver.
+fn resolve_effective_sandbox(
+    base: yi_agent_tools::SandboxMode,
+    inherited: Option<yi_agent_core::InheritedSandbox>,
+) -> yi_agent_tools::SandboxMode {
+    use yi_agent_tools::SandboxMode;
+    let target = inherited.map(sandbox_mode_from).unwrap_or(base);
+    match target {
+        SandboxMode::ReadOnly => SandboxMode::WorkspaceWrite,
+        other => other,
+    }
+}
+
+fn sandbox_mode_str(mode: yi_agent_tools::SandboxMode) -> &'static str {
+    use yi_agent_tools::SandboxMode;
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::WorkspaceWrite => "workspace-write",
+        SandboxMode::DangerFullAccess => "danger-full-access",
+    }
 }
 
 fn git_writable_roots_for_worktree(workspace: &std::path::Path) -> Vec<PathBuf> {
@@ -1098,6 +1147,7 @@ pub fn register_attached_root_tools(
     registry: &mut ToolRegistry,
     runtime_socket: PathBuf,
     root: &AttachedRoot,
+    controller: yi_agent_tools::SandboxController,
 ) {
     register_application_subagent_tools(
         registry,
@@ -1105,6 +1155,7 @@ pub fn register_attached_root_tools(
         root.session_id.clone(),
         root.task_id.clone(),
         root.capability.clone(),
+        controller,
     );
 }
 
@@ -1114,12 +1165,14 @@ pub fn register_application_subagent_tools(
     session_id: String,
     caller_task_id: String,
     application_capability: String,
+    controller: yi_agent_tools::SandboxController,
 ) {
     registry.register(Arc::new(DaemonApplicationSpawnAgentTool {
         runtime_socket: runtime_socket.clone(),
         session_id: session_id.clone(),
         caller_task_id: caller_task_id.clone(),
         application_capability: application_capability.clone(),
+        controller,
     }));
     registry.register(Arc::new(DaemonApplicationSendMessageTool {
         runtime_socket: runtime_socket.clone(),
@@ -1204,10 +1257,23 @@ fn spawn_model(args: &Value) -> Result<Option<String>, ToolResult> {
     }
 }
 
+/// The `sandbox` IPC field for a spawn: only a coding child inherits the
+/// caller's effective sandbox; a read-only child carries nothing.
+fn spawn_sandbox(
+    args: &Value,
+    effective: yi_agent_tools::SandboxMode,
+) -> Result<Option<String>, ToolResult> {
+    match spawn_mode(args)? {
+        ChildWriteMode::Coding => Ok(Some(sandbox_mode_str(effective).to_string())),
+        ChildWriteMode::ReadOnly => Ok(None),
+    }
+}
+
 struct DaemonSpawnAgentTool {
     runtime_socket: PathBuf,
     session_id: String,
     caller_task_id: String,
+    sandbox: yi_agent_tools::SandboxMode,
 }
 
 struct DaemonApplicationSpawnAgentTool {
@@ -1215,6 +1281,7 @@ struct DaemonApplicationSpawnAgentTool {
     session_id: String,
     caller_task_id: String,
     application_capability: String,
+    controller: yi_agent_tools::SandboxController,
 }
 
 /// Extract the child's text report from its stored terminal payload, using the
@@ -1308,6 +1375,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(workdir) => workdir,
             Err(error) => return error,
         };
+        let sandbox = match spawn_sandbox(&args, self.controller.effective()) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
@@ -1318,8 +1389,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 mode: Some(mode.as_str().to_string()),
                 model,
                 workdir,
-
-                sandbox: None,
+                sandbox,
             },
         );
         match response {
@@ -1640,6 +1710,10 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(workdir) => workdir,
             Err(error) => return error,
         };
+        let sandbox = match spawn_sandbox(&args, self.sandbox) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &self.runtime_socket,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
@@ -1649,8 +1723,7 @@ impl Tool for DaemonSpawnAgentTool {
                 mode: Some(mode.as_str().to_string()),
                 model,
                 workdir,
-
-                sandbox: None,
+                sandbox,
             },
         );
         match response {
@@ -2167,7 +2240,7 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
+        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -2288,7 +2361,7 @@ mod tests {
             base_commit: String::new(),
         };
 
-        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly);
+        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly, None);
         let read_only_names: Vec<_> = read_only
             .schemas()
             .into_iter()
@@ -2301,7 +2374,7 @@ mod tests {
             "read-only registry must omit write/edit, got {read_only_names:?}"
         );
 
-        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding);
+        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
         let coding_names: Vec<_> = coding
             .schemas()
             .into_iter()
@@ -3155,5 +3228,65 @@ mod tests {
             result.content.as_slice(),
             [yi_agent_core::ContentBlock::Text(text)] if text.contains("rejected") || text.contains("unavailable")
         ));
+    }
+}
+
+#[cfg(test)]
+mod sandbox_inheritance_tests {
+    use super::{resolve_effective_sandbox, sandbox_mode_str, spawn_sandbox};
+    use serde_json::json;
+
+    #[test]
+    fn effective_sandbox_clamps_read_only_up_to_workspace_write() {
+        use yi_agent_core::InheritedSandbox;
+        use yi_agent_tools::SandboxMode;
+        assert_eq!(
+            resolve_effective_sandbox(
+                SandboxMode::WorkspaceWrite,
+                Some(InheritedSandbox::ReadOnly)
+            ),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            resolve_effective_sandbox(
+                SandboxMode::WorkspaceWrite,
+                Some(InheritedSandbox::DangerFullAccess)
+            ),
+            SandboxMode::DangerFullAccess
+        );
+        assert_eq!(
+            resolve_effective_sandbox(SandboxMode::WorkspaceWrite, None),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            resolve_effective_sandbox(
+                SandboxMode::DangerFullAccess,
+                Some(InheritedSandbox::WorkspaceWrite)
+            ),
+            SandboxMode::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn spawn_sandbox_only_carries_for_a_coding_child() {
+        use yi_agent_tools::SandboxMode;
+        assert_eq!(
+            spawn_sandbox(&json!({"mode": "coding"}), SandboxMode::DangerFullAccess).unwrap(),
+            Some("danger-full-access".to_string())
+        );
+        // Read-only children never carry a sandbox: the runtime pins them.
+        assert_eq!(
+            spawn_sandbox(&json!({"mode": "read_only"}), SandboxMode::DangerFullAccess).unwrap(),
+            None
+        );
+        // An omitted mode defaults to read-only, so no sandbox travels.
+        assert_eq!(
+            spawn_sandbox(&json!({}), SandboxMode::DangerFullAccess).unwrap(),
+            None
+        );
+        assert_eq!(
+            sandbox_mode_str(SandboxMode::WorkspaceWrite),
+            "workspace-write"
+        );
     }
 }

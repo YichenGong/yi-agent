@@ -86,6 +86,11 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
         &mut registry,
         attached.socket_path.clone(),
         &attached.attached_root,
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
     );
     assert!(
         registry.names().contains(&"spawn_agent".to_string()),
