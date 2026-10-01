@@ -105,6 +105,10 @@ pub struct ToolSetup {
     /// 周期的调用方**(headless / TUI)在退出前应调用 `shutdown()` 关闭 stdio 子
     /// 进程;不负责生命周期的调用方可以丢弃它。
     pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
+    /// 支撑 `process_start` / `process_list` / `process_read` / `process_kill`
+    /// 四个工具的进程管理器。**必须与 `tools` 里的进程工具同行**：调用方要按
+    /// 「哪个注册表生效」选中对应的 manager，否则会查到一个空列表而工具明明可用。
+    pub process_manager: Arc<yi_agent_tools::ProcessManager>,
 }
 
 /// 注册内置工具(含 sandbox 配置)。
@@ -189,11 +193,15 @@ pub fn build_tool_setup_with_controller(
     controller: yi_agent_tools::SandboxController,
 ) -> Result<ToolSetup> {
     if naked {
+        // 空 root 的 manager:与空 registry 配套,保证结构体总是自洽。
+        // naked 调用方只用 `tools`(空),不会起进程。
+        let process_manager = yi_agent_tools::ProcessManager::new(std::env::temp_dir());
         return Ok(ToolSetup {
             tools: Arc::new(yi_agent_core::ToolRegistry::new()),
             catalog: None,
             system_prompt: None,
             mcp: None,
+            process_manager,
         });
     }
 
@@ -217,7 +225,7 @@ pub fn build_tool_setup_with_controller(
         controller,
         cfg.sandbox_writable_roots.clone(),
     );
-    yi_agent_tools::register_process_tools(&mut registry, process_manager);
+    yi_agent_tools::register_process_tools(&mut registry, Arc::clone(&process_manager));
 
     // MCP 配置是项目级文件(`.yi-agent/mcp.json`,被 gitignore),固定在项目根
     // `cfg.workdir` 下读取——与 skills 的项目根一致,而非子 agent 的 worktree
@@ -238,6 +246,7 @@ pub fn build_tool_setup_with_controller(
         catalog: prompt.catalog,
         system_prompt: prompt.system_prompt,
         mcp,
+        process_manager,
     })
 }
 
@@ -625,6 +634,44 @@ mod tests {
             registry.get("process_start").is_some(),
             "process tools must be registered"
         );
+    }
+
+    #[test]
+    fn tool_setup_exposes_the_process_manager_it_registered() {
+        let mut cfg = sample_config();
+        // workdir 指向临时目录:测试不许往仓库根写进程运行时目录。
+        // TempDir 必须绑到具名变量——匿名的临时值在本行末即被 drop,目录随之
+        // 删除,后续 `start`(manager 以 workdir 为根,并 canonicalize 它)会因
+        // cwd 不存在而失败。
+        let tmp = tempfile::TempDir::new().unwrap();
+        cfg.workdir = tmp.path().to_path_buf();
+        let setup = build_tool_setup(&cfg, false).expect("build setup");
+        // manager 必须与注册表同行:注册表里有 process_start,就必须有对应的
+        // manager 可查——否则 app-server 拿不到句柄,进程面板会是空的。
+        assert!(setup.tools.get("process_start").is_some());
+        // 起一个真实后台进程,断言它出现在同一份 manager 的 list 里。
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let started = rt
+            .block_on(setup.process_manager.start(yi_agent_tools::ProcessStartOptions {
+                command: "sleep 30".into(),
+                name: Some("t1-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: None,
+                ready_timeout_sec: None,
+            }))
+            .expect("start");
+        assert_eq!(started.name.as_deref(), Some("t1-probe"));
+        assert!(setup
+            .process_manager
+            .list()
+            .iter()
+            .any(|p| p.name.as_deref() == Some("t1-probe")));
+        // 收尾:on_exit 默认 Kill,shutdown 会杀掉它(不留孤儿 sleep 30)。
+        // 必须在同一个 runtime 上 block_on —— 进程的 reader/waiter task 挂在
+        // 那个 runtime 上,换一个 runtime 收尾是无效的。
+        let _ = rt.block_on(setup.process_manager.shutdown());
     }
 
     #[test]
