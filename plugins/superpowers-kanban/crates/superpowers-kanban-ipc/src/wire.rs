@@ -152,7 +152,7 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol_version":1,"request_id":"1","command":{"type":"CreateAutonomousSession","objective":"implement the plan","workdir":"/tmp/worktree"}}"#
+            format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"1","command":{{"type":"CreateAutonomousSession","objective":"implement the plan","workdir":"/tmp/worktree"}}}}"#)
         );
     }
 
@@ -169,14 +169,14 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol_version":1,"request_id":"2","command":{"type":"ListTaskSummaries","session_id":null,"active_only":false}}"#
+            format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"2","command":{{"type":"ListTaskSummaries","session_id":null,"active_only":false}}}}"#)
         );
     }
 
     #[test]
     fn a_create_response_round_trips() {
-        let json = r#"{"protocol_version":1,"request_id":"1","result":{"type":"AutonomousSessionCreated","session_id":"s1","root_task_id":"t1"}}"#;
-        let envelope: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        let json = format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"1","result":{{"type":"AutonomousSessionCreated","session_id":"s1","root_task_id":"t1"}}}}"#);
+        let envelope: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
         assert_eq!(envelope.request_id, "1");
         assert_eq!(
@@ -190,8 +190,8 @@ mod tests {
 
     #[test]
     fn a_task_summaries_response_round_trips() {
-        let json = r#"{"protocol_version":1,"request_id":"2","result":{"type":"TaskSummaries","tasks":[{"task_id":"t1","state":"running","is_root":true}]}}"#;
-        let envelope: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        let json = format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"2","result":{{"type":"TaskSummaries","tasks":[{{"task_id":"t1","state":"running","is_root":true}}]}}}}"#);
+        let envelope: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(
             envelope.result,
             Reply::TaskSummaries {
@@ -206,8 +206,8 @@ mod tests {
 
     #[test]
     fn an_error_response_round_trips() {
-        let json = r#"{"protocol_version":1,"request_id":"3","result":{"type":"Error","code":"InvalidState","message":"workdir does not exist: /nope"}}"#;
-        let envelope: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        let json = format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"3","result":{{"type":"Error","code":"InvalidState","message":"workdir does not exist: /nope"}}}}"#);
+        let envelope: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(
             envelope.result,
             Reply::Error {
@@ -220,14 +220,13 @@ mod tests {
     #[test]
     fn an_unknown_reply_variant_decodes_as_other_instead_of_failing() {
         // 前向兼容：daemon 新增变体不应让插件解析崩溃。
-        let json = r#"{"protocol_version":1,"request_id":"4","result":{"type":"SomethingBrandNew","x":1}}"#;
-        let envelope: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        let json = format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"4","result":{{"type":"SomethingBrandNew","x":1}}}}"#);
+        let envelope: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert!(matches!(envelope.result, Reply::Other { .. }));
     }
 
     #[test]
     fn the_frame_limit_matches_the_daemon() {
         assert_eq!(MAX_FRAME_BYTES, 1_048_576);
-        assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

@@ -155,14 +155,14 @@ mod tests {
         let text = std::str::from_utf8(&frame[..frame.len() - 1]).unwrap();
         assert_eq!(
             text,
-            r#"{"protocol_version":1,"request_id":"7","command":{"type":"ListTaskSummaries","session_id":null,"active_only":false}}"#
+            format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"7","command":{{"type":"ListTaskSummaries","session_id":null,"active_only":false}}}}"#)
         );
     }
 
     #[test]
     fn a_matching_response_decodes_to_its_reply() {
-        let line = br#"{"protocol_version":1,"request_id":"7","result":{"type":"AutonomousSessionCreated","session_id":"s","root_task_id":"t"}}"#;
-        let reply = decode_response(line, "7").unwrap();
+        let line = format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"7","result":{{"type":"AutonomousSessionCreated","session_id":"s","root_task_id":"t"}}}}"#).into_bytes();
+        let reply = decode_response(&line, "7").unwrap();
         assert_eq!(
             reply,
             crate::wire::Reply::AutonomousSessionCreated {
@@ -174,8 +174,8 @@ mod tests {
 
     #[test]
     fn a_response_for_another_request_is_rejected() {
-        let line = br#"{"protocol_version":1,"request_id":"8","result":{"type":"Status","high_water_event_id":0}}"#;
-        let error = decode_response(line, "7").unwrap_err();
+        let line = format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"8","result":{{"type":"Status","high_water_event_id":0}}}}"#).into_bytes();
+        let error = decode_response(&line, "7").unwrap_err();
         assert!(
             matches!(error, ClientError::RequestIdMismatch { .. }),
             "{error:?}"
@@ -184,14 +184,16 @@ mod tests {
 
     #[test]
     fn a_different_protocol_version_is_rejected() {
-        let line = br#"{"protocol_version":2,"request_id":"7","result":{"type":"Status","high_water_event_id":0}}"#;
-        let error = decode_response(line, "7").unwrap_err();
+        // 用一个**确定不等于**当前版本的版本号：写死 2 的话，等版本升到 2 这条测试就失效了。
+        let other = PROTOCOL_VERSION + 1;
+        let line = format!(r#"{{"protocol_version":{other},"request_id":"7","result":{{"type":"Status","high_water_event_id":0}}}}"#).into_bytes();
+        let error = decode_response(&line, "7").unwrap_err();
         assert!(
             matches!(
                 error,
                 ClientError::ProtocolVersion {
-                    found: 2,
-                    expected: 1
+                    found: other,
+                    expected: PROTOCOL_VERSION
                 }
             ),
             "{error:?}"
