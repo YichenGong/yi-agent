@@ -1,20 +1,22 @@
 use std::path::Path;
 
-use yi_agent_board_ui::inbox::{board_state_dir, deliver_card, enqueue_path, inbox_dir};
+use yi_agent_board_ui::inbox::{
+    board_state_dir, board_state_dir_for_read, deliver_card, enqueue_path, inbox_dir,
+};
 
 #[test]
 fn the_state_dir_sits_beside_the_other_plugin_state() {
     assert_eq!(
         board_state_dir(Path::new("/proj")),
-        Path::new("/proj/.yi-agent/board")
+        Path::new("/proj/.yi-agent/superpowers-kanban")
     );
     assert_eq!(
-        inbox_dir(Path::new("/proj/.yi-agent/board")),
-        Path::new("/proj/.yi-agent/board/inbox")
+        inbox_dir(Path::new("/proj/.yi-agent/superpowers-kanban")),
+        Path::new("/proj/.yi-agent/superpowers-kanban/inbox")
     );
     assert_eq!(
-        enqueue_path(Path::new("/proj/.yi-agent/board"), "card-1"),
-        Path::new("/proj/.yi-agent/board/inbox/card-1.json")
+        enqueue_path(Path::new("/proj/.yi-agent/superpowers-kanban"), "card-1"),
+        Path::new("/proj/.yi-agent/superpowers-kanban/inbox/card-1.json")
     );
 }
 
@@ -41,4 +43,57 @@ fn delivering_is_idempotent_and_leaves_no_temp_file() {
         .collect();
     assert_eq!(entries, vec!["card-1.json".to_string()]);
     assert!(!dir.path().join("inbox/card-1.json.tmp").exists());
+}
+
+#[test]
+fn reads_fall_back_to_the_legacy_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".yi-agent/board")).unwrap();
+    assert_eq!(
+        board_state_dir_for_read(dir.path()),
+        dir.path().join(".yi-agent/board")
+    );
+}
+
+#[test]
+fn reads_prefer_the_new_directory_when_both_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".yi-agent/board")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".yi-agent/superpowers-kanban")).unwrap();
+    assert_eq!(
+        board_state_dir_for_read(dir.path()),
+        dir.path().join(".yi-agent/superpowers-kanban")
+    );
+}
+
+/// The migration contract end to end: with only a legacy layout on disk, reads
+/// find the old cards, but a new delivery lands in the new directory and the
+/// legacy files are left untouched.
+#[test]
+fn a_legacy_layout_is_readable_but_new_deliveries_land_in_the_new_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join(".yi-agent/board");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let legacy_board = legacy.join("board.json");
+    std::fs::write(&legacy_board, r#"{"cards":[],"next_order":0}"#).unwrap();
+
+    // Reads fall back to the legacy directory...
+    assert_eq!(board_state_dir_for_read(dir.path()), legacy);
+
+    // ...but writes go to the new one.
+    let write_dir = board_state_dir(dir.path());
+    deliver_card(&write_dir, "card-1", "a.spec.md", "a.plan.md").unwrap();
+    assert_eq!(
+        write_dir,
+        dir.path().join(".yi-agent/superpowers-kanban")
+    );
+    assert!(enqueue_path(&write_dir, "card-1").is_file());
+
+    // The legacy files are neither moved nor modified.
+    assert!(legacy_board.is_file());
+    assert_eq!(
+        std::fs::read_to_string(&legacy_board).unwrap(),
+        r#"{"cards":[],"next_order":0}"#
+    );
+    assert!(!legacy.join("inbox").exists());
 }

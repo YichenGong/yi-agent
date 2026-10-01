@@ -586,7 +586,8 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
 
 /// `board/list`：读插件写出的 `board.json`，映射成可渲染的卡片数组。
 fn board_list(workdir: &Path) -> serde_json::Value {
-    let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
+    // 读路径走 `_for_read`：新目录优先，回退旧目录（迁移期兼容）。
+    let state_dir = yi_agent_board_ui::inbox::board_state_dir_for_read(workdir);
     let cards: Vec<serde_json::Value> = yi_agent_board_ui::state::load_cards(&state_dir)
         .into_iter()
         .map(|card| {
@@ -878,10 +879,10 @@ where
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
-                    "board/list" => {
+                    "superpowers-kanban/list" => {
                         write_response(&writer, ok_response(id, board_list(&cfg.workdir))).await?;
                     }
-                    "board/enqueue" => {
+                    "superpowers-kanban/enqueue" => {
                         let requested = req
                             .params
                             .get("id")
@@ -911,11 +912,11 @@ where
                             .await?,
                         }
                     }
-                    "board/switch/read" => {
+                    "superpowers-kanban/switch/read" => {
                         write_response(&writer, ok_response(id, board_switch_read(&cfg.workdir)))
                             .await?;
                     }
-                    "board/switch/write" => {
+                    "superpowers-kanban/switch/write" => {
                         let on = req
                             .params
                             .get("on")

@@ -21,32 +21,23 @@ import type {
   WorkspaceGroup,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
-import { BoardView } from "./components/BoardView";
-import { SettingsPanel } from "./components/SettingsPanel";
+import { formatError } from "./lib/errorMessage";
+import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
+import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
+import { SuperpowersKanbanCollapsedStrip } from "./components/SuperpowersKanbanCollapsedStrip";
+import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import {
   type BoardCardDto,
   type SwitchSource,
+  enqueueBoardCard,
   fetchBoard,
   readBoardSwitch,
   setBoardSwitch,
-} from "./lib/boardSwitch";
+} from "./lib/superpowersKanbanSwitch";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
-
-/**
- * RPC rejections are `RpcError` objects, so `String(e)` would render
- * `[object Object]`. Prefer the `message` field when present, falling back to
- * the default coercion for primitives and other shapes.
- */
-function formatError(e: unknown): string {
-  if (e && typeof e === "object" && "message" in e) {
-    const m = (e as { message?: unknown }).message;
-    if (typeof m === "string") return m;
-  }
-  return String(e);
-}
 
 /**
  * Read the persisted permission mode for a thread from the `thread/listAll`
@@ -108,6 +99,9 @@ export default function App() {
   const [boardOn, setBoardOn] = useState(false);
   const [boardSource, setBoardSource] = useState<SwitchSource>("default");
   const [boardCards, setBoardCards] = useState<BoardCardDto[]>([]);
+  // Collapsed board panel. Deliberately not persisted: every launch starts
+  // expanded, and the switch state is independent of the panel being folded.
+  const [kanbanCollapsed, setKanbanCollapsed] = useState(false);
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -277,6 +271,13 @@ export default function App() {
   const pickDirectory = async (): Promise<string | null> => {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({ directory: true, multiple: false });
+    return typeof picked === "string" ? picked : null;
+  };
+
+  /** 原生选择器选一个文件；取消返回 null。与 pickDirectory 同款动态 import。 */
+  const pickFile = async (): Promise<string | null> => {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({ directory: false, multiple: false });
     return typeof picked === "string" ? picked : null;
   };
 
@@ -606,23 +607,32 @@ export default function App() {
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
         />
-        <div className="flex w-72 flex-col border-r border-neutral-800">
-          <SettingsPanel
-            switchOn={boardOn}
-            source={boardSource}
-            onToggle={(next) => {
-              void setBoardSwitch(boardRpc, next)
-                .then(() => {
-                  setBoardOn(next);
-                  setBoardSource("project");
-                })
-                .catch(() => {
-                  /* 写失败保持原状，下一轮轮询会纠正 */
-                });
-            }}
-          />
-          <BoardView switchOn={boardOn} source={boardSource} cards={boardCards} />
-        </div>
+        {kanbanCollapsed ? (
+          <SuperpowersKanbanCollapsedStrip onExpand={() => setKanbanCollapsed(false)} />
+        ) : (
+          <div className="flex w-72 flex-col border-r border-neutral-800">
+            <SuperpowersKanbanSettings
+              switchOn={boardOn}
+              source={boardSource}
+              onToggle={(next) => {
+                void setBoardSwitch(boardRpc, next)
+                  .then(() => {
+                    setBoardOn(next);
+                    setBoardSource("project");
+                  })
+                  .catch(() => {
+                    /* 写失败保持原状，下一轮轮询会纠正 */
+                  });
+              }}
+              onCollapse={() => setKanbanCollapsed(true)}
+            />
+            <SuperpowersKanbanEnqueue
+              pickFile={pickFile}
+              enqueue={(spec, plan) => enqueueBoardCard(boardRpc, spec, plan)}
+            />
+            <SuperpowersKanbanView switchOn={boardOn} source={boardSource} cards={boardCards} />
+          </div>
+        )}
         <div className="relative flex min-w-0 flex-1 flex-col">
           <ApprovalBanner
             items={bannerItems}

@@ -16,7 +16,7 @@ pub struct Layout {
 
 impl Layout {
     pub fn for_workdir(workdir: &Path) -> Self {
-        let state_dir = workdir.join(".yi-agent").join("board");
+        let state_dir = workdir.join(".yi-agent").join("superpowers-kanban");
         let runtime_dir = workdir.join(".yi-agent").join("runtime");
         Self {
             workdir: workdir.to_path_buf(),

@@ -1,0 +1,14 @@
+{
+  "name": "superpowers-kanban",
+  "command": "superpowers-kanban",
+  "args": [
+    "run",
+    "--runtime-dir", "{runtime_dir}",
+    "--state-dir", "{state_dir}",
+    "--project-root", "{workdir}",
+    "--interval-secs", "60"
+  ],
+  "switch_key": "superpowers_kanban",
+  "restart_backoff_ms": 1000,
+  "restart_backoff_max_ms": 30000
+}

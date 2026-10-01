@@ -1,8 +1,25 @@
 use std::path::{Path, PathBuf};
 
-/// 插件状态目录：`<workdir>/.yi-agent/board`。`board.json` 与 `inbox/` 都在这里。
+/// 插件状态目录（**写入**位置）：`<workdir>/.yi-agent/superpowers-kanban`。
+/// `board.json` 与 `inbox/` 都在这里。
 pub fn board_state_dir(workdir: &Path) -> PathBuf {
-    workdir.join(".yi-agent").join("board")
+    workdir.join(".yi-agent").join("superpowers-kanban")
+}
+
+/// 读取位置：新目录存在则用新；否则旧目录 `.yi-agent/board` 存在则用旧
+/// （迁移期兼容）；两者都无则返回新目录（供首次创建）。
+///
+/// **只读**：本函数绝不创建、修改或移动旧目录。
+pub fn board_state_dir_for_read(workdir: &Path) -> PathBuf {
+    let new = board_state_dir(workdir);
+    if new.is_dir() {
+        return new;
+    }
+    let legacy = workdir.join(".yi-agent").join("board");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    new
 }
 
 /// 投递目录：`<state_dir>/inbox`。

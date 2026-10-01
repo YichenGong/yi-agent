@@ -1,7 +1,7 @@
 # Superpowers 看板：可折叠面板
 
 日期：2026-10-01
-状态：已评审待实施（设计已获用户确认）
+状态：已实施（Spec 5，桌面端 30 文件 / 263 测试通过）
 
 ## 1. 背景
 
@@ -74,8 +74,8 @@
 
 ## 6. 遗留（本次不做，另行决定）
 
-- 桌面端**没有创建卡片的入口**。`desktop/src/lib/boardSwitch.ts` 里的 `enqueueBoardCard()` 目前**未接到任何组件**（死代码）；卡片目前只能经 TUI `/kanban add <spec> <plan>` 入队。是否补桌面端入口，见既有 spec 的 §7 / §9.1「卡片交互操作」。
-- 「子 agent」面板收起后无法再打开（既有缺陷，与本设计同构，可复用同样的竖条方案）。
+- 桌面端**没有创建卡片的入口**。`desktop/src/lib/superpowersKanbanSwitch.ts` 里的 `enqueueBoardCard()` 目前**未接到任何组件**（死代码）；卡片目前只能经 TUI `/superpowers-kanban add <spec> <plan>` 入队。是否补桌面端入口，见既有 spec 的 §7 / §9.1「卡片交互操作」。
+- 「子 agent」面板收起后无法再打开（既有缺陷，与本设计同构，可复用 `SuperpowersKanbanCollapsedStrip` 同样的竖条方案）。
 
 ## 7. 命名对齐（2026-10-01 更新）
 
