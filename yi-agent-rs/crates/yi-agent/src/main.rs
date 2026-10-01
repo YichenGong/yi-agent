@@ -475,6 +475,40 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
     Ok(())
 }
 
+/// 停止句柄：置位后循环退出并 `stop_all`，用于测试与 daemon 退出时的回收。
+pub(crate) struct SupervisorHandle {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SupervisorHandle {
+    pub(crate) fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// 在后台线程里按固定间隔对齐托管子进程（分辨率 500ms）。
+pub(crate) fn serve_supervisor(workdir: &std::path::Path) -> SupervisorHandle {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let layout = yi_agent_supervisors::supervisor::Layout::for_workdir(workdir);
+    let join = std::thread::spawn(move || {
+        let mut supervisor = yi_agent_supervisors::supervisor::Supervisor::new(layout);
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            supervisor.reconcile();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        supervisor.stop_all();
+    });
+    SupervisorHandle {
+        stop,
+        join: Some(join),
+    }
+}
+
 fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     let workdir = config::resolve_workdir(cli)?;
     let runtime_dir = runtime_directory_for(&workdir);
@@ -528,10 +562,13 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // `daemon start` detaches this subcommand with its stderr on
             // `/dev/null`, but a directly invoked `serve` owns the terminal and
             // so keeps the historical line.
+            let supervisor = serve_supervisor(&workdir);
             report_reclaimed_orphans_to_stderr(daemon.reclaimed_orphans());
-            daemon
+            let result = daemon
                 .wait()
-                .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}"))
+                .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}"));
+            supervisor.stop();
+            result
         }
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
     }
@@ -1874,6 +1911,56 @@ mod tests {
     #[test]
     fn ensure_stdio_listen_accepts_stdio() {
         assert!(ensure_stdio_listen("stdio://").is_ok());
+    }
+
+    #[test]
+    fn the_supervisor_loop_starts_a_manifest_when_its_switch_is_on() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+        // 假子进程：写标记后睡。
+        let marker = workdir.join("child.pid");
+        let child = workdir.join("child.sh");
+        std::fs::write(
+            &child,
+            format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&child).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&child, perms).unwrap();
+        }
+        let manifests = workdir.join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(
+            manifests.join("demo.json"),
+            format!(
+                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+                child.display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(workdir.join(".yi-agent")).unwrap();
+        std::fs::write(
+            workdir.join(".yi-agent/preferences.json"),
+            r#"{"demo_on":true}"#,
+        )
+        .unwrap();
+
+        let handle = serve_supervisor(workdir);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut started = false;
+        while Instant::now() < deadline {
+            if marker.exists() {
+                started = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.stop();
+        assert!(started, "the supervisor loop should have started the child");
     }
 
     #[test]
