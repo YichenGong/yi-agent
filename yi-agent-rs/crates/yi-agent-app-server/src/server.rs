@@ -1238,16 +1238,22 @@ where
                             },
                         );
 
-                        if !process_watches.contains_key(&thread_id) {
-                            let rx = process_manager.subscribe();
-                            let handle = tokio::spawn(watch_processes(
-                                Arc::clone(&writer),
-                                thread_id.clone(),
-                                Arc::clone(&process_manager),
-                                rx,
-                            ));
-                            process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
+                        // 先停旧守望者、再订阅本次生效的 manager。`thread/start` 通常没有
+                        // 旧守望者(remove 得到 None,no-op),但 `thread/resume` 恢复一个
+                        // 仍在内存的活 thread 时会换掉生效的 manager:旧守望者若被
+                        // `contains_key` 守卫留下,就仍订阅那份已被丢弃的 manager,与
+                        // `process/list` 用的新 manager 脱节,`process/updated` 静默失联。
+                        if let Some(previous) = process_watches.remove(&thread_id) {
+                            previous.stop().await;
                         }
+                        let rx = process_manager.subscribe();
+                        let handle = tokio::spawn(watch_processes(
+                            Arc::clone(&writer),
+                            thread_id.clone(),
+                            Arc::clone(&process_manager),
+                            rx,
+                        ));
+                        process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
 
                         // 每个 thread 一个 driver task:独占 agent 与两个 receiver,
                         // 串行驱动 turn。
@@ -1439,16 +1445,20 @@ where
                             },
                         );
 
-                        if !process_watches.contains_key(&thread_id) {
-                            let rx = process_manager.subscribe();
-                            let handle = tokio::spawn(watch_processes(
-                                Arc::clone(&writer),
-                                thread_id.clone(),
-                                Arc::clone(&process_manager),
-                                rx,
-                            ));
-                            process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
+                        // 与 `thread/start` 同款:先停旧守望者、再对本次生效的 manager 重订。
+                        // 这里正是缺陷所在——resume 一个活 thread 会新建 manager,若沿用
+                        // 「有守望者就不重建」的守卫,旧守望者会继续订阅被丢弃的 manager。
+                        if let Some(previous) = process_watches.remove(&thread_id) {
+                            previous.stop().await;
                         }
+                        let rx = process_manager.subscribe();
+                        let handle = tokio::spawn(watch_processes(
+                            Arc::clone(&writer),
+                            thread_id.clone(),
+                            Arc::clone(&process_manager),
+                            rx,
+                        ));
+                        process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
 
                         let driver_writer = Arc::clone(&writer);
                         let driver_turn_tx = turn_tx.clone();
@@ -3900,6 +3910,38 @@ mod tests {
             }
         }
         panic!("no response with id {want}");
+    }
+
+    /// 带总时限地读到「指定 method 的通知」,丢弃中间帧(其它通知、请求响应)。
+    ///
+    /// `process/updated` 由守望者异步推来,不由任何请求直接触发,故不能靠「读下一帧」;
+    /// 只能按 method 收敛。逐帧读另设较短上限,以免没有帧时 `read_value` 内部 5s 超时
+    /// 先 panic(那会让失败信息含混);总时限到则返回 `None`,由调用方给出明确断言。
+    async fn await_notification(
+        h: &mut Harness,
+        method: &str,
+        timeout: Duration,
+    ) -> Option<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let slice = remaining.min(Duration::from_millis(1000));
+            match tokio::time::timeout(slice, h.read_value()).await {
+                Ok(v) => {
+                    if v.get("method").and_then(|m| m.as_str()) == Some(method) {
+                        return Some(v);
+                    }
+                }
+                Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                }
+            }
+        }
     }
 
     fn summary(
@@ -7314,5 +7356,99 @@ mod tests {
             let _ = held.shutdown().await;
             h.shutdown().await;
         }
+    }
+
+    /// 回归(Task 5 缺陷):resume 一个**仍在内存的活 thread** 时,该 thread 生效的
+    /// manager 会被新工厂产出的一份替换;守望者必须跟着换到新 manager 上。
+    ///
+    /// 修复前:`thread/resume` 的守望者启动被 `if !process_watches.contains_key(..)`
+    /// 拦住,仍旧订阅**旧的、已被丢弃**的 manager。于是 `process/list` 读得到新
+    /// manager 的进程,`process/updated` 却永远不来——面板静默失联。本测试正是抓这个:
+    /// 对新建后未起 turn 的活 thread 直接 resume(得到生效 manager 数组下标 1),在其上
+    /// 起进程,断言能从客户端流里读到 process_id 匹配的 `process/updated`。
+    ///
+    /// 隔离:`cfg.provider` 设成非 anthropic/openai,委派装配确定性失败,`thread/start`
+    /// 与 `thread/resume` 都不会经 `wrap_for_delegation` 换掉工厂给出的 manager,因此
+    /// 「工厂第 N 次产出的 manager 即该路径生效的 manager」成立。
+    ///
+    /// 收敛读带超时(见 `await_notification`),修复前是「等不到」而非挂死。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_live_thread_rebinds_process_watcher_to_the_effective_manager() {
+        use std::sync::Arc;
+
+        // 工厂每次被调用都把「本次生效的 manager」推进这里:start 产出下标 0,
+        // resume 产出下标 1(即 resume 后生效的那一份)。
+        let seen: Arc<std::sync::Mutex<Vec<Arc<yi_agent_tools::ProcessManager>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_factory = Arc::clone(&seen);
+
+        let mut cfg = test_config();
+        cfg.provider = "t5-isolated".to_string();
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                let built = build_test_agent(session, cwd, mode)?;
+                let manager = Arc::clone(&built.process_manager);
+                for_factory.lock().unwrap().push(manager);
+                Ok(built)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        let thread_id = start_thread(&mut h).await;
+
+        // 活 thread:未起 turn 时直接 resume,走的是「仍在内存中的活 thread」那条分支。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let resumed = read_response(&mut h, 3).await;
+        assert_eq!(resumed["result"]["thread_id"], thread_id.as_str(), "{resumed}");
+
+        //resume 之后该 thread 生效的 manager 就是工厂第二次产出的那一份。
+        let managers = seen.lock().unwrap().clone();
+        assert_eq!(
+            managers.len(),
+            2,
+            "factory must run once for start and once for resume: {}",
+            managers.len()
+        );
+        let effective = Arc::clone(&managers[1]);
+
+        // 在生效 manager 上起一个进程;守望者若正确重订,应推送 process/updated。
+        let started = effective
+            .start(yi_agent_tools::ProcessStartOptions {
+                command: "sleep 300".into(),
+                name: Some("t5-resume-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: None,
+                ready_timeout_sec: None,
+            })
+            .await
+            .expect("start");
+
+        let note = await_notification(&mut h, "process/updated", Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "resume 后仍未重订守望者:等不到 process/updated(process_id={})",
+                    started.process_id
+                )
+            });
+        assert_eq!(
+            note["params"]["process_id"], started.process_id.as_str(),
+            "{note}"
+        );
+        assert_eq!(note["params"]["thread_id"], thread_id.as_str(), "{note}");
+        // `start` 返回时进程已在运行,守望者至少应报出一个非终态标签。
+        let state = note["params"]["state"].as_str().unwrap_or("");
+        assert!(
+            matches!(state, "starting" | "running" | "ready"),
+            "unexpected state on a running process: {note}"
+        );
+
+        let _ = effective.shutdown().await;
+        h.shutdown().await;
     }
 }
