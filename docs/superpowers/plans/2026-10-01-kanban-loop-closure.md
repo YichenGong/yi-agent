@@ -1,6 +1,6 @@
 # Superpowers 看板 — 闭环接线 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 打通看板闭环——daemon 按开关托管插件进程，两端能「加入看板」把卡片投递进队列，插件消费投递并入队推进，两端实时显示卡片。
 
@@ -67,7 +67,7 @@
   - `SupervisorManifest::expand_args(&self, workdir: &Path, state_dir: &Path, runtime_dir: &Path) -> Vec<String>`
   - `yi_agent_supervisors::manifest::load_manifests(dir: &Path) -> Vec<SupervisorManifest>`（缺失目录→空；单个坏清单跳过）
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `crates/yi-agent-supervisors/src/manifest.rs` 末尾：
 
@@ -151,12 +151,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors --offline`
 Expected: 编译失败（crate 不存在 / 类型未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `crates/yi-agent-supervisors/Cargo.toml`：
 
@@ -320,12 +320,12 @@ pub fn load_manifests(dir: &Path) -> Vec<SupervisorManifest> {
     "crates/yi-agent-supervisors",
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors --offline`
 Expected: PASS（manifest 6 个测试）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -348,7 +348,7 @@ git commit -m "feat(supervisors): parse supervisor manifests with placeholder ex
 
 > 这是**通用**的「按 JSON 布尔键读两层开关」，与看板无关——不依赖 `yi-agent-board-ui`。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `crates/yi-agent-supervisors/src/switch.rs` 末尾：
 
@@ -395,12 +395,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors switch --offline`
 Expected: 编译失败（`read_bool_key` / `resolve_bool` 未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `crates/yi-agent-supervisors/src/switch.rs`：
 
@@ -422,12 +422,12 @@ pub fn resolve_bool(global: Option<bool>, project: Option<bool>) -> bool {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors switch --offline`
 Expected: PASS（5 个测试）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -455,7 +455,7 @@ git commit -m "feat(supervisors): resolve a generic two-layer boolean switch"
   - `Supervisor::reconcile(&mut self)`（一次对齐）
   - `Supervisor::stop_all(&mut self)`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `crates/yi-agent-supervisors/tests/supervisor.rs`：
 
@@ -633,12 +633,12 @@ fn stop_all_reaps_every_child() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors --test supervisor --offline`
 Expected: 编译失败（`supervisor` 模块 / `Supervisor` 未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `crates/yi-agent-supervisors/src/lib.rs` 追加 `pub mod supervisor;`（使其为 `manifest` / `supervisor` / `switch`）。
 
@@ -816,12 +816,12 @@ impl Supervisor {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors --offline`
 Expected: PASS（manifest 6 + switch 5 + supervisor 5）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -842,7 +842,7 @@ git commit -m "feat(supervisors): supervise switch-gated child processes"
 - Consumes: Task 3 的 `Layout` / `Supervisor`
 - Produces: `fn serve_supervisor(workdir: &std::path::Path)` —— 在后台线程里按固定间隔 `reconcile`，返回一个停止句柄（`Arc<AtomicBool>`），供测试与退出回收使用。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `yi-agent-rs/crates/yi-agent/src/main.rs` 的测试模块里追加（`use` 放测试模块内）：
 
@@ -898,12 +898,12 @@ git commit -m "feat(supervisors): supervise switch-gated child processes"
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent the_supervisor_loop_starts --offline`
 Expected: 编译失败（`serve_supervisor` 未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `yi-agent-rs/crates/yi-agent/Cargo.toml` 的 `[dependencies]` 里追加：
 
@@ -963,12 +963,12 @@ pub(crate) fn serve_supervisor(workdir: &std::path::Path) -> SupervisorHandle {
 
 （即把原来那句 `daemon.wait().map_err(...)` 替换为上面的四行。）
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent the_supervisor_loop_starts --offline`
 Expected: PASS（1 个测试）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -993,7 +993,7 @@ git commit -m "feat(daemon): supervise plugin processes while the daemon serves"
   - `yi_agent_board_ui::inbox::enqueue_path(state_dir: &Path, id: &str) -> PathBuf`
   - `yi_agent_board_ui::inbox::deliver_card(state_dir: &Path, id: &str, spec: &str, plan: &str) -> std::io::Result<()>`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `crates/yi-agent-board-ui/tests/inbox.rs`：
 
@@ -1044,12 +1044,12 @@ fn delivering_is_idempotent_and_leaves_no_temp_file() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-board-ui --test inbox --offline`
 Expected: 编译失败（`inbox` 模块未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `crates/yi-agent-board-ui/src/lib.rs` 追加 `pub mod inbox;`（保持字母序：`inbox` / `state` / `switch` / `view`）。
 
@@ -1092,12 +1092,12 @@ pub fn deliver_card(state_dir: &Path, id: &str, spec: &str, plan: &str) -> std::
 }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-board-ui --test inbox --offline`
 Expected: PASS（3 个测试）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1121,7 +1121,7 @@ git commit -m "feat(board-ui): deliver cards into the plugin's inbox"
   - `board_runner::inbox::consume(state_dir: &Path, board: &mut Board, now: DateTime<Local>) -> Vec<InboxOutcome>`
   - `board_runner::inbox::InboxOutcome { id: String, result: Result<(), String> }`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `plugins/superpowers-board/crates/board-runner/src/inbox.rs` 末尾：
 
@@ -1221,12 +1221,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd plugins/superpowers-board && cargo test -p board-runner inbox --offline`
 Expected: 编译失败（`consume` / `InboxOutcome` 未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `crates/board-runner/src/lib.rs` 追加 `pub mod inbox;`。
 
@@ -1353,12 +1353,12 @@ fn reject(inbox: &Path, path: &Path, id: &str) {
         }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd plugins/superpowers-board && cargo test --offline`
 Expected: PASS（board-core 42 + board-ipc 14 + board-runner 15 + inbox 4）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd plugins/superpowers-board && cargo fmt --all
@@ -1379,7 +1379,7 @@ git commit -m "feat(board-runner): consume the inbox and enqueue validated cards
 - Consumes: Task 5 的 `yi_agent_board_ui::inbox::{board_state_dir, deliver_card}`；既有 `yi_agent_board_ui::state::load_cards`
 - Produces: `handle_kanban(workdir, args)` 支持 `""`（显示实时卡片）、`on`、`off`、`add <spec> <plan>`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `crates/yi-agent/src/tui/board.rs` 的测试模块追加：
 
@@ -1441,12 +1441,12 @@ git commit -m "feat(board-runner): consume the inbox and enqueue validated cards
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::board --offline`
 Expected: FAIL（`add` 分支与实时卡片未实现）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 在 `crates/yi-agent/src/tui/board.rs` 里：
 
@@ -1537,12 +1537,12 @@ fn card_id_for(spec: &str, plan: &str) -> String {
 
 在 `slash.rs` 的 `Kanban` 参数用法里把 `"[on|off|run]"` 改成 `"[on|off|add <spec> <plan>]"`。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::board --offline && cargo test -p yi-agent --bin yi-agent slash --offline`
 Expected: PASS（board 9 + slash 47）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1568,7 +1568,7 @@ git commit -m "feat(tui): show live board cards and deliver cards from /kanban a
   - `board/switch/read` → `{"on":bool,"source":"project"|"global"|"default"}`
   - `board/switch/write`（params `{on:bool}`）→ `{"on":bool}`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `yi-agent-rs/crates/yi-agent-app-server/src/server.rs` 的测试模块追加：
 
@@ -1610,12 +1610,12 @@ git commit -m "feat(tui): show live board cards and deliver cards from /kanban a
     }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server board --offline`
 Expected: 编译失败（`board_list` 等未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 在 `server.rs` 里新增三个自由函数（供 RPC 与测试共用）：
 
@@ -1861,14 +1861,14 @@ import {
         </div>
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server board --offline`
 Expected: PASS（3 个测试）。
 Run: `cd desktop && npx tsc --noEmit && TMPDIR="$PWD/.tmpverify" npm test`
 Expected: tsc 干净；测试全绿（含新增的 App 挂载断言）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1891,7 +1891,7 @@ git commit -m "feat(desktop): expose board RPCs and mount the board view"
 - Consumes: Task 1/3 的清单字段与 `board_core::calendar::ConcurrencyCalendar::from_toml`
 - Produces: 示例 `kanban.toml`（工作日 09:00–24:00→3；工作日 00:00–09:00→10；周末全天→10）与清单样例
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `plugins/superpowers-board/crates/board-runner/src/main.rs` 末尾**新建**测试模块（该文件当前没有测试模块）：
 
@@ -1919,12 +1919,12 @@ mod tests {
 
 > `board-runner` 的 `Cargo.toml` 需已有 `chrono` 依赖（Plan 3a 已加）。若 `mod tests` 里用到 `super::*` 但 `main.rs` 顶层没有可复用的导入，改为在测试里写全路径（如 `board_core::calendar::ConcurrencyCalendar`），本测试已如此。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd plugins/superpowers-board && cargo test -p board-runner the_sample_calendar --offline`
 Expected: FAIL（`kanban.toml` 不存在，`include_str!` 编译失败）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 `plugins/superpowers-board/kanban.toml`：
 
@@ -1995,12 +1995,12 @@ daemon 常驻（`yi-agent daemon start`）。daemon 会按清单与开关拉起 
 `kanban.toml` 放在 `<项目>/.yi-agent/board/kanban.toml`（示例见本目录）。
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `cd plugins/superpowers-board && cargo test --offline`
 Expected: PASS（含新增的 `the_sample_calendar_expresses_the_three_and_ten_windows`）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd plugins/superpowers-board && cargo fmt --all
