@@ -36,6 +36,13 @@ struct BindingState {
     handle: RuntimeHandle,
     /// `None` for fixed bindings; `Some` for managed ones.
     runtime: Option<Arc<AttachedProjectRuntime>>,
+    /// How many times a replacement runtime has been installed.
+    ///
+    /// A fresh binding is generation 0; every `repair()` that adopts a
+    /// replacement runtime bumps this. A replacement daemon sweeps the previous
+    /// daemon's roots away, so anything that cached a root across the boundary
+    /// must be able to notice that the runtime it belongs to is gone.
+    generation: u64,
 }
 
 /// A shared, self-healing reference to a project runtime.
@@ -61,6 +68,7 @@ impl RuntimeBinding {
             state: Mutex::new(BindingState {
                 handle: Self::handle_of(&initial),
                 runtime: Some(initial),
+                generation: 0,
             }),
             repair: Some(RepairPlan {
                 cfg: cfg.clone(),
@@ -75,6 +83,7 @@ impl RuntimeBinding {
             state: Mutex::new(BindingState {
                 handle,
                 runtime: None,
+                generation: 0,
             }),
             repair: None,
             flight: Mutex::new(()),
@@ -100,6 +109,16 @@ impl RuntimeBinding {
     /// The current handle, without any repair attempt.
     pub fn current(&self) -> Result<RuntimeHandle, String> {
         Ok(self.lock_state().handle.clone())
+    }
+
+    /// How many replacement runtimes this binding has installed.
+    ///
+    /// Starts at 0 and is bumped by every `repair()` that adopts a fresh runtime.
+    /// A caller that caches something minted against one runtime (a conversation
+    /// root, say) compares this before and after: a change means the runtime it
+    /// cached against was replaced and whatever it cached is gone.
+    pub fn generation(&self) -> u64 {
+        self.lock_state().generation
     }
 
     /// The project directory this binding was created for. Used to decide
@@ -133,6 +152,9 @@ impl RuntimeBinding {
         let mut state = self.lock_state();
         state.handle = handle.clone();
         state.runtime = Some(Arc::new(fresh));
+        // A replacement runtime sweeps the old one's roots away; record the
+        // boundary so callers that cached a root can notice it is stale.
+        state.generation = state.generation.wrapping_add(1);
         Ok(handle)
     }
 
