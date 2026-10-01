@@ -58,6 +58,10 @@ pub struct DaemonAgentWorkerFactory {
     workspace_registry: Option<Arc<DaemonWorkspaceService>>,
     recovery_workspace: Option<PathBuf>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    /// Resident subagent capacity the daemon's coordinator admits. Roots do not
+    /// consume it. Defaults to [`yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT`]
+    /// so a construction path that omits the builder is unchanged.
+    max_resident_subagents: u16,
 }
 
 impl DaemonAgentWorkerFactory {
@@ -78,6 +82,7 @@ impl DaemonAgentWorkerFactory {
             workspace_registry: None,
             recovery_workspace: None,
             catalog: None,
+            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
         }
     }
 
@@ -115,6 +120,14 @@ impl DaemonAgentWorkerFactory {
         catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
     ) -> Self {
         self.catalog = catalog;
+        self
+    }
+
+    /// Configures the resident subagent capacity this daemon's coordinator
+    /// admits, so the configured value reaches the coordinator rather than the
+    /// trait default. Roots do not consume it.
+    pub fn with_max_resident_subagents(mut self, max_resident_subagents: u16) -> Self {
+        self.max_resident_subagents = max_resident_subagents;
         self
     }
 
@@ -451,6 +464,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         // A daemon owns one configured provider profile; this identifier never
         // contains the API key or any other credential material.
         Some("daemon-default".into())
+    }
+
+    fn max_resident_subagents(&self) -> u16 {
+        self.max_resident_subagents
     }
 
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {

@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
+use yi_agent_core::subagent::scheduler::ResourceCoordinator;
 use yi_agent_core::subagent::task::{
     AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox, IntegrationValidation,
     MessageId, PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
@@ -2668,20 +2669,27 @@ async fn global_resident_capacity_leaves_excess_child_queued() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
-    let mut children = Vec::new();
-    for _ in 0..17 {
+    // One past the cap, whatever the cap is, so this survives a default change.
+    let capacity = usize::from(ResourceCoordinator::DEFAULT_GLOBAL_RESIDENT_SUBAGENTS);
+    let mut running = Vec::new();
+    for _ in 0..capacity {
         let session = coordinator.create_session().unwrap();
         let root = coordinator.root_task_id(&session).unwrap();
         let child = coordinator.spawn_child(&session, &root).await.unwrap();
-        children.push((session, child));
+        coordinator.start_worker(&session, &child).await.unwrap();
+        running.push((session, child));
     }
 
-    for (session, child) in children.iter().take(16) {
-        coordinator.start_worker(session, child).await.unwrap();
-    }
-    let (session, child) = &children[16];
-    assert!(coordinator.start_worker(session, child).await.is_err());
-    assert_eq!(coordinator.task_state(child).unwrap(), "queued");
+    // Admitting each child as it spawns keeps the store's separate queued-task
+    // gate out of the way, so this test only exercises the resident capacity.
+    let (session, child) = {
+        let session = coordinator.create_session().unwrap();
+        let root = coordinator.root_task_id(&session).unwrap();
+        let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        (session, child)
+    };
+    assert!(coordinator.start_worker(&session, &child).await.is_err());
+    assert_eq!(coordinator.task_state(&child).unwrap(), "queued");
 }
 
 #[tokio::test]
@@ -2689,20 +2697,27 @@ async fn releasing_a_resident_lease_admits_a_queued_child() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    // One past the cap, whatever the cap is, so this survives a default change.
+    let capacity = usize::from(ResourceCoordinator::DEFAULT_GLOBAL_RESIDENT_SUBAGENTS);
     let mut children = Vec::new();
-    for _ in 0..17 {
+    for _ in 0..capacity {
         let session = coordinator.create_session().unwrap();
         let root = coordinator.root_task_id(&session).unwrap();
         let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        coordinator.start_worker(&session, &child).await.unwrap();
         children.push((session, child));
     }
-    for (session, child) in children.iter().take(16) {
-        coordinator.start_worker(session, child).await.unwrap();
-    }
-    let (queued_session, queued_child) = &children[16];
+    // Admitting each child as it spawns keeps the store's separate queued-task
+    // gate out of the way, so this test only exercises the resident capacity.
+    let (queued_session, queued_child) = {
+        let session = coordinator.create_session().unwrap();
+        let root = coordinator.root_task_id(&session).unwrap();
+        let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        (session, child)
+    };
     assert!(
         coordinator
-            .start_worker(queued_session, queued_child)
+            .start_worker(&queued_session, &queued_child)
             .await
             .is_err()
     );
@@ -2717,10 +2732,10 @@ async fn releasing_a_resident_lease_admits_a_queued_child() {
         .unwrap();
 
     coordinator
-        .start_worker(queued_session, queued_child)
+        .start_worker(&queued_session, &queued_child)
         .await
         .unwrap();
-    assert_eq!(coordinator.task_state(queued_child).unwrap(), "running");
+    assert_eq!(coordinator.task_state(&queued_child).unwrap(), "running");
 }
 
 #[tokio::test]
@@ -2728,20 +2743,27 @@ async fn fair_resident_grant_is_retained_for_the_selected_queued_child() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    // One past the cap, whatever the cap is, so this survives a default change.
+    let capacity = usize::from(ResourceCoordinator::DEFAULT_GLOBAL_RESIDENT_SUBAGENTS);
     let mut children = Vec::new();
-    for _ in 0..17 {
+    for _ in 0..capacity {
         let session = coordinator.create_session().unwrap();
         let root = coordinator.root_task_id(&session).unwrap();
         let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        coordinator.start_worker(&session, &child).await.unwrap();
         children.push((session, child));
     }
-    for (session, child) in children.iter().take(16) {
-        coordinator.start_worker(session, child).await.unwrap();
-    }
-    let (waiting_session, waiting_child) = &children[16];
+    // Admitting each child as it spawns keeps the store's separate queued-task
+    // gate out of the way, so this test only exercises the resident capacity.
+    let (waiting_session, waiting_child) = {
+        let session = coordinator.create_session().unwrap();
+        let root = coordinator.root_task_id(&session).unwrap();
+        let child = coordinator.spawn_child(&session, &root).await.unwrap();
+        (session, child)
+    };
     assert!(
         coordinator
-            .start_worker(waiting_session, waiting_child)
+            .start_worker(&waiting_session, &waiting_child)
             .await
             .is_err()
     );
@@ -2765,10 +2787,10 @@ async fn fair_resident_grant_is_retained_for_the_selected_queued_child() {
             .is_err()
     );
     coordinator
-        .start_worker(waiting_session, waiting_child)
+        .start_worker(&waiting_session, &waiting_child)
         .await
         .unwrap();
-    assert_eq!(coordinator.task_state(waiting_child).unwrap(), "running");
+    assert_eq!(coordinator.task_state(&waiting_child).unwrap(), "running");
     assert_eq!(coordinator.task_state(&later_child).unwrap(), "queued");
 }
 

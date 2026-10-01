@@ -102,7 +102,10 @@ pub fn worker_factory(
         .with_catalog(catalog)
         // Recovery must inspect the same worktree ordinary builtin tools use.
         .with_sandbox(cfg.sandbox, cfg.sandbox_writable_roots.clone())
-        .with_workspace(cfg.workdir.clone()),
+        .with_workspace(cfg.workdir.clone())
+        // The configured capacity must reach the coordinator; without this the
+        // factory reports the trait default and the env var is inert.
+        .with_max_resident_subagents(cfg.max_resident_subagents),
     ))
 }
 
@@ -354,8 +357,45 @@ pub fn retire_if_wedged(socket_path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeProbe, probe_runtime, project_runtime_directory};
+    use super::{RuntimeProbe, probe_runtime, project_runtime_directory, worker_factory};
     use yi_agent_store::ipc::Daemon;
+
+    /// The configured capacity must survive the trip through the factory: this
+    /// is what makes `YI_AGENT_MAX_RESIDENT_SUBAGENTS` effective in the daemon
+    /// instead of inert. A regression that drops the `with_max_resident_subagents`
+    /// chain in `worker_factory` fails this with 64 against 8.
+    #[test]
+    fn the_configured_resident_capacity_reaches_the_worker_factory() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let cfg = yi_agent_runtime::config::RuntimeConfig {
+            provider: "anthropic".into(),
+            api_url: "https://api.anthropic.com".into(),
+            api_key: String::new(),
+            model: "test-model".into(),
+            max_turns: 4,
+            max_resident_subagents: 8,
+            workdir: directory.path().to_path_buf(),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: true,
+        };
+        let socket = directory.path().join("runtime.sock");
+
+        let factory = worker_factory(&cfg, socket).expect("factory");
+
+        assert_eq!(
+            factory.max_resident_subagents(),
+            8,
+            "the configured capacity must reach the factory, not the trait default"
+        );
+    }
 
     /// The daemon, the TUI and the app-server must land on one location, so
     /// this is the single place the default is spelled out.
