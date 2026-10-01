@@ -1,5 +1,7 @@
 # Superpowers Kanban 插件
 
+完整安装步骤（含每步的预期输出与卸载）见 [INSTALL.md](INSTALL.md)。
+
 ## 安装
 1. 放入 `superpowers-kanban` 可执行文件（`cargo build -p superpowers-kanban-runner --release`，
    产物名为 `superpowers-kanban`）。
@@ -22,8 +24,22 @@ daemon 常驻（`yi-agent daemon start`）。daemon 会按清单与开关拉起 
 （示例见本目录）。旧名 `kanban.toml` 仍会被读取（迁移期兼容），但**只读不改**。
 
 ## 加入看板
-在 TUI 里 `/superpowers-kanban add <spec> <plan>`；桌面端用看板面板的入队动作。
-宿主只把投递写进 `<项目>/.yi-agent/superpowers-kanban/inbox/`，插件每 tick 消费并入队。
+三种入口，写的是同一个投递目录：
+
+- 命令行：`superpowers-kanban add <spec> <plan>`（可选 `--state-dir <dir>`）
+- TUI：`/superpowers-kanban add <spec> <plan>`
+- 桌面端：看板面板的入队动作
+
+`add` 会先校验两份文件存在且互不相同，失败立刻以非零退出码报错。
+投递写进 `<项目>/.yi-agent/superpowers-kanban/inbox/`，插件每 tick 消费并入队。
+
+## 命令行
+`superpowers-kanban <run|add|list|on|off|workdir>`——`run` 是 daemon 守护的推进循环，
+其余是一次性查询/写入。`workdir` 报告状态目录对应的项目根。
+
+## 开关
+`superpowers-kanban on|off` 写**项目层**（`<项目>/.yi-agent/preferences.json`）。
+全局层在 `~/.yi-agent/preferences.json`，需自行设置。
 
 ## 迁移说明（旧名 → 新名）
 旧布局仍被**读取**，不会被修改或删除：
