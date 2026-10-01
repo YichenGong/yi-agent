@@ -1226,3 +1226,17 @@ git commit -m "docs: record the per-conversation root change and the unenforced 
 | 7 | 结束一个会话不影响另一个 | `cargo test -p yi-agent-store --test runtime_ipc ending_one_conversation_reclaims_only_its_own_root` |
 | 8 | 工作区整体健康 | `cargo clippy --workspace --all-targets -- -D warnings` |
 | 9 | 前端零改动 | `cd desktop && npx tsc --noEmit && npm test` 且 `git diff --stat -- desktop/` 为空 |
+
+---
+
+## Plan corrections discovered during execution
+
+Recorded so the plan matches reality. These are gaps in the original text, found by implementers and verified by the controller.
+
+1. **Task 2's `RuntimeConfig` literal list was incomplete.** It listed 4 sites; there are 5. The fifth is `yi-agent-rs/crates/yi-agent/src/main.rs` (~`:1999`), invisible to `grep "RuntimeConfig {"` because `yi-agent/src/config.rs:12` aliases the type (`pub type Config = yi_agent_runtime::config::RuntimeConfig;`) and the literal is written `Config {`. Discovered by `cargo check --workspace --all-targets`. Rule for future tasks: trust the compiler, not the grep.
+
+2. **Task 2 as written did not achieve Goal G3.** It wired config → factory trait → `RuntimeCoordinator::open` → coordinator, which is verifiable in isolation, but the production factory never forwarded the value: `DaemonAgentWorkerFactory` (`yi-agent-subagent/src/lib.rs`) did not implement `max_resident_subagents`, and `worker_factory` (`yi-agent-subagent/src/attach.rs:78-107`) did not pass `cfg.max_resident_subagents`. Net effect without the fix: `YI_AGENT_MAX_RESIDENT_SUBAGENTS=8` changed the config value but the daemon still admitted 64 — the env var was inert. Fixed in Task 2 fix round 1 by adding the field + builder + trait impl and chaining it in `worker_factory`.
+
+3. **Task 1 has collateral damage the plan did not anticipate.** Changing the default from 16 to 64 broke three tests in `yi-agent-store/tests/runtime_coordinator.rs` that hardcode `16 + 1 = 17` children: `global_resident_capacity_leaves_excess_child_queued`, `releasing_a_resident_lease_admits_a_queued_child`, `fair_resident_grant_is_retained_for_the_selected_queued_child`. Attribution was proven by reproducing the identical failures at Task 1's commit (`487aca8`). Fixed in Task 2 fix round 1 by deriving the count from `DEFAULT_GLOBAL_RESIDENT_SUBAGENTS`. Lesson: a default-value change needs a workspace-wide search for tests that encode the old number, not just a search for the constant.
+
+4. **Test-environment note.** For `yi-agent-store` tests (not for compiling), `TMPDIR=/Users/gongyichen/.t1short` (26 chars) keeps generated socket paths under the 103-byte limit; compiling still needs a TMPDIR clang can write to. Four `ipc::socket_path_tests` failures under the longer TMPDIR are environmental, not defects.
