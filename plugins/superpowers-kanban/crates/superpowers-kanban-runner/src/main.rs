@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn the_sample_calendar_expresses_the_three_and_ten_windows() {
         use superpowers_kanban_core::calendar::ConcurrencyCalendar;
-        let text = include_str!("../../../kanban.toml");
+        let text = include_str!("../../../superpowers-kanban.toml");
         let calendar = ConcurrencyCalendar::from_toml(text).unwrap();
         use chrono::{Datelike, Local, TimeZone, Weekday};
         let at = |y, m, d, h| Local.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap();
