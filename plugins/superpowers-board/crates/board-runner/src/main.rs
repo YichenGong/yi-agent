@@ -91,6 +91,14 @@ fn main() {
         }
 
         let mut board = board_runner::persist::load_board(&board_path);
+        for outcome in
+            board_runner::inbox::consume(&args.state_dir, &mut board, chrono::Local::now())
+        {
+            match outcome.result {
+                Ok(()) => eprintln!("board-runner: enqueued {}", outcome.id),
+                Err(reason) => eprintln!("board-runner: rejected {} ({reason})", outcome.id),
+            }
+        }
         let limit = calendar.limit_at(chrono::Local::now());
 
         // 启动前为每张待启动卡片预建 worktree（纯本地 git，不消耗模型调用）。
