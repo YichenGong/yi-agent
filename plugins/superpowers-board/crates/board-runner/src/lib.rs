@@ -2,3 +2,6 @@
 
 pub mod client;
 pub mod runner;
+
+pub mod persist;
+pub mod worktree;
