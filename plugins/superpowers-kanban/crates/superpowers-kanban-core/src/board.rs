@@ -66,6 +66,12 @@ impl Board {
         self.cards.iter().find(|card| &card.id == id)
     }
 
+    /// 只读遍历全部卡片。CLI 的 `list` 需要报告非排队中的卡片（running /
+    /// done / failed / …），而逐个 `get` 需要先知道 id，做不到。
+    pub fn cards(&self) -> &[Card] {
+        &self.cards
+    }
+
     pub fn len(&self) -> usize {
         self.cards.len()
     }
