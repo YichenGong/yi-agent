@@ -189,14 +189,23 @@ fn build_runtime_tooling(
     attached: &yi_agent_subagent::attach::AttachedProjectRuntime,
     yolo: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<RuntimeTooling, String> {
-    let setup =
-        yi_agent_runtime::bootstrap::build_tool_setup_in(cfg, false, &attached.workspace_root)
-            .map_err(|error| error.to_string())?;
+    // One controller, one truth: it backs the root's builtin tools AND the
+    // subagent spawn tools, and it reads the thread's live YOLO switch.
+    let controller =
+        yi_agent_tools::SandboxController::new(yolo.clone(), cfg.sandbox, cfg.sandbox_promotable);
+    let setup = yi_agent_runtime::bootstrap::build_tool_setup_with_controller(
+        cfg,
+        false,
+        &attached.workspace_root,
+        controller.clone(),
+    )
+    .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
     yi_agent_subagent::register_attached_root_tools(
         &mut registry,
         attached.socket_path.clone(),
         &attached.attached_root,
+        controller,
     );
     let permission = yi_agent_runtime::bootstrap::load_permission_checker_with_switch(
         &attached.workspace_root,
@@ -2138,6 +2147,42 @@ mod tests {
             panic!("a git project must admit a delegated child, got {spawned:?}");
         };
         assert!(!task_id.is_empty(), "the child must get an id to wait on");
+    }
+
+    /// One live controller backs both the root's builtin tools and the
+    /// subagent spawn tools: flipping the thread's YOLO switch must move the
+    /// root's `bash` sandbox, proving there is no second, static copy.
+    #[test]
+    fn delegation_tooling_uses_the_threads_live_yolo_switch() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+        // The default test sandbox is workspace-write and promotable.
+        assert!(cfg.sandbox_promotable);
+
+        let attached =
+            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
+                .expect("a clean git repo must attach");
+
+        let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
+        let tooling = build_runtime_tooling(&cfg, &attached, switch.clone()).expect("tooling");
+        let bash = tooling.registry.get("bash").expect("bash is registered");
+        assert_eq!(
+            bash.sandbox_mode(),
+            Some("workspace-write"),
+            "with YOLO off the root bash runs under workspace-write"
+        );
+
+        // Flipping the thread's live switch must escalate the already-built
+        // registry: the controller is shared, not snapshotted.
+        switch.set(true);
+        assert_eq!(
+            bash.sandbox_mode(),
+            Some("danger-full-access"),
+            "flipping the thread YOLO switch must escalate the root bash sandbox"
+        );
     }
 
     /// A plain directory has no checkout to move into, so the root runs in
