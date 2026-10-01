@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingProvider {
+    pub(crate) struct RecordingProvider {
         requests: Mutex<Vec<ProviderRequest>>,
     }
 
@@ -3233,8 +3233,87 @@ mod tests {
 
 #[cfg(test)]
 mod sandbox_inheritance_tests {
-    use super::{resolve_effective_sandbox, sandbox_mode_str, spawn_sandbox};
+    use super::{
+        DaemonAgentWorkerFactory, resolve_effective_sandbox, sandbox_mode_str, spawn_sandbox,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use yi_agent_core::ToolRegistry;
+    use yi_agent_core::subagent::task::ChildWriteMode;
+    use yi_agent_core::subagent::worker::WorkerWorkspace;
+
+    fn factory_with_sandbox(mode: yi_agent_tools::SandboxMode) -> DaemonAgentWorkerFactory {
+        let dir = std::env::temp_dir();
+        DaemonAgentWorkerFactory::new(
+            Arc::new(crate::tests::RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+            dir.join("runtime.sock"),
+        )
+        .with_sandbox(mode, Vec::new())
+    }
+
+    fn workspace() -> WorkerWorkspace {
+        let dir = std::env::temp_dir();
+        WorkerWorkspace {
+            lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+            repository_root: dir.clone(),
+            path: dir,
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        }
+    }
+
+    /// The user-facing contract: a coding child's registered `bash` sandbox is
+    /// its inherited value clamped up to at least workspace-write, and a
+    /// read-only child stays read-only regardless of inheritance.
+    #[test]
+    fn coding_child_bash_sandbox_tracks_the_inherited_value() {
+        use yi_agent_core::InheritedSandbox;
+        use yi_agent_tools::SandboxMode;
+
+        let factory = factory_with_sandbox(SandboxMode::WorkspaceWrite);
+        let workspace = workspace();
+
+        // Inheriting danger-full-access (the YOLO case) reaches the child bash.
+        let tools = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            Some(InheritedSandbox::DangerFullAccess),
+        );
+        assert_eq!(
+            tools.get("bash").unwrap().sandbox_mode(),
+            Some("danger-full-access")
+        );
+
+        // A read-only inheritance cannot stop a coding child from delivering:
+        // it is clamped up to workspace-write.
+        let tools = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            Some(InheritedSandbox::ReadOnly),
+        );
+        assert_eq!(
+            tools.get("bash").unwrap().sandbox_mode(),
+            Some("workspace-write")
+        );
+
+        // No inheritance: the factory's configured mode stands.
+        let tools = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        assert_eq!(
+            tools.get("bash").unwrap().sandbox_mode(),
+            Some("workspace-write")
+        );
+
+        // A read-only child ignores inheritance entirely.
+        let tools = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::ReadOnly,
+            Some(InheritedSandbox::DangerFullAccess),
+        );
+        assert_eq!(tools.get("bash").unwrap().sandbox_mode(), Some("read-only"));
+    }
 
     #[test]
     fn effective_sandbox_clamps_read_only_up_to_workspace_write() {
