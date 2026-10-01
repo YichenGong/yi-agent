@@ -558,14 +558,27 @@ impl ThreadRoot {
     }
 
     /// The handle a delegation call should act as: the shared socket plus this
-    /// conversation's own root triple.
+    /// conversation's own root triple, resolved *together*.
+    ///
+    /// Invariant: the returned root always belongs to the daemon the returned
+    /// socket points at. A repair can swap in a fresh daemon whose sweep removed
+    /// the root this conversation had cached, so the cached triple must be
+    /// dropped and re-attached whenever it no longer belongs to the live session.
     pub fn handle(&self) -> Result<RuntimeHandle, String> {
-        self.attach()?;
         let shared = self.binding.current_or_repair()?;
-        let root = self
-            .lock_root()
-            .clone()
-            .ok_or_else(|| "the conversation root is not attached".to_string())?;
+        let cached = self.lock_root().clone();
+        let root = match cached {
+            Some(root) if root.session_id == shared.session_id => root,
+            // Either nothing was attached yet, or a repair replaced the daemon
+            // and swept the previous root: attach against the live session.
+            _ => {
+                *self.lock_root() = None;
+                self.attach()?;
+                self.lock_root()
+                    .clone()
+                    .ok_or_else(|| "the conversation root is not attached".to_string())?
+            }
+        };
         Ok(RuntimeHandle {
             socket_path: shared.socket_path,
             workspace_root: shared.workspace_root,
@@ -1240,3 +1253,8 @@ Recorded so the plan matches reality. These are gaps in the original text, found
 3. **Task 1 has collateral damage the plan did not anticipate.** Changing the default from 16 to 64 broke three tests in `yi-agent-store/tests/runtime_coordinator.rs` that hardcode `16 + 1 = 17` children: `global_resident_capacity_leaves_excess_child_queued`, `releasing_a_resident_lease_admits_a_queued_child`, `fair_resident_grant_is_retained_for_the_selected_queued_child`. Attribution was proven by reproducing the identical failures at Task 1's commit (`487aca8`). Fixed in Task 2 fix round 1 by deriving the count from `DEFAULT_GLOBAL_RESIDENT_SUBAGENTS`. Lesson: a default-value change needs a workspace-wide search for tests that encode the old number, not just a search for the constant.
 
 4. **Test-environment note.** For `yi-agent-store` tests (not for compiling), `TMPDIR=/Users/gongyichen/.t1short` (26 chars) keeps generated socket paths under the 103-byte limit; compiling still needs a TMPDIR clang can write to. Four `ipc::socket_path_tests` failures under the longer TMPDIR are environmental, not defects.
+
+5. **Task 3's Step 3 sketch was defective and the review governed.** Two Important defects were found in the code the plan mandated, and the human ruled the review governs (recorded in the SDD ledger):
+   - `handle()` resolved the socket via `current_or_repair()` but served the root triple cached at `attach()` time. After a repair swapped in a fresh daemon (whose sweep removes the old root), the caller got the new socket paired with a swept root — a silent failure surfacing only as a server-side "task does not exist". Fixed by resolving the socket and the triple together: the cached root is re-attached whenever its `session_id` no longer matches the live session.
+   - The documented self-healing was not delivered: `RuntimeBinding::current()` is infallible, so `current_or_repair()` never reaches `repair()`. Fixed by routing the root's IPC through `RuntimeBinding::send`, which repairs and retries once on a liveness error.
+   The corrected sketch is inlined above in Task 3 Step 3.
