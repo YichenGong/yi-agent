@@ -80,11 +80,10 @@ pub fn save(workdir: &Path, pref: RuntimePreference) -> std::io::Result<()> {
             .unwrap_or_default(),
         Err(_) => serde_json::Map::new(),
     };
-    let value = serde_json::to_value(pref)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let value = serde_json::to_value(pref).map_err(std::io::Error::other)?;
     object.insert("subagent_runtime".to_string(), value);
     let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        .map_err(std::io::Error::other)?;
     let tmp_path = dir.join("preferences.json.tmp");
     std::fs::write(&tmp_path, &text)?;
     std::fs::rename(&tmp_path, &path)
