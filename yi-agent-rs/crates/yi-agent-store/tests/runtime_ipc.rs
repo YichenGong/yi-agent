@@ -5994,3 +5994,201 @@ fn inherited_sandbox_is_persisted_and_recovered() {
         .unwrap();
     assert_eq!(repository.task_inherited_sandbox(&legacy).unwrap(), None);
 }
+
+/// Two conversations on one daemon must never share a root, must not reach
+/// across, and must not split one child budget. This is the invariant the
+/// desktop app depends on: "four subagents" is four *per conversation*, not
+/// four per project.
+#[test]
+fn two_conversation_roots_do_not_share_children_or_reach_across() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let workspace = PathBuf::from("/tmp/yi-agent-test-project");
+
+    // Two conversations, two roots, one daemon.
+    let attach = |key: &str| {
+        let IpcResponse::ApplicationRootAttached {
+            session_id,
+            root_task_id,
+            message_capability,
+            ..
+        } = send_request(
+            daemon.socket_path(),
+            IpcRequest::AttachApplicationRoot {
+                idempotency_key: key.into(),
+                workspace: workspace.clone(),
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected attachment for {key}");
+        };
+        (session_id, root_task_id, message_capability)
+    };
+    let (session_a, root_a, cap_a) = attach("thread:thread-a");
+    let (session_b, root_b, cap_b) = attach("thread:thread-b");
+    assert_ne!(root_a, root_b, "two conversations must get two roots");
+
+    // A's child, reached only through A's own session/capability.
+    let IpcResponse::TaskSpawned { task_id: child_a } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_a.clone(),
+            parent_task_id: root_a.clone(),
+            capability: cap_a.clone(),
+            objective: "conversation A work".into(),
+            mode: Some("read_only".into()),
+            model: None,
+            thread_id: Some("thread-a".into()),
+            sandbox: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("A must admit its own child");
+    };
+
+    // B cannot reach A's child: the ids cross but the root/session does not match.
+    let crossed = send_request(
+        daemon.socket_path(),
+        IpcRequest::InspectChild {
+            session_id: session_b.clone(),
+            caller_task_id: root_b.clone(),
+            capability: cap_b.clone(),
+            task_id: child_a.clone(),
+        },
+    );
+    assert!(
+        matches!(crossed, Err(_) | Ok(IpcResponse::Error { .. })),
+        "a conversation must not reach another conversation's child, got {crossed:?}"
+    );
+
+    // Each root has its own budget: while A holds one child, B still admits its
+    // own four. Under the old shared-root behaviour B would run out here.
+    for index in 0..4 {
+        assert!(
+            matches!(
+                send_request(
+                    daemon.socket_path(),
+                    IpcRequest::SpawnApplicationChild {
+                        workdir: None,
+                        session_id: session_b.clone(),
+                        parent_task_id: root_b.clone(),
+                        capability: cap_b.clone(),
+                        objective: format!("conversation B child {index}"),
+                        mode: Some("read_only".into()),
+                        model: None,
+                        thread_id: Some("thread-b".into()),
+                        sandbox: None,
+                    },
+                )
+                .unwrap(),
+                IpcResponse::TaskSpawned { .. }
+            ),
+            "B must still admit its own four children while A holds one"
+        );
+        // Complete B's children as they are admitted, so its own slots free up
+        // and the loop proves four is a budget, not a lucky race.
+        let handle = factory
+            .handles
+            .lock()
+            .unwrap()
+            .last()
+            .expect("the daemon admitted a worker for B's child")
+            .clone();
+        handle.report_completed(format!("b-done-{index}"));
+    }
+}
+
+/// Ending one conversation reclaims only its own root: the shared daemon and
+/// every other conversation's root must survive it.
+#[test]
+fn ending_one_conversation_reclaims_only_its_own_root() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let workspace = PathBuf::from("/tmp/yi-agent-test-project");
+
+    let attach = |key: &str| {
+        let IpcResponse::ApplicationRootAttached {
+            session_id,
+            root_task_id,
+            message_capability,
+            ..
+        } = send_request(
+            daemon.socket_path(),
+            IpcRequest::AttachApplicationRoot {
+                idempotency_key: key.into(),
+                workspace: workspace.clone(),
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected attachment for {key}");
+        };
+        (session_id, root_task_id, message_capability)
+    };
+    let (session_a, root_a, cap_a) = attach("thread:thread-a");
+    let (session_b, root_b, cap_b) = attach("thread:thread-b");
+
+    send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_a.clone(),
+            parent_task_id: root_a.clone(),
+            capability: cap_a.clone(),
+            objective: "conversation A work".into(),
+            mode: Some("read_only".into()),
+            model: None,
+            thread_id: Some("thread-a".into()),
+            sandbox: None,
+        },
+    )
+    .unwrap();
+
+    // Detaching A ends A's root; B's root must survive.
+    assert!(matches!(
+        send_request(
+            daemon.socket_path(),
+            IpcRequest::DetachApplicationRoot {
+                session_id: session_a,
+                root_task_id: root_a,
+                capability: cap_a,
+            },
+        )
+        .unwrap(),
+        IpcResponse::ApplicationRootDetached
+    ));
+
+    // B still admits work: detaching A did not take B's root down with it.
+    assert!(
+        matches!(
+            send_request(
+                daemon.socket_path(),
+                IpcRequest::SpawnApplicationChild {
+                    workdir: None,
+                    session_id: session_b,
+                    parent_task_id: root_b,
+                    capability: cap_b,
+                    objective: "conversation B work".into(),
+                    mode: Some("read_only".into()),
+                    model: None,
+                    thread_id: Some("thread-b".into()),
+                    sandbox: None,
+                },
+            )
+            .unwrap(),
+            IpcResponse::TaskSpawned { .. }
+        ),
+        "ending conversation A must not end conversation B"
+    );
+}

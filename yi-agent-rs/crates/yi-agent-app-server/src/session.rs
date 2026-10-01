@@ -14,13 +14,13 @@ use crate::protocol::ThreadStatus;
 pub struct TurnPrompt {
     pub turn_id: String,
     pub prompt: String,
-    /// 该 thread 若已 attach 到项目 runtime,则带上它的 binding,在**首个 turn** 激活。
+    /// 该 thread 若已 attach 到项目 runtime,则带上它自己的 root,在**首个 turn** 激活。
     ///
     /// 激活是同步 socket 调用,放在 driver 里(而不是请求循环)才不会让一个 thread
     /// 卡住所有 thread 的请求处理;用首个 turn 的真正 prompt 作 objective,因为
-    /// objective 会被写进 root 任务。带上 binding 而非某个快照,这样激活前能先探活、
-    /// 必要时重建 runtime。
-    pub activate: Option<Arc<yi_agent_subagent::binding::RuntimeBinding>>,
+    /// objective 会被写进 root 任务。带上 root 而非某个快照,这样激活前能先探活、
+    /// 必要时重建 runtime 并重挂本会话的 root。
+    pub activate: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>>,
 }
 
 /// 一条中途追加的用户消息,投递给该 thread 的 driver。

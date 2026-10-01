@@ -30,6 +30,7 @@ use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
 use yi_agent_subagent::binding::RuntimeBinding;
+use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -71,6 +72,22 @@ struct RuntimeTooling {
 /// bring-up(git 检查 + daemon 起停尝试)。
 type ProjectRuntimes = Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
 
+/// 每会话自己的 root,建在项目共享 binding 之上。
+///
+/// runtime(daemon)按项目共享,是 G2;root 按会话独立,是这次改动的核心——
+/// 一个 root 才是一份 `MAX_DIRECT_CHILDREN` 预算,两个会话共用一个 root 就会共用
+/// 一份预算,这正是桌面端「四个就满」的成因。
+type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
+
+/// 本进程的 runtime 接线:daemon 按项目共享,root 按会话持有。
+///
+/// 两者成对传递,调用点无法只更新一半——只换了 daemon 映射、忘了 root 映射,
+/// 正是「每个会话应当有自己的 root」这条不变量最危险的破坏方式。
+struct RuntimeAttachments {
+    runtimes: ProjectRuntimes,
+    thread_roots: ThreadRoots,
+}
+
 /// The key that identifies one project directory across this process.
 ///
 /// Runtime attach and every later lookup must agree on this value, so it is
@@ -110,7 +127,7 @@ fn project_key(path: &Path) -> PathBuf {
 /// 一次 attach 的结果:可能被换过工具集的 agent,以及该 thread 首个 turn 要激活的 runtime。
 struct Activation {
     built: BuiltAgent,
-    runtime: Option<Arc<RuntimeBinding>>,
+    runtime: Option<Arc<ThreadRoot>>,
 }
 
 /// 为该 cwd 的 agent 接上委派能力。失败即降级:保留原 agent,只记 trace。
@@ -120,6 +137,8 @@ struct Activation {
 /// `threads.insert(..)` 是安全的。
 fn attach_delegation(
     runtimes: &ProjectRuntimes,
+    thread_roots: &ThreadRoots,
+    runtime_dir: &Path,
     cfg: &RuntimeConfig,
     cwd: &str,
     thread_id: &str,
@@ -127,9 +146,8 @@ fn attach_delegation(
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
     thread_cfg.workdir = PathBuf::from(cwd);
-    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&thread_cfg.workdir);
-    let runtime = match attach_cwd_runtime(runtimes, &runtime_dir, &thread_cfg) {
-        Ok(runtime) => runtime,
+    let binding = match attach_cwd_runtime(runtimes, runtime_dir, &thread_cfg) {
+        Ok(binding) => binding,
         Err(cause) => {
             tracing::warn!(
                 stage = "attach",
@@ -143,10 +161,31 @@ fn attach_delegation(
             };
         }
     };
-    match build_runtime_tooling(&thread_cfg, &runtime, thread_id, built.yolo.clone()) {
+    // The daemon is shared per project, but the root is per conversation: the
+    // root is what carries the child budget, so two conversations in one
+    // directory must never share it.
+    let root = ThreadRoot::new(Arc::clone(&binding), thread_id, PathBuf::from(cwd));
+    if let Err(cause) = root.attach() {
+        tracing::warn!(
+            stage = "attach_root",
+            %cause,
+            cwd,
+            thread_id,
+            "subagent delegation unavailable for this thread"
+        );
+        return Activation {
+            built,
+            runtime: None,
+        };
+    }
+    thread_roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(thread_id.to_string(), Arc::clone(&root));
+    match build_runtime_tooling(&thread_cfg, &root, thread_id, built.yolo.clone()) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
-            runtime: Some(runtime),
+            runtime: Some(root),
         },
         Err(cause) => {
             tracing::warn!(
@@ -517,13 +556,13 @@ fn attached_runtimes(runtimes: &ProjectRuntimes) -> Vec<Arc<RuntimeBinding>> {
 /// 与权限层会脱钩。
 fn build_runtime_tooling(
     cfg: &RuntimeConfig,
-    binding: &Arc<RuntimeBinding>,
+    root: &Arc<ThreadRoot>,
     thread_id: &str,
     yolo: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<RuntimeTooling, String> {
-    // The tools get the binding itself, not its snapshot: they re-resolve the
-    // live socket and root on every call.
-    let workspace_root = binding.current()?.workspace_root;
+    // The tools get the root handle itself, not its snapshot: they re-resolve
+    // the live socket and this conversation's own root on every call.
+    let workspace_root = root.handle()?.workspace_root;
     // One controller, one truth: it backs the root's builtin tools AND the
     // subagent spawn tools, and it reads the thread's live YOLO switch.
     let controller =
@@ -541,7 +580,7 @@ fn build_runtime_tooling(
     // their own so every child they spawn is tagged with this conversation.
     yi_agent_subagent::register_attached_root_tools_in_thread(
         &mut registry,
-        Arc::clone(binding),
+        Arc::clone(root),
         controller,
         Some(thread_id.to_string()),
     );
@@ -683,13 +722,17 @@ where
     let cfg_for_factory = cfg.clone();
     let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
     run_with(
         reader,
         writer,
         cfg,
         PERMISSION_TIMEOUT,
         workspaces,
-        runtimes,
+        RuntimeAttachments {
+            runtimes,
+            thread_roots,
+        },
         move |session, cwd, mode| {
             let mut thread_cfg = cfg_for_factory.clone();
             thread_cfg.workdir = cwd.to_path_buf();
@@ -726,7 +769,7 @@ async fn run_with<R, W, F>(
     cfg: RuntimeConfig,
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
-    runtimes: ProjectRuntimes,
+    attachments: RuntimeAttachments,
     build_agent: F,
 ) -> anyhow::Result<()>
 where
@@ -740,6 +783,10 @@ where
         + Send
         + 'static,
 {
+    let RuntimeAttachments {
+        runtimes,
+        thread_roots,
+    } = attachments;
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
     let (req_tx, mut req_rx) = mpsc::channel::<anyhow::Result<String>>(64);
@@ -780,7 +827,7 @@ where
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
-    let mut pending_activation: HashMap<String, Option<Arc<RuntimeBinding>>> = HashMap::new();
+    let mut pending_activation: HashMap<String, Option<Arc<ThreadRoot>>> = HashMap::new();
     // 每个 thread 至多一条被关注的轨迹流。换任务即替换(不并存),thread 删除即收尾。
     let mut trace_watches: HashMap<String, TraceWatch> = HashMap::new();
     // 每个 thread 至多一个子任务列表守望者,首次 agent/children/list 时建立。
@@ -1090,7 +1137,17 @@ where
                         };
                         // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
                         // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
-                        let activation = attach_delegation(&runtimes, &cfg, &cwd, &thread_id, built);
+                        let runtime_dir =
+                            yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
+                        let activation = attach_delegation(
+                            &runtimes,
+                            &thread_roots,
+                            &runtime_dir,
+                            &cfg,
+                            &cwd,
+                            &thread_id,
+                            built,
+                        );
                         let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
                             activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
@@ -1290,7 +1347,17 @@ where
                                 continue;
                             }
                         };
-                        let activation = attach_delegation(&runtimes, &cfg, &cwd, &thread_id, built);
+                        let runtime_dir =
+                            yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
+                        let activation = attach_delegation(
+                            &runtimes,
+                            &thread_roots,
+                            &runtime_dir,
+                            &cfg,
+                            &cwd,
+                            &thread_id,
+                            built,
+                        );
                         let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
                             activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
@@ -1513,6 +1580,16 @@ where
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         pending_activation.remove(&thread_id);
+                        // End this conversation's own root before the shared binding is
+                        // considered for detach: the root is per conversation, the
+                        // binding is per project and outlives any single conversation.
+                        if let Some(root) = thread_roots
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&thread_id)
+                        {
+                            root.detach();
+                        }
                         if let Some(watch) = trace_watches.remove(&thread_id) {
                             watch.stop().await;
                         }
@@ -2919,10 +2996,11 @@ mod tests {
         );
         let binding =
             RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
 
         let tooling = build_runtime_tooling(
             &cfg,
-            &binding,
+            &root,
             "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
         )
@@ -2983,7 +3061,7 @@ mod tests {
             yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
                 .expect("a clean git repo must attach");
 
-        let binding = Arc::new(yi_agent_subagent::binding::RuntimeBinding::fixed(
+        let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
             yi_agent_subagent::binding::RuntimeHandle {
                 socket_path: attached.socket_path.clone(),
                 workspace_root: attached.workspace_root.clone(),
@@ -2991,10 +3069,11 @@ mod tests {
                 task_id: attached.attached_root.task_id.clone(),
                 capability: attached.attached_root.capability.clone(),
             },
-        ));
+        );
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
         let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
         let tooling =
-            build_runtime_tooling(&cfg, &binding, "thread-test", switch.clone()).expect("tooling");
+            build_runtime_tooling(&cfg, &root, "thread-test", switch.clone()).expect("tooling");
         let bash = tooling.registry.get("bash").expect("bash is registered");
         assert_eq!(
             bash.sandbox_mode(),
@@ -3033,9 +3112,10 @@ mod tests {
         );
         let binding =
             RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
         let names = build_runtime_tooling(
             &cfg,
-            &binding,
+            &root,
             "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
         )
@@ -3137,25 +3217,55 @@ mod tests {
         assert_eq!(project_key(&link), project_key(target.path()));
     }
 
-    /// A second thread in one cwd reuses the attached runtime: the app-server is
-    /// one long-lived process, but a runtime is per project.
+    /// Two threads in one cwd share the daemon but never the root: sharing the
+    /// root is what made every conversation in a directory split one
+    /// `MAX_DIRECT_CHILDREN` budget.
+    ///
+    /// It drives the real wiring (`attach_delegation`), not two hand-built
+    /// `ThreadRoot`s: a test that builds its own roots would stay green even
+    /// while the wiring still shared one.
     #[test]
-    fn two_threads_in_one_cwd_share_one_attached_runtime() {
+    fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         let repo = tempfile::TempDir::new().unwrap();
         let runtime = tempfile::TempDir::new().unwrap();
         init_git_repo(repo.path());
         let mut cfg = test_config();
         cfg.workdir = repo.path().to_path_buf();
         let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+        let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+        let cwd = cfg.workdir.to_string_lossy().to_string();
 
-        let first = attach_cwd_runtime(&runtimes, runtime.path(), &cfg).expect("first attach");
-        let second = attach_cwd_runtime(&runtimes, runtime.path(), &cfg).expect("second attach");
-
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a second thread in the same cwd must reuse the attached runtime"
+        let first = attach_delegation(
+            &runtimes,
+            &thread_roots,
+            runtime.path(),
+            &cfg,
+            &cwd,
+            "thread-a",
+            build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
-        assert_eq!(runtimes.lock().unwrap().len(), 1);
+        let second = attach_delegation(
+            &runtimes,
+            &thread_roots,
+            runtime.path(),
+            &cfg,
+            &cwd,
+            "thread-b",
+            build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
+        );
+
+        assert_eq!(runtimes.lock().unwrap().len(), 1, "one daemon per project");
+        let a = first
+            .runtime
+            .expect("thread a attached")
+            .root_task_id()
+            .expect("thread a root is attached");
+        let b = second
+            .runtime
+            .expect("thread b attached")
+            .root_task_id()
+            .expect("thread b root is attached");
+        assert_ne!(a, b, "two conversations must not share one root");
     }
 
     /// A runtime whose daemon died (its owning terminal was closed, say) must
@@ -3466,7 +3576,10 @@ mod tests {
                 cfg,
                 permission_timeout,
                 workspaces,
-                Arc::new(StdMutex::new(HashMap::new())),
+                RuntimeAttachments {
+                    runtimes: Arc::new(StdMutex::new(HashMap::new())),
+                    thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                },
                 build,
             ));
             Self {
@@ -4000,7 +4113,10 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
-            Arc::new(StdMutex::new(HashMap::new())),
+            RuntimeAttachments {
+                runtimes: Arc::new(StdMutex::new(HashMap::new())),
+                thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            },
             build_test_agent,
         ));
 
@@ -4054,7 +4170,10 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
-            Arc::new(StdMutex::new(HashMap::new())),
+            RuntimeAttachments {
+                runtimes: Arc::new(StdMutex::new(HashMap::new())),
+                thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            },
             |_s: Option<yi_agent_core::Session>,
              _cwd: &std::path::Path,
              _mode: crate::thread_store::ThreadMode| {
@@ -4112,7 +4231,10 @@ mod tests {
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
-            Arc::new(StdMutex::new(HashMap::new())),
+            RuntimeAttachments {
+                runtimes: Arc::new(StdMutex::new(HashMap::new())),
+                thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            },
             build_test_agent,
         ));
 
