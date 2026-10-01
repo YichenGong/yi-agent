@@ -1522,7 +1522,7 @@ where
                             children_for_thread(&snapshot.unwrap_or_default(), &thread_id);
                         // 首次拉取时建立守望者:此后列表变化由 agent/children/updated 推出,
                         // 客户端不必轮询。daemon 不可达时不建立(没有可观察的变化)。
-                        if children_watches.get(&thread_id).is_none() {
+                        if !children_watches.contains_key(&thread_id) {
                             if let Some(socket) = socket_for_thread(&runtimes, &threads, &thread_id) {
                                 let task = tokio::spawn(watch_children(
                                     Arc::clone(&writer),

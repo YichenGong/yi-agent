@@ -1304,24 +1304,23 @@ impl TraceSubscription {
                 }
             }
         }
-        loop {
-            match self.next_frame() {
-                Ok(envelope) => match envelope.result {
-                    IpcResponse::TraceEvent(row) => return Ok(Some(row)),
-                    IpcResponse::ResyncRequired => return Ok(None),
-                    other => {
-                        return Err(IpcError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unexpected frame on a trace subscription: {other:?}"),
-                        )));
-                    }
-                },
-                // A closed stream is the documented end of the subscription.
-                Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
+        // Every outcome of one frame is terminal for this call: a row, the end
+        // of the stream, or an error. `next_row` is therefore a single read, not
+        // a loop; a caller that wants to keep going just calls it again.
+        match self.next_frame() {
+            Ok(envelope) => match envelope.result {
+                IpcResponse::TraceEvent(row) => Ok(Some(row)),
+                IpcResponse::ResyncRequired => Ok(None),
+                other => Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unexpected frame on a trace subscription: {other:?}"),
+                ))),
+            },
+            // A closed stream is the documented end of the subscription.
+            Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Ok(None)
             }
+            Err(error) => Err(error),
         }
     }
 }
@@ -1774,6 +1773,7 @@ fn trace_snapshot(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_trace_subscription(
     stream: &mut UnixStream,
     database_path: &Path,
@@ -1829,10 +1829,9 @@ fn stream_trace_subscription(
                 fresh.sort_by_key(|row| row.event_id);
                 for row in fresh {
                     cursor = row.event_id;
-                    if kinds.is_empty() || kinds.iter().any(|kind| kind == &row.kind) {
-                        if !producer_pending.push_trace_row(row) {
-                            return Ok(());
-                        }
+                    let wanted = kinds.is_empty() || kinds.iter().any(|kind| kind == &row.kind);
+                    if wanted && !producer_pending.push_trace_row(row) {
+                        return Ok(());
                     }
                 }
                 thread::sleep(Duration::from_millis(10));

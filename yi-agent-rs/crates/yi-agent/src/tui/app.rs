@@ -732,7 +732,7 @@ enum RuntimePopup {
     None,
     Bash(BashPopup),
     Processes(ProcessPopup),
-    Agents(AgentsPopup),
+    Agents(Box<AgentsPopup>),
 }
 
 /// The subagent tab: the child list, the open detail, and the small amount of
@@ -782,7 +782,7 @@ impl RuntimePopup {
                 Self::Processes(ProcessPopup::List(ProcessListPopup::new()))
             }
             Some(RuntimeTab::BashTasks) => Self::Bash(BashPopup::List(ListPopup::new(process_ids))),
-            Some(RuntimeTab::Agents) => Self::Agents(AgentsPopup::new(children)),
+            Some(RuntimeTab::Agents) => Self::Agents(Box::new(AgentsPopup::new(children))),
             None => Self::None,
         };
     }
@@ -819,7 +819,7 @@ fn switch_runtime_tab_for_test(
         Some(RuntimeTab::BashTasks) => {
             RuntimePopup::Bash(BashPopup::List(ListPopup::new(bash_ids.to_vec())))
         }
-        Some(RuntimeTab::Agents) => RuntimePopup::Agents(AgentsPopup::new(children)),
+        Some(RuntimeTab::Agents) => RuntimePopup::Agents(Box::new(AgentsPopup::new(children))),
         None => RuntimePopup::None,
     };
 }
@@ -1190,7 +1190,7 @@ fn open_agent_detail(
 ) {
     let mut agents = AgentsPopup::new(children.clone());
     agents.detail = Some(TracePopup::Detail(TraceDetailPopup::new(task_id)));
-    *runtime_popup = RuntimePopup::Agents(agents);
+    *runtime_popup = RuntimePopup::Agents(Box::new(agents));
 }
 
 fn handle_agents_key(
@@ -1384,10 +1384,10 @@ fn sync_trace_streams(
     let (pending, showing) = match runtime_popup {
         RuntimePopup::Agents(agents) => {
             let pending = agents.pending.take();
-            let showing = match &agents.detail {
-                Some(TracePopup::Detail(detail)) => Some(detail.task_id().to_string()),
-                None => None,
-            };
+            let showing = agents
+                .detail
+                .as_ref()
+                .map(|TracePopup::Detail(detail)| detail.task_id().to_string());
             (pending, showing)
         }
         _ => (None, None),
@@ -6406,7 +6406,7 @@ mod tests {
     #[test]
     fn enter_on_a_list_row_opens_that_agents_detail() {
         let children = subagent_items();
-        let mut popup = RuntimePopup::Agents(AgentsPopup::new(children.clone()));
+        let mut popup = RuntimePopup::Agents(Box::new(AgentsPopup::new(children.clone())));
 
         agents_key(key(KeyCode::Down), &mut popup, &children);
         agents_key(key(KeyCode::Enter), &mut popup, &children);
@@ -6423,7 +6423,7 @@ mod tests {
     #[test]
     fn esc_in_a_detail_returns_to_the_list_before_closing_the_popup() {
         let children = subagent_items();
-        let mut popup = RuntimePopup::Agents(AgentsPopup::new(children.clone()));
+        let mut popup = RuntimePopup::Agents(Box::new(AgentsPopup::new(children.clone())));
         agents_key(key(KeyCode::Enter), &mut popup, &children);
 
         agents_key(key(KeyCode::Esc), &mut popup, &children);
@@ -6437,7 +6437,7 @@ mod tests {
     #[test]
     fn esc_on_the_agent_list_closes_the_popup() {
         let children = subagent_items();
-        let mut popup = RuntimePopup::Agents(AgentsPopup::new(children.clone()));
+        let mut popup = RuntimePopup::Agents(Box::new(AgentsPopup::new(children.clone())));
 
         agents_key(key(KeyCode::Esc), &mut popup, &children);
 
