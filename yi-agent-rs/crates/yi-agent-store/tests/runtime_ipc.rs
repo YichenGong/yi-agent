@@ -5739,3 +5739,58 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
         "the partial transcript must survive the restart"
     );
 }
+
+#[test]
+fn daemon_creates_an_autonomous_session_bound_to_a_worktree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let worktree = directory.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let factory = Arc::new(RecordingWorkerFactory);
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory).unwrap();
+    let socket = daemon.socket_path().to_path_buf();
+
+    let response = send_request(
+        &socket,
+        IpcRequest::CreateAutonomousSession {
+            objective: "implement the plan".into(),
+            workdir: worktree.to_string_lossy().to_string(),
+        },
+    )
+    .unwrap();
+
+    let IpcResponse::AutonomousSessionCreated {
+        session_id,
+        root_task_id,
+    } = response
+    else {
+        panic!("expected an autonomous session, got {response:?}");
+    };
+    assert!(!session_id.is_empty());
+    assert!(!root_task_id.is_empty());
+}
+
+#[test]
+fn daemon_refuses_an_autonomous_session_in_a_missing_directory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(RecordingWorkerFactory);
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory).unwrap();
+    let socket = daemon.socket_path().to_path_buf();
+
+    let response = send_request(
+        &socket,
+        IpcRequest::CreateAutonomousSession {
+            objective: "implement the plan".into(),
+            workdir: directory.path().join("nope").to_string_lossy().to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        matches!(response, IpcResponse::Error { .. }),
+        "a missing workdir must be refused, got {response:?}"
+    );
+}

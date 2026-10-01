@@ -203,6 +203,13 @@ pub enum IpcRequest {
         session_id: String,
         task_id: String,
     },
+    /// Creates a root session that runs `objective` autonomously in `workdir`
+    /// and starts its worker. Generic: the daemon does not interpret the
+    /// objective, and `workdir` must already exist as a git worktree.
+    CreateAutonomousSession {
+        objective: String,
+        workdir: String,
+    },
     CancelTask {
         session_id: String,
         task_id: String,
@@ -350,6 +357,10 @@ pub enum IpcResponse {
     },
     Stopping,
     SessionCreated {
+        session_id: String,
+        root_task_id: String,
+    },
+    AutonomousSessionCreated {
         session_id: String,
         root_task_id: String,
     },
@@ -2575,6 +2586,18 @@ fn respond(
                 .build()?;
             runtime.block_on(coordinator.start_worker(&session_id, &task_id))?;
             Ok(IpcResponse::TaskStarted)
+        }
+        IpcRequest::CreateAutonomousSession { objective, workdir } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let created = runtime.block_on(
+                coordinator.create_autonomous_session(objective, std::path::PathBuf::from(workdir)),
+            )?;
+            Ok(IpcResponse::AutonomousSessionCreated {
+                session_id: created.session_id.to_string(),
+                root_task_id: created.root_task_id.to_string(),
+            })
         }
         IpcRequest::CancelTask { .. } => Ok(IpcResponse::Error {
             code: IpcErrorCode::ConfirmationRequired,
