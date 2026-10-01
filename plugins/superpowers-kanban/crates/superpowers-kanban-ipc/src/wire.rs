@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 插件说的协议版本。**必须与宿主的 `yi-agent-store::ipc::PROTOCOL_VERSION` 同步**。
+///
+/// 插件零 `yi-agent-*` 依赖，协议只能手写复刻，版本号也只能手抄——这正是它
+/// 曾经停在 1、而宿主已到 2 的原因：daemon 严格拒绝版本不匹配，于是"建会话"
+/// 这条路从 v2 起一直是断的，卡片永远停在 queued。
+///
+/// 宿主的 `wire` 形状（信封字段、命令/回复变体）在两版之间**没有变**，
+/// 变版本号只是为了拒绝旧 daemon 时给出清晰错误而非解析错误。
+/// 宿主侧有测试读这个文件比对版本，漂移会立刻炸。
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

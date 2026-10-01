@@ -3808,6 +3808,43 @@ impl AgentWorkerFactory for UnavailableWorkerFactory {
 }
 
 #[cfg(test)]
+mod plugin_protocol_tests {
+    //! 插件与宿主的协议版本必须同步。
+    //!
+    //! 插件零 `yi-agent-*` 依赖，协议只能手写复刻，版本号也只能手抄。它曾经停在
+    //! 1 而宿主已到 2：daemon 严格拒绝版本不匹配，于是"插件建会话"这条路一直是
+    //! 断的（卡片永远停在 queued），而且不报错、只静默失败。
+    //!
+    //! 宿主的信封字段与命令/回复变体在两版之间没有变，所以这条测试只需要盯版本号。
+    //! 目录缺失时跳过：插件可独立卸载，宿主不该因为插件不在而构建失败。
+
+    use super::PROTOCOL_VERSION;
+
+    fn plugin_protocol_version() -> Option<u32> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../plugins/superpowers-kanban/crates/superpowers-kanban-ipc/src/wire.rs");
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("pub const PROTOCOL_VERSION"))?;
+        let value = line.split_once('=')?.1;
+        Some(value.trim().trim_end_matches(';').trim().parse().ok()?)
+    }
+
+    #[test]
+    fn the_plugin_speaks_the_hosts_protocol_version() {
+        let Some(plugin) = plugin_protocol_version() else {
+            return; // 插件目录不在：无从对照。
+        };
+        assert_eq!(
+            plugin, PROTOCOL_VERSION,
+            "插件说 {plugin}、宿主说 {PROTOCOL_VERSION}：daemon 会拒绝插件的每一个请求，\
+             卡片将永远停在 queued 且不报错"
+        );
+    }
+}
+
+#[cfg(test)]
 mod socket_path_tests {
     use super::*;
 

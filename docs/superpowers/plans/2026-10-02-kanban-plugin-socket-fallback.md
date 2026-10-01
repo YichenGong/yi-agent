@@ -36,17 +36,17 @@
   - `pub fn daemon_socket_for(runtime_dir: &Path) -> Result<PathBuf, SocketPathError>`——
     复刻宿主 `socket_path_for`（`yi-agent-` 前缀，哈希 runtime_dir）。
 
-- [ ] **Step 1: 写失败测试**（socket.rs 内）
+- [x] **Step 1: 写失败测试**（socket.rs 内）
   1. 短路径直通，返回原路径；
   2. 长路径回退到 `temp_dir()/plugin-<16hex>.sock`，且**确定**（两次同值）；
   3. 回退结果与宿主 `yi-agent-` 前缀**不同名**；
   4. 回退后仍超长 → `Err`；
   5. `daemon_socket_for` 对 `LONG_RUNTIME_DIR` 的样例值与宿主 `socket_path_for` **一致**
      （跨端一致性靠这条锁住）。
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -61,12 +61,12 @@
 - Produces: `query_socket_path(...) -> Option<Result<PathBuf, …>>` 或等价形态——
   展开后按 `plugin-` 规则解析。
 
-- [ ] **Step 1: 写失败测试**——深 `state_dir` 下，展开结果等于
+- [x] **Step 1: 写失败测试**——深 `state_dir` 下，展开结果等于
   `temp_dir()/plugin-<sha256(展开路径)16>.sock`。
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -75,22 +75,22 @@
 **Files:**
 - Test: `plugins/superpowers-kanban/crates/superpowers-kanban-ipc/tests/`（新文件）或主工作区集成测试
 
-- [ ] **Step 1: 写测试**——对同一深 `state_dir`：
+- [x] **Step 1: 写测试**——对同一深 `state_dir`：
   宿主 `query_socket_path` 的结果 == 插件 `server::socket_path` 的结果。
   两端各写死一条**期望值**（同一字符串），任一侧规则漂移都会炸。
-- [ ] **Step 2: 运行确认通过**（若失败，说明两侧规则没对齐，回 Task 1/2 修）
-- [ ] **Step 3: Commit**
+- [x] **Step 2: 运行确认通过**（若失败，说明两侧规则没对齐，回 Task 1/2 修）
+- [x] **Step 3: Commit**
 
 ---
 
 ### Task 4: 真实插件的深路径集成 + 手工冒烟
 
-- [ ] **Step 1: 集成测试**——长路径项目 + 内嵌 daemon + 真清单：
+- [x] **Step 1: 集成测试**——长路径项目 + 内嵌 daemon + 真清单：
   断言插件进程被拉起、**socket 被 bind 上**、`PluginQuery` 能取到 `switch.read`。
-- [ ] **Step 2: 全量回归**——主工作区、插件 115+、桌面 282、`grep -rn yi_agent_board_ui` 为空。
-- [ ] **Step 3: 手工冒烟**——本仓库（深路径）重启 TUI，`/superpowers-kanban` 看到队列；
+- [x] **Step 2: 全量回归**——主工作区、插件 115+、桌面 282、`grep -rn yi_agent_board_ui` 为空。
+- [x] **Step 3: 手工冒烟**——本仓库（深路径）重启 TUI，`/superpowers-kanban` 看到队列；
   那张冒烟卡从 `queued` 真正跑起来（用户已认领此步）。
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ---
 
@@ -108,3 +108,19 @@
 - 不改插件→daemon 的线协议。
 - 不改清单里 `query_socket` 的模板写法。
 - #3（看板按项目目录组织）另开一轮，不在本 plan。
+
+---
+
+### Task 5: 协议版本对齐（实施中发现，spec §6）
+
+- [x] 插件 `PROTOCOL_VERSION` 1 → 2（与宿主对齐）
+- [x] 宿主侧防漂移测试：读插件 `wire.rs` 比对，目录缺失跳过
+- [x] 反向验证：插件退回 1 时测试红
+- [x] 提交
+
+## 实施结果
+
+- 深路径（188 字节）真实闭环：入队 → 消费 → 预建 worktree → **Launched / running**
+- 三处修复：插件 socket 回退、宿主转发表回退、协议版本对齐
+- 两把锁：socket 契约夹具（两端共读）、协议版本比对（宿主读插件源码）
+- 另记录一个非代码问题：`cp` 覆盖安装触发 macOS 签名缓存拒绝，需重签名
