@@ -49,8 +49,11 @@ impl From<std::io::Error> for ClientError {
 }
 
 /// The socket the daemon listens on for a given runtime directory.
-pub fn socket_path(runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join("runtime.sock")
+///
+/// 复刻宿主的回退规则（`yi-agent-` 前缀、哈希 `runtime_dir`）：深路径下宿主的
+/// daemon 会把 socket 挪到临时目录，插件必须落到**同一处**才连得上。
+pub fn socket_path(runtime_dir: &Path) -> Result<PathBuf, crate::socket::SocketPathError> {
+    crate::socket::daemon_socket_for(runtime_dir)
 }
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -132,7 +135,7 @@ mod tests {
     #[test]
     fn the_socket_lives_beside_its_runtime_directory() {
         assert_eq!(
-            socket_path(std::path::Path::new("/project/.yi-agent/runtime")),
+            socket_path(std::path::Path::new("/project/.yi-agent/runtime")).expect("short path stays"),
             std::path::PathBuf::from("/project/.yi-agent/runtime/runtime.sock")
         );
     }

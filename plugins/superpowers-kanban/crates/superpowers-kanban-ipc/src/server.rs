@@ -18,9 +18,13 @@ use serde_json::{Value, json};
 
 use crate::wire::MAX_FRAME_BYTES;
 
-/// 查询 socket 的落点。与 supervisor 清单里声明的 `{state_dir}/superpowers-kanban.sock` 同源。
-pub fn socket_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("superpowers-kanban.sock")
+/// 查询 socket 的落点。
+///
+/// 清单里声明的是 `{state_dir}/superpowers-kanban.sock`；深路径下直接拼会超过
+/// `sun_path` 上限、`bind` 失败，所以这里交给 [`crate::socket::plugin_socket_for`]
+/// 按**与宿主转发表完全相同**的规则解析（哈希直接路径，前缀 `plugin-`）。
+pub fn socket_path(state_dir: &Path) -> Result<PathBuf, crate::socket::SocketPathError> {
+    crate::socket::plugin_socket_for(&state_dir.join("superpowers-kanban.sock"))
 }
 
 /// 一条查询的处理者。实现者在 runner 里，可脱离 socket 测试。
@@ -152,7 +156,7 @@ mod tests {
     #[test]
     fn the_socket_sits_where_the_manifest_says() {
         assert_eq!(
-            socket_path(Path::new("/proj/.yi-agent/superpowers-kanban")),
+            socket_path(Path::new("/proj/.yi-agent/superpowers-kanban")).expect("short path stays"),
             PathBuf::from("/proj/.yi-agent/superpowers-kanban/superpowers-kanban.sock")
         );
     }
@@ -197,7 +201,7 @@ mod tests {
     #[test]
     fn a_client_that_connects_and_leaves_does_not_stop_serving() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = socket_path(dir.path());
+        let socket = socket_path(dir.path()).expect("temp dir fits");
         let dispatch = fake();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&stop);
