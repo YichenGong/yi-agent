@@ -626,3 +626,34 @@ describe("App slash commands", () => {
     await screen.findByText(/压缩/);
   });
 });
+
+describe("App Superpowers 看板 collapse", () => {
+  it("folds the board panel down to a strip and unfolds it again", async () => {
+    render(<App />);
+    // The board is rendered regardless of the switch, so no need to wait for
+    // the poll: the settings panel is part of the initial layout.
+    const collapse = await screen.findByRole("button", { name: "收起看板" });
+
+    expect(screen.getByRole("checkbox")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "展开看板" })).toBeNull();
+
+    fireEvent.click(collapse);
+
+    // Collapsed: the column is gone and the expand affordance has taken its place.
+    expect(screen.queryByRole("button", { name: "收起看板" })).toBeNull();
+    const expand = screen.getByRole("button", { name: "展开看板" });
+
+    fireEvent.click(expand);
+
+    // Expanded again: collapse comes back, expand goes away. Collapse and expand
+    // must be a pair, or the panel becomes unreachable once folded.
+    expect(screen.getByRole("button", { name: "收起看板" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "展开看板" })).toBeNull();
+  });
+
+  it("starts every launch expanded", async () => {
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "收起看板" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "展开看板" })).toBeNull();
+  });
+});

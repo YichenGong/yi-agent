@@ -20,4 +20,38 @@ describe("SuperpowersKanbanSettings", () => {
     fireEvent.click(screen.getByRole("checkbox"));
     expect(onToggle).toHaveBeenCalledWith(true);
   });
+
+  it("renders the collapse affordance only when a handler is supplied", () => {
+    const { unmount } = render(
+      <SuperpowersKanbanSettings switchOn source="project" onToggle={() => {}} />,
+    );
+    expect(screen.queryByRole("button", { name: "收起看板" })).toBeNull();
+    unmount();
+
+    // Matches SubagentRail's convention: no handler, no button. The host that
+    // cannot collapse the panel shouldn't advertise a button that does nothing.
+    render(
+      <SuperpowersKanbanSettings
+        switchOn
+        source="project"
+        onToggle={() => {}}
+        onCollapse={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "收起看板" })).toBeTruthy();
+  });
+
+  it("reports the collapse request once per click", () => {
+    const onCollapse = vi.fn();
+    render(
+      <SuperpowersKanbanSettings
+        switchOn={false}
+        source="default"
+        onToggle={() => {}}
+        onCollapse={onCollapse}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "收起看板" }));
+    expect(onCollapse).toHaveBeenCalledTimes(1);
+  });
 });

@@ -23,6 +23,7 @@ import type {
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
+import { SuperpowersKanbanCollapsedStrip } from "./components/SuperpowersKanbanCollapsedStrip";
 import {
   type BoardCardDto,
   type SwitchSource,
@@ -108,6 +109,9 @@ export default function App() {
   const [boardOn, setBoardOn] = useState(false);
   const [boardSource, setBoardSource] = useState<SwitchSource>("default");
   const [boardCards, setBoardCards] = useState<BoardCardDto[]>([]);
+  // Collapsed board panel. Deliberately not persisted: every launch starts
+  // expanded, and the switch state is independent of the panel being folded.
+  const [kanbanCollapsed, setKanbanCollapsed] = useState(false);
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -606,23 +610,28 @@ export default function App() {
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
         />
-        <div className="flex w-72 flex-col border-r border-neutral-800">
-          <SuperpowersKanbanSettings
-            switchOn={boardOn}
-            source={boardSource}
-            onToggle={(next) => {
-              void setBoardSwitch(boardRpc, next)
-                .then(() => {
-                  setBoardOn(next);
-                  setBoardSource("project");
-                })
-                .catch(() => {
-                  /* 写失败保持原状，下一轮轮询会纠正 */
-                });
-            }}
-          />
-          <SuperpowersKanbanView switchOn={boardOn} source={boardSource} cards={boardCards} />
-        </div>
+        {kanbanCollapsed ? (
+          <SuperpowersKanbanCollapsedStrip onExpand={() => setKanbanCollapsed(false)} />
+        ) : (
+          <div className="flex w-72 flex-col border-r border-neutral-800">
+            <SuperpowersKanbanSettings
+              switchOn={boardOn}
+              source={boardSource}
+              onToggle={(next) => {
+                void setBoardSwitch(boardRpc, next)
+                  .then(() => {
+                    setBoardOn(next);
+                    setBoardSource("project");
+                  })
+                  .catch(() => {
+                    /* 写失败保持原状，下一轮轮询会纠正 */
+                  });
+              }}
+              onCollapse={() => setKanbanCollapsed(true)}
+            />
+            <SuperpowersKanbanView switchOn={boardOn} source={boardSource} cards={boardCards} />
+          </div>
+        )}
         <div className="relative flex min-w-0 flex-1 flex-col">
           <ApprovalBanner
             items={bannerItems}
