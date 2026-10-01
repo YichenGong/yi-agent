@@ -7,6 +7,7 @@
 
 pub mod attach;
 pub mod binding;
+pub mod thread_root;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
