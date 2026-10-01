@@ -5,7 +5,7 @@
 //! 串行消费 turn、驱动 `agent.run()` 的事件流,并经 `Translator` 写成协议通知。
 //! 另有 `not_initialized` / `method_not_found` / 解析错误 / stdin EOF 优雅退出。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -668,7 +668,12 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
 /// shape here: this is a generic channel, so the UI (not the server) owns what a
 /// card or a switch field means. A plugin the daemon does not supervise, or one
 /// that refuses, surfaces as an RPC error the client can show.
-fn plugin_query(workdir: &Path, method: &str, plugin: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+fn plugin_query(
+    workdir: &Path,
+    method: &str,
+    plugin: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     if plugin.is_empty() {
         return Err("plugin/query needs a `plugin` name".to_string());
     }
@@ -676,7 +681,8 @@ fn plugin_query(workdir: &Path, method: &str, plugin: &str, params: serde_json::
     // that runs the plugin lives at the same project root, so that is where the
     // question has to go.
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(workdir);
-    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| error.to_string())?;
+    let socket =
+        yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| error.to_string())?;
     let response = yi_agent_store::ipc::send_request(
         &socket,
         yi_agent_store::ipc::IpcRequest::PluginQuery {
@@ -1001,18 +1007,7 @@ where
                             // 存储字段重命名不会悄悄改变 RPC 输出。
                             let threads: Vec<serde_json::Value> = metas
                                 .into_iter()
-                                .map(|m| {
-                                    json!({
-                                        "thread_id": m.thread_id,
-                                        "cwd": m.cwd,
-                                        "model": m.model,
-                                        "created_at": m.created_at,
-                                        "updated_at": m.updated_at,
-                                        "title": m.title,
-                                        "permission_mode": m.permission_mode,
-                                        "status": thread_status(&threads, &m.thread_id),
-                                    })
-                                })
+                                .map(|m| thread_summary_json(&m, &threads))
                                 .collect();
                             write_response(&writer, ok_response(id, json!({ "threads": threads })))
                                 .await?;
@@ -1038,18 +1033,7 @@ where
                                 match crate::thread_store::ThreadStore::new(path).list() {
                                     Ok(metas) => metas
                                         .into_iter()
-                                        .map(|m| {
-                                            json!({
-                                                "thread_id": m.thread_id,
-                                                "cwd": m.cwd,
-                                                "model": m.model,
-                                                "created_at": m.created_at,
-                                                "updated_at": m.updated_at,
-                                                "title": m.title,
-                                                "permission_mode": m.permission_mode,
-                                                "status": thread_status(&threads, &m.thread_id),
-                                            })
-                                        })
+                                        .map(|m| thread_summary_json(&m, &threads))
                                         .collect(),
                                     Err(e) => {
                                         eprintln!(
@@ -1067,8 +1051,15 @@ where
                                 "threads": threads,
                             }));
                         }
-                        write_response(&writer, ok_response(id, json!({ "groups": groups })))
-                            .await?;
+                        let pinned: Vec<serde_json::Value> = collect_pinned(&workspaces)
+                            .iter()
+                            .map(|m| thread_summary_json(m, &threads))
+                            .collect();
+                        write_response(
+                            &writer,
+                            ok_response(id, json!({ "groups": groups, "pinned": pinned })),
+                        )
+                        .await?;
                     }
                     "thread/start" => {
                         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
@@ -1508,6 +1499,143 @@ where
                             ),
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
+                    }
+                    "thread/setPinned" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // 参数校验先于 thread 存在性:非布尔一律 `-32602`。
+                        let Some(pinned) = req.params.get("pinned").and_then(|v| v.as_bool())
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params("pinned must be a boolean"),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 降序契约:now_millis 是当前最大值 → 新置顶项天然在最顶。
+                        let seq = if pinned {
+                            Some(crate::thread_store::now_millis())
+                        } else {
+                            None
+                        };
+                        match store_lookup(&threads, &workspaces, &cfg, &thread_id)
+                            .set_pin_seq(&thread_id, seq)
+                        {
+                            Ok(true) => {
+                                write_response(&writer, ok_response(id, json!({}))).await?;
+                            }
+                            Ok(false) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    "thread/reorderPinned" => {
+                        let arr = match req.params.get("threadIds").and_then(|v| v.as_array()) {
+                            Some(a) => a,
+                            None => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(
+                                            "threadIds must be an array of strings",
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 全部必须是字符串,否则拒绝(不允许静默丢弃非字符串项)。
+                        let ids: Vec<String> = match arr
+                            .iter()
+                            .map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Option<Vec<_>>>()
+                        {
+                            Some(v) => v,
+                            None => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(
+                                            "threadIds must be an array of strings",
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 校验:与「当前全部置顶集合」完全一致,且无重复。
+                        let pinned_now = collect_pinned(&workspaces);
+                        let current: HashSet<&str> =
+                            pinned_now.iter().map(|m| m.thread_id.as_str()).collect();
+                        let unique: HashSet<&str> =
+                            ids.iter().map(|s| s.as_str()).collect();
+                        let valid = unique.len() == ids.len()
+                            && ids.len() == current.len()
+                            && ids.iter().all(|i| current.contains(i.as_str()));
+                        if !valid {
+                            write_response(
+                                &writer,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(
+                                        "threadIds must list exactly the pinned threads, no duplicates",
+                                    ),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let current_seq: HashMap<String, Option<i64>> = pinned_now
+                            .iter()
+                            .map(|m| (m.thread_id.clone(), m.pin_seq))
+                            .collect();
+                        let assignments =
+                            crate::thread_store::assign_pin_seqs(&ids, &current_seq);
+                        let mut err: Option<RpcError> = None;
+                        for (tid, seq) in assignments {
+                            let store = store_for(&workspaces, &cfg, &tid);
+                            match store.set_pin_seq(&tid, Some(seq)) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    err = Some(RpcError::unknown_thread(&tid));
+                                    break;
+                                }
+                                Err(e) => {
+                                    err = Some(RpcError::internal(e.to_string()));
+                                    break;
+                                }
+                            }
+                        }
+                        match err {
+                            None => {
+                                write_response(&writer, ok_response(id, json!({}))).await?;
+                            }
+                            Some(e) => {
+                                write_response(&writer, err_response(id, e)).await?;
+                            }
+                        }
                     }
                     "thread/delete" => {
                         let Some(thread_id) =
@@ -2237,6 +2365,47 @@ fn thread_status(threads: &HashMap<String, ThreadSession>, thread_id: &str) -> T
         .unwrap_or(ThreadStatus::Idle)
 }
 
+/// 跨工作目录收集已置顶的 thread meta，按置顶分区契约排序：
+/// `pin_seq` 降序（越大越靠前），`updated_at` 降序，`thread_id` 升序。
+fn collect_pinned(workspaces: &WorkspaceIndex) -> Vec<crate::thread_store::ThreadMeta> {
+    let mut out = Vec::new();
+    for dir in workspaces.list() {
+        let path = Path::new(&dir);
+        if !path.is_dir() {
+            continue;
+        }
+        match crate::thread_store::ThreadStore::new(path).list() {
+            Ok(metas) => out.extend(metas.into_iter().filter(|m| m.pin_seq.is_some())),
+            Err(e) => eprintln!("[app-server] collect_pinned failed to list {dir}: {e}"),
+        }
+    }
+    out.sort_by(|a, b| {
+        b.pin_seq
+            .cmp(&a.pin_seq)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| a.thread_id.cmp(&b.thread_id))
+    });
+    out
+}
+
+/// 把 thread meta 渲染成 wire 上的 ThreadSummary（含 `pinned`）。
+fn thread_summary_json(
+    m: &crate::thread_store::ThreadMeta,
+    threads: &HashMap<String, ThreadSession>,
+) -> serde_json::Value {
+    json!({
+        "thread_id": m.thread_id,
+        "cwd": m.cwd,
+        "model": m.model,
+        "created_at": m.created_at,
+        "updated_at": m.updated_at,
+        "title": m.title,
+        "permission_mode": m.permission_mode,
+        "pinned": m.pin_seq.is_some(),
+        "status": thread_status(threads, &m.thread_id),
+    })
+}
+
 /// 把客户端对反向请求的响应路由到等待中的 driver。
 async fn route_client_response(
     resp: ClientResponse,
@@ -2878,7 +3047,11 @@ mod plugin_query_tests {
     /// and params verbatim without interpreting any of them.
     fn fake_daemon(
         dir: &Path,
-    ) -> (PathBuf, Arc<StdMutex<serde_json::Value>>, std::thread::JoinHandle<()>) {
+    ) -> (
+        PathBuf,
+        Arc<StdMutex<serde_json::Value>>,
+        std::thread::JoinHandle<()>,
+    ) {
         let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(dir);
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
@@ -6822,6 +6995,177 @@ mod tests {
             .find(|t| t["thread_id"] == tid.as_str())
             .expect("thread must be listed");
         assert_eq!(listed["status"], "idle");
+        h.shutdown().await;
+    }
+
+    fn pin_test_config(dir: &std::path::Path) -> RuntimeConfig {
+        let mut c = test_config();
+        c.workdir = dir.to_path_buf();
+        c
+    }
+
+    /// 读一个指定 id 的响应，跳过其间所有通知。
+    async fn read_response(h: &mut Harness, want: u64) -> serde_json::Value {
+        for _ in 0..12 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(want)) {
+                return v;
+            }
+        }
+        panic!("no response with id {want}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_pinned_puts_thread_on_top_of_list_all_pinned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+
+        let start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}});
+        h.send(&start.to_string()).await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        let pin = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/setPinned",
+            "params":{"threadId": tid, "pinned": true}});
+        h.send(&pin.to_string()).await;
+        let resp = read_response(&mut h, 3).await;
+        assert!(
+            resp.get("error").is_none(),
+            "setPinned must succeed: {resp}"
+        );
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        let pinned = v["result"]["pinned"].as_array().expect("顶层 pinned 数组");
+        assert_eq!(pinned.len(), 1, "恰一个置顶: {v}");
+        assert_eq!(pinned[0]["thread_id"].as_str().unwrap(), tid);
+        assert_eq!(pinned[0]["pinned"], true);
+
+        // 仍在原分组内,且带 pinned:true。
+        let all: Vec<&serde_json::Value> = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .collect();
+        let me = all
+            .iter()
+            .find(|t| t["thread_id"].as_str() == Some(tid.as_str()))
+            .expect("in group");
+        assert_eq!(me["pinned"], true);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_pinned_false_removes_from_pinned_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+        let start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}});
+        h.send(&start.to_string()).await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        for (id, pinned) in [(3u64, true), (4u64, false)] {
+            let req = serde_json::json!({"jsonrpc":"2.0","id":id,"method":"thread/setPinned",
+                "params":{"threadId": tid, "pinned": pinned}});
+            h.send(&req.to_string()).await;
+            let r = read_response(&mut h, id).await;
+            assert!(r.get("error").is_none(), "{r}");
+        }
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert_eq!(v["result"]["pinned"].as_array().unwrap().len(), 0);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_pinned_rejects_non_boolean_and_unknown_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/setPinned","params":{"threadId":"thread-x","pinned":"yes"}}"#).await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["error"]["code"], -32602, "非布尔 → invalid_params: {v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/setPinned","params":{"threadId":"thread-x","pinned":true}}"#).await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["error"]["code"], -32011, "未知 id → unknown_thread: {v}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reorder_pinned_rewrites_order_and_rejects_bad_input() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+
+        let mut tids = Vec::new();
+        for id in [2u64, 3u64] {
+            let start =
+                serde_json::json!({"jsonrpc":"2.0","id":id,"method":"thread/start","params":{}});
+            h.send(&start.to_string()).await;
+            tids.push(read_thread_start_response(&mut h, id).await);
+        }
+        // 两个都置顶(后置顶的 tids[1] 在顶)。
+        for (i, tid) in tids.iter().enumerate() {
+            let req = serde_json::json!({"jsonrpc":"2.0","id":10+i as u64,"method":"thread/setPinned",
+                "params":{"threadId": tid, "pinned": true}});
+            h.send(&req.to_string()).await;
+            let r = read_response(&mut h, 10 + i as u64).await;
+            assert!(r.get("error").is_none(), "{r}");
+        }
+        // 反转顺序：tids[0] 放到最顶。
+        let rev = serde_json::json!({"jsonrpc":"2.0","id":20,"method":"thread/reorderPinned",
+            "params":{"threadIds": tids}});
+        h.send(&rev.to_string()).await;
+        let r = read_response(&mut h, 20).await;
+        assert!(r.get("error").is_none(), "reorder must succeed: {r}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":21,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 21).await;
+        let pinned = v["result"]["pinned"].as_array().unwrap();
+        assert_eq!(pinned[0]["thread_id"].as_str().unwrap(), tids[0]);
+
+        // 含未置顶 id → invalid_params。
+        let bad = serde_json::json!({"jsonrpc":"2.0","id":22,"method":"thread/reorderPinned",
+            "params":{"threadIds": ["thread-nope"]}});
+        h.send(&bad.to_string()).await;
+        let v = read_response(&mut h, 22).await;
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "未置顶 id → invalid_params: {v}"
+        );
+
+        // 重复 id → invalid_params。
+        let dup = serde_json::json!({"jsonrpc":"2.0","id":23,"method":"thread/reorderPinned",
+            "params":{"threadIds": [tids[0].clone(), tids[0].clone()]}});
+        h.send(&dup.to_string()).await;
+        let v = read_response(&mut h, 23).await;
+        assert_eq!(v["error"]["code"], -32602, "重复 id → invalid_params: {v}");
         h.shutdown().await;
     }
 }
