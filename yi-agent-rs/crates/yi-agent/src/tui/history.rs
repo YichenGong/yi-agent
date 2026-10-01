@@ -257,24 +257,6 @@ impl HistoryState {
         self.apply_scroll_delta(was_scrolled, lines_before, width);
     }
 
-    /// Replace the newest cell in place.
-    ///
-    /// A live trace always materializes a text row as soon as it arrives and
-    /// then folds the following rows of the same run into that cell, so it
-    /// rewrites the tail instead of pushing one cell per row. No-op on an empty
-    /// history. Scroll-locking mirrors `push`.
-    #[allow(dead_code)]
-    pub(crate) fn replace_last(&mut self, cell: HistoryCell, width: u16) {
-        if self.cells.is_empty() {
-            return;
-        }
-        let was_scrolled = self.scroll_offset != 0;
-        let lines_before = self.flattened_line_count(width);
-        *self.cells.last_mut().expect("checked non-empty above") = cell;
-        self.note_content_change();
-        self.apply_scroll_delta(was_scrolled, lines_before, width);
-    }
-
     /// Append `more` to the trailing assistant message, if that is what the
     /// tail is. Returns false when it is not, which tells the caller to push a
     /// fresh cell instead. Scroll-locking mirrors `push`.

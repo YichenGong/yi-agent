@@ -287,11 +287,6 @@ impl TraceDetailPopup {
         &self.input
     }
 
-    #[allow(dead_code)]
-    pub fn input_mut(&mut self) -> &mut String {
-        &mut self.input
-    }
-
     pub fn feed(&self) -> &TraceFeed {
         &self.feed
     }
