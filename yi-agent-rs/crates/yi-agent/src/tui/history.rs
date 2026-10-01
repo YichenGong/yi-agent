@@ -191,6 +191,17 @@ impl HistoryCache {
     }
 }
 
+impl std::fmt::Debug for HistoryState {
+    /// The memoized render is an implementation detail, and dumping every
+    /// rendered line would bury the cells it was derived from.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryState")
+            .field("cells", &self.cells)
+            .field("scroll_offset", &self.scroll_offset)
+            .finish_non_exhaustive()
+    }
+}
+
 /// State for the scrollable history area.
 pub struct HistoryState {
     pub cells: Vec<HistoryCell>,
@@ -244,6 +255,39 @@ impl HistoryState {
         self.cells.push(cell);
         self.note_content_change();
         self.apply_scroll_delta(was_scrolled, lines_before, width);
+    }
+
+    /// Replace the newest cell in place.
+    ///
+    /// A live trace always materializes a text row as soon as it arrives and
+    /// then folds the following rows of the same run into that cell, so it
+    /// rewrites the tail instead of pushing one cell per row. No-op on an empty
+    /// history. Scroll-locking mirrors `push`.
+    #[allow(dead_code)]
+    pub(crate) fn replace_last(&mut self, cell: HistoryCell, width: u16) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let was_scrolled = self.scroll_offset != 0;
+        let lines_before = self.flattened_line_count(width);
+        *self.cells.last_mut().expect("checked non-empty above") = cell;
+        self.note_content_change();
+        self.apply_scroll_delta(was_scrolled, lines_before, width);
+    }
+
+    /// Append `more` to the trailing assistant message, if that is what the
+    /// tail is. Returns false when it is not, which tells the caller to push a
+    /// fresh cell instead. Scroll-locking mirrors `push`.
+    pub(crate) fn extend_last_assistant_text(&mut self, more: &str, width: u16) -> bool {
+        let was_scrolled = self.scroll_offset != 0;
+        let lines_before = self.flattened_line_count(width);
+        let Some(HistoryCell::AssistantMessage { markdown }) = self.cells.last_mut() else {
+            return false;
+        };
+        markdown.push_str(more);
+        self.note_content_change();
+        self.apply_scroll_delta(was_scrolled, lines_before, width);
+        true
     }
 
     /// Clear all cells and reset state.
