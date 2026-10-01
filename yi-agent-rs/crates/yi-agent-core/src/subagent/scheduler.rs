@@ -131,12 +131,23 @@ impl Default for ResourceCoordinator {
 }
 
 impl ResourceCoordinator {
-    pub const DEFAULT_GLOBAL_RESIDENT_SUBAGENTS: u16 = 16;
+    /// Resident subagent capacity for one daemon. Roots do not consume it; only
+    /// subagents do (`runtime.rs` requests `resident:global` for subagents only).
+    pub const DEFAULT_GLOBAL_RESIDENT_SUBAGENTS: u16 = 64;
     pub const DEFAULT_LLM_PER_PROVIDER_KEY: u16 = 8;
     pub const RESERVED_COORDINATION_LLM_PERMITS: u16 = 1;
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds a coordinator whose resident capacity is `units` instead of
+    /// [`Self::DEFAULT_GLOBAL_RESIDENT_SUBAGENTS`]. `units` of 0 is allowed and
+    /// admits nothing, which callers use to park all subagent work.
+    pub fn with_resident_capacity(units: u16) -> Self {
+        let mut coordinator = Self::default();
+        coordinator.set_capacity("resident:global", units);
+        coordinator
     }
 
     pub fn set_capacity(&mut self, key: impl Into<String>, units: u16) {

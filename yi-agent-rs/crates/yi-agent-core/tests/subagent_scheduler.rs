@@ -8,7 +8,7 @@ use yi_agent_core::subagent::scheduler::{
 fn coordinator_exposes_the_confirmed_global_default_capacities() {
     let coordinator = ResourceCoordinator::new();
 
-    assert_eq!(coordinator.capacity("resident:global"), Some(16));
+    assert_eq!(coordinator.capacity("resident:global"), Some(64));
     assert_eq!(coordinator.capacity("coding:global"), Some(6));
     assert_eq!(coordinator.capacity("build:host"), Some(2));
     assert_eq!(ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY, 8);
@@ -557,4 +557,20 @@ fn unrunnable_coordination_request_does_not_block_reserve_borrowing() {
     for _ in 0..ResourceCoordinator::DEFAULT_LLM_PER_PROVIDER_KEY {
         assert!(coordinator.grant_next(regular_key).is_some());
     }
+}
+
+#[test]
+fn the_default_resident_capacity_is_sixty_four() {
+    let coordinator = ResourceCoordinator::new();
+    assert_eq!(coordinator.capacity("resident:global"), Some(64));
+    assert_eq!(
+        coordinator.capacity("resident:global"),
+        Some(ResourceCoordinator::DEFAULT_GLOBAL_RESIDENT_SUBAGENTS)
+    );
+}
+
+#[test]
+fn a_configured_resident_capacity_replaces_the_default() {
+    let coordinator = ResourceCoordinator::with_resident_capacity(128);
+    assert_eq!(coordinator.capacity("resident:global"), Some(128));
 }
