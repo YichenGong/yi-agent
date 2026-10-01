@@ -30,7 +30,7 @@ impl BoardView {
         if !self.switch_on {
             return vec![
                 "Superpowers 看板 is disabled. Enable it in settings, or set \
-                 \"superpowers_board\": true in preferences.json."
+                 \"superpowers_kanban\": true in preferences.json."
                     .to_string(),
             ];
         }

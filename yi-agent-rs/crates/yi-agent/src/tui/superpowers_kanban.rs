@@ -82,7 +82,7 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
                 KanbanOutcome {
                     lines: vec![format!(
                         "Superpowers 看板 is disabled (source: {source}). \
-                         Enable it with /kanban on, or set \"superpowers_board\": true."
+                         Enable it with /superpowers-kanban on, or set \"superpowers_kanban\": true."
                     )],
                     toggled_to: None,
                 }
