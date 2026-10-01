@@ -9,8 +9,8 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
 use yi_agent_core::subagent::task::{
-    DeliveryReport, IntegrationValidation, PauseReason, PermissionRequestId, RootSessionId,
-    TaskDepth, TaskId, TaskState,
+    DeliveryReport, InheritedSandbox, IntegrationValidation, PauseReason, PermissionRequestId,
+    RootSessionId, TaskDepth, TaskId, TaskState,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, SpawnRequest, WorkerError, WorkerHandle, WorkerStart,
@@ -1053,4 +1053,54 @@ fn supervisor_toolset_registers_all_three_builtin_schemas() {
         .map(|schema| schema.name)
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["send_message", "spawn_agent", "wait_agent"]);
+}
+
+#[test]
+fn worker_start_carries_inherited_sandbox_from_supervisor() {
+    let session = RootSessionId::new();
+    let mut supervisor = AgentSupervisor::new_with_objective(session, "root".into());
+    let root = supervisor.root_task_id().clone();
+    supervisor.set_inherited_sandbox(&root, InheritedSandbox::DangerFullAccess);
+    assert_eq!(
+        supervisor.inherited_sandbox(&root),
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+
+    let child = supervisor
+        .spawn_with_objective(
+            root.clone(),
+            SpawnRequest::new("child".into(), ChildWriteMode::Coding, None),
+        )
+        .expect("child spawns");
+    // A child starts with no recorded inheritance; the coordinator seeds it
+    // from the persisted task row before the worker starts.
+    assert_eq!(supervisor.inherited_sandbox(&child), None);
+
+    // The value flows into the assembled WorkerStart.
+    let factory = CapabilityWorkerFactory {
+        start: Arc::new(Mutex::new(None)),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        supervisor.start_worker(&factory, &child).await.unwrap();
+    });
+    assert_eq!(
+        factory
+            .start
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .inherited_sandbox,
+        None
+    );
+
+    supervisor.set_inherited_sandbox(&child, InheritedSandbox::DangerFullAccess);
+    assert_eq!(
+        supervisor.inherited_sandbox(&child),
+        Some(InheritedSandbox::DangerFullAccess)
+    );
 }
