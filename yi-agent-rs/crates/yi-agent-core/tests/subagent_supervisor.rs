@@ -62,6 +62,56 @@ async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
     );
 }
 
+/// A coding child delivers a commit to its parent over the mailbox. If that
+/// parent is already terminal (a recovered root is parked in
+/// `recovery_required`, which is terminal), the notification can never be
+/// accepted — but that is not the child's fault and must not throw away the
+/// child's completion fact. Before the fix this `Delivered` event failed, the
+/// error aborted the whole reconciliation pass, and the child stayed `running`
+/// forever with no completion event.
+#[tokio::test]
+async fn a_coding_delivery_to_a_terminal_parent_does_not_wedge_reconciliation() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+    // The parent goes terminal while the child keeps running. A root that was
+    // recovered is driven to its terminal state from `running`.
+    supervisor.start_task(&root).unwrap();
+    supervisor
+        .fail_task(&root, "the root's session was recovered")
+        .unwrap();
+    assert!(
+        supervisor.task(&root).unwrap().state().is_terminal(),
+        "the fixture needs a terminal parent"
+    );
+
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
+    handle.report_delivery(delivery);
+    let reconciled = supervisor.reconcile_worker_events();
+
+    assert!(
+        reconciled.is_ok(),
+        "a delivery to a terminal parent must not wedge reconciliation, got {reconciled:?}"
+    );
+    assert!(
+        matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::AwaitingParentReview(_)
+        ),
+        "the child's delivery must still be recorded, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+}
+
 /// A child cut off at its turn ceiling must reach the parent as an exhausted
 /// budget carrying its partial transcript, never as a clean completion: the
 /// report is a half-finished sentence, and a parent that merges on sight would
