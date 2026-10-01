@@ -162,4 +162,22 @@ mod tests {
             outcome.lines
         );
     }
+
+    #[test]
+    fn saving_the_runtime_preference_does_not_drop_the_board_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        handle_kanban(dir.path(), "on");
+        crate::tui::runtime_prefs::save(
+            dir.path(),
+            crate::tui::runtime_prefs::RuntimePreference::Never,
+        )
+        .unwrap();
+        assert_eq!(
+            yi_agent_board_ui::switch::read_layer(&yi_agent_board_ui::switch::project_path(
+                dir.path()
+            )),
+            Some(yi_agent_board_ui::switch::BoardSwitch::Enabled),
+            "a runtime-pref save must not clobber the board switch in preferences.json"
+        );
+    }
 }
