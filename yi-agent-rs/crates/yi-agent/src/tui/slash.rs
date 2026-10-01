@@ -327,10 +327,24 @@ pub fn render_mcp_status(master: bool, servers: &[(String, bool)]) -> String {
     out
 }
 
+/// Maximum popup height in rows, including borders. Shared by the layout (which
+/// reserves the rows) and the widget (which fills them) so they cannot drift.
+const POPUP_MAX_ROWS: usize = 10;
+/// Rows `compute_layout` is expected to keep outside the popup on a comfortable
+/// terminal: history minimum (3), status bar (1), blank gap (1), input (1).
+/// Queued messages and a wrapping input can claim more, so this is a floor for
+/// the height estimate, not a guarantee. A squeezed layout hands the popup a
+/// smaller area, which is why the draw path re-clamps rather than trusting it.
+const MIN_NON_POPUP_ROWS: usize = 6;
+
 /// State for the slash command popup shown above the input area.
 pub struct CommandPopup {
     filtered: Vec<SlashCommand>,
     selected: usize,
+    /// Index of the first command drawn in the visible window. The filtered
+    /// list can be taller than the popup, so this is what keeps the highlighted
+    /// row on screen.
+    offset: usize,
     last_filter: String,
 }
 
@@ -340,6 +354,7 @@ impl CommandPopup {
         Self {
             filtered: SlashCommand::all().to_vec(),
             selected: 0,
+            offset: 0,
             last_filter: String::new(),
         }
     }
@@ -362,9 +377,12 @@ impl CommandPopup {
                 .collect();
         }
         self.selected = 0;
+        self.offset = 0;
     }
 
-    /// The filtered list of commands currently visible in the popup.
+    /// The filtered list of commands. Production draws through [`Self::visible`];
+    /// this stays for assertions about the underlying list.
+    #[cfg(test)]
     pub fn filtered(&self) -> &[SlashCommand] {
         &self.filtered
     }
@@ -379,6 +397,7 @@ impl CommandPopup {
         } else {
             self.selected -= 1;
         }
+        self.scroll_to_selection();
     }
 
     /// Move the selection down by one, wrapping to the top.
@@ -387,6 +406,7 @@ impl CommandPopup {
             return;
         }
         self.selected = (self.selected + 1) % self.filtered.len();
+        self.scroll_to_selection();
     }
 
     /// The currently selected command, if any.
@@ -397,6 +417,76 @@ impl CommandPopup {
     /// The index of the currently selected item.
     pub fn selected_index(&self) -> usize {
         self.selected
+    }
+
+    /// Index of the first command actually drawn, clamped so the highlight sits
+    /// inside a window of `height` rows even when the layout squeezes the popup
+    /// shorter than [`Self::height`] predicted. [`Self::window_start`] reports
+    /// this value, so the widget's highlight index and the drawn rows stay in
+    /// the same coordinate space.
+    pub fn window_start(&self, height: usize) -> usize {
+        let window = self.effective_window(height);
+        self.clamped_start(window)
+    }
+
+    /// The commands to draw, at most `height` of them: the effective window,
+    /// which always contains the selection (unless the list is empty).
+    pub fn visible(&self, height: usize) -> &[SlashCommand] {
+        let start = self.clamped_start(self.effective_window(height));
+        let end = (start + height).min(self.filtered.len());
+        &self.filtered[start..end]
+    }
+
+    /// Rows the popup reserves for commands while handling keys -- `height` for
+    /// a comfortable terminal. The draw path sizes from the live popup area and
+    /// re-clamps, so a squeezed layout can never hide the selection either.
+    fn window_height(&self) -> usize {
+        POPUP_MAX_ROWS.saturating_sub(2).max(1)
+    }
+
+    /// Fold the selection into a `height`-row window without narrowing below
+    /// what the cursor needs, so the highlight is always drawn.
+    fn effective_window(&self, height: usize) -> usize {
+        height.max(1).min(self.filtered.len().max(1))
+    }
+
+    /// Window start that keeps `selected` visible within `window` rows, and
+    /// stays at 0 when the list is short enough to fit.
+    fn clamped_start(&self, window: usize) -> usize {
+        let start = if self.filtered.len() <= window {
+            0
+        } else if self.selected < self.offset {
+            self.selected
+        } else if self.selected >= self.offset + window {
+            self.selected + 1 - window
+        } else {
+            self.offset
+        };
+        start.min(self.filtered.len().saturating_sub(window))
+    }
+
+    /// Slide the window so `selected` is inside it, touching only what is
+    /// needed: at most one row of scrolling per move keeps the list steady
+    /// rather than jumping.
+    fn scroll_to_selection(&mut self) {
+        let height = self.window_height();
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + height {
+            self.offset = self.selected + 1 - height;
+        }
+    }
+
+    /// Rows the popup occupies (borders included) for a terminal `area_height`
+    /// tall: tall enough for every command, but capped so a long catalog can
+    /// never crowd out history, status, or the input. An empty filter keeps the
+    /// minimal border-only box rather than reserving the full cap.
+    pub fn height(&self, area_height: u16) -> usize {
+        let available = (area_height as usize).saturating_sub(MIN_NON_POPUP_ROWS);
+        (self.filtered.len() + 2)
+            .min(POPUP_MAX_ROWS)
+            .min(available)
+            .max(1)
     }
 }
 
@@ -467,6 +557,131 @@ mod tests {
         popup.move_up();
         popup.move_down();
         assert!(popup.selected().is_none());
+    }
+
+    #[test]
+    fn visible_window_contains_the_selection_after_scrolling_past_the_cap() {
+        let mut popup = CommandPopup::new();
+        let total = popup.filtered().len();
+        let window = POPUP_MAX_ROWS - 2;
+        assert!(total > window, "the catalog must be long enough to scroll");
+        for _ in 0..total {
+            popup.move_down();
+            let drawn = popup.visible(window);
+            assert!(
+                drawn.contains(&popup.selected().unwrap()),
+                "selection escaped the visible window at index {}",
+                popup.selected_index()
+            );
+        }
+    }
+
+    /// A squeezed layout hands the popup fewer rows than [`CommandPopup::height`]
+    /// predicted. The drawn window must still contain the highlight.
+    #[test]
+    fn drawn_window_clamps_the_selection_when_the_popup_is_squeezed() {
+        let mut popup = CommandPopup::new();
+        let squeezed = 6;
+        for _ in 0..12 {
+            popup.move_down();
+        }
+        assert!(popup.selected_index() >= squeezed);
+        assert!(
+            popup.visible(squeezed).contains(&popup.selected().unwrap()),
+            "highlight escaped the squeezed window"
+        );
+        assert_eq!(
+            popup.window_start(squeezed) + popup.visible(squeezed).len(),
+            popup.selected_index() + 1,
+            "the highlight must be the last drawn row"
+        );
+    }
+
+    #[test]
+    fn scrolling_past_the_cap_advances_the_window() {
+        let mut popup = CommandPopup::new();
+        let window = POPUP_MAX_ROWS - 2;
+        // The window holds indices `0..window`; the selection stays inside it
+        // until it steps one past the last visible row.
+        for _ in 0..window - 1 {
+            popup.move_down();
+        }
+        assert_eq!(
+            popup.window_start(window),
+            0,
+            "window must not move until it fills"
+        );
+        popup.move_down();
+        assert_eq!(
+            popup.window_start(window),
+            1,
+            "window follows the selection down"
+        );
+    }
+
+    #[test]
+    fn move_up_wraps_and_keeps_the_last_command_visible() {
+        let mut popup = CommandPopup::new();
+        let window = POPUP_MAX_ROWS - 2;
+        popup.move_up();
+        assert_eq!(popup.selected_index(), popup.filtered().len() - 1);
+        assert!(popup.visible(window).contains(&popup.selected().unwrap()));
+    }
+
+    #[test]
+    fn filtering_resets_the_window_to_the_top() {
+        let mut popup = CommandPopup::new();
+        let window = POPUP_MAX_ROWS - 2;
+        for _ in 0..12 {
+            popup.move_down();
+        }
+        assert!(popup.window_start(window) > 0);
+        popup.filter("c");
+        assert_eq!(popup.window_start(window), 0);
+    }
+
+    #[test]
+    fn height_lists_every_command_until_the_cap() {
+        let popup = CommandPopup::new();
+        assert_eq!(
+            popup.height(24),
+            10,
+            "the full catalog is capped at 10 rows"
+        );
+        assert_eq!(popup.height(50), 10);
+    }
+
+    #[test]
+    fn height_reserves_rows_for_history_on_a_short_terminal() {
+        let popup = CommandPopup::new();
+        // 8 rows - 6 reserved = 2 available, even though the catalog is longer.
+        assert_eq!(popup.height(8), 2);
+        assert_eq!(popup.height(0), 1);
+    }
+
+    #[test]
+    fn height_shrinks_to_fit_a_filtered_list() {
+        let mut popup = CommandPopup::new();
+        popup.filter("cl");
+        assert_eq!(popup.filtered().len(), 1);
+        assert_eq!(popup.height(24), 3, "one command plus borders");
+    }
+
+    #[test]
+    fn height_stays_minimal_when_nothing_matches() {
+        let mut popup = CommandPopup::new();
+        popup.filter("zzz");
+        assert_eq!(popup.filtered().len(), 0);
+        assert_eq!(popup.height(24), 2, "borders only: no blank rows budget");
+    }
+
+    #[test]
+    fn visible_returns_the_whole_list_when_it_fits() {
+        let mut popup = CommandPopup::new();
+        popup.filter("r");
+        let matched = popup.filtered().len();
+        assert!(matched > 0 && matched < 8, "pick a filter that fits");
+        assert_eq!(popup.visible(8).len(), matched);
     }
 
     #[test]

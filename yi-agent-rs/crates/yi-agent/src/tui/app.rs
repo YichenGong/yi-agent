@@ -491,7 +491,7 @@ fn run_loop<B: Backend, E: EventSource>(
             if let Some(p) = &popup {
                 let popup_area = chunks[1];
                 if popup_area.height > 0 {
-                    f.render_widget(build_popup(p), popup_area);
+                    f.render_widget(build_popup(p, popup_area.height), popup_area);
                 }
             }
 
@@ -3183,9 +3183,17 @@ fn format_agents_summary(
 }
 
 /// Build the popup widget for rendering.
-fn build_popup<'a>(popup: &'a CommandPopup) -> Paragraph<'a> {
-    let lines: Vec<Line<'a>> = popup
-        .filtered()
+///
+/// `height` is the popup's row budget, borders included -- the area the layout
+/// actually gave us, which a squeezed terminal can make smaller than the popup
+/// asked for. Only the windowed commands are drawn; the renderer clips the
+/// rest, so rendering the whole list would hide the highlighted row once the
+/// selection scrolls past the visible rows.
+fn build_popup<'a>(popup: &'a CommandPopup, height: u16) -> Paragraph<'a> {
+    let content_height = height.saturating_sub(2) as usize;
+    let window = popup.visible(content_height);
+    let window_start = popup.window_start(content_height);
+    let lines: Vec<Line<'a>> = window
         .iter()
         .enumerate()
         .map(|(i, cmd)| {
@@ -3197,7 +3205,7 @@ fn build_popup<'a>(popup: &'a CommandPopup) -> Paragraph<'a> {
                     .unwrap_or_default()
             );
             let desc = cmd.description();
-            let is_selected = i == popup.selected_index();
+            let is_selected = window_start + i == popup.selected_index();
             let style = if is_selected {
                 Style::new().bg(Color::Blue).fg(Color::White)
             } else {
@@ -3260,7 +3268,7 @@ fn compute_layout(
     let input_height = compute_input_height(input, pending_quit, input_width).min(6);
     let popup_height = popup
         .as_ref()
-        .map(|p| (p.filtered().len() + 2).min(10) as u16)
+        .map(|p| p.height(area.height) as u16)
         .unwrap_or(0);
 
     let chunks = Layout::default()
@@ -6802,6 +6810,128 @@ mod tests {
         assert!(
             row_text.contains("/clear"),
             "expected '/clear' after Down+Tab, got: {row_text:?}"
+        );
+    }
+
+    /// Moving the selection past the visible window must scroll the popup so the
+    /// highlighted row stays on screen. Otherwise the user cannot see what Enter
+    /// is about to execute.
+    #[test]
+    fn slash_popup_scrolls_to_keep_selection_visible() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // The popup is capped at 10 rows, i.e. 8 content rows, so 20 Down presses
+        // land the selection far outside the initial window.
+        const DOWNS: usize = 20;
+        let target = SlashCommand::all()[DOWNS];
+
+        // `ScriptedEvents` pops from the back, so push in reverse delivery order.
+        let mut script = vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))];
+        script.extend(
+            (0..DOWNS).map(|_| Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))),
+        );
+        script.push(Event::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        let source = ScriptedEvents {
+            events: Rc::new(RefCell::new(script)),
+        };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let highlight_row = (0..24u16)
+            .find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue));
+        let row = highlight_row.expect("the highlighted command row must be visible");
+        let row_text: String = (0..80u16).map(|x| buffer[(x, row)].symbol()).collect();
+        assert!(
+            row_text.contains(target.name()),
+            "expected the highlighted row to show /{}, got: {row_text:?}",
+            target.name()
+        );
+    }
+
+    /// The highlighted row must stay on screen even when the popup is drawn
+    /// shorter than its 10-row cap (short terminal or a squeezed layout), where
+    /// the drawn height no longer matches the scroll window.
+    #[test]
+    fn slash_popup_keeps_selection_visible_on_a_short_terminal() {
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // A 14-row terminal leaves the popup only 8 rows, i.e. 6 content rows.
+        const DOWNS: usize = 12;
+        let target = SlashCommand::all()[DOWNS];
+
+        let mut script = vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))];
+        script.extend(
+            (0..DOWNS).map(|_| Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))),
+        );
+        script.push(Event::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        let source = ScriptedEvents {
+            events: Rc::new(RefCell::new(script)),
+        };
+
+        run_tui_with_backend_and_events(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+        )
+        .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let highlight_row = (0..14u16)
+            .find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue));
+        let row = highlight_row.expect("the highlighted command row must be visible");
+        let row_text: String = (0..80u16).map(|x| buffer[(x, row)].symbol()).collect();
+        assert!(
+            row_text.contains(target.name()),
+            "expected the highlighted row to show /{}, got: {row_text:?}",
+            target.name()
         );
     }
 
