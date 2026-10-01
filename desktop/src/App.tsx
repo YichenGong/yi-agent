@@ -8,8 +8,16 @@ import { StatusBar } from "./components/StatusBar";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ApprovalBanner } from "./components/ApprovalBanner";
 import { ThreadSidebar } from "./components/ThreadSidebar";
+import { SubagentRail } from "./components/SubagentRail";
 import { TitleBar } from "./components/TitleBar";
-import type { ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "./lib/protocol";
+import type {
+  AgentChildrenListResult,
+  ThreadStatus,
+  TurnStatus,
+  Workspace,
+  WorkspaceGroup,
+} from "./lib/protocol";
+import { SubagentRailStore } from "./lib/subagents";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 
@@ -69,6 +77,19 @@ export default function App() {
   const [status, setStatus] = useState<string>("connecting");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
+  // 不进 store;数据本身仍随通知累积,展开即是当前值。
+  const railStore = useRef(new SubagentRailStore()).current;
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  // 用户在暂留区点开的子 agent。详情视图由后续任务接入;此刻选择本身可见,
+  // 免得一次点击看起来什么都没发生。
+  const [railSelection, setRailSelection] = useState<{
+    threadId: string;
+    taskId: string;
+  } | null>(null);
+  const openSubagent = railSelection && railSelection.threadId === currentId
+    ? railSelection.taskId
+    : null;
 
   const current = currentId ? store.view(currentId) : null;
 
@@ -106,6 +127,26 @@ export default function App() {
   };
 
   /**
+   * 取某对话当前的子 agent 列表。
+   *
+   * 失败即放弃:暂留区是附属视图,列表读不到就保持上一次的值(或空),绝不因为
+   * 它把对话打断。daemon 未 attach 时服务端返回空表,这里不会走到 catch。
+   */
+  const refreshSubagents = async (threadId: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      const r = await c.request<AgentChildrenListResult>("agent/children/list", {
+        threadId,
+      });
+      railStore.set(threadId, r.children);
+      force((v) => v + 1);
+    } catch {
+      // 附属视图:读失败不改动已有内容。
+    }
+  };
+
+  /**
    * Switch the visible thread. A warm thread (already resumed) only swaps the
    * view — its timeline kept accumulating in the background. A cold thread is
    * resumed once; per-thread isolation means the base session list/sidebar can
@@ -115,6 +156,8 @@ export default function App() {
     store.select(id);
     setCurrentId(id);
     force((v) => v + 1);
+    // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
+    void refreshSubagents(id);
     if (warm.current.has(id) || inFlightResume.current.has(id)) return; // warm → 只切视图
     const c = clientRef.current;
     if (!c) return;
@@ -280,6 +323,12 @@ export default function App() {
     const client = new RpcClient(tauriTransport());
     clientRef.current = client;
     client.onNotification((n) => {
+      // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
+      if (n.method === "agent/children/updated") {
+        railStore.applyNotification(n.params.threadId, n.params.children);
+        force((v) => v + 1);
+        return;
+      }
       // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
       store.applyNotification(n);
       force((v) => v + 1);
@@ -440,6 +489,17 @@ export default function App() {
             />
           )}
         </div>
+        {currentId && !railCollapsed && (
+          <SubagentRail
+            rows={railStore.get(currentId)}
+            selectedTaskId={openSubagent}
+            onOpen={(taskId) => {
+              // 详情视图由后续任务接入;此刻先把目标 id 交给它,选择本身可见。
+              setRailSelection({ threadId: currentId, taskId });
+            }}
+            onCollapse={() => setRailCollapsed(true)}
+          />
+        )}
         </div>
       </div>
     </>
