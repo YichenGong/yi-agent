@@ -123,6 +123,11 @@ pub enum IpcError {
          shorten the project path or set YI_AGENT_RUNTIME_DIR to a short directory"
     )]
     SocketPathTooLong { path: String, limit: usize },
+    /// The daemon answered with an error frame. The code is its stable
+    /// category and the message is whatever it chose to disclose; both are
+    /// already sanitized at the wire boundary.
+    #[error("daemon returned {code}: {message}")]
+    Remote { code: IpcErrorCode, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1094,6 +1099,22 @@ pub fn send_request_with_version(
     Ok(envelope.result)
 }
 
+/// Turns a daemon error frame into a real error.
+///
+/// `send_request` deliberately hands back whatever frame the daemon sent. The
+/// trace helpers below cannot: their whole contract is "a snapshot or nothing",
+/// so an error frame must not reach a caller that would then read an empty
+/// trace as a healthy task.
+fn into_result(response: IpcResponse) -> Result<IpcResponse, IpcError> {
+    match response {
+        IpcResponse::Error { code, message } => Err(IpcError::Remote {
+            code,
+            message: message.unwrap_or_else(|| code.to_string()),
+        }),
+        result => Ok(result),
+    }
+}
+
 pub fn subscribe(
     socket_path: impl AsRef<Path>,
     after_event_id: i64,
@@ -1121,6 +1142,150 @@ pub fn subscribe_with_filters(
         reader: BufReader::new(stream),
         request_id,
     })
+}
+
+/// Reads a task's retained trace: the rows plus the cursor to resume from.
+pub fn read_task_trace(
+    socket_path: impl AsRef<Path>,
+    task_id: &str,
+) -> Result<TraceSnapshot, IpcError> {
+    match into_result(send_request(
+        socket_path,
+        IpcRequest::ReadTaskTrace {
+            task_id: task_id.to_owned(),
+        },
+    )?)? {
+        IpcResponse::TaskTrace {
+            high_water_id,
+            rows,
+            ..
+        } => Ok(TraceSnapshot {
+            high_water_id,
+            rows,
+        }),
+        other => Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("daemon returned a non-trace response: {other:?}"),
+        ))),
+    }
+}
+
+/// Follows one or more tasks' traces live.
+///
+/// `task_ids` must be non-empty: the daemon rejects an unscoped subscription
+/// rather than guessing at "every task".
+pub fn subscribe_trace(
+    socket_path: impl AsRef<Path>,
+    after_id: i64,
+    task_ids: &[String],
+    kinds: &[String],
+) -> Result<TraceSubscription, IpcError> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    let request_id = next_request_id();
+    write_request(
+        &mut stream,
+        PROTOCOL_VERSION,
+        request_id.clone(),
+        IpcRequest::SubscribeTrace {
+            task_ids: task_ids.to_vec(),
+            after_id: Some(after_id),
+            kinds: kinds.to_vec(),
+        },
+    )?;
+    Ok(TraceSubscription {
+        reader: BufReader::new(stream),
+        request_id,
+        started: false,
+    })
+}
+
+/// A client-side trace stream. The first frame is always a `TraceSubscription`
+/// snapshot, which `next_row` consumes before yielding any row.
+pub struct TraceSubscription {
+    reader: BufReader<UnixStream>,
+    request_id: String,
+    /// The snapshot frame is consumed lazily so a caller can still inspect the
+    /// frame it arrived in.
+    started: bool,
+}
+
+impl TraceSubscription {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Reads one frame and checks its correlation, mirroring `Subscription`.
+    pub fn next_frame(&mut self) -> Result<ResponseEnvelope, IpcError> {
+        let response = read_limited_frame(&mut self.reader)?.ok_or_else(|| {
+            IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon closed the trace subscription",
+            ))
+        })?;
+        let envelope: ResponseEnvelope = serde_json::from_slice(&response)?;
+        if envelope.protocol_version != PROTOCOL_VERSION || envelope.request_id != self.request_id {
+            return Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trace subscription envelope identity mismatch",
+            )));
+        }
+        if let IpcResponse::TraceEvent(row) = &envelope.result {
+            if envelope.event_id != Some(row.event_id) {
+                return Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trace subscription event envelope identity mismatch",
+                )));
+            }
+        }
+        if let IpcResponse::Error { code, message } = &envelope.result {
+            return Err(IpcError::Remote {
+                code: *code,
+                message: message.clone().unwrap_or_else(|| code.to_string()),
+            });
+        }
+        Ok(envelope)
+    }
+
+    /// The next streamed row, or `None` once the stream ends.
+    ///
+    /// The snapshot frame is consumed on the first call, so a caller that only
+    /// wants rows never has to know the snapshot exists. A stream that overflows
+    /// closes as it does for events, which surfaces here as `None` after the
+    /// daemon's resync frame.
+    pub fn next_row(&mut self) -> Result<Option<IpcTraceRow>, IpcError> {
+        if !self.started {
+            self.started = true;
+            match self.next_frame()?.result {
+                IpcResponse::TraceSubscription(_) => {}
+                IpcResponse::ResyncRequired => return Ok(None),
+                other => {
+                    return Err(IpcError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("trace subscription began with {other:?}"),
+                    )));
+                }
+            }
+        }
+        loop {
+            match self.next_frame() {
+                Ok(envelope) => match envelope.result {
+                    IpcResponse::TraceEvent(row) => return Ok(Some(row)),
+                    IpcResponse::ResyncRequired => return Ok(None),
+                    other => {
+                        return Err(IpcError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unexpected frame on a trace subscription: {other:?}"),
+                        )));
+                    }
+                },
+                // A closed stream is the documented end of the subscription.
+                Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 fn write_request(
@@ -2565,6 +2730,7 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         | IpcError::FrameTooLarge
         | IpcError::TruncatedFrame { .. }
         | IpcError::FrameWriteTimeout { .. } => IpcErrorCode::Validation,
+        IpcError::Remote { code, .. } => *code,
         _ => IpcErrorCode::Internal,
     }
 }
@@ -3483,5 +3649,163 @@ mod error_logging_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_subscription_tests {
+    use super::*;
+
+    struct Server {
+        writer: UnixStream,
+        request_id: String,
+    }
+
+    impl Server {
+        fn send(&mut self, event_id: Option<i64>, response: IpcResponse) {
+            write_envelope_frame(
+                &mut self.writer,
+                &response_envelope(&self.request_id, event_id, response),
+            )
+            .unwrap();
+        }
+    }
+
+    fn pair(request_id: &str) -> (TraceSubscription, Server) {
+        let (server, client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        (
+            TraceSubscription {
+                reader: BufReader::new(client),
+                request_id: request_id.into(),
+                started: false,
+            },
+            Server {
+                writer: server,
+                request_id: request_id.into(),
+            },
+        )
+    }
+
+    fn row(event_id: i64) -> IpcTraceRow {
+        IpcTraceRow {
+            event_id,
+            task_id: "task-1".into(),
+            kind: "assistant_text".into(),
+            payload_json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn a_trace_subscription_rejects_a_frame_for_another_request() {
+        let (mut subscription, mut server) = pair("mine");
+        server.request_id = "someone-else".into();
+        server.send(
+            None,
+            IpcResponse::TraceSubscription(TraceSnapshot {
+                high_water_id: 0,
+                rows: Vec::new(),
+            }),
+        );
+        assert!(matches!(
+            subscription.next_row(),
+            Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn a_trace_subscription_consumes_the_snapshot_then_yields_rows() {
+        let (mut subscription, mut server) = pair("mine");
+        server.send(
+            None,
+            IpcResponse::TraceSubscription(TraceSnapshot {
+                high_water_id: 2,
+                rows: vec![row(1), row(2)],
+            }),
+        );
+        server.send(Some(3), IpcResponse::TraceEvent(row(3)));
+        server.send(Some(4), IpcResponse::TraceEvent(row(4)));
+        drop(server.writer);
+
+        assert_eq!(subscription.next_row().unwrap().unwrap().event_id, 3);
+        assert_eq!(subscription.next_row().unwrap().unwrap().event_id, 4);
+        assert!(subscription.next_row().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_trace_subscription_rejects_a_row_whose_envelope_id_disagrees() {
+        let (mut subscription, mut server) = pair("mine");
+        server.send(
+            None,
+            IpcResponse::TraceSubscription(TraceSnapshot {
+                high_water_id: 0,
+                rows: Vec::new(),
+            }),
+        );
+        // Envelope says 9, the row says 10.
+        server.send(Some(9), IpcResponse::TraceEvent(row(10)));
+        assert!(matches!(
+            subscription.next_row(),
+            Err(IpcError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn a_trace_subscription_surfaces_a_daemon_error_frame() {
+        let (mut subscription, mut server) = pair("mine");
+        server.send(
+            None,
+            IpcResponse::Error {
+                code: IpcErrorCode::Validation,
+                message: Some("a trace subscription requires at least one valid task id".into()),
+            },
+        );
+        assert!(matches!(
+            subscription.next_row(),
+            Err(IpcError::Remote {
+                code: IpcErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_trace_subscription_treats_resync_as_the_end_of_the_stream() {
+        let (mut subscription, mut server) = pair("mine");
+        server.send(
+            None,
+            IpcResponse::TraceSubscription(TraceSnapshot {
+                high_water_id: 0,
+                rows: Vec::new(),
+            }),
+        );
+        server.send(None, IpcResponse::ResyncRequired);
+        assert!(subscription.next_row().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_trace_subscription_does_not_mistake_a_resync_first_frame_for_a_snapshot() {
+        let (mut subscription, mut server) = pair("mine");
+        server.send(None, IpcResponse::ResyncRequired);
+        assert!(subscription.next_row().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_daemon_error_frame_becomes_a_remote_error_not_a_response() {
+        let error = into_result(IpcResponse::Error {
+            code: IpcErrorCode::AuthorityDenied,
+            message: None,
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            IpcError::Remote {
+                code: IpcErrorCode::AuthorityDenied,
+                ..
+            }
+        ));
+        assert!(into_result(IpcResponse::ResyncRequired).is_ok());
     }
 }
