@@ -732,7 +732,16 @@ impl AgentSupervisor {
                         .map_err(|error| error.to_string())?;
                         (attempt_id, parent_id)
                     };
-                    self.send_message(
+                    // The child's terminal outcome is normally the parent's next
+                    // input. A parent that has already gone terminal — its root
+                    // was recovered, cancelled, or otherwise finished — can never
+                    // accept that message. That is not the child's fault: the
+                    // delivery is already recorded above, so the completed task
+                    // must still be reported instead of letting this notification
+                    // failure abort the whole reconciliation pass (which would
+                    // strand the child in `running` forever and starve every other
+                    // task in the same pass).
+                    let notification = self.send_message(
                         &task_id,
                         MailboxMessageDraft::new(
                             task_id.clone(),
@@ -740,8 +749,12 @@ impl AgentSupervisor {
                             MessageKind::Completed(delivery),
                             Some(attempt_id),
                         ),
-                    )
-                    .map_err(|error| error.to_string())?;
+                    );
+                    if let Err(error) = notification {
+                        if !matches!(error, MessageDeliveryError::RecipientTerminal) {
+                            return Err(error.to_string());
+                        }
+                    }
                 }
                 WorkerEvent::Completed { report } => {
                     let task = self

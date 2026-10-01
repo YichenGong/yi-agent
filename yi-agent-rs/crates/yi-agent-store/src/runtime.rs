@@ -3018,6 +3018,13 @@ impl RuntimeCoordinator {
         let mut deliveries = Vec::new();
         let mut consumed_overrides = Vec::new();
         let mut watchdog_updates = Vec::new();
+        // A failure in one session's supervisor (a wedged reducer, a delivery
+        // that can no longer be routed to a terminal parent) must not discard
+        // the transitions already collected from every other session: those
+        // updates are persisted only after this loop, so an early `?` here
+        // would silently un-complete other sessions' finished work and strand
+        // their tasks. Remember the first error and keep walking.
+        let mut first_error: Option<RuntimeCoordinatorError> = None;
         for supervisor in &supervisors {
             let mut supervisor = supervisor.lock().await;
             // Drain and persist trace facts before the reducer runs. Two
@@ -3027,13 +3034,22 @@ impl RuntimeCoordinator {
             // later drain would silently drop the terminal note that explains
             // why the worker stopped. Persisting in the same step, ahead of
             // the reducer and the transition collection below, keeps the
-            // writes independent: a `?` in either later stage can no longer
-            // discard facts that this drain already took off the worker.
-            self.persist_worker_trace_facts(supervisor.take_worker_trace_events())?;
+            // writes independent: a failure in either later stage can no
+            // longer discard facts that this drain already took off the worker.
+            if let Err(error) =
+                self.persist_worker_trace_facts(supervisor.take_worker_trace_events())
+            {
+                first_error.get_or_insert(error);
+                continue;
+            }
             watchdog_updates.extend(supervisor.take_worker_watchdog_events());
-            let changed = supervisor
-                .reconcile_worker_events()
-                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            let changed = match supervisor.reconcile_worker_events() {
+                Ok(changed) => changed,
+                Err(error) => {
+                    first_error.get_or_insert(RuntimeCoordinatorError::Supervisor(error));
+                    continue;
+                }
+            };
             for task_id in changed {
                 let task = supervisor.task(&task_id).expect("reconciled task exists");
                 let state = task.state();
@@ -3150,6 +3166,9 @@ impl RuntimeCoordinator {
                 repository.transition_task_and_attempt(&task_id, &attempt, state, event)?;
             }
             self.release_resident_lease(&task_id);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }

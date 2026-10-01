@@ -9,9 +9,8 @@ use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
-    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox,
-    IntegrationValidation, MessageId,
-    PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
+    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox, IntegrationValidation,
+    MessageId, PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
@@ -4249,5 +4248,53 @@ async fn inherited_sandbox_is_persisted_and_threaded_to_the_worker() {
     assert_eq!(
         child_start.inherited_sandbox,
         Some(InheritedSandbox::DangerFullAccess)
+    );
+}
+
+/// One supervisor's reconcile failure must not discard another session's
+/// unrelated completion. A single reconcile pass persists every session's
+/// updates after walking all supervisors, so before the fix a failure in one
+/// wedged session aborted the pass and left a healthy session's finished root
+/// stuck in `running` despite having completed.
+#[tokio::test]
+async fn one_supervisors_failure_does_not_discard_another_sessions_completion() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    // Session A: a healthy root whose worker finishes with no changes, so its
+    // supervisor's reconcile step applies a `completed_no_changes` transition.
+    let session_a = coordinator.create_session().unwrap();
+    let root_a = coordinator.root_task_id(&session_a).unwrap();
+    coordinator.start_worker(&session_a, &root_a).await.unwrap();
+
+    // Session B: a root whose worker submits a delivery. A root has no parent,
+    // so the delivery cannot be routed and this supervisor's step fails.
+    let session_b = coordinator.create_session().unwrap();
+    let root_b = coordinator.root_task_id(&session_b).unwrap();
+    coordinator.start_worker(&session_b, &root_b).await.unwrap();
+
+    let handles = factory.handles.lock().unwrap().clone();
+    assert_eq!(handles.len(), 2, "each root owns one worker");
+    handles[0].report_completed("finished cleanly");
+    handles[1].report_delivery(DeliveryReport::coding(
+        "deadbeef",
+        "main",
+        WorkspaceLeaseId::new(),
+        "cargo test",
+    ));
+
+    // The pass may surface the poisoned session's failure, but it must still
+    // apply the healthy session's completion before returning.
+    let _ = coordinator.reconcile_worker_events().await;
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&root_a)
+            .unwrap(),
+        "completed_no_changes",
+        "a healthy session's completion must survive another session's failure"
     );
 }
