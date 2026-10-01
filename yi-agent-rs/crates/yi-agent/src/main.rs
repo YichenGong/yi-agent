@@ -613,10 +613,16 @@ fn build_headless_root_tools(
     let setup =
         build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
     let mut registry = (*setup.tools).clone();
+    let delegation_controller = yi_agent_tools::SandboxController::new(
+        yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+        config.sandbox,
+        config.sandbox_promotable,
+    );
     crate::tui::subagents::register_attached_root_tools(
         &mut registry,
         runtime_socket,
         attached_root,
+        delegation_controller,
     );
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
@@ -718,10 +724,16 @@ fn build_tui_root_tools(
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
+    let delegation_controller = yi_agent_tools::SandboxController::new(
+        yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+        config.sandbox,
+        config.sandbox_promotable,
+    );
     crate::tui::subagents::register_attached_root_tools(
         &mut registry,
         runtime_socket,
         attached_root,
+        delegation_controller,
     );
     registry
 }
