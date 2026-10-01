@@ -65,6 +65,9 @@
 - [ ] 手动端到端冒烟（原生窗口 / 流式文本 / 工具卡片 / 审批弹窗放行与拒绝 / Stop 中断 / 杀 sidecar 不崩）— 判据：`cd desktop && npm run sidecar && npm run tauri dev` 后人工逐项确认（设计文档 §12 成功判据，`docs/superpowers/plans/2026-09-26-desktop-gui-design.md:354`）；自动化可覆盖部分已验：应用可启动、sidecar 子进程被拉起
 - [x] 发送方法自愈（服务端报 `-32013`/`-32012` 时自动改走另一方法，消息不丢）— `desktop/src/App.tsx:312`（`send` 的两跳重试）/ `desktop/src/App.tsx:46`（`sendMethodMismatchCode`，读原始错误对象的 `code`——`formatError` 会丢掉它）/ `desktop/src/lib/threadStore.ts:83`（`seed` 按 `statusSource` 只播种、不回退实时状态，堵住 `turn/completed` → 落盘 → `idle` 窗口内 `thread/listAll` 快照把状态翻回 `running` 的污染源）；判据：`desktop/src/App.test.tsx` 的 `App send recovery from a status disagreement`（4 例：两向自愈、不乒乓、首选跟随缓存状态）与 `desktop/src/lib/threadStore.test.ts` 的「不回退实时状态 / 仍播种新 thread」全绿
 
+- [x] 子 agent 暂留区（列表 + 状态） — 主对话旁一个可折叠的暂留区（并列、非弹窗），每个子 agent 一张卡片，显示目标与状态（终态卡片标记「已结束」、不再显示"当前步骤"），空态显示「暂无子 agent」；点卡片进入详情。数据来自 `agent/children/list`（按对话过滤），并由 `agent/children/updated` 就地整表更新，切换对话时重新拉取。代码：`desktop/src/components/SubagentRail.tsx:26`、`desktop/src/lib/subagents.ts:80`（`SubagentRailStore`）、`desktop/src/App.tsx:173`（`refreshSubagents`）、`desktop/src/App.tsx`（`agent/children/updated` 分支），验证：`cd desktop && npx vitest run src/components/SubagentRail.test.tsx src/lib/subagents.test.ts`；协议类型 `desktop/src/lib/protocol.ts`（`AgentChild`）
+- [x] 子 agent 轨迹详情（两级 + 下钻 + 两个动作） — 打开详情先 `agent/trace/read` 回灌、再 `agent/trace/watch` 开一条流，`agent/trace/event` 只追加**当前打开任务**的行（换任务时在途帧被丢弃），关闭即 `agent/trace/unwatch`；默认显示摘要（状态、目标、最近步骤、行数），展开才渲染完整轨迹——连续 `assistant_text` 合并为一段，工具调用/结果各自成块；详情内列出该任务的直接子任务可继续进入；`发消息` 走 `agent/message`，`取消该任务` 先 `agent/cancel/preview` 拿 token 并在页面上确认后才 `agent/cancel`（弹出确认前不取消任何东西）。代码：`desktop/src/components/SubagentTrace.tsx:47`、`desktop/src/lib/subagents.ts:141`（`foldTraceRows`）、`desktop/src/lib/subagents.ts:110`（`childrenOf`）、`desktop/src/App.tsx:139`（`openDetail`）、`desktop/src/App.tsx:157`（`closeDetail`）、`desktop/src/App.tsx:370`（`agent/trace/event` 分支），验证：`cd desktop && npx vitest run src/components/SubagentTrace.test.tsx src/lib/subagents.test.ts`
+
 **P1 剩余：**
 
 - [ ] reasoning / thinking 展示 — core `ProviderEvent`（`yi-agent-rs/crates/yi-agent-core/src/provider.rs:43`）与 `AgentEvent`（`yi-agent-rs/crates/yi-agent-core/src/agent.rs:198`）当前无 thinking 变体，provider 未解析 thinking block；需 core + provider + protocol + translate + 前端逐层加支持；判据：发一条触发 extended thinking 的 prompt，GUI 显示 reasoning 内容
@@ -81,7 +84,7 @@
 **P3 路线图：**
 
 - [ ] MCP 集成 — 后端 `yi-agent-mcp` 已完成（配置/懒连接/调用/`/mcp` 开关，见 [yi-agent-mcp](./yi-agent-mcp.md)）；判据：GUI 可查看 / 启停 MCP server
-- [ ] 子 agent 任务树可视化 — 复用现有 daemon IPC（见 [subagent-runtime](./subagent-runtime.md)）；判据：GUI 展示子 agent 任务树
+
 - [ ] Unix socket / websocket 传输 — 当前仅 stdio（其它一律拒绝，`yi-agent-rs/crates/yi-agent/src/main.rs:74`）；判据：`--listen` 支持 socket/ws 且 GUI 可连
 - [ ] 多窗口共享 daemon — 判据：多个 GUI 窗口连同一 daemon
 - [ ] Linux 打包验证 — 判据：产出并启动 Linux 包
