@@ -111,6 +111,27 @@ impl Supervisor {
         }
     }
 
+    /// 当前可被查询的插件：清单声明了 socket，且进程正在运行。
+    ///
+    /// 这是「插件是否有查询通道」的唯一判据——daemon 只认这份列表，不会接受
+    /// 请求方传来的任意 socket 路径。停止或未声明的插件下一轮就会消失。
+    pub fn query_sockets(&self) -> Vec<(String, PathBuf)> {
+        let manifests = load_manifests(&self.layout.manifests_dir());
+        manifests
+            .into_iter()
+            .filter(|manifest| self.running.contains_key(&manifest.name))
+            .filter_map(|manifest| {
+                manifest
+                    .query_socket_path(
+                        &self.layout.workdir,
+                        &self.layout.state_dir,
+                        &self.layout.runtime_dir,
+                    )
+                    .map(|path| (manifest.name.clone(), path))
+            })
+            .collect()
+    }
+
     fn ensure_running(&mut self, manifest: &SupervisorManifest) {
         if let Some(running) = self.running.get_mut(&manifest.name) {
             match running.child.try_wait() {

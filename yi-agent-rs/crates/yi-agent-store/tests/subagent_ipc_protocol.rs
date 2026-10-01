@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use yi_agent_core::subagent::task::{RootSessionId, TaskId};
 use yi_agent_store::ipc::{
-    Daemon, IpcRequest, IpcResponse, RequestEnvelope, send_request, subscribe,
+    Daemon, IpcRequest, IpcResponse, PROTOCOL_VERSION, RequestEnvelope, send_request, subscribe,
 };
 use yi_agent_store::repository::{RuntimeEvent, RuntimeRepository};
 
@@ -110,7 +110,7 @@ fn fragmented_status_frames_preserve_request_correlation() {
     )
     .unwrap();
     let envelope = RequestEnvelope {
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
         request_id: "fragmented-status".into(),
         command: IpcRequest::Status,
     };
@@ -118,7 +118,7 @@ fn fragmented_status_frames_preserve_request_correlation() {
 
     for size in 1..=frame.len() {
         let response = send_in_chunks(daemon.socket_path(), &frame, size);
-        assert_eq!(response["protocol_version"], json!(1));
+        assert_eq!(response["protocol_version"], json!(PROTOCOL_VERSION));
         assert_eq!(response["request_id"], json!("fragmented-status"));
         assert!(
             response["result"].is_object(),
@@ -137,9 +137,9 @@ fn malformed_and_oversized_clients_do_not_stop_healthy_requests() {
     .unwrap();
     for frame in [
         b"{\"protocol_version\":1".as_slice(),
-        b"{\"protocol_version\":999,\"request_id\":\"bad-version\",\"command\":\"status\"}"
+        b"{\"protocol_version\":9999,\"request_id\":\"bad-version\",\"command\":\"status\"}"
             .as_slice(),
-        b"{\"protocol_version\":1,\"request_id\":\"unknown\",\"command\":\"unknown\"}".as_slice(),
+        b"{\"protocol_version\":2,\"request_id\":\"unknown\",\"command\":\"unknown\"}".as_slice(),
     ] {
         let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
         stream.write_all(frame).unwrap();
