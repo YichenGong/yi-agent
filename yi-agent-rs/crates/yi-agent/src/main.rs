@@ -756,6 +756,9 @@ struct AttachedTuiRuntime {
     socket_path: std::path::PathBuf,
     attached_root: crate::tui::subagents::AttachedRoot,
     embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
+    /// 插件监督句柄。本 TUI 起了 daemon 才真的监督；借用别人的 daemon 时是空转。
+    /// 生命周期交给 Drop：会话结束即停止监督，不必依赖调用点的纪律。
+    supervisor: yi_agent_runtime::supervise::SuperviseHandle,
 }
 
 impl TuiRuntimeSession {
@@ -889,6 +892,9 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
             return Ok(Some(TuiRuntimeSession::unavailable(reason)));
         }
     };
+    // 只有"我起的 daemon"才该由我监督：借用了别人的 daemon 还去监督，
+    // 两边会互相拉/停同一批插件进程。
+    let owns_daemon = embedded_daemon.is_some();
     let idempotency_key = format!(
         "tui:{}:{}:{}",
         std::process::id(),
@@ -927,6 +933,10 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
                 workspace,
             },
             embedded_daemon,
+            supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+                &config.workdir,
+                owns_daemon,
+            ),
         },
     ))))
 }
@@ -1555,6 +1565,7 @@ fn run_tui_agent(
                                         socket_path,
                                         attached_root,
                                         embedded_daemon,
+                                        supervisor,
                                     } = *attached;
                                     if let Some(daemon) = &embedded_daemon {
                                         tracing::info!("embedded subagent runtime started for TUI");
@@ -1617,6 +1628,7 @@ fn run_tui_agent(
                                                         socket_path,
                                                         attached_root,
                                                         embedded_daemon,
+                                                        supervisor,
                                                     },
                                                 )));
                                             root_activated = false;
