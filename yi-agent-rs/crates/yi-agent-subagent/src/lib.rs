@@ -602,25 +602,34 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                     task_id: request.task_id.to_string(),
                     capability: request.message_capability.clone(),
                 });
+            let worker_root = crate::thread_root::ThreadRoot::from_handle(
+                Arc::clone(&worker_binding),
+                crate::AttachedRoot {
+                    session_id: request.root_session_id.to_string(),
+                    task_id: request.task_id.to_string(),
+                    capability: request.message_capability.clone(),
+                    workspace: workspace.clone(),
+                },
+            );
             for tool in [
                 Arc::new(DaemonSpawnAgentTool {
-                    binding: Arc::clone(&worker_binding),
+                    root: Arc::clone(&worker_root),
                     sandbox: effective_sandbox,
                 }) as Arc<dyn Tool>,
                 Arc::new(DaemonSendMessageTool {
-                    binding: Arc::clone(&worker_binding),
+                    root: Arc::clone(&worker_root),
                 }),
                 Arc::new(DaemonWaitAgentTool {
-                    binding: Arc::clone(&worker_binding),
+                    root: Arc::clone(&worker_root),
                 }),
                 Arc::new(DaemonInspectAgentTool {
-                    binding: Arc::clone(&worker_binding),
+                    root: Arc::clone(&worker_root),
                 }),
                 Arc::new(DaemonCancelAgentTool {
-                    binding: Arc::clone(&worker_binding),
+                    root: Arc::clone(&worker_root),
                 }),
                 Arc::new(DaemonReviewAgentTool {
-                    binding: Arc::clone(&worker_binding),
+                    root: Arc::clone(&worker_root),
                 }),
             ] {
                 worker_tools.register(tool);
@@ -1137,11 +1146,11 @@ fn validate_recovery_context(
 }
 
 struct DaemonApplicationSendMessageTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
 }
 
 struct DaemonSendMessageTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
 }
 
 #[async_trait]
@@ -1178,11 +1187,16 @@ impl Tool for DaemonApplicationSendMessageTool {
         }
         let recipient = recipient.to_owned();
         let message = message.to_owned();
-        match self.binding.send(
-            |h| yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
-                session_id: h.session_id.clone(),
-                sender_task_id: h.task_id.clone(),
-                capability: h.capability.clone(),
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        match yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
+                session_id: handle.session_id.clone(),
+                sender_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
                 recipient_task_id: recipient.clone(),
                 message: message.clone(),
             },
@@ -1233,15 +1247,20 @@ impl Tool for DaemonSendMessageTool {
         }
         let recipient = recipient.to_owned();
         let message = message.to_owned();
-        match self
-            .binding
-            .send(|h| yi_agent_store::ipc::IpcRequest::SendMessage {
-                session_id: h.session_id.clone(),
-                sender_task_id: h.task_id.clone(),
-                worker_capability: h.capability.clone(),
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        match yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::SendMessage {
+                session_id: handle.session_id.clone(),
+                sender_task_id: handle.task_id.clone(),
+                worker_capability: handle.capability.clone(),
                 recipient_task_id: recipient.clone(),
                 message: message.clone(),
-            }) {
+            },
+        ) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
@@ -1266,10 +1285,10 @@ pub struct AttachedRoot {
 /// Adds the six delegation tools to a root agent's registry.
 pub fn register_attached_root_tools(
     registry: &mut ToolRegistry,
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
 ) {
-    register_attached_root_tools_in_thread(registry, binding, controller, None);
+    register_attached_root_tools_in_thread(registry, root, controller, None);
 }
 
 /// Register the delegation tools with a conversation marker.
@@ -1281,46 +1300,46 @@ pub fn register_attached_root_tools(
 /// through them is tagged with the conversation that asked for it.
 pub fn register_attached_root_tools_in_thread(
     registry: &mut ToolRegistry,
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
 ) {
-    register_application_subagent_tools_in_thread(registry, binding, controller, thread_id);
+    register_application_subagent_tools_in_thread(registry, root, controller, thread_id);
 }
 
 pub fn register_application_subagent_tools(
     registry: &mut ToolRegistry,
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
 ) {
-    register_application_subagent_tools_in_thread(registry, binding, controller, None);
+    register_application_subagent_tools_in_thread(registry, root, controller, None);
 }
 
 pub fn register_application_subagent_tools_in_thread(
     registry: &mut ToolRegistry,
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
 ) {
     registry.register(Arc::new(DaemonApplicationSpawnAgentTool {
-        binding: Arc::clone(&binding),
+        root: Arc::clone(&root),
         controller,
         thread_id,
     }));
     registry.register(Arc::new(DaemonApplicationSendMessageTool {
-        binding: Arc::clone(&binding),
+        root: Arc::clone(&root),
     }));
     registry.register(Arc::new(DaemonWaitAgentTool {
-        binding: Arc::clone(&binding),
+        root: Arc::clone(&root),
     }));
     registry.register(Arc::new(DaemonInspectAgentTool {
-        binding: Arc::clone(&binding),
+        root: Arc::clone(&root),
     }));
     registry.register(Arc::new(DaemonCancelAgentTool {
-        binding: Arc::clone(&binding),
+        root: Arc::clone(&root),
     }));
     registry.register(Arc::new(DaemonReviewAgentTool {
-        binding: Arc::clone(&binding),
+        root: Arc::clone(&root),
     }));
 }
 
@@ -1388,12 +1407,12 @@ fn spawn_sandbox(
 }
 
 struct DaemonSpawnAgentTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
     sandbox: yi_agent_tools::SandboxMode,
 }
 
 struct DaemonApplicationSpawnAgentTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
     /// The conversation this tool belongs to, captured at assembly time. Every
     /// child it spawns is tagged with it so a client can scope children to the
@@ -1413,19 +1432,19 @@ fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
 }
 
 struct DaemonInspectAgentTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
 }
 
 struct DaemonCancelAgentTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
 }
 
 struct DaemonReviewAgentTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
 }
 
 struct DaemonWaitAgentTool {
-    binding: Arc<crate::binding::RuntimeBinding>,
+    root: Arc<crate::thread_root::ThreadRoot>,
 }
 
 #[async_trait]
@@ -1487,20 +1506,25 @@ impl Tool for DaemonApplicationSpawnAgentTool {
         };
         let mode = mode.as_str().to_string();
         let objective = task.to_string();
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
         let thread_id = self.thread_id.clone();
-        let response =
-            self.binding
-                .send(|h| yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-                    session_id: h.session_id.clone(),
-                    parent_task_id: h.task_id.clone(),
-                    capability: h.capability.clone(),
-                    objective: objective.clone(),
-                    mode: Some(mode.clone()),
-                    model: model.clone(),
-                    workdir: workdir.clone(),
-                    thread_id: thread_id.clone(),
-                    sandbox: sandbox.clone(),
-                });
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: handle.session_id.clone(),
+                parent_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                objective: objective.clone(),
+                mode: Some(mode.clone()),
+                model: model.clone(),
+                workdir: workdir.clone(),
+                thread_id: thread_id.clone(),
+                sandbox: sandbox.clone(),
+            },
+        );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
@@ -1549,14 +1573,19 @@ impl Tool for DaemonInspectAgentTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let task_id = task_id.to_owned();
-        let response = self
-            .binding
-            .send(|h| yi_agent_store::ipc::IpcRequest::InspectChild {
-                session_id: h.session_id.clone(),
-                caller_task_id: h.task_id.clone(),
-                capability: h.capability.clone(),
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::InspectChild {
+                session_id: handle.session_id.clone(),
+                caller_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
                 task_id: task_id.clone(),
-            });
+            },
+        );
         let detail = match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskDetail(detail)) => detail,
             Ok(other) => return ToolResult::error(format_ipc_rejection("inspect request", &other)),
@@ -1571,11 +1600,12 @@ impl Tool for DaemonInspectAgentTool {
             "report": report,
         });
         if include_diff {
-            let diff = self
-                .binding
-                .send(|_| yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+            let diff = yi_agent_store::ipc::send_request(
+                &handle.socket_path,
+                yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
                     task_id: task_id.clone(),
-                });
+                },
+            );
             if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { diff, .. }) = diff {
                 payload["diff"] = json!(diff);
             }
@@ -1622,15 +1652,20 @@ impl Tool for DaemonCancelAgentTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let task_id = task_id.to_owned();
-        let response = self
-            .binding
-            .send(|h| yi_agent_store::ipc::IpcRequest::CancelChild {
-                session_id: h.session_id.clone(),
-                caller_task_id: h.task_id.clone(),
-                capability: h.capability.clone(),
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::CancelChild {
+                session_id: handle.session_id.clone(),
+                caller_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
                 task_id: task_id.clone(),
                 recursive,
-            });
+            },
+        );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskCancelled) => {
                 ToolResult::text(json!({ "task_id": task_id, "status": "cancelled" }).to_string())
@@ -1696,15 +1731,20 @@ impl Tool for DaemonReviewAgentTool {
             None => return ToolResult::error("decision is required"),
         };
         let task_id = task_id.to_owned();
-        let response = self
-            .binding
-            .send(|h| yi_agent_store::ipc::IpcRequest::ReviewChild {
-                session_id: h.session_id.clone(),
-                caller_task_id: h.task_id.clone(),
-                capability: h.capability.clone(),
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::ReviewChild {
+                session_id: handle.session_id.clone(),
+                caller_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
                 task_id: task_id.clone(),
                 decision: decision.clone(),
-            });
+            },
+        );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::ChildReviewAccepted) => ToolResult::text(
                 json!({ "task_id": task_id, "status": "review_recorded" }).to_string(),
@@ -1742,15 +1782,20 @@ impl Tool for DaemonWaitAgentTool {
             return ToolResult::error("mode must be one, any, or all");
         }
         let mode = mode.to_owned();
-        let response = self
-            .binding
-            .send(|h| yi_agent_store::ipc::IpcRequest::WaitAgent {
-                session_id: h.session_id.clone(),
-                caller_task_id: h.task_id.clone(),
-                capability: h.capability.clone(),
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::WaitAgent {
+                session_id: handle.session_id.clone(),
+                caller_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
                 mode: mode.clone(),
                 timeout_ms: Some(TUI_WAIT_AGENT_TIMEOUT_MS),
-            });
+            },
+        );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::WaitCompleted {
                 status,
@@ -1824,17 +1869,22 @@ impl Tool for DaemonSpawnAgentTool {
         };
         let mode = mode.as_str().to_string();
         let objective = task.to_string();
-        let response = self
-            .binding
-            .send(|h| yi_agent_store::ipc::IpcRequest::SpawnChild {
-                session_id: h.session_id.clone(),
-                parent_task_id: h.task_id.clone(),
+        let handle = match self.root.handle() {
+            Ok(handle) => handle,
+            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
+        };
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::SpawnChild {
+                session_id: handle.session_id.clone(),
+                parent_task_id: handle.task_id.clone(),
                 objective: objective.clone(),
                 mode: Some(mode.clone()),
                 model: model.clone(),
                 workdir: workdir.clone(),
                 sandbox: sandbox.clone(),
-            });
+            },
+        );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
@@ -1847,11 +1897,11 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
-    /// The whole point of the binding refactor: the six application delegation
-    /// tools share one live binding instead of freezing their own socket.
+    /// The whole point of the root refactor: the six application delegation tools
+    /// share one conversation root instead of freezing their own socket.
     #[test]
-    fn application_tools_share_one_binding() {
-        let binding = test_binding(
+    fn application_tools_share_one_root() {
+        let root = test_root(
             PathBuf::from("/tmp/unused.sock"),
             "s".into(),
             "t".into(),
@@ -1860,7 +1910,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         register_attached_root_tools(
             &mut registry,
-            binding,
+            root,
             yi_agent_tools::SandboxController::new(
                 yi_agent_core::autonomy::YoloSwitch::new(false),
                 yi_agent_tools::SandboxMode::WorkspaceWrite,
@@ -1893,6 +1943,37 @@ mod tests {
             task_id: task,
             capability,
         })
+    }
+
+    /// A root handle over literals, for tools exercised without a live daemon.
+    fn test_root(
+        socket: PathBuf,
+        session: String,
+        task: String,
+        capability: String,
+    ) -> Arc<crate::thread_root::ThreadRoot> {
+        let binding = test_binding(
+            socket,
+            session.clone(),
+            task.clone(),
+            capability.clone(),
+        );
+        crate::thread_root::ThreadRoot::from_handle(
+            binding,
+            crate::AttachedRoot {
+                session_id: session,
+                task_id: task,
+                capability,
+                workspace: yi_agent_core::subagent::worker::WorkerWorkspace {
+                    lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+                    repository_root: PathBuf::from("/tmp/unused-ws"),
+                    path: PathBuf::from("/tmp/unused-ws"),
+                    branch: String::new(),
+                    parent_branch: String::new(),
+                    base_commit: String::new(),
+                },
+            },
+        )
     }
 
     use std::sync::{Arc, Mutex};
@@ -1995,7 +2076,7 @@ mod tests {
     #[tokio::test]
     async fn review_agent_validates_its_arguments_before_touching_the_daemon() {
         let tool = DaemonReviewAgentTool {
-            binding: test_binding(
+            root: test_root(
                 PathBuf::from("/tmp/unused.sock"),
                 "s".into(),
                 "c".into(),
@@ -2033,7 +2114,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_agent_requires_a_task_id_and_a_valid_uuid() {
         let tool = DaemonCancelAgentTool {
-            binding: test_binding(
+            root: test_root(
                 PathBuf::from("/tmp/unused.sock"),
                 "s".into(),
                 "c".into(),
@@ -2052,7 +2133,7 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         let socket = directory.path().join("runtime.sock");
         let tool = DaemonInspectAgentTool {
-            binding: test_binding(
+            root: test_root(
                 socket.clone(),
                 "session".into(),
                 "caller".into(),
@@ -2073,7 +2154,7 @@ mod tests {
     #[test]
     fn inspect_agent_schema_defaults_include_diff_to_false() {
         let schema = DaemonInspectAgentTool {
-            binding: test_binding(
+            root: test_root(
                 PathBuf::from("/tmp/unused.sock"),
                 "s".into(),
                 "c".into(),
@@ -3309,7 +3390,7 @@ mod tests {
         };
 
         let tool = DaemonSendMessageTool {
-            binding: test_binding(
+            root: test_root(
                 daemon.socket_path().to_path_buf(),
                 session_id,
                 child_task_id,
@@ -3384,7 +3465,7 @@ mod tests {
         .unwrap();
 
         let tool = DaemonWaitAgentTool {
-            binding: test_binding(
+            root: test_root(
                 daemon.socket_path().to_path_buf(),
                 session_id,
                 root_task_id,

@@ -26,24 +26,27 @@ pub enum RuntimeStartupIntent {
 }
 
 pub use yi_agent_subagent::binding::{RuntimeBinding, RuntimeHandle};
+pub use yi_agent_subagent::thread_root::ThreadRoot;
 pub use yi_agent_subagent::{AttachedRoot, register_attached_root_tools};
 
-/// A fixed binding for a runtime this process owns for the whole session.
+/// A root handle for a runtime this process owns for the whole session.
 ///
 /// The TUI starts (or joins) its daemon once at launch and keeps it for the
-/// session, so its tools need no repair plan: a fixed handle is exactly the old
-/// behaviour, expressed through the binding the delegation tools now take.
+/// session, so its tools need no repair plan: a fixed binding plus the root it
+/// was attached as is exactly the old behaviour, now expressed through the
+/// `ThreadRoot` the delegation tools take.
 pub fn root_binding(
     socket_path: std::path::PathBuf,
     attached_root: &AttachedRoot,
-) -> std::sync::Arc<RuntimeBinding> {
-    RuntimeBinding::fixed(RuntimeHandle {
+) -> std::sync::Arc<ThreadRoot> {
+    let binding = RuntimeBinding::fixed(RuntimeHandle {
         socket_path,
         workspace_root: attached_root.workspace.path.clone(),
         session_id: attached_root.session_id.clone(),
         task_id: attached_root.task_id.clone(),
         capability: attached_root.capability.clone(),
-    })
+    });
+    ThreadRoot::from_handle(binding, attached_root.clone())
 }
 
 /// The Chinese line shown when the runtime the user asked for (`y`, or a

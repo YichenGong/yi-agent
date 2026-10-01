@@ -6,6 +6,9 @@
 //! once, delegate, detach.
 
 use std::path::Path;
+use std::sync::Arc;
+
+use yi_agent_subagent::thread_root::ThreadRoot;
 
 fn init_git_repo(dir: &Path) {
     for args in [
@@ -83,18 +86,21 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
     // The tools the applications register over this runtime are exactly the ones
     // the model calls, so exercise the spawn they share.
     let mut registry = yi_agent_core::ToolRegistry::new();
-    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
-        yi_agent_subagent::binding::RuntimeHandle {
-            socket_path: attached.socket_path.clone(),
-            workspace_root: attached.workspace_root.clone(),
-            session_id: attached.attached_root.session_id.clone(),
-            task_id: attached.attached_root.task_id.clone(),
-            capability: attached.attached_root.capability.clone(),
-        },
+    let root = ThreadRoot::from_handle(
+        yi_agent_subagent::binding::RuntimeBinding::fixed(
+            yi_agent_subagent::binding::RuntimeHandle {
+                socket_path: attached.socket_path.clone(),
+                workspace_root: attached.workspace_root.clone(),
+                session_id: attached.attached_root.session_id.clone(),
+                task_id: attached.attached_root.task_id.clone(),
+                capability: attached.attached_root.capability.clone(),
+            },
+        ),
+        attached.attached_root.clone(),
     );
     yi_agent_subagent::register_attached_root_tools(
         &mut registry,
-        binding,
+        root,
         yi_agent_tools::SandboxController::new(
             yi_agent_core::autonomy::YoloSwitch::new(false),
             yi_agent_tools::SandboxMode::WorkspaceWrite,
@@ -179,4 +185,87 @@ fn ensure_owned_reuses_a_healthy_daemon() {
         joined.embedded_daemon.is_none(),
         "must not steal a healthy daemon"
     );
+}
+
+/// A daemon shared by several conversations, each with its own root: this is the
+/// desktop app's shape, and the reason it must not be capped at four children in
+/// total. One conversation's root must never reach another's child.
+#[test]
+fn delegation_tools_act_as_the_conversations_own_root() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let attached =
+        yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime_dir.path().to_path_buf())
+            .expect("a clean git project must attach");
+
+    // One shared binding (one daemon), two conversations: exactly the desktop
+    // app-server's arrangement.
+    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
+        yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: attached.socket_path.clone(),
+            workspace_root: attached.workspace_root.clone(),
+            session_id: attached.attached_root.session_id.clone(),
+            task_id: attached.attached_root.task_id.clone(),
+            capability: attached.attached_root.capability.clone(),
+        },
+    );
+    let thread_a = ThreadRoot::new(Arc::clone(&binding), "thread-a", repo.path().to_path_buf());
+    let thread_b = ThreadRoot::new(Arc::clone(&binding), "thread-b", repo.path().to_path_buf());
+    thread_a.attach().expect("conversation A attaches");
+    thread_b.attach().expect("conversation B attaches");
+
+    let id_a = thread_a.root_task_id().expect("A is attached");
+    let id_b = thread_b.root_task_id().expect("B is attached");
+    assert_ne!(
+        id_a, id_b,
+        "two conversations in one directory must own two distinct roots"
+    );
+    assert_eq!(
+        thread_a.handle().expect("A resolves a handle").task_id,
+        id_a,
+        "the delegation tools act as their own conversation's root"
+    );
+    assert_eq!(thread_b.handle().expect("B resolves a handle").task_id, id_b);
+
+    // A child spawned as conversation A is out of reach for conversation B:
+    // separate roots are separate authorization scopes.
+    let a_handle = thread_a.handle().expect("A resolves a handle");
+    let spawned = yi_agent_store::ipc::send_request(
+        &a_handle.socket_path,
+        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+            session_id: a_handle.session_id.clone(),
+            parent_task_id: a_handle.task_id.clone(),
+            capability: a_handle.capability.clone(),
+            objective: "conversation A's child".into(),
+            mode: Some("read_only".into()),
+            model: None,
+            workdir: None,
+            thread_id: Some("thread-a".into()),
+            sandbox: None,
+        },
+    )
+    .expect("A's child must be admitted");
+    let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id: child_of_a } = spawned else {
+        panic!("A's child must be admitted, got {spawned:?}");
+    };
+
+    let b_handle = thread_b.handle().expect("B resolves a handle");
+    let inspected = yi_agent_store::ipc::send_request(
+        &b_handle.socket_path,
+        yi_agent_store::ipc::IpcRequest::InspectChild {
+            session_id: b_handle.session_id.clone(),
+            caller_task_id: b_handle.task_id.clone(),
+            capability: b_handle.capability.clone(),
+            task_id: child_of_a.clone(),
+        },
+    )
+    .expect("the socket answers");
+    assert!(
+        matches!(inspected, yi_agent_store::ipc::IpcResponse::Error { .. }),
+        "conversation B must not inspect conversation A's child, got {inspected:?}"
+    );
+
+    yi_agent_subagent::attach::detach_root(&attached.socket_path, &attached.attached_root);
 }

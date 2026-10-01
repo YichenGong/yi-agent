@@ -65,6 +65,20 @@ impl ThreadRoot {
         })
     }
 
+    /// Wraps a root that already exists on a fixed runtime, without attaching.
+    ///
+    /// The TUI and the daemon's own workers own their daemon for the life of the
+    /// process and were handed an already-attached root; they must not re-attach
+    /// through the wire. The fixed binding reports generation 0 forever, so the
+    /// root stays live and no repair is ever attempted.
+    pub fn from_handle(binding: Arc<RuntimeBinding>, root: AttachedRoot) -> Arc<Self> {
+        let thread_id = root.session_id.clone();
+        let project_dir = root.workspace.path.clone();
+        let thread_root = Self::new(binding, thread_id, project_dir);
+        *thread_root.lock_cached() = Some(CachedRoot { generation: 0, root });
+        thread_root
+    }
+
     fn lock_cached(&self) -> std::sync::MutexGuard<'_, Option<CachedRoot>> {
         self.cached
             .lock()
