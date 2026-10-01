@@ -75,9 +75,30 @@ pub pin_seq: Option<i64>,
 各自写下同一毫秒的时间戳），按 `updated_at` 降序、`thread_id` 升序打破平局，
 保证顺序确定。
 
-### 4.2 `ThreadStore` 新增方法
+### 4.2 排序算法与 `ThreadStore` 新增方法
 
-在 `thread_store.rs` 中，沿用既有 `update_meta`（持 `meta_lock` 做读-改-写）实现：
+会话按工作目录**分目录存储**，而置顶会话是**跨目录**的，因此「重排」不是任何单个
+`ThreadStore` 的方法。拆成两层：
+
+1. 一个**纯函数**（放 `thread_store.rs` 顶层，`pub(crate)`，可独立单测）负责算出
+   每个 id 的目标 `pin_seq`；不碰文件系统。
+2. `ThreadStore` 只保留一个按 id 写入的方法，调用方按 id 所在目录分别调用。
+
+```rust
+/// 计算重排后的 `pin_seq` 赋值。`order` 为**从顶到底**的完整有序 id 列表，
+/// `current` 为这些 id 当前的 `pin_seq`。返回 (id, 新 seq) 列表。
+///
+/// 算法：取 `current` 中现有 `pin_seq` 的**互异**值升序得 `seqs`；将 `order`
+/// 从顶到底依次赋值为 `seqs` 的从大到小（`order[0]` 拿最大值）。复用既有互异
+/// 数值做双射，**永不产生新的重复值**，且与 §4.1 的降序契约一致。
+/// `current` 里为 `None` 的项（异常态）补 `now_millis() + 递增偏移` 后纳入 `seqs`。
+pub(crate) fn assign_pin_seqs(
+    order: &[String],
+    current: &HashMap<String, Option<i64>>,
+) -> Vec<(String, i64)>;
+```
+
+`ThreadStore` 新增（沿用既有 `update_meta`，持 `meta_lock` 做读-改-写）：
 
 ```rust
 /// 写入置顶顺序键：`Some(seq)` = 置顶，`None` = 取消置顶。
@@ -86,27 +107,15 @@ pub pin_seq: Option<i64>,
 /// `updated_at` 排序的普通分组顺序（与 `set_permission_mode` 同理）。
 /// 返回 false 表示 thread 不存在或 meta 不可读。
 pub fn set_pin_seq(&self, id: &str, seq: Option<i64>) -> io::Result<bool>;
-
-/// 按给定顺序重写一组 thread 的 `pin_seq`。`order` 为**从顶到底**的完整有序 id 列表。
-/// 返回是否成功（任一 thread 不存在或 meta 不可读即返回 false）。
-pub fn reorder_pinned(&self, order: &[String]) -> io::Result<bool>;
 ```
 
-#### `reorder_pinned` 的赋值算法（碰撞安全）
+重排的落盘由 RPC 处理函数完成：对 `assign_pin_seqs` 的每个 `(id, seq)`，用
+`store_for(workspaces, cfg, id)` 定位其 store 后调用 `set_pin_seq`。
 
-设参与重排的 thread 集为 `S`（由调用方保证 `S` 与 `order` 一一对应）。取 `S` 中
-现有 `pin_seq` 的**互异**值，升序排列得 `seqs = [s_0 < s_1 < ... < s_{m-1}]`，
-其中 `m = |S|`。
-
-将 `order` 按**从顶到底**依次赋值为 `seqs` 的**从大到小**：
-`order[0]` → `s_{m-1}`、`order[1]` → `s_{m-2}` … `order[n-1]` → `s_0`。
-
-- 让赋值构成集合到集合的双射，复用既有互异数值，**永不产生新的重复值**。
-- 与降序排序契约一致：`order[0]`（最顶）拿到最大值。
 - 写入条目数取决于位移跨度，最坏 `O(n)`（把最后一项拖到最前，会整体下移）；
   相邻两项交换只改 2 条。置顶集合通常很小，写放大可接受。
 - 若 `S` 内存在 `pin_seq = None` 的项（异常态：调用方声称已置顶但存储无值），
-  为这些项补 `now_millis() + 递增偏移` 后再纳入 `seqs`。
+  为该 id 的当前值补 `now_millis() + 递增偏移` 后再纳入 `seqs`。
 
 ### 4.3 RPC 接口
 
@@ -269,9 +278,10 @@ const onReorderPinned = async (orderedIds: string[]) => {
 - `set_pin_seq(id, Some(x))` 后 `pin_seq == Some(x)`，且 **`updated_at` 不变**。
 - `set_pin_seq(id, None)` 后 `pin_seq == None`。
 - 反序列化旧 meta（无 `pin_seq` 字段）→ `None`，不报错。
-- `reorder_pinned` 后各 thread 的 `pin_seq` 严格互异，且按降序还原出请求顺序。
-- `reorder_pinned` 与请求顺序一致地重排（构造交换首末的场景，断言最终顺序正确）。
-- `reorder_pinned` 幂等：以相同顺序重复调用返回 true 且 `pin_seq` 不变。
+- `assign_pin_seqs` 复用互异序列：给定 `order` 与各 id 的当前 `pin_seq`，
+  输出序列严格互异且按降序还原出 `order`。
+- `assign_pin_seqs` 对 `pin_seq = None` 的项补号后仍互异、顺序正确。
+- `assign_pin_seqs` 幂等：以当前顺序为 `order` 再算一次，输出的 seq 序列与输入一致。
 - 未知 id 的 `set_pin_seq` 返回 `false`。
 
 `server.rs` 集成测（沿用现有 in-process JSON-RPC 测试脚手架）：
