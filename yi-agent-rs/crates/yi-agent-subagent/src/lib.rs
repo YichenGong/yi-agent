@@ -1207,12 +1207,29 @@ pub fn register_attached_root_tools(
     runtime_socket: PathBuf,
     root: &AttachedRoot,
 ) {
-    register_application_subagent_tools(
+    register_attached_root_tools_in_thread(registry, runtime_socket, root, None);
+}
+
+/// Register the delegation tools with a conversation marker.
+///
+/// The marker has to be captured here, at assembly time, because the model that
+/// calls `spawn_agent` never sees a thread id: it only knows the objective. A
+/// client that runs several conversations in one directory therefore binds each
+/// conversation's id into its own tool instances, and every child spawned
+/// through them is tagged with the conversation that asked for it.
+pub fn register_attached_root_tools_in_thread(
+    registry: &mut ToolRegistry,
+    runtime_socket: PathBuf,
+    root: &AttachedRoot,
+    thread_id: Option<String>,
+) {
+    register_application_subagent_tools_in_thread(
         registry,
         runtime_socket,
         root.session_id.clone(),
         root.task_id.clone(),
         root.capability.clone(),
+        thread_id,
     );
 }
 
@@ -1223,11 +1240,30 @@ pub fn register_application_subagent_tools(
     caller_task_id: String,
     application_capability: String,
 ) {
+    register_application_subagent_tools_in_thread(
+        registry,
+        runtime_socket,
+        session_id,
+        caller_task_id,
+        application_capability,
+        None,
+    );
+}
+
+pub fn register_application_subagent_tools_in_thread(
+    registry: &mut ToolRegistry,
+    runtime_socket: PathBuf,
+    session_id: String,
+    caller_task_id: String,
+    application_capability: String,
+    thread_id: Option<String>,
+) {
     registry.register(Arc::new(DaemonApplicationSpawnAgentTool {
         runtime_socket: runtime_socket.clone(),
         session_id: session_id.clone(),
         caller_task_id: caller_task_id.clone(),
         application_capability: application_capability.clone(),
+        thread_id: thread_id.clone(),
     }));
     registry.register(Arc::new(DaemonApplicationSendMessageTool {
         runtime_socket: runtime_socket.clone(),
@@ -1323,6 +1359,10 @@ struct DaemonApplicationSpawnAgentTool {
     session_id: String,
     caller_task_id: String,
     application_capability: String,
+    /// The conversation this tool belongs to, captured at assembly time. Every
+    /// child it spawns is tagged with it so a client can scope children to the
+    /// conversation that asked for them.
+    thread_id: Option<String>,
 }
 
 /// Extract the child's text report from its stored terminal payload, using the
@@ -1426,7 +1466,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 mode: Some(mode.as_str().to_string()),
                 model,
                 workdir,
-                thread_id: None,
+                thread_id: self.thread_id.clone(),
             },
         );
         match response {
