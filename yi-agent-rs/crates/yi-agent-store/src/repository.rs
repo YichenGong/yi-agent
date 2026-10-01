@@ -3287,6 +3287,50 @@ impl RuntimeRepository {
         })
     }
 
+    /// The live (non-terminal) children bound to a conversation.
+    ///
+    /// Roots are excluded on purpose: a root task is never tagged with a
+    /// conversation, and a shared directory's root must survive one
+    /// conversation being deleted. The `thread_id` filter is exact, so an
+    /// untagged task (legacy rows written before the marker existed) matches
+    /// nothing and is never collected by this query.
+    pub fn active_children_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<TaskId>, RepositoryError> {
+        let placeholders = (1..=TERMINAL_TASK_STATES.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cutoff = TERMINAL_TASK_STATES.len() + 1;
+        let sql = format!(
+            "SELECT id FROM tasks
+             WHERE thread_id = ?{cutoff}
+               AND parent_id IS NOT NULL
+               AND state_json NOT IN ({placeholders})
+             ORDER BY created_at, id"
+        );
+        let mut values: Vec<String> = TERMINAL_TASK_STATES
+            .iter()
+            .map(|state| (*state).to_string())
+            .collect();
+        values.push(thread_id.to_string());
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|row| {
+                let task_id = row?;
+                task_id
+                    .parse()
+                    .map_err(|_| RepositoryError::UnknownEventKind {
+                        kind: format!("invalid task ID in store: {task_id}"),
+                    })
+            })
+            .collect()
+    }
+
     pub fn active_attempt_id(&self, task: &TaskId) -> Result<AttemptId, RepositoryError> {
         let value = self
             .connection

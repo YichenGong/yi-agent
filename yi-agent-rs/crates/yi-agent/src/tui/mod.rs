@@ -2,7 +2,7 @@
 
 pub mod app;
 pub mod bash_popup;
-pub mod board;
+pub mod superpowers_kanban;
 pub mod cell;
 pub mod cost;
 pub mod history;

@@ -1911,6 +1911,7 @@ fn handle_key(
                         input.clear();
                         return execute_slash_command(
                             cmd,
+                            None,
                             args_str,
                             history,
                             history_width,
@@ -1992,6 +1993,7 @@ fn handle_key(
                     *popup = None;
                     return execute_slash_command(
                         cmd,
+                        Some(name.to_string()),
                         args,
                         history,
                         history_width,
@@ -2149,6 +2151,8 @@ fn sync_popup(popup: &mut Option<CommandPopup>, buffer: &str) {
 #[allow(clippy::too_many_arguments)]
 fn execute_slash_command(
     cmd: SlashCommand,
+    // 用户实际敲的命令名（用于提示已改名的过渡别名）。
+    invoked_as: Option<String>,
     args: Option<String>,
     history: &mut HistoryState,
     width: u16,
@@ -2314,7 +2318,16 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Kanban => {
-            let outcome = crate::tui::board::handle_kanban(workdir, args.as_deref().unwrap_or(""));
+            // `/kanban` 是过渡别名；命中时先提示规范名，避免肌肉记忆继续传播旧名。
+            if invoked_as.as_deref() == Some("kanban") {
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some("已更名为 /superpowers-kanban".to_string()),
+                    },
+                    width,
+                );
+            }
+            let outcome = crate::tui::superpowers_kanban::handle_kanban(workdir, args.as_deref().unwrap_or(""));
             for line in outcome.lines {
                 history.push(HistoryCell::Separator { label: Some(line) }, width);
             }
@@ -8649,6 +8662,7 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Clear,
             None,
+            None,
             &mut history,
             80,
             &CostTracker::default(),
@@ -8692,6 +8706,7 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Cost,
             None,
+            None,
             &mut history,
             80,
             &cost,
@@ -8732,6 +8747,7 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Cost,
             None,
+            None,
             &mut history,
             80,
             &cost,
@@ -8771,6 +8787,7 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Mcp,
+            None,
             Some("on".into()),
             &mut history,
             80,
@@ -8804,6 +8821,7 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Mcp,
+            None,
             Some("disable nope".into()),
             &mut history,
             80,
@@ -8847,6 +8865,7 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Mcp,
             None,
+            None,
             &mut history,
             80,
             &CostTracker::default(),
@@ -8885,6 +8904,7 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
             None,
+            None,
             &mut history,
             80,
             &CostTracker::default(),
@@ -8922,6 +8942,7 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
+            None,
             Some("never".into()),
             &mut history,
             80,
@@ -8962,6 +8983,7 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
+            None,
             Some("sometimes".into()),
             &mut history,
             80,

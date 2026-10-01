@@ -17,7 +17,7 @@ use yi_agent_core::subagent::worker::{
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
-    SubscriptionFilters, send_request, send_request_with_version, subscribe,
+    SubscriptionFilters, PROTOCOL_VERSION, send_request, send_request_with_version, subscribe,
     subscribe_with_filters,
 };
 use yi_agent_store::repository::{
@@ -2538,7 +2538,12 @@ fn daemon_rejects_second_instance_and_reports_protocol_mismatch() {
     let daemon = Daemon::start(&runtime, &database).unwrap();
 
     assert!(Daemon::start(&runtime, &database).is_err());
-    let response = send_request_with_version(daemon.socket_path(), 2, IpcRequest::Status).unwrap();
+    // Pick a version the daemon certainly does not speak. Hardcoding "one
+    // above today's number" would silently stop being a mismatch the moment
+    // the constant moves past it.
+    let unsupported = PROTOCOL_VERSION + 1;
+    let response =
+        send_request_with_version(daemon.socket_path(), unsupported, IpcRequest::Status).unwrap();
     assert!(matches!(response, IpcResponse::UnsupportedProtocol { .. }));
 }
 
@@ -2551,7 +2556,7 @@ fn raw_ipc_replies_are_versioned_and_echo_the_request_id() {
     for (request_id, protocol_version, command, expected_type, expected_error_code) in [
         (
             "status-request",
-            1,
+            PROTOCOL_VERSION,
             json!({"type": "Status"}),
             "Status",
             None,
@@ -2565,14 +2570,14 @@ fn raw_ipc_replies_are_versioned_and_echo_the_request_id() {
         ),
         (
             "missing-task-request",
-            1,
+            PROTOCOL_VERSION,
             json!({"type": "InspectTask", "task_id": TaskId::new().to_string()}),
             "Error",
             Some("not_found"),
         ),
         (
             "invalid-task-request",
-            1,
+            PROTOCOL_VERSION,
             json!({"type": "InspectTask", "task_id": "not-a-task-id"}),
             "Error",
             Some("validation"),
@@ -2586,7 +2591,7 @@ fn raw_ipc_replies_are_versioned_and_echo_the_request_id() {
                 "command": command,
             }),
         );
-        assert_eq!(response["protocol_version"], 1);
+        assert_eq!(response["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(response["request_id"], request_id);
         assert_eq!(response["result"]["type"], expected_type);
         assert!(
@@ -2600,7 +2605,7 @@ fn raw_ipc_replies_are_versioned_and_echo_the_request_id() {
     }
 
     let malformed = raw_request_text(daemon.socket_path(), "{malformed");
-    assert_eq!(malformed["protocol_version"], 1);
+    assert_eq!(malformed["protocol_version"], PROTOCOL_VERSION);
     assert_eq!(malformed["request_id"], "");
     assert_eq!(malformed["result"]["type"], "Error");
     assert_eq!(malformed["result"]["code"], "validation");
@@ -2620,7 +2625,7 @@ fn spawning_from_an_unknown_parent_returns_not_found() {
     let response = raw_request(
         daemon.socket_path(),
         json!({
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "request_id": "missing-parent",
             "command": {
                 "type": "SpawnChild",
@@ -2641,12 +2646,13 @@ fn oversized_request_echoes_an_id_available_in_its_bounded_prefix() {
     let database = directory.path().join("runtime.sqlite");
     let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
     let oversized = format!(
-        r#"{{"protocol_version":1,"request_id":"oversized-request","command":{{"type":"Status"}},"padding":"{}"}}"#,
+        r#"{{"protocol_version":{},"request_id":"oversized-request","command":{{"type":"Status"}},"padding":"{}"}}"#,
+        PROTOCOL_VERSION,
         "x".repeat(1024 * 1024)
     );
 
     let response = raw_request_text_allowing_peer_close(daemon.socket_path(), &oversized);
-    assert_eq!(response["protocol_version"], 1);
+    assert_eq!(response["protocol_version"], PROTOCOL_VERSION);
     assert_eq!(response["request_id"], "oversized-request");
     assert_eq!(response["result"]["type"], "Error");
     assert_eq!(response["result"]["code"], "validation");
@@ -2663,12 +2669,12 @@ fn subscription_initialization_failure_returns_an_internal_error_frame() {
     let response = raw_request(
         daemon.socket_path(),
         json!({
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "request_id": "failed-subscription",
             "command": {"type": "SubscribeEvents", "after_event_id": 0},
         }),
     );
-    assert_eq!(response["protocol_version"], 1);
+    assert_eq!(response["protocol_version"], PROTOCOL_VERSION);
     assert_eq!(response["request_id"], "failed-subscription");
     assert_eq!(response["result"]["type"], "Error");
     assert_eq!(response["result"]["code"], "internal");
@@ -2687,7 +2693,7 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
     let request_id = "subscription-request";
     let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
     let frame = json!({
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
         "command": {"type": "SubscribeEvents", "after_event_id": 0},
     });
@@ -2696,7 +2702,7 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
     let mut reader = BufReader::new(stream);
 
     let snapshot = raw_response(&mut reader);
-    assert_eq!(snapshot["protocol_version"], 1);
+    assert_eq!(snapshot["protocol_version"], PROTOCOL_VERSION);
     assert_eq!(snapshot["request_id"], request_id);
     assert_eq!(snapshot["result"]["type"], "Subscription");
 
@@ -2704,7 +2710,7 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
         .transition_task(&task, "running", RuntimeEvent::TaskStarted)
         .unwrap();
     let event = raw_response(&mut reader);
-    assert_eq!(event["protocol_version"], 1);
+    assert_eq!(event["protocol_version"], PROTOCOL_VERSION);
     assert_eq!(event["request_id"], request_id);
     assert_eq!(event["event_id"], 1);
     assert_eq!(event["event"]["type"], "task_started");
@@ -2777,7 +2783,7 @@ fn slow_daemon_subscriber_gets_one_framed_resync_without_affecting_another_clien
         slow_stream,
         "{}",
         serde_json::to_string(&json!({
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "request_id": request_id,
             "command": {
                 "type": "SubscribeEvents",
@@ -5376,7 +5382,7 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
     // Read raw bytes rather than JSON: a truncated frame is only detectable by
     // its missing terminator, and serde would report a parse error instead.
     let request = json!({
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
         "request_id": "large-response",
         "command": { "type": "InspectTask", "task_id": task_id },
     });
@@ -6190,5 +6196,105 @@ fn ending_one_conversation_reclaims_only_its_own_root() {
             IpcResponse::TaskSpawned { .. }
         ),
         "ending conversation A must not end conversation B"
+    );
+}
+
+#[test]
+fn cancelling_a_thread_cancels_only_its_own_children() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-scoped-cancel".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    let spawn = |thread: &str, objective: &str| -> String {
+        let response = send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id: session_id.clone(),
+                parent_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: objective.into(),
+                mode: None,
+                model: None,
+                workdir: None,
+                thread_id: Some(thread.into()),
+                sandbox: None,
+            },
+        )
+        .unwrap();
+        match response {
+            IpcResponse::TaskSpawned { task_id } => task_id,
+            other => panic!("expected a spawned child, got {other:?}"),
+        }
+    };
+
+    // Two conversations in one directory, each with one child, on a shared root.
+    let child_of_a = spawn("thread-a", "conversation a work");
+    let child_of_b = spawn("thread-b", "conversation b work");
+
+    let state = |task: &str| -> String {
+        let IpcResponse::TaskSummaries { tasks } = send_request(
+            daemon.socket_path(),
+            IpcRequest::ListTaskSummaries {
+                session_id: Some(session_id.clone()),
+                active_only: false,
+            },
+        )
+        .unwrap() else {
+            panic!("expected task summaries");
+        };
+        tasks
+            .into_iter()
+            .find(|summary| summary.task_id == task)
+            .map(|summary| summary.state)
+            .unwrap_or_else(|| panic!("task {task} is missing from the summaries"))
+    };
+
+    assert!(
+        !matches!(state(&child_of_a).as_str(), "cancelled"),
+        "the child starts live"
+    );
+
+    let IpcResponse::ThreadTasksCancelled { task_ids } = send_request(
+        daemon.socket_path(),
+        IpcRequest::CancelThreadTasks {
+            session_id: session_id.clone(),
+            thread_id: "thread-a".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a thread-scoped cancellation response");
+    };
+
+    // Exactly the conversation's own child, and nothing else.
+    assert_eq!(task_ids, vec![child_of_a.clone()]);
+    assert_eq!(state(&child_of_a), "cancelled");
+    // The sibling conversation's child is untouched: this is the regression the
+    // shared root would otherwise cause.
+    assert_ne!(
+        state(&child_of_b),
+        "cancelled",
+        "a sibling conversation's child must keep running"
+    );
+    // The shared root is never a child and must survive its own deletion.
+    assert_ne!(
+        state(&root_task_id),
+        "cancelled",
+        "the shared root must not be cancelled by one conversation leaving"
     );
 }

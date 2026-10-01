@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -33,6 +33,10 @@ pub struct SupervisorManifest {
     pub switch_key: String,
     pub restart_backoff_ms: u64,
     pub restart_backoff_max_ms: u64,
+    /// Socket this process can be queried on, if it serves one. Generic: the
+    /// field names no plugin and the daemon attaches no meaning to the answers.
+    /// `None` means "not queryable", so an older manifest keeps loading.
+    pub query_socket: Option<String>,
 }
 
 const DEFAULT_BACKOFF_MS: u64 = 1000;
@@ -47,6 +51,7 @@ struct RawManifest {
     switch_key: String,
     restart_backoff_ms: Option<u64>,
     restart_backoff_max_ms: Option<u64>,
+    query_socket: Option<String>,
 }
 
 impl SupervisorManifest {
@@ -68,7 +73,23 @@ impl SupervisorManifest {
             switch_key: raw.switch_key,
             restart_backoff_ms: raw.restart_backoff_ms.unwrap_or(DEFAULT_BACKOFF_MS),
             restart_backoff_max_ms: raw.restart_backoff_max_ms.unwrap_or(DEFAULT_BACKOFF_MAX_MS),
+            query_socket: raw.query_socket,
         })
+    }
+
+    /// 展开查询 socket 的占位符。未声明 → `None`。
+    pub fn query_socket_path(
+        &self,
+        workdir: &Path,
+        state_dir: &Path,
+        runtime_dir: &Path,
+    ) -> Option<PathBuf> {
+        let raw = self.query_socket.as_ref()?;
+        Some(PathBuf::from(
+            raw.replace("{workdir}", &workdir.to_string_lossy())
+                .replace("{state_dir}", &state_dir.to_string_lossy())
+                .replace("{runtime_dir}", &runtime_dir.to_string_lossy()),
+        ))
     }
 
     /// 展开 `{workdir}` / `{state_dir}` / `{runtime_dir}` 占位。
@@ -189,5 +210,33 @@ mod tests {
     #[test]
     fn a_missing_directory_yields_no_manifests() {
         assert!(load_manifests(Path::new("/definitely/not/here")).is_empty());
+    }
+
+    #[test]
+    fn a_declared_query_socket_expands_its_placeholders() {
+        let manifest = SupervisorManifest::parse(
+            r#"{"name":"demo","command":"c","args":[],"switch_key":"k",
+                "query_socket":"{state_dir}/demo.sock"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.query_socket_path(
+                Path::new("/proj"),
+                Path::new("/proj/.yi-agent/state"),
+                Path::new("/proj/.yi-agent/runtime"),
+            ),
+            Some(std::path::PathBuf::from("/proj/.yi-agent/state/demo.sock"))
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_a_query_socket_still_loads() {
+        // Old manifests predate the field; loading them must not start failing.
+        let manifest = SupervisorManifest::parse(SAMPLE).unwrap();
+        assert_eq!(manifest.query_socket, None);
+        assert_eq!(
+            manifest.query_socket_path(Path::new("/w"), Path::new("/s"), Path::new("/r")),
+            None
+        );
     }
 }

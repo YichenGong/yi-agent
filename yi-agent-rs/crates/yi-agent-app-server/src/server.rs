@@ -246,6 +246,45 @@ fn socket_for_thread(
         .map(|handle| handle.socket_path)
 }
 
+/// Cancels every live child a conversation owns, before its files go away.
+///
+/// The children live in the shared project runtime, where the conversation's
+/// files are not the authority, so deleting them alone would leave the agents
+/// running where nobody can see them. The cancellation is scoped by the
+/// conversation marker rather than the root: several conversations share one
+/// attached root, and a root-scoped cancel would stop a sibling's work too.
+///
+/// Best effort by construction: the thread is being deleted either way, so an
+/// unreachable daemon is reported to the log and never blocks the deletion.
+fn cancel_thread_children(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+) -> Result<usize, String> {
+    let cwd = threads
+        .get(thread_id)
+        .map(|session| session.cwd.clone())
+        .ok_or_else(|| "the thread is not held in memory".to_string())?;
+    let key = project_key(Path::new(&cwd));
+    let binding = {
+        let guard = runtimes.lock().unwrap_or_else(|p| p.into_inner());
+        guard.get(&key).cloned()
+    }
+    .ok_or_else(|| "no attached runtime for this project".to_string())??;
+    let response = binding.send(
+        |handle| yi_agent_store::ipc::IpcRequest::CancelThreadTasks {
+            session_id: handle.session_id.clone(),
+            thread_id: thread_id.to_owned(),
+        },
+    )?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::ThreadTasksCancelled { task_ids } => Ok(task_ids.len()),
+        other => Err(format!(
+            "daemon returned a non-cancellation response: {other:?}"
+        )),
+    }
+}
+
 /// The task summaries the daemon holds for a conversation's directory.
 fn list_task_summaries(
     runtimes: &ProjectRuntimes,
@@ -623,91 +662,37 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
     }
 }
 
-/// `board/list`：读插件写出的 `board.json`，映射成可渲染的卡片数组。
-fn board_list(workdir: &Path) -> serde_json::Value {
-    let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
-    let cards: Vec<serde_json::Value> = yi_agent_board_ui::state::load_cards(&state_dir)
-        .into_iter()
-        .map(|card| {
-            json!({
-                "id": card.id,
-                "state": card.state,
-                "progress": card.progress,
-                "detail": card.detail,
-            })
-        })
-        .collect();
-    json!({ "cards": cards })
-}
-
-/// `board/enqueue`：把一张卡投递进插件的 inbox。
-fn board_enqueue(
-    workdir: &Path,
-    id: &str,
-    spec: &str,
-    plan: &str,
-) -> Result<serde_json::Value, String> {
-    let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
-    yi_agent_board_ui::inbox::deliver_card(&state_dir, id, spec, plan)
-        .map_err(|error| error.to_string())?;
-    Ok(json!({ "id": id }))
-}
-
-/// `board/switch/read`：返回两层解析后的开关与来源。
-fn board_switch_read(workdir: &Path) -> serde_json::Value {
-    use yi_agent_board_ui::switch::{
-        SwitchSource, global_path, project_path, read_layer, resolve,
-    };
-    let project = read_layer(&project_path(workdir));
-    let global = global_path().and_then(|path| read_layer(&path));
-    let resolved = resolve(global, project);
-    let source = match resolved.source {
-        SwitchSource::Project => "project",
-        SwitchSource::Global => "global",
-        SwitchSource::Default => "default",
-    };
-    json!({ "on": resolved.value.is_enabled(), "source": source })
-}
-
-/// `board/switch/write`：写项目层开关。
-fn board_switch_write(workdir: &Path, on: bool) -> Result<serde_json::Value, String> {
-    use yi_agent_board_ui::switch::{BoardSwitch, project_path, write_layer};
-    let value = if on {
-        BoardSwitch::Enabled
-    } else {
-        BoardSwitch::Disabled
-    };
-    write_layer(&project_path(workdir), value).map_err(|error| error.to_string())?;
-    Ok(json!({ "on": on }))
-}
-
-/// 由一对路径派生卡片 id（与 TUI 的 `/kanban add` 同规则，保证两端一致）。
-fn derive_card_id(spec: &str, plan: &str) -> String {
-    let stem = |path: &str| {
-        std::path::Path::new(path)
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_default()
-    };
-    let slug = |text: &str| {
-        let mut out = String::new();
-        let mut last_dash = false;
-        for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() {
-                out.push(ch.to_ascii_lowercase());
-                last_dash = false;
-            } else if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        }
-        out.trim_matches('-').to_string()
-    };
-    let id = format!("{}-{}", slug(&stem(spec)), slug(&stem(plan)));
-    if id == "-" || id.is_empty() {
-        "card".to_string()
-    } else {
-        id
+/// Ask a supervised plugin a question and return its answer verbatim.
+///
+/// The host attaches no meaning to `method` or `params`, and unwraps no board
+/// shape here: this is a generic channel, so the UI (not the server) owns what a
+/// card or a switch field means. A plugin the daemon does not supervise, or one
+/// that refuses, surfaces as an RPC error the client can show.
+fn plugin_query(workdir: &Path, method: &str, plugin: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if plugin.is_empty() {
+        return Err("plugin/query needs a `plugin` name".to_string());
+    }
+    // The board RPCs used to read `<workdir>/.yi-agent/...` directly. The daemon
+    // that runs the plugin lives at the same project root, so that is where the
+    // question has to go.
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(workdir);
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| error.to_string())?;
+    let response = yi_agent_store::ipc::send_request(
+        &socket,
+        yi_agent_store::ipc::IpcRequest::PluginQuery {
+            plugin: plugin.to_string(),
+            method: method.to_string(),
+            params,
+        },
+    )
+    .map_err(|error| format!("daemon is unavailable: {error}"))?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::PluginResult { value } => Ok(value),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
+            "the plugin rejected the query: {code:?} {}",
+            message.unwrap_or_default()
+        )),
+        other => Err(format!("daemon returned an unexpected response: {other:?}")),
     }
 }
 
@@ -925,56 +910,28 @@ where
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
-                    "board/list" => {
-                        write_response(&writer, ok_response(id, board_list(&cfg.workdir))).await?;
-                    }
-                    "board/enqueue" => {
-                        let requested = req
+                    "plugin/query" => {
+                        let plugin = req
                             .params
-                            .get("id")
+                            .get("plugin")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let spec = req
+                        let method = req
                             .params
-                            .get("spec_path")
+                            .get("method")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let plan = req
+                        let params = req
                             .params
-                            .get("plan_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let card_id = if requested.is_empty() {
-                            derive_card_id(spec, plan)
-                        } else {
-                            requested.to_string()
-                        };
-                        match board_enqueue(&cfg.workdir, &card_id, spec, plan) {
+                            .get("params")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        match plugin_query(&cfg.workdir, method, plugin, params) {
                             Ok(value) => write_response(&writer, ok_response(id, value)).await?,
-                            Err(message) => write_response(
-                                &writer,
-                                err_response(id, RpcError::internal(message)),
-                            )
-                            .await?,
-                        }
-                    }
-                    "board/switch/read" => {
-                        write_response(&writer, ok_response(id, board_switch_read(&cfg.workdir)))
-                            .await?;
-                    }
-                    "board/switch/write" => {
-                        let on = req
-                            .params
-                            .get("on")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        match board_switch_write(&cfg.workdir, on) {
-                            Ok(value) => write_response(&writer, ok_response(id, value)).await?,
-                            Err(message) => write_response(
-                                &writer,
-                                err_response(id, RpcError::internal(message)),
-                            )
-                            .await?,
+                            Err(message) => {
+                                write_response(&writer, err_response(id, RpcError::internal(message)))
+                                    .await?
+                            }
                         }
                     }
                     "workspace/list" => {
@@ -1577,6 +1534,19 @@ where
                         // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
                         // 故复用 resume 的等待模式,等落盘后再删。
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
+                        // 在删文件之前先取消该会话名下的子代理。子代理跑在共享的项目
+                        // runtime 里,对话文件不是它的权威,只删文件会把它留在无人可见
+                        // 的地方继续跑。按会话标记取消,不动同目录其它会话的子代理
+                        // (它们共享同一个 root)。
+                        match cancel_thread_children(&runtimes, &threads, &thread_id) {
+                            Ok(cancelled) if cancelled > 0 => eprintln!(
+                                "[app-server] cancelled {cancelled} subagent task(s) for {thread_id}"
+                            ),
+                            Ok(_) => {}
+                            Err(cause) => eprintln!(
+                                "[app-server] could not cancel subagents for {thread_id}: {cause}"
+                            ),
+                        }
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         pending_activation.remove(&thread_id);
@@ -2897,51 +2867,79 @@ fn extract_prompt(params: &serde_json::Value) -> Option<String> {
 }
 
 #[cfg(test)]
-mod board_rpc_tests {
+mod plugin_query_tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    /// A fake daemon that records the request it received and replies with one
+    /// frame, so the test can prove the host forwards the plugin name, method
+    /// and params verbatim without interpreting any of them.
+    fn fake_daemon(
+        dir: &Path,
+    ) -> (PathBuf, Arc<StdMutex<serde_json::Value>>, std::thread::JoinHandle<()>) {
+        let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(dir);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
+        let seen = Arc::new(StdMutex::new(serde_json::Value::Null));
+        let captured = Arc::clone(&seen);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                *captured.lock().unwrap() = request.clone();
+                // Echo the request id: the client rejects a response for another
+                // request, so a fake daemon that hardcodes one would look broken.
+                let reply = json!({
+                    "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                    "request_id": request["request_id"],
+                    "result": { "type": "PluginResult", "value": { "cards": [] } },
+                });
+                let mut stream = stream;
+                let _ = stream.write_all(reply.to_string().as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+        });
+        (socket, seen, handle)
+    }
 
     #[test]
-    fn board_list_reads_cards_from_the_state_file() {
+    fn a_query_reaches_the_daemon_with_the_plugin_and_method_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let state_dir = yi_agent_board_ui::inbox::board_state_dir(dir.path());
-        std::fs::create_dir_all(&state_dir).unwrap();
-        std::fs::write(
-            yi_agent_board_ui::state::board_state_path(&state_dir),
-            r#"{"cards":[{"id":"card-1","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"awaiting_merge","enqueued_at":"2026-10-01T09:00:00+08:00","order":0}],"next_order":1}"#,
+        let (_socket, seen, handle) = fake_daemon(dir.path());
+
+        plugin_query(
+            dir.path(),
+            "list",
+            "superpowers-kanban",
+            json!({ "verbose": true }),
         )
         .unwrap();
+        handle.join().unwrap();
 
-        let value = board_list(dir.path());
-        let cards = value["cards"].as_array().unwrap();
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0]["id"], "card-1");
-        assert_eq!(cards[0]["state"], "awaiting_merge");
+        let request = seen.lock().unwrap().clone();
+        assert_eq!(request["command"]["type"], "PluginQuery");
+        assert_eq!(request["command"]["plugin"], "superpowers-kanban");
+        assert_eq!(request["command"]["method"], "list");
+        assert_eq!(request["command"]["params"]["verbose"], true);
     }
 
     #[test]
-    fn board_enqueue_writes_a_delivery_file() {
+    fn a_missing_plugin_name_is_refused_before_touching_the_daemon() {
         let dir = tempfile::tempdir().unwrap();
-        let value = board_enqueue(dir.path(), "card-1", "a.spec.md", "a.plan.md").unwrap();
-        assert_eq!(value["id"], "card-1");
-        let state_dir = yi_agent_board_ui::inbox::board_state_dir(dir.path());
-        assert!(yi_agent_board_ui::inbox::enqueue_path(&state_dir, "card-1").exists());
+        let error = plugin_query(dir.path(), "list", "", json!({})).unwrap_err();
+        assert!(error.contains("plugin"), "{error}");
     }
 
     #[test]
-    fn board_switch_write_then_read_round_trips() {
+    fn an_unreachable_daemon_reports_that_the_plugin_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        board_switch_write(dir.path(), true).unwrap();
-        let value = board_switch_read(dir.path());
-        assert_eq!(value["on"], true);
-        assert_eq!(value["source"], "project");
-    }
-
-    #[test]
-    fn derive_card_id_matches_the_tui_rule() {
-        assert_eq!(
-            derive_card_id("docs/a-feature.spec.md", "docs/a-feature.plan.md"),
-            "a-feature-spec-a-feature-plan"
-        );
+        let error = plugin_query(dir.path(), "list", "superpowers-kanban", json!({})).unwrap_err();
+        assert!(error.contains("daemon is unavailable"), "{error}");
     }
 }
 

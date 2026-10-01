@@ -30,7 +30,11 @@ use crate::runtime::{
 };
 use crate::schedule::ScheduleDefinition;
 
-const PROTOCOL_VERSION: u32 = 1;
+/// Bumped whenever the request/response wire shape changes. `PluginQuery` is an
+/// additive variant, but `IpcRequest` is `deny_unknown_fields`, so a v1 daemon
+/// would reject a v2 request outright. Bumping makes the mismatch explicit and
+/// reachable through `UnsupportedProtocol` rather than a bare parse failure.
+pub const PROTOCOL_VERSION: u32 = 2;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_EVENT_FRAMES: usize = 1024;
 const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
@@ -110,6 +114,12 @@ pub enum IpcError {
     Runtime(#[from] RuntimeCoordinatorError),
     #[error("a daemon is already running for {path}")]
     AlreadyRunning { path: PathBuf },
+    #[error("plugin {plugin} is not running or does not declare a query socket")]
+    PluginUnavailable { plugin: String },
+    #[error("plugin {plugin} did not answer within {seconds}s")]
+    PluginTimeout { plugin: String, seconds: u64 },
+    #[error("plugin {plugin} refused the query")]
+    PluginRefused { plugin: String },
     #[error("IPC frame exceeds {MAX_FRAME_BYTES} bytes")]
     FrameTooLarge,
     #[error("IPC response frame is truncated after {received} bytes (the peer closed mid-frame)")]
@@ -228,6 +238,19 @@ pub enum IpcRequest {
         session_id: String,
         task_id: String,
         recursive: bool,
+    },
+    /// Cancels every live child a conversation owns.
+    ///
+    /// A conversation shares one attached root with its directory siblings, so
+    /// routing a deletion through the root would cancel work belonging to the
+    /// other conversations. The conversation marker is the only thing that
+    /// separates their children, so this request takes the marker, not a task
+    /// id, and the daemon resolves the set itself. Confirmation is the caller's
+    /// own decision to delete: no preview token is required, unlike
+    /// `CancelTask`/`ConfirmCancel`.
+    CancelThreadTasks {
+        session_id: String,
+        thread_id: String,
     },
     PreviewCancel {
         task_id: String,
@@ -366,6 +389,17 @@ pub enum IpcRequest {
         #[serde(default)]
         filters: SubscriptionFilters,
     },
+    /// Ask a supervised plugin a question, verbatim.
+    ///
+    /// The daemon forwards `method`/`params` and returns whatever comes back; it
+    /// attaches no meaning to either. Which methods exist is a contract between
+    /// the caller and the plugin, not something the daemon knows.
+    PluginQuery {
+        plugin: String,
+        method: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +452,13 @@ pub enum IpcResponse {
     },
     TaskStarted,
     TaskCancelled,
+    /// The children a conversation-scoped cancellation actually cancelled.
+    ///
+    /// An empty `task_ids` is a success, not an error: the conversation may
+    /// have finished everything already, and the caller is deleting anyway.
+    ThreadTasksCancelled {
+        task_ids: Vec<String>,
+    },
     CancelPreview {
         confirmation_token: String,
         task_ids: Vec<String>,
@@ -453,6 +494,10 @@ pub enum IpcResponse {
     TaskDetail(IpcTaskDetail),
     TaskSummaries {
         tasks: Vec<IpcTaskSummary>,
+    },
+    /// A plugin's answer, passed through untouched.
+    PluginResult {
+        value: serde_json::Value,
     },
     TaskEvents {
         events: Vec<IpcEvent>,
@@ -807,6 +852,9 @@ impl Daemon {
         let reclaimed_orphans = repository.reclaim_orphaned_tasks(DEFAULT_ORPHAN_GRACE_SECS)?;
         drop(repository);
         let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
+        // A fresh daemon starts with no plugin routes; the supervisor republishes
+        // them as soon as it reconciles.
+        clear_plugin_sockets();
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
@@ -2746,6 +2794,10 @@ fn log_request_failure(request_id: &str, error: &IpcError) {
 fn ipc_error_message(error: &IpcError) -> Option<String> {
     match error {
         IpcError::Runtime(RuntimeCoordinatorError::Supervisor(message)) => Some(message.clone()),
+        IpcError::PluginUnavailable { plugin } => Some(format!("plugin {plugin} is not available")),
+        IpcError::PluginTimeout { plugin, seconds } => {
+            Some(format!("plugin {plugin} timed out after {seconds}s"))
+        }
         IpcError::Runtime(RuntimeCoordinatorError::Spawn(
             yi_agent_core::subagent::supervisor::SpawnError::DirectChildLimitReached,
         )) => Some("an agent may have at most four direct children".into()),
@@ -2782,6 +2834,9 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         | IpcError::FrameTooLarge
         | IpcError::TruncatedFrame { .. }
         | IpcError::FrameWriteTimeout { .. } => IpcErrorCode::Validation,
+        IpcError::PluginUnavailable { .. } => IpcErrorCode::NotFound,
+        IpcError::PluginTimeout { .. } => IpcErrorCode::InvalidState,
+        IpcError::PluginRefused { .. } => IpcErrorCode::Validation,
         IpcError::Remote { code, .. } => *code,
         _ => IpcErrorCode::Internal,
     }
@@ -2921,6 +2976,118 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
     }
 }
 
+/// How long a plugin gets to answer before the daemon gives up.
+///
+/// `respond` runs on the daemon's request thread, so an unresponsive plugin
+/// would otherwise wedge the request path for every client.
+const PLUGIN_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sockets this process may forward plugin queries to.
+///
+/// Populated by whoever supervises the plugins (the binary that runs the daemon
+/// also runs the supervisor loop), because the store deliberately knows nothing
+/// about manifests or plugin names. An entry exists only while its process is
+/// actually running and its manifest declared a socket, so a request can never
+/// name an arbitrary path on the machine.
+static PLUGIN_SOCKETS: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+
+/// Replace the forwarding table. Called on every supervisor reconcile, so a
+/// stopped or undeclared plugin disappears from the table by omission.
+pub fn register_plugin_sockets(entries: Vec<(String, PathBuf)>) {
+    *PLUGIN_SOCKETS.lock().expect("plugin socket table poisoned") = entries;
+}
+
+/// Drop every entry. Called when a daemon starts so a previous process in the
+/// same address space cannot leave a stale route behind.
+pub fn clear_plugin_sockets() {
+    register_plugin_sockets(Vec::new());
+}
+
+/// The socket currently registered for `plugin`, if any.
+///
+/// The read side of the forwarding table. It exists so a caller can assert that
+/// a route is present (or gone) without issuing a request — the supervision
+/// contract says a stopped supervisor leaves no routes behind, and that has to
+/// be checkable from outside this module.
+pub fn plugin_socket_for(plugin: &str) -> Option<PathBuf> {
+    plugin_socket(plugin)
+}
+
+fn plugin_socket(plugin: &str) -> Option<PathBuf> {
+    PLUGIN_SOCKETS
+        .lock()
+        .expect("plugin socket table poisoned")
+        .iter()
+        .find(|(name, _)| name == plugin)
+        .map(|(_, path)| path.clone())
+}
+
+/// Forward a `PluginQuery` to the plugin's declared socket.
+///
+/// The socket path comes from the supervisor's manifest, never from the caller:
+/// accepting a caller-supplied path would turn this into a proxy for any local
+/// socket. Unknown, undeclared, or not-running plugins are a structured error.
+fn forward_plugin_query(
+    plugin: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<IpcResponse, IpcError> {
+    let Some(socket) = plugin_socket(plugin) else {
+        return Err(IpcError::PluginUnavailable {
+            plugin: plugin.to_string(),
+        });
+    };
+    let request = serde_json::json!({
+        "type": "plugin.query",
+        "method": method,
+        "params": params,
+    });
+    let mut frame = serde_json::to_vec(&request)?;
+    frame.push(b'\n');
+
+    let mut stream = UnixStream::connect(&socket).map_err(|_| IpcError::PluginUnavailable {
+        plugin: plugin.to_string(),
+    })?;
+    stream.set_read_timeout(Some(PLUGIN_QUERY_TIMEOUT))?;
+    stream.set_write_timeout(Some(PLUGIN_QUERY_TIMEOUT))?;
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = match reader.read_line(&mut line) {
+        Ok(read) => read,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return Err(IpcError::PluginTimeout {
+                plugin: plugin.to_string(),
+                seconds: PLUGIN_QUERY_TIMEOUT.as_secs(),
+            })
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if read == 0 {
+        // The plugin closed without answering.
+        return Err(IpcError::PluginRefused {
+            plugin: plugin.to_string(),
+        });
+    }
+    let reply: serde_json::Value = serde_json::from_str(&line)?;
+    match reply.get("type").and_then(|value| value.as_str()) {
+        Some("plugin.result") => Ok(IpcResponse::PluginResult {
+            value: reply.get("value").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+        // The plugin refused the query (bad method, invalid paths, ...). Surface
+        // it through the standard error path rather than inventing a second
+        // error shape for plugin-owned failures.
+        _ => Err(IpcError::PluginRefused {
+            plugin: plugin.to_string(),
+        }),
+    }
+}
+
 fn respond(
     database_path: &Path,
     coordinator: &Arc<RuntimeCoordinator>,
@@ -3023,6 +3190,14 @@ fn respond(
                 })
                 .collect(),
         }),
+        // Forwarded verbatim: the daemon never inspects `method` or `params`,
+        // and never invents a socket path - only a supervised plugin's declared
+        // socket is reachable, so this cannot serve as a local socket proxy.
+        IpcRequest::PluginQuery {
+            plugin,
+            method,
+            params,
+        } => forward_plugin_query(&plugin, &method, params),
         IpcRequest::DeleteSchedule { schedule_id } => {
             if !repository.delete_schedule(&schedule_id)? {
                 return Err(IpcError::Io(std::io::Error::new(
@@ -3121,6 +3296,23 @@ fn respond(
             Ok(IpcResponse::AutonomousSessionCreated {
                 session_id: created.session_id.to_string(),
                 root_task_id: created.root_task_id.to_string(),
+            })
+        }
+        IpcRequest::CancelThreadTasks {
+            session_id,
+            thread_id,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let cancelled = runtime
+                .block_on(coordinator.cancel_thread_tasks(&session_id, &thread_id))?
+                .into_iter()
+                .map(|task| task.to_string())
+                .collect();
+            Ok(IpcResponse::ThreadTasksCancelled {
+                task_ids: cancelled,
             })
         }
         IpcRequest::CancelTask { .. } => Ok(IpcResponse::Error {
@@ -3925,5 +4117,164 @@ mod inherited_sandbox_param_tests {
         // snake_case must be rejected: the wire form is kebab-case.
         assert!(parse_inherited_sandbox(Some("read_only".into())).is_err());
         assert!(parse_inherited_sandbox(Some("bogus".into())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod plugin_query_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    /// The forwarding table is one process-wide static, so the tests that
+    /// publish to it must not run in parallel: a concurrently registered
+    /// "demo" socket would answer `forward_plugin_query` in place of this
+    /// test's fake plugin. Hold this for the whole test.
+    static TABLE: Mutex<()> = Mutex::new(());
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        TABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A one-shot fake plugin: answers the first line with `reply`.
+    fn serve_once(socket: PathBuf, reply: &'static str) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(&socket).unwrap();
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let mut stream = stream;
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+        })
+    }
+
+    #[test]
+    fn an_undeclared_plugin_is_a_structured_error_not_a_panic() {
+        let _guard = exclusive();
+        clear_plugin_sockets();
+        let error = forward_plugin_query("nobody", "list", serde_json::json!({}))
+            .expect_err("an unknown plugin must not be forwarded to");
+        assert!(matches!(error, IpcError::PluginUnavailable { .. }));
+        assert_eq!(ipc_error_code(&error), IpcErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_result_is_passed_through_untouched() {
+        let _guard = exclusive();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("plugin.sock");
+        let handle = serve_once(
+            socket.clone(),
+            r#"{"type":"plugin.result","value":{"cards":[{"id":"a"}]}}"#,
+        );
+        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+
+        // The daemon adds no interpretation: whatever the plugin put in `value`
+        // comes back verbatim, including nested objects it knows nothing about.
+        let response =
+            forward_plugin_query("demo", "list", serde_json::json!({"x": 1})).unwrap();
+        match response {
+            IpcResponse::PluginResult { value } => {
+                assert_eq!(value["cards"][0]["id"], "a");
+            }
+            other => panic!("expected a plugin result, got {other:?}"),
+        }
+        handle.join().unwrap();
+        clear_plugin_sockets();
+    }
+
+    #[test]
+    fn the_request_forwards_method_and_params_verbatim() {
+        let _guard = exclusive();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("plugin.sock");
+        let seen = Arc::new(Mutex::new(String::new()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let captured = Arc::clone(&seen);
+        let handle = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                *captured.lock().unwrap() = line;
+                let mut stream = stream;
+                let _ = stream.write_all(b"{\"type\":\"plugin.result\",\"value\":1}\n");
+            }
+        });
+        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+
+        forward_plugin_query("demo", "switch.write", serde_json::json!({"on": true})).unwrap();
+        handle.join().unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(seen.lock().unwrap().trim()).unwrap();
+        assert_eq!(sent["method"], "switch.write");
+        assert_eq!(sent["params"]["on"], true);
+        clear_plugin_sockets();
+    }
+
+    #[test]
+    fn a_plugin_that_closes_without_answering_is_refused() {
+        let _guard = exclusive();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("plugin.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = thread::spawn(move || {
+            // Accept, read, then drop without replying.
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+            }
+        });
+        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+
+        let error = forward_plugin_query("demo", "list", serde_json::json!({}))
+            .expect_err("a silent plugin must not look like success");
+        assert!(matches!(error, IpcError::PluginRefused { .. }));
+        handle.join().unwrap();
+        clear_plugin_sockets();
+    }
+
+    #[test]
+    fn a_plugin_that_refuses_maps_to_a_validation_error() {
+        let _guard = exclusive();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("plugin.sock");
+        let handle = serve_once(socket.clone(), r#"{"type":"plugin.error"}"#);
+        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+
+        let error = forward_plugin_query("demo", "enqueue", serde_json::json!({}))
+            .expect_err("a plugin-side refusal is not a result");
+        assert_eq!(ipc_error_code(&error), IpcErrorCode::Validation);
+        handle.join().unwrap();
+        clear_plugin_sockets();
+    }
+
+    #[test]
+    fn a_stopped_plugin_disappears_from_the_table() {
+        let _guard = exclusive();
+        // Republishing with an empty list is how a stop is expressed.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("plugin.sock");
+        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+        assert!(plugin_socket("demo").is_some());
+        register_plugin_sockets(vec![]);
+        assert!(plugin_socket("demo").is_none());
+    }
+
+    #[test]
+    fn plugin_query_positions_a_verified_socket_are_not_reused_across_plugins() {
+        let _guard = exclusive();
+        register_plugin_sockets(vec![
+            ("a".to_string(), PathBuf::from("/tmp/a.sock")),
+            ("b".to_string(), PathBuf::from("/tmp/b.sock")),
+        ]);
+        assert_eq!(plugin_socket("a"), Some(PathBuf::from("/tmp/a.sock")));
+        assert_eq!(plugin_socket("b"), Some(PathBuf::from("/tmp/b.sock")));
+        assert_eq!(plugin_socket("c"), None);
+        clear_plugin_sockets();
     }
 }

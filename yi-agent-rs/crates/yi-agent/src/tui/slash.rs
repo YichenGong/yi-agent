@@ -111,7 +111,7 @@ impl SlashCommand {
             SlashCommand::Daemon => "daemon",
             SlashCommand::Mcp => "mcp",
             SlashCommand::Runtime => "runtime",
-            SlashCommand::Kanban => "kanban",
+            SlashCommand::Kanban => "superpowers-kanban",
         }
     }
 
@@ -224,6 +224,10 @@ impl SlashCommand {
     pub fn from_name(name: &str) -> Option<SlashCommand> {
         if name == "?" {
             return Some(Self::Help);
+        }
+        // `/kanban` 是过渡别名：老名字仍可解析，但规范名是 `/superpowers-kanban`。
+        if name == "kanban" {
+            return Some(Self::Kanban);
         }
         Self::all().iter().copied().find(|cmd| cmd.name() == name)
     }
@@ -861,9 +865,18 @@ mod tests {
     }
 
     #[test]
+    fn the_legacy_kanban_name_still_resolves_to_the_command() {
+        assert_eq!(SlashCommand::from_name("kanban"), Some(SlashCommand::Kanban));
+        assert_eq!(
+            SlashCommand::from_name("superpowers-kanban"),
+            Some(SlashCommand::Kanban)
+        );
+    }
+
+    #[test]
     fn kanban_is_a_known_slash_command_with_a_description() {
         let command = SlashCommand::Kanban;
-        assert_eq!(command.name(), "kanban");
+        assert_eq!(command.name(), "superpowers-kanban");
         assert!(
             command.description().contains("Superpowers 看板"),
             "{}",

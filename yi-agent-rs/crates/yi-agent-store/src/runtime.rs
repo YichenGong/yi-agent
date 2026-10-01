@@ -2076,6 +2076,29 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// Cancels every live child a conversation owns, leaving its directory
+    /// siblings and the shared root untouched.
+    ///
+    /// The work is per task and reuses [`Self::cancel_task`], so leases and
+    /// unmerged deliveries are accounted for by the same path a single-task
+    /// cancel uses. Returns the tasks that were cancelled; an empty result
+    /// means the conversation had nothing live, which is not an error.
+    pub async fn cancel_thread_tasks(
+        &self,
+        session: &RootSessionId,
+        thread_id: &str,
+    ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
+        let targets = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .active_children_for_thread(thread_id)?;
+        for task in &targets {
+            self.cancel_task(session, task, true).await?;
+        }
+        Ok(targets)
+    }
+
     pub async fn pause_task(
         &self,
         session: &RootSessionId,

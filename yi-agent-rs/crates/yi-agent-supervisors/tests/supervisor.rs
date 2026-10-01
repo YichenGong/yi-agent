@@ -182,3 +182,13 @@ fn stop_all_reaps_every_child() {
     supervisor.stop_all();
     assert_eq!(supervisor.running_count(), 0);
 }
+
+#[test]
+fn the_layout_state_dir_uses_the_superpowers_kanban_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::for_workdir(dir.path());
+    assert_eq!(
+        layout.state_dir,
+        dir.path().join(".yi-agent/superpowers-kanban")
+    );
+}
