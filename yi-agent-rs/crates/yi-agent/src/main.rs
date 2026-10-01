@@ -476,46 +476,7 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
 }
 
 /// 停止句柄：置位后循环退出并 `stop_all`，用于测试与 daemon 退出时的回收。
-pub(crate) struct SupervisorHandle {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    join: Option<std::thread::JoinHandle<()>>,
-}
-
-impl SupervisorHandle {
-    pub(crate) fn stop(mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
-}
-
-/// 在后台线程里按固定间隔对齐托管子进程（分辨率 500ms）。
-pub(crate) fn serve_supervisor(workdir: &std::path::Path) -> SupervisorHandle {
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = stop.clone();
-    let layout = yi_agent_supervisors::supervisor::Layout::for_workdir(workdir);
-    let join = std::thread::spawn(move || {
-        let mut supervisor = yi_agent_supervisors::supervisor::Supervisor::new(layout);
-        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-            supervisor.reconcile();
-            // Republish the plugins that declared a query socket and are actually
-            // running. The store owns the forwarding table but knows nothing about
-            // manifests; this loop is the only place that can see both.
-            yi_agent_store::ipc::register_plugin_sockets(supervisor.query_sockets());
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        // Nothing is running any more, so nothing is reachable.
-        yi_agent_store::ipc::clear_plugin_sockets();
-        supervisor.stop_all();
-    });
-    SupervisorHandle {
-        stop,
-        join: Some(join),
-    }
-}
-
-fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
+pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     let workdir = config::resolve_workdir(cli)?;
     let runtime_dir = runtime_directory_for(&workdir);
     let runtime = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
@@ -568,7 +529,7 @@ fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // `daemon start` detaches this subcommand with its stderr on
             // `/dev/null`, but a directly invoked `serve` owns the terminal and
             // so keeps the historical line.
-            let supervisor = serve_supervisor(&workdir);
+            let supervisor = yi_agent_runtime::supervise::serve(&workdir);
             report_reclaimed_orphans_to_stderr(daemon.reclaimed_orphans());
             let result = daemon
                 .wait()
@@ -1945,7 +1906,7 @@ mod tests {
         )
         .unwrap();
 
-        let handle = serve_supervisor(workdir);
+        let handle = yi_agent_runtime::supervise::serve(workdir);
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut started = false;
         while Instant::now() < deadline {

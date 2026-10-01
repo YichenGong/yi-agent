@@ -6000,3 +6000,107 @@ fn inherited_sandbox_is_persisted_and_recovered() {
         .unwrap();
     assert_eq!(repository.task_inherited_sandbox(&legacy).unwrap(), None);
 }
+
+/// The conversation marker is the only thing that separates two threads'
+/// children in one directory: they share one attached root. Cancelling a
+/// conversation must therefore collect exactly its children and leave the
+/// sibling conversation, the shared root, and the runtime alone.
+#[test]
+fn cancelling_a_thread_cancels_only_its_own_children() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-scoped-cancel".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+
+    let spawn = |thread: &str, objective: &str| -> String {
+        let response = send_request(
+            daemon.socket_path(),
+            IpcRequest::SpawnApplicationChild {
+                session_id: session_id.clone(),
+                parent_task_id: root_task_id.clone(),
+                capability: message_capability.clone(),
+                objective: objective.into(),
+                mode: None,
+                model: None,
+                workdir: None,
+                thread_id: Some(thread.into()),
+                sandbox: None,
+            },
+        )
+        .unwrap();
+        match response {
+            IpcResponse::TaskSpawned { task_id } => task_id,
+            other => panic!("expected a spawned child, got {other:?}"),
+        }
+    };
+
+    // Two conversations in one directory, each with one child, on a shared root.
+    let child_of_a = spawn("thread-a", "conversation a work");
+    let child_of_b = spawn("thread-b", "conversation b work");
+
+    let state = |task: &str| -> String {
+        let IpcResponse::TaskSummaries { tasks } = send_request(
+            daemon.socket_path(),
+            IpcRequest::ListTaskSummaries {
+                session_id: Some(session_id.clone()),
+                active_only: false,
+            },
+        )
+        .unwrap() else {
+            panic!("expected task summaries");
+        };
+        tasks
+            .into_iter()
+            .find(|summary| summary.task_id == task)
+            .map(|summary| summary.state)
+            .unwrap_or_else(|| panic!("task {task} is missing from the summaries"))
+    };
+
+    assert!(
+        !matches!(state(&child_of_a).as_str(), "cancelled"),
+        "the child starts live"
+    );
+
+    let IpcResponse::ThreadTasksCancelled { task_ids } = send_request(
+        daemon.socket_path(),
+        IpcRequest::CancelThreadTasks {
+            session_id: session_id.clone(),
+            thread_id: "thread-a".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a thread-scoped cancellation response");
+    };
+
+    // Exactly the conversation's own child, and nothing else.
+    assert_eq!(task_ids, vec![child_of_a.clone()]);
+    assert_eq!(state(&child_of_a), "cancelled");
+    // The sibling conversation's child is untouched: this is the regression the
+    // shared root would otherwise cause.
+    assert_ne!(
+        state(&child_of_b),
+        "cancelled",
+        "a sibling conversation's child must keep running"
+    );
+    // The shared root is never a child and must survive its own deletion.
+    assert_ne!(
+        state(&root_task_id),
+        "cancelled",
+        "the shared root must not be cancelled by one conversation leaving"
+    );
+}

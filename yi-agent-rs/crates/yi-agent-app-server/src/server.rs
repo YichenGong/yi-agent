@@ -207,6 +207,45 @@ fn socket_for_thread(
         .map(|handle| handle.socket_path)
 }
 
+/// Cancels every live child a conversation owns, before its files go away.
+///
+/// The children live in the shared project runtime, where the conversation's
+/// files are not the authority, so deleting them alone would leave the agents
+/// running where nobody can see them. The cancellation is scoped by the
+/// conversation marker rather than the root: several conversations share one
+/// attached root, and a root-scoped cancel would stop a sibling's work too.
+///
+/// Best effort by construction: the thread is being deleted either way, so an
+/// unreachable daemon is reported to the log and never blocks the deletion.
+fn cancel_thread_children(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+) -> Result<usize, String> {
+    let cwd = threads
+        .get(thread_id)
+        .map(|session| session.cwd.clone())
+        .ok_or_else(|| "the thread is not held in memory".to_string())?;
+    let key = project_key(Path::new(&cwd));
+    let binding = {
+        let guard = runtimes.lock().unwrap_or_else(|p| p.into_inner());
+        guard.get(&key).cloned()
+    }
+    .ok_or_else(|| "no attached runtime for this project".to_string())??;
+    let response = binding.send(
+        |handle| yi_agent_store::ipc::IpcRequest::CancelThreadTasks {
+            session_id: handle.session_id.clone(),
+            thread_id: thread_id.to_owned(),
+        },
+    )?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::ThreadTasksCancelled { task_ids } => Ok(task_ids.len()),
+        other => Err(format!(
+            "daemon returned a non-cancellation response: {other:?}"
+        )),
+    }
+}
+
 /// The task summaries the daemon holds for a conversation's directory.
 fn list_task_summaries(
     runtimes: &ProjectRuntimes,
@@ -1428,6 +1467,19 @@ where
                         // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
                         // 故复用 resume 的等待模式,等落盘后再删。
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
+                        // 在删文件之前先取消该会话名下的子代理。子代理跑在共享的项目
+                        // runtime 里,对话文件不是它的权威,只删文件会把它留在无人可见
+                        // 的地方继续跑。按会话标记取消,不动同目录其它会话的子代理
+                        // (它们共享同一个 root)。
+                        match cancel_thread_children(&runtimes, &threads, &thread_id) {
+                            Ok(cancelled) if cancelled > 0 => eprintln!(
+                                "[app-server] cancelled {cancelled} subagent task(s) for {thread_id}"
+                            ),
+                            Ok(_) => {}
+                            Err(cause) => eprintln!(
+                                "[app-server] could not cancel subagents for {thread_id}: {cause}"
+                            ),
+                        }
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         pending_activation.remove(&thread_id);
