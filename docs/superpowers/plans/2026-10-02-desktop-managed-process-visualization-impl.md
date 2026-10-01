@@ -64,25 +64,25 @@
 ```rust
     #[test]
     fn tool_setup_exposes_the_process_manager_it_registered() {
-        let cfg = sample_config();
+        let mut cfg = sample_config();
+        // workdir 指向临时目录:测试不许往仓库根写进程运行时目录。
+        cfg.workdir = tempfile::TempDir::new().unwrap().path().to_path_buf();
         let setup = build_tool_setup(&cfg, false).expect("build setup");
         // manager 必须与注册表同行:注册表里有 process_start,就必须有对应的
         // manager 可查——否则 app-server 拿不到句柄,进程面板会是空的。
         assert!(setup.tools.get("process_start").is_some());
-        // 起一个真实后台进程,断言它出现在 manager 的 list 里。
-        let started = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(setup.process_manager.start(
-                yi_agent_tools::ProcessStartOptions {
-                    command: "sleep 30".into(),
-                    name: Some("t1-probe".into()),
-                    cwd: None,
-                    env: Default::default(),
-                    on_exit: Default::default(),
-                    ready_pattern: None,
-                    ready_timeout_sec: None,
-                },
-            ))
+        // 起一个真实后台进程,断言它出现在同一份 manager 的 list 里。
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let started = rt
+            .block_on(setup.process_manager.start(yi_agent_tools::ProcessStartOptions {
+                command: "sleep 30".into(),
+                name: Some("t1-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: None,
+                ready_timeout_sec: None,
+            }))
             .expect("start");
         assert_eq!(started.name.as_deref(), Some("t1-probe"));
         assert!(setup
@@ -90,11 +90,14 @@
             .list()
             .iter()
             .any(|p| p.name.as_deref() == Some("t1-probe")));
-        let _ = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(setup.process_manager.shutdown());
+        // 收尾:on_exit 默认 Kill,shutdown 会杀掉它(不留孤儿 sleep 30)。
+        // 必须在同一个 runtime 上 block_on —— 进程的 reader/waiter task 挂在
+        // 那个 runtime 上,换一个 runtime 收尾是无效的。
+        let _ = rt.block_on(setup.process_manager.shutdown());
     }
 ```
+
+> `on_exit: Default::default()` 即 `OnExitPolicy::Kill`，因此上面的 `shutdown()` 会真正终止 `sleep 30`。若省略收尾，测试会留下一个存活 30 秒的孤儿进程。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -196,7 +199,8 @@ git commit -m "feat(runtime): ToolSetup 带出 process manager"
 ```rust
     #[test]
     fn agent_bootstrap_exposes_the_process_manager() {
-        let cfg = sample_config();
+        let mut cfg = sample_config();
+        cfg.workdir = tempfile::TempDir::new().unwrap().path().to_path_buf();
         let boot = bootstrap_agent(&cfg, PermissionMode::AutoAllow).expect("bootstrap");
         // 与 AgentBootstrap.tools 同理:调用方重建 agent 时要能沿用同一份
         // manager,否则进程列表会跟实际生效的工具集脱钩。
@@ -256,51 +260,161 @@ git commit -m "feat(runtime): AgentBootstrap 带出 process manager"
 - Consumes: `AgentBootstrap.process_manager`（Task 2）、`ToolSetup.process_manager`（Task 1）
 - Produces: `BuiltAgent.process_manager: Arc<ProcessManager>`；`RuntimeTooling.process_manager: Arc<ProcessManager>`；`ThreadSession.process_manager: Arc<ProcessManager>`
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 先确认基线为绿（本任务不新增测试）**
 
-在 `server.rs` 的 tests 模块追加（这是一条**契约测试**，直接针对设计文档 §4.2 的陷阱）：
+本任务只做「带出并保存 manager」的接线,不引入新的可观察行为,因此**不写新测试**——
+它为 Task 4 的 `process/list` 提供数据来源,行为断言在 Task 4 落地。这里先确认基线:
+`BuiltAgent` 是私有的、`Agent` 也没有公开的 `tools()` 访问器,任何从外部断言
+「注册表与 manager 配套」的测试都无法编译;强行加一个只为测试而生的公开访问器
+属于为测试改生产接口,是本任务不该做的事。
+
+Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server`
+
+Expected: PASS(既有全绿)。若不绿,先查清再动本任务。
+
+- [ ] **Step 2: 实现**
+
+`BuiltAgent`（`:49-61`）加字段：
 
 ```rust
-    #[test]
-    fn built_agent_carries_the_same_manager_as_its_registry() {
-        // 基础路径:工厂产出的 BuiltAgent 必须同时给出注册表与支撑它的 manager。
-        // 若二者脱钩(例如 manager 用的是另一份),进程面板会显示空列表。
-        let cfg = sample_config();
-        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
-            &cfg,
-            yi_agent_runtime::bootstrap::PermissionMode::AutoAllow,
-        )
-        .expect("bootstrap");
-        assert!(built.tools.get("process_start").is_some());
-        assert_eq!(built.process_manager.list().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn runtime_tooling_keeps_a_manager_for_its_registry() {
-        // 委派路径:build_runtime_tooling 换掉了注册表,就必须一并换掉 manager。
-        // 这条断言是「哪个注册表生效、就看哪个 manager」的守卫。
-        let cfg = sample_config();
-        let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
-        let dir = tempfile::TempDir::new().unwrap();
-        let setup = yi_agent_runtime::bootstrap::build_tool_setup_with_switch(
-            &cfg,
-            false,
-            dir.path(),
-            switch.clone(),
-        )
-        .expect("setup");
-        assert!(setup.tools.get("process_start").is_some());
-        // 同一个 setup 里的注册表与 manager 必须配套(list 可查且不 panic)。
-        assert!(setup.process_manager.list().is_empty());
-    }
+struct BuiltAgent {
+    agent: yi_agent_core::Agent,
+    provider: Arc<dyn yi_agent_core::Provider>,
+    config: yi_agent_core::AgentConfig,
+    decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
+    decision_rx: Option<yi_agent_runtime::bootstrap::DecisionReceiver>,
+    catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
+    yolo: yi_agent_core::autonomy::YoloSwitch,
+    /// 支撑该 agent 工具集里的进程工具的 manager。**与生效的工具集同行**：
+    /// `build_runtime_tooling` 换掉工具集时必须一并替换它。
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
+}
 ```
 
-> 说明：`build_runtime_tooling` 需要真实 attach 才能调用（依赖 `git` 项目与 daemon），因此这里守卫的是「注册表与 manager 配套」这一不变量本身；Task 6 会在真实 thread 上端到端验证生效的那一份。
+`RuntimeTooling`（`:63`）加：
 
-- [ ] **Step 2: 运行测试确认失败**
+```rust
+struct RuntimeTooling {
+    registry: Arc<yi_agent_core::ToolRegistry>,
+    permission: Arc<yi_agent_core::permission::PermissionChecker>,
+    /// 这一份注册表对应的 manager(与 registry 同源)。
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
+}
+```
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server built_agent_carries_the_same_manager_as_its_registry`
-Expected: 编译失败 — `BuiltAgent` 上无 `tools` / `process_manager`（或字段缺失）
+`build_runtime_tooling` 取出并返回（`:609-632`）：
+
+```rust
+    let setup = yi_agent_runtime::bootstrap::build_tool_setup_with_controller(
+        cfg,
+        false,
+        &workspace_root,
+        controller.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut registry = (*setup.tools).clone();
+    let process_manager = Arc::clone(&setup.process_manager);
+```
+
+```rust
+    Ok(RuntimeTooling {
+        registry: Arc::new(registry),
+        permission,
+        process_manager,
+    })
+```
+
+`wrap_for_delegation`（`:636`）在解构与重建中都带上：
+
+```rust
+fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent {
+    let BuiltAgent {
+        agent,
+        provider,
+        config,
+        decision_tx,
+        decision_rx,
+        catalog,
+        yolo,
+        ..
+    } = built;
+    let session = agent.session();
+    let mut rebuilt =
+        yi_agent_core::Agent::new(provider.clone(), tooling.registry.clone(), config.clone())
+            .with_session(session);
+    if let Some(rx) = decision_rx.clone() {
+        rebuilt = rebuilt.with_permission(tooling.permission.clone(), rx);
+    }
+    BuiltAgent {
+        agent: rebuilt,
+        provider,
+        config,
+        decision_tx,
+        decision_rx,
+        catalog,
+        yolo,
+        // 注册表换了,manager 必须跟着换:否则面板查的是被丢弃的那一份。
+        process_manager: tooling.process_manager,
+    }
+}
+```
+
+两处解构 `let BuiltAgent { .. } = activation.built;`（`:1108`、`:1318`）都加上 `process_manager`，并把它交给 `ThreadSession`：
+
+```rust
+                        let BuiltAgent {
+                            agent,
+                            provider,
+                            config,
+                            decision_tx,
+                            catalog,
+                            yolo,
+                            process_manager,
+                        } = activation.built;
+```
+
+`ThreadSession`（`session.rs:60`）加字段：
+
+```rust
+    /// 该 thread 生效的进程管理器(与它的工具集同行),供 `process/*` 查询。
+    pub process_manager: Arc<yi_agent_tools::ProcessManager>,
+```
+
+两处 `ThreadSession { .. }` 字面量（`:1151`、`:1332`）各加 `process_manager: Arc::clone(&process_manager),`。
+
+基础工厂（`:725-745`）产出 `BuiltAgent` 时补字段：
+
+```rust
+            Ok(BuiltAgent {
+                agent: apply_session(built.agent, session),
+                provider: built.provider,
+                config,
+                decision_tx: built.decision_tx,
+                decision_rx: built.decision_rx,
+                catalog: built.catalog,
+                yolo: built.yolo,
+                process_manager: built.process_manager,
+            })
+```
+
+> 注意：`apply_session` 只换 session，不动工具集，所以这里的 manager 与 `built.agent` 的注册表同源——这正是要的。
+
+- [ ] **Step 3: 修复所有编译错误**
+
+Run: `cd yi-agent-rs && cargo build -p yi-agent-app-server`
+Expected: 编译通过。测试 fixture（如 `:4874`、`:3436` 等处构造 `BuiltAgent` 的辅助函数，例如 `build_test_agent`、`build_permission_agent`）若报缺字段，按同样方式补上该 harness 自己的 `ProcessManager::new(std::env::temp_dir())`。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd yi-agent-rs && git add crates/yi-agent-app-server/src/server.rs crates/yi-agent-app-server/src/session.rs
+git commit -m "feat(app-server): 装配路径带出并保存 per-thread process manager"
+```
 
 - [ ] **Step 3: 实现**
 
@@ -459,26 +573,23 @@ git commit -m "feat(app-server): 装配路径带出并保存 per-thread process 
 
 - [ ] **Step 1: 写失败测试**
 
-在 `server.rs` 的 tests 模块追加（沿用既有 `h` = harness 的会话撮合模式）：
+在 `server.rs` 的 tests 模块追加。复用该文件既有的 harness API：`Harness::new()` /
+`Harness::with_factory(..)`（`server.rs:3527`）、`start_thread(&mut h)`（内含
+`initialize`）、`h.read_value()`（`server.rs:3598`）、`build_test_agent`（`:3429`）、
+`PERMISSION_TIMEOUT`。**不要**新造 harness。
 
 ```rust
     #[tokio::test]
     async fn process_list_is_empty_for_a_fresh_thread_and_for_an_unknown_one() {
-        let (cfg, _dir) = test_config_with_workdir();
-        let (mut h, _handle) = spawn_server(cfg).await;
-        h.send(
-            r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"/tmp"}}"#,
-        )
-        .await;
-        let started = h.recv().await;
-        let thread_id = started["result"]["thread_id"].as_str().unwrap().to_string();
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
 
         // 新 thread:没有进程,列表为空(不是错误)。
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"process/list","params":{{"thread_id":"{thread_id}"}}}}"#
         ))
         .await;
-        let listed = h.recv().await;
+        let listed = h.read_value().await;
         assert_eq!(listed["id"], 3);
         assert!(listed["error"].is_null(), "{listed}");
         assert_eq!(listed["result"]["processes"].as_array().unwrap().len(), 0);
@@ -488,43 +599,121 @@ git commit -m "feat(app-server): 装配路径带出并保存 per-thread process 
             r#"{"jsonrpc":"2.0","id":4,"method":"process/list","params":{"thread_id":"thread-nope"}}"#,
         )
         .await;
-        let unknown = h.recv().await;
+        let unknown = h.read_value().await;
         assert_eq!(unknown["id"], 4);
         assert!(unknown["error"].is_null(), "{unknown}");
         assert_eq!(unknown["result"]["processes"].as_array().unwrap().len(), 0);
+
+        h.shutdown().await;
     }
 
     #[tokio::test]
     async fn process_read_reports_an_unknown_process_as_an_error() {
-        let (cfg, _dir) = test_config_with_workdir();
-        let (mut h, _handle) = spawn_server(cfg).await;
-        h.send(
-            r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"/tmp"}}"#,
-        )
-        .await;
-        let started = h.recv().await;
-        let thread_id = started["result"]["thread_id"].as_str().unwrap().to_string();
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
 
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"proc_999"}}}}"#
         ))
         .await;
-        let bad = h.recv().await;
+        let bad = h.read_value().await;
         assert_eq!(bad["id"], 3);
         assert!(bad["result"].is_null(), "{bad}");
         assert!(bad["error"]["message"]
             .as_str()
             .unwrap()
             .contains("process not found"));
+
+        h.shutdown().await;
+    }
+
+    /// 生效的那一份 manager 才被看见:thread 必须采用工厂给出的 manager,而不是
+    /// 自建一份——否则进程面板显示空列表,而 agent 明明能起进程(设计 §4.2 的陷阱)。
+    ///
+    /// 顺带验证 `process/read` 的游标增量语义:两次读不重不漏。
+    #[tokio::test]
+    async fn process_list_and_read_observe_the_managers_the_factory_handed_over() {
+        use std::sync::Arc;
+
+        let held: Arc<yi_agent_tools::ProcessManager> =
+            Arc::new(yi_agent_tools::ProcessManager::new(std::env::temp_dir()));
+        let for_factory = Arc::clone(&held);
+
+        let mut h = Harness::with_factory(
+            move |session, cwd, mode| {
+                let mut built = build_test_agent(session, cwd, mode)?;
+                // 这一份才是「生效」的:thread 必须采用它。
+                built.process_manager = Arc::clone(&for_factory);
+                Ok(built)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        let thread_id = start_thread(&mut h).await;
+
+        // ready_pattern 让 start() 等到输出出现才返回,断言因此是确定性的。
+        let started = held
+            .start(yi_agent_tools::ProcessStartOptions {
+                command: "printf alpha".into(),
+                name: Some("t4-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: Some("alpha".into()),
+                ready_timeout_sec: Some(5),
+            })
+            .await
+            .expect("start");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/list","params":{{"thread_id":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["id"], 3);
+        assert!(listed["error"].is_null(), "{listed}");
+        let names: Vec<&str> = listed["result"]["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(names.contains(&"t4-probe"), "thread must see the held manager: {listed}");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{}"}}}}"#,
+            started.process_id
+        ))
+        .await;
+        let first = h.read_value().await;
+        assert_eq!(first["id"], 4);
+        assert!(first["error"].is_null(), "{first}");
+        assert!(
+            first["result"]["stdout"].as_str().unwrap().contains("alpha"),
+            "{first}"
+        );
+        let cursor = first["result"]["next_cursor"].as_u64().unwrap();
+        assert!(cursor > 0, "{first}");
+
+        // 从上一轮游标继续读:没有新输出(不重不漏)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{}","cursor":{cursor}}}}}"#,
+            started.process_id
+        ))
+        .await;
+        let second = h.read_value().await;
+        assert_eq!(second["id"], 5);
+        assert!(second["error"].is_null(), "{second}");
+        assert_eq!(second["result"]["stdout"].as_str().unwrap(), "", "{second}");
+
+        let _ = held.shutdown().await;
+        h.shutdown().await;
     }
 ```
-
-> 若测试 harness 的构造方式与 `test_config_with_workdir` / `spawn_server` 名称不符，沿用该文件中**相邻进程测试所使用**的同一套既有 helper（参考 `agent/children/list` 的用例写法），不要新造 harness。
 
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server process_list_is_empty_for_a_fresh_thread_and_for_an_unknown_one`
-Expected: FAIL — 响应 `error.code == -32601`（method not found）
+Expected: FAIL — 响应 `error.code == -32601`(method not found)
 
 - [ ] **Step 3: 实现**
 
@@ -673,23 +862,84 @@ git commit -m "feat(app-server): process/list 与 process/read"
 ```rust
     #[tokio::test]
     async fn process_kill_reports_an_unknown_process_as_an_error() {
-        let (cfg, _dir) = test_config_with_workdir();
-        let (mut h, _handle) = spawn_server(cfg).await;
-        h.send(
-            r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"/tmp"}}"#,
-        )
-        .await;
-        let started = h.recv().await;
-        let thread_id = started["result"]["thread_id"].as_str().unwrap().to_string();
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
 
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"process/kill","params":{{"thread_id":"{thread_id}","process_id":"proc_999"}}}}"#
         ))
         .await;
-        let bad = h.recv().await;
+        let bad = h.read_value().await;
         assert_eq!(bad["id"], 3);
         assert!(bad["result"].is_null(), "{bad}");
         assert!(!bad["error"].is_null());
+
+        h.shutdown().await;
+    }
+
+    /// kill 真的能终止进程,并把状态推到 `exited`/`killed`。
+    #[tokio::test]
+    async fn process_kill_terminates_a_held_manager_process() {
+        use std::sync::Arc;
+
+        let held: Arc<yi_agent_tools::ProcessManager> =
+            Arc::new(yi_agent_tools::ProcessManager::new(std::env::temp_dir()));
+        let for_factory = Arc::clone(&held);
+        let mut h = Harness::with_factory(
+            move |session, cwd, mode| {
+                let mut built = build_test_agent(session, cwd, mode)?;
+                built.process_manager = Arc::clone(&for_factory);
+                Ok(built)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        let thread_id = start_thread(&mut h).await;
+
+        let started = held
+            .start(yi_agent_tools::ProcessStartOptions {
+                command: "sleep 300".into(),
+                name: Some("t5-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: None,
+                ready_timeout_sec: None,
+            })
+            .await
+            .expect("start");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/kill","params":{{"thread_id":"{thread_id}","process_id":"{}"}}}}"#,
+            started.process_id
+        ))
+        .await;
+        let killed = h.read_value().await;
+        assert_eq!(killed["id"], 3);
+        assert!(killed["error"].is_null(), "{killed}");
+        assert_eq!(killed["result"]["ok"], true);
+
+        // 状态必须落到终态之一,而不是仍显示 running。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snap = held
+                .list()
+                .into_iter()
+                .find(|p| p.process_id == started.process_id)
+                .expect("process must still be listed after kill");
+            let state = serde_json::to_value(&snap.status).unwrap();
+            let label = state["state"].as_str().unwrap_or("").to_string();
+            if label == "killed" || label == "exited" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process never reached a terminal state: {state}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let _ = held.shutdown().await;
+        h.shutdown().await;
     }
 ```
 
