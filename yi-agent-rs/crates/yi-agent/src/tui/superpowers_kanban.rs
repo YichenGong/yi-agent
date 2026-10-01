@@ -237,8 +237,27 @@ mod tests {
 
     #[test]
     fn a_disabled_board_refuses_to_run_and_says_where_the_switch_is() {
+        // The global layer lives at `$HOME/.yi-agent/preferences.json`, which is
+        // a real, user-owned file. Without pointing HOME at an empty directory
+        // this test reads whatever the developer has on disk: a machine with the
+        // switch on answered "enabled" and the assertion below failed on a clean
+        // checkout. Pin HOME so the test only ever sees its own temporary layers.
+        let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded within this test; restored before returning.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
         let outcome = handle_kanban(dir.path(), "run");
+
+        // SAFETY: see above.
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
         assert_eq!(outcome.toggled_to, None);
         assert!(
             outcome.lines[0].contains("disabled"),
