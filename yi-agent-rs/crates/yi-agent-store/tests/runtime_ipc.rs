@@ -80,7 +80,7 @@ fn legacy_v6_database() -> PathBuf {
     connection
         .execute_batch(
             "DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11);",
+             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12);",
         )
         .unwrap();
     database
@@ -745,7 +745,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                  detached_at TEXT
              );
-             DELETE FROM schema_migrations WHERE version = 11;",
+             DELETE FROM schema_migrations WHERE version >= 11;",
         )
         .unwrap();
     database
