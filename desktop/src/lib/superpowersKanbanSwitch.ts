@@ -34,7 +34,7 @@ type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
 
 /** 经 app-server 读看板卡片（宿主侧读 board.json）。 */
 export async function fetchBoard(rpc: BoardRpc): Promise<BoardCardDto[]> {
-  const result = await rpc<{ cards?: BoardCardDto[] }>("board/list", {});
+  const result = await rpc<{ cards?: BoardCardDto[] }>("superpowers-kanban/list", {});
   return result?.cards ?? [];
 }
 
@@ -42,12 +42,12 @@ export async function fetchBoard(rpc: BoardRpc): Promise<BoardCardDto[]> {
 export async function readBoardSwitch(
   rpc: BoardRpc,
 ): Promise<{ on: boolean; source: SwitchSource }> {
-  return rpc<{ on: boolean; source: SwitchSource }>("board/switch/read", {});
+  return rpc<{ on: boolean; source: SwitchSource }>("superpowers-kanban/switch/read", {});
 }
 
 /** 经 app-server 写项目层开关。 */
 export async function setBoardSwitch(rpc: BoardRpc, on: boolean): Promise<void> {
-  await rpc("board/switch/write", { on });
+  await rpc("superpowers-kanban/switch/write", { on });
 }
 
 /** 经 app-server 投递一张卡片。 */
@@ -56,5 +56,5 @@ export async function enqueueBoardCard(
   specPath: string,
   planPath: string,
 ): Promise<void> {
-  await rpc("board/enqueue", { spec_path: specPath, plan_path: planPath });
+  await rpc("superpowers-kanban/enqueue", { spec_path: specPath, plan_path: planPath });
 }

@@ -879,10 +879,10 @@ where
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
-                    "board/list" => {
+                    "superpowers-kanban/list" => {
                         write_response(&writer, ok_response(id, board_list(&cfg.workdir))).await?;
                     }
-                    "board/enqueue" => {
+                    "superpowers-kanban/enqueue" => {
                         let requested = req
                             .params
                             .get("id")
@@ -912,11 +912,11 @@ where
                             .await?,
                         }
                     }
-                    "board/switch/read" => {
+                    "superpowers-kanban/switch/read" => {
                         write_response(&writer, ok_response(id, board_switch_read(&cfg.workdir)))
                             .await?;
                     }
-                    "board/switch/write" => {
+                    "superpowers-kanban/switch/write" => {
                         let on = req
                             .params
                             .get("on")

@@ -1,6 +1,6 @@
-import type { SwitchSource } from "../lib/boardSwitch";
+import type { SwitchSource } from "../lib/superpowersKanbanSwitch";
 
-export function SettingsPanel({
+export function SuperpowersKanbanSettings({
   switchOn,
   source,
   onToggle,

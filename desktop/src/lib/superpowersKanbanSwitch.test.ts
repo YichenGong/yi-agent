@@ -5,7 +5,7 @@ import {
   readBoardSwitch,
   resolveSwitch,
   setBoardSwitch,
-} from "./boardSwitch";
+} from "./superpowersKanbanSwitch";
 
 describe("resolveSwitch", () => {
   it("lets the project layer win over the global layer", () => {
@@ -60,6 +60,6 @@ describe("board RPC wrappers", () => {
   it("setBoardSwitch writes the requested value", async () => {
     const inner = vi.fn(async () => ({ on: true }));
     await setBoardSwitch(asRpc(inner), true);
-    expect(inner).toHaveBeenCalledWith("board/switch/write", { on: true });
+    expect(inner).toHaveBeenCalledWith("superpowers-kanban/switch/write", { on: true });
   });
 });

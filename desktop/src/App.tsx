@@ -21,15 +21,15 @@ import type {
   WorkspaceGroup,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
-import { BoardView } from "./components/BoardView";
-import { SettingsPanel } from "./components/SettingsPanel";
+import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
+import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import {
   type BoardCardDto,
   type SwitchSource,
   fetchBoard,
   readBoardSwitch,
   setBoardSwitch,
-} from "./lib/boardSwitch";
+} from "./lib/superpowersKanbanSwitch";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
@@ -607,7 +607,7 @@ export default function App() {
           onBrowse={onBrowse}
         />
         <div className="flex w-72 flex-col border-r border-neutral-800">
-          <SettingsPanel
+          <SuperpowersKanbanSettings
             switchOn={boardOn}
             source={boardSource}
             onToggle={(next) => {
@@ -621,7 +621,7 @@ export default function App() {
                 });
             }}
           />
-          <BoardView switchOn={boardOn} source={boardSource} cards={boardCards} />
+          <SuperpowersKanbanView switchOn={boardOn} source={boardSource} cards={boardCards} />
         </div>
         <div className="relative flex min-w-0 flex-1 flex-col">
           <ApprovalBanner

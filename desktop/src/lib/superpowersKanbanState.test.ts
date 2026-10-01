@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boardJsonPath, parseBoard } from "./boardState";
+import { boardJsonPath, parseBoard } from "./superpowersKanbanState";
 
 describe("boardJsonPath", () => {
   it("points at board.json inside the state directory", () => {

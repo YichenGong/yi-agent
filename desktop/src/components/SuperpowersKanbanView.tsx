@@ -1,4 +1,4 @@
-import type { SwitchSource } from "../lib/boardSwitch";
+import type { SwitchSource } from "../lib/superpowersKanbanSwitch";
 
 export interface BoardCard {
   id: string;
@@ -7,7 +7,7 @@ export interface BoardCard {
   detail: string;
 }
 
-export function BoardView({
+export function SuperpowersKanbanView({
   switchOn,
   source,
   cards,

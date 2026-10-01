@@ -1,16 +1,16 @@
 /** @vitest-environment jsdom */
 import { describe, expect, it, afterEach } from "vitest";
 import { render, cleanup, screen } from "@testing-library/react";
-import { BoardView } from "./BoardView";
+import { SuperpowersKanbanView } from "./SuperpowersKanbanView";
 
 afterEach(() => {
   cleanup();
 });
 
-describe("BoardView", () => {
+describe("SuperpowersKanbanView", () => {
   it("renders a card with its state, progress and detail", () => {
     render(
-      <BoardView
+      <SuperpowersKanbanView
         switchOn
         source="project"
         cards={[
@@ -31,12 +31,12 @@ describe("BoardView", () => {
   });
 
   it("explains itself instead of looking empty when disabled", () => {
-    render(<BoardView switchOn={false} source="default" cards={[]} />);
+    render(<SuperpowersKanbanView switchOn={false} source="default" cards={[]} />);
     expect(screen.getByText(/disabled/i)).toBeTruthy();
   });
 
   it("says the board is empty when enabled with no cards", () => {
-    render(<BoardView switchOn source="project" cards={[]} />);
+    render(<SuperpowersKanbanView switchOn source="project" cards={[]} />);
     expect(screen.getByText(/empty/i)).toBeTruthy();
   });
 });

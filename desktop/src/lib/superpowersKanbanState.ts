@@ -1,4 +1,4 @@
-import type { BoardCard } from "../components/BoardView";
+import type { BoardCard } from "../components/SuperpowersKanbanView";
 
 export function boardJsonPath(stateDir: string): string {
   return `${stateDir}/board.json`;
