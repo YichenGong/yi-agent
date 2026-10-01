@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
 /// 单层偏好里记录的开关值。
@@ -44,6 +46,56 @@ pub fn parse_switch_json(text: &str) -> Option<SwitchValue> {
         true => Some(SwitchValue::Enabled),
         false => Some(SwitchValue::Disabled),
     }
+}
+
+/// 项目层偏好路径：`<workdir>/.yi-agent/preferences.json`。
+///
+/// `state_dir` 是 `<workdir>/.yi-agent/superpowers-kanban`，故取其父目录——
+/// 项目层偏好与状态目录同级，这是宿主 `Layout` 的既有约定。
+pub fn project_preferences_path(state_dir: &Path) -> PathBuf {
+    state_dir
+        .parent()
+        .unwrap_or(state_dir)
+        .join("preferences.json")
+}
+
+/// 全局层偏好路径：`$HOME/.yi-agent/preferences.json`。无 `HOME` 时返回 `None`。
+pub fn global_preferences_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".yi-agent")
+            .join("preferences.json")
+    })
+}
+
+/// 读一层偏好：缺失 / 损坏 / 缺键一律 `None`（视作"该层未设置"）。
+pub fn read_layer(path: &Path) -> Option<SwitchValue> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_switch_json(&text)
+}
+
+/// 写一层偏好：读-改-写整个 JSON 对象（保留 `subagent_runtime` 等其他键），
+/// 只设置新键 `superpowers_kanban`；temp + rename 原子替换。
+///
+/// 只写新键、不删旧键：迁移期旧键仍然可读，删它属于清理而非本工具的职责。
+pub fn write_layer(path: &Path, value: SwitchValue) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut object = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert(
+        "superpowers_kanban".to_string(),
+        serde_json::Value::Bool(matches!(value, SwitchValue::Enabled)),
+    );
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -139,5 +191,59 @@ mod tests {
             parse_switch_json(r#"{"subagent_runtime":"always","superpowers_board":true}"#),
             Some(SwitchValue::Enabled)
         );
+    }
+
+    #[test]
+    fn project_preferences_live_beside_the_state_directory() {
+        assert_eq!(
+            project_preferences_path(Path::new("/proj/.yi-agent/superpowers-kanban")),
+            PathBuf::from("/proj/.yi-agent/preferences.json")
+        );
+    }
+
+    #[test]
+    fn writing_sets_the_new_key_and_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, r#"{"subagent_runtime":"always"}"#).unwrap();
+        write_layer(&path, SwitchValue::Enabled).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["superpowers_kanban"], true);
+        assert_eq!(value["subagent_runtime"], "always");
+        assert_eq!(parse_switch_json(&text), Some(SwitchValue::Enabled));
+    }
+
+    #[test]
+    fn writing_into_a_missing_directory_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".yi-agent/preferences.json");
+        write_layer(&path, SwitchValue::Disabled).unwrap();
+        assert_eq!(read_layer(&path), Some(SwitchValue::Disabled));
+    }
+
+    #[test]
+    fn writing_replaces_a_previous_value_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        write_layer(&path, SwitchValue::Enabled).unwrap();
+        write_layer(&path, SwitchValue::Disabled).unwrap();
+        assert_eq!(read_layer(&path), Some(SwitchValue::Disabled));
+        assert!(!dir.path().join("preferences.json.tmp").exists());
+    }
+
+    #[test]
+    fn a_broken_file_is_repaired_rather_than_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, "not json").unwrap();
+        write_layer(&path, SwitchValue::Enabled).unwrap();
+        assert_eq!(read_layer(&path), Some(SwitchValue::Enabled));
+    }
+
+    #[test]
+    fn read_layer_reports_none_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_layer(&dir.path().join("nope.json")), None);
     }
 }
