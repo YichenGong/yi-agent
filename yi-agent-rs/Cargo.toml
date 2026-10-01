@@ -12,6 +12,7 @@ members = [
     "crates/yi-agent-runtime",
     "crates/yi-agent-app-server",
     "crates/yi-agent-subagent",
+    "crates/yi-agent-board-ui",
 ]
 
 [workspace.package]
