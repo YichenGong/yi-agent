@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -46,26 +46,6 @@ pub fn parse_switch_json(text: &str) -> Option<SwitchValue> {
         true => Some(SwitchValue::Enabled),
         false => Some(SwitchValue::Disabled),
     }
-}
-
-/// 项目层偏好路径：`<workdir>/.yi-agent/preferences.json`。
-///
-/// `state_dir` 是 `<workdir>/.yi-agent/superpowers-kanban`，故取其父目录——
-/// 项目层偏好与状态目录同级，这是宿主 `Layout` 的既有约定。
-pub fn project_preferences_path(state_dir: &Path) -> PathBuf {
-    state_dir
-        .parent()
-        .unwrap_or(state_dir)
-        .join("preferences.json")
-}
-
-/// 全局层偏好路径：`$HOME/.yi-agent/preferences.json`。无 `HOME` 时返回 `None`。
-pub fn global_preferences_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".yi-agent")
-            .join("preferences.json")
-    })
 }
 
 /// 读一层偏好：缺失 / 损坏 / 缺键一律 `None`（视作"该层未设置"）。
@@ -190,14 +170,6 @@ mod tests {
         assert_eq!(
             parse_switch_json(r#"{"subagent_runtime":"always","superpowers_board":true}"#),
             Some(SwitchValue::Enabled)
-        );
-    }
-
-    #[test]
-    fn project_preferences_live_beside_the_state_directory() {
-        assert_eq!(
-            project_preferences_path(Path::new("/proj/.yi-agent/superpowers-kanban")),
-            PathBuf::from("/proj/.yi-agent/preferences.json")
         );
     }
 
