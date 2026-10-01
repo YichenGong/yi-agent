@@ -106,6 +106,8 @@ export interface AgentChild {
   objective?: string;
   state: string;
   lastStep?: string;
+  /** 该子任务自己的父任务;顶层子任务缺省。用于下钻时只列出自己的直接子任务。 */
+  parentTaskId?: string;
 }
 
 /** 一条子 agent 轨迹行,原样透传 daemon 的持久化行。 */
@@ -125,6 +127,13 @@ export interface AgentChildrenListResult {
 export interface AgentTraceSnapshotResult {
   rows: AgentTraceRow[];
   highWaterId: number;
+}
+
+/** `agent/cancel/preview` 的响应：确认取消所需的 token 与它的有效期。 */
+export interface AgentCancelPreviewResult {
+  confirmationToken: string;
+  taskIds: string[];
+  expiresInSecs: number;
 }
 
 /// Why the turn is being retried, as reported by the server on `turn/retry`.

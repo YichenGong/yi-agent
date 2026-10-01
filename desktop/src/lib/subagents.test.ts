@@ -1,12 +1,21 @@
 import { describe, it, expect } from "vitest";
 import {
   applyChildrenUpdated,
+  childrenOf,
+  foldTraceRows,
   isFinished,
   openTarget,
   SubagentRailStore,
   toRow,
   toTraceLine,
 } from "./subagents";
+
+const row = (eventId: number, kind: string, payload: unknown): {
+  eventId: number;
+  taskId: string;
+  kind: string;
+  payloadJson: string;
+} => ({ eventId, taskId: "t", kind, payloadJson: JSON.stringify(payload) });
 
 const child = (taskId: string, state: string, lastStep?: string): {
   taskId: string;
@@ -97,6 +106,45 @@ describe("subagents folding", () => {
         payloadJson: JSON.stringify({ type: "state_note", note: "completed" }),
       }).text,
     ).toBe("· completed");
+  });
+
+  it("merges consecutive assistant_text rows into one block", () => {
+    const blocks = foldTraceRows([
+      row(1, "assistant_text", { type: "assistant_text", text: "one " }),
+      row(2, "assistant_text", { type: "assistant_text", text: "two" }),
+      row(3, "tool_call", { type: "tool_call", name: "bash", summary: "ls" }),
+      row(4, "assistant_text", { type: "assistant_text", text: "after" }),
+    ]);
+    expect(blocks.map((b) => b.text)).toEqual(["one two", "bash(ls)", "after"]);
+    expect(blocks[0].key).toBe("row-1");
+  });
+
+  it("keeps a tool call and its result as separate blocks", () => {
+    const blocks = foldTraceRows([
+      row(1, "tool_call", { type: "tool_call", name: "bash", summary: "ls" }),
+      row(2, "tool_result", { type: "tool_result", name: "bash", is_error: false, summary: "ok" }),
+    ]);
+    expect(blocks).toHaveLength(2);
+    expect(blocks[1].kind).toBe("tool_result");
+  });
+
+  it("returns the direct children of a task, not its whole subtree", () => {
+    const kids = childrenOf(
+      [
+        { taskId: "a", parentTaskId: "root" },
+        { taskId: "b", parentTaskId: "a" },
+        { taskId: "c", parentTaskId: "a" },
+        { taskId: "d", parentTaskId: "b" },
+      ],
+      "a",
+    );
+    expect(kids.map((c) => c.taskId)).toEqual(["b", "c"]);
+    expect(childrenOf([{ taskId: "a", parentTaskId: "root" }], "d")).toEqual([]);
+  });
+
+  it("computes a row's parent so the rail can be walked as a tree", () => {
+    expect(toRow({ taskId: "a", state: "running", parentTaskId: "root" }).parentTaskId).toBe("root");
+    expect(toRow({ taskId: "b", state: "running" }).parentTaskId).toBeNull();
   });
 
   it("falls back to the raw payload when a row does not parse", () => {

@@ -16,6 +16,8 @@ export interface SubagentRow {
   lastStep: string | null;
   /** True once the child can no longer make progress. */
   finished: boolean;
+  /** The row's own parent, used to find a task's direct children for drilling. */
+  parentTaskId: string | null;
 }
 
 /**
@@ -43,6 +45,7 @@ export function toRow(child: AgentChild): SubagentRow {
     state: child.state,
     lastStep: finished ? null : (child.lastStep ?? null),
     finished,
+    parentTaskId: child.parentTaskId ?? null,
   };
 }
 
@@ -95,6 +98,63 @@ export class SubagentRailStore {
   drop(threadId: string): void {
     this.byThread.delete(threadId);
   }
+}
+
+/**
+ * The direct children of one task, which are a detail's drill-down targets.
+ *
+ * The server hands the client one flat list per conversation; the tree is
+ * recovered by parent, so drilling down walks that list rather than requesting
+ * a new one per level.
+ */
+export function childrenOf<T extends { taskId: string; parentTaskId?: string | null }>(
+  children: T[],
+  taskId: string,
+): T[] {
+  return children.filter((child) => (child.parentTaskId ?? null) === taskId);
+}
+
+/**
+ * One block of the trace detail: what the user reads, not what was persisted.
+ *
+ * A run of assistant text rows is one block (the writer flushes text every 512
+ * bytes or 200ms, so consecutive rows are one message split by its flush
+ * threshold, not two messages). Tool calls and results stay separate blocks so
+ * a tool's state is visible without expanding anything.
+ */
+export interface TraceBlock {
+  /** Stable within a view; the first row id that produced the block. */
+  key: string;
+  kind: "assistant_text" | "tool_call" | "tool_result" | "state_note" | string;
+  text: string;
+  isError: boolean;
+}
+
+/**
+ * Fold trace rows into blocks, merging consecutive assistant text.
+ *
+ * The fold is a pure function of the whole row list. A streaming client that
+ * appended to a mutable block would have to know which block the previous frame
+ * ended on; folding the list it already holds cannot drift, and the memoization
+ * upstream keeps it from re-running per delta.
+ */
+export function foldTraceRows(rows: AgentTraceRow[]): TraceBlock[] {
+  const blocks: TraceBlock[] = [];
+  for (const row of rows) {
+    const line = toTraceLine(row);
+    const last = blocks[blocks.length - 1];
+    if (line.kind === "assistant_text" && last?.kind === "assistant_text") {
+      blocks[blocks.length - 1] = { ...last, text: last.text + line.text };
+      continue;
+    }
+    blocks.push({
+      key: `row-${row.eventId}`,
+      kind: line.kind,
+      text: line.text,
+      isError: line.isError,
+    });
+  }
+  return blocks;
 }
 
 /**

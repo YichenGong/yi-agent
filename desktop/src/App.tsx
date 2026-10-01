@@ -9,15 +9,18 @@ import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ApprovalBanner } from "./components/ApprovalBanner";
 import { ThreadSidebar } from "./components/ThreadSidebar";
 import { SubagentRail } from "./components/SubagentRail";
+import { SubagentTrace } from "./components/SubagentTrace";
 import { TitleBar } from "./components/TitleBar";
 import type {
+  AgentCancelPreviewResult,
   AgentChildrenListResult,
+  AgentTraceSnapshotResult,
   ThreadStatus,
   TurnStatus,
   Workspace,
   WorkspaceGroup,
 } from "./lib/protocol";
-import { SubagentRailStore } from "./lib/subagents";
+import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 
@@ -81,15 +84,16 @@ export default function App() {
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
   const [railCollapsed, setRailCollapsed] = useState(false);
-  // 用户在暂留区点开的子 agent。详情视图由后续任务接入;此刻选择本身可见,
-  // 免得一次点击看起来什么都没发生。
-  const [railSelection, setRailSelection] = useState<{
-    threadId: string;
-    taskId: string;
-  } | null>(null);
-  const openSubagent = railSelection && railSelection.threadId === currentId
-    ? railSelection.taskId
-    : null;
+  // 打开的详情:进入栈 + 该栈顶任务的轨迹行。栈让"子任务再进入"可退回,
+  // 与 TUI 页签同一语义。
+  const [detailStack, setDetailStack] = useState<string[]>([]);
+  const [traceRows, setTraceRows] = useState<AgentTraceSnapshotResult["rows"]>([]);
+  const openSubagent = detailStack.length > 0 ? detailStack[detailStack.length - 1] : null;
+  // 通知回调在 effect 里注册一次,读不到最新的 state,所以当前打开的任务放在 ref。
+  const openTaskId = useRef<string | null>(null);
+  useEffect(() => {
+    openTaskId.current = openSubagent;
+  }, [openSubagent]);
 
   const current = currentId ? store.view(currentId) : null;
 
@@ -123,6 +127,40 @@ export default function App() {
       setWorkspaces(r.workspaces);
     } catch {
       // 最近目录刷新失败不影响当前对话。
+    }
+  };
+
+  /**
+   * 打开某任务的详情:回灌历史,然后开一条流。
+   *
+   * 关闭(或换任务)时先 unwatch 再开新的,任何时刻只有一路流:否则换任务后
+   * 旧任务的 `agent/trace/event` 仍会到达,把两个任务的轨迹混进一个视图。
+   */
+  const openDetail = async (threadId: string, taskId: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    setDetailStack([taskId]);
+    setTraceRows([]);
+    try {
+      const snapshot = await c.request<AgentTraceSnapshotResult>("agent/trace/read", {
+        threadId,
+        taskId,
+      });
+      setTraceRows(snapshot.rows);
+      await c.request("agent/trace/watch", { threadId, taskId });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    }
+  };
+
+  const closeDetail = async (threadId: string) => {
+    setDetailStack([]);
+    setTraceRows([]);
+    try {
+      await clientRef.current?.request("agent/trace/unwatch", { threadId });
+    } catch {
+      // 关闭是本地动作:即使 unwatch 失败也不把详情留在屏幕上。
     }
   };
 
@@ -329,6 +367,14 @@ export default function App() {
         force((v) => v + 1);
         return;
       }
+      if (n.method === "agent/trace/event") {
+        // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
+        // 把两个任务的轨迹拼在一起安全。
+        setTraceRows((prev) =>
+          n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
+        );
+        return;
+      }
       // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
       store.applyNotification(n);
       force((v) => v + 1);
@@ -471,6 +517,38 @@ export default function App() {
             mode={current?.mode ?? null}
             onModeChange={setThreadMode}
           />
+          {currentId && openSubagent && (
+            <SubagentTrace
+              taskId={openSubagent}
+              row={
+                railStore.get(currentId).find((r) => r.taskId === openSubagent) ?? null
+              }
+              children={childrenOf(railStore.get(currentId), openSubagent)}
+              rows={traceRows}
+              onClose={() => void closeDetail(currentId)}
+              onDrill={(taskId) => void openDetail(currentId, taskId)}
+              onMessage={async (taskId, message) => {
+                await clientRef.current?.request("agent/message", {
+                  threadId: currentId,
+                  taskId,
+                  message,
+                });
+              }}
+              onCancel={async (taskId) =>
+                await clientRef.current!.request<AgentCancelPreviewResult>(
+                  "agent/cancel/preview",
+                  { threadId: currentId, taskId },
+                )
+              }
+              onConfirmCancel={async (taskId, token) => {
+                await clientRef.current?.request("agent/cancel", {
+                  threadId: currentId,
+                  taskId,
+                  confirmationToken: token,
+                });
+              }}
+            />
+          )}
           {approval && (
             <ApprovalDialog
               key={approval.id}
@@ -493,10 +571,7 @@ export default function App() {
           <SubagentRail
             rows={railStore.get(currentId)}
             selectedTaskId={openSubagent}
-            onOpen={(taskId) => {
-              // 详情视图由后续任务接入;此刻先把目标 id 交给它,选择本身可见。
-              setRailSelection({ threadId: currentId, taskId });
-            }}
+            onOpen={(taskId) => void openDetail(currentId, taskId)}
             onCollapse={() => setRailCollapsed(true)}
           />
         )}
