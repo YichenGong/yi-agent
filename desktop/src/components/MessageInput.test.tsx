@@ -265,6 +265,30 @@ describe("MessageInput", () => {
       expect(onSend).toHaveBeenCalledWith("/Users/me/src");
     });
 
+    it("keeps a bare-slash Enter inert until the user types or picks a command", () => {
+      // The popup's default highlight is index 0, and the catalog's index 0 is
+      // the destructive `/clear`. A lone "/" names no command, so Enter on the
+      // untouched default must do nothing; an explicit ↑/↓ choice is honoured.
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ onSend, onSlashCommand });
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/" } });
+      expect(screen.getByTestId("slash-popup")).toBeTruthy();
+
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+      // The popup stays open so the user can keep narrowing the list.
+      expect(screen.getByTestId("slash-popup")).toBeTruthy();
+
+      // ↑/↓ is an explicit choice, so Enter then runs it (catalog index 1).
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashCommand).toHaveBeenCalledWith("compact", null);
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
     it("dismisses the popup on Escape while keeping the text", () => {
       renderInput();
       const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;

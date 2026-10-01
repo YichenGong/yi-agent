@@ -108,6 +108,15 @@ export function MessageInput({
             }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
+              // A bare "/" names no command (`parseSlashInput("/")` is
+              // `{ kind: "none" }`), yet the popup is offered for it and its
+              // DEFAULT highlight is index 0 — the destructive `/clear`. A stray
+              // Enter on that untouched default would erase the transcript, so it
+              // is inert until the user either types a name character (kind turns
+              // "command", as for "/cos") or moves the highlight with ↑/↓ (an
+              // explicit choice, which the line below honours). Tab still
+              // completes.
+              if (parsed.kind !== "command" && selected === 0) return;
               // A space closes the popup (name-mode only), so no arguments can
               // be pending here: accepting the highlighted row is exactly what
               // "complete and run" means (`/cos` -> `/cost`). Fully typed
