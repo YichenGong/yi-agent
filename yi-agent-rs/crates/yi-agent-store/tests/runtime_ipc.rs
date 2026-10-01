@@ -5794,3 +5794,56 @@ fn daemon_refuses_an_autonomous_session_in_a_missing_directory() {
         "a missing workdir must be refused, got {response:?}"
     );
 }
+
+#[test]
+fn an_autonomous_session_is_listed_after_a_daemon_restart() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let runtime_dir = directory.path().join("runtime");
+    let worktree = directory.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+
+    let session_id = {
+        let factory = Arc::new(RecordingWorkerFactory);
+        let daemon = Daemon::start_with_factory(runtime_dir.clone(), &database, factory).unwrap();
+        let socket = daemon.socket_path().to_path_buf();
+        let response = send_request(
+            &socket,
+            IpcRequest::CreateAutonomousSession {
+                objective: "implement the plan".into(),
+                workdir: worktree.to_string_lossy().to_string(),
+            },
+        )
+        .unwrap();
+        let IpcResponse::AutonomousSessionCreated { session_id, .. } = response else {
+            panic!("expected a session, got {response:?}");
+        };
+        session_id
+    };
+
+    // Restart against the same database and socket directory.
+    let factory = Arc::new(RecordingWorkerFactory);
+    let daemon = Daemon::start_with_factory(runtime_dir, &database, factory).unwrap();
+    let socket = daemon.socket_path().to_path_buf();
+    let response = send_request(
+        &socket,
+        IpcRequest::ListTaskSummaries {
+            session_id: None,
+            active_only: false,
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskSummaries { tasks } = response else {
+        panic!("expected task summaries, got {response:?}");
+    };
+    // `IpcTaskSummary` carries only task_id/state/is_root, so the durable
+    // survival check is that the session's root task is still listed.
+    assert!(
+        tasks.iter().any(|task| task.is_root),
+        "the autonomous session's root task must survive a restart"
+    );
+    assert!(
+        !session_id.is_empty(),
+        "session id must round-trip out of the first daemon"
+    );
+}
