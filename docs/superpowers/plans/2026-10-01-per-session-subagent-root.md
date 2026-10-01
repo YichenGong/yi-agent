@@ -291,6 +291,24 @@ pub const RESIDENT_SUBAGENTS_DEFAULT: u16 = 64;
         max_resident_subagents: RESIDENT_SUBAGENTS_DEFAULT,
 ```
 
+**同一步必须补齐所有字面量构造点**（新字段会让它们编译失败）。经预检，全仓库共 3 处（各含一次 `RuntimeConfig {` 字面量）：
+
+1. `yi-agent-rs/crates/yi-agent-runtime/src/config.rs:319`（`load` 的返回，已在上文覆盖）；
+2. `yi-agent-rs/crates/yi-agent-runtime/src/config.rs:361`（`sample_config`，本节交付）；
+3. `yi-agent-rs/crates/yi-agent-app-server/src/server.rs:3396`（`test_config`）：
+
+```rust
+            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
+```
+
+4. `yi-agent-rs/crates/yi-agent-subagent/tests/attach_delegation.rs:26`（`config_for`）：
+
+```rust
+        max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
+```
+
+（1 和 2 在 `config.rs` 内，可直接用 `RESIDENT_SUBAGENTS_DEFAULT`；3 和 4 在别的 crate，须走完整路径。若编译报出本清单之外的位置，一并补上同样的默认值。）
+
 - [ ] **Step 4: 加 trait 访问器并在 `open` 中接线**
 
 `yi-agent-rs/crates/yi-agent-core/src/subagent/worker.rs:613` 的 trait，在 `provider_profile_id`（`:621-624`）附近新增：
