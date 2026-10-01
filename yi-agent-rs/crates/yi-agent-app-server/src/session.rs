@@ -65,6 +65,8 @@ pub struct ThreadSession {
     pub active_turn_id: Option<String>,
     /// 该线程的运行时自主权开关(与沙箱、权限层共享同一 `Arc`)。
     pub yolo: yi_agent_core::autonomy::YoloSwitch,
+    /// 该 thread 生效的进程管理器(与它的工具集同行),供 `process/*` 查询。
+    pub process_manager: Arc<yi_agent_tools::ProcessManager>,
     /// 向该 thread 的 driver task 投递 turn。
     pub(crate) prompt_tx: mpsc::Sender<TurnPrompt>,
     /// 请求中断当前 turn(携带目标 turn id,driver 据此丢弃残留信号)。
