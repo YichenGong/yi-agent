@@ -4036,6 +4036,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "yi-agent-board-ui",
  "yi-agent-core",
  "yi-agent-runtime",
  "yi-agent-store",
