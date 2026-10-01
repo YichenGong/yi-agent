@@ -27,7 +27,16 @@ const { clients, state } = vi.hoisted(() => ({
     rejectCode: {} as Record<string, number>,
     // Status reported by `thread/listAll` for every seeded thread.
     listStatus: "idle" as "idle" | "running" | "awaiting_approval",
+    // Paths the native file picker hands back, in order. `null` = cancelled.
+    // Tests push what they need; an empty queue resolves to `null`.
+    picks: [] as (string | null)[],
   },
+}));
+
+// The board panel's enqueue control opens the native picker twice. Stub it at
+// the module boundary the component imports lazily.
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: async () => state.picks.shift() ?? null,
 }));
 
 vi.mock("./lib/rpc", () => ({
@@ -115,6 +124,7 @@ beforeEach(() => {
   state.approvalHandlers.length = 0;
   state.rejectCode = {};
   state.listStatus = "idle";
+  state.picks = [];
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -655,5 +665,56 @@ describe("App Superpowers 看板 collapse", () => {
     render(<App />);
     expect(await screen.findByRole("button", { name: "收起看板" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "展开看板" })).toBeNull();
+  });
+});
+
+describe("App Superpowers 看板 enqueue", () => {
+  const clickEnqueue = () =>
+    fireEvent.click(screen.getByRole("button", { name: "加入看板" }));
+
+  it("sends one enqueue with both picked paths", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "加入看板" });
+
+    state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
+    clickEnqueue();
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "superpowers-kanban/enqueue",
+        params: { spec_path: "/p/a.spec.md", plan_path: "/p/a.plan.md" },
+      }),
+    );
+    expect(
+      clients[0].requests.filter((r) => r.method === "superpowers-kanban/enqueue"),
+    ).toHaveLength(1);
+  });
+
+  it("sends nothing when the picker is cancelled", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "加入看板" });
+
+    state.picks = [null];
+    clickEnqueue();
+
+    await waitFor(() => expect(state.picks).toHaveLength(0));
+    expect(
+      clients[0].requests.filter((r) => r.method === "superpowers-kanban/enqueue"),
+    ).toHaveLength(0);
+  });
+
+  it("surfaces a rejected enqueue instead of crashing", async () => {
+    state.rejectCode["superpowers-kanban/enqueue"] = -32000;
+    render(<App />);
+    await screen.findByRole("button", { name: "加入看板" });
+
+    state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
+    clickEnqueue();
+
+    await waitFor(() => expect(screen.getByText(/forced -32000/)).toBeTruthy());
+    // Still usable after the failure.
+    expect(
+      (screen.getByRole("button", { name: "加入看板" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 });

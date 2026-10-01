@@ -25,9 +25,11 @@ import { formatError } from "./lib/errorMessage";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanCollapsedStrip } from "./components/SuperpowersKanbanCollapsedStrip";
+import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import {
   type BoardCardDto,
   type SwitchSource,
+  enqueueBoardCard,
   fetchBoard,
   readBoardSwitch,
   setBoardSwitch,
@@ -37,11 +39,6 @@ import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermission
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
 
-/**
- * RPC rejections are `RpcError` objects, so `String(e)` would render
- * `[object Object]`. Prefer the `message` field when present, falling back to
- * the default coercion for primitives and other shapes.
- */
 /**
  * Read the persisted permission mode for a thread from the `thread/listAll`
  * groups. `thread/resume`/`thread/start` responses do not carry the mode, so it
@@ -274,6 +271,13 @@ export default function App() {
   const pickDirectory = async (): Promise<string | null> => {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({ directory: true, multiple: false });
+    return typeof picked === "string" ? picked : null;
+  };
+
+  /** 原生选择器选一个文件；取消返回 null。与 pickDirectory 同款动态 import。 */
+  const pickFile = async (): Promise<string | null> => {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({ directory: false, multiple: false });
     return typeof picked === "string" ? picked : null;
   };
 
@@ -621,6 +625,10 @@ export default function App() {
                   });
               }}
               onCollapse={() => setKanbanCollapsed(true)}
+            />
+            <SuperpowersKanbanEnqueue
+              pickFile={pickFile}
+              enqueue={(spec, plan) => enqueueBoardCard(boardRpc, spec, plan)}
             />
             <SuperpowersKanbanView switchOn={boardOn} source={boardSource} cards={boardCards} />
           </div>

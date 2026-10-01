@@ -1,7 +1,10 @@
 /**
  * Turn an unknown thrown value into something a person can read.
  *
- * RPC rejections arrive as `{ code, message }`; anything else is stringified.
+ * RPC rejections are `RpcError` objects, so `String(e)` would render
+ * `[object Object]`. Prefer the `message` field when present, falling back to
+ * the default coercion for primitives and other shapes.
+ *
  * Lives here rather than in `App.tsx` because the board panel's error paths need
  * the same rendering as the rest of the shell.
  */
