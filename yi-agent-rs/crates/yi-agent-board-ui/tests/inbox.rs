@@ -65,3 +65,35 @@ fn reads_prefer_the_new_directory_when_both_exist() {
         dir.path().join(".yi-agent/superpowers-kanban")
     );
 }
+
+/// The migration contract end to end: with only a legacy layout on disk, reads
+/// find the old cards, but a new delivery lands in the new directory and the
+/// legacy files are left untouched.
+#[test]
+fn a_legacy_layout_is_readable_but_new_deliveries_land_in_the_new_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join(".yi-agent/board");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let legacy_board = legacy.join("board.json");
+    std::fs::write(&legacy_board, r#"{"cards":[],"next_order":0}"#).unwrap();
+
+    // Reads fall back to the legacy directory...
+    assert_eq!(board_state_dir_for_read(dir.path()), legacy);
+
+    // ...but writes go to the new one.
+    let write_dir = board_state_dir(dir.path());
+    deliver_card(&write_dir, "card-1", "a.spec.md", "a.plan.md").unwrap();
+    assert_eq!(
+        write_dir,
+        dir.path().join(".yi-agent/superpowers-kanban")
+    );
+    assert!(enqueue_path(&write_dir, "card-1").is_file());
+
+    // The legacy files are neither moved nor modified.
+    assert!(legacy_board.is_file());
+    assert_eq!(
+        std::fs::read_to_string(&legacy_board).unwrap(),
+        r#"{"cards":[],"next_order":0}"#
+    );
+    assert!(!legacy.join("inbox").exists());
+}
