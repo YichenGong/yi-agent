@@ -4051,6 +4051,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "yi-agent-store",
 ]
 
 [[package]]

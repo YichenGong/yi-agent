@@ -10,6 +10,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 # `registry::register` stamps `created_at`; the workspace already pins chrono.
 chrono = { workspace = true }
+# Resolving and probing a project's daemon socket reuses the store's IPC layer.
+yi-agent-store = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]

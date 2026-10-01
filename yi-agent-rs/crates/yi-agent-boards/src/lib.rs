@@ -8,6 +8,7 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
+pub mod board_daemon;
 pub mod registry;
 pub mod scaffold;
 
