@@ -586,7 +586,8 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
 
 /// `board/list`：读插件写出的 `board.json`，映射成可渲染的卡片数组。
 fn board_list(workdir: &Path) -> serde_json::Value {
-    let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
+    // 读路径走 `_for_read`：新目录优先，回退旧目录（迁移期兼容）。
+    let state_dir = yi_agent_board_ui::inbox::board_state_dir_for_read(workdir);
     let cards: Vec<serde_json::Value> = yi_agent_board_ui::state::load_cards(&state_dir)
         .into_iter()
         .map(|card| {

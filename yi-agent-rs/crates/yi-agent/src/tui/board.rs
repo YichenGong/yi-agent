@@ -28,7 +28,8 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
 
     match argument {
         "" => {
-            let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
+            // 读路径走 `_for_read`：新目录优先，回退旧目录（迁移期兼容）。
+            let state_dir = yi_agent_board_ui::inbox::board_state_dir_for_read(workdir);
             let cards = yi_agent_board_ui::state::load_cards(&state_dir);
             let view = yi_agent_board_ui::view::BoardView {
                 switch_on: resolved.value.is_enabled(),

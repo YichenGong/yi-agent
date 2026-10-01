@@ -1,20 +1,22 @@
 use std::path::Path;
 
-use yi_agent_board_ui::inbox::{board_state_dir, deliver_card, enqueue_path, inbox_dir};
+use yi_agent_board_ui::inbox::{
+    board_state_dir, board_state_dir_for_read, deliver_card, enqueue_path, inbox_dir,
+};
 
 #[test]
 fn the_state_dir_sits_beside_the_other_plugin_state() {
     assert_eq!(
         board_state_dir(Path::new("/proj")),
-        Path::new("/proj/.yi-agent/board")
+        Path::new("/proj/.yi-agent/superpowers-kanban")
     );
     assert_eq!(
-        inbox_dir(Path::new("/proj/.yi-agent/board")),
-        Path::new("/proj/.yi-agent/board/inbox")
+        inbox_dir(Path::new("/proj/.yi-agent/superpowers-kanban")),
+        Path::new("/proj/.yi-agent/superpowers-kanban/inbox")
     );
     assert_eq!(
-        enqueue_path(Path::new("/proj/.yi-agent/board"), "card-1"),
-        Path::new("/proj/.yi-agent/board/inbox/card-1.json")
+        enqueue_path(Path::new("/proj/.yi-agent/superpowers-kanban"), "card-1"),
+        Path::new("/proj/.yi-agent/superpowers-kanban/inbox/card-1.json")
     );
 }
 
@@ -41,4 +43,25 @@ fn delivering_is_idempotent_and_leaves_no_temp_file() {
         .collect();
     assert_eq!(entries, vec!["card-1.json".to_string()]);
     assert!(!dir.path().join("inbox/card-1.json.tmp").exists());
+}
+
+#[test]
+fn reads_fall_back_to_the_legacy_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".yi-agent/board")).unwrap();
+    assert_eq!(
+        board_state_dir_for_read(dir.path()),
+        dir.path().join(".yi-agent/board")
+    );
+}
+
+#[test]
+fn reads_prefer_the_new_directory_when_both_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".yi-agent/board")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".yi-agent/superpowers-kanban")).unwrap();
+    assert_eq!(
+        board_state_dir_for_read(dir.path()),
+        dir.path().join(".yi-agent/superpowers-kanban")
+    );
 }
