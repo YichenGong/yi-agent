@@ -4,3 +4,4 @@
 //! （尤其是两层解析顺序与原子写入），而不是各自重写一遍。
 
 pub mod switch;
+pub mod view;
