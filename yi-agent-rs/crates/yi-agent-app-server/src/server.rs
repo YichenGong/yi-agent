@@ -2163,6 +2163,89 @@ where
                         }
                         write_response(&writer, ok_response(id, json!({ "stopped": true }))).await?;
                     }
+                    "process/list" => {
+                        let Some(thread_id) =
+                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing thread_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 未知 thread 返回空表而非错误:切走再切回、thread 已删除
+                        // 都是正常路径,报错只会弹一条无意义的红条。
+                        let processes = threads
+                            .get(&thread_id)
+                            .map(|s| s.process_manager.list())
+                            .unwrap_or_default();
+                        write_response(&writer, ok_response(id, json!({ "processes": processes })))
+                            .await?;
+                    }
+                    "process/read" => {
+                        let Some(thread_id) =
+                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing thread_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(process_id) = req
+                            .params
+                            .get("process_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing process_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(session) = threads.get(&thread_id) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let cursor = req.params.get("cursor").and_then(|v| v.as_u64());
+                        let max_bytes = req
+                            .params
+                            .get("max_bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(64 * 1024) as usize;
+                        match session
+                            .process_manager
+                            .read(yi_agent_tools::ProcessSelector::Id(process_id), cursor, max_bytes)
+                            .await
+                        {
+                            Ok(result) => {
+                                write_response(
+                                    &writer,
+                                    ok_response(
+                                        id,
+                                        serde_json::to_value(result)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    ),
+                                )
+                                .await?
+                            }
+                            Err(message) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::invalid_params(message)),
+                                )
+                                .await?
+                            }
+                        }
+                    }
                     _ => {
                         write_response(&writer, err_response(id, RpcError::method_not_found(&method)))
                             .await?;
@@ -6856,6 +6939,137 @@ mod tests {
             .find(|t| t["thread_id"] == tid.as_str())
             .expect("thread must be listed");
         assert_eq!(listed["status"], "idle");
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn process_list_is_empty_for_a_fresh_thread_and_for_an_unknown_one() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+
+        // 新 thread:没有进程,列表为空(不是错误)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/list","params":{{"thread_id":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["id"], 3);
+        assert!(listed["error"].is_null(), "{listed}");
+        assert_eq!(listed["result"]["processes"].as_array().unwrap().len(), 0);
+
+        // 未知 thread:仍返回空列表而非错误(切走再切回是正常路径)。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"process/list","params":{"thread_id":"thread-nope"}}"#,
+        )
+        .await;
+        let unknown = h.read_value().await;
+        assert_eq!(unknown["id"], 4);
+        assert!(unknown["error"].is_null(), "{unknown}");
+        assert_eq!(unknown["result"]["processes"].as_array().unwrap().len(), 0);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn process_read_reports_an_unknown_process_as_an_error() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"proc_999"}}}}"#
+        ))
+        .await;
+        let bad = h.read_value().await;
+        assert_eq!(bad["id"], 3);
+        assert!(bad["result"].is_null(), "{bad}");
+        assert!(bad["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("process not found"));
+
+        h.shutdown().await;
+    }
+
+    /// 生效的那一份 manager 才被看见:thread 必须采用工厂给出的 manager,而不是
+    /// 自建一份——否则进程面板显示空列表,而 agent 明明能起进程(设计 §4.2 的陷阱)。
+    ///
+    /// 顺带验证 `process/read` 的游标增量语义:两次读不重不漏。
+    #[tokio::test]
+    async fn process_list_and_read_observe_the_managers_the_factory_handed_over() {
+        use std::sync::Arc;
+
+        // 修正:既有 API `ProcessManager::new` 直接返回 `Arc<Self>`,不能再套 `Arc::new`。
+        let held: Arc<yi_agent_tools::ProcessManager> =
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir());
+        let for_factory = Arc::clone(&held);
+
+        let mut h = Harness::with_factory(
+            move |session, cwd, mode| {
+                let mut built = build_test_agent(session, cwd, mode)?;
+                // 这一份才是「生效」的:thread 必须采用它。
+                built.process_manager = Arc::clone(&for_factory);
+                Ok(built)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        let thread_id = start_thread(&mut h).await;
+
+        // ready_pattern 让 start() 等到输出出现才返回,断言因此是确定性的。
+        let started = held
+            .start(yi_agent_tools::ProcessStartOptions {
+                command: "printf alpha".into(),
+                name: Some("t4-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: Some("alpha".into()),
+                ready_timeout_sec: Some(5),
+            })
+            .await
+            .expect("start");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/list","params":{{"thread_id":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["id"], 3);
+        assert!(listed["error"].is_null(), "{listed}");
+        let names: Vec<&str> = listed["result"]["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(names.contains(&"t4-probe"), "thread must see the held manager: {listed}");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{}"}}}}"#,
+            started.process_id
+        ))
+        .await;
+        let first = h.read_value().await;
+        assert_eq!(first["id"], 4);
+        assert!(first["error"].is_null(), "{first}");
+        assert!(
+            first["result"]["stdout"].as_str().unwrap().contains("alpha"),
+            "{first}"
+        );
+        let cursor = first["result"]["next_cursor"].as_u64().unwrap();
+        assert!(cursor > 0, "{first}");
+
+        // 从上一轮游标继续读:没有新输出(不重不漏)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{}","cursor":{cursor}}}}}"#,
+            started.process_id
+        ))
+        .await;
+        let second = h.read_value().await;
+        assert_eq!(second["id"], 5);
+        assert!(second["error"].is_null(), "{second}");
+        assert_eq!(second["result"]["stdout"].as_str().unwrap(), "", "{second}");
+
+        let _ = held.shutdown().await;
         h.shutdown().await;
     }
 }
