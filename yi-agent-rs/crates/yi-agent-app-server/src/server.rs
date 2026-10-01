@@ -237,6 +237,94 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
     }
 }
 
+/// `board/list`：读插件写出的 `board.json`，映射成可渲染的卡片数组。
+fn board_list(workdir: &Path) -> serde_json::Value {
+    let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
+    let cards: Vec<serde_json::Value> = yi_agent_board_ui::state::load_cards(&state_dir)
+        .into_iter()
+        .map(|card| {
+            json!({
+                "id": card.id,
+                "state": card.state,
+                "progress": card.progress,
+                "detail": card.detail,
+            })
+        })
+        .collect();
+    json!({ "cards": cards })
+}
+
+/// `board/enqueue`：把一张卡投递进插件的 inbox。
+fn board_enqueue(
+    workdir: &Path,
+    id: &str,
+    spec: &str,
+    plan: &str,
+) -> Result<serde_json::Value, String> {
+    let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
+    yi_agent_board_ui::inbox::deliver_card(&state_dir, id, spec, plan)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "id": id }))
+}
+
+/// `board/switch/read`：返回两层解析后的开关与来源。
+fn board_switch_read(workdir: &Path) -> serde_json::Value {
+    use yi_agent_board_ui::switch::{
+        SwitchSource, global_path, project_path, read_layer, resolve,
+    };
+    let project = read_layer(&project_path(workdir));
+    let global = global_path().and_then(|path| read_layer(&path));
+    let resolved = resolve(global, project);
+    let source = match resolved.source {
+        SwitchSource::Project => "project",
+        SwitchSource::Global => "global",
+        SwitchSource::Default => "default",
+    };
+    json!({ "on": resolved.value.is_enabled(), "source": source })
+}
+
+/// `board/switch/write`：写项目层开关。
+fn board_switch_write(workdir: &Path, on: bool) -> Result<serde_json::Value, String> {
+    use yi_agent_board_ui::switch::{BoardSwitch, project_path, write_layer};
+    let value = if on {
+        BoardSwitch::Enabled
+    } else {
+        BoardSwitch::Disabled
+    };
+    write_layer(&project_path(workdir), value).map_err(|error| error.to_string())?;
+    Ok(json!({ "on": on }))
+}
+
+/// 由一对路径派生卡片 id（与 TUI 的 `/kanban add` 同规则，保证两端一致）。
+fn derive_card_id(spec: &str, plan: &str) -> String {
+    let stem = |path: &str| {
+        std::path::Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    let slug = |text: &str| {
+        let mut out = String::new();
+        let mut last_dash = false;
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+                last_dash = false;
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+        out.trim_matches('-').to_string()
+    };
+    let id = format!("{}-{}", slug(&stem(spec)), slug(&stem(plan)));
+    if id == "-" || id.is_empty() {
+        "card".to_string()
+    } else {
+        id
+    }
+}
+
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
 ///
 /// `cfg` 同时用于 `config/read` 响应与(每个 thread 的)`bootstrap_agent`。
@@ -441,6 +529,58 @@ where
                     }
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
+                    }
+                    "board/list" => {
+                        write_response(&writer, ok_response(id, board_list(&cfg.workdir))).await?;
+                    }
+                    "board/enqueue" => {
+                        let requested = req
+                            .params
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let spec = req
+                            .params
+                            .get("spec_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let plan = req
+                            .params
+                            .get("plan_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let card_id = if requested.is_empty() {
+                            derive_card_id(spec, plan)
+                        } else {
+                            requested.to_string()
+                        };
+                        match board_enqueue(&cfg.workdir, &card_id, spec, plan) {
+                            Ok(value) => write_response(&writer, ok_response(id, value)).await?,
+                            Err(message) => write_response(
+                                &writer,
+                                err_response(id, RpcError::internal(message)),
+                            )
+                            .await?,
+                        }
+                    }
+                    "board/switch/read" => {
+                        write_response(&writer, ok_response(id, board_switch_read(&cfg.workdir)))
+                            .await?;
+                    }
+                    "board/switch/write" => {
+                        let on = req
+                            .params
+                            .get("on")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        match board_switch_write(&cfg.workdir, on) {
+                            Ok(value) => write_response(&writer, ok_response(id, value)).await?,
+                            Err(message) => write_response(
+                                &writer,
+                                err_response(id, RpcError::internal(message)),
+                            )
+                            .await?,
+                        }
                     }
                     "workspace/list" => {
                         let list: Vec<serde_json::Value> = workspaces
@@ -1758,6 +1898,55 @@ fn extract_prompt(params: &serde_json::Value) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[cfg(test)]
+mod board_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn board_list_reads_cards_from_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = yi_agent_board_ui::inbox::board_state_dir(dir.path());
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            yi_agent_board_ui::state::board_state_path(&state_dir),
+            r#"{"cards":[{"id":"card-1","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"awaiting_merge","enqueued_at":"2026-10-01T09:00:00+08:00","order":0}],"next_order":1}"#,
+        )
+        .unwrap();
+
+        let value = board_list(dir.path());
+        let cards = value["cards"].as_array().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["id"], "card-1");
+        assert_eq!(cards[0]["state"], "awaiting_merge");
+    }
+
+    #[test]
+    fn board_enqueue_writes_a_delivery_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = board_enqueue(dir.path(), "card-1", "a.spec.md", "a.plan.md").unwrap();
+        assert_eq!(value["id"], "card-1");
+        let state_dir = yi_agent_board_ui::inbox::board_state_dir(dir.path());
+        assert!(yi_agent_board_ui::inbox::enqueue_path(&state_dir, "card-1").exists());
+    }
+
+    #[test]
+    fn board_switch_write_then_read_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        board_switch_write(dir.path(), true).unwrap();
+        let value = board_switch_read(dir.path());
+        assert_eq!(value["on"], true);
+        assert_eq!(value["source"], "project");
+    }
+
+    #[test]
+    fn derive_card_id_matches_the_tui_rule() {
+        assert_eq!(
+            derive_card_id("docs/a-feature.spec.md", "docs/a-feature.plan.md"),
+            "a-feature-spec-a-feature-plan"
+        );
     }
 }
 

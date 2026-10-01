@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { formatSwitch, resolveSwitch } from "./boardSwitch";
+import { describe, expect, it, vi } from "vitest";
+import {
+  fetchBoard,
+  formatSwitch,
+  readBoardSwitch,
+  resolveSwitch,
+  setBoardSwitch,
+} from "./boardSwitch";
 
 describe("resolveSwitch", () => {
   it("lets the project layer win over the global layer", () => {
@@ -26,5 +32,34 @@ describe("formatSwitch", () => {
 
   it("says off when disabled", () => {
     expect(formatSwitch(false, "default")).toContain("off");
+  });
+});
+
+describe("board RPC wrappers", () => {
+  type Rpc = Parameters<typeof fetchBoard>[0];
+  const asRpc = (fn: unknown) => fn as unknown as Rpc;
+
+  it("fetchBoard unwraps the cards array", async () => {
+    const rpc = asRpc(vi.fn(async () => ({
+      cards: [{ id: "c1", state: "queued", progress: null, detail: "/w" }],
+    })));
+    const cards = await fetchBoard(rpc);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].id).toBe("c1");
+  });
+
+  it("fetchBoard tolerates a missing cards field", async () => {
+    expect(await fetchBoard(asRpc(vi.fn(async () => ({}))))).toEqual([]);
+  });
+
+  it("readBoardSwitch returns the resolved switch", async () => {
+    const rpc = asRpc(vi.fn(async () => ({ on: true, source: "project" })));
+    expect(await readBoardSwitch(rpc)).toEqual({ on: true, source: "project" });
+  });
+
+  it("setBoardSwitch writes the requested value", async () => {
+    const inner = vi.fn(async () => ({ on: true }));
+    await setBoardSwitch(asRpc(inner), true);
+    expect(inner).toHaveBeenCalledWith("board/switch/write", { on: true });
   });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { RpcClient } from "./lib/rpc";
 import { ThreadStore } from "./lib/threadStore";
 import { tauriTransport } from "./tauriTransport";
@@ -9,6 +9,15 @@ import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ApprovalBanner } from "./components/ApprovalBanner";
 import { ThreadSidebar } from "./components/ThreadSidebar";
 import { TitleBar } from "./components/TitleBar";
+import { BoardView } from "./components/BoardView";
+import { SettingsPanel } from "./components/SettingsPanel";
+import {
+  type BoardCardDto,
+  type SwitchSource,
+  fetchBoard,
+  readBoardSwitch,
+  setBoardSwitch,
+} from "./lib/boardSwitch";
 import type { ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "./lib/protocol";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
@@ -69,6 +78,19 @@ export default function App() {
   const [status, setStatus] = useState<string>("connecting");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [boardOn, setBoardOn] = useState(false);
+  const [boardSource, setBoardSource] = useState<SwitchSource>("default");
+  const [boardCards, setBoardCards] = useState<BoardCardDto[]>([]);
+
+  /** 经 app-server 调 board RPC；未连接时直接失败。 */
+  const boardRpc = useCallback(
+    <T = unknown,>(method: string, params: unknown): Promise<T> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request<T>(method, params);
+    },
+    [],
+  );
 
   const current = currentId ? store.view(currentId) : null;
 
@@ -307,6 +329,23 @@ export default function App() {
       setCurrentError(msg);
       setStatus(`error: ${msg}`);
     });
+    // 看板轮询：读取失败绝不影响主流程。
+    const refreshBoard = async () => {
+      try {
+        const [sw, cards] = await Promise.all([
+          readBoardSwitch(boardRpc),
+          fetchBoard(boardRpc),
+        ]);
+        setBoardOn(sw.on);
+        setBoardSource(sw.source);
+        setBoardCards(cards);
+      } catch {
+        /* 看板读取失败绝不影响主流程 */
+      }
+    };
+    void refreshBoard();
+    const boardTimer = window.setInterval(refreshBoard, 2000);
+    return () => window.clearInterval(boardTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -395,6 +434,23 @@ export default function App() {
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
         />
+        <div className="flex w-72 flex-col border-r border-neutral-800">
+          <SettingsPanel
+            switchOn={boardOn}
+            source={boardSource}
+            onToggle={(next) => {
+              void setBoardSwitch(boardRpc, next)
+                .then(() => {
+                  setBoardOn(next);
+                  setBoardSource("project");
+                })
+                .catch(() => {
+                  /* 写失败保持原状，下一轮轮询会纠正 */
+                });
+            }}
+          />
+          <BoardView switchOn={boardOn} source={boardSource} cards={boardCards} />
+        </div>
         <div className="relative flex min-w-0 flex-1 flex-col">
           <ApprovalBanner
             items={bannerItems}
