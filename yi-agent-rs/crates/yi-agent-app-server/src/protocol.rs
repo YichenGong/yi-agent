@@ -204,6 +204,11 @@ pub struct AgentChild {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_step: Option<String>,
+    /// The task's parent, absent for a top-level child. Lets a client walk the
+    /// tree it was handed without a second request, so the detail's drill-down
+    /// lists exactly the task's own children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
 }
 
 /// 一条轨迹行,原样透传 daemon 的 `IpcTraceRow`。

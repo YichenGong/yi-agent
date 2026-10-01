@@ -370,6 +370,7 @@ fn children_for_thread(
             objective: None,
             state: task.state.clone(),
             last_step: None,
+            parent_task_id: task.parent_task_id.clone(),
         })
         .collect()
 }
@@ -2939,6 +2940,7 @@ mod tests {
                 objective: Some("do the thing".into()),
                 state: "running".into(),
                 last_step: Some("running tests".into()),
+                parent_task_id: Some("root".into()),
             }],
         };
         let json = serde_json::to_value(&children).unwrap();
