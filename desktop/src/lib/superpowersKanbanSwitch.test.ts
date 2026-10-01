@@ -102,9 +102,12 @@ describe("board RPC wrappers", () => {
 
 describe("pluginIsUnavailable", () => {
   it("recognises the daemon refusing a plugin it does not supervise", () => {
+    // Verbatim shape the daemon produces: NotFound + this message line.
     expect(
       pluginIsUnavailable(
-        new Error("daemon rejected the request: the plugin superpowers-kanban is not running"),
+        new Error(
+          "the plugin rejected the query: NotFound plugin superpowers-kanban is not available",
+        ),
       ),
     ).toBe(true);
   });

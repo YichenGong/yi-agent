@@ -139,15 +139,15 @@
 - Delete: `yi-agent-rs/crates/yi-agent-board-ui/`
 - Modify: 两处 `Cargo.toml`（去掉依赖）、工作区 `Cargo.toml`
 
-- [ ] **Step 1: TUI 改经 daemon → 插件取状态、投递、读写开关**
-- [ ] **Step 2: 删除 crate 与依赖**
-- [ ] **Step 3: 编译期验收**
+- [x] **Step 1: TUI 改经 daemon → 插件取状态、投递、读写开关**
+- [x] **Step 2: 删除 crate 与依赖**
+- [x] **Step 3: 编译期验收**
 
 Run: `grep -rn "yi_agent_board_ui\|yi-agent-board-ui" yi-agent-rs/ --include=*.rs --include=*.toml`
 Expected: 空
 
-- [ ] **Step 4: 全量回归**（主工作区 60 套件 + 插件 + 桌面端）
-- [ ] **Step 5: Commit**
+- [x] **Step 4: 全量回归**（主工作区 60 套件 + 插件 + 桌面端）
+- [x] **Step 5: Commit**
 
 ---
 

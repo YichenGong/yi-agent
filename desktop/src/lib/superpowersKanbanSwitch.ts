@@ -57,7 +57,10 @@ async function queryPlugin<T>(
  */
 export function pluginIsUnavailable(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error ?? "");
-  return text.includes("PluginUnavailable") || text.includes("is not running");
+  // The daemon answers `plugin <name> is not available` when it does not
+  // supervise the plugin (or the plugin never declared a query socket). The
+  // structured code is kept as a second signal in case the wording changes.
+  return text.includes("is not available") || text.includes("PluginUnavailable");
 }
 
 /** 经插件读看板卡片。 */
