@@ -694,18 +694,22 @@ impl RuntimeCoordinator {
         Ok(session_id)
     }
 
-    /// Creates an autonomous root session bound to `workdir` and starts its
-    /// worker. The directory must already exist and be a git worktree; the
-    /// runtime observes it and never creates it.
+    /// Creates a new autonomous root session bound to `workdir` and starts its
+    /// worker. Every call creates a *new* session and root task; this method does
+    /// not de-duplicate, so a caller that must not start the same objective twice
+    /// de-duplicates on its own key before calling.
     ///
-    /// Idempotency lives one level down (`start_worker` refuses a task that
-    /// already owns a worker), so a repeated call for the same session is safe
-    /// but a repeated call creates a *new* session — callers de-duplicate on
-    /// their own key.
+    /// The directory must already exist: it is observed, never created. Only the
+    /// "exists" requirement is checked here; the "is a git worktree" requirement
+    /// is enforced one level down, where the bound workdir is resolved by the
+    /// workspace service at worker start.
+    ///
+    /// The only idempotency on this path is inside `start_worker`, which refuses
+    /// to start a second worker for a root task that already owns one.
     pub async fn create_autonomous_session(
         &self,
         objective: String,
-        workdir: std::path::PathBuf,
+        workdir: PathBuf,
     ) -> Result<AutonomousSession, RuntimeCoordinatorError> {
         if objective.trim().is_empty() {
             return Err(RuntimeCoordinatorError::Supervisor(
@@ -725,7 +729,7 @@ impl RuntimeCoordinator {
             let handle = self.supervisor(&session_id)?;
             let mut supervisor = handle.lock().await;
             supervisor
-                .set_workdir(&root_task_id, workdir.clone())
+                .set_workdir(&root_task_id, workdir)
                 .map_err(RuntimeCoordinatorError::Supervisor)?;
         }
         self.start_worker(&session_id, &root_task_id).await?;

@@ -4067,7 +4067,19 @@ async fn an_autonomous_session_runs_in_the_given_worktree() {
     let database = directory.path().join("runtime.sqlite");
     let worktree = directory.path().join("worktree");
     std::fs::create_dir(&worktree).unwrap();
-    let factory = Arc::new(MessageRecordingFactory::default());
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(StaticWorkspaceService {
+            workspace: WorkerWorkspace {
+                lease_id: WorkspaceLeaseId::new(),
+                repository_root: worktree.clone(),
+                path: worktree.clone(),
+                branch: String::new(),
+                parent_branch: String::new(),
+                base_commit: String::new(),
+            },
+        })),
+        ..Default::default()
+    });
     let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
 
     let session = coordinator
@@ -4085,6 +4097,13 @@ async fn an_autonomous_session_runs_in_the_given_worktree() {
         .find(|start| start.task_id == session.root_task_id)
         .expect("the root worker must have been started");
     assert_eq!(root_start.root_session_id, session.session_id);
+    // The bound workdir reaches the worker: the workspace the runtime assigned is
+    // the directory handed to `create_autonomous_session`, not some other path.
+    assert_eq!(
+        root_start.workspace.as_ref().map(|assigned| &assigned.path),
+        Some(&worktree),
+        "the worker must run in the workdir it was given"
+    );
 }
 
 #[tokio::test]
@@ -4106,6 +4125,38 @@ async fn an_autonomous_session_rejects_a_missing_directory() {
     assert!(
         message.contains("does not exist") || message.contains("not inside a git worktree"),
         "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn an_autonomous_session_refuses_a_workdir_that_is_not_a_git_worktree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let workdir = directory.path().join("not-a-worktree");
+    std::fs::create_dir(&workdir).unwrap();
+    // `TMPDIR` sits inside this repository, so a bare directory here would be
+    // read as part of it. A gitfile pointing at a missing gitdir makes the
+    // directory exist while git refuses to see a worktree at it.
+    std::fs::write(workdir.join(".git"), "gitdir: /nonexistent/yi-agent-test\n").unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(workdir.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let error = coordinator
+        .create_autonomous_session("implement the plan".into(), workdir)
+        .await
+        .unwrap_err();
+
+    // The refusal comes from the git check, not from a silent in-place run.
+    assert!(
+        error.to_string().contains("not a git repository"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        factory.starts.lock().unwrap().is_empty(),
+        "no worker may start in a directory that is not a git worktree"
     );
 }
 
