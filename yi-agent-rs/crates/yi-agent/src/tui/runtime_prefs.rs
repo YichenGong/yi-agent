@@ -64,15 +64,26 @@ pub fn load(workdir: &Path) -> RuntimePreference {
 ///
 /// Mirrors `yi-agent-core/src/permission.rs` (`permissions.toml`), where rename
 /// within one filesystem is atomic — a crash cannot leave a half-written file.
+///
+/// The write is a **read-modify-write**: `preferences.json` is shared with other
+/// writers (notably the Superpowers board switch, which stores
+/// `superpowers_board`), so saving the runtime preference must preserve every
+/// unrelated key instead of replacing the file with a single-key object.
 pub fn save(workdir: &Path, pref: RuntimePreference) -> std::io::Result<()> {
     let dir = workdir.join(".yi-agent");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("preferences.json");
-    let body = PreferencesFile {
-        subagent_runtime: pref,
+    let mut object = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        Err(_) => serde_json::Map::new(),
     };
-    let text = serde_json::to_string_pretty(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let value = serde_json::to_value(pref).map_err(std::io::Error::other)?;
+    object.insert("subagent_runtime".to_string(), value);
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
     let tmp_path = dir.join("preferences.json.tmp");
     std::fs::write(&tmp_path, &text)?;
     std::fs::rename(&tmp_path, &path)
@@ -130,5 +141,37 @@ mod tests {
         save(dir.path(), RuntimePreference::Never).unwrap();
         assert!(dir.path().join(".yi-agent/preferences.json").exists());
         assert!(!dir.path().join(".yi-agent/preferences.json.tmp").exists());
+    }
+
+    #[test]
+    fn saving_the_runtime_preference_preserves_unrelated_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            r#"{"superpowers_board":true}"#,
+        )
+        .unwrap();
+        save(dir.path(), RuntimePreference::Never).unwrap();
+        let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["subagent_runtime"], "never");
+        assert_eq!(
+            value["superpowers_board"], true,
+            "saving the runtime preference must not drop the board switch"
+        );
+    }
+
+    #[test]
+    fn saving_over_a_corrupt_file_replaces_it_with_a_valid_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(preferences_path(dir.path()), "{ not json").unwrap();
+        save(dir.path(), RuntimePreference::Always).unwrap();
+        assert_eq!(
+            load(dir.path()),
+            RuntimePreference::Always,
+            "a corrupt file must not block the save"
+        );
     }
 }

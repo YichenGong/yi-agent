@@ -36,6 +36,7 @@ pub enum SlashCommand {
     Daemon,
     Mcp,
     Runtime,
+    Kanban,
 }
 
 impl SlashCommand {
@@ -68,7 +69,8 @@ impl SlashCommand {
             | Self::Cost
             | Self::Compact
             | Self::Config
-            | Self::Runtime => {
+            | Self::Runtime
+            | Self::Kanban => {
                 return None;
             }
         };
@@ -109,6 +111,7 @@ impl SlashCommand {
             SlashCommand::Daemon => "daemon",
             SlashCommand::Mcp => "mcp",
             SlashCommand::Runtime => "runtime",
+            SlashCommand::Kanban => "kanban",
         }
     }
 
@@ -146,6 +149,7 @@ impl SlashCommand {
             SlashCommand::Daemon => "管理本地 runtime daemon",
             SlashCommand::Mcp => "管理 MCP server 开关",
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
+            SlashCommand::Kanban => "Superpowers 看板：查看状态与开关",
         }
     }
 
@@ -164,6 +168,7 @@ impl SlashCommand {
             SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => Some("<task-id>"),
             SlashCommand::Priority => Some("<task-id> <level>"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
+            SlashCommand::Kanban => Some("[on|off|add <spec> <plan>]"),
             SlashCommand::Approve => Some("<request-id> [once|task]"),
             SlashCommand::Deny => Some("<request-id>"),
             SlashCommand::Review => Some("<task-id>"),
@@ -211,6 +216,7 @@ impl SlashCommand {
             SlashCommand::Daemon,
             SlashCommand::Mcp,
             SlashCommand::Runtime,
+            SlashCommand::Kanban,
         ]
     }
 
@@ -637,5 +643,17 @@ mod tests {
             render_mcp_status(true, &[("fs".into(), true), ("gh".into(), false)]),
             "MCP master: on\n  fs: on\n  gh: off\n"
         );
+    }
+
+    #[test]
+    fn kanban_is_a_known_slash_command_with_a_description() {
+        let command = SlashCommand::Kanban;
+        assert_eq!(command.name(), "kanban");
+        assert!(
+            command.description().contains("Superpowers 看板"),
+            "{}",
+            command.description()
+        );
+        assert!(SlashCommand::all().contains(&SlashCommand::Kanban));
     }
 }

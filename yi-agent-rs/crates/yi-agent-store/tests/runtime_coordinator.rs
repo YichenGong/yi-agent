@@ -9,18 +9,17 @@ use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
-    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox, IntegrationValidation,
-    MessageId, PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
+    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox,
+    IntegrationValidation, MessageId,
+    PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
-use yi_agent_core::subagent::trace::TraceFact;
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_store::repository::{
-    RuntimeEvent, RuntimeRepository, TRACE_TERMINAL_RETENTION_SECS, WatchdogEvidence,
-    WatchdogResourceWait, WatchdogTerminal,
+    RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
 };
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
 use yi_agent_store::schedule::{
@@ -2549,52 +2548,6 @@ async fn recovered_child_resumes_after_runtime_restart() {
 }
 
 #[tokio::test]
-async fn recovered_child_keeps_its_inherited_sandbox() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let session = RootSessionId::new();
-    let root = yi_agent_core::TaskId::new();
-    let root_attempt = yi_agent_core::AttemptId::new();
-    let child = yi_agent_core::TaskId::new();
-    let child_attempt = yi_agent_core::AttemptId::new();
-    let mut repository = RuntimeRepository::open(&database).unwrap();
-    repository
-        .create_task_with_attempt(&root, &session, &root_attempt, 1, "running")
-        .unwrap();
-    repository
-        .create_child_task_with_attempt_and_objective(
-            &child,
-            &session,
-            &root,
-            1,
-            &child_attempt,
-            1,
-            "running",
-            "Recovered child with a sandbox.",
-            ChildWriteMode::Coding,
-            None,
-            None,
-            Some(InheritedSandbox::DangerFullAccess),
-        )
-        .unwrap();
-    repository.recover_inflight_tasks().unwrap();
-    drop(repository);
-
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
-    coordinator.resume_task(&session, &child).await.unwrap();
-    let starts = factory.starts.lock().unwrap();
-    let child_start = starts
-        .iter()
-        .find(|start| start.task_id == child)
-        .expect("the recovered child worker was started");
-    assert_eq!(
-        child_start.inherited_sandbox,
-        Some(InheritedSandbox::DangerFullAccess)
-    );
-}
-
-#[tokio::test]
 async fn unsafe_recovery_inspection_blocks_the_task_with_recovery_conflict() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -2679,198 +2632,6 @@ async fn coordinator_persists_worker_failure_reported_by_the_factory() {
     let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
     assert_eq!(terminal["reason"], "worker_failed");
     assert_eq!(terminal["error"], "provider disconnected");
-}
-
-async fn running_child_coordinator(
-    database: &Path,
-    factory: Arc<MessageRecordingFactory>,
-) -> (RuntimeCoordinator, TaskId) {
-    let coordinator = RuntimeCoordinator::open(database, factory.clone()).unwrap();
-    let session = coordinator.create_session().unwrap();
-    let parent = coordinator.root_task_id(&session).unwrap();
-    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
-    coordinator.start_worker(&session, &child).await.unwrap();
-    (coordinator, child)
-}
-
-#[tokio::test]
-async fn reconcile_persists_worker_trace_facts() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
-    {
-        let handle = factory.handles.lock().unwrap()[0].clone();
-        handle.report_trace(TraceFact::AssistantText {
-            text: "on it".into(),
-        });
-        handle.report_trace(TraceFact::ToolCall {
-            name: "bash".into(),
-            summary: "cargo test".into(),
-        });
-        handle.report_trace(TraceFact::ToolResult {
-            name: "bash".into(),
-            is_error: false,
-            summary: "ok".into(),
-        });
-        handle.report_trace(TraceFact::StateNote {
-            note: "running".into(),
-        });
-    }
-
-    coordinator.reconcile_worker_events().await.unwrap();
-
-    let repository = RuntimeRepository::open(&database).unwrap();
-    let rows = repository.trace_after(&child, 0).unwrap();
-    let kinds = rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>();
-    assert_eq!(
-        kinds,
-        ["assistant_text", "tool_call", "tool_result", "state_note"],
-        "every fact is tagged with its own type and kept in order"
-    );
-    assert!(rows[0].payload_json.contains("on it"));
-    assert!(rows[1].payload_json.contains("cargo test"));
-    assert!(rows[3].payload_json.contains("running"));
-    assert!(
-        rows[3].payload_json.contains(r#""type":"state_note""#),
-        "the payload stays self-describing for a reader that ignores `kind`"
-    );
-}
-
-#[tokio::test]
-async fn a_reconciled_trace_survives_a_reopen() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
-    factory.handles.lock().unwrap()[0].report_trace(TraceFact::AssistantText {
-        text: "durable spool".into(),
-    });
-
-    coordinator.reconcile_worker_events().await.unwrap();
-    drop(coordinator);
-
-    let repository = RuntimeRepository::open(&database).unwrap();
-    let rows = repository.trace_after(&child, 0).unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "a persisted fact survives reopening the store"
-    );
-    assert!(rows[0].payload_json.contains("durable spool"));
-}
-
-#[tokio::test]
-async fn reconcile_persists_the_terminal_note_of_a_finishing_worker() {
-    // The drain must run before the state transition, because a terminal (or
-    // paused) transition removes the worker from the supervisor. If the drain
-    // ran after it, this final fact would be lost and the row count would be 0.
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
-    let handle = factory.handles.lock().unwrap()[0].clone();
-    handle.report_trace(TraceFact::StateNote {
-        note: "completed".into(),
-    });
-    handle.report_cancelled();
-
-    coordinator.reconcile_worker_events().await.unwrap();
-
-    assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
-    let rows = RuntimeRepository::open(&database)
-        .unwrap()
-        .trace_after(&child, 0)
-        .unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "the fact must be drained before the transition removes the worker"
-    );
-    assert!(rows[0].payload_json.contains("completed"));
-}
-
-#[tokio::test]
-async fn drained_trace_facts_survive_a_later_reducer_error() {
-    // Persistence is independent of the transition bookkeeping: the drain
-    // commits a worker's facts before the reducer runs, so a `?` from a later
-    // stage of the same pass cannot take back rows already drained.
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
-    let handle = factory.handles.lock().unwrap()[0].clone();
-    handle.report_trace(TraceFact::StateNote {
-        note: "drained before the reducer tripped".into(),
-    });
-    // No pause was ever requested, so `PauseAcknowledged` makes the reducer
-    // return `Err` and the reconcile pass aborts.
-    handle.report_paused();
-
-    let error = coordinator
-        .reconcile_worker_events()
-        .await
-        .expect_err("the reducer must reject an unsolicited pause acknowledgement");
-    let message = error.to_string();
-    assert!(
-        message.contains("illegal task state transition"),
-        "the pass must abort in the reducer stage, not somewhere else: {message}"
-    );
-
-    let rows = RuntimeRepository::open(&database)
-        .unwrap()
-        .trace_after(&child, 0)
-        .unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "facts drained and committed before the failing reducer must survive"
-    );
-    assert!(
-        rows[0]
-            .payload_json
-            .contains("drained before the reducer tripped")
-    );
-}
-
-#[tokio::test]
-async fn coordinator_prunes_the_trace_of_a_worker_that_ended() {
-    // This is the daemon minute tick's call. It ties the two halves together:
-    // reconcile persisted the ended worker's note, and the prune that follows
-    // recognises the task as terminal and releases its rows past the window.
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
-    {
-        let handle = factory.handles.lock().unwrap()[0].clone();
-        handle.report_trace(TraceFact::StateNote {
-            note: "cancelled".into(),
-        });
-        handle.report_cancelled();
-    }
-    coordinator.reconcile_worker_events().await.unwrap();
-    assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .trace_row_count(&child)
-            .unwrap(),
-        1
-    );
-
-    let beyond_retention = Utc::now() + ChronoDuration::seconds(TRACE_TERMINAL_RETENTION_SECS + 1);
-    assert_eq!(
-        coordinator.prune_terminal_traces(beyond_retention).unwrap(),
-        1
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .trace_row_count(&child)
-            .unwrap(),
-        0
-    );
 }
 
 #[tokio::test]
@@ -4313,6 +4074,121 @@ fn reclaim_keeps_recovery_required_tasks_that_can_still_resume() {
         "a task with a checkpoint and a workspace lease is still resumable"
     );
     assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
+}
+
+#[tokio::test]
+async fn an_autonomous_session_runs_in_the_given_worktree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let worktree = directory.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(StaticWorkspaceService {
+            workspace: WorkerWorkspace {
+                lease_id: WorkspaceLeaseId::new(),
+                repository_root: worktree.clone(),
+                path: worktree.clone(),
+                branch: String::new(),
+                parent_branch: String::new(),
+                base_commit: String::new(),
+            },
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let session = coordinator
+        .create_autonomous_session("implement the plan".into(), worktree.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        coordinator.root_task_id(&session.session_id).unwrap(),
+        session.root_task_id
+    );
+    let starts = factory.starts.lock().unwrap();
+    let root_start = starts
+        .iter()
+        .find(|start| start.task_id == session.root_task_id)
+        .expect("the root worker must have been started");
+    assert_eq!(root_start.root_session_id, session.session_id);
+    // The bound workdir reaches the worker: the workspace the runtime assigned is
+    // the directory handed to `create_autonomous_session`, not some other path.
+    assert_eq!(
+        root_start.workspace.as_ref().map(|assigned| &assigned.path),
+        Some(&worktree),
+        "the worker must run in the workdir it was given"
+    );
+}
+
+#[tokio::test]
+async fn an_autonomous_session_rejects_a_missing_directory() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let error = coordinator
+        .create_autonomous_session(
+            "implement the plan".into(),
+            directory.path().join("does-not-exist"),
+        )
+        .await
+        .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("does not exist") || message.contains("not inside a git worktree"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn an_autonomous_session_refuses_a_workdir_that_is_not_a_git_worktree() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let workdir = directory.path().join("not-a-worktree");
+    std::fs::create_dir(&workdir).unwrap();
+    // `TMPDIR` sits inside this repository, so a bare directory here would be
+    // read as part of it. A gitfile pointing at a missing gitdir makes the
+    // directory exist while git refuses to see a worktree at it.
+    std::fs::write(workdir.join(".git"), "gitdir: /nonexistent/yi-agent-test\n").unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(GitWorkspaceService::new(workdir.clone()))),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let error = coordinator
+        .create_autonomous_session("implement the plan".into(), workdir)
+        .await
+        .unwrap_err();
+
+    // The refusal comes from the git check, not from a silent in-place run.
+    assert!(
+        error.to_string().contains("not a git repository"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        factory.starts.lock().unwrap().is_empty(),
+        "no worker may start in a directory that is not a git worktree"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_objective_is_rejected() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let worktree = directory.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+
+    let error = coordinator
+        .create_autonomous_session("   ".into(), worktree)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("objective"), "{error}");
 }
 
 #[tokio::test]

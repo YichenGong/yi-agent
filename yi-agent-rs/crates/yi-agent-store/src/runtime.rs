@@ -43,6 +43,14 @@ use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 
 const REVIEW_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 
+/// A root session created to run a single objective autonomously in its own
+/// worktree. Generic on purpose: nothing here knows what the objective is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomousSession {
+    pub session_id: RootSessionId,
+    pub root_task_id: TaskId,
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
     #[error(transparent)]
@@ -715,6 +723,51 @@ impl RuntimeCoordinator {
             .expect("runtime supervisor mutex poisoned")
             .insert(session_id.clone(), Arc::new(AsyncMutex::new(supervisor)));
         Ok(session_id)
+    }
+
+    /// Creates a new autonomous root session bound to `workdir` and starts its
+    /// worker. Every call creates a *new* session and root task; this method does
+    /// not de-duplicate, so a caller that must not start the same objective twice
+    /// de-duplicates on its own key before calling.
+    ///
+    /// The directory must already exist: it is observed, never created. Only the
+    /// "exists" requirement is checked here; the "is a git worktree" requirement
+    /// is enforced one level down, where the bound workdir is resolved by the
+    /// workspace service at worker start.
+    ///
+    /// The only idempotency on this path is inside `start_worker`, which refuses
+    /// to start a second worker for a root task that already owns one.
+    pub async fn create_autonomous_session(
+        &self,
+        objective: String,
+        workdir: PathBuf,
+    ) -> Result<AutonomousSession, RuntimeCoordinatorError> {
+        if objective.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "autonomous session objective must not be empty".into(),
+            ));
+        }
+        if !workdir.is_dir() {
+            return Err(RuntimeCoordinatorError::Supervisor(format!(
+                "workdir does not exist: {}",
+                workdir.display()
+            )));
+        }
+        let session_id =
+            self.create_session_with_objective_and_mode(objective, ChildWriteMode::Coding, None)?;
+        let root_task_id = self.root_task_id(&session_id)?;
+        {
+            let handle = self.supervisor(&session_id)?;
+            let mut supervisor = handle.lock().await;
+            supervisor
+                .set_workdir(&root_task_id, workdir)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+        }
+        self.start_worker(&session_id, &root_task_id).await?;
+        Ok(AutonomousSession {
+            session_id,
+            root_task_id,
+        })
     }
 
     // This synchronous guard serializes the durable idempotency check and root

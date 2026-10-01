@@ -1,0 +1,23 @@
+# Superpowers 看板 — 时段并发上限（任务级）。
+# 命中第一个匹配的 window；无命中用 default_max_tasks。
+default_max_tasks = 3
+
+# 工作日白天：工作日 09:00–24:00 限流（≈800 req/h），最多 3 个任务并发。
+[[window]]
+days = "Mon-Fri"
+start = "09:00"
+end = "24:00"
+max_tasks = 3
+
+# 工作日凌晨：不限流，最多 10 个任务并发。
+[[window]]
+days = "Mon-Fri"
+start = "00:00"
+end = "09:00"
+max_tasks = 10
+
+# 周末全天：不限流，最多 10 个任务并发。
+[[window]]
+days = "Sat,Sun"
+all_day = true
+max_tasks = 10
