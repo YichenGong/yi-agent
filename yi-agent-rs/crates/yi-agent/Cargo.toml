@@ -21,6 +21,7 @@ yi-agent-web = { workspace = true }
 yi-agent-runtime = { workspace = true }
 yi-agent-app-server = { workspace = true }
 yi-agent-subagent = { workspace = true }
+yi-agent-board-ui = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }

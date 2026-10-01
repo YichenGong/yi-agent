@@ -1947,6 +1947,13 @@ fn execute_slash_command(
             history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
+        SlashCommand::Kanban => {
+            let outcome = crate::tui::board::handle_kanban(workdir, args.as_deref().unwrap_or(""));
+            for line in outcome.lines {
+                history.push(HistoryCell::Separator { label: Some(line) }, width);
+            }
+            KeyOutcome::None
+        }
         SlashCommand::Mcp => {
             match parse_mcp_args(args.as_deref().unwrap_or("")) {
                 Ok(McpAction::Status) => {

@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod bash_popup;
+pub mod board;
 pub mod cell;
 pub mod cost;
 pub mod history;
