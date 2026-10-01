@@ -277,6 +277,8 @@ pub struct AgentBootstrap {
     /// re-deriving a tool set of their own, which would drop the skills and
     /// MCP wiring only this constructor knows about.
     pub tools: Arc<yi_agent_core::ToolRegistry>,
+    /// 本次装配的进程管理器;与 `tools` 里的进程工具是同一份。
+    pub process_manager: Arc<yi_agent_tools::ProcessManager>,
     /// 交互模式下由调用方(CLI / app-server)用它回传权限决定;
     /// AutoAllow 模式下为 `None`(通道已关闭,黑名单命令解析为 Deny)。
     pub decision_tx: Option<tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>>,
@@ -331,6 +333,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
     let provider_handle = Arc::clone(&provider);
     let tools = Arc::clone(&setup.tools);
     let catalog = setup.catalog;
+    let process_manager = Arc::clone(&setup.process_manager);
     match mode {
         PermissionMode::Interactive => {
             let agent = yi_agent_core::Agent::new(provider, setup.tools, agent_config)
@@ -340,6 +343,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 permission: checker,
                 provider: provider_handle,
                 tools,
+                process_manager: Arc::clone(&process_manager),
                 catalog,
                 decision_tx: Some(decision_tx),
                 decision_rx: Some(rx_arc),
@@ -358,6 +362,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 permission: checker,
                 provider: provider_handle,
                 tools,
+                process_manager: Arc::clone(&process_manager),
                 catalog,
                 decision_tx: None,
                 decision_rx: None,
@@ -568,6 +573,64 @@ mod tests {
             Arc::strong_count(&built.provider) >= 2,
             "the exposed provider must be the instance the agent runs on"
         );
+    }
+
+    #[test]
+    fn agent_bootstrap_exposes_the_process_manager() {
+        let mut cfg = sample_config();
+        // TempDir 必须绑到具名变量(同 Task 1):匿名的临时值在本行末即被 drop,
+        // 目录随之删除,manager 以 workdir 为根时会在 canonicalize 上失败。
+        let tmp = tempfile::TempDir::new().unwrap();
+        cfg.workdir = tmp.path().to_path_buf();
+        let boot = bootstrap_agent(&cfg, PermissionMode::AutoAllow).expect("bootstrap");
+        // 与 AgentBootstrap.tools 同理:调用方重建 agent 时要能沿用同一份
+        // manager,否则进程列表会跟实际生效的工具集脱钩。
+        assert!(boot.tools.get("process_start").is_some());
+        assert_eq!(boot.process_manager.list().len(), 0);
+    }
+
+    /// Pins the invariant the test above only *names*, at the `AgentBootstrap`
+    /// layer: the manager exposed as `boot.process_manager` must be the very
+    /// same `Arc` the returned registry's `process_start` tool drives. The test
+    /// above starts nothing and merely lists the exposed manager, so it stays
+    /// green even if `bootstrap_agent` handed back a *second, independent*
+    /// manager while registering the tools against the real one — precisely the
+    /// forbidden refactor (a fresh manager also lists zero processes). Here the
+    /// probe is started *through the registry's own tool* and must then be
+    /// visible via `boot.process_manager.list()`; that can only hold while both
+    /// hold one manager.
+    #[test]
+    fn agent_bootstrap_process_start_tool_shares_the_returned_manager() {
+        let mut cfg = sample_config();
+        // Same fixture rule as the test above: a *named* `TempDir` must outlive
+        // the test, because the manager canonicalizes this root on `start`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        cfg.workdir = tmp.path().to_path_buf();
+        let boot = bootstrap_agent(&cfg, PermissionMode::AutoAllow).expect("bootstrap");
+
+        let tool = boot.tools.get("process_start").expect("registered");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(tool.call(serde_json::json!({
+            "command": "sleep 30",
+            "name": "t2-arc-probe",
+        })));
+        assert!(
+            !result.is_error,
+            "process_start through the registry failed: {:?}",
+            result.content
+        );
+        // The registry tool started the process in *its* manager; finding it
+        // here proves that manager is the one `AgentBootstrap` returned.
+        assert!(
+            boot.process_manager
+                .list()
+                .iter()
+                .any(|p| p.name.as_deref() == Some("t2-arc-probe")),
+            "the manager on AgentBootstrap is not the one backing the registry's process_start"
+        );
+        // Teardown on the SAME runtime (the reader/waiter tasks live on it):
+        // `on_exit` defaults to Kill, so `shutdown()` reaps the `sleep 30`.
+        let _ = rt.block_on(boot.process_manager.shutdown());
     }
 
     #[test]
