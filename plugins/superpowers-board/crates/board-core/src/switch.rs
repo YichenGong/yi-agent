@@ -28,17 +28,19 @@ pub fn resolve(global: Option<SwitchValue>, project: Option<SwitchValue>) -> Boa
     }
 }
 
-/// 从 `preferences.json` 文本里读出 `superpowers_board` 键。
+/// 从 `preferences.json` 文本里读出开关键：优先 `superpowers_kanban`，
+/// 回退旧键 `superpowers_board`（迁移期兼容）。
 ///
 /// 文件损坏、缺键或类型不对一律返回 `None`（调用方视作"该层未设置"），绝不 panic。
 /// 其他键（如 `subagent_runtime`）被忽略，因此可以安全读取现有偏好文件。
 pub fn parse_switch_json(text: &str) -> Option<SwitchValue> {
     #[derive(Deserialize)]
     struct Preferences {
+        superpowers_kanban: Option<bool>,
         superpowers_board: Option<bool>,
     }
     let parsed: Preferences = serde_json::from_str(text).ok()?;
-    match parsed.superpowers_board? {
+    match parsed.superpowers_kanban.or(parsed.superpowers_board)? {
         true => Some(SwitchValue::Enabled),
         false => Some(SwitchValue::Disabled),
     }
@@ -47,6 +49,22 @@ pub fn parse_switch_json(text: &str) -> Option<SwitchValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_legacy_key_when_the_new_one_is_absent() {
+        assert_eq!(
+            parse_switch_json(r#"{"superpowers_board": true}"#),
+            Some(SwitchValue::Enabled)
+        );
+    }
+
+    #[test]
+    fn the_new_key_wins_over_the_legacy_one() {
+        assert_eq!(
+            parse_switch_json(r#"{"superpowers_board": true, "superpowers_kanban": false}"#),
+            Some(SwitchValue::Disabled)
+        );
+    }
 
     #[test]
     fn the_project_layer_overrides_the_global_layer() {

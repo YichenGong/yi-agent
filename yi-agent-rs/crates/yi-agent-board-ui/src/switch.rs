@@ -53,7 +53,8 @@ pub fn read_layer(path: &Path) -> Option<BoardSwitch> {
             return None;
         }
     };
-    match value.get("superpowers_board").and_then(Value::as_bool) {
+    let key = |name: &str| value.get(name).and_then(Value::as_bool);
+    match key("superpowers_kanban").or_else(|| key("superpowers_board")) {
         Some(true) => Some(BoardSwitch::Enabled),
         Some(false) => Some(BoardSwitch::Disabled),
         None => None,
@@ -91,7 +92,7 @@ pub fn write_layer(path: &Path, value: BoardSwitch) -> std::io::Result<()> {
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     object.insert(
-        "superpowers_board".to_string(),
+        "superpowers_kanban".to_string(),
         Value::Bool(value.is_enabled()),
     );
     let body =
@@ -151,7 +152,40 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["subagent_runtime"], "always");
-        assert_eq!(value["superpowers_board"], true);
+        assert_eq!(value["superpowers_kanban"], true);
+    }
+
+    #[test]
+    fn reads_the_legacy_switch_key_when_the_new_one_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, r#"{"superpowers_board":true}"#).unwrap();
+        assert_eq!(read_layer(&path), Some(BoardSwitch::Enabled));
+    }
+
+    #[test]
+    fn the_new_key_wins_over_the_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(
+            &path,
+            r#"{"superpowers_board":true,"superpowers_kanban":false}"#,
+        )
+        .unwrap();
+        assert_eq!(read_layer(&path), Some(BoardSwitch::Disabled));
+    }
+
+    #[test]
+    fn writes_only_the_new_key_and_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, r#"{"subagent_runtime":"always"}"#).unwrap();
+        write_layer(&path, BoardSwitch::Enabled).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["superpowers_kanban"], true);
+        assert_eq!(value["subagent_runtime"], "always");
+        assert!(value.get("superpowers_board").is_none());
     }
 
     #[test]
@@ -193,7 +227,7 @@ mod tests {
         write_layer(&path, BoardSwitch::Disabled).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["superpowers_board"], false);
+        assert_eq!(value["superpowers_kanban"], false);
         assert_eq!(read_layer(&path), Some(BoardSwitch::Disabled));
     }
 
