@@ -168,7 +168,7 @@ impl SlashCommand {
             SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => Some("<task-id>"),
             SlashCommand::Priority => Some("<task-id> <level>"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
-            SlashCommand::Kanban => Some("[on|off|run]"),
+            SlashCommand::Kanban => Some("[on|off|add <spec> <plan>]"),
             SlashCommand::Approve => Some("<request-id> [once|task]"),
             SlashCommand::Deny => Some("<request-id>"),
             SlashCommand::Review => Some("<task-id>"),

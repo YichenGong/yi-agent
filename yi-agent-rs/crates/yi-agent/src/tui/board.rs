@@ -28,13 +28,12 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
 
     match argument {
         "" => {
+            let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
+            let cards = yi_agent_board_ui::state::load_cards(&state_dir);
             let view = yi_agent_board_ui::view::BoardView {
                 switch_on: resolved.value.is_enabled(),
                 switch_source: source,
-                // The card list is supplied by the plugin process (Plan 3a);
-                // this first version renders the switch state and the empty
-                // state without inventing rows.
-                cards: Vec::new(),
+                cards,
             };
             let mut lines = vec![view.header()];
             lines.extend(view.render_lines());
@@ -88,8 +87,32 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
                 }
             }
         }
+        _ if argument.starts_with("add ") || argument == "add" => {
+            let mut parts = argument.split_whitespace();
+            let _verb = parts.next();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(spec), Some(plan), None) => {
+                    let state_dir = yi_agent_board_ui::inbox::board_state_dir(workdir);
+                    let id = card_id_for(spec, plan);
+                    match yi_agent_board_ui::inbox::deliver_card(&state_dir, &id, spec, plan) {
+                        Ok(()) => KanbanOutcome {
+                            lines: vec![format!("Superpowers 看板: delivered {id} to inbox")],
+                            toggled_to: None,
+                        },
+                        Err(error) => KanbanOutcome {
+                            lines: vec![format!("Superpowers 看板: could not deliver: {error}")],
+                            toggled_to: None,
+                        },
+                    }
+                }
+                _ => KanbanOutcome {
+                    lines: vec!["usage: /kanban add <spec> <plan>".to_string()],
+                    toggled_to: None,
+                },
+            }
+        }
         _ => KanbanOutcome {
-            lines: vec!["usage: /kanban [on|off|run]".to_string()],
+            lines: vec!["usage: /kanban [on|off|run|add <spec> <plan>]".to_string()],
             toggled_to: None,
         },
     }
@@ -152,6 +175,66 @@ mod tests {
     }
 
     #[test]
+    fn the_board_shows_cards_read_from_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // 开板才能看到卡片（关闭时只渲染「已禁用」）。
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent/preferences.json"),
+            r#"{"superpowers_board":true}"#,
+        )
+        .unwrap();
+        let state_dir = yi_agent_board_ui::inbox::board_state_dir(dir.path());
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            yi_agent_board_ui::state::board_state_path(&state_dir),
+            r#"{"cards":[{"id":"card-1","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"running","enqueued_at":"2026-10-01T09:00:00+08:00","order":0}],"next_order":1}"#,
+        )
+        .unwrap();
+
+        let outcome = handle_kanban(dir.path(), "");
+        assert!(
+            outcome.lines.iter().any(|line| line.contains("card-1")),
+            "the live card should be rendered, got {:?}",
+            outcome.lines
+        );
+        assert!(
+            outcome.lines.iter().any(|line| line.contains("running")),
+            "the card state should be visible, got {:?}",
+            outcome.lines
+        );
+    }
+
+    #[test]
+    fn add_delivers_a_card_to_the_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = handle_kanban(dir.path(), "add a.spec.md a.plan.md");
+        assert_eq!(outcome.toggled_to, None);
+        assert!(
+            outcome.lines[0].contains("inbox") || outcome.lines[0].contains("投递"),
+            "expected a delivery acknowledgement, got {:?}",
+            outcome.lines
+        );
+        let state_dir = yi_agent_board_ui::inbox::board_state_dir(dir.path());
+        let entries: Vec<_> = std::fs::read_dir(yi_agent_board_ui::inbox::inbox_dir(&state_dir))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one delivery file is written");
+    }
+
+    #[test]
+    fn add_with_missing_paths_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = handle_kanban(dir.path(), "add only-one-arg");
+        assert!(
+            outcome.lines[0].contains("usage"),
+            "expected a usage line, got {:?}",
+            outcome.lines
+        );
+    }
+
+    #[test]
     fn a_disabled_board_refuses_to_run_and_says_where_the_switch_is() {
         let dir = tempfile::tempdir().unwrap();
         let outcome = handle_kanban(dir.path(), "run");
@@ -179,5 +262,35 @@ mod tests {
             Some(yi_agent_board_ui::switch::BoardSwitch::Enabled),
             "a runtime-pref save must not clobber the board switch in preferences.json"
         );
+    }
+}
+
+/// 由一对路径派生卡片 id：取两文件名主干，非字母数字折叠为 `-`。
+fn card_id_for(spec: &str, plan: &str) -> String {
+    let stem = |path: &str| {
+        std::path::Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    let slug = |text: &str| {
+        let mut out = String::new();
+        let mut last_dash = false;
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+                last_dash = false;
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+        out.trim_matches('-').to_string()
+    };
+    let id = format!("{}-{}", slug(&stem(spec)), slug(&stem(plan)));
+    if id == "-" || id.is_empty() {
+        "card".to_string()
+    } else {
+        id
     }
 }
