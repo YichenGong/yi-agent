@@ -15,7 +15,63 @@ use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, 
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 12;
+const LATEST_SCHEMA_VERSION: i64 = 13;
+
+/// Hard ceiling on the trace rows a single task may retain. A worker's trace is
+/// observation data, not history: it must stay bounded no matter how long the
+/// task runs, so `append_trace` trims the oldest rows in the same transaction
+/// that inserts the newest.
+pub const TRACE_MAX_ROWS_PER_TASK: usize = 2000;
+
+/// How long a terminal task's trace survives before `prune_terminal_traces`
+/// may drop it. One day is long enough for a supervisor to read the tail of a
+/// finished worker and short enough that abandoned pass-through rows do not
+/// accumulate for the life of the installation.
+pub const TRACE_TERMINAL_RETENTION_SECS: i64 = 86_400;
+
+/// The persisted `tasks.state_json` values that mean "this task will never
+/// move again".
+///
+/// `yi_agent_core::subagent::task::TaskState::is_terminal` is the same notion,
+/// but it takes the typed enum, and this layer only ever holds the serialized
+/// state string. Rather than re-derive the enum just to ask one question, the
+/// names are listed here once and pinned by
+/// `prune_treats_only_terminal_states_as_finished`.
+///
+/// `RecoveryRequired` is included on purpose: it is a holding pen for explicit
+/// resume, not a live task, and `TaskState::is_terminal` agrees.
+///
+/// The two other persisted spellings of that state belong here too. Runtime
+/// hydration folds `recovery_gated` and `recovery_attested` into
+/// `TaskState::RecoveryRequired` (`runtime.rs:3410`), so a task parked at either
+/// one is terminal for the same reason `recovery_required` is.
+/// `recovery_gated` is written by `activate_successor_attempt` and
+/// `recovery_attested` by `attest_recovery_gate`. Leaving them out made those
+/// rows permanently uncollectable — the exact unbounded growth the retention
+/// window exists to stop — so the behaviour is pinned by
+/// `tasks_parked_in_recovery_states_have_their_traces_pruned`.
+const TERMINAL_TASK_STATES: [&str; 11] = [
+    "completed",
+    "completed_no_changes",
+    "blocked",
+    "stalled",
+    "timed_out",
+    "budget_exhausted",
+    "failed",
+    "cancelled",
+    "recovery_required",
+    "recovery_gated",
+    "recovery_attested",
+];
+
+/// A single persisted row of a task's observation trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTraceRow {
+    pub id: i64,
+    pub task_id: TaskId,
+    pub kind: String,
+    pub payload_json: String,
+}
 
 /// Grace period before a task with no application-root attachment at all is
 /// treated as unowned. An application root writes its attachment before it
@@ -298,6 +354,12 @@ pub struct PersistedTaskSummary {
     pub task_id: String,
     pub state: String,
     pub is_root: bool,
+    /// The task's parent, absent for a root task. Lets a reader rebuild the
+    /// task tree without a second query.
+    pub parent_task_id: Option<String>,
+    /// The conversation this task belongs to, when it was tagged with one.
+    /// Lets a reader scope tasks to a conversation without a second query.
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +468,14 @@ impl RuntimeRepository {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// A read-only handle on the underlying connection so migration tests can
+    /// assert on the schema itself, without going through a read API that the
+    /// migration under test has not added yet.
+    #[cfg(test)]
+    pub(crate) fn connection_for_test(&self) -> &Connection {
+        &self.connection
     }
 
     /// Persists a validated schedule without coupling it to an interactive
@@ -984,6 +1054,9 @@ impl RuntimeRepository {
             // read-only child go through `create_child_task_with_attempt_and_objective`.
             ChildWriteMode::Coding,
             None,
+            // No conversation marker and no inherited sandbox: this legacy
+            // wrapper predates both.
+            None,
             None,
         )
     }
@@ -1001,13 +1074,14 @@ impl RuntimeRepository {
         objective: &str,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        thread_id: Option<&str>,
         inherited_sandbox: Option<InheritedSandbox>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, inherited_sandbox)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, thread_id, inherited_sandbox)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -1018,6 +1092,7 @@ impl RuntimeRepository {
                 delivery_json,
                 workspace_mode.as_str(),
                 model,
+                thread_id,
                 inherited_sandbox.map(|value| value.as_str()),
             ],
         )?;
@@ -3038,6 +3113,180 @@ impl RuntimeRepository {
         }))
     }
 
+    /// Appends one observation row for a task.
+    ///
+    /// The write is trimmed to [`TRACE_MAX_ROWS_PER_TASK`] inside the same
+    /// transaction that inserts the row, so a reader can never observe a trace
+    /// that is over the ceiling. `kind` and `payload_json` are the caller's own
+    /// vocabulary: the store does not interpret the payload, which is what lets
+    /// the trace evolve without a schema migration.
+    pub fn append_trace(
+        &mut self,
+        task: &TaskId,
+        kind: &str,
+        payload_json: &str,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO task_trace_events (task_id, kind, payload_json) VALUES (?1, ?2, ?3)",
+            params![task.to_string(), kind, payload_json],
+        )?;
+        trim_trace_rows(&transaction, task)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every retained row after `after_id`, oldest first. `after_id = 0` reads
+    /// the whole trace; a reader resuming from [`Self::trace_high_water`] reads
+    /// only what it has not seen.
+    pub fn trace_after(
+        &self,
+        task: &TaskId,
+        after_id: i64,
+    ) -> Result<Vec<PersistedTraceRow>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, kind, payload_json FROM task_trace_events
+             WHERE task_id = ?1 AND id > ?2 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![task.to_string(), after_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        rows.into_iter()
+            .map(|(id, task_id, kind, payload_json)| {
+                let task_id = task_id.parse().map_err(|_| RepositoryError::TaskNotFound {
+                    task: task_id.clone(),
+                })?;
+                Ok(PersistedTraceRow {
+                    id,
+                    task_id,
+                    kind,
+                    payload_json,
+                })
+            })
+            .collect()
+    }
+
+    /// The largest trace id this task has produced, or `0` when it has none.
+    /// Ids are allocated by SQLite and never reused, so this is exactly the
+    /// cursor a reader stores to resume without gaps or duplicates.
+    pub fn trace_high_water(&self, task: &TaskId) -> Result<i64, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM task_trace_events WHERE task_id = ?1",
+            params![task.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// How many trace rows this task currently retains.
+    pub fn trace_row_count(&self, task: &TaskId) -> Result<i64, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM task_trace_events WHERE task_id = ?1",
+            params![task.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Re-applies [`TRACE_MAX_ROWS_PER_TASK`] to a trace that already exists.
+    ///
+    /// [`Self::append_trace`] already trims on every write; this is the
+    /// maintenance entry point for callers that must bound a trace without
+    /// adding a row of their own.
+    pub fn trim_trace(&mut self, task: &TaskId) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        trim_trace_rows(&transaction, task)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Deletes the trace rows of terminal tasks whose rows are older than
+    /// [`TRACE_TERMINAL_RETENTION_SECS`], and returns how many rows went away.
+    ///
+    /// Only *terminal* tasks are eligible. A live task keeps every row it has,
+    /// however old: those rows are the head of the sequence a reader replays,
+    /// and dropping them would silently truncate an in-flight worker's trace.
+    /// Rows of a terminal task that are still inside the window also survive,
+    /// so a supervisor has a full day to read how the task ended.
+    pub fn prune_terminal_traces(&mut self, now: DateTime<Utc>) -> Result<usize, RepositoryError> {
+        let placeholders = (1..=TERMINAL_TASK_STATES.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cutoff = TERMINAL_TASK_STATES.len() + 1;
+        let sql = format!(
+            "DELETE FROM task_trace_events
+             WHERE task_id IN (SELECT id FROM tasks WHERE state_json IN ({placeholders}))
+               AND created_at < ?{cutoff}"
+        );
+        let mut values: Vec<String> = TERMINAL_TASK_STATES
+            .iter()
+            .map(|state| (*state).to_string())
+            .collect();
+        // `CURRENT_TIMESTAMP` writes 'YYYY-MM-DD HH:MM:SS' in UTC, so the cutoff
+        // is rendered the same way: comparing a different format would make the
+        // order of two same-day instants depend on the separator character.
+        values.push(
+            (now - chrono::Duration::seconds(TRACE_TERMINAL_RETENTION_SECS))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        );
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(&sql, rusqlite::params_from_iter(values))?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    /// Binds a task to the desktop conversation (`thread`) that owns it.
+    ///
+    /// The link is metadata: it deliberately does not touch `updated_at`, which
+    /// is the idle clock orphan reclamation reads. Binding a thread to an
+    /// abandoned task must not make it look freshly alive.
+    pub fn set_task_thread_id(
+        &mut self,
+        task: &TaskId,
+        thread_id: &str,
+    ) -> Result<(), RepositoryError> {
+        let changed = self.connection.execute(
+            "UPDATE tasks SET thread_id = ?1 WHERE id = ?2",
+            params![thread_id, task.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TaskNotFound {
+                task: task.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The conversation bound to a task, or `None` for a task that has never
+    /// been bound. A task that does not exist is an error, not `None`.
+    pub fn task_thread_id(&self, task: &TaskId) -> Result<Option<String>, RepositoryError> {
+        let row: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT thread_id FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        row.ok_or_else(|| RepositoryError::TaskNotFound {
+            task: task.to_string(),
+        })
+    }
+
     pub fn active_attempt_id(&self, task: &TaskId) -> Result<AttemptId, RepositoryError> {
         let value = self
             .connection
@@ -3716,22 +3965,22 @@ impl RuntimeRepository {
     ) -> Result<Vec<PersistedTaskSummary>, RepositoryError> {
         let (sql, parameters): (&str, Vec<String>) = match (root_session_id, active_only) {
             (Some(session), false) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks
                  WHERE root_session_id = ?1 ORDER BY created_at, id",
                 vec![session.to_string()],
             ),
             (None, true) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks
                  WHERE state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
                  ORDER BY created_at, id",
                 Vec::new(),
             ),
             (None, false) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks ORDER BY created_at, id",
+                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks ORDER BY created_at, id",
                 Vec::new(),
             ),
             (Some(session), true) => (
-                "SELECT id, state_json, parent_id IS NULL FROM tasks
+                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks
                  WHERE root_session_id = ?1
                    AND state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
                  ORDER BY created_at, id",
@@ -3745,6 +3994,8 @@ impl RuntimeRepository {
                     task_id: row.get(0)?,
                     state: row.get(1)?,
                     is_root: row.get(2)?,
+                    parent_task_id: row.get(3)?,
+                    thread_id: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -4166,6 +4417,26 @@ fn validate_recovery_context(context: &WorkerRecoveryContext) -> Result<(), Repo
     Ok(())
 }
 
+/// Deletes a task's oldest trace rows until it retains at most
+/// [`TRACE_MAX_ROWS_PER_TASK`].
+///
+/// `id` is the insertion order (`AUTOINCREMENT`), so the 2000th newest id is the
+/// watermark: everything strictly below it is the tail the ceiling drops. When
+/// the trace is at or under the ceiling the inner query lands on the oldest
+/// retained row (or nothing), and nothing is deleted. The caller owns the
+/// transaction so the trim and the insert it belongs to commit together.
+fn trim_trace_rows(transaction: &Transaction<'_>, task: &TaskId) -> Result<(), RepositoryError> {
+    transaction.execute(
+        "DELETE FROM task_trace_events
+         WHERE task_id = ?1 AND id < (
+             SELECT id FROM task_trace_events WHERE task_id = ?1
+             ORDER BY id DESC LIMIT 1 OFFSET ?2
+         )",
+        params![task.to_string(), TRACE_MAX_ROWS_PER_TASK as i64 - 1],
+    )?;
+    Ok(())
+}
+
 fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
@@ -4471,6 +4742,39 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
         transaction.commit()?;
     }
+
+    // v13 rather than a widened v12: a database that already recorded v12 for
+    // the inherited sandbox would never re-run v12, so folding the trace table
+    // into it would leave those installations without `task_trace_events`.
+    if current_version < 13 {
+        let transaction = connection.unchecked_transaction()?;
+        // A worker's trace lives apart from the audit `events` table: it is
+        // high-volume, prunable observation data, not durable history.
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_trace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS task_trace_task_id_idx ON task_trace_events(task_id, id);",
+        )?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // Null means the task belongs to no desktop conversation, which is
+            // every task that predates this column.
+            transaction.execute_batch("ALTER TABLE tasks ADD COLUMN thread_id TEXT;")?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -4492,4 +4796,403 @@ mod runtime_event_tests {
 
     #[test]
     fn recycle_events_round_trip_through_name_and_parse() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_thirteen_adds_the_trace_table_and_thread_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        let repository = RuntimeRepository::open(&path).unwrap();
+
+        let connection = repository.connection_for_test();
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_trace_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
+
+        let has_thread_id: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_thread_id);
+        assert_eq!(LATEST_SCHEMA_VERSION, 13);
+    }
+
+    #[test]
+    fn a_version_twelve_database_gains_the_trace_table_and_thread_id() {
+        // The fresh-open test above never exercises the upgrade an existing
+        // install performs, so roll a database back to exactly the v12 shape
+        // and reopen it. v12 is the shape a store already has once the
+        // inherited-sandbox migration has run, which is exactly the case that
+        // would break if the trace table had been folded into v12.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_trace_events;
+                 ALTER TABLE tasks DROP COLUMN thread_id;
+                 DELETE FROM schema_migrations WHERE version = 13;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 13);
+        let connection = repository.connection_for_test();
+        assert!(
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_trace_events')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "a v12 database must gain the trace table"
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "a v12 database must gain tasks.thread_id"
+        );
+    }
+
+    #[test]
+    fn a_version_eleven_database_gains_both_later_migrations() {
+        // Renumbering the trace work to v13 must not strand a v11 database: it
+        // has neither the sandbox column nor the trace, so one open has to run
+        // both migrations in order.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_trace_events;
+                 ALTER TABLE tasks DROP COLUMN thread_id;
+                 ALTER TABLE tasks DROP COLUMN inherited_sandbox;
+                 DELETE FROM schema_migrations WHERE version IN (12, 13);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 13);
+        let connection = repository.connection_for_test();
+        for (probe, what) in [
+            (
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_trace_events')",
+                "the trace table",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'thread_id')",
+                "tasks.thread_id",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'inherited_sandbox')",
+                "tasks.inherited_sandbox",
+            ),
+        ] {
+            assert!(
+                connection
+                    .query_row(probe, [], |row| row.get::<_, bool>(0))
+                    .unwrap(),
+                "a v11 database must gain {what}"
+            );
+        }
+    }
+
+    /// Builds a `running` root task through the production insert path, so the
+    /// trace tests start from a row that really exists.
+    fn seed_running_task(repository: &mut RuntimeRepository) -> (RootSessionId, TaskId, AttemptId) {
+        let session = RootSessionId::new();
+        let task = TaskId::new();
+        let attempt = AttemptId::new();
+        repository
+            .create_task_with_attempt(&task, &session, &attempt, 1, "running")
+            .unwrap();
+        (session, task, attempt)
+    }
+
+    #[test]
+    fn trace_rows_are_trimmed_to_the_per_task_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let (_session, task, _attempt) = seed_running_task(&mut repository);
+
+        for index in 0..(TRACE_MAX_ROWS_PER_TASK + 5) {
+            repository
+                .append_trace(
+                    &task,
+                    "state_note",
+                    &format!(r#"{{"note":"step {index}"}}"#),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            repository.trace_row_count(&task).unwrap(),
+            TRACE_MAX_ROWS_PER_TASK as i64
+        );
+        let rows = repository.trace_after(&task, 0).unwrap();
+        assert_eq!(rows.len(), TRACE_MAX_ROWS_PER_TASK);
+        // The newest rows survive; the oldest are gone.
+        assert_eq!(rows.first().unwrap().payload_json, r#"{"note":"step 5"}"#);
+        assert_eq!(
+            rows.last().unwrap().payload_json,
+            format!(r#"{{"note":"step {}"}}"#, TRACE_MAX_ROWS_PER_TASK + 4)
+        );
+        assert_eq!(
+            repository.trace_high_water(&task).unwrap(),
+            rows.last().unwrap().id
+        );
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "rows must come back in id order: {ids:?}"
+        );
+
+        // Reading from the high-water mark yields nothing, because a reader
+        // already owns every row up to that id.
+        assert!(
+            repository
+                .trace_after(&task, repository.trace_high_water(&task).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+
+        // `trim_trace` is idempotent: a trace at the ceiling is already trimmed.
+        repository.trim_trace(&task).unwrap();
+        assert_eq!(
+            repository.trace_row_count(&task).unwrap(),
+            TRACE_MAX_ROWS_PER_TASK as i64
+        );
+    }
+
+    #[test]
+    fn trim_trace_enforces_the_ceiling_on_an_existing_trace() {
+        // `append_trace` already trims on every write, so this pins the
+        // maintenance entry point against a trace that is over the ceiling for
+        // some other reason.
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let (_session, task, _attempt) = seed_running_task(&mut repository);
+        {
+            let connection = repository.connection_for_test();
+            for index in 0..(TRACE_MAX_ROWS_PER_TASK + 5) {
+                connection
+                    .execute(
+                        "INSERT INTO task_trace_events (task_id, kind, payload_json)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            task.to_string(),
+                            "state_note",
+                            format!(r#"{{"note":"step {index}"}}"#)
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            repository.trace_row_count(&task).unwrap(),
+            (TRACE_MAX_ROWS_PER_TASK + 5) as i64
+        );
+
+        repository.trim_trace(&task).unwrap();
+
+        assert_eq!(
+            repository.trace_row_count(&task).unwrap(),
+            TRACE_MAX_ROWS_PER_TASK as i64
+        );
+        let rows = repository.trace_after(&task, 0).unwrap();
+        assert_eq!(rows.first().unwrap().payload_json, r#"{"note":"step 5"}"#);
+    }
+
+    #[test]
+    fn terminal_traces_are_pruned_after_the_retention_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let (_session, task, _attempt) = seed_running_task(&mut repository);
+        repository
+            .append_trace(&task, "state_note", r#"{"note":"done"}"#)
+            .unwrap();
+        repository
+            .transition_task(&task, "completed_no_changes", RuntimeEvent::TaskCompleted)
+            .unwrap();
+
+        let removed = repository
+            .prune_terminal_traces(
+                Utc::now() + chrono::Duration::seconds(TRACE_TERMINAL_RETENTION_SECS + 1),
+            )
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(repository.trace_row_count(&task).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_treats_only_terminal_states_as_finished() {
+        // The retention window is cleanup for finished work. A task that is
+        // still live keeps its rows no matter how old they are, because they
+        // are the head of the sequence a reader replays.
+        let terminal = [
+            "completed",
+            "completed_no_changes",
+            "blocked",
+            "stalled",
+            "timed_out",
+            "budget_exhausted",
+            "failed",
+            "cancelled",
+            "recovery_required",
+            // Terminal spellings of the same held state: hydration folds these
+            // into `TaskState::RecoveryRequired`, which is terminal.
+            "recovery_gated",
+            "recovery_attested",
+        ];
+        let live = [
+            "running",
+            "queued",
+            "paused",
+            // A delivery waiting on its parent is resting, not finished: its
+            // trace is exactly what the reviewer needs to read.
+            "awaiting_parent_review",
+        ];
+        // Pin the production set itself, so drift in either direction — a state
+        // quietly added, or one quietly dropped — fails here rather than in the
+        // field, where the symptom would be a truncated or uncollectable trace.
+        assert_eq!(TERMINAL_TASK_STATES, terminal);
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let session = RootSessionId::new();
+        let mut tasks = Vec::new();
+        for state in terminal.iter().chain(live.iter()) {
+            let task = TaskId::new();
+            let attempt = AttemptId::new();
+            repository
+                .create_task_with_attempt(&task, &session, &attempt, 1, state)
+                .unwrap();
+            repository
+                .append_trace(&task, "state_note", r#"{"note":"old"}"#)
+                .unwrap();
+            tasks.push((state, task));
+        }
+
+        let removed = repository
+            .prune_terminal_traces(
+                Utc::now() + chrono::Duration::seconds(TRACE_TERMINAL_RETENTION_SECS * 400),
+            )
+            .unwrap();
+        assert_eq!(removed, terminal.len());
+        for (state, task) in tasks {
+            let expected = if terminal.contains(state) { 0 } else { 1 };
+            assert_eq!(
+                repository.trace_row_count(&task).unwrap(),
+                expected,
+                "state {state} kept the wrong number of trace rows"
+            );
+        }
+    }
+
+    /// The pin above compares the constant against a hand-written list, so it
+    /// can only catch a name the author also forgot here. This test asks the
+    /// database instead: the retention window must actually delete the trace
+    /// rows of a task parked in each recovery state. That is the property the
+    /// constant exists to serve, and it is the one that catches an omission.
+    #[test]
+    fn tasks_parked_in_recovery_states_have_their_traces_pruned() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let session = RootSessionId::new();
+
+        // `recovery_gated` and `recovery_attested` are written by production
+        // paths (`activate_successor_attempt`, `attest_recovery_gate`), so the
+        // rows below are shapes the store really persists.
+        let mut gated = None;
+        let mut attested = None;
+        for state in ["recovery_gated", "recovery_attested"] {
+            let task = TaskId::new();
+            let attempt = AttemptId::new();
+            repository
+                .create_task_with_attempt(&task, &session, &attempt, 1, state)
+                .unwrap();
+            repository
+                .append_trace(&task, "state_note", r#"{"note":"parked"}"#)
+                .unwrap();
+            if state == "recovery_gated" {
+                gated = Some(task);
+            } else {
+                attested = Some(task);
+            }
+        }
+        let gated = gated.unwrap();
+        let attested = attested.unwrap();
+
+        // A task parked in recovery is terminal, so past the window its rows go.
+        let removed = repository
+            .prune_terminal_traces(
+                Utc::now() + chrono::Duration::seconds(TRACE_TERMINAL_RETENTION_SECS + 1),
+            )
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(repository.trace_row_count(&gated).unwrap(), 0);
+        assert_eq!(repository.trace_row_count(&attested).unwrap(), 0);
+    }
+
+    #[test]
+    fn task_thread_id_round_trips_and_unknown_tasks_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let (_session, task, _attempt) = seed_running_task(&mut repository);
+
+        // The column is additive: a task created today starts with no desktop
+        // conversation bound to it.
+        assert_eq!(repository.task_thread_id(&task).unwrap(), None);
+
+        repository.set_task_thread_id(&task, "thread-42").unwrap();
+        assert_eq!(
+            repository.task_thread_id(&task).unwrap().as_deref(),
+            Some("thread-42")
+        );
+
+        // Re-binding updates the existing row instead of inserting a second one.
+        repository.set_task_thread_id(&task, "thread-43").unwrap();
+        assert_eq!(
+            repository.task_thread_id(&task).unwrap().as_deref(),
+            Some("thread-43")
+        );
+
+        let unknown = TaskId::new();
+        assert!(matches!(
+            repository.set_task_thread_id(&unknown, "thread-44"),
+            Err(RepositoryError::TaskNotFound { .. })
+        ));
+        assert!(matches!(
+            repository.task_thread_id(&unknown),
+            Err(RepositoryError::TaskNotFound { .. })
+        ));
+    }
 }

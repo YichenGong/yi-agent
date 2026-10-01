@@ -16,6 +16,7 @@ use super::task::{
     AttemptId, ChildWriteMode, DeliveryReport, InheritedSandbox, MessageId, RootSessionId, TaskId,
     WorkspaceLeaseId,
 };
+use super::trace::TraceFact;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerWorkspace {
@@ -244,6 +245,7 @@ pub struct WorkerHandle {
     pause_updates: watch::Sender<bool>,
     events: Arc<Mutex<Vec<WorkerEvent>>>,
     watchdog_events: Arc<Mutex<Vec<WorkerWatchdogEvent>>>,
+    trace_events: Arc<Mutex<Vec<TraceFact>>>,
     messages: Arc<Mutex<VecDeque<WorkerMessage>>>,
     message_updates: watch::Sender<u64>,
 }
@@ -347,6 +349,7 @@ impl WorkerHandle {
             pause_updates,
             events: Arc::new(Mutex::new(Vec::new())),
             watchdog_events: Arc::new(Mutex::new(Vec::new())),
+            trace_events: Arc::new(Mutex::new(Vec::new())),
             messages: Arc::new(Mutex::new(VecDeque::new())),
             message_updates,
         }
@@ -436,6 +439,15 @@ impl WorkerHandle {
         self.report_watchdog(WorkerWatchdogEvent::MeaningfulProgress);
     }
 
+    /// Buffers one trace fact for the supervisor to drain. This is an in-memory
+    /// hand-off: persistence belongs to the coordinator, not the worker.
+    pub fn report_trace(&self, fact: TraceFact) {
+        self.trace_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(fact);
+    }
+
     pub fn take_events(&self) -> Vec<WorkerEvent> {
         std::mem::take(
             &mut *self
@@ -449,6 +461,16 @@ impl WorkerHandle {
         std::mem::take(
             &mut *self
                 .watchdog_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// Drains buffered trace facts, leaving the buffer empty.
+    pub fn take_trace_events(&self) -> Vec<TraceFact> {
+        std::mem::take(
+            &mut *self
+                .trace_events
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )

@@ -8,8 +8,19 @@ import { StatusBar } from "./components/StatusBar";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ApprovalBanner } from "./components/ApprovalBanner";
 import { ThreadSidebar } from "./components/ThreadSidebar";
+import { SubagentRail } from "./components/SubagentRail";
+import { SubagentTrace } from "./components/SubagentTrace";
 import { TitleBar } from "./components/TitleBar";
-import type { ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "./lib/protocol";
+import type {
+  AgentCancelPreviewResult,
+  AgentChildrenListResult,
+  AgentTraceSnapshotResult,
+  ThreadStatus,
+  TurnStatus,
+  Workspace,
+  WorkspaceGroup,
+} from "./lib/protocol";
+import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
@@ -71,6 +82,20 @@ export default function App() {
   const [status, setStatus] = useState<string>("connecting");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
+  // 不进 store;数据本身仍随通知累积,展开即是当前值。
+  const railStore = useRef(new SubagentRailStore()).current;
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  // 打开的详情:进入栈 + 该栈顶任务的轨迹行。栈让"子任务再进入"可退回,
+  // 与 TUI 页签同一语义。
+  const [detailStack, setDetailStack] = useState<string[]>([]);
+  const [traceRows, setTraceRows] = useState<AgentTraceSnapshotResult["rows"]>([]);
+  const openSubagent = detailStack.length > 0 ? detailStack[detailStack.length - 1] : null;
+  // 通知回调在 effect 里注册一次,读不到最新的 state,所以当前打开的任务放在 ref。
+  const openTaskId = useRef<string | null>(null);
+  useEffect(() => {
+    openTaskId.current = openSubagent;
+  }, [openSubagent]);
 
   const current = currentId ? store.view(currentId) : null;
 
@@ -108,6 +133,60 @@ export default function App() {
   };
 
   /**
+   * 打开某任务的详情:回灌历史,然后开一条流。
+   *
+   * 关闭(或换任务)时先 unwatch 再开新的,任何时刻只有一路流:否则换任务后
+   * 旧任务的 `agent/trace/event` 仍会到达,把两个任务的轨迹混进一个视图。
+   */
+  const openDetail = async (threadId: string, taskId: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    setDetailStack([taskId]);
+    setTraceRows([]);
+    try {
+      const snapshot = await c.request<AgentTraceSnapshotResult>("agent/trace/read", {
+        threadId,
+        taskId,
+      });
+      setTraceRows(snapshot.rows);
+      await c.request("agent/trace/watch", { threadId, taskId });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    }
+  };
+
+  const closeDetail = async (threadId: string) => {
+    setDetailStack([]);
+    setTraceRows([]);
+    try {
+      await clientRef.current?.request("agent/trace/unwatch", { threadId });
+    } catch {
+      // 关闭是本地动作:即使 unwatch 失败也不把详情留在屏幕上。
+    }
+  };
+
+  /**
+   * 取某对话当前的子 agent 列表。
+   *
+   * 失败即放弃:暂留区是附属视图,列表读不到就保持上一次的值(或空),绝不因为
+   * 它把对话打断。daemon 未 attach 时服务端返回空表,这里不会走到 catch。
+   */
+  const refreshSubagents = async (threadId: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      const r = await c.request<AgentChildrenListResult>("agent/children/list", {
+        threadId,
+      });
+      railStore.set(threadId, r.children);
+      force((v) => v + 1);
+    } catch {
+      // 附属视图:读失败不改动已有内容。
+    }
+  };
+
+  /**
    * Switch the visible thread. A warm thread (already resumed) only swaps the
    * view — its timeline kept accumulating in the background. A cold thread is
    * resumed once; per-thread isolation means the base session list/sidebar can
@@ -117,6 +196,8 @@ export default function App() {
     store.select(id);
     setCurrentId(id);
     force((v) => v + 1);
+    // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
+    void refreshSubagents(id);
     if (warm.current.has(id) || inFlightResume.current.has(id)) return; // warm → 只切视图
     const c = clientRef.current;
     if (!c) return;
@@ -282,6 +363,20 @@ export default function App() {
     const client = new RpcClient(tauriTransport());
     clientRef.current = client;
     client.onNotification((n) => {
+      // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
+      if (n.method === "agent/children/updated") {
+        railStore.applyNotification(n.params.threadId, n.params.children);
+        force((v) => v + 1);
+        return;
+      }
+      if (n.method === "agent/trace/event") {
+        // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
+        // 把两个任务的轨迹拼在一起安全。
+        setTraceRows((prev) =>
+          n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
+        );
+        return;
+      }
       // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
       store.applyNotification(n);
       force((v) => v + 1);
@@ -500,6 +595,38 @@ export default function App() {
             onModeChange={setThreadMode}
             onSlashCommand={(name, args) => void onSlashCommand(name, args)}
           />
+          {currentId && openSubagent && (
+            <SubagentTrace
+              taskId={openSubagent}
+              row={
+                railStore.get(currentId).find((r) => r.taskId === openSubagent) ?? null
+              }
+              children={childrenOf(railStore.get(currentId), openSubagent)}
+              rows={traceRows}
+              onClose={() => void closeDetail(currentId)}
+              onDrill={(taskId) => void openDetail(currentId, taskId)}
+              onMessage={async (taskId, message) => {
+                await clientRef.current?.request("agent/message", {
+                  threadId: currentId,
+                  taskId,
+                  message,
+                });
+              }}
+              onCancel={async (taskId) =>
+                await clientRef.current!.request<AgentCancelPreviewResult>(
+                  "agent/cancel/preview",
+                  { threadId: currentId, taskId },
+                )
+              }
+              onConfirmCancel={async (taskId, token) => {
+                await clientRef.current?.request("agent/cancel", {
+                  threadId: currentId,
+                  taskId,
+                  confirmationToken: token,
+                });
+              }}
+            />
+          )}
           {approval && (
             <ApprovalDialog
               key={approval.id}
@@ -518,6 +645,14 @@ export default function App() {
             />
           )}
         </div>
+        {currentId && !railCollapsed && (
+          <SubagentRail
+            rows={railStore.get(currentId)}
+            selectedTaskId={openSubagent}
+            onOpen={(taskId) => void openDetail(currentId, taskId)}
+            onCollapse={() => setRailCollapsed(true)}
+          />
+        )}
         </div>
       </div>
     </>

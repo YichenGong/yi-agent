@@ -17,6 +17,7 @@ use super::task::{
     PermissionRequestId, RecoveryEvidence, RootSessionId, TaskAttempt, TaskEvent, TaskFailure,
     TaskId, TaskState, TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
 };
+use super::trace::TraceFact;
 use super::worker::{
     AgentWorkerFactory, SpawnRequest, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart,
     WorkerWatchdogEvent,
@@ -824,6 +825,22 @@ impl AgentSupervisor {
                     .take_watchdog_events()
                     .into_iter()
                     .map(|event| (task_id.clone(), event))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Drains trace facts buffered by running workers, keyed by the task that
+    /// produced them. Destructive: a second call yields nothing until a worker
+    /// reports again. Persistence belongs to the coordinator.
+    pub fn take_worker_trace_events(&self) -> Vec<(TaskId, TraceFact)> {
+        self.workers
+            .iter()
+            .flat_map(|(task_id, handle)| {
+                handle
+                    .take_trace_events()
+                    .into_iter()
+                    .map(|fact| (task_id.clone(), fact))
                     .collect::<Vec<_>>()
             })
             .collect()

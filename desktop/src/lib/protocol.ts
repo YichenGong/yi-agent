@@ -85,7 +85,56 @@ export type Notification =
       method: "turn/interjectionsReturned";
       params: { thread_id: string; turn_id: string; items: string[] };
     }
+  | {
+      method: "agent/children/updated";
+      params: { threadId: string; children: AgentChild[] };
+    }
+  | {
+      method: "agent/trace/event";
+      params: { threadId: string; taskId: string; row: AgentTraceRow };
+    }
   | { method: "error"; params: { message: string } };
+
+/**
+ * 该对话名下一个子 agent 的列表项。
+ *
+ * 字段是 camelCase：`agent/*` 是与 `thread/` `turn/` 并列的新命名空间,其参数
+ * 由 app-server 直接序列化 `AgentChild`,故不沿用旧命名空间的 snake_case。
+ */
+export interface AgentChild {
+  taskId: string;
+  objective?: string;
+  state: string;
+  lastStep?: string;
+  /** 该子任务自己的父任务;顶层子任务缺省。用于下钻时只列出自己的直接子任务。 */
+  parentTaskId?: string;
+}
+
+/** 一条子 agent 轨迹行,原样透传 daemon 的持久化行。 */
+export interface AgentTraceRow {
+  eventId: number;
+  taskId: string;
+  kind: "assistant_text" | "tool_call" | "tool_result" | "state_note" | string;
+  payloadJson: string;
+}
+
+/** `agent/children/list` 的响应。 */
+export interface AgentChildrenListResult {
+  children: AgentChild[];
+}
+
+/** `agent/trace/read` 与 `agent/trace/watch` 的响应。 */
+export interface AgentTraceSnapshotResult {
+  rows: AgentTraceRow[];
+  highWaterId: number;
+}
+
+/** `agent/cancel/preview` 的响应：确认取消所需的 token 与它的有效期。 */
+export interface AgentCancelPreviewResult {
+  confirmationToken: string;
+  taskIds: string[];
+  expiresInSecs: number;
+}
 
 /// Why the turn is being retried, as reported by the server on `turn/retry`.
 export type RetryCause = "idle_stall" | "request_timeout";

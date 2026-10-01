@@ -86,6 +86,7 @@ fn attach_delegation(
     runtimes: &ProjectRuntimes,
     cfg: &RuntimeConfig,
     cwd: &str,
+    thread_id: &str,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -106,7 +107,7 @@ fn attach_delegation(
             };
         }
     };
-    match build_runtime_tooling(&thread_cfg, &runtime, built.yolo.clone()) {
+    match build_runtime_tooling(&thread_cfg, &runtime, thread_id, built.yolo.clone()) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
             runtime: Some(runtime),
@@ -123,6 +124,301 @@ fn attach_delegation(
                 runtime: None,
             }
         }
+    }
+}
+
+/// Reject an `agent/*` request for a conversation the server does not host.
+///
+/// Distinct from an unattached conversation, which exists and answers with an
+/// empty result: a thread id that was never started is a caller error.
+async fn require_known_thread<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &MessageWriter<W>,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+    id: RequestId,
+) -> anyhow::Result<bool> {
+    if threads.contains_key(thread_id) {
+        return Ok(true);
+    }
+    write_response(
+        writer,
+        err_response(id, RpcError::unknown_thread(thread_id)),
+    )
+    .await?;
+    Ok(false)
+}
+
+/// The runtime socket a conversation's children live on.
+///
+/// The socket belongs to the attached project root, which is keyed by the
+/// thread's own directory. A thread that never attached has no socket, and every
+/// `agent/*` answer for it is empty rather than an error.
+fn socket_for_thread(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+) -> Option<PathBuf> {
+    let cwd = threads.get(thread_id)?.cwd.clone();
+    let key = std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(&cwd));
+    let entry = runtimes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)?
+        .clone();
+    entry
+        .ok()
+        .and_then(|binding| binding.current().ok())
+        .map(|handle| handle.socket_path)
+}
+
+/// The task summaries the daemon holds for a conversation's directory.
+fn list_task_summaries(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+) -> Result<Vec<yi_agent_store::ipc::IpcTaskSummary>, String> {
+    let socket = socket_for_thread(runtimes, threads, thread_id)
+        .ok_or_else(|| "no attached runtime for this thread".to_string())?;
+    let response = yi_agent_store::ipc::send_request(
+        &socket,
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id: None,
+            active_only: false,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } => Ok(tasks),
+        other => Err(format!("daemon returned a non-summary response: {other:?}")),
+    }
+}
+
+/// Read a task's persisted trace, plus the high-water mark to resume from.
+fn read_task_trace(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+    task_id: &str,
+) -> Result<(Vec<crate::protocol::AgentTraceRow>, i64), RpcError> {
+    let socket = socket_for_thread(runtimes, threads, thread_id)
+        .ok_or_else(|| RpcError::unknown_thread(thread_id))?;
+    let snapshot = yi_agent_store::ipc::read_task_trace(&socket, task_id)
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    Ok((trace_rows(snapshot.rows), snapshot.high_water_id))
+}
+
+/// The watch's opening frame carries the backlog the client would otherwise miss.
+fn snapshot_for_watch(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+    task_id: &str,
+) -> Result<(Vec<crate::protocol::AgentTraceRow>, i64), RpcError> {
+    read_task_trace(runtimes, threads, thread_id, task_id)
+}
+
+fn trace_rows(rows: Vec<yi_agent_store::ipc::IpcTraceRow>) -> Vec<crate::protocol::AgentTraceRow> {
+    rows.into_iter().map(agent_trace_row).collect()
+}
+
+fn agent_trace_row(row: yi_agent_store::ipc::IpcTraceRow) -> crate::protocol::AgentTraceRow {
+    crate::protocol::AgentTraceRow {
+        event_id: row.event_id,
+        task_id: row.task_id,
+        kind: row.kind,
+        payload_json: row.payload_json,
+    }
+}
+
+/// Send one request to the daemon the conversation is attached to.
+///
+/// A request the daemon rejects is an error the caller must see, so the daemon's
+/// own error frame is turned into the RPC error rather than swallowed. A
+/// conversation with no attached runtime is an unknown-thread error, since there
+/// is nothing to send to.
+fn forward_to_daemon(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+    request: yi_agent_store::ipc::IpcRequest,
+) -> Result<yi_agent_store::ipc::IpcResponse, RpcError> {
+    let socket = socket_for_thread(runtimes, threads, thread_id)
+        .ok_or_else(|| RpcError::unknown_thread(thread_id))?;
+    let response = yi_agent_store::ipc::send_request(&socket, request)
+        .map_err(|error| RpcError::internal(format!("daemon is unavailable: {error}")))?;
+    if let yi_agent_store::ipc::IpcResponse::Error { code, message } = &response {
+        return Err(RpcError::internal(format!(
+            "daemon rejected the request: {code:?} {}",
+            message.clone().unwrap_or_default()
+        )));
+    }
+    Ok(response)
+}
+
+/// Push the conversation's child list whenever it changes.
+///
+/// The first frame is skipped: the caller has just answered the same question
+/// synchronously, so pushing it again would be a duplicate. Every later
+/// difference is pushed whole, because the list is small and a client that
+/// applies it wholesale cannot drift out of order.
+async fn watch_children<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    writer: Arc<MessageWriter<W>>,
+    thread_id: String,
+    socket: PathBuf,
+    initial: Vec<crate::protocol::AgentChild>,
+) {
+    let mut last = initial;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let tasks = match yi_agent_store::ipc::send_request(
+            &socket,
+            yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+                session_id: None,
+                active_only: false,
+            },
+        ) {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks }) => tasks,
+            // A daemon that is briefly unavailable is not a change; the next
+            // poll will pick the list back up.
+            _ => continue,
+        };
+        let current = children_for_thread(&tasks, &thread_id);
+        if current == last {
+            continue;
+        }
+        last = current.clone();
+        let notification = Notification::AgentChildrenUpdated {
+            thread_id: thread_id.clone(),
+            children: current,
+        };
+        if write_notification(&writer, &notification).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Forward a watched task's rows until the stream ends or the task is aborted.
+///
+/// The subscription is non-blocking so the task yields between polls; it ends on
+/// its own when the daemon closes the stream, and is aborted when the client
+/// unwatches, watches another task, or closes the thread.
+async fn stream_trace<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    writer: Arc<MessageWriter<W>>,
+    thread_id: String,
+    task_id: String,
+    socket: PathBuf,
+    after_id: i64,
+) {
+    let subscription = match yi_agent_store::ipc::subscribe_trace(
+        &socket,
+        after_id,
+        std::slice::from_ref(&task_id),
+        &[],
+    ) {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            tracing::warn!(%error, %thread_id, %task_id, "trace watch could not subscribe");
+            return;
+        }
+    };
+    if let Err(error) = subscription.set_nonblocking(true) {
+        tracing::warn!(%error, %thread_id, %task_id, "trace watch could not poll");
+        return;
+    }
+    let mut subscription = subscription;
+    loop {
+        match subscription.try_row() {
+            Ok(Some(row)) => {
+                let notification = Notification::AgentTraceEvent {
+                    thread_id: thread_id.clone(),
+                    task_id: task_id.clone(),
+                    row: agent_trace_row(row),
+                };
+                if write_notification(&writer, &notification).await.is_err() {
+                    return;
+                }
+            }
+            // Nothing yet, or the stream ended: either way, yield and retry.
+            // The stream ending is indistinguishable from a quiet moment by
+            // design, so the loop is bounded by the abort that the caller does.
+            Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(error) => {
+                tracing::warn!(%error, %thread_id, %task_id, "trace watch stream failed");
+                return;
+            }
+        }
+    }
+}
+
+/// The children of one conversation, derived from a task-summary snapshot.
+///
+/// A conversation is scoped by the `thread_id` the spawner bound into its tools,
+/// not by the directory: several conversations can share one directory and one
+/// attached root, so the marker is the only thing that separates their children.
+/// Root tasks are never children, and the `thread_id` filter is exact, so an
+/// untagged task belongs to no conversation rather than to all of them.
+fn children_for_thread(
+    tasks: &[yi_agent_store::ipc::IpcTaskSummary],
+    thread_id: &str,
+) -> Vec<crate::protocol::AgentChild> {
+    tasks
+        .iter()
+        .filter(|task| !task.is_root)
+        .filter(|task| task.thread_id.as_deref() == Some(thread_id))
+        .map(|task| crate::protocol::AgentChild {
+            task_id: task.task_id.clone(),
+            // `ListTaskSummaries` carries no objective; a later source can fill
+            // it without changing this shape.
+            objective: None,
+            state: task.state.clone(),
+            last_step: None,
+            parent_task_id: task.parent_task_id.clone(),
+        })
+        .collect()
+}
+
+/// Whether a task state can still make progress.
+#[cfg(test)]
+fn is_terminal_state(state: &str) -> bool {
+    matches!(
+        state,
+        "completed" | "completed_no_changes" | "failed" | "cancelled"
+    )
+}
+
+/// One conversation's child-list watcher.
+///
+/// The plan called for a kind-filtered `SubscribeTrace`; polling the summary
+/// list is used instead because it is strictly cheaper here (summaries are tiny
+/// and carry the objective/state the rail needs, which trace rows do not) and it
+/// reuses the same read the initial `agent/children/list` does, so the pushed
+/// list can never disagree with a fresh request. The observable contract is
+/// unchanged: whole-list `agent/children/updated` notifications on change.
+struct ChildrenWatch {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ChildrenWatch {
+    async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+/// One conversation's live trace watch.
+///
+/// At most one task per conversation is watched, because the client shows one
+/// detail at a time; watching another replaces the watch rather than adding a
+/// second stream, so rows never arrive for a task the user has left.
+struct TraceWatch {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TraceWatch {
+    /// Stop forwarding and wait for the task to observe the cancellation.
+    async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
     }
 }
 
@@ -186,6 +482,7 @@ fn attached_runtimes(runtimes: &ProjectRuntimes) -> Vec<Arc<RuntimeBinding>> {
 fn build_runtime_tooling(
     cfg: &RuntimeConfig,
     binding: &Arc<RuntimeBinding>,
+    thread_id: &str,
     yolo: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the binding itself, not its snapshot: they re-resolve the
@@ -203,7 +500,15 @@ fn build_runtime_tooling(
     )
     .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
-    yi_agent_subagent::register_attached_root_tools(&mut registry, Arc::clone(binding), controller);
+    // The conversation marker is bound here, not inferred later: the model that
+    // calls `spawn_agent` never sees a thread id, so each thread's tools carry
+    // their own so every child they spawn is tagged with this conversation.
+    yi_agent_subagent::register_attached_root_tools_in_thread(
+        &mut registry,
+        Arc::clone(binding),
+        controller,
+        Some(thread_id.to_string()),
+    );
     let permission =
         yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
             .map_err(|error| error.to_string())?;
@@ -352,6 +657,10 @@ where
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
     let mut pending_activation: HashMap<String, Option<Arc<RuntimeBinding>>> = HashMap::new();
+    // 每个 thread 至多一条被关注的轨迹流。换任务即替换(不并存),thread 删除即收尾。
+    let mut trace_watches: HashMap<String, TraceWatch> = HashMap::new();
+    // 每个 thread 至多一个子任务列表守望者,首次 agent/children/list 时建立。
+    let mut children_watches: HashMap<String, ChildrenWatch> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -605,7 +914,7 @@ where
                         };
                         // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
                         // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
-                        let activation = attach_delegation(&runtimes, &cfg, &cwd, built);
+                        let activation = attach_delegation(&runtimes, &cfg, &cwd, &thread_id, built);
                         let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
                             activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
@@ -805,7 +1114,7 @@ where
                                 continue;
                             }
                         };
-                        let activation = attach_delegation(&runtimes, &cfg, &cwd, built);
+                        let activation = attach_delegation(&runtimes, &cfg, &cwd, &thread_id, built);
                         let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
                             activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
@@ -1028,6 +1337,12 @@ where
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         pending_activation.remove(&thread_id);
+                        if let Some(watch) = trace_watches.remove(&thread_id) {
+                            watch.stop().await;
+                        }
+                        if let Some(watch) = children_watches.remove(&thread_id) {
+                            watch.stop().await;
+                        }
                         let live_cwds = threads
                             .values()
                             .map(|session| session.cwd.clone())
@@ -1313,6 +1628,289 @@ where
                             ),
                         )
                         .await?;
+                    }
+                    "agent/children/list" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        // 列表是尽力而为的只读视图:attach 未就绪或 daemon 不可达时返回空表,
+                        // 而不是报错。桌面端的暂留区因此永远能渲染,turn 也照常跑。
+                        let snapshot = list_task_summaries(&runtimes, &threads, &thread_id);
+                        let children =
+                            children_for_thread(&snapshot.unwrap_or_default(), &thread_id);
+                        // 首次拉取时建立守望者:此后列表变化由 agent/children/updated 推出,
+                        // 客户端不必轮询。daemon 不可达时不建立(没有可观察的变化)。
+                        if !children_watches.contains_key(&thread_id) {
+                            if let Some(socket) = socket_for_thread(&runtimes, &threads, &thread_id) {
+                                let task = tokio::spawn(watch_children(
+                                    Arc::clone(&writer),
+                                    thread_id.clone(),
+                                    socket,
+                                    children.clone(),
+                                ));
+                                children_watches.insert(thread_id.clone(), ChildrenWatch { task });
+                            }
+                        }
+                        write_response(&writer, ok_response(id, json!({ "children": children })))
+                            .await?;
+                    }
+                    "agent/trace/read" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let Some(task_id) =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing taskId")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        match read_task_trace(&runtimes, &threads, &thread_id, &task_id) {
+                            Ok((rows, high_water_id)) => {
+                                write_response(
+                                    &writer,
+                                    ok_response(
+                                        id,
+                                        json!({ "rows": rows, "highWaterId": high_water_id }),
+                                    ),
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
+                    "agent/trace/watch" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let Some(task_id) =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing taskId")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 替换而不是叠加:一个 thread 只关注一个任务,旧流必须先停,
+                        // 否则换任务后两个任务的行使会同时到达客户端。
+                        if let Some(previous) = trace_watches.remove(&thread_id) {
+                            previous.stop().await;
+                        }
+                        match snapshot_for_watch(&runtimes, &threads, &thread_id, &task_id) {
+                            Ok((rows, high_water_id)) => {
+                                let handle = tokio::spawn(stream_trace(
+                                    Arc::clone(&writer),
+                                    thread_id.clone(),
+                                    task_id.clone(),
+                                    socket_for_thread(&runtimes, &threads, &thread_id)
+                                        .unwrap_or_default(),
+                                    high_water_id,
+                                ));
+                                trace_watches.insert(thread_id.clone(), TraceWatch { task: handle });
+                                write_response(
+                                    &writer,
+                                    ok_response(id, json!({ "rows": rows, "highWaterId": high_water_id })),
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
+                    "agent/message" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let task_id =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string);
+                        let message =
+                            req.params.get("message").and_then(|v| v.as_str()).map(str::to_string);
+                        let (Some(task_id), Some(message)) = (task_id, message) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing taskId or message")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        match forward_to_daemon(
+                            &runtimes,
+                            &threads,
+                            &thread_id,
+                            yi_agent_store::ipc::IpcRequest::SendUserMessage {
+                                task_id: task_id.clone(),
+                                message,
+                            },
+                        ) {
+                            Ok(_) => {
+                                write_response(&writer, ok_response(id, json!({ "queued": true })))
+                                    .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
+                    "agent/cancel/preview" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let Some(task_id) =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing taskId")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 取消必须两步:预览拿 token,确认才真取消。这里只做第一步,
+                        // 绝不代客户端跳过确认。
+                        match forward_to_daemon(
+                            &runtimes,
+                            &threads,
+                            &thread_id,
+                            yi_agent_store::ipc::IpcRequest::PreviewCancel {
+                                task_id: task_id.clone(),
+                                recursive: false,
+                            },
+                        ) {
+                            Ok(yi_agent_store::ipc::IpcResponse::CancelPreview {
+                                confirmation_token,
+                                task_ids,
+                                expires_in_secs,
+                                ..
+                            }) => {
+                                write_response(
+                                    &writer,
+                                    ok_response(
+                                        id,
+                                        json!({
+                                            "confirmationToken": confirmation_token,
+                                            "taskIds": task_ids,
+                                            "expiresInSecs": expires_in_secs,
+                                        }),
+                                    ),
+                                )
+                                .await?;
+                            }
+                            Ok(other) => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::internal(format!(
+                                            "daemon returned a non-preview response: {other:?}"
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
+                    "agent/cancel" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let task_id =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string);
+                        let confirmation_token = req
+                            .params
+                            .get("confirmationToken")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let (Some(task_id), Some(confirmation_token)) =
+                            (task_id, confirmation_token)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(
+                                        "missing taskId or confirmationToken; preview first",
+                                    ),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        match forward_to_daemon(
+                            &runtimes,
+                            &threads,
+                            &thread_id,
+                            yi_agent_store::ipc::IpcRequest::ConfirmCancel {
+                                task_id: task_id.clone(),
+                                recursive: false,
+                                confirmation_token,
+                            },
+                        ) {
+                            Ok(_) => {
+                                write_response(&writer, ok_response(id, json!({ "cancelled": true })))
+                                    .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
+                    "agent/trace/unwatch" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        if let Some(watch) = trace_watches.remove(&thread_id) {
+                            watch.stop().await;
+                        }
+                        if let Some(watch) = children_watches.remove(&thread_id) {
+                            watch.stop().await;
+                        }
+                        write_response(&writer, ok_response(id, json!({ "stopped": true }))).await?;
                     }
                     _ => {
                         write_response(&writer, err_response(id, RpcError::method_not_found(&method)))
@@ -2100,6 +2698,7 @@ mod tests {
         let tooling = build_runtime_tooling(
             &cfg,
             &binding,
+            "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
         )
         .expect("tooling");
@@ -2131,7 +2730,7 @@ mod tests {
                 mode: Some("read_only".into()),
                 model: None,
                 workdir: None,
-
+                thread_id: None,
                 sandbox: None,
             },
         )
@@ -2169,7 +2768,8 @@ mod tests {
             },
         ));
         let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
-        let tooling = build_runtime_tooling(&cfg, &binding, switch.clone()).expect("tooling");
+        let tooling =
+            build_runtime_tooling(&cfg, &binding, "thread-test", switch.clone()).expect("tooling");
         let bash = tooling.registry.get("bash").expect("bash is registered");
         assert_eq!(
             bash.sandbox_mode(),
@@ -2211,6 +2811,7 @@ mod tests {
         let names = build_runtime_tooling(
             &cfg,
             &binding,
+            "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
         )
         .expect("tooling")
@@ -2250,7 +2851,7 @@ mod tests {
                 mode: Some("read_only".into()),
                 model: None,
                 workdir: None,
-
+                thread_id: None,
                 sandbox: None,
             },
         )
@@ -2654,6 +3255,237 @@ mod tests {
             }
         }
         panic!("no thread/start response");
+    }
+
+    fn summary(
+        task_id: &str,
+        state: &str,
+        thread_id: Option<&str>,
+    ) -> yi_agent_store::ipc::IpcTaskSummary {
+        yi_agent_store::ipc::IpcTaskSummary {
+            task_id: task_id.into(),
+            state: state.into(),
+            is_root: false,
+            parent_task_id: Some("root".into()),
+            thread_id: thread_id.map(str::to_string),
+        }
+    }
+
+    /// A conversation sees only the children it spawned.
+    ///
+    /// One directory can host several conversations sharing one root, so the
+    /// marker bound at assembly time is the only thing that separates them. An
+    /// untagged task belongs to no conversation rather than to all of them.
+    #[test]
+    fn children_are_scoped_by_the_conversation_marker() {
+        let tasks = vec![
+            summary("mine-1", "running", Some("thread-a")),
+            summary("theirs", "running", Some("thread-b")),
+            summary("untagged", "running", None),
+            summary("mine-2", "completed", Some("thread-a")),
+        ];
+        let mine = children_for_thread(&tasks, "thread-a");
+        assert_eq!(
+            mine.iter().map(|c| c.task_id.as_str()).collect::<Vec<_>>(),
+            vec!["mine-1", "mine-2"],
+            "only this conversation's children, in order"
+        );
+        assert!(
+            children_for_thread(&tasks, "thread-b")
+                .iter()
+                .all(|c| c.task_id == "theirs")
+        );
+        assert!(
+            children_for_thread(&tasks, "thread-c").is_empty(),
+            "a conversation with no children lists none"
+        );
+    }
+
+    /// A root task is never a child, even when it carries the marker.
+    #[test]
+    fn the_root_is_never_listed_as_a_child() {
+        let mut root = summary("root", "running", Some("thread-a"));
+        root.is_root = true;
+        let tasks = vec![root, summary("child", "running", Some("thread-a"))];
+        let children = children_for_thread(&tasks, "thread-a");
+        assert_eq!(
+            children
+                .iter()
+                .map(|c| c.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child"]
+        );
+    }
+
+    /// A finished child stays in the list; the state is what marks it finished.
+    #[test]
+    fn a_finished_child_stays_in_the_list() {
+        let tasks = vec![summary("done", "completed", Some("thread-a"))];
+        let children = children_for_thread(&tasks, "thread-a");
+        assert_eq!(children.len(), 1);
+        assert!(
+            is_terminal_state(&children[0].state),
+            "the client marks it done"
+        );
+    }
+
+    /// The notifications and rows carry the method names and camelCase fields
+    /// the desktop client keys on.
+    #[test]
+    fn the_agent_notifications_use_their_documented_wire_shape() {
+        let children = Notification::AgentChildrenUpdated {
+            thread_id: "thread-1".into(),
+            children: vec![crate::protocol::AgentChild {
+                task_id: "task-1".into(),
+                objective: Some("do the thing".into()),
+                state: "running".into(),
+                last_step: Some("running tests".into()),
+                parent_task_id: Some("root".into()),
+            }],
+        };
+        let json = serde_json::to_value(&children).unwrap();
+        assert_eq!(json["method"], "agent/children/updated");
+        assert_eq!(json["params"]["threadId"], "thread-1");
+        assert_eq!(json["params"]["children"][0]["taskId"], "task-1");
+        assert_eq!(json["params"]["children"][0]["lastStep"], "running tests");
+
+        let event = Notification::AgentTraceEvent {
+            thread_id: "thread-1".into(),
+            task_id: "task-1".into(),
+            row: crate::protocol::AgentTraceRow {
+                event_id: 7,
+                task_id: "task-1".into(),
+                kind: "assistant_text".into(),
+                payload_json: "{\"type\":\"assistant_text\",\"text\":\"hi\"}".into(),
+            },
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["method"], "agent/trace/event");
+        assert_eq!(json["params"]["taskId"], "task-1");
+        assert_eq!(json["params"]["row"]["eventId"], 7);
+        assert_eq!(
+            json["params"]["row"]["payloadJson"],
+            "{\"type\":\"assistant_text\",\"text\":\"hi\"}"
+        );
+    }
+
+    /// The list degrades to empty rather than failing when the conversation has
+    /// no runtime, so the desktop rail always renders and the turn keeps running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_children_list_is_empty_without_an_attached_runtime() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/children/list","params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert!(
+            v.get("error").is_none(),
+            "an unattached conversation answers with an empty list, not an error: {v}"
+        );
+        assert_eq!(v["result"]["children"], serde_json::json!([]));
+        h.shutdown().await;
+    }
+
+    /// An unknown conversation is a caller error, not an empty list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_methods_reject_an_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"agent/children/list","params":{"threadId":"thread-nope"}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32011, "unknown thread: {v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":10,"method":"agent/trace/read","params":{"threadId":"thread-nope","taskId":"t"}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 10);
+        assert_eq!(v["error"]["code"], -32011, "unknown thread: {v}");
+        h.shutdown().await;
+    }
+
+    /// `agent/trace/read` without a task id is a parameter error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_trace_read_requires_a_task_id() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/trace/read","params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32602, "missing taskId: {v}");
+        h.shutdown().await;
+    }
+
+    /// Cancelling without a preview token is refused, so the confirmation step
+    /// cannot be skipped by a client that calls `agent/cancel` directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_requires_a_confirmation_token() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/cancel","params":{{"threadId":"{thread_id}","taskId":"task-1"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32602, "no token, no cancel: {v}");
+        h.shutdown().await;
+    }
+
+    /// A message to an unattached conversation fails loudly rather than
+    /// pretending to queue: there is no daemon to queue it on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_message_without_a_runtime_is_an_error() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/message","params":{{"threadId":"{thread_id}","taskId":"task-1","message":"hello"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32011, "unattached conversation: {v}");
+        h.shutdown().await;
+    }
+
+    /// A malformed message request is a parameter error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_message_requires_a_task_and_text() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/message","params":{{"threadId":"{thread_id}","taskId":"task-1"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32602, "missing message: {v}");
+        h.shutdown().await;
+    }
+
+    /// Unwatching a conversation that is not watching anything is a no-op, so a
+    /// client closing a detail twice is not an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_trace_unwatch_is_idempotent() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        for id in [9, 10] {
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"agent/trace/unwatch","params":{{"threadId":"{thread_id}"}}}}"#
+            ))
+            .await;
+            let v = h.read_value().await;
+            assert_eq!(v["id"], id);
+            assert_eq!(v["result"]["stopped"], true, "unwatch always succeeds: {v}");
+        }
+        h.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

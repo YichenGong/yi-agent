@@ -74,13 +74,13 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
             "DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12);",
+             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13);",
         )
         .unwrap();
     database
@@ -476,7 +476,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
             objective: "child task".into(),
             mode: Some("read_only".into()),
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -550,7 +550,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
             objective: "child".into(),
             mode: Some("read_only".into()),
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -648,7 +648,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
             objective: "do the work".into(),
             mode: Some("read_only".into()),
             model: Some("small-model".into()),
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -698,7 +698,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     for table in [
         "sessions",
         "tasks",
@@ -727,7 +727,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     // Rebuild the pre-v11 shape of the attachment table and roll the schema
@@ -753,14 +753,14 @@ fn v10_database_without_workspace_root() -> PathBuf {
 
 #[test]
 fn a_version_10_database_is_migrated_to_the_current_schema() {
-    // Regression: a database written by the previous release reports schema
-    // version 10, which equals LATEST_SCHEMA_VERSION. The migration gate then
-    // returns early and the v11 `workspace_root` column is never added, so the
-    // first attach fails with `no such column: workspace_root`.
+    // Regression: a database written by the previous release reported a schema
+    // version the migration gate took for current, so it returned early and the
+    // v11 `workspace_root` column was never added; the first attach then failed
+    // with `no such column: workspace_root`.
     let database = v10_database_without_workspace_root();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     let has_column: bool = Connection::open(&database)
         .unwrap()
         .query_row(
@@ -816,7 +816,7 @@ fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     assert!(
         repository
             .has_table("application_root_attachments")
@@ -895,7 +895,7 @@ fn application_roots_use_their_attaching_project_workspace() {
             objective: "inspect project B".into(),
             mode: Some("coding".into()),
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -1054,7 +1054,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
                 objective: "inspect the parser".into(),
                 mode: None,
                 model: None,
-
+                thread_id: None,
                 sandbox: None,
             },
         )
@@ -1441,7 +1441,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
             objective: "child task".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -1508,7 +1508,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             objective: "fast child".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -1523,7 +1523,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             objective: "slow child".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -1567,7 +1567,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             objective: "fast child".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -1587,7 +1587,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             objective: "slow child".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -1643,7 +1643,7 @@ fn application_root_rejects_more_than_four_direct_children() {
                     objective: format!("child {index}"),
                     mode: None,
                     model: None,
-
+                    thread_id: None,
                     sandbox: None,
                 },
             )
@@ -1662,7 +1662,7 @@ fn application_root_rejects_more_than_four_direct_children() {
             objective: "fifth child".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -1712,7 +1712,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                     objective: format!("historical child {index}"),
                     mode: None,
                     model: None,
-
+                    thread_id: None,
                     sandbox: None,
                 },
             )
@@ -1747,7 +1747,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                 objective: "new child after historical completions".into(),
                 mode: None,
                 model: None,
-
+                thread_id: None,
                 sandbox: None,
             },
         )
@@ -1846,7 +1846,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
                 objective: "after paused reattach".into(),
                 mode: None,
                 model: None,
-
+                thread_id: None,
                 sandbox: None,
             },
         )
@@ -1927,7 +1927,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
                 objective: "after reattach".into(),
                 mode: None,
                 model: None,
-
+                thread_id: None,
                 sandbox: None,
             },
         )
@@ -1999,7 +1999,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
                 objective: "after restart".into(),
                 mode: None,
                 model: None,
-
+                thread_id: None,
                 sandbox: None,
             },
         )
@@ -2117,7 +2117,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -2712,6 +2712,276 @@ fn subscription_frames_are_versioned_and_correlated_to_the_request() {
 }
 
 #[test]
+fn daemon_reads_a_task_trace_snapshot() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            r#"{"type":"assistant_text","text":"hello"}"#,
+        )
+        .unwrap();
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            r#"{"type":"tool_call","name":"read","summary":"x"}"#,
+        )
+        .unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskTrace {
+            task_id: task.to_string(),
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskTrace {
+        task_id,
+        high_water_id,
+        rows,
+    } = response
+    else {
+        panic!("expected a trace snapshot");
+    };
+    assert_eq!(task_id, task.to_string());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].kind, "assistant_text");
+    assert_eq!(rows[1].kind, "tool_call");
+    assert!(rows[0].event_id < rows[1].event_id);
+    assert_eq!(high_water_id, rows.last().unwrap().event_id);
+}
+
+#[test]
+fn a_task_trace_snapshot_is_empty_with_zero_high_water() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::ReadTaskTrace {
+            task_id: task.to_string(),
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskTrace {
+        high_water_id,
+        rows,
+        ..
+    } = response
+    else {
+        panic!("expected a trace snapshot");
+    };
+    assert!(rows.is_empty());
+    assert_eq!(high_water_id, 0);
+}
+
+#[test]
+fn a_trace_subscription_replays_then_streams_without_gaps_or_duplicates() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    for text in ["one", "two"] {
+        repository
+            .append_trace(
+                &task,
+                "assistant_text",
+                &json!({ "type": "assistant_text", "text": text }).to_string(),
+            )
+            .unwrap();
+    }
+
+    let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::to_string(&json!({
+            "protocol_version": 1,
+            "request_id": "trace-stream",
+            "command": {
+                "type": "SubscribeTrace",
+                "task_ids": [task.to_string()],
+                "after_id": 0,
+            },
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let snapshot = raw_response(&mut reader);
+    assert_eq!(snapshot["result"]["type"], "TraceSubscription");
+    let mut seen: Vec<i64> = snapshot["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["event_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seen.len(), 2, "both durable rows are replayed");
+    assert_eq!(
+        snapshot["result"]["high_water_id"].as_i64().unwrap(),
+        *seen.last().unwrap()
+    );
+
+    // Only a row written AFTER subscribing is streamed; the replayed rows are
+    // already delivered by the snapshot and must not repeat.
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            &json!({ "type": "tool_call", "name": "read", "summary": "third" }).to_string(),
+        )
+        .unwrap();
+    let frame = raw_response(&mut reader);
+    assert_eq!(frame["result"]["type"], "TraceEvent");
+    let streamed = frame["result"]["event_id"].as_i64().unwrap();
+    assert_eq!(frame["event_id"], frame["result"]["event_id"]);
+    assert!(
+        streamed > *seen.last().unwrap(),
+        "a streamed row must be newer than everything replayed"
+    );
+    seen.push(streamed);
+
+    // Appending a fourth row must arrive as the next streamed frame, proving
+    // the cursor advanced rather than re-reporting the third.
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            &json!({ "type": "assistant_text", "text": "fourth" }).to_string(),
+        )
+        .unwrap();
+    let frame = raw_response(&mut reader);
+    assert_eq!(frame["result"]["type"], "TraceEvent");
+    seen.push(frame["result"]["event_id"].as_i64().unwrap());
+
+    assert!(
+        seen.windows(2).all(|pair| pair[0] < pair[1]),
+        "ids strictly increase with no repeats and no gaps: {seen:?}"
+    );
+    assert_eq!(seen.len(), 4, "two replayed and two streamed: {seen:?}");
+}
+
+#[test]
+fn a_trace_subscription_can_be_kind_filtered() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    let root = RootSessionId::new();
+    let task = TaskId::new();
+    repository.create_task(&task, &root, "queued").unwrap();
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            r#"{"type":"assistant_text","text":"ignored"}"#,
+        )
+        .unwrap();
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            r#"{"type":"tool_call","name":"read","summary":"kept"}"#,
+        )
+        .unwrap();
+
+    let mut stream = UnixStream::connect(daemon.socket_path()).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::to_string(&json!({
+            "protocol_version": 1,
+            "request_id": "trace-filtered",
+            "command": {
+                "type": "SubscribeTrace",
+                "task_ids": [task.to_string()],
+                "after_id": 0,
+                "kinds": ["tool_call"],
+            },
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let snapshot = raw_response(&mut reader);
+    let rows = snapshot["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the assistant_text row is filtered out");
+    assert_eq!(rows[0]["kind"], "tool_call");
+    assert_eq!(
+        snapshot["result"]["high_water_id"].as_i64().unwrap(),
+        rows[0]["event_id"].as_i64().unwrap(),
+        "the cursor follows the filtered view actually delivered"
+    );
+
+    // A newly written row of the watched kind streams; a filtered kind does not.
+    repository
+        .append_trace(
+            &task,
+            "assistant_text",
+            r#"{"type":"assistant_text","text":"also ignored"}"#,
+        )
+        .unwrap();
+    repository
+        .append_trace(
+            &task,
+            "tool_call",
+            r#"{"type":"tool_call","name":"write","summary":"kept too"}"#,
+        )
+        .unwrap();
+    let frame = raw_response(&mut reader);
+    assert_eq!(frame["result"]["type"], "TraceEvent");
+    assert_eq!(frame["result"]["kind"], "tool_call");
+    let payload: Value =
+        serde_json::from_str(frame["result"]["payload_json"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["summary"], "kept too");
+}
+
+#[test]
+fn a_trace_subscription_requires_task_ids() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let daemon = Daemon::start(directory.path().join("runtime"), &database).unwrap();
+
+    let response = raw_request(
+        daemon.socket_path(),
+        json!({
+            "protocol_version": 1,
+            "request_id": "trace-unscoped",
+            "command": {"type": "SubscribeTrace", "task_ids": []},
+        }),
+    );
+    assert_eq!(response["result"]["type"], "Error");
+    assert_eq!(response["result"]["code"], "validation");
+}
+
+#[test]
 fn daemon_lists_compact_task_summaries() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -3197,7 +3467,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3278,7 +3548,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             objective: "Inspect child behavior slowly".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3347,7 +3617,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             objective: "finish first".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3367,7 +3637,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3441,7 +3711,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             objective: "finish first".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3461,7 +3731,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3533,7 +3803,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
             objective: "reply quickly".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3611,7 +3881,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3673,7 +3943,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
             objective: "stay pending".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3751,7 +4021,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3861,7 +4131,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -3949,7 +4219,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
             objective: "Inspect child behavior".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -5071,7 +5341,7 @@ fn workspace_mode_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -5109,6 +5379,7 @@ fn workspace_mode_is_persisted_and_recovered() {
             "recovery_required",
             "child",
             ChildWriteMode::ReadOnly,
+            None,
             None,
             None,
         )
@@ -5168,7 +5439,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
             objective: "Change a file".into(),
             mode: Some("coding".into()),
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -5218,7 +5489,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
             objective: "Inspect without editing".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -5232,6 +5503,254 @@ fn daemon_spawn_agent_defaults_to_read_only() {
     assert_eq!(
         repository.task_workspace_mode(&child).unwrap(),
         ChildWriteMode::ReadOnly
+    );
+}
+
+/// The conversation marker is metadata: a client that tags a spawn must find the
+/// tag on the child row, not on the client's own bookkeeping.
+#[test]
+fn a_child_records_the_thread_that_spawned_it() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-tagged-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "a tagged investigation".into(),
+            mode: None,
+            model: None,
+            thread_id: Some("thread-a".into()),
+            sandbox: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&child)
+            .unwrap()
+            .as_deref(),
+        Some("thread-a"),
+        "the child records the conversation that spawned it"
+    );
+}
+
+/// The marker is inherited through the parent's STORED row, so a grandchild
+/// inherits no matter which entry point created it: the child-spawns-a-child
+/// path passes no marker of its own.
+#[test]
+fn a_grandchild_inherits_its_parents_thread() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-inherited-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "a tagged child".into(),
+            mode: None,
+            model: None,
+            thread_id: Some("thread-a".into()),
+            sandbox: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+    // The child delegates onward through a DIFFERENT entry point, the legacy
+    // session spawn, which carries no marker of its own. Inheritance still
+    // works because the daemon reads the parent's stored row.
+    let descendant = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnChild {
+            workdir: None,
+            session_id,
+            parent_task_id: child_task_id.clone(),
+            objective: "a descendant that names no conversation".into(),
+            mode: None,
+            model: None,
+            sandbox: None,
+        },
+    )
+    .unwrap();
+    let IpcResponse::TaskSpawned {
+        task_id: grandchild_task_id,
+    } = descendant
+    else {
+        panic!("expected a spawned descendant task, got {descendant:?}");
+    };
+
+    let grandchild: TaskId = grandchild_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&grandchild)
+            .unwrap()
+            .as_deref(),
+        Some("thread-a"),
+        "a descendant inherits its parent's conversation when it names none"
+    );
+}
+
+#[test]
+fn an_explicit_thread_overrides_the_inherited_one() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-override-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    // The root itself is bound to a conversation (Task 8 owns that surface in
+    // production); a child that names its own conversation must keep it.
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .set_task_thread_id(&root_task_id.parse().unwrap(), "thread-a")
+        .unwrap();
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "a child that names its own conversation".into(),
+            mode: None,
+            model: None,
+            thread_id: Some("thread-b".into()),
+            sandbox: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&child)
+            .unwrap()
+            .as_deref(),
+        Some("thread-b"),
+        "an explicit marker wins over the one inherited from the parent"
+    );
+}
+
+#[test]
+fn a_child_with_no_thread_and_no_parent_thread_has_none() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "thread-absent-spawn".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached application root");
+    };
+    let IpcResponse::TaskSpawned {
+        task_id: child_task_id,
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id,
+            parent_task_id: root_task_id,
+            capability: message_capability,
+            objective: "an untagged investigation".into(),
+            mode: None,
+            model: None,
+            thread_id: None,
+            sandbox: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a spawned child task");
+    };
+
+    let child: TaskId = child_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_thread_id(&child)
+            .unwrap(),
+        None,
+        "with no marker anywhere the child stays unbound, exactly as before"
     );
 }
 
@@ -5451,7 +5970,7 @@ fn delivered_application_child_over_ipc(
             objective: "Implement the parser".into(),
             mode: Some("coding".into()),
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -5564,7 +6083,7 @@ fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
             objective: "A sibling that must not review".into(),
             mode: Some("read_only".into()),
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -5742,7 +6261,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
             objective: "Rewrite the parser".into(),
             mode: None,
             model: None,
-
+            thread_id: None,
             sandbox: None,
         },
     )
@@ -5833,7 +6352,7 @@ fn inherited_sandbox_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -5869,6 +6388,7 @@ fn inherited_sandbox_is_persisted_and_recovered() {
             "recovery_required",
             "child",
             ChildWriteMode::Coding,
+            None,
             None,
             Some(InheritedSandbox::DangerFullAccess),
         )

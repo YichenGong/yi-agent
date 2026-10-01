@@ -29,6 +29,7 @@ use yi_agent_core::subagent::task::{
     PermissionRequestId, RecoveryEvidence, RootSessionId, TaskFailure, TaskId, TaskState,
     TimeoutKind, WatchdogEvidence as CoreWatchdogEvidence, WorkspaceLeaseId,
 };
+use yi_agent_core::subagent::trace::TraceFact;
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
     WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
@@ -68,6 +69,21 @@ pub enum RuntimeCoordinatorError {
     QueueCapacityExceeded,
     #[error("runtime is draining and rejects new admissions")]
     Draining,
+}
+
+/// The `kind` column for a trace fact.
+///
+/// The store holds no trace vocabulary of its own: the serialized fact is the
+/// whole payload, and this tag names the row for readers that index by kind
+/// instead of parsing every JSON body. The payload repeats the tag inside
+/// `"type"`, which is harmless and expected.
+fn trace_fact_kind(fact: &TraceFact) -> &'static str {
+    match fact {
+        TraceFact::AssistantText { .. } => "assistant_text",
+        TraceFact::ToolCall { .. } => "tool_call",
+        TraceFact::ToolResult { .. } => "tool_result",
+        TraceFact::StateNote { .. } => "state_note",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1043,6 +1059,7 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        thread_id: Option<String>,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
@@ -1053,6 +1070,7 @@ impl RuntimeCoordinator {
             workspace_mode,
             model,
             workdir,
+            thread_id,
             inherited_sandbox,
         )
         .await
@@ -1066,6 +1084,23 @@ impl RuntimeCoordinator {
             .root_task_id()
             .clone();
         Ok(root_id)
+    }
+
+    /// Deletes the trace rows of terminal tasks past the retention window and
+    /// returns how many rows went away.
+    ///
+    /// This is the daemon's maintenance entry point, called from the minute
+    /// tick. The count is observability only: a wedged database is a caller
+    /// concern, not a result this method can hide.
+    pub fn prune_terminal_traces(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize, RuntimeCoordinatorError> {
+        Ok(self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .prune_terminal_traces(now)?)
     }
 
     /// Fires all schedules due at `now` into newly isolated root sessions.
@@ -1171,11 +1206,21 @@ impl RuntimeCoordinator {
             ChildWriteMode::ReadOnly,
             None,
             None,
+            // No conversation marker and no inherited sandbox: this legacy
+            // wrapper predates both.
+            None,
             None,
         )
         .await
     }
 
+    /// Spawns a child and durably records it.
+    ///
+    /// `thread_id` is the conversation marker a UI groups subagents by. It is
+    /// metadata only: it never gates admission or scheduling. An explicit value
+    /// wins; otherwise the child inherits its parent's stored marker, read from
+    /// the parent row so inheritance is transitive no matter which entry point
+    /// created the intermediate task.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child_with_objective(
         &self,
@@ -1185,6 +1230,7 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        thread_id: Option<String>,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
@@ -1203,6 +1249,17 @@ impl RuntimeCoordinator {
         // (which is unrelated to any task). Resolving before the spawn means the
         // supervisor stores the absolute path worker start will look up.
         let workdir = workdir.map(|workdir| self.resolve_parent_workdir(parent, &workdir));
+        // Resolve the marker before the child row is written so the inherited
+        // value lands in the same INSERT as the row: there is no intermediate
+        // state in which the task exists but its marker does not.
+        let thread_id = thread_id.or_else(|| {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .task_thread_id(parent)
+                .ok()
+                .flatten()
+        });
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(
@@ -1246,6 +1303,7 @@ impl RuntimeCoordinator {
                 &objective,
                 workspace_mode,
                 model.clone(),
+                thread_id.as_deref(),
                 inherited_sandbox,
             )?;
         // Auto-registration: the parent prepares the directory (`git worktree
@@ -1293,6 +1351,7 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        thread_id: Option<String>,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
@@ -1303,6 +1362,7 @@ impl RuntimeCoordinator {
                 workspace_mode,
                 model,
                 workdir,
+                thread_id,
                 inherited_sandbox,
             )
             .await?;
@@ -2907,6 +2967,16 @@ impl RuntimeCoordinator {
         let mut watchdog_updates = Vec::new();
         for supervisor in &supervisors {
             let mut supervisor = supervisor.lock().await;
+            // Drain and persist trace facts before the reducer runs. Two
+            // orderings are load-bearing here. Draining first is required
+            // because a terminal or paused transition removes the worker from
+            // `workers`, taking every fact it still buffers with it, so a
+            // later drain would silently drop the terminal note that explains
+            // why the worker stopped. Persisting in the same step, ahead of
+            // the reducer and the transition collection below, keeps the
+            // writes independent: a `?` in either later stage can no longer
+            // discard facts that this drain already took off the worker.
+            self.persist_worker_trace_facts(supervisor.take_worker_trace_events())?;
             watchdog_updates.extend(supervisor.take_worker_watchdog_events());
             let changed = supervisor
                 .reconcile_worker_events()
@@ -3027,6 +3097,31 @@ impl RuntimeCoordinator {
                 repository.transition_task_and_attempt(&task_id, &attempt, state, event)?;
             }
             self.release_resident_lease(&task_id);
+        }
+        Ok(())
+    }
+
+    /// Persists drained worker trace facts in one repository transaction.
+    ///
+    /// Kept apart from the reducer and transition bookkeeping so that draining
+    /// a worker's facts and committing them are a single step: a later `?` in
+    /// the reconcile pass cannot lose facts already taken off a worker, and
+    /// every supervisor's facts are committed before the reducer runs over the
+    /// next supervisor.
+    fn persist_worker_trace_facts(
+        &self,
+        facts: Vec<(TaskId, TraceFact)>,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if facts.is_empty() {
+            return Ok(());
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        for (task_id, fact) in facts {
+            let payload = serde_json::to_string(&fact).map_err(RepositoryError::from)?;
+            repository.append_trace(&task_id, trace_fact_kind(&fact), &payload)?;
         }
         Ok(())
     }

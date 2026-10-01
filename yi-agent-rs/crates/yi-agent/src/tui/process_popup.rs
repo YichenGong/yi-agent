@@ -8,6 +8,7 @@ use yi_agent_tools::{ManagedProcessSnapshot, ProcessReadResult, ProcessStatus};
 pub enum RuntimeTab {
     BashTasks,
     Processes,
+    Agents,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +39,8 @@ impl RuntimeTab {
     pub fn next(self) -> Self {
         match self {
             Self::BashTasks => Self::Processes,
-            Self::Processes => Self::BashTasks,
+            Self::Processes => Self::Agents,
+            Self::Agents => Self::BashTasks,
         }
     }
 }

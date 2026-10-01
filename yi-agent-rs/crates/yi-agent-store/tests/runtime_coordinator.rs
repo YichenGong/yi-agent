@@ -12,13 +12,15 @@ use yi_agent_core::subagent::task::{
     AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox, IntegrationValidation,
     MessageId, PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
+use yi_agent_core::subagent::trace::TraceFact;
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_store::repository::{
-    RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
+    RuntimeEvent, RuntimeRepository, TRACE_TERMINAL_RETENTION_SECS, WatchdogEvidence,
+    WatchdogResourceWait, WatchdogTerminal,
 };
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
 use yi_agent_store::schedule::{
@@ -648,6 +650,7 @@ async fn child_recovery_context_uses_the_in_memory_workspace_assignment() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -696,6 +699,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             &root,
             "Complete the delegated task.".into(),
             ChildWriteMode::Coding,
+            None,
             None,
             None,
             None,
@@ -1905,6 +1909,7 @@ async fn delivered_child_coordinator(
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2527,6 +2532,7 @@ async fn recovered_child_resumes_after_runtime_restart() {
             yi_agent_core::ChildWriteMode::Coding, // Task 5/6 threads the requested mode through here.
             None,
             None,
+            None,
         )
         .unwrap();
     repository.recover_inflight_tasks().unwrap();
@@ -2566,6 +2572,7 @@ async fn recovered_child_keeps_its_inherited_sandbox() {
             "running",
             "Recovered child with a sandbox.",
             ChildWriteMode::Coding,
+            None,
             None,
             Some(InheritedSandbox::DangerFullAccess),
         )
@@ -2672,6 +2679,198 @@ async fn coordinator_persists_worker_failure_reported_by_the_factory() {
     let terminal: serde_json::Value = serde_json::from_str(&terminal).unwrap();
     assert_eq!(terminal["reason"], "worker_failed");
     assert_eq!(terminal["error"], "provider disconnected");
+}
+
+async fn running_child_coordinator(
+    database: &Path,
+    factory: Arc<MessageRecordingFactory>,
+) -> (RuntimeCoordinator, TaskId) {
+    let coordinator = RuntimeCoordinator::open(database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let parent = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    (coordinator, child)
+}
+
+#[tokio::test]
+async fn reconcile_persists_worker_trace_facts() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
+    {
+        let handle = factory.handles.lock().unwrap()[0].clone();
+        handle.report_trace(TraceFact::AssistantText {
+            text: "on it".into(),
+        });
+        handle.report_trace(TraceFact::ToolCall {
+            name: "bash".into(),
+            summary: "cargo test".into(),
+        });
+        handle.report_trace(TraceFact::ToolResult {
+            name: "bash".into(),
+            is_error: false,
+            summary: "ok".into(),
+        });
+        handle.report_trace(TraceFact::StateNote {
+            note: "running".into(),
+        });
+    }
+
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    let rows = repository.trace_after(&child, 0).unwrap();
+    let kinds = rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        ["assistant_text", "tool_call", "tool_result", "state_note"],
+        "every fact is tagged with its own type and kept in order"
+    );
+    assert!(rows[0].payload_json.contains("on it"));
+    assert!(rows[1].payload_json.contains("cargo test"));
+    assert!(rows[3].payload_json.contains("running"));
+    assert!(
+        rows[3].payload_json.contains(r#""type":"state_note""#),
+        "the payload stays self-describing for a reader that ignores `kind`"
+    );
+}
+
+#[tokio::test]
+async fn a_reconciled_trace_survives_a_reopen() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
+    factory.handles.lock().unwrap()[0].report_trace(TraceFact::AssistantText {
+        text: "durable spool".into(),
+    });
+
+    coordinator.reconcile_worker_events().await.unwrap();
+    drop(coordinator);
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    let rows = repository.trace_after(&child, 0).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a persisted fact survives reopening the store"
+    );
+    assert!(rows[0].payload_json.contains("durable spool"));
+}
+
+#[tokio::test]
+async fn reconcile_persists_the_terminal_note_of_a_finishing_worker() {
+    // The drain must run before the state transition, because a terminal (or
+    // paused) transition removes the worker from the supervisor. If the drain
+    // ran after it, this final fact would be lost and the row count would be 0.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
+    let handle = factory.handles.lock().unwrap()[0].clone();
+    handle.report_trace(TraceFact::StateNote {
+        note: "completed".into(),
+    });
+    handle.report_cancelled();
+
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
+    let rows = RuntimeRepository::open(&database)
+        .unwrap()
+        .trace_after(&child, 0)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the fact must be drained before the transition removes the worker"
+    );
+    assert!(rows[0].payload_json.contains("completed"));
+}
+
+#[tokio::test]
+async fn drained_trace_facts_survive_a_later_reducer_error() {
+    // Persistence is independent of the transition bookkeeping: the drain
+    // commits a worker's facts before the reducer runs, so a `?` from a later
+    // stage of the same pass cannot take back rows already drained.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
+    let handle = factory.handles.lock().unwrap()[0].clone();
+    handle.report_trace(TraceFact::StateNote {
+        note: "drained before the reducer tripped".into(),
+    });
+    // No pause was ever requested, so `PauseAcknowledged` makes the reducer
+    // return `Err` and the reconcile pass aborts.
+    handle.report_paused();
+
+    let error = coordinator
+        .reconcile_worker_events()
+        .await
+        .expect_err("the reducer must reject an unsolicited pause acknowledgement");
+    let message = error.to_string();
+    assert!(
+        message.contains("illegal task state transition"),
+        "the pass must abort in the reducer stage, not somewhere else: {message}"
+    );
+
+    let rows = RuntimeRepository::open(&database)
+        .unwrap()
+        .trace_after(&child, 0)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "facts drained and committed before the failing reducer must survive"
+    );
+    assert!(
+        rows[0]
+            .payload_json
+            .contains("drained before the reducer tripped")
+    );
+}
+
+#[tokio::test]
+async fn coordinator_prunes_the_trace_of_a_worker_that_ended() {
+    // This is the daemon minute tick's call. It ties the two halves together:
+    // reconcile persisted the ended worker's note, and the prune that follows
+    // recognises the task as terminal and releases its rows past the window.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let (coordinator, child) = running_child_coordinator(&database, factory.clone()).await;
+    {
+        let handle = factory.handles.lock().unwrap()[0].clone();
+        handle.report_trace(TraceFact::StateNote {
+            note: "cancelled".into(),
+        });
+        handle.report_cancelled();
+    }
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .trace_row_count(&child)
+            .unwrap(),
+        1
+    );
+
+    let beyond_retention = Utc::now() + ChronoDuration::seconds(TRACE_TERMINAL_RETENTION_SECS + 1);
+    assert_eq!(
+        coordinator.prune_terminal_traces(beyond_retention).unwrap(),
+        1
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .trace_row_count(&child)
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -3646,6 +3845,7 @@ async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
             None,
             Some(prepared.clone()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3743,6 +3943,7 @@ async fn mode_only_changes_write_access_not_the_directory() {
             None,
             Some(project_root.clone()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3797,6 +3998,7 @@ async fn a_relative_workdir_resolves_against_the_parents_position() {
             ChildWriteMode::Coding,
             None,
             Some(std::path::PathBuf::from("sub")),
+            None,
             None,
         )
         .await
@@ -4148,6 +4350,7 @@ async fn inherited_sandbox_is_persisted_and_threaded_to_the_worker() {
             &root,
             "child".into(),
             ChildWriteMode::ReadOnly,
+            None,
             None,
             None,
             Some(InheritedSandbox::DangerFullAccess),
