@@ -7,5 +7,6 @@ pub mod board;
 pub mod card_id;
 pub mod calendar;
 pub mod card;
+pub mod inbox;
 pub mod promotion;
 pub mod switch;
