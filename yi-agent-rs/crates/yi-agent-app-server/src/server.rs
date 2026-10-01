@@ -1126,6 +1126,7 @@ where
                             updated_at: now,
                             title: None,
                             permission_mode: mode,
+                            pin_seq: None,
                         };
                         if let Err(e) = thread_store.create(&meta) {
                             // 持久化是尽力而为:写失败不阻断 thread 创建。
