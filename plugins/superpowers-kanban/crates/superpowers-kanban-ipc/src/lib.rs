@@ -5,4 +5,5 @@
 
 pub mod client;
 pub mod server;
+pub mod socket;
 pub mod wire;

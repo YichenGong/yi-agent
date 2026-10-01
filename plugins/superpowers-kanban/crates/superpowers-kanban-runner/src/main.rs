@@ -322,7 +322,15 @@ impl superpowers_kanban_ipc::server::Dispatch for QueryDispatch {
 /// 进程退出即随之消失，不需要显式 join。
 fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
-    let socket = superpowers_kanban_ipc::server::socket_path(state_dir);
+    let socket = match superpowers_kanban_ipc::server::socket_path(state_dir) {
+        Ok(socket) => socket,
+        Err(error) => {
+            // 深到回退也放不下：静默下去只会让看板 UI 显示「插件不存在」。
+            eprintln!("superpowers-kanban: query server disabled: {error}");
+            return stop;
+        }
+    };
+    eprintln!("superpowers-kanban: query socket at {}", socket.display());
     let dispatch = Arc::new(QueryDispatch {
         state_dir: state_dir.to_path_buf(),
     });
@@ -344,7 +352,14 @@ fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
 /// 周期性推进队列，直到进程被杀。
 fn run_daemon(args: Args) {
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
-    let socket = superpowers_kanban_ipc::client::socket_path(&args.runtime_dir);
+    let socket = match superpowers_kanban_ipc::client::socket_path(&args.runtime_dir) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("superpowers-kanban: cannot locate the daemon socket: {error}");
+            return;
+        }
+    };
+    eprintln!("superpowers-kanban: daemon socket at {}", socket.display());
     let daemon = BoardDaemon::new(socket);
     let board_path = args.state_dir.join("board.json");
 
