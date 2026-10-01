@@ -118,6 +118,36 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
     }
 }
 
+/// 由一对路径派生卡片 id：取两文件名主干，非字母数字折叠为 `-`。
+fn card_id_for(spec: &str, plan: &str) -> String {
+    let stem = |path: &str| {
+        std::path::Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    let slug = |text: &str| {
+        let mut out = String::new();
+        let mut last_dash = false;
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+                last_dash = false;
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+        out.trim_matches('-').to_string()
+    };
+    let id = format!("{}-{}", slug(&stem(spec)), slug(&stem(plan)));
+    if id == "-" || id.is_empty() {
+        "card".to_string()
+    } else {
+        id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,35 +292,5 @@ mod tests {
             Some(yi_agent_board_ui::switch::BoardSwitch::Enabled),
             "a runtime-pref save must not clobber the board switch in preferences.json"
         );
-    }
-}
-
-/// 由一对路径派生卡片 id：取两文件名主干，非字母数字折叠为 `-`。
-fn card_id_for(spec: &str, plan: &str) -> String {
-    let stem = |path: &str| {
-        std::path::Path::new(path)
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_default()
-    };
-    let slug = |text: &str| {
-        let mut out = String::new();
-        let mut last_dash = false;
-        for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() {
-                out.push(ch.to_ascii_lowercase());
-                last_dash = false;
-            } else if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        }
-        out.trim_matches('-').to_string()
-    };
-    let id = format!("{}-{}", slug(&stem(spec)), slug(&stem(plan)));
-    if id == "-" || id.is_empty() {
-        "card".to_string()
-    } else {
-        id
     }
 }
