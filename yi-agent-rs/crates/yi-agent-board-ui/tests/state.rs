@@ -111,3 +111,17 @@ fn an_empty_workdir_falls_back_to_the_plan_path() {
         "an empty workdir is not a location"
     );
 }
+
+#[test]
+fn a_mixed_case_state_is_lowercased_for_the_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    write_board(
+        dir.path(),
+        r#"{"cards":[{"id":"c","spec_path":"c.spec.md","plan_path":"c.plan.md","state":"Awaiting_Merge","enqueued_at":"2026-10-01T09:00:00+08:00","order":0}],"next_order":1}"#,
+    );
+    let cards = load_cards(dir.path());
+    assert_eq!(
+        cards[0].state, "awaiting_merge",
+        "the UI shows the state in lowercase, matching the TS reader"
+    );
+}

@@ -32,11 +32,21 @@ describe("parseBoard", () => {
     expect(cards[0].detail).toBe("/w");
   });
 
-  it("falls back to the plan path when there is no workdir", () => {
+  it("falls back to the plan path when workdir is missing", () => {
     const cards = parseBoard(
       JSON.stringify({ cards: [{ id: "a", plan_path: "a.plan.md", state: "Queued", order: 0 }] }),
     );
     expect(cards[0].detail).toBe("a.plan.md");
+  });
+
+  it("lowercases a mixed-case state", () => {
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [{ id: "c", plan_path: "c.plan.md", state: "Awaiting_Merge", order: 0 }],
+        next_order: 1,
+      }),
+    );
+    expect(cards[0].state).toBe("awaiting_merge");
   });
 
   it("returns nothing for corrupt input instead of throwing", () => {
