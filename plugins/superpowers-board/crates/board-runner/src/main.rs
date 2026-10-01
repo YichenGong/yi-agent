@@ -147,3 +147,21 @@ fn main() {
         std::thread::sleep(args.interval);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_sample_calendar_expresses_the_three_and_ten_windows() {
+        use board_core::calendar::ConcurrencyCalendar;
+        let text = include_str!("../../../kanban.toml");
+        let calendar = ConcurrencyCalendar::from_toml(text).unwrap();
+        use chrono::{Datelike, Local, TimeZone, Weekday};
+        let at = |y, m, d, h| Local.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap();
+        // 2026-10-01 是周四；2026-10-03 是周六；2026-10-04 是周日。
+        assert_eq!(at(2026, 10, 1, 10).weekday(), Weekday::Thu);
+        assert_eq!(calendar.limit_at(at(2026, 10, 1, 10)), 3, "周四上午 = 3");
+        assert_eq!(calendar.limit_at(at(2026, 10, 1, 3)), 10, "周四凌晨 = 10");
+        assert_eq!(calendar.limit_at(at(2026, 10, 3, 12)), 10, "周六全天 = 10");
+        assert_eq!(calendar.limit_at(at(2026, 10, 4, 12)), 10, "周日全天 = 10");
+    }
+}
