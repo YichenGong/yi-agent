@@ -111,6 +111,17 @@ impl RuntimeBinding {
         Ok(self.lock_state().handle.clone())
     }
 
+    /// The current handle and the generation that produced it, read from one
+    /// state snapshot.
+    ///
+    /// Reading both under a single lock matters: a caller that caches something
+    /// keyed on the generation must be sure the handle it pairs it with came from
+    /// that very generation.
+    pub(crate) fn current_with_generation(&self) -> (RuntimeHandle, u64) {
+        let state = self.lock_state();
+        (state.handle.clone(), state.generation)
+    }
+
     /// How many replacement runtimes this binding has installed.
     ///
     /// Starts at 0 and is bumped by every `repair()` that adopts a fresh runtime.
@@ -134,6 +145,11 @@ impl RuntimeBinding {
 
     /// Brings the runtime back up (single-flight) and adopts the result.
     pub fn repair(&self) -> Result<RuntimeHandle, String> {
+        self.repair_with_generation().map(|(handle, _generation)| handle)
+    }
+
+    /// Like `repair`, but also reports the generation of the runtime adopted.
+    fn repair_with_generation(&self) -> Result<(RuntimeHandle, u64), String> {
         let Some(plan) = &self.repair else {
             return Err("this runtime binding cannot be repaired".to_string());
         };
@@ -143,8 +159,11 @@ impl RuntimeBinding {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Another thread may have finished repairing while we waited for the
         // flight lock; if so, adopt its result instead of starting a second daemon.
-        if attach::probe_runtime(&self.current()?.socket_path) == attach::RuntimeProbe::Healthy {
-            return self.current();
+        {
+            let state = self.lock_state();
+            if attach::probe_runtime(&state.handle.socket_path) == attach::RuntimeProbe::Healthy {
+                return Ok((state.handle.clone(), state.generation));
+            }
         }
         let fresh = attach::ensure_owned_runtime(&plan.cfg, plan.runtime_dir.clone())
             .map_err(|failure| format!("{}: {}", failure.stage, failure.cause))?;
@@ -155,7 +174,7 @@ impl RuntimeBinding {
         // A replacement runtime sweeps the old one's roots away; record the
         // boundary so callers that cached a root can notice it is stale.
         state.generation = state.generation.wrapping_add(1);
-        Ok(handle)
+        Ok((handle, state.generation))
     }
 
     /// Current if usable, else repair.
@@ -172,12 +191,28 @@ impl RuntimeBinding {
     where
         F: Fn(&RuntimeHandle) -> IpcRequest,
     {
-        let handle = self.current_or_repair()?;
+        self.send_with_generation(build)
+            .map(|(response, _generation)| response)
+    }
+
+    /// Like `send`, but also reports the generation of the runtime that served
+    /// the request.
+    ///
+    /// The generation comes from the same snapshot as the handle, so an answer
+    /// can never be attributed to a runtime other than the one that produced it
+    /// -- a repair racing with the request cannot make a stale result look fresh.
+    pub(crate) fn send_with_generation<F>(&self, build: F) -> Result<(IpcResponse, u64), String>
+    where
+        F: Fn(&RuntimeHandle) -> IpcRequest,
+    {
+        let (handle, generation) = self.current_with_generation();
         match send_request(&handle.socket_path, build(&handle)) {
-            Ok(response) => Ok(response),
+            Ok(response) => Ok((response, generation)),
             Err(error) if is_liveness_error(&error) => {
-                let handle = self.repair()?;
-                send_request(&handle.socket_path, build(&handle)).map_err(|e| e.to_string())
+                let (handle, generation) = self.repair_with_generation()?;
+                send_request(&handle.socket_path, build(&handle))
+                    .map(|response| (response, generation))
+                    .map_err(|e| e.to_string())
             }
             Err(error) => Err(error.to_string()),
         }

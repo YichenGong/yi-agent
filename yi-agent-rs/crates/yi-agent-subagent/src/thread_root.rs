@@ -103,13 +103,17 @@ impl ThreadRoot {
         if self.live_cached_root(generation).is_some() {
             return Ok(());
         }
-        // `send` repairs and retries once on a liveness failure, so a daemon that
-        // died while a root was cached is recovered instead of surfacing a raw
-        // transport error.
-        let response = self.binding.send(|_handle| IpcRequest::AttachApplicationRoot {
-            idempotency_key: application_root_key(&self.thread_id),
-            workspace: self.project_dir.clone(),
-        })?;
+        // The binding repairs and retries once on a liveness failure, so a daemon
+        // that died while a root was cached is recovered instead of surfacing a
+        // raw transport error. The generation comes back together with the answer,
+        // naming the runtime that actually served this mint -- never a later one a
+        // concurrent repair may have installed in the meantime.
+        let (response, generation) =
+            self.binding
+                .send_with_generation(|_handle| IpcRequest::AttachApplicationRoot {
+                    idempotency_key: application_root_key(&self.thread_id),
+                    workspace: self.project_dir.clone(),
+                })?;
         let IpcResponse::ApplicationRootAttached {
             session_id,
             root_task_id,
@@ -119,11 +123,8 @@ impl ThreadRoot {
         else {
             return Err(format!("daemon rejected the conversation root: {response:?}"));
         };
-        // Stamp the root with the generation that minted it. A repair may have
-        // run mid-request; re-read the generation afterwards so a root is never
-        // recorded against a runtime newer than the one that answered.
         *self.lock_cached() = Some(CachedRoot {
-            generation: self.binding.generation(),
+            generation,
             root: AttachedRoot {
                 session_id,
                 task_id: root_task_id,
@@ -140,9 +141,12 @@ impl ThreadRoot {
         // attach() mints or repairs the root against the live runtime, so the
         // root it leaves cached belongs to the live generation.
         self.attach()?;
-        let shared = self.binding.current()?;
+        // Read the socket and the generation from one snapshot: if a repair lands
+        // after this, the generation moves and the cache is invalidated, so the
+        // next call re-attaches rather than serving a root this socket never knew.
+        let (shared, generation) = self.binding.current_with_generation();
         let root = self
-            .live_cached_root(self.binding.generation())
+            .live_cached_root(generation)
             .ok_or_else(|| "the conversation root is not attached".to_string())?;
         Ok(RuntimeHandle {
             socket_path: shared.socket_path,
