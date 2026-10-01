@@ -146,3 +146,26 @@ export interface WorkspaceGroup {
   exists: boolean;
   threads: ThreadSummary[];
 }
+
+/**
+ * `thread/clear` 的参数与结果。清空该 thread 的 agent 上下文并截断持久化日志，
+ * 保留 thread 身份（标题 / cwd / 模型）。
+ */
+export interface ThreadClearParams {
+  threadId: string;
+}
+export type ThreadClearResult = Record<string, never>;
+
+/**
+ * `thread/compact` 的参数与结果。`status` 三态：
+ * - `compacted`   —— 已压缩
+ * - `not_reduced` —— 历史太短，无需压缩（不是错误）
+ * - `failed`      —— 压缩失败，`error` 带原因
+ */
+export interface ThreadCompactParams {
+  threadId: string;
+}
+export interface ThreadCompactResult {
+  status: "compacted" | "not_reduced" | "failed";
+  error?: string;
+}
