@@ -4,4 +4,5 @@
 //! 安装与卸载。协议版本在信封里校验，不匹配即报错，不做兼容猜测。
 
 pub mod client;
+pub mod server;
 pub mod wire;

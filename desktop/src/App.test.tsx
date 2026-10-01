@@ -681,12 +681,20 @@ describe("App Superpowers 看板 enqueue", () => {
 
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
-        method: "superpowers-kanban/enqueue",
-        params: { spec_path: "/p/a.spec.md", plan_path: "/p/a.plan.md" },
+        method: "plugin/query",
+        params: {
+          plugin: "superpowers-kanban",
+          method: "enqueue",
+          params: { spec_path: "/p/a.spec.md", plan_path: "/p/a.plan.md" },
+        },
       }),
     );
     expect(
-      clients[0].requests.filter((r) => r.method === "superpowers-kanban/enqueue"),
+      clients[0].requests.filter(
+        (r) =>
+          r.method === "plugin/query" &&
+          (r.params as { method?: string })?.method === "enqueue",
+      ),
     ).toHaveLength(1);
   });
 
@@ -699,12 +707,16 @@ describe("App Superpowers 看板 enqueue", () => {
 
     await waitFor(() => expect(state.picks).toHaveLength(0));
     expect(
-      clients[0].requests.filter((r) => r.method === "superpowers-kanban/enqueue"),
+      clients[0].requests.filter(
+        (r) =>
+          r.method === "plugin/query" &&
+          (r.params as { method?: string })?.method === "enqueue",
+      ),
     ).toHaveLength(0);
   });
 
   it("surfaces a rejected enqueue instead of crashing", async () => {
-    state.rejectCode["superpowers-kanban/enqueue"] = -32000;
+    state.rejectCode["plugin/query"] = -32000;
     render(<App />);
     await screen.findByRole("button", { name: "加入看板" });
 

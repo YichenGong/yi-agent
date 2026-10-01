@@ -29,7 +29,7 @@
 - Produces: `IpcRequest::PluginQuery { plugin: String, method: String, params: Value }`
   与 `IpcResponse::PluginResult { value: Value }`；`PROTOCOL_VERSION` 递增。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 // 1. PluginQuery 能 round-trip 编解码（params 原样保留）
@@ -37,14 +37,14 @@
 // 3. 旧 PROTOCOL_VERSION 的请求被拒绝（既有拒绝路径不得被新变体绕过）
 ```
 
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
   - 加两个变体；`PROTOCOL_VERSION` +1。
   - `respond(...)` 里 `PluginQuery` 分支：查"插件名 → socket"映射；查不到 →
     `Err(IpcError::...)` 结构化错误；查到则转发（Task 3 落地真实转发，本步可先返回
     `unimplemented` 的结构化错误并测试它）。
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -57,7 +57,7 @@
 **Interfaces:**
 - Produces: `SupervisorManifest::query_socket: Option<PathBuf>`；占位符展开（`{state_dir}` 等）与 `args` 同款。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 // 1. 清单带 query_socket 时解析成功，且占位符被展开
@@ -65,10 +65,10 @@
 // 3. 插件清单声明的 socket 路径 == <state_dir>/superpowers-kanban.sock
 ```
 
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -83,11 +83,11 @@
 - Produces: 把 `PluginQuery` 转发到清单声明的 socket，把插件的回包包成
   `IpcResponse::PluginResult { value }`；任何失败都是结构化 `IpcError`。
 
-- [ ] **Step 1: 写失败测试**（起一个假插件 socket，断言：原样转发、原样返回、错误可区分）
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**（注意：`respond` 目前是同步的；socket 往返要有**超时**，否则插件卡住会拖死 daemon 请求线程）
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 1: 写失败测试**（起一个假插件 socket，断言：原样转发、原样返回、错误可区分）
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**（注意：`respond` 目前是同步的；socket 往返要有**超时**，否则插件卡住会拖死 daemon 请求线程）
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -103,13 +103,13 @@
   `list` / `enqueue` / `switch.read` / `switch.write`。复用 Task 2（Spec 2）已下沉的
   `card_id_for` / `deliver_card` / `write_layer` / `read_layer`，以及 `persist::load_board`。
 
-- [ ] **Step 1: 写失败测试**（对 `dispatch(method, params) -> Result<Value, String>` 的纯函数测试；
+- [x] **Step 1: 写失败测试**（对 `dispatch(method, params) -> Result<Value, String>` 的纯函数测试；
   每个方法一组：`list` 返回卡片数组；`enqueue` 校验失败返回错误且不落盘；
   `switch.read` 返回解析后的值与来源；`switch.write` 写项目层）
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**（dispatch 与 socket 循环分开：socket 层只做编解码，逻辑全在可测的 dispatch）
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**（dispatch 与 socket 循环分开：socket 层只做编解码，逻辑全在可测的 dispatch）
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -124,11 +124,11 @@
 **Interfaces:**
 - Produces: 桌面端经 `plugin/query` 拿状态；**不存在**"插件未安装"以外的看板语义在 app-server 里。
 
-- [ ] **Step 1: 写失败测试**（桌面端：转发参数正确；插件未安装 → 显示"插件未安装"文案）
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 1: 写失败测试**（桌面端：转发参数正确；插件未安装 → 显示"插件未安装"文案）
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
+- [x] **Step 4: 运行确认通过** → PASS
+- [x] **Step 5: Commit**
 
 ---
 
@@ -139,15 +139,15 @@
 - Delete: `yi-agent-rs/crates/yi-agent-board-ui/`
 - Modify: 两处 `Cargo.toml`（去掉依赖）、工作区 `Cargo.toml`
 
-- [ ] **Step 1: TUI 改经 daemon → 插件取状态、投递、读写开关**
-- [ ] **Step 2: 删除 crate 与依赖**
-- [ ] **Step 3: 编译期验收**
+- [x] **Step 1: TUI 改经 daemon → 插件取状态、投递、读写开关**
+- [x] **Step 2: 删除 crate 与依赖**
+- [x] **Step 3: 编译期验收**
 
 Run: `grep -rn "yi_agent_board_ui\|yi-agent-board-ui" yi-agent-rs/ --include=*.rs --include=*.toml`
 Expected: 空
 
-- [ ] **Step 4: 全量回归**（主工作区 60 套件 + 插件 + 桌面端）
-- [ ] **Step 5: Commit**
+- [x] **Step 4: 全量回归**（主工作区 60 套件 + 插件 + 桌面端）
+- [x] **Step 5: Commit**
 
 ---
 

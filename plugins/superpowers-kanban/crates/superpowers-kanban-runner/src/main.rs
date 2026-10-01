@@ -10,6 +10,8 @@
 //! `run` 只做一件事：周期性推进队列。安装 = 放这个二进制；卸载 = 删掉它。
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use superpowers_kanban_core::calendar::ConcurrencyCalendar;
@@ -305,12 +307,49 @@ fn main() {
     }
 }
 
+/// 把插件的查询入口接到 `dispatch` 上。
+struct QueryDispatch {
+    state_dir: PathBuf,
+}
+
+impl superpowers_kanban_ipc::server::Dispatch for QueryDispatch {
+    fn dispatch(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        superpowers_kanban_runner::dispatch::dispatch(&self.state_dir, method, params)
+    }
+}
+
+/// 起查询服务线程。跑在自己的线程里，慢客户端不能拖住推进循环；
+/// 进程退出即随之消失，不需要显式 join。
+fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let socket = superpowers_kanban_ipc::server::socket_path(state_dir);
+    let dispatch = Arc::new(QueryDispatch {
+        state_dir: state_dir.to_path_buf(),
+    });
+    let keep_going = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        if let Err(error) = superpowers_kanban_ipc::server::serve_with(
+            &socket,
+            dispatch,
+            || !keep_going.load(Ordering::SeqCst),
+        ) {
+            eprintln!(
+                "superpowers-kanban: query server stopped: {error} (queries will be refused)"
+            );
+        }
+    });
+    stop
+}
+
 /// 周期性推进队列，直到进程被杀。
 fn run_daemon(args: Args) {
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     let socket = superpowers_kanban_ipc::client::socket_path(&args.runtime_dir);
     let daemon = BoardDaemon::new(socket);
     let board_path = args.state_dir.join("board.json");
+
+    // 查询通道与推进循环互不阻塞：宿主问状态时队列照常在动。
+    let _query_server = start_query_server(&args.state_dir);
 
     loop {
         if !board_switch(&args.state_dir).is_enabled() {

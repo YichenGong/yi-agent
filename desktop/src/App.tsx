@@ -31,6 +31,7 @@ import {
   type SwitchSource,
   enqueueBoardCard,
   fetchBoard,
+  pluginIsUnavailable,
   readBoardSwitch,
   setBoardSwitch,
 } from "./lib/superpowersKanbanSwitch";
@@ -99,6 +100,9 @@ export default function App() {
   const [boardOn, setBoardOn] = useState(false);
   const [boardSource, setBoardSource] = useState<SwitchSource>("default");
   const [boardCards, setBoardCards] = useState<BoardCardDto[]>([]);
+  // The plugin answers every board question, so an unanswered query means it is
+  // not installed. Distinct from "installed and empty".
+  const [boardPluginMissing, setBoardPluginMissing] = useState(false);
   // Collapsed board panel. Deliberately not persisted: every launch starts
   // expanded, and the switch state is independent of the panel being folded.
   const [kanbanCollapsed, setKanbanCollapsed] = useState(false);
@@ -437,8 +441,11 @@ export default function App() {
         setBoardOn(sw.on);
         setBoardSource(sw.source);
         setBoardCards(cards);
-      } catch {
-        /* 看板读取失败绝不影响主流程 */
+        setBoardPluginMissing(false);
+      } catch (error) {
+        // 看板读取失败绝不影响主流程。但「插件不在」值得说清楚：那意味着
+        // 看板根本没有后端，而不是「装好了但没有卡片」。
+        if (pluginIsUnavailable(error)) setBoardPluginMissing(true);
       }
     };
     void refreshBoard();
@@ -630,7 +637,12 @@ export default function App() {
               pickFile={pickFile}
               enqueue={(spec, plan) => enqueueBoardCard(boardRpc, spec, plan)}
             />
-            <SuperpowersKanbanView switchOn={boardOn} source={boardSource} cards={boardCards} />
+            <SuperpowersKanbanView
+              switchOn={boardOn}
+              source={boardSource}
+              cards={boardCards}
+              pluginMissing={boardPluginMissing}
+            />
           </div>
         )}
         <div className="relative flex min-w-0 flex-1 flex-col">

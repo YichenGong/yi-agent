@@ -7,3 +7,4 @@ pub mod tick;
 
 pub mod persist;
 pub mod worktree;
+pub mod dispatch;

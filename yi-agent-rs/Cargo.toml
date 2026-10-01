@@ -12,7 +12,6 @@ members = [
     "crates/yi-agent-runtime",
     "crates/yi-agent-app-server",
     "crates/yi-agent-subagent",
-    "crates/yi-agent-board-ui",
     "crates/yi-agent-supervisors",
 ]
 
@@ -36,7 +35,6 @@ yi-agent-skills = { path = "crates/yi-agent-skills" }
 yi-agent-runtime = { path = "crates/yi-agent-runtime" }
 yi-agent-app-server = { path = "crates/yi-agent-app-server" }
 yi-agent-subagent = { path = "crates/yi-agent-subagent" }
-yi-agent-board-ui = { path = "crates/yi-agent-board-ui" }
 
 # 共享公共依赖
 tokio = { version = "1", features = ["full"] }

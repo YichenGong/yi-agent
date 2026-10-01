@@ -499,8 +499,14 @@ pub(crate) fn serve_supervisor(workdir: &std::path::Path) -> SupervisorHandle {
         let mut supervisor = yi_agent_supervisors::supervisor::Supervisor::new(layout);
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
             supervisor.reconcile();
+            // Republish the plugins that declared a query socket and are actually
+            // running. The store owns the forwarding table but knows nothing about
+            // manifests; this loop is the only place that can see both.
+            yi_agent_store::ipc::register_plugin_sockets(supervisor.query_sockets());
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
+        // Nothing is running any more, so nothing is reachable.
+        yi_agent_store::ipc::clear_plugin_sockets();
         supervisor.stop_all();
     });
     SupervisorHandle {
@@ -2888,7 +2894,10 @@ mod tests {
             serde_json::json!({"type": "Error", "code": "internal"})
         };
         let body = serde_json::json!({
-            "protocol_version": 1,
+            // Speak the version the real client accepts: a stale literal would
+            // make the response a protocol mismatch instead of an `internal`
+            // answer, and these tests are about the latter.
+            "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
             "request_id": request_id,
             "result": result,
         });
