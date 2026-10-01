@@ -674,6 +674,50 @@ mod tests {
         let _ = rt.block_on(setup.process_manager.shutdown());
     }
 
+    /// Pins the invariant the test above only *names*: the manager exposed as
+    /// `setup.process_manager` must be the very same `Arc` the registry's
+    /// `process_start` tool drives. The previous test starts a process through
+    /// `setup.process_manager` and then lists that same instance, so it stays
+    /// green even if `build_tool_setup` registered a *second, independent*
+    /// manager while returning a different one — precisely the forbidden
+    /// refactor. Here the probe is started *through the registry's own tool*
+    /// and must then be visible via `setup.process_manager.list()`; that can
+    /// only hold while both hold one manager.
+    #[test]
+    fn tool_setup_process_start_tool_shares_the_returned_manager() {
+        let mut cfg = sample_config();
+        // Same fixture rule as the test above: a *named* `TempDir` must outlive
+        // the test, because the manager canonicalizes this root on `start`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        cfg.workdir = tmp.path().to_path_buf();
+        let setup = build_tool_setup(&cfg, false).expect("build setup");
+
+        let tool = setup.tools.get("process_start").expect("registered");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(tool.call(serde_json::json!({
+            "command": "sleep 30",
+            "name": "t1-arc-probe",
+        })));
+        assert!(
+            !result.is_error,
+            "process_start through the registry failed: {:?}",
+            result.content
+        );
+        // The registry tool started the process in *its* manager; finding it
+        // here proves that manager is the one `ToolSetup` returned.
+        assert!(
+            setup
+                .process_manager
+                .list()
+                .iter()
+                .any(|p| p.name.as_deref() == Some("t1-arc-probe")),
+            "the manager returned by ToolSetup is not the one backing the registry's process_start"
+        );
+        // Teardown on the SAME runtime (the reader/waiter tasks live on it):
+        // `on_exit` defaults to Kill, so `shutdown()` reaps the `sleep 30`.
+        let _ = rt.block_on(setup.process_manager.shutdown());
+    }
+
     #[test]
     fn build_tool_setup_naked_is_empty() {
         let cfg = sample_config();
