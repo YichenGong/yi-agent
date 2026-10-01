@@ -6,16 +6,6 @@ use yi_agent_core::subagent::task::{
 };
 use yi_agent_store::repository::{RepositoryError, RuntimeEvent, RuntimeRepository};
 
-fn persisted_root(repository: &mut RuntimeRepository) -> (RootSessionId, TaskId, AttemptId) {
-    let session = RootSessionId::new();
-    let task = TaskId::new();
-    let attempt = AttemptId::new();
-    repository
-        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
-        .unwrap();
-    (session, task, attempt)
-}
-
 #[test]
 fn permission_resolution_is_an_atomic_audited_task_transition() {
     let directory = TempDir::new().unwrap();

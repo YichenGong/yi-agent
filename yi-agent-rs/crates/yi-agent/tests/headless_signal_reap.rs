@@ -44,9 +44,8 @@ fn spawn_mock_gateway(port: u16, probe_cmd: &str) -> std::thread::JoinHandle<()>
             } else {
                 let args = serde_json::json!({ "command": cmd, "timeout": 600 }).to_string();
                 vec![
-                    format!(
-                        r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"c1","function":{{"name":"bash","arguments":""}}}}]}}}}]}}"#
-                    ),
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":""}}]}}]}"#
+                        .to_string(),
                     format!(
                         r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"function":{{"arguments":{}}}}}]}}}}]}}"#,
                         serde_json::to_string(&args).unwrap()
