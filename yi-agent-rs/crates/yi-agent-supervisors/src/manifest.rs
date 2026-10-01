@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use serde::Deserialize;
 
 /// 清单解析失败的原因。
@@ -78,18 +80,25 @@ impl SupervisorManifest {
     }
 
     /// 展开查询 socket 的占位符。未声明 → `None`。
+    /// 展开查询 socket 的占位符，并按**插件通道**的规则做长度回退。未声明 → `None`。
+    ///
+    /// 深路径下直接拼接会超过 `sun_path` 上限，插件根本 bind 不上，而转发表若仍
+    /// 指向那条长路径，daemon 就会一直答「插件不可用」。规则必须与插件侧
+    /// `superpowers-kanban-ipc::socket::plugin_socket_for` 完全一致：哈希**展开后的
+    /// 直接路径**（不是目录），前缀 `plugin-`。两边拿到的是同一个字符串，因此对得上。
     pub fn query_socket_path(
         &self,
         workdir: &Path,
         state_dir: &Path,
         runtime_dir: &Path,
-    ) -> Option<PathBuf> {
+    ) -> Option<Result<PathBuf, SocketPathTooLong>> {
         let raw = self.query_socket.as_ref()?;
-        Some(PathBuf::from(
+        let expanded = PathBuf::from(
             raw.replace("{workdir}", &workdir.to_string_lossy())
                 .replace("{state_dir}", &state_dir.to_string_lossy())
                 .replace("{runtime_dir}", &runtime_dir.to_string_lossy()),
-        ))
+        );
+        Some(resolve_plugin_socket(&expanded))
     }
 
     /// 展开 `{workdir}` / `{state_dir}` / `{runtime_dir}` 占位。
@@ -101,6 +110,55 @@ impl SupervisorManifest {
         };
         self.args.iter().map(|arg| expand(arg)).collect()
     }
+}
+
+/// 查询 socket 回退后仍超长。
+///
+/// 与插件侧 `superpowers-kanban-ipc::socket::SocketPathError` 是同一件事的两份
+/// 实现——插件零 `yi-agent-*` 依赖，规则只能各自手写，靠跨端一致性测试锁住。
+#[derive(Debug)]
+pub struct SocketPathTooLong {
+    pub path: String,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for SocketPathTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "query socket path is {} bytes after fallback, over the {}-byte limit: {}",
+            self.path.len(),
+            self.limit,
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for SocketPathTooLong {}
+
+/// `sun_path` 上限（不含结尾 NUL）。与插件侧同值。
+pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+
+/// 插件通道的 socket 规则：直通 → `$TMPDIR/plugin-<sha256(直接路径)[..16]>.sock` → 报错。
+///
+/// **不要**把它和 `yi-agent-store::ipc::socket_path_for` 合并：后者是 daemon 自己的
+/// socket，前缀 `yi-agent-`、哈希 `runtime_dir`，用途不同。
+fn resolve_plugin_socket(direct: &Path) -> Result<PathBuf, SocketPathTooLong> {
+    if direct.as_os_str().len() <= MAX_SOCKET_PATH_BYTES {
+        return Ok(direct.to_path_buf());
+    }
+
+    let digest = Sha256::digest(direct.as_os_str().as_encoded_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let fallback = std::env::temp_dir().join(format!("plugin-{}.sock", &hex[..16]));
+
+    if fallback.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+        return Err(SocketPathTooLong {
+            path: fallback.display().to_string(),
+            limit: MAX_SOCKET_PATH_BYTES,
+        });
+    }
+    Ok(fallback)
 }
 
 /// 读清单目录：目录缺失→空；单个文件坏→跳过并记 warning（绝不 panic）。
@@ -220,12 +278,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            manifest.query_socket_path(
+            manifest
+                .query_socket_path(
+                    Path::new("/proj"),
+                    Path::new("/proj/.yi-agent/state"),
+                    Path::new("/proj/.yi-agent/runtime"),
+                )
+                .expect("declared")
+                .expect("short path stays"),
+            std::path::PathBuf::from("/proj/.yi-agent/state/demo.sock")
+        );
+    }
+
+    /// 读宿主与插件共用的 socket 契约（**与插件 `socket.rs` 是同一份文件**）。
+    ///
+    /// 运行时读取而非 `include_str!`：插件是可独立安装/卸载的，宿主单独 checkout
+    /// 时这个目录可能不存在，编译期依赖会让宿主构建直接失败。这里文件缺失就
+    /// 跳过——本测试锁的是「monorepo 内两侧一致」，不是宿主的构建前提。
+    fn contract() -> Option<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../plugins/superpowers-kanban/crates/superpowers-kanban-ipc/contract/plugin-socket.json");
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn contract_str(contract: &str, key: &str) -> String {
+        let needle = format!("\"{key}\": \"");
+        let start = contract.find(&needle).expect("contract key") + needle.len();
+        contract[start..].split('"').next().unwrap().to_string()
+    }
+
+    fn contract_usize(contract: &str, key: &str) -> usize {
+        let needle = format!("\"{key}\": ");
+        let start = contract.find(&needle).expect("contract key") + needle.len();
+        contract[start..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_query_socket_matches_the_shared_contract() {
+        let Some(contract) = contract() else {
+            return; // 宿主单独 checkout：没有插件目录，无从对照。
+        };
+        // 契约里的模板与目录，还原出插件会去 bind 的直接路径。
+        let template = contract_str(&contract, "query_socket_template");
+        let state_dir = contract_str(&contract, "state_dir");
+        let expanded = template.replace("{state_dir}", &state_dir);
+        assert_eq!(
+            expanded,
+            contract_str(&contract, "expected_direct_path"),
+            "契约自相矛盾：模板展开后应等于 expected_direct_path"
+        );
+
+        let manifest = SupervisorManifest::parse(&format!(
+            r#"{{"name":"superpowers-kanban","command":"c","args":[],"switch_key":"k",
+                "query_socket":"{template}"}}"#
+        ))
+        .unwrap();
+
+        let socket = manifest
+            .query_socket_path(
                 Path::new("/proj"),
-                Path::new("/proj/.yi-agent/state"),
+                Path::new(&state_dir),
                 Path::new("/proj/.yi-agent/runtime"),
-            ),
-            Some(std::path::PathBuf::from("/proj/.yi-agent/state/demo.sock"))
+            )
+            .expect("declared")
+            .expect("falls back");
+
+        assert!(socket.as_os_str().len() <= contract_usize(&contract, "max_socket_path_bytes"));
+        assert_eq!(socket.parent().unwrap(), std::env::temp_dir());
+        assert_eq!(
+            socket.file_name().unwrap().to_string_lossy(),
+            contract_str(&contract, "expected_fallback_file_name"),
+            "宿主转发表与插件将用不同的名字：这条路修了等于没修"
         );
     }
 
@@ -234,9 +362,10 @@ mod tests {
         // Old manifests predate the field; loading them must not start failing.
         let manifest = SupervisorManifest::parse(SAMPLE).unwrap();
         assert_eq!(manifest.query_socket, None);
-        assert_eq!(
-            manifest.query_socket_path(Path::new("/w"), Path::new("/s"), Path::new("/r")),
-            None
+        assert!(
+            manifest
+                .query_socket_path(Path::new("/w"), Path::new("/s"), Path::new("/r"))
+                .is_none()
         );
     }
 }

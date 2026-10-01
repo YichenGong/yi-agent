@@ -113,10 +113,35 @@ mod tests {
 
     /// 与宿主 `yi-agent-store::ipc` 测试里同一个深路径，用来锁住两侧一致。
     const LONG_RUNTIME_DIR: &str = "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/runtime";
-    const LONG_STATE_DIR: &str = "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/superpowers-kanban";
+
+    /// 宿主与插件共用的 socket 契约（同一份文件，两端各自 `include_str!`）。
+    ///
+    /// 这是"两侧规则不得漂移"的唯一权威：谁改了规则却没同步这里，测试就红。
+    const CONTRACT: &str = include_str!("../contract/plugin-socket.json");
+
+    fn contract_str(key: &str) -> String {
+        let needle = format!("\"{key}\": \"");
+        let start = CONTRACT.find(&needle).expect("contract key") + needle.len();
+        CONTRACT[start..].split('"').next().unwrap().to_string()
+    }
+
+    fn contract_usize(key: &str) -> usize {
+        let needle = format!("\"{key}\": ");
+        let start = CONTRACT.find(&needle).expect("contract key") + needle.len();
+        CONTRACT[start..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn long_state_dir() -> PathBuf {
+        PathBuf::from(contract_str("state_dir"))
+    }
 
     fn long_query_socket() -> PathBuf {
-        Path::new(LONG_STATE_DIR).join("superpowers-kanban.sock")
+        PathBuf::from(contract_str("expected_direct_path"))
     }
 
     #[test]
@@ -138,8 +163,8 @@ mod tests {
         assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH_BYTES);
         assert_eq!(socket.parent().unwrap(), std::env::temp_dir());
         assert_eq!(
-            socket.file_name().unwrap(),
-            "plugin-b16a6326f33a64c5.sock",
+            socket.file_name().unwrap().to_string_lossy(),
+            contract_str("expected_fallback_file_name"),
             "规则漂移了：宿主转发表会指向别的地方"
         );
     }
@@ -188,7 +213,7 @@ mod tests {
     #[test]
     fn a_temp_dir_that_is_still_too_deep_is_an_error() {
         // 现状是静默失败，排查成本高；回退不了就必须显式报错。
-        let deep_temp = Path::new(LONG_STATE_DIR).join(".yi-agent/.yi-agent/.yi-agent");
+        let deep_temp = long_state_dir().join(".yi-agent/.yi-agent/.yi-agent");
         let direct = long_query_socket();
         assert!(
             deep_temp.join("plugin-0000000000000000.sock")

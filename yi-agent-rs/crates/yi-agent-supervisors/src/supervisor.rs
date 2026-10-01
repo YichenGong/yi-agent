@@ -121,13 +121,24 @@ impl Supervisor {
             .into_iter()
             .filter(|manifest| self.running.contains_key(&manifest.name))
             .filter_map(|manifest| {
-                manifest
-                    .query_socket_path(
-                        &self.layout.workdir,
-                        &self.layout.state_dir,
-                        &self.layout.runtime_dir,
-                    )
-                    .map(|path| (manifest.name.clone(), path))
+                match manifest.query_socket_path(
+                    &self.layout.workdir,
+                    &self.layout.state_dir,
+                    &self.layout.runtime_dir,
+                ) {
+                    Some(Ok(path)) => Some((manifest.name.clone(), path)),
+                    Some(Err(error)) => {
+                        // 路径深到连回退都放不下：插件不会在那个位置 bind，
+                        // 转发表放进去只会让查询超时。跳过并说清原因。
+                        tracing::warn!(
+                            plugin = %manifest.name,
+                            %error,
+                            "query socket is unusable; plugin will not be queryable"
+                        );
+                        None
+                    }
+                    None => None,
+                }
             })
             .collect()
     }

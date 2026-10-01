@@ -1,0 +1,8 @@
+{
+  "_comment": "宿主转发表与插件服务端共用的 socket 契约。两端用 include_str! 读同一份，任一侧规则漂移都会测试失败。",
+  "state_dir": "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/superpowers-kanban",
+  "query_socket_template": "{state_dir}/superpowers-kanban.sock",
+  "expected_direct_path": "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/superpowers-kanban/superpowers-kanban.sock",
+  "expected_fallback_file_name": "plugin-b16a6326f33a64c5.sock",
+  "max_socket_path_bytes": 103
+}
