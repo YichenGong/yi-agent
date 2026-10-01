@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use board_core::board::Board;
-use board_core::card::CardId;
-use board_core::promotion::validate_promotion;
+use superpowers_kanban_core::board::Board;
+use superpowers_kanban_core::card::CardId;
+use superpowers_kanban_core::promotion::validate_promotion;
 use chrono::{DateTime, Local};
 
 /// 一张投递文件的处理结果。

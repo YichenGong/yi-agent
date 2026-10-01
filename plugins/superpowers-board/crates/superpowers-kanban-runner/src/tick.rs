@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use board_core::board::Board;
-use board_core::card::{CardId, CardState};
+use superpowers_kanban_core::board::Board;
+use superpowers_kanban_core::card::{CardId, CardState};
 
 use crate::client::BoardDaemon;
 
@@ -68,7 +68,7 @@ pub fn run_once(
 
 /// The objective handed to the daemon. Kept in one place so the wording (and
 /// the Superpowers constraints it carries) is reviewable at a glance.
-pub fn objective_for(card: &board_core::card::Card) -> String {
+pub fn objective_for(card: &superpowers_kanban_core::card::Card) -> String {
     format!(
         "Implement the plan at {plan} following its spec at {spec}. \
          Work only in this worktree. Use superpowers:subagent-driven-development \

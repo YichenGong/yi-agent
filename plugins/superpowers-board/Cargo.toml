@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/board-core", "crates/board-ipc", "crates/board-runner"]
+members = [
+    "crates/superpowers-kanban-core",
+    "crates/superpowers-kanban-ipc",
+    "crates/superpowers-kanban-runner",
+]
 
 [workspace.package]
 version = "0.1.0"

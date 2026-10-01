@@ -1,14 +1,14 @@
 //! Superpowers 看板插件进程入口。
 //!
-//! 用法：`board-runner --runtime-dir <dir> --state-dir <dir> [--project-root <dir>] [--interval-secs 60]`
+//! 用法：`superpowers-kanban --runtime-dir <dir> --state-dir <dir> [--project-root <dir>] [--interval-secs 60]`
 //! 它只做一件事：周期性推进队列。安装 = 放这个二进制；卸载 = 删掉它。
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use board_core::calendar::ConcurrencyCalendar;
-use board_core::switch::{BoardSwitch, parse_switch_json, resolve};
-use board_runner::client::BoardDaemon;
+use superpowers_kanban_core::calendar::ConcurrencyCalendar;
+use superpowers_kanban_core::switch::{BoardSwitch, parse_switch_json, resolve};
+use superpowers_kanban_runner::client::BoardDaemon;
 
 #[derive(Debug)]
 struct Args {
@@ -74,12 +74,12 @@ fn main() {
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("board-runner: {message}");
+            eprintln!("superpowers-kanban: {message}");
             std::process::exit(2);
         }
     };
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
-    let socket = board_ipc::client::socket_path(&args.runtime_dir);
+    let socket = superpowers_kanban_ipc::client::socket_path(&args.runtime_dir);
     let daemon = BoardDaemon::new(socket);
     let board_path = args.state_dir.join("board.json");
 
@@ -90,39 +90,39 @@ fn main() {
             continue;
         }
 
-        let mut board = board_runner::persist::load_board(&board_path);
+        let mut board = superpowers_kanban_runner::persist::load_board(&board_path);
         for outcome in
-            board_runner::inbox::consume(&args.state_dir, &mut board, chrono::Local::now())
+            superpowers_kanban_runner::inbox::consume(&args.state_dir, &mut board, chrono::Local::now())
         {
             match outcome.result {
-                Ok(()) => eprintln!("board-runner: enqueued {}", outcome.id),
-                Err(reason) => eprintln!("board-runner: rejected {} ({reason})", outcome.id),
+                Ok(()) => eprintln!("superpowers-kanban: enqueued {}", outcome.id),
+                Err(reason) => eprintln!("superpowers-kanban: rejected {} ({reason})", outcome.id),
             }
         }
         let limit = calendar.limit_at(chrono::Local::now());
 
         // 启动前为每张待启动卡片预建 worktree（纯本地 git，不消耗模型调用）。
         let project_root = args.project_root.clone();
-        let mut launch = |card_id: &board_core::card::CardId| {
-            let branch = format!("kanban/{}", board_runner::worktree::slugify(card_id));
-            match board_runner::worktree::ensure_worktree(&project_root, card_id, &branch) {
+        let mut launch = |card_id: &superpowers_kanban_core::card::CardId| {
+            let branch = format!("kanban/{}", superpowers_kanban_runner::worktree::slugify(card_id));
+            match superpowers_kanban_runner::worktree::ensure_worktree(&project_root, card_id, &branch) {
                 Ok(path) => Some(path),
                 Err(error) => {
-                    eprintln!("board-runner: worktree for {} failed: {error}", card_id.0);
+                    eprintln!("superpowers-kanban: worktree for {} failed: {error}", card_id.0);
                     None
                 }
             }
         };
 
-        let outcomes = board_runner::tick::run_once(&mut board, &daemon, limit, &mut launch);
+        let outcomes = superpowers_kanban_runner::tick::run_once(&mut board, &daemon, limit, &mut launch);
         for outcome in &outcomes {
             // 把预建好的 worktree 记进卡片，控制面据此显示「跑在哪里」。
-            if let board_runner::tick::TickAction::Launched { .. } = &outcome.action {
+            if let superpowers_kanban_runner::tick::TickAction::Launched { .. } = &outcome.action {
                 let branch = format!(
                     "kanban/{}",
-                    board_runner::worktree::slugify(&outcome.card_id)
+                    superpowers_kanban_runner::worktree::slugify(&outcome.card_id)
                 );
-                if let Ok(path) = board_runner::worktree::ensure_worktree(
+                if let Ok(path) = superpowers_kanban_runner::worktree::ensure_worktree(
                     &project_root,
                     &outcome.card_id,
                     &branch,
@@ -131,15 +131,15 @@ fn main() {
                 }
             }
             eprintln!(
-                "board-runner: {} -> {:?}",
+                "superpowers-kanban: {} -> {:?}",
                 outcome.card_id.0, outcome.action
             );
         }
 
-        if let Err(error) = board_runner::persist::save_board(&board_path, &board) {
+        if let Err(error) = superpowers_kanban_runner::persist::save_board(&board_path, &board) {
             // 落盘失败只记 warning：控制面会看到旧数据，但推进循环不停。
             eprintln!(
-                "board-runner: could not persist {}: {error}",
+                "superpowers-kanban: could not persist {}: {error}",
                 board_path.display()
             );
         }
@@ -152,7 +152,7 @@ fn main() {
 mod tests {
     #[test]
     fn the_sample_calendar_expresses_the_three_and_ten_windows() {
-        use board_core::calendar::ConcurrencyCalendar;
+        use superpowers_kanban_core::calendar::ConcurrencyCalendar;
         let text = include_str!("../../../kanban.toml");
         let calendar = ConcurrencyCalendar::from_toml(text).unwrap();
         use chrono::{Datelike, Local, TimeZone, Weekday};

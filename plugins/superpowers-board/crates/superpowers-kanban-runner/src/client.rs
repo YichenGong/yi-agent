@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use board_ipc::client::{self, ClientError};
-use board_ipc::wire::{Command, Reply};
+use superpowers_kanban_ipc::client::{self, ClientError};
+use superpowers_kanban_ipc::wire::{Command, Reply};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedSession {

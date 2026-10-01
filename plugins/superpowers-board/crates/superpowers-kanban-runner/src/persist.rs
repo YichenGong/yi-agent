@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use board_core::board::Board;
+use superpowers_kanban_core::board::Board;
 
 #[derive(Debug)]
 pub enum PersistError {
@@ -47,7 +47,7 @@ pub fn save_board(path: &Path, board: &Board) -> Result<(), PersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use board_core::card::CardId;
+    use superpowers_kanban_core::card::CardId;
     use chrono::{Local, TimeZone};
 
     fn seeded() -> Board {

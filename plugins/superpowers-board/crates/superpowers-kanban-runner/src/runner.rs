@@ -1,5 +1,5 @@
-use board_core::board::Board;
-use board_core::card::{CardId, CardState};
+use superpowers_kanban_core::board::Board;
+use superpowers_kanban_core::card::{CardId, CardState};
 
 /// The daemon task states a card can be derived from. Unknown states return
 /// `None` so a daemon upgrade never makes the runner act on a guess.
@@ -28,7 +28,7 @@ mod tests {
     // Kept from the brief: the limit is currently supplied by the caller, so the
     // calendar import is not yet exercised by these tests.
     #[allow(unused_imports)]
-    use board_core::calendar::ConcurrencyCalendar;
+    use superpowers_kanban_core::calendar::ConcurrencyCalendar;
     use chrono::{Local, TimeZone};
 
     fn at(hour: u32) -> chrono::DateTime<Local> {

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use board_core::card::CardId;
+use superpowers_kanban_core::card::CardId;
 
 #[derive(Debug)]
 pub enum WorktreeError {
