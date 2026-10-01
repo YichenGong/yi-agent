@@ -94,6 +94,22 @@ impl ConcurrencyCalendar {
     }
 
     /// 读取配置；文件缺失、不可读或损坏一律回退默认，绝不 panic。
+    /// 新名优先、旧名回退、都无则默认。
+    ///
+    /// `superpowers-kanban.toml` 是迁移后的名字；`kanban.toml` 是旧名，
+    /// 仅在旧文件存在且新文件不存在时读取。**从不修改或删除旧文件。**
+    pub fn load_preferring_new(state_dir: &std::path::Path) -> Self {
+        let new = state_dir.join("superpowers-kanban.toml");
+        if new.is_file() {
+            return Self::load_or_default(&new);
+        }
+        let legacy = state_dir.join("kanban.toml");
+        if legacy.is_file() {
+            return Self::load_or_default(&legacy);
+        }
+        Self::default()
+    }
+
     pub fn load_or_default(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::from_toml(&text).unwrap_or_else(|error| {
@@ -289,6 +305,31 @@ max_tasks = 10
     fn a_calendar_without_windows_falls_back_to_the_default() {
         let calendar = ConcurrencyCalendar::from_toml("default_max_tasks = 7").unwrap();
         assert_eq!(calendar.limit_at(at(10, 1, 12, 0)), 7);
+    }
+
+    #[test]
+    fn prefers_the_new_calendar_file_over_the_legacy_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kanban.toml"), "default_max_tasks = 3\n").unwrap();
+        std::fs::write(
+            dir.path().join("superpowers-kanban.toml"),
+            "default_max_tasks = 10\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ConcurrencyCalendar::load_preferring_new(dir.path()).default_max_tasks,
+            10
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_legacy_calendar_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kanban.toml"), "default_max_tasks = 3\n").unwrap();
+        assert_eq!(
+            ConcurrencyCalendar::load_preferring_new(dir.path()).default_max_tasks,
+            3
+        );
     }
 
     #[test]

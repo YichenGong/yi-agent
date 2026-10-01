@@ -78,7 +78,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let calendar = ConcurrencyCalendar::load_or_default(&args.state_dir.join("kanban.toml"));
+    let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     let socket = board_ipc::client::socket_path(&args.runtime_dir);
     let daemon = BoardDaemon::new(socket);
     let board_path = args.state_dir.join("board.json");
