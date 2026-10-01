@@ -228,6 +228,31 @@ fn agent_trace_row(row: yi_agent_store::ipc::IpcTraceRow) -> crate::protocol::Ag
     }
 }
 
+/// Send one request to the daemon the conversation is attached to.
+///
+/// A request the daemon rejects is an error the caller must see, so the daemon's
+/// own error frame is turned into the RPC error rather than swallowed. A
+/// conversation with no attached runtime is an unknown-thread error, since there
+/// is nothing to send to.
+fn forward_to_daemon(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    thread_id: &str,
+    request: yi_agent_store::ipc::IpcRequest,
+) -> Result<yi_agent_store::ipc::IpcResponse, RpcError> {
+    let socket = socket_for_thread(runtimes, threads, thread_id)
+        .ok_or_else(|| RpcError::unknown_thread(thread_id))?;
+    let response = yi_agent_store::ipc::send_request(&socket, request)
+        .map_err(|error| RpcError::internal(format!("daemon is unavailable: {error}")))?;
+    if let yi_agent_store::ipc::IpcResponse::Error { code, message } = &response {
+        return Err(RpcError::internal(format!(
+            "daemon rejected the request: {code:?} {}",
+            message.clone().unwrap_or_default()
+        )));
+    }
+    Ok(response)
+}
+
 /// Push the conversation's child list whenever it changes.
 ///
 /// The first frame is skipped: the caller has just answered the same question
@@ -1591,6 +1616,161 @@ where
                             }
                         }
                     }
+                    "agent/message" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let task_id =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string);
+                        let message =
+                            req.params.get("message").and_then(|v| v.as_str()).map(str::to_string);
+                        let (Some(task_id), Some(message)) = (task_id, message) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing taskId or message")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        match forward_to_daemon(
+                            &runtimes,
+                            &threads,
+                            &thread_id,
+                            yi_agent_store::ipc::IpcRequest::SendUserMessage {
+                                task_id: task_id.clone(),
+                                message,
+                            },
+                        ) {
+                            Ok(_) => {
+                                write_response(&writer, ok_response(id, json!({ "queued": true })))
+                                    .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
+                    "agent/cancel/preview" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let Some(task_id) =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing taskId")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 取消必须两步:预览拿 token,确认才真取消。这里只做第一步,
+                        // 绝不代客户端跳过确认。
+                        match forward_to_daemon(
+                            &runtimes,
+                            &threads,
+                            &thread_id,
+                            yi_agent_store::ipc::IpcRequest::PreviewCancel {
+                                task_id: task_id.clone(),
+                                recursive: false,
+                            },
+                        ) {
+                            Ok(yi_agent_store::ipc::IpcResponse::CancelPreview {
+                                confirmation_token,
+                                task_ids,
+                                expires_in_secs,
+                                ..
+                            }) => {
+                                write_response(
+                                    &writer,
+                                    ok_response(
+                                        id,
+                                        json!({
+                                            "confirmationToken": confirmation_token,
+                                            "taskIds": task_ids,
+                                            "expiresInSecs": expires_in_secs,
+                                        }),
+                                    ),
+                                )
+                                .await?;
+                            }
+                            Ok(other) => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::internal(format!(
+                                            "daemon returned a non-preview response: {other:?}"
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
+                    "agent/cancel" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                            continue;
+                        }
+                        let task_id =
+                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string);
+                        let confirmation_token = req
+                            .params
+                            .get("confirmationToken")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let (Some(task_id), Some(confirmation_token)) =
+                            (task_id, confirmation_token)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(
+                                        "missing taskId or confirmationToken; preview first",
+                                    ),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        match forward_to_daemon(
+                            &runtimes,
+                            &threads,
+                            &thread_id,
+                            yi_agent_store::ipc::IpcRequest::ConfirmCancel {
+                                task_id: task_id.clone(),
+                                recursive: false,
+                                confirmation_token,
+                            },
+                        ) {
+                            Ok(_) => {
+                                write_response(&writer, ok_response(id, json!({ "cancelled": true })))
+                                    .await?;
+                            }
+                            Err(error) => {
+                                write_response(&writer, err_response(id, error)).await?;
+                            }
+                        }
+                    }
                     "agent/trace/unwatch" => {
                         let Some(thread_id) =
                             require_thread_id(&writer, &req.params, id.clone()).await?
@@ -2838,6 +3018,53 @@ mod tests {
         let v = h.read_value().await;
         assert_eq!(v["id"], 9);
         assert_eq!(v["error"]["code"], -32602, "missing taskId: {v}");
+        h.shutdown().await;
+    }
+
+    /// Cancelling without a preview token is refused, so the confirmation step
+    /// cannot be skipped by a client that calls `agent/cancel` directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_requires_a_confirmation_token() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/cancel","params":{{"threadId":"{thread_id}","taskId":"task-1"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32602, "no token, no cancel: {v}");
+        h.shutdown().await;
+    }
+
+    /// A message to an unattached conversation fails loudly rather than
+    /// pretending to queue: there is no daemon to queue it on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_message_without_a_runtime_is_an_error() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/message","params":{{"threadId":"{thread_id}","taskId":"task-1","message":"hello"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32011, "unattached conversation: {v}");
+        h.shutdown().await;
+    }
+
+    /// A malformed message request is a parameter error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_message_requires_a_task_and_text() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent/message","params":{{"threadId":"{thread_id}","taskId":"task-1"}}}}"#
+        ))
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32602, "missing message: {v}");
         h.shutdown().await;
     }
 
