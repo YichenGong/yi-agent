@@ -43,6 +43,9 @@ pub struct AttachedProjectRuntime {
     pub attached_root: AttachedRoot,
     /// Held only when this process started the daemon.
     pub embedded_daemon: Option<Daemon>,
+    /// 插件监督句柄：本进程起了 daemon 才真的监督，借用别人的则空转。
+    /// 生命周期交给 Drop，随 binding 一起结束。
+    supervisor: yi_agent_runtime::supervise::SuperviseHandle,
 }
 
 /// The project-local runtime directory. The TUI's slash commands and the CLI
@@ -165,6 +168,8 @@ pub fn attach_project_runtime(
     else {
         return Err(AttachFailure::new("attach", describe_rejection(&response)));
     };
+    // 借用了别人的 daemon 就不监督：监督者应是那个真正拥有 daemon 的进程。
+    let owns_daemon = embedded_daemon.is_some();
     Ok(AttachedProjectRuntime {
         socket_path,
         workspace_root: workspace.path.clone(),
@@ -176,6 +181,10 @@ pub fn attach_project_runtime(
             workspace,
         },
         embedded_daemon,
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+            &cfg.workdir,
+            owns_daemon,
+        ),
     })
 }
 
