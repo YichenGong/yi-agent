@@ -21,8 +21,9 @@ const { clients, state } = vi.hoisted(() => ({
     threads: null as ThreadSeed[] | null,
     notifHandlers: [] as Array<(n: unknown) => void>,
     approvalHandlers: [] as Array<(r: unknown) => void>,
-    // Method -> error code. When a request matches, reject with that code, so a
-    // test can force the `-32013` / `-32012` disagreement the server can report.
+    // Method -> error code. Any method can be forced to reject, so a test can
+    // force the `-32013` / `-32012` disagreement the server can report — or a
+    // `thread/clear` rejection (`-32012`, the accepted post-turn window).
     rejectCode: {} as Record<string, number>,
     // Status reported by `thread/listAll` for every seeded thread.
     listStatus: "idle" as "idle" | "running" | "awaiting_approval",
@@ -92,6 +93,8 @@ vi.mock("./lib/rpc", () => ({
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
         return {};
       }
+      if (method === "thread/clear") return {};
+      if (method === "thread/compact") return { status: "compacted" };
       return {};
     }
   },
@@ -544,5 +547,82 @@ describe("App send recovery from a status disagreement", () => {
       expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
     );
     expect(clients[0].requests.map((r) => r.method)).not.toContain("turn/interject");
+  });
+});
+
+describe("App slash commands", () => {
+  it("renders /help output as a notice without touching the agent", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/help" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByText(/可用命令:/);
+    expect(
+      clients[0].requests.some((r) => r.method === "turn/start"),
+    ).toBe(false);
+  });
+
+  it("sends thread/clear and empties the transcript on /clear", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 先造一条消息,让 clear 有东西可清。
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    await screen.findByText("hello");
+
+    fireEvent.change(textarea, { target: { value: "/clear" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/clear")).toBe(true),
+    );
+    await waitFor(() => expect(screen.queryByText("hello")).toBeNull());
+    await screen.findByText(/对话已清空/);
+  });
+
+  it("surfaces a rejected /clear without clearing the transcript", async () => {
+    state.rejectCode = { "thread/clear": -32012 };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await screen.findByText("hello");
+
+    fireEvent.change(textarea, { target: { value: "/clear" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByText(/清空失败|-32012/);
+    expect(screen.getByText("hello")).toBeTruthy();
+  });
+
+  it("sends thread/compact and reports the server's verdict", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/compact" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/compact")).toBe(true),
+    );
+    // 默认 mock 返回 {},没有 status 字段 → 视为 unknown,提示"未知结果"。
+    await screen.findByText(/压缩/);
   });
 });

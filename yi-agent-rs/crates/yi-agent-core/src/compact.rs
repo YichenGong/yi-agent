@@ -853,7 +853,7 @@ mod tests {
             },
             detail: crate::message::ImageDetail::High,
         };
-        assert!(IMAGE_TOKEN_ESTIMATE > 0);
+        const { assert!(IMAGE_TOKEN_ESTIMATE > 0) };
         assert_eq!(estimate_block_tokens(&img), IMAGE_TOKEN_ESTIMATE);
     }
 

@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
+import type { NoticeItem } from "../lib/session";
 import { AgentMessage } from "./MarkdownText";
 import { ToolCallCard } from "./ToolCallCard";
 
@@ -25,8 +26,14 @@ const ToolCallRow = memo(ToolCallCard);
  * shallow prop comparison notice the change while leaving every other message —
  * whose text did not move — untouched.
  */
-function ChatItem({ item }: { item: Item }) {
+function ChatItem({ item }: { item: Item | NoticeItem }) {
   switch (item.type) {
+    case "notice":
+      return (
+        <div className="my-1 self-center rounded-md bg-neutral-800/60 px-3 py-1 text-xs text-neutral-400">
+          {item.text}
+        </div>
+      );
     case "userMessage":
       return (
         <div className="my-1 max-w-[80%] self-end rounded-lg bg-blue-600 px-3 py-2 text-sm whitespace-pre-wrap text-white">
@@ -55,7 +62,7 @@ export function ChatView({
   error,
   retrying,
 }: {
-  items: Item[];
+  items: (Item | NoticeItem)[];
   error?: string | null;
   retrying?: { attempt: number; max: number; cause: RetryCause } | null;
 }) {
