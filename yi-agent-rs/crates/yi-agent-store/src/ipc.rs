@@ -594,6 +594,9 @@ pub struct IpcTaskSummary {
     pub is_root: bool,
     /// The task's parent, absent for a root task.
     pub parent_task_id: Option<String>,
+    /// The conversation this task belongs to, when it was tagged with one.
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3417,6 +3420,7 @@ fn respond(
                     state: task.state,
                     is_root: task.is_root,
                     parent_task_id: task.parent_task_id,
+                    thread_id: task.thread_id,
                 })
                 .collect();
             Ok(IpcResponse::TaskSummaries { tasks })
