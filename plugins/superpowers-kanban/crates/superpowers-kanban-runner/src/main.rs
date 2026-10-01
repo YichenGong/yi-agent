@@ -15,9 +15,8 @@ use std::time::Duration;
 use superpowers_kanban_core::calendar::ConcurrencyCalendar;
 use superpowers_kanban_core::card_id::card_id_for;
 use superpowers_kanban_core::promotion::validate_promotion;
-use superpowers_kanban_core::switch::{
-    BoardSwitch, SwitchValue, project_preferences_path, read_layer, resolve, write_layer,
-};
+use superpowers_kanban_core::layout::{global_preferences_path, project_preferences_path, project_root};
+use superpowers_kanban_core::switch::{BoardSwitch, SwitchValue, read_layer, resolve, write_layer};
 use superpowers_kanban_runner::client::BoardDaemon;
 
 #[derive(Debug)]
@@ -194,9 +193,7 @@ where
 /// The project layer sits beside the state directory, not inside it:
 /// `<state_dir>/../preferences.json`, i.e. `<workdir>/.yi-agent/preferences.json`.
 fn board_switch(state_dir: &std::path::Path) -> BoardSwitch {
-    let global = superpowers_kanban_core::switch::global_preferences_path()
-        .as_deref()
-        .and_then(read_layer);
+    let global = global_preferences_path().as_deref().and_then(read_layer);
     let project = read_layer(&project_preferences_path(state_dir));
     resolve(global, project)
 }
@@ -292,10 +289,7 @@ fn main() {
             plan,
         } => command_add(&state_dir, &spec, &plan),
         Subcommand::List { state_dir } => command_list(&state_dir),
-        Subcommand::Workdir { state_dir } => Ok(project_preferences_path(&state_dir)
-            .parent()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default()),
+        Subcommand::Workdir { state_dir } => Ok(project_root(&state_dir).display().to_string()),
         Subcommand::Switch { state_dir, value } => command_set_switch(&state_dir, value),
     };
     match outcome {
