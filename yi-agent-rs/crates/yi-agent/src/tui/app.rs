@@ -3225,6 +3225,8 @@ mod tests {
                 objective: "实现 parser".into(),
                 mode: Some("coding".into()),
                 model: None,
+
+                sandbox: None,
             },
         )
         .unwrap();

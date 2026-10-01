@@ -2129,6 +2129,8 @@ mod tests {
                 mode: Some("read_only".into()),
                 model: None,
                 workdir: None,
+
+                sandbox: None,
             },
         )
         .expect("the runtime socket must answer");
@@ -2199,6 +2201,8 @@ mod tests {
                 mode: Some("read_only".into()),
                 model: None,
                 workdir: None,
+
+                sandbox: None,
             },
         )
         .expect("the runtime socket answers even when it refuses");

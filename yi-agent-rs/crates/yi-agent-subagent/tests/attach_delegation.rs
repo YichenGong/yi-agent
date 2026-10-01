@@ -102,6 +102,8 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
             mode: Some("read_only".into()),
             model: None,
             workdir: None,
+
+            sandbox: None,
         },
     )
     .expect("the runtime socket must accept a delegated child");

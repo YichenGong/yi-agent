@@ -1318,6 +1318,8 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 mode: Some(mode.as_str().to_string()),
                 model,
                 workdir,
+
+                sandbox: None,
             },
         );
         match response {
@@ -1647,6 +1649,8 @@ impl Tool for DaemonSpawnAgentTool {
                 mode: Some(mode.as_str().to_string()),
                 model,
                 workdir,
+
+                sandbox: None,
             },
         );
         match response {
@@ -3056,6 +3060,8 @@ mod tests {
                 objective: "Inspect the target".into(),
                 mode: None,
                 model: None,
+
+                sandbox: None,
             },
         )
         .unwrap()
@@ -3105,6 +3111,8 @@ mod tests {
                 objective: "Inspect the target".into(),
                 mode: None,
                 model: None,
+
+                sandbox: None,
             },
         )
         .unwrap()

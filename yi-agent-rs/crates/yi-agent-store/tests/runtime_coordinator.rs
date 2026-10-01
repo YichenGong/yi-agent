@@ -9,8 +9,8 @@ use tempfile::TempDir;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::task::{
-    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, IntegrationValidation, MessageId,
-    PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
+    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox, IntegrationValidation,
+    MessageId, PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
@@ -647,6 +647,7 @@ async fn child_recovery_context_uses_the_in_memory_workspace_assignment() {
             ChildWriteMode::Coding,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -695,6 +696,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             &root,
             "Complete the delegated task.".into(),
             ChildWriteMode::Coding,
+            None,
             None,
             None,
         )
@@ -1902,6 +1904,7 @@ async fn delivered_child_coordinator(
             ChildWriteMode::Coding,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2536,6 +2539,51 @@ async fn recovered_child_resumes_after_runtime_restart() {
     assert_eq!(
         factory.starts.lock().unwrap()[0].objective,
         "Preserve this recovered child objective."
+    );
+}
+
+#[tokio::test]
+async fn recovered_child_keeps_its_inherited_sandbox() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let root = yi_agent_core::TaskId::new();
+    let root_attempt = yi_agent_core::AttemptId::new();
+    let child = yi_agent_core::TaskId::new();
+    let child_attempt = yi_agent_core::AttemptId::new();
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&root, &session, &root_attempt, 1, "running")
+        .unwrap();
+    repository
+        .create_child_task_with_attempt_and_objective(
+            &child,
+            &session,
+            &root,
+            1,
+            &child_attempt,
+            1,
+            "running",
+            "Recovered child with a sandbox.",
+            ChildWriteMode::Coding,
+            None,
+            Some(InheritedSandbox::DangerFullAccess),
+        )
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    coordinator.resume_task(&session, &child).await.unwrap();
+    let starts = factory.starts.lock().unwrap();
+    let child_start = starts
+        .iter()
+        .find(|start| start.task_id == child)
+        .expect("the recovered child worker was started");
+    assert_eq!(
+        child_start.inherited_sandbox,
+        Some(InheritedSandbox::DangerFullAccess)
     );
 }
 
@@ -3597,6 +3645,7 @@ async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
             ChildWriteMode::Coding,
             None,
             Some(prepared.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -3693,6 +3742,7 @@ async fn mode_only_changes_write_access_not_the_directory() {
             ChildWriteMode::ReadOnly,
             None,
             Some(project_root.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -3747,6 +3797,7 @@ async fn a_relative_workdir_resolves_against_the_parents_position() {
             ChildWriteMode::Coding,
             None,
             Some(std::path::PathBuf::from("sub")),
+            None,
         )
         .await
         .unwrap();
@@ -4060,4 +4111,64 @@ fn reclaim_keeps_recovery_required_tasks_that_can_still_resume() {
         "a task with a checkpoint and a workspace lease is still resumable"
     );
     assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
+}
+
+#[tokio::test]
+async fn inherited_sandbox_is_persisted_and_threaded_to_the_worker() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    // Read-only root/child avoid workspace provisioning; sandbox inheritance is
+    // orthogonal to the write mode at this layer.
+    let session = coordinator
+        .create_session_with_objective_and_mode(
+            "root".into(),
+            ChildWriteMode::ReadOnly,
+            Some(InheritedSandbox::DangerFullAccess),
+        )
+        .unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_inherited_sandbox(&root)
+            .unwrap(),
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+    coordinator.start_worker(&session, &root).await.unwrap();
+    assert_eq!(
+        factory.starts.lock().unwrap()[0].inherited_sandbox,
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "child".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            Some(InheritedSandbox::DangerFullAccess),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_inherited_sandbox(&child)
+            .unwrap(),
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+    coordinator.start_worker(&session, &child).await.unwrap();
+    let starts = factory.starts.lock().unwrap();
+    let child_start = starts
+        .iter()
+        .find(|start| start.task_id == child)
+        .expect("the child worker was started");
+    assert_eq!(
+        child_start.inherited_sandbox,
+        Some(InheritedSandbox::DangerFullAccess)
+    );
 }
