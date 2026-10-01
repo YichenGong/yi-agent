@@ -589,6 +589,50 @@ mod tests {
         assert_eq!(boot.process_manager.list().len(), 0);
     }
 
+    /// Pins the invariant the test above only *names*, at the `AgentBootstrap`
+    /// layer: the manager exposed as `boot.process_manager` must be the very
+    /// same `Arc` the returned registry's `process_start` tool drives. The test
+    /// above starts nothing and merely lists the exposed manager, so it stays
+    /// green even if `bootstrap_agent` handed back a *second, independent*
+    /// manager while registering the tools against the real one — precisely the
+    /// forbidden refactor (a fresh manager also lists zero processes). Here the
+    /// probe is started *through the registry's own tool* and must then be
+    /// visible via `boot.process_manager.list()`; that can only hold while both
+    /// hold one manager.
+    #[test]
+    fn agent_bootstrap_process_start_tool_shares_the_returned_manager() {
+        let mut cfg = sample_config();
+        // Same fixture rule as the test above: a *named* `TempDir` must outlive
+        // the test, because the manager canonicalizes this root on `start`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        cfg.workdir = tmp.path().to_path_buf();
+        let boot = bootstrap_agent(&cfg, PermissionMode::AutoAllow).expect("bootstrap");
+
+        let tool = boot.tools.get("process_start").expect("registered");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(tool.call(serde_json::json!({
+            "command": "sleep 30",
+            "name": "t2-arc-probe",
+        })));
+        assert!(
+            !result.is_error,
+            "process_start through the registry failed: {:?}",
+            result.content
+        );
+        // The registry tool started the process in *its* manager; finding it
+        // here proves that manager is the one `AgentBootstrap` returned.
+        assert!(
+            boot.process_manager
+                .list()
+                .iter()
+                .any(|p| p.name.as_deref() == Some("t2-arc-probe")),
+            "the manager on AgentBootstrap is not the one backing the registry's process_start"
+        );
+        // Teardown on the SAME runtime (the reader/waiter tasks live on it):
+        // `on_exit` defaults to Kill, so `shutdown()` reaps the `sleep 30`.
+        let _ = rt.block_on(boot.process_manager.shutdown());
+    }
+
     #[test]
     fn build_tool_setup_with_controller_tracks_the_live_switch() {
         let cfg = sample_config();
