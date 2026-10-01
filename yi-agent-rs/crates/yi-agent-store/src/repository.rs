@@ -11,11 +11,11 @@ use yi_agent_core::subagent::task::{
 };
 use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionRequestId};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
-use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 11;
+const LATEST_SCHEMA_VERSION: i64 = 12;
 
 /// Grace period before a task with no application-root attachment at all is
 /// treated as unowned. An application root writes its attachment before it
@@ -357,6 +357,7 @@ pub struct PersistedRecoveredTask {
     pub recovery_gated: bool,
     pub recovery_attested: bool,
     pub workspace_mode: ChildWriteMode,
+    pub inherited_sandbox: Option<InheritedSandbox>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -890,6 +891,7 @@ impl RuntimeRepository {
             // wrapper keeps the coding mode.
             ChildWriteMode::Coding,
             None,
+            None,
         )
     }
 
@@ -904,6 +906,7 @@ impl RuntimeRepository {
         objective: &str,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        inherited_sandbox: Option<InheritedSandbox>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
@@ -912,8 +915,8 @@ impl RuntimeRepository {
             params![root.to_string()],
         )?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model)
-             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, inherited_sandbox)
+             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6, ?7, ?8)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -922,6 +925,7 @@ impl RuntimeRepository {
                 delivery_json,
                 workspace_mode.as_str(),
                 model,
+                inherited_sandbox.map(|value| value.as_str()),
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -980,6 +984,7 @@ impl RuntimeRepository {
             // read-only child go through `create_child_task_with_attempt_and_objective`.
             ChildWriteMode::Coding,
             None,
+            None,
         )
     }
 
@@ -996,12 +1001,13 @@ impl RuntimeRepository {
         objective: &str,
         workspace_mode: ChildWriteMode,
         model: Option<String>,
+        inherited_sandbox: Option<InheritedSandbox>,
     ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, inherited_sandbox)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -1012,6 +1018,7 @@ impl RuntimeRepository {
                 delivery_json,
                 workspace_mode.as_str(),
                 model,
+                inherited_sandbox.map(|value| value.as_str()),
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;
@@ -3290,6 +3297,31 @@ impl RuntimeRepository {
         }
     }
 
+    /// Reads a task's inherited sandbox. `None` means no inheritance was
+    /// recorded (old rows, or a task spawned before this feature).
+    pub fn task_inherited_sandbox(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<InheritedSandbox>, RepositoryError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT inherited_sandbox FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        match value {
+            Some(value) => InheritedSandbox::parse(&value).map(Some).ok_or_else(|| {
+                RepositoryError::UnknownEventKind {
+                    kind: format!("invalid inherited_sandbox in store: {value}"),
+                }
+            }),
+            None => Ok(None),
+        }
+    }
+
     pub fn attempt_state(&self, attempt: &AttemptId) -> Result<String, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT state FROM attempts WHERE id = ?1",
@@ -3379,7 +3411,7 @@ impl RuntimeRepository {
                      WHERE task_id = tasks.id AND state = 'active' AND resource_key LIKE 'worktree:%'
                      ORDER BY acquired_at DESC, id DESC LIMIT 1),
                     attempts.checkpoint_json, attempts.usage_json, tasks.state_json, tasks.delivery_json,
-                    tasks.workspace_mode
+                    tasks.workspace_mode, tasks.inherited_sandbox
              FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.state_json IN ('recovery_required', 'recovery_gated', 'recovery_attested')
              ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
@@ -3400,6 +3432,7 @@ impl RuntimeRepository {
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             })?
             .map(|row| {
@@ -3417,6 +3450,7 @@ impl RuntimeRepository {
                     task_state,
                     delivery_json,
                     workspace_mode,
+                    inherited_sandbox,
                 ) = row?;
                 Ok(PersistedRecoveredTask {
                     session_id: session_id.parse().map_err(|_| {
@@ -3467,6 +3501,16 @@ impl RuntimeRepository {
                             kind: format!("invalid workspace_mode in store: {workspace_mode}"),
                         }
                     })?,
+                    inherited_sandbox: inherited_sandbox
+                        .as_deref()
+                        .map(|value| {
+                            InheritedSandbox::parse(value).ok_or_else(|| {
+                                RepositoryError::UnknownEventKind {
+                                    kind: format!("invalid inherited_sandbox in store: {value}"),
+                                }
+                            })
+                        })
+                        .transpose()?,
                 })
             })
             .collect()
@@ -4406,6 +4450,25 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             )?;
         }
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
+        transaction.commit()?;
+    }
+
+    if current_version < 12 {
+        let transaction = connection.unchecked_transaction()?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tasks')
+                WHERE name = 'inherited_sandbox'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // NULL means "no inheritance recorded": the worker factory falls
+            // back to its configured sandbox, preserving pre-change behavior.
+            transaction.execute_batch("ALTER TABLE tasks ADD COLUMN inherited_sandbox TEXT;")?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
         transaction.commit()?;
     }
     Ok(())

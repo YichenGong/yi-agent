@@ -2523,6 +2523,7 @@ async fn recovered_child_resumes_after_runtime_restart() {
             "Preserve this recovered child objective.",
             yi_agent_core::ChildWriteMode::Coding, // Task 5/6 threads the requested mode through here.
             None,
+            None,
         )
         .unwrap();
     repository.recover_inflight_tasks().unwrap();

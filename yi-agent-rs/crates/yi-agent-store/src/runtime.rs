@@ -678,6 +678,7 @@ impl RuntimeCoordinator {
                 &objective,
                 workspace_mode,
                 None,
+                None,
             )?;
         self.supervisors
             .lock()
@@ -1215,6 +1216,7 @@ impl RuntimeCoordinator {
                 &objective,
                 workspace_mode,
                 model.clone(),
+                None,
             )?;
         // Auto-registration: the parent prepares the directory (`git worktree
         // add`) and hands over its path; the daemon only records that position.

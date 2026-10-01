@@ -14,7 +14,7 @@ use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider,
 };
-use yi_agent_core::{AttemptId, ChildWriteMode, RootSessionId, TaskId};
+use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
     SubscriptionFilters, send_request, send_request_with_version, subscribe,
@@ -74,7 +74,7 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
@@ -692,7 +692,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     for table in [
         "sessions",
         "tasks",
@@ -721,7 +721,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     // Rebuild the pre-v11 shape of the attachment table and roll the schema
@@ -754,7 +754,7 @@ fn a_version_10_database_is_migrated_to_the_current_schema() {
     let database = v10_database_without_workspace_root();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     let has_column: bool = Connection::open(&database)
         .unwrap()
         .query_row(
@@ -810,7 +810,7 @@ fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     assert!(
         repository
             .has_table("application_root_attachments")
@@ -2083,7 +2083,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -4997,7 +4997,7 @@ fn workspace_mode_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 11);
+    assert_eq!(repository.schema_version().unwrap(), 12);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -5011,6 +5011,7 @@ fn workspace_mode_is_persisted_and_recovered() {
             "queued",
             "root",
             ChildWriteMode::Coding,
+            None,
             None,
         )
         .unwrap();
@@ -5034,6 +5035,7 @@ fn workspace_mode_is_persisted_and_recovered() {
             "recovery_required",
             "child",
             ChildWriteMode::ReadOnly,
+            None,
             None,
         )
         .unwrap();
@@ -5738,4 +5740,70 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
         Some("I got as far as rewriting the lexer"),
         "the partial transcript must survive the restart"
     );
+}
+
+#[test]
+fn inherited_sandbox_is_persisted_and_recovered() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 12);
+
+    let session = RootSessionId::new();
+    let root = TaskId::new();
+    let root_attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt_and_objective(
+            &root,
+            &session,
+            &root_attempt,
+            1,
+            "queued",
+            "root",
+            ChildWriteMode::Coding,
+            None,
+            None,
+        )
+        .unwrap();
+    // A root with no recorded inheritance reads back as `None`.
+    assert_eq!(repository.task_inherited_sandbox(&root).unwrap(), None);
+
+    // A recoverable child carries a value so both the getter and the
+    // `recovered_tasks` column read and parse path are exercised.
+    let child = TaskId::new();
+    let child_attempt = AttemptId::new();
+    repository
+        .create_child_task_with_attempt_and_objective(
+            &child,
+            &session,
+            &root,
+            1,
+            &child_attempt,
+            1,
+            "recovery_required",
+            "child",
+            ChildWriteMode::Coding,
+            None,
+            Some(InheritedSandbox::DangerFullAccess),
+        )
+        .unwrap();
+    assert_eq!(
+        repository.task_inherited_sandbox(&child).unwrap(),
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+
+    let recovered = repository.recovered_tasks().unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].task_id, child);
+    assert_eq!(
+        recovered[0].inherited_sandbox,
+        Some(InheritedSandbox::DangerFullAccess)
+    );
+
+    // The legacy insert omits `inherited_sandbox`, so the column stays NULL.
+    let legacy = TaskId::new();
+    repository
+        .create_child_task(&legacy, &session, &root, 1, "queued")
+        .unwrap();
+    assert_eq!(repository.task_inherited_sandbox(&legacy).unwrap(), None);
 }
