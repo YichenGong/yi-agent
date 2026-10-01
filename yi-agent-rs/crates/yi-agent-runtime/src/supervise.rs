@@ -30,11 +30,40 @@ impl SuperviseHandle {
     }
 
     /// 停止监督：先清空转发表（不留指向将死 socket 的路由），再停子进程。
-    pub fn stop(mut self) {
+    ///
+    /// 幂等：`Drop` 会再调一次，届时 join 已被取走。
+    fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+
+    /// 显式停止。等价于把它 drop 掉，只为让调用点读起来有意图。
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+}
+
+/// 句柄被丢弃即停止监督。
+///
+/// 生命周期交给 Drop，而不是指望每个调用点都记得写 `stop()`：监督循环与宿主
+/// 同生共死是**不变量**，不该靠纪律维持。
+impl Drop for SuperviseHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// 按"谁起了 daemon"决定是否监督。
+///
+/// 规则只有一条：`owns_daemon` 为真才监督。两个内嵌路径（TUI、桌面）共用它，
+/// 免得各自的 `if` 有一天漂移成两种语义。
+pub fn for_daemon_ownership(workdir: &Path, owns_daemon: bool) -> SuperviseHandle {
+    if owns_daemon {
+        serve(workdir)
+    } else {
+        idle()
     }
 }
 
@@ -231,6 +260,71 @@ mod tests {
             "idle must not start anything: borrowing another daemon means not supervising"
         );
         handle.stop();
+    }
+
+    #[test]
+    fn the_rule_supervises_only_what_this_process_started() {
+        let _guard = exclusive();
+        clear_table();
+        let owned_dir = tempfile::tempdir().unwrap();
+        let owned_marker = owned_dir.path().join("child.pid");
+        armed_project(owned_dir.path(), &owned_marker);
+
+        // 我起的 daemon → 我监督，子进程起来。
+        let owned = for_daemon_ownership(owned_dir.path(), true);
+        assert!(owned.is_supervising());
+        assert!(
+            wait_for(&owned_marker, Duration::from_secs(3)),
+            "the process that owns the daemon must supervise"
+        );
+        owned.stop();
+
+        let borrowed_dir = tempfile::tempdir().unwrap();
+        let borrowed_marker = borrowed_dir.path().join("child.pid");
+        armed_project(borrowed_dir.path(), &borrowed_marker);
+
+        // 借用的 daemon → 不监督，什么也不起（监督者应是那个真正拥有 daemon 的进程）。
+        let borrowed = for_daemon_ownership(borrowed_dir.path(), false);
+        assert!(!borrowed.is_supervising());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !borrowed_marker.exists(),
+            "borrowing another process's daemon must not start anything"
+        );
+        borrowed.stop();
+    }
+
+    #[test]
+    fn dropping_the_handle_stops_supervision() {
+        let _guard = exclusive();
+        clear_table();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child.pid");
+        armed_project(dir.path(), &marker);
+
+        {
+            let handle = serve(dir.path());
+            assert!(wait_for(&marker, Duration::from_secs(3)));
+            // 路由在每轮对账末尾登记，与子进程写 marker 有竞态，所以轮询等它出现，
+            // 而不是假定"子进程一起来路由就到"。
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline
+                && yi_agent_store::ipc::plugin_socket_for("demo").is_none()
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                yi_agent_store::ipc::plugin_socket_for("demo").is_some(),
+                "the route should be registered while the supervisor runs"
+            );
+            drop(handle); // 不调用 stop()，只靠 Drop
+        }
+
+        // Drop 之后转发表必须已被清空：生命周期不依赖调用点的纪律。
+        assert!(
+            yi_agent_store::ipc::plugin_socket_for("demo").is_none(),
+            "dropping the handle must clear the forwarding table"
+        );
     }
 
     #[test]
