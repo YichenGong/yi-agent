@@ -470,6 +470,8 @@ fn spawn_child(
             objective: objective.into(),
             mode: Some("coding".into()),
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap();
@@ -525,6 +527,8 @@ fn delivery_review_survives_restart_without_restarting_worker() {
             objective: "deliver".into(),
             mode: Some("coding".into()),
             model: None,
+
+            sandbox: None,
         },
     )
     .unwrap();

@@ -173,6 +173,21 @@ pub fn build_tool_setup_with_switch(
     workspace: &Path,
     switch: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<ToolSetup> {
+    let controller =
+        yi_agent_tools::SandboxController::new(switch, cfg.sandbox, cfg.sandbox_promotable);
+    build_tool_setup_with_controller(cfg, naked, workspace, controller)
+}
+
+/// Same as [`build_tool_setup_with_switch`], but with an externally-owned
+/// controller so the caller can share one controller with other tools (e.g.
+/// the subagent spawn tools); this keeps the root's sandbox and the spawn
+/// tools reading the same live YOLO switch.
+pub fn build_tool_setup_with_controller(
+    cfg: &RuntimeConfig,
+    naked: bool,
+    workspace: &Path,
+    controller: yi_agent_tools::SandboxController,
+) -> Result<ToolSetup> {
     if naked {
         return Ok(ToolSetup {
             tools: Arc::new(yi_agent_core::ToolRegistry::new()),
@@ -190,8 +205,6 @@ pub fn build_tool_setup_with_switch(
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
-    let controller =
-        yi_agent_tools::SandboxController::new(switch, cfg.sandbox, cfg.sandbox_promotable);
     yi_agent_tools::register_builtin_tools_with_controller(
         &mut registry,
         workspace.to_path_buf(),
@@ -545,6 +558,33 @@ mod tests {
         assert!(
             Arc::strong_count(&built.provider) >= 2,
             "the exposed provider must be the instance the agent runs on"
+        );
+    }
+
+    #[test]
+    fn build_tool_setup_with_controller_tracks_the_live_switch() {
+        let cfg = sample_config();
+        let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
+        let controller = yi_agent_tools::SandboxController::new(
+            switch.clone(),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        );
+        let setup =
+            build_tool_setup_with_controller(&cfg, false, &cfg.workdir, controller).expect("setup");
+        let bash = setup.tools.get("bash").expect("bash is registered");
+        assert_eq!(
+            bash.sandbox_mode(),
+            Some("workspace-write"),
+            "the controller's base mode must drive the root bash sandbox"
+        );
+        // The registry reads the same live switch, so a flip after build must
+        // be visible without rebuilding the tool set.
+        switch.set(true);
+        assert_eq!(
+            bash.sandbox_mode(),
+            Some("danger-full-access"),
+            "a live YOLO flip must escalate the root bash sandbox"
         );
     }
 

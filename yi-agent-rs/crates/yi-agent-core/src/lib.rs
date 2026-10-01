@@ -24,7 +24,8 @@ pub use provider::{
     StopReason, StreamEnd, TokenUsage,
 };
 pub use subagent::task::{
-    AgentTask, AttemptId, ChildWriteMode, RootSessionId, TaskDepth, TaskEvent, TaskId, TaskState,
+    AgentTask, AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskDepth, TaskEvent,
+    TaskId, TaskState,
 };
 pub use tool::{
     OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,

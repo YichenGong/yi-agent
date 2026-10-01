@@ -91,7 +91,15 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
             capability: attached.attached_root.capability.clone(),
         },
     );
-    yi_agent_subagent::register_attached_root_tools(&mut registry, binding);
+    yi_agent_subagent::register_attached_root_tools(
+        &mut registry,
+        binding,
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+    );
     assert!(
         registry.names().contains(&"spawn_agent".to_string()),
         "an attached root exposes the delegation tools, got {:?}",
@@ -107,6 +115,8 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
             mode: Some("read_only".into()),
             model: None,
             workdir: None,
+
+            sandbox: None,
         },
     )
     .expect("the runtime socket must accept a delegated child");

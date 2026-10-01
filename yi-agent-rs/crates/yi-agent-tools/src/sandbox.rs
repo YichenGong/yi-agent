@@ -18,6 +18,17 @@ pub enum SandboxMode {
     DangerFullAccess,
 }
 
+impl SandboxMode {
+    /// The wire/kebab-case label, matching the clap `ValueEnum` names.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SandboxMode::ReadOnly => "read-only",
+            SandboxMode::WorkspaceWrite => "workspace-write",
+            SandboxMode::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
 /// Runtime-mutable view over the sandbox mode.
 ///
 /// `base` is the mode configured at construction time; `promotable` says

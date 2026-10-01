@@ -130,11 +130,38 @@ mod tests {
     }
 
     #[test]
+    fn tui_registers_delegation_tools_with_a_controller() {
+        use yi_agent_core::autonomy::YoloSwitch;
+        use yi_agent_tools::{SandboxController, SandboxMode};
+
+        // The controller the TUI passes is derived from the launch-time yolo
+        // switch; asserting its effective mode proves the wiring is live, and
+        // the `register_attached_root_tools` call below must compile with it.
+        let controller =
+            SandboxController::new(YoloSwitch::new(true), SandboxMode::WorkspaceWrite, true);
+        assert_eq!(controller.effective(), SandboxMode::DangerFullAccess);
+
+        let root = attached_root();
+        let binding = root_binding("/tmp/runtime.sock".into(), &root);
+        let mut registry = ToolRegistry::new();
+        register_attached_root_tools(&mut registry, binding, controller);
+        assert!(registry.names().contains(&"spawn_agent".to_string()));
+    }
+
+    #[test]
     fn attached_tui_root_exposes_subagent_tools_without_a_delegate_command() {
         let mut registry = ToolRegistry::new();
         let root = attached_root();
         let binding = root_binding("/tmp/runtime.sock".into(), &root);
-        register_attached_root_tools(&mut registry, binding);
+        register_attached_root_tools(
+            &mut registry,
+            binding,
+            yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                false,
+            ),
+        );
         let names = registry
             .schemas()
             .into_iter()

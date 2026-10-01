@@ -410,13 +410,15 @@ impl RuntimeCoordinator {
                         "persisted recovered child has no recovered root".into(),
                     )
                 })?;
-                // Read the model before `task.task_id` is moved into the call.
+                // Read the model and inherited sandbox before `task.task_id`
+                // is moved into the call.
                 let model = repository.task_model(&task.task_id)?;
+                let inherited_sandbox = repository.task_inherited_sandbox(&task.task_id)?;
+                let task_id = task.task_id.clone();
+                let mut supervisor = supervisor.try_lock().map_err(|_| {
+                    RuntimeCoordinatorError::Supervisor("recovery hydration is busy".into())
+                })?;
                 supervisor
-                    .try_lock()
-                    .map_err(|_| {
-                        RuntimeCoordinatorError::Supervisor("recovery hydration is busy".into())
-                    })?
                     .insert_recovered_child(
                         task.task_id,
                         parent_id,
@@ -429,6 +431,11 @@ impl RuntimeCoordinator {
                         model,
                     )
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
+                // Seed after the insert: `insert_recovered_child` clears any
+                // stale entry for the id, so the recovered value must win.
+                if let Some(inherited_sandbox) = inherited_sandbox {
+                    supervisor.set_inherited_sandbox(&task_id, inherited_sandbox);
+                }
             } else {
                 // A recovered root must keep the mode persisted at spawn time:
                 // reattaching an application root early-returns before the
@@ -454,6 +461,9 @@ impl RuntimeCoordinator {
                 };
                 let root_id = supervisor.root_task_id().clone();
                 supervisor.set_workspace_mode(&root_id, root_mode);
+                if let Some(inherited_sandbox) = repository.task_inherited_sandbox(&root_id)? {
+                    supervisor.set_inherited_sandbox(&root_id, inherited_sandbox);
+                }
                 supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
             }
         }
@@ -644,7 +654,7 @@ impl RuntimeCoordinator {
         &self,
         objective: String,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
-        self.create_session_with_objective_and_mode(objective, ChildWriteMode::Coding)
+        self.create_session_with_objective_and_mode(objective, ChildWriteMode::Coding, None)
     }
 
     /// Creates an isolated root session with an immutable initial objective and
@@ -654,6 +664,7 @@ impl RuntimeCoordinator {
         &self,
         objective: String,
         workspace_mode: ChildWriteMode,
+        inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
@@ -661,6 +672,9 @@ impl RuntimeCoordinator {
             AgentSupervisor::new_with_objective(session_id.clone(), objective.clone());
         let root_id = supervisor.root_task_id().clone();
         supervisor.set_workspace_mode(&root_id, workspace_mode);
+        if let Some(inherited_sandbox) = inherited_sandbox {
+            supervisor.set_inherited_sandbox(&root_id, inherited_sandbox);
+        }
         let root_attempt = supervisor
             .task(&root_id)
             .expect("new root task exists")
@@ -678,6 +692,7 @@ impl RuntimeCoordinator {
                 &objective,
                 workspace_mode,
                 None,
+                inherited_sandbox,
             )?;
         self.supervisors
             .lock()
@@ -766,6 +781,7 @@ impl RuntimeCoordinator {
         let session_id = self.create_session_with_objective_and_mode(
             "TUI application root pending activation.".into(),
             root_mode,
+            None,
         )?;
         self.application_root_workspace_services
             .lock()
@@ -1027,10 +1043,19 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
-        self.spawn_child_and_admit(session, parent, objective, workspace_mode, model, workdir)
-            .await
+        self.spawn_child_and_admit(
+            session,
+            parent,
+            objective,
+            workspace_mode,
+            model,
+            workdir,
+            inherited_sandbox,
+        )
+        .await
     }
 
     pub fn root_task_id(&self, session: &RootSessionId) -> Result<TaskId, RuntimeCoordinatorError> {
@@ -1146,10 +1171,12 @@ impl RuntimeCoordinator {
             ChildWriteMode::ReadOnly,
             None,
             None,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child_with_objective(
         &self,
         session: &RootSessionId,
@@ -1158,6 +1185,7 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1199,6 +1227,9 @@ impl RuntimeCoordinator {
                 .expect("newly spawned task exists")
                 .active_attempt()
                 .clone();
+            if let Some(inherited_sandbox) = inherited_sandbox {
+                supervisor.set_inherited_sandbox(&child, inherited_sandbox);
+            }
             (child, depth, attempt)
         };
         self.repository
@@ -1215,6 +1246,7 @@ impl RuntimeCoordinator {
                 &objective,
                 workspace_mode,
                 model.clone(),
+                inherited_sandbox,
             )?;
         // Auto-registration: the parent prepares the directory (`git worktree
         // add`) and hands over its path; the daemon only records that position.
@@ -1252,6 +1284,7 @@ impl RuntimeCoordinator {
     /// durably queued. A capacity wait is represented by the existing queued
     /// state; a real application worker starts immediately when capacity is
     /// available.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child_and_admit(
         &self,
         session: &RootSessionId,
@@ -1260,9 +1293,18 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         model: Option<String>,
         workdir: Option<PathBuf>,
+        inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
-            .spawn_child_with_objective(session, parent, objective, workspace_mode, model, workdir)
+            .spawn_child_with_objective(
+                session,
+                parent,
+                objective,
+                workspace_mode,
+                model,
+                workdir,
+                inherited_sandbox,
+            )
             .await?;
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {

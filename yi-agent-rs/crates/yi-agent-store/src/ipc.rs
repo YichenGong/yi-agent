@@ -186,6 +186,8 @@ pub enum IpcRequest {
         model: Option<String>,
         #[serde(default)]
         workdir: Option<String>,
+        #[serde(default)]
+        sandbox: Option<String>,
     },
     SpawnApplicationChild {
         session_id: String,
@@ -198,6 +200,8 @@ pub enum IpcRequest {
         model: Option<String>,
         #[serde(default)]
         workdir: Option<String>,
+        #[serde(default)]
+        sandbox: Option<String>,
     },
     StartWorker {
         session_id: String,
@@ -2515,10 +2519,12 @@ fn respond(
             mode,
             model,
             workdir,
+            sandbox,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
             let workspace_mode = parse_workspace_mode(mode)?;
+            let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2530,6 +2536,7 @@ fn respond(
                 workspace_mode,
                 model,
                 workdir,
+                inherited_sandbox,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -2543,10 +2550,12 @@ fn respond(
             mode,
             model,
             workdir,
+            sandbox,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
             let workspace_mode = parse_workspace_mode(mode)?;
+            let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2559,6 +2568,7 @@ fn respond(
                 workspace_mode,
                 model,
                 workdir,
+                inherited_sandbox,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -3003,6 +3013,27 @@ fn parse_workspace_mode(mode: Option<String>) -> Result<yi_agent_core::ChildWrit
     }
 }
 
+/// Resolves the optional inherited sandbox carried by a spawn request. An
+/// omitted value means "no inheritance"; an explicit but unknown value is
+/// rejected (`invalid_params` at the boundary).
+fn parse_inherited_sandbox(
+    sandbox: Option<String>,
+) -> Result<Option<yi_agent_core::InheritedSandbox>, IpcError> {
+    match sandbox.as_deref() {
+        None => Ok(None),
+        Some(value) => yi_agent_core::InheritedSandbox::parse(value)
+            .map(Some)
+            .ok_or_else(|| {
+                IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "sandbox must be 'read-only', 'workspace-write', or 'danger-full-access', got {value}"
+                    ),
+                ))
+            }),
+    }
+}
+
 struct UnavailableWorkerFactory;
 
 impl AgentWorkerFactory for UnavailableWorkerFactory {
@@ -3149,5 +3180,30 @@ mod error_logging_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod inherited_sandbox_param_tests {
+    use super::*;
+
+    #[test]
+    fn parse_inherited_sandbox_accepts_kebab_and_rejects_snake_case() {
+        assert_eq!(parse_inherited_sandbox(None).unwrap(), None);
+        assert_eq!(
+            parse_inherited_sandbox(Some("danger-full-access".into())).unwrap(),
+            Some(yi_agent_core::InheritedSandbox::DangerFullAccess)
+        );
+        assert_eq!(
+            parse_inherited_sandbox(Some("workspace-write".into())).unwrap(),
+            Some(yi_agent_core::InheritedSandbox::WorkspaceWrite)
+        );
+        assert_eq!(
+            parse_inherited_sandbox(Some("read-only".into())).unwrap(),
+            Some(yi_agent_core::InheritedSandbox::ReadOnly)
+        );
+        // snake_case must be rejected: the wire form is kebab-case.
+        assert!(parse_inherited_sandbox(Some("read_only".into())).is_err());
+        assert!(parse_inherited_sandbox(Some("bogus".into())).is_err());
     }
 }

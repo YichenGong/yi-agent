@@ -83,6 +83,10 @@ impl Tool for BashTool {
         "Execute a shell command via sh -c. Subject to blocklist + timeout. cwd persists across calls. On timeout or cancellation the command's entire process group is killed, including background processes it started; for long-lived services use the managed process tools instead. Prefer combining dependent steps with && into a single call (e.g. `mkdir -p foo && touch foo/bar.txt && ls foo`) rather than splitting across turns."
     }
 
+    fn sandbox_mode(&self) -> Option<&'static str> {
+        Some(self.sandbox.mode().as_str())
+    }
+
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
