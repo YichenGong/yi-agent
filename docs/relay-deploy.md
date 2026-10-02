@@ -289,11 +289,19 @@ App 启动时由 `desktop/src/transportFactory.ts` 决定：若 `localStorage` �
 
 ## 六、范围与已知限制
 
-**Tier 1 已落地：** 多客户端 ws + 设备 token 认证（4401）；一次性配对码（`pair/create`
-→ `pair/redeemed` → 4403）；scope 体系（`observe < control < admin`，新设备默认
-`control`，admin 类 RPC 返回 `-32014`）；设备列表/撤销（`device/list` 任意已握手客户端
-可读、`device/revoke` 需 admin，撤销即断连并废 token）；审批广播 + `approvalResolved`；
-反向 WSS 中继；电脑侧 `--relay` 出站桥接；iOS target 与前端传输接缝。
+**Tier 1 已落地（协议与单测）：** 多客户端 ws + 设备 token 认证（4401）；配对码协议
+（`pair/create` → `pair/redeemed` → 4403，一次性、5 分钟）；scope 体系（`observe <
+control < admin`，新设备默认 `control`，admin 类 RPC 返回 `-32014`）；设备列表/撤销
+（`device/list` 任意已握手客户端可读、`device/revoke` 需 admin，撤销即断连并废 token）；
+审批广播 + `approvalResolved`；反向 WSS 中继；电脑侧 `--relay` 出站桥接；iOS target 与
+前端传输接缝。
+
+**尚未端到端打通（生产不可组合）：**
+
+- **扫码配对**：配对码只存于**创建它的进程内存**，从不落盘；`pair/create` 由桌面
+  stdio 边车进程服务，而跨中继/跨进程的 `?pair=` 兑换发生在**另一个进程**（`--relay`/
+  `ws://`），二者 `PairingState` 不共享内存，故生产环境无法用桌面生成的码完成兑换。
+  单测通过是因为在**同一进程内** create + serve_ws（见 §4.4）。
 
 **不在 Tier 1（后续）：**
 
@@ -312,8 +320,10 @@ App 启动时由 `desktop/src/transportFactory.ts` 决定：若 `localStorage` �
   `wss://`。
 - **准入即认证。** app-server 的 ws 传输对每条连接都要求设备 token；绑定非回环地址
   时启动会打印认证告警。不要把无 token 的内部端口暴露到公网。
-- **admin 操作只在桌面可发。** `pair/create`、`device/revoke` 等是 admin-only；经中继
-  的客户端也无法执行（见 §三）。`device/revoke` 会即时断开被撤销设备的活连接并作废
-  其 token。
+- **admin 操作只在桌面可发。** `pair/create`、`device/revoke` 等是 admin-only；桌面
+  GUI 经 stdio 边车（`serve_stdio` → `Scope::Admin`）可发，网络客户端（直连 `ws://`
+  或经中继）一律 `control`，发 admin 类 RPC 会得到 `-32014`。`device/revoke` 对**直连
+  的**被撤销设备会即时断开活连接并作废其 token；**经中继的手机不适用**——中继只是透传，
+  app-server 侧只看到桥接的单一身份（见 §4.4、§六）。
 - **`~/.yi-agent/devices.json` 只存 token 哈希，但请按敏感文件保护**（撤销即删记录）。
 - **背压是 fail-safe 的**：慢消费者被摘除、被撤销设备的帧被丢弃，不静默丢单帧。

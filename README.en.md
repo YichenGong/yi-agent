@@ -152,6 +152,16 @@ pairing (one-time `XXXX-XXXX` code, valid for 5 minutes, new devices default to
 `control` scope), device listing/revocation, and approvals broadcast to every
 connected device.
 
+> **Experimental caveat**: the protocol and unit tests described here are in
+> place, but **QR pairing is not wired end-to-end** — a pairing code lives only in
+> the in-memory state of the process that created it (`pair/create` is served by
+> the desktop stdio sidecar, while a cross-relay/cross-process `?pair=`
+> redemption is a different process), and there is **no installable iOS build**
+> and **no iOS first-launch pairing screen** yet. So "scan and go" is not
+> available today; see
+> [iOS remote control and relay deployment](docs/relay-deploy.md) §4.4, §六 for
+> status and follow-ups.
+
 **The iOS app connects through a self-hosted reverse WSS relay** (both ends only
 make outbound connections; the computer opens no inbound port):
 
