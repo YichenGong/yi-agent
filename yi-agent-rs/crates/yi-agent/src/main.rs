@@ -1585,6 +1585,24 @@ fn run_tui_agent(
                             );
                             tracing::info!("MCP tool registry refreshed");
                         }
+                        ControlCommand::SetModel(new_model) => {
+                            let mut next_config = rebuild_config.clone();
+                            next_config.model = new_model.clone();
+                            agent = yi_agent_core::Agent::new(
+                                Arc::clone(&rebuild_provider),
+                                Arc::clone(&current_tools),
+                                next_config,
+                            )
+                            .with_session(agent.session())
+                            .with_permission(
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                            );
+                            tracing::info!(model = %new_model, "agent model switched via /model");
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::ModelChanged { model: new_model })
+                                .await;
+                        }
                     }
                     continue;
                 }
@@ -1905,12 +1923,14 @@ fn run_tui_agent(
 /// Control commands sent from the TUI to the agent driver task.
 /// Allows the TUI to trigger agent session rebuilds (e.g. /clear, /compact)
 /// without reconstructing the whole agent inline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlCommand {
     /// Clear the agent session (rebuild with empty session).
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
+    /// Rebuild the agent with a new model, preserving the session.
+    SetModel(String),
     /// Rebuild the agent so its tool registry matches the MCP switches the TUI
     /// already applied directly to the shared `McpManager`.
     McpRefresh,
@@ -1937,6 +1957,21 @@ fn manual_compaction_outcome_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_model_control_command_distinguishes_its_payload() {
+        // Guards against a `PartialEq` that ignores the payload (e.g. compares only
+        // the discriminant): two different models must not compare equal, and
+        // `SetModel` must not compare equal to a payload-less variant.
+        let a = ControlCommand::SetModel("claude-opus-4-1".into());
+        let b = ControlCommand::SetModel("claude-sonnet-4-5".into());
+        assert_ne!(a, b);
+        assert_ne!(a, ControlCommand::McpRefresh);
+        assert_eq!(
+            ControlCommand::SetModel("claude-opus-4-1".into()),
+            ControlCommand::SetModel("claude-opus-4-1".into()),
+        );
+    }
 
     #[test]
     fn manual_compaction_outcome_events_preserve_counts_and_errors() {

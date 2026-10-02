@@ -287,6 +287,12 @@ pub enum AgentEvent {
     ManualCompactFailed {
         message: String,
     },
+    /// A runtime `/model` switch succeeded and the agent was rebuilt with a new
+    /// model. Emitted only after the rebuild, so a consumer may treat it as the
+    /// authoritative "now using this model" signal.
+    ModelChanged {
+        model: String,
+    },
     Cancelled,
     /// A mid-turn user message was pushed into the session as a user message.
     /// Emitted only after the text is actually in the transcript, so consumers
@@ -1578,6 +1584,16 @@ mod tests {
     use crate::tool::{Tool, ToolMetadata, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+
+    #[test]
+    fn model_changed_event_is_constructible() {
+        let event = AgentEvent::ModelChanged {
+            model: "claude-opus-4-1".into(),
+        };
+        assert!(
+            matches!(event, AgentEvent::ModelChanged { ref model } if model == "claude-opus-4-1")
+        );
+    }
 
     /// Provider that returns a fixed sequence of events.
     /// Each call returns the next script; if scripts exhausted, returns empty (EndTurn).

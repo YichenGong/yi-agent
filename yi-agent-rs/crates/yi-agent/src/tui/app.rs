@@ -323,6 +323,7 @@ fn run_loop<B: Backend, E: EventSource>(
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
     config: &TuiConfigSnapshot,
 ) -> std::io::Result<usize> {
+    let mut current_model: String = model.to_string();
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
     let mut queued = crate::tui::queued::DeliveredInterjections::new();
@@ -444,6 +445,9 @@ fn run_loop<B: Backend, E: EventSource>(
             // 把一帧内的多个事件合并处理，退回的文本就会被回合结束分支抢先消费。
             // 顺序固定下来后，两种情形都安全。
             apply_interjection_event(&event, &mut queued, input, history, draw_text_width);
+            if let AgentEvent::ModelChanged { model: new_model } = &event {
+                current_model = new_model.clone();
+            }
             history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
@@ -525,7 +529,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 &statusbar_state,
                 &task_registry,
                 active_process_count,
-                model,
+                &current_model,
                 chunks[2].width,
             );
             f.render_widget(statusbar_line, chunks[2]);
@@ -703,7 +707,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     &workdir,
                     &mcp,
                     config,
-                    model,
+                    &current_model,
                 ) {
                     KeyOutcome::Quit => break,
                     KeyOutcome::Submit(_) => {
@@ -2266,20 +2270,21 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Model => {
-            if let Some(model) = args {
-                history.push(
-                    HistoryCell::Separator {
-                        label: Some(format!("切换模型到: {} (暂未实现)", model)),
-                    },
-                    width,
-                );
-            } else {
-                history.push(
-                    HistoryCell::Separator {
-                        label: Some("用法: /model <model-name>".to_string()),
-                    },
-                    width,
-                );
+            match args.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(new_model) => {
+                    let _ = control_tx
+                        .blocking_send(crate::ControlCommand::SetModel(new_model.to_string()));
+                    // 确认行由 `ModelChanged` 事件驱动；这里不预写成功行，避免与
+                    // driver 真实结果冲突。
+                }
+                None => {
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some("用法: /model <model-name>".to_string()),
+                        },
+                        width,
+                    );
+                }
             }
             KeyOutcome::None
         }
@@ -8855,6 +8860,70 @@ mod tests {
             control_rx.try_recv(),
             Ok(crate::ControlCommand::Clear)
         ));
+    }
+
+    #[test]
+    fn model_command_sends_set_model_control() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let _ = execute_slash_command(
+            SlashCommand::Model,
+            None,
+            Some("claude-opus-4-1".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        assert_eq!(
+            control_rx.try_recv(),
+            Ok(crate::ControlCommand::SetModel("claude-opus-4-1".into()))
+        );
+    }
+
+    #[test]
+    fn model_command_without_args_shows_usage() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let _ = execute_slash_command(
+            SlashCommand::Model,
+            None,
+            None,
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("用法: /model <model-name>"))
+        );
     }
 
     #[test]

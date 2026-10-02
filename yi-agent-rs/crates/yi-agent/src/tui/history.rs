@@ -974,6 +974,11 @@ impl HistoryState {
             AgentEvent::ManualCompactFailed { message } => {
                 self.replace_pending_compaction(format!("压缩失败：{message}"));
             }
+            AgentEvent::ModelChanged { model } => {
+                self.cells.push(HistoryCell::Separator {
+                    label: Some(format!("已切换模型: {model}")),
+                });
+            }
             AgentEvent::AutoCompacting {
                 old_msg_count,
                 new_msg_count,
@@ -3228,6 +3233,24 @@ mod tests {
             &history.cells[0],
             HistoryCell::Separator { label: Some(label) }
                 if label == "压缩失败：provider unavailable"
+        ));
+    }
+
+    #[test]
+    fn model_changed_event_renders_the_new_model() {
+        let mut history = HistoryState::new();
+
+        history.push_event(
+            AgentEvent::ModelChanged {
+                model: "claude-opus-4-1".into(),
+            },
+            80,
+        );
+
+        assert!(matches!(
+            &history.cells[0],
+            HistoryCell::Separator { label: Some(label) }
+                if label == "已切换模型: claude-opus-4-1"
         ));
     }
 
