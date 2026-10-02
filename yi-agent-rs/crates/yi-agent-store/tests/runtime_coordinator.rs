@@ -3239,6 +3239,60 @@ async fn runtime_watchdog_can_timeout_a_queued_resource_wait() {
     assert_eq!(coordinator.task_state(&task).unwrap(), "timed_out");
 }
 
+#[tokio::test]
+async fn a_watchdog_timed_out_parent_cascades_and_releases_its_childs_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let parent = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    // The coding child claims its workspace lease while running.
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    // The brief's skeleton asserted on a coordinator-level `has_active_lease_prefix`,
+    // which does not exist; this file's fixtures read leases from a
+    // `RuntimeRepository` handle instead.
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "fixture requires the child to hold a workspace lease"
+    );
+
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(
+        coordinator
+            .record_watchdog_terminal(
+                &session,
+                &parent,
+                WatchdogTerminal::TimedOut(TimeoutKind::WallClock),
+                WatchdogEvidence {
+                    last_meaningful_event_id: None,
+                    last_meaningful_at: timestamp,
+                    elapsed_secs: 301,
+                    current_wait: None,
+                },
+            )
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(coordinator.task_state(&parent).unwrap(), "timed_out");
+    assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
+    assert!(
+        !RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "the cascaded child must release its workspace lease"
+    );
+}
+
 #[test]
 fn watchdog_terminal_variants_emit_their_distinct_event_kinds() {
     for (terminal, expected_state, expected_event) in [

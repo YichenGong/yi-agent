@@ -317,6 +317,38 @@ impl RuntimeCoordinator {
             .remove(task);
     }
 
+    /// Persists one parent-terminal cascade victim and releases its resident
+    /// lease, mirroring the per-id treatment `reconcile_worker_events` and the
+    /// direct cancel path already apply to every id a supervisor reduction
+    /// reports. `terminal_json` keeps the caller's terminal-shape semantics:
+    /// pass `None` for the plain per-state transition (as the cancel path does).
+    fn persist_cascaded_task(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        state: &str,
+        event: RuntimeEvent,
+        terminal_json: Option<&str>,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        match terminal_json {
+            Some(terminal_json) => repository.transition_task_and_attempt_with_terminal(
+                task,
+                attempt,
+                state,
+                event,
+                terminal_json,
+            )?,
+            None => repository.transition_task_and_attempt(task, attempt, state, event)?,
+        };
+        drop(repository);
+        self.release_resident_lease(task);
+        Ok(())
+    }
+
     pub fn resident_admission_cursor(&self) -> AdmissionCursor {
         self.resource_coordinator
             .lock()
@@ -1503,7 +1535,37 @@ impl RuntimeCoordinator {
                         RuntimeEvent::TaskFailed,
                         &evidence,
                     )?;
-                let _ = supervisor.fail_task(task, error.to_string());
+                // The failure reduces an already-terminal task, so the cascade
+                // cannot fire again. Its returned ids still have to be consumed:
+                // `reduce_task` is the choke point, and a later change that
+                // widens the cascade must not silently lose a victim here. A
+                // reduce error is not actionable (the task is already durably
+                // failed above) and must not mask the real provisioning error.
+                let cascaded = supervisor
+                    .fail_task(task, error.to_string())
+                    .unwrap_or_default();
+                let cascaded_attempts = cascaded
+                    .into_iter()
+                    .filter(|id| *id != *task)
+                    .map(|id| {
+                        let victim_attempt = supervisor
+                            .task(&id)
+                            .expect("cascaded task exists")
+                            .active_attempt_id()
+                            .clone();
+                        (id, victim_attempt)
+                    })
+                    .collect::<Vec<_>>();
+                drop(supervisor);
+                for (cascaded_id, victim_attempt) in cascaded_attempts {
+                    self.persist_cascaded_task(
+                        &cascaded_id,
+                        &victim_attempt,
+                        "cancelled",
+                        RuntimeEvent::TaskCancelled,
+                        None,
+                    )?;
+                }
                 return Err(RuntimeCoordinatorError::Supervisor(error.to_string()));
             }
         };
@@ -1964,7 +2026,13 @@ impl RuntimeCoordinator {
             return Ok(false);
         }
 
-        match terminal {
+        // The repository transaction above durably recorded the watchdog
+        // terminal for `task` itself; this reduction additionally settles the
+        // parent-terminal cascade in memory. Its tail (the cascade victims) has
+        // never been persisted, so capture each victim's attempt, drop the
+        // supervisor borrow, and commit + release every one. `affected` always
+        // contains `task` first, which the transaction above already handled.
+        let affected = match terminal {
             WatchdogTerminal::Stalled => supervisor.stall_task(
                 task,
                 CoreWatchdogEvidence {
@@ -1980,7 +2048,28 @@ impl RuntimeCoordinator {
             WatchdogTerminal::BudgetExhausted(kind) => supervisor.exhaust_task_budget(task, kind),
         }
         .map_err(RuntimeCoordinatorError::Supervisor)?;
+        let cascaded = affected
+            .into_iter()
+            .filter(|id| id != task)
+            .map(|id| {
+                let victim_attempt = supervisor
+                    .task(&id)
+                    .expect("cascaded task exists")
+                    .active_attempt_id()
+                    .clone();
+                (id, victim_attempt)
+            })
+            .collect::<Vec<_>>();
         drop(supervisor);
+        for (victim, victim_attempt) in cascaded {
+            self.persist_cascaded_task(
+                &victim,
+                &victim_attempt,
+                "cancelled",
+                RuntimeEvent::TaskCancelled,
+                None,
+            )?;
+        }
         self.release_resident_lease(task);
         Ok(true)
     }

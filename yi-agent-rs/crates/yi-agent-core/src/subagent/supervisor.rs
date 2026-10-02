@@ -635,7 +635,21 @@ impl AgentSupervisor {
         {
             Ok(handle) => handle,
             Err(error) => {
-                self.fail_task(task_id, error.to_string())?;
+                let affected = self.fail_task(task_id, error.to_string())?;
+                // The task crashed before it owned a worker, so the usual case
+                // is `[task_id]`: the catalogue layer has no repository and the
+                // coordinator persists `task_id` as failed from this returned
+                // error. A descendant spawned before this start could in
+                // principle be cascaded here, so surface it rather than let it
+                // disappear silently; wiring that (rarer) victim to the
+                // repository is out of this path's scope.
+                if affected.len() > 1 {
+                    tracing::warn!(
+                        ?task_id,
+                        cascaded = affected.len() - 1,
+                        "worker start failure cascaded live descendants the caller must persist"
+                    );
+                }
                 return Err(error.to_string());
             }
         };
@@ -1497,11 +1511,15 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    /// Fails a task and returns every id whose state changed: the failed task
+    /// plus any descendants the parent-terminal cascade cancelled. Callers that
+    /// persist or release leases (the runtime coordinator) must consume the id
+    /// list rather than discard it.
     pub fn fail_task(
         &mut self,
         task_id: &TaskId,
         message: impl Into<String>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<TaskId>, String> {
         let attempt_id = self
             .tasks
             .get(task_id)
@@ -1514,23 +1532,25 @@ impl AgentSupervisor {
                 attempt_id,
                 failure: TaskFailure::new(message),
             },
-        )?;
-        self.notify_update();
-        Ok(())
+        )
     }
 
     pub fn stall_task(
         &mut self,
         task_id: &TaskId,
         evidence: WatchdogEvidence,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<TaskId>, String> {
         self.reduce_watchdog_event(task_id, |attempt_id| TaskEvent::WatchdogStalled {
             attempt_id,
             evidence,
         })
     }
 
-    pub fn timeout_task(&mut self, task_id: &TaskId, kind: TimeoutKind) -> Result<(), String> {
+    pub fn timeout_task(
+        &mut self,
+        task_id: &TaskId,
+        kind: TimeoutKind,
+    ) -> Result<Vec<TaskId>, String> {
         self.reduce_watchdog_event(task_id, |attempt_id| TaskEvent::WatchdogTimedOut {
             attempt_id,
             kind,
@@ -1541,18 +1561,21 @@ impl AgentSupervisor {
         &mut self,
         task_id: &TaskId,
         kind: BudgetKind,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<TaskId>, String> {
         self.reduce_watchdog_event(task_id, |attempt_id| TaskEvent::WatchdogBudgetExhausted {
             attempt_id,
             kind,
         })
     }
 
+    /// Returns every id whose state changed (the watchdog-terminal task plus any
+    /// cascade victims), so the runtime coordinator persists and releases each.
+    /// `reduce_task` already notifies, so no extra notification is issued here.
     fn reduce_watchdog_event(
         &mut self,
         task_id: &TaskId,
         event: impl FnOnce(AttemptId) -> TaskEvent,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<TaskId>, String> {
         if let Some(worker) = self.workers.get(task_id) {
             worker.cancel();
         }
@@ -1562,9 +1585,7 @@ impl AgentSupervisor {
             .ok_or_else(|| "task does not exist".to_string())?
             .active_attempt_id()
             .clone();
-        self.reduce_task(task_id, event(attempt_id))?;
-        self.notify_update();
-        Ok(())
+        self.reduce_task(task_id, event(attempt_id))
     }
 
     pub fn start_task(&mut self, task_id: &TaskId) -> Result<(), String> {

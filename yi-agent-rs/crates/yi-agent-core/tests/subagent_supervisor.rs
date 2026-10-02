@@ -1191,7 +1191,16 @@ fn failing_a_parent_cascades_its_live_child_to_terminal() {
     supervisor.start_task(&root).unwrap();
     supervisor.start_task(&child).unwrap();
 
-    supervisor.fail_task(&root, "worker crashed").unwrap();
+    let affected = supervisor.fail_task(&root, "worker crashed").unwrap();
+    assert_eq!(
+        affected.first(),
+        Some(&root),
+        "the failed task itself is always the first affected id"
+    );
+    assert!(
+        affected.contains(&child),
+        "the returned id list must carry the cascaded child, got {affected:?}"
+    );
 
     assert!(
         supervisor.task(&child).unwrap().state().is_terminal(),
