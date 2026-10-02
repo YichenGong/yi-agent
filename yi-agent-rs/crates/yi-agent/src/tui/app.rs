@@ -6914,7 +6914,9 @@ mod tests {
         // The popup is capped at 10 rows, i.e. 8 content rows, so 20 Down presses
         // land the selection far outside the initial window.
         const DOWNS: usize = 20;
-        let target = SlashCommand::all()[DOWNS];
+        // The popup lists `completable()`, so the Nth row after N Down presses is
+        // the Nth completable command (not the Nth entry of the full catalog).
+        let target = SlashCommand::completable()[DOWNS];
 
         // `ScriptedEvents` pops from the back, so push in reverse delivery order.
         let mut script = vec![Event::Key(KeyEvent::new(
@@ -6976,7 +6978,9 @@ mod tests {
 
         // A 14-row terminal leaves the popup only 8 rows, i.e. 6 content rows.
         const DOWNS: usize = 12;
-        let target = SlashCommand::all()[DOWNS];
+        // See `slash_popup_scrolls_to_keep_selection_visible`: the popup lists
+        // `completable()`, so index into that view.
+        let target = SlashCommand::completable()[DOWNS];
 
         let mut script = vec![Event::Key(KeyEvent::new(
             KeyCode::Char('q'),
