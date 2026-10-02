@@ -20,6 +20,10 @@ function thread(id: string, title: string, cwd: string): ThreadSummary {
   return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title };
 }
 
+function pinnedThread(id: string, title: string): ThreadSummary {
+  return { thread_id: id, cwd: "/work/projA", model: "m", created_at: 0, updated_at: 0, title, pinned: true };
+}
+
 const groups: WorkspaceGroup[] = [
   {
     workspace: "/work/projA",
@@ -38,11 +42,14 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     groups,
     workspaces: [],
     currentId: null,
+    pinned: [],
     statuses: new Map(),
     unread: new Map(),
     onSelect: vi.fn(),
     onRename: vi.fn(),
     onDelete: vi.fn(),
+    onTogglePin: vi.fn(),
+    onReorderPinned: vi.fn(),
     onNew: vi.fn(),
     onRemoveWorkspace: vi.fn(),
     onBrowse: vi.fn(),
@@ -512,5 +519,116 @@ describe("ThreadSidebar 看板", () => {
     const idleClasses = idle.container.querySelector('[aria-label="看板"]')!.className.split(/\s+/);
     // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-neutral-800/50 被当选中态。
     expect(idleClasses).not.toContain("bg-neutral-800");
+  });
+});
+
+describe("ThreadSidebar pinned section", () => {
+  it("renders pinned threads in the Pinned section, in the given order", () => {
+    const { container } = renderSidebar({ pinned: [pinnedThread("9", "pinned-nine"), pinnedThread("8", "pinned-eight")] });
+    expect(container.textContent).toContain("Pinned");
+    const rows = Array.from(container.querySelectorAll("[data-pinned-row]"));
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining("pinned-nine"),
+      expect.stringContaining("pinned-eight"),
+    ]);
+  });
+
+  it("hides pinned threads from their workspace group", () => {
+    const groups: WorkspaceGroup[] = [
+      { workspace: "/work/projA", exists: true, threads: [thread("1", "alpha", "/work/projA"), pinnedThread("9", "pin-a")] },
+    ];
+    const { container } = renderSidebar({ groups, pinned: [pinnedThread("9", "pin-a")] });
+    const groupRows = Array.from(container.querySelectorAll("[data-group-row]")).map((r) => r.textContent!);
+    expect(groupRows.some((t) => t.includes("pin-a"))).toBe(false);
+    expect(groupRows.some((t) => t.includes("alpha"))).toBe(true);
+  });
+
+  it("does not render a Pinned section when there are no pinned threads", () => {
+    const { container } = renderSidebar({ pinned: [] });
+    expect(container.textContent).not.toContain("Pinned");
+  });
+
+  it("toggles pin on button click without selecting the thread", () => {
+    const onTogglePin = vi.fn();
+    const onSelect = vi.fn();
+    const { container } = renderSidebar({ groups, onTogglePin, onSelect });
+    const btn = container.querySelector<HTMLButtonElement>('[aria-label="Pin thread"]')!;
+    fireEvent.click(btn);
+    expect(onTogglePin).toHaveBeenCalledWith("1", true);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("shows a lit pin button on an already-pinned row", () => {
+    const onTogglePin = vi.fn();
+    const { container } = renderSidebar({
+      pinned: [pinnedThread("9", "pin-a")],
+      onTogglePin,
+    });
+    // 分组里 alpha-thread 未置顶 → 该行是 "Pin thread";置顶行是 "Unpin thread"。
+    const lit = container.querySelector<HTMLButtonElement>('[aria-label="Unpin thread"]')!;
+    expect(lit.getAttribute("aria-pressed")).toBe("true");
+    // 未置顶的行（默认 fixtures 里的 alpha/beta）仍提供可点的 "Pin thread"。
+    expect(container.querySelectorAll('[aria-label="Pin thread"]')).toHaveLength(2);
+    // 置顶状态在同一时刻只能有一处点亮：只有置顶行是 aria-pressed="true"。
+    expect(container.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    fireEvent.click(lit);
+    expect(onTogglePin).toHaveBeenCalledWith("9", false);
+  });
+
+  it("reorders pinned threads on drop", () => {
+    const onReorderPinned = vi.fn();
+    const { container } = renderSidebar({
+      pinned: [pinnedThread("9", "nine"), pinnedThread("8", "eight")],
+      onReorderPinned,
+    });
+    const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
+    // 把第一行拖到第二行位置。
+    fireEvent.dragStart(rows[0]);
+    fireEvent.dragOver(rows[1]);
+    // 悬停期间要有可见的落点指示线，否则用户看不到会落到哪儿。
+    expect(container.querySelector("[data-pin-drop-indicator]")).not.toBeNull();
+    fireEvent.drop(rows[1]);
+    expect(onReorderPinned).toHaveBeenCalledWith(["8", "9"]);
+  });
+
+  it("does not reorder when a pinned row is dropped on itself", () => {
+    const onReorderPinned = vi.fn();
+    const { container } = renderSidebar({
+      pinned: [pinnedThread("9", "nine"), pinnedThread("8", "eight")],
+      onReorderPinned,
+    });
+    const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
+    fireEvent.dragStart(rows[0]);
+    fireEvent.dragOver(rows[0]);
+    fireEvent.drop(rows[0]);
+    expect(onReorderPinned).not.toHaveBeenCalled();
+  });
+
+  it("collapses and expands the pinned section from its caret", () => {
+    const { container } = renderSidebar({ pinned: [pinnedThread("9", "nine")] });
+    fireEvent.click(container.querySelector('[aria-label="Collapse pinned"]')!);
+    expect(container.querySelectorAll("[data-pinned-row]")).toHaveLength(0);
+    // 折叠是局部的:工作区分组不受影响。
+    expect(container.textContent).toContain("alpha-thread");
+
+    fireEvent.click(container.querySelector('[aria-label="Expand pinned"]')!);
+    expect(container.querySelectorAll("[data-pinned-row]")).toHaveLength(1);
+  });
+
+  it("renders neither a pin button nor draggable on the row being renamed", () => {
+    const { container } = renderSidebar({ pinned: [pinnedThread("9", "nine")] });
+    fireEvent.doubleClick(screen.getByText("nine"));
+    const row = container.querySelector<HTMLElement>("[data-pinned-row]")!;
+    expect(row.querySelector("[aria-label=\"Unpin thread\"]")).toBeNull();
+    expect(row.querySelector("[aria-label=\"Pin thread\"]")).toBeNull();
+    expect(row.getAttribute("draggable")).not.toBe("true");
+  });
+
+  it("does not make unpinned group rows draggable", () => {
+    const { container } = renderSidebar();
+    const notDraggable = Array.from(container.querySelectorAll<HTMLElement>("[data-group-row]")).every(
+      (r) => r.getAttribute("draggable") !== "true",
+    );
+    expect(notDraggable).toBe(true);
   });
 });

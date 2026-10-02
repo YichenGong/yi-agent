@@ -5,7 +5,7 @@
 //! 串行消费 turn、驱动 `agent.run()` 的事件流,并经 `Translator` 写成协议通知。
 //! 另有 `not_initialized` / `method_not_found` / 解析错误 / stdin EOF 优雅退出。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,12 +57,17 @@ struct BuiltAgent {
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
     /// 该 agent 的运行时 yolo 开关;`ThreadSession` 存它以便 RPC 即时切换。
     yolo: yi_agent_core::autonomy::YoloSwitch,
+    /// 支撑该 agent 工具集里的进程工具的 manager。**与生效的工具集同行**：
+    /// `build_runtime_tooling` 换掉工具集时必须一并替换它。
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
 }
 
 /// 一个 cwd 的工具集与其权限检查器。
 struct RuntimeTooling {
     registry: Arc<yi_agent_core::ToolRegistry>,
     permission: Arc<yi_agent_core::permission::PermissionChecker>,
+    /// 这一份注册表对应的 manager(与 registry 同源)。
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
 }
 
 /// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目
@@ -423,6 +428,47 @@ async fn watch_children<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     }
 }
 
+/// 把 manager 的状态广播转成 `process/updated` 通知。
+///
+/// 只在状态变化时推送(`Output` 丢弃):高频输出走 `process/read` 按需拉取。
+/// 关闭 thread 时由调用方 abort。
+async fn watch_processes<W>(
+    writer: Arc<MessageWriter<W>>,
+    thread_id: String,
+    manager: Arc<yi_agent_tools::ProcessManager>,
+    mut rx: tokio::sync::broadcast::Receiver<yi_agent_tools::ProcessEvent>,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use yi_agent_tools::ProcessEvent;
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let (process_id, state) = match event {
+                    ProcessEvent::Started { process_id } => (process_id, "starting"),
+                    ProcessEvent::Ready { process_id } => (process_id, "ready"),
+                    ProcessEvent::Exited { process_id, .. } => (process_id, "exited"),
+                    ProcessEvent::Killed { process_id } => (process_id, "killed"),
+                    // 输出是高频流:不转发,详情页自己按需增量拉。
+                    ProcessEvent::Output { .. } => continue,
+                };
+                let _ = manager.list(); // 保证条目仍在(仅作存在性自检,结果丢弃)
+                let _ = write_notification(
+                    &writer,
+                    &Notification::ProcessUpdated {
+                        thread_id: thread_id.clone(),
+                        process_id,
+                        state: state.to_string(),
+                    },
+                )
+                .await;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Forward a watched task's rows until the stream ends or the task is aborted.
 ///
 /// The subscription is non-blocking so the task yields between polls; it ends on
@@ -531,6 +577,19 @@ impl ChildrenWatch {
     }
 }
 
+/// 每个 thread 一个进程状态守望者:订阅该 thread 生效 manager 的广播,把
+/// 低频状态事件转成 `process/updated` 通知。`Output` 事件在此丢弃。
+struct ProcessWatch {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProcessWatch {
+    async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
 /// One conversation's live trace watch.
 ///
 /// At most one task per conversation is watched, because the client shows one
@@ -626,6 +685,7 @@ fn build_runtime_tooling(
     )
     .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
+    let process_manager = Arc::clone(&setup.process_manager);
     // The conversation marker is bound here, not inferred later: the model that
     // calls `spawn_agent` never sees a thread id, so each thread's tools carry
     // their own so every child they spawn is tagged with this conversation.
@@ -641,6 +701,7 @@ fn build_runtime_tooling(
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
         permission,
+        process_manager,
     })
 }
 
@@ -671,6 +732,8 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         decision_rx,
         catalog,
         yolo,
+        // 注册表换了,manager 必须跟着换:否则面板查的是被丢弃的那一份。
+        process_manager: tooling.process_manager,
     }
 }
 
@@ -737,7 +800,9 @@ fn plugin_query(
     }
     // The daemon that runs the plugin lives at the project root, which is also
     // what `yi_agent_boards::lifecycle` and `board_daemon` dial.
-    let runtime_dir = project.join(".yi-agent").join("runtime");
+    // 复用共享 helper 而不是手写 `.yi-agent/runtime`：它先认 `YI_AGENT_RUNTIME_DIR`，
+    // 与工作区其它地方对「runtime socket 在哪」保持同一个定义。
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(project);
     let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir)
         .map_err(|error| BoardQueryError::new("daemon_unavailable", format!("daemon is unavailable: {error}")))?;
     let response = yi_agent_store::ipc::send_request(
@@ -841,6 +906,7 @@ where
                 decision_rx: built.decision_rx,
                 catalog: built.catalog,
                 yolo: built.yolo,
+                process_manager: built.process_manager,
             })
         },
     )
@@ -923,6 +989,8 @@ where
     let mut trace_watches: HashMap<String, TraceWatch> = HashMap::new();
     // 每个 thread 至多一个子任务列表守望者,首次 agent/children/list 时建立。
     let mut children_watches: HashMap<String, ChildrenWatch> = HashMap::new();
+    // 每个 thread 一个进程状态守望者,建立 thread 时拉起。
+    let mut process_watches: HashMap<String, ProcessWatch> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1194,18 +1262,7 @@ where
                             // 存储字段重命名不会悄悄改变 RPC 输出。
                             let threads: Vec<serde_json::Value> = metas
                                 .into_iter()
-                                .map(|m| {
-                                    json!({
-                                        "thread_id": m.thread_id,
-                                        "cwd": m.cwd,
-                                        "model": m.model,
-                                        "created_at": m.created_at,
-                                        "updated_at": m.updated_at,
-                                        "title": m.title,
-                                        "permission_mode": m.permission_mode,
-                                        "status": thread_status(&threads, &m.thread_id),
-                                    })
-                                })
+                                .map(|m| thread_summary_json(&m, &threads))
                                 .collect();
                             write_response(&writer, ok_response(id, json!({ "threads": threads })))
                                 .await?;
@@ -1231,18 +1288,7 @@ where
                                 match crate::thread_store::ThreadStore::new(path).list() {
                                     Ok(metas) => metas
                                         .into_iter()
-                                        .map(|m| {
-                                            json!({
-                                                "thread_id": m.thread_id,
-                                                "cwd": m.cwd,
-                                                "model": m.model,
-                                                "created_at": m.created_at,
-                                                "updated_at": m.updated_at,
-                                                "title": m.title,
-                                                "permission_mode": m.permission_mode,
-                                                "status": thread_status(&threads, &m.thread_id),
-                                            })
-                                        })
+                                        .map(|m| thread_summary_json(&m, &threads))
                                         .collect(),
                                     Err(e) => {
                                         eprintln!(
@@ -1260,8 +1306,15 @@ where
                                 "threads": threads,
                             }));
                         }
-                        write_response(&writer, ok_response(id, json!({ "groups": groups })))
-                            .await?;
+                        let pinned: Vec<serde_json::Value> = collect_pinned(&workspaces)
+                            .iter()
+                            .map(|m| thread_summary_json(m, &threads))
+                            .collect();
+                        write_response(
+                            &writer,
+                            ok_response(id, json!({ "groups": groups, "pinned": pinned })),
+                        )
+                        .await?;
                     }
                     "thread/start" => {
                         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
@@ -1298,8 +1351,16 @@ where
                             &thread_id,
                             built,
                         );
-                        let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
-                            activation.built;
+                        let BuiltAgent {
+                            agent,
+                            provider,
+                            config,
+                            decision_tx,
+                            catalog,
+                            yolo,
+                            process_manager,
+                            ..
+                        } = activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
@@ -1319,6 +1380,7 @@ where
                             updated_at: now,
                             title: None,
                             permission_mode: mode,
+                            pin_seq: None,
                         };
                         if let Err(e) = thread_store.create(&meta) {
                             // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -1347,6 +1409,7 @@ where
                                 model: model.clone(),
                                 active_turn_id: None,
                                 yolo,
+                                process_manager: Arc::clone(&process_manager),
                                 prompt_tx,
                                 interrupt_tx,
                                 interject_tx,
@@ -1355,6 +1418,23 @@ where
                                 status: Arc::clone(&store_status),
                             },
                         );
+
+                        // 先停旧守望者、再订阅本次生效的 manager。`thread/start` 通常没有
+                        // 旧守望者(remove 得到 None,no-op),但 `thread/resume` 恢复一个
+                        // 仍在内存的活 thread 时会换掉生效的 manager:旧守望者若被
+                        // `contains_key` 守卫留下,就仍订阅那份已被丢弃的 manager,与
+                        // `process/list` 用的新 manager 脱节,`process/updated` 静默失联。
+                        if let Some(previous) = process_watches.remove(&thread_id) {
+                            previous.stop().await;
+                        }
+                        let rx = process_manager.subscribe();
+                        let handle = tokio::spawn(watch_processes(
+                            Arc::clone(&writer),
+                            thread_id.clone(),
+                            Arc::clone(&process_manager),
+                            rx,
+                        ));
+                        process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
 
                         // 每个 thread 一个 driver task:独占 agent 与两个 receiver,
                         // 串行驱动 turn。
@@ -1508,8 +1588,16 @@ where
                             &thread_id,
                             built,
                         );
-                        let BuiltAgent { agent, provider, config, decision_tx, catalog, yolo, .. } =
-                            activation.built;
+                        let BuiltAgent {
+                            agent,
+                            provider,
+                            config,
+                            decision_tx,
+                            catalog,
+                            yolo,
+                            process_manager,
+                            ..
+                        } = activation.built;
                         pending_activation.insert(thread_id.clone(), activation.runtime);
 
                         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
@@ -1528,6 +1616,7 @@ where
                                 model: model.clone(),
                                 active_turn_id: None,
                                 yolo,
+                                process_manager: Arc::clone(&process_manager),
                                 prompt_tx,
                                 interrupt_tx,
                                 interject_tx,
@@ -1536,6 +1625,21 @@ where
                                 status: Arc::clone(&store_status),
                             },
                         );
+
+                        // 与 `thread/start` 同款:先停旧守望者、再对本次生效的 manager 重订。
+                        // 这里正是缺陷所在——resume 一个活 thread 会新建 manager,若沿用
+                        // 「有守望者就不重建」的守卫,旧守望者会继续订阅被丢弃的 manager。
+                        if let Some(previous) = process_watches.remove(&thread_id) {
+                            previous.stop().await;
+                        }
+                        let rx = process_manager.subscribe();
+                        let handle = tokio::spawn(watch_processes(
+                            Arc::clone(&writer),
+                            thread_id.clone(),
+                            Arc::clone(&process_manager),
+                            rx,
+                        ));
+                        process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
 
                         let driver_writer = Arc::clone(&writer);
                         let driver_turn_tx = turn_tx.clone();
@@ -1701,6 +1805,143 @@ where
                         }
                         write_response(&writer, ok_response(id, json!({}))).await?;
                     }
+                    "thread/setPinned" => {
+                        let Some(thread_id) =
+                            require_thread_id(&writer, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // 参数校验先于 thread 存在性:非布尔一律 `-32602`。
+                        let Some(pinned) = req.params.get("pinned").and_then(|v| v.as_bool())
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params("pinned must be a boolean"),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 降序契约:now_millis 是当前最大值 → 新置顶项天然在最顶。
+                        let seq = if pinned {
+                            Some(crate::thread_store::now_millis())
+                        } else {
+                            None
+                        };
+                        match store_lookup(&threads, &workspaces, &cfg, &thread_id)
+                            .set_pin_seq(&thread_id, seq)
+                        {
+                            Ok(true) => {
+                                write_response(&writer, ok_response(id, json!({}))).await?;
+                            }
+                            Ok(false) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    "thread/reorderPinned" => {
+                        let arr = match req.params.get("threadIds").and_then(|v| v.as_array()) {
+                            Some(a) => a,
+                            None => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(
+                                            "threadIds must be an array of strings",
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 全部必须是字符串,否则拒绝(不允许静默丢弃非字符串项)。
+                        let ids: Vec<String> = match arr
+                            .iter()
+                            .map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Option<Vec<_>>>()
+                        {
+                            Some(v) => v,
+                            None => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(
+                                            "threadIds must be an array of strings",
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 校验:与「当前全部置顶集合」完全一致,且无重复。
+                        let pinned_now = collect_pinned(&workspaces);
+                        let current: HashSet<&str> =
+                            pinned_now.iter().map(|m| m.thread_id.as_str()).collect();
+                        let unique: HashSet<&str> =
+                            ids.iter().map(|s| s.as_str()).collect();
+                        let valid = unique.len() == ids.len()
+                            && ids.len() == current.len()
+                            && ids.iter().all(|i| current.contains(i.as_str()));
+                        if !valid {
+                            write_response(
+                                &writer,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(
+                                        "threadIds must list exactly the pinned threads, no duplicates",
+                                    ),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let current_seq: HashMap<String, Option<i64>> = pinned_now
+                            .iter()
+                            .map(|m| (m.thread_id.clone(), m.pin_seq))
+                            .collect();
+                        let assignments =
+                            crate::thread_store::assign_pin_seqs(&ids, &current_seq);
+                        let mut err: Option<RpcError> = None;
+                        for (tid, seq) in assignments {
+                            let store = store_lookup(&threads, &workspaces, &cfg, &tid);
+                            match store.set_pin_seq(&tid, Some(seq)) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    err = Some(RpcError::unknown_thread(&tid));
+                                    break;
+                                }
+                                Err(e) => {
+                                    err = Some(RpcError::internal(e.to_string()));
+                                    break;
+                                }
+                            }
+                        }
+                        match err {
+                            None => {
+                                write_response(&writer, ok_response(id, json!({}))).await?;
+                            }
+                            Some(e) => {
+                                write_response(&writer, err_response(id, e)).await?;
+                            }
+                        }
+                    }
                     "thread/delete" => {
                         let Some(thread_id) =
                             require_thread_id(&writer, &req.params, id.clone()).await?
@@ -1757,6 +1998,9 @@ where
                             watch.stop().await;
                         }
                         if let Some(watch) = children_watches.remove(&thread_id) {
+                            watch.stop().await;
+                        }
+                        if let Some(watch) = process_watches.remove(&thread_id) {
                             watch.stop().await;
                         }
                         let live_cwds = threads
@@ -2326,7 +2570,143 @@ where
                         if let Some(watch) = children_watches.remove(&thread_id) {
                             watch.stop().await;
                         }
+                        if let Some(watch) = process_watches.remove(&thread_id) {
+                            watch.stop().await;
+                        }
                         write_response(&writer, ok_response(id, json!({ "stopped": true }))).await?;
+                    }
+                    "process/list" => {
+                        let Some(thread_id) =
+                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing thread_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 未知 thread 返回空表而非错误:切走再切回、thread 已删除
+                        // 都是正常路径,报错只会弹一条无意义的红条。
+                        let processes = threads
+                            .get(&thread_id)
+                            .map(|s| s.process_manager.list())
+                            .unwrap_or_default();
+                        write_response(&writer, ok_response(id, json!({ "processes": processes })))
+                            .await?;
+                    }
+                    "process/read" => {
+                        let Some(thread_id) =
+                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing thread_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(process_id) = req
+                            .params
+                            .get("process_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing process_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(session) = threads.get(&thread_id) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let cursor = req.params.get("cursor").and_then(|v| v.as_u64());
+                        let max_bytes = req
+                            .params
+                            .get("max_bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(64 * 1024) as usize;
+                        match session
+                            .process_manager
+                            .read(yi_agent_tools::ProcessSelector::Id(process_id), cursor, max_bytes)
+                            .await
+                        {
+                            Ok(result) => {
+                                write_response(
+                                    &writer,
+                                    ok_response(
+                                        id,
+                                        serde_json::to_value(result)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    ),
+                                )
+                                .await?
+                            }
+                            Err(message) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::invalid_params(message)),
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    "process/kill" => {
+                        let Some(thread_id) =
+                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing thread_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(process_id) = req
+                            .params
+                            .get("process_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing process_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+        let Some(session) = threads.get(&thread_id) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::unknown_thread(&thread_id)),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        match session
+                            .process_manager
+                            .kill(yi_agent_tools::ProcessSelector::Id(process_id))
+                            .await
+                        {
+                            Ok(()) => {
+                                write_response(&writer, ok_response(id, json!({ "ok": true })))
+                                    .await?
+                            }
+                            Err(message) => {
+                                write_response(
+                                    &writer,
+                                    err_response(id, RpcError::invalid_params(message)),
+                                )
+                                .await?
+                            }
+                        }
                     }
                     _ => {
                         write_response(&writer, err_response(id, RpcError::method_not_found(&method)))
@@ -2427,6 +2807,47 @@ fn thread_status(threads: &HashMap<String, ThreadSession>, thread_id: &str) -> T
         .get(thread_id)
         .map(|s| *s.status.lock().unwrap_or_else(|p| p.into_inner()))
         .unwrap_or(ThreadStatus::Idle)
+}
+
+/// 跨工作目录收集已置顶的 thread meta，按置顶分区契约排序：
+/// `pin_seq` 降序（越大越靠前），`updated_at` 降序，`thread_id` 升序。
+fn collect_pinned(workspaces: &WorkspaceIndex) -> Vec<crate::thread_store::ThreadMeta> {
+    let mut out = Vec::new();
+    for dir in workspaces.list() {
+        let path = Path::new(&dir);
+        if !path.is_dir() {
+            continue;
+        }
+        match crate::thread_store::ThreadStore::new(path).list() {
+            Ok(metas) => out.extend(metas.into_iter().filter(|m| m.pin_seq.is_some())),
+            Err(e) => eprintln!("[app-server] collect_pinned failed to list {dir}: {e}"),
+        }
+    }
+    out.sort_by(|a, b| {
+        b.pin_seq
+            .cmp(&a.pin_seq)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| a.thread_id.cmp(&b.thread_id))
+    });
+    out
+}
+
+/// 把 thread meta 渲染成 wire 上的 ThreadSummary（含 `pinned`）。
+fn thread_summary_json(
+    m: &crate::thread_store::ThreadMeta,
+    threads: &HashMap<String, ThreadSession>,
+) -> serde_json::Value {
+    json!({
+        "thread_id": m.thread_id,
+        "cwd": m.cwd,
+        "model": m.model,
+        "created_at": m.created_at,
+        "updated_at": m.updated_at,
+        "title": m.title,
+        "permission_mode": m.permission_mode,
+        "pinned": m.pin_seq.is_some(),
+        "status": thread_status(threads, &m.thread_id),
+    })
 }
 
 /// 把客户端对反向请求的响应路由到等待中的 driver。
@@ -3213,9 +3634,10 @@ mod plugin_query_tests {
         dir: &Path,
         result: serde_json::Value,
     ) -> (PathBuf, Arc<StdMutex<serde_json::Value>>, std::thread::JoinHandle<()>) {
-        // The exact path `plugin_query` dials: a fake daemon bound anywhere else
-        // would let a wrong-path implementation pass.
-        let runtime_dir = dir.join(".yi-agent").join("runtime");
+        // The exact path `plugin_query` dials, via the same helper the
+        // implementation uses: a fake bound anywhere else would let a
+        // wrong-path implementation pass.
+        let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(dir);
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
         let seen = Arc::new(StdMutex::new(serde_json::Value::Null));
@@ -3892,6 +4314,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -3917,6 +4340,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -3942,6 +4366,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -4090,6 +4515,52 @@ mod tests {
             }
         }
         panic!("no thread/start response");
+    }
+
+    /// 读到 id 匹配的那一帧响应,丢弃中间穿插的通知(如 `process/updated`)。
+    ///
+    /// Task 5 之后,进程状态守望者会随时把 `process/updated` 插进同一路流里,
+    /// 请求响应不再保证是紧接着的下一帧,故按 id 收敛而非"读一帧就当响应"。
+    async fn read_response(h: &mut Harness, want: u64) -> serde_json::Value {
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(want)) {
+                return v;
+            }
+        }
+        panic!("no response with id {want}");
+    }
+
+    /// 带总时限地读到「指定 method 的通知」,丢弃中间帧(其它通知、请求响应)。
+    ///
+    /// `process/updated` 由守望者异步推来,不由任何请求直接触发,故不能靠「读下一帧」;
+    /// 只能按 method 收敛。逐帧读另设较短上限,以免没有帧时 `read_value` 内部 5s 超时
+    /// 先 panic(那会让失败信息含混);总时限到则返回 `None`,由调用方给出明确断言。
+    async fn await_notification(
+        h: &mut Harness,
+        method: &str,
+        timeout: Duration,
+    ) -> Option<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let slice = remaining.min(Duration::from_millis(1000));
+            match tokio::time::timeout(slice, h.read_value()).await {
+                Ok(v) => {
+                    if v.get("method").and_then(|m| m.as_str()) == Some(method) {
+                        return Some(v);
+                    }
+                }
+                Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                }
+            }
+        }
     }
 
     fn summary(
@@ -5341,6 +5812,7 @@ mod tests {
             decision_rx: Some(rx_arc),
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -6156,6 +6628,7 @@ mod tests {
                 decision_rx: None,
                 catalog: None,
                 yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             })
         };
         let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -6389,6 +6862,7 @@ mod tests {
             decision_rx: None,
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
     }
 
@@ -6463,6 +6937,7 @@ mod tests {
                 decision_rx: None,
                 catalog: None,
                 yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             })
         };
         let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -7279,6 +7754,486 @@ mod tests {
             .find(|t| t["thread_id"] == tid.as_str())
             .expect("thread must be listed");
         assert_eq!(listed["status"], "idle");
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn process_list_is_empty_for_a_fresh_thread_and_for_an_unknown_one() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+
+        // 新 thread:没有进程,列表为空(不是错误)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/list","params":{{"thread_id":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["id"], 3);
+        assert!(listed["error"].is_null(), "{listed}");
+        assert_eq!(listed["result"]["processes"].as_array().unwrap().len(), 0);
+
+        // 未知 thread:仍返回空列表而非错误(切走再切回是正常路径)。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"process/list","params":{"thread_id":"thread-nope"}}"#,
+        )
+        .await;
+        let unknown = h.read_value().await;
+        assert_eq!(unknown["id"], 4);
+        assert!(unknown["error"].is_null(), "{unknown}");
+        assert_eq!(unknown["result"]["processes"].as_array().unwrap().len(), 0);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn process_read_reports_an_unknown_process_as_an_error() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"proc_999"}}}}"#
+        ))
+        .await;
+        let bad = h.read_value().await;
+        assert_eq!(bad["id"], 3);
+        assert!(bad["result"].is_null(), "{bad}");
+        assert!(bad["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("process not found"));
+
+        h.shutdown().await;
+    }
+
+    /// 生效的那一份 manager 才被看见:thread 必须采用工厂给出的 manager,而不是
+    /// 自建一份——否则进程面板显示空列表,而 agent 明明能起进程(设计 §4.2 的陷阱)。
+    ///
+    /// 顺带验证 `process/read` 的游标增量语义:两次读不重不漏。
+    ///
+    /// 隔离:`cfg.provider` 设成非 anthropic/openai,委派装配会在 `worker_factory` 处
+    /// 确定性失败,`thread/start` 因而**不会**经 `wrap_for_delegation` 换掉工厂给出的
+    /// manager——本测试的前提(工厂那一份生效)才成立,且与 `/tmp` 残留状态无关。
+    #[tokio::test]
+    async fn process_list_and_read_observe_the_managers_the_factory_handed_over() {
+        use std::sync::Arc;
+
+        // 修正:既有 API `ProcessManager::new` 直接返回 `Arc<Self>`,不能再套 `Arc::new`。
+        let held: Arc<yi_agent_tools::ProcessManager> =
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir());
+        let for_factory = Arc::clone(&held);
+
+        let mut cfg = test_config();
+        cfg.provider = "t5-isolated".to_string();
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                let mut built = build_test_agent(session, cwd, mode)?;
+                // 这一份才是「生效」的:thread 必须采用它。
+                built.process_manager = Arc::clone(&for_factory);
+                Ok(built)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        let thread_id = start_thread(&mut h).await;
+
+        // ready_pattern 让 start() 等到输出出现才返回,断言因此是确定性的。
+        let started = held
+            .start(yi_agent_tools::ProcessStartOptions {
+                command: "printf alpha".into(),
+                name: Some("t4-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: Some("alpha".into()),
+                ready_timeout_sec: Some(5),
+            })
+            .await
+            .expect("start");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/list","params":{{"thread_id":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let listed = read_response(&mut h, 3).await;
+        assert!(listed["error"].is_null(), "{listed}");
+        let names: Vec<&str> = listed["result"]["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(names.contains(&"t4-probe"), "thread must see the held manager: {listed}");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{}"}}}}"#,
+            started.process_id
+        ))
+        .await;
+        let first = read_response(&mut h, 4).await;
+        assert!(first["error"].is_null(), "{first}");
+        assert!(
+            first["result"]["stdout"].as_str().unwrap().contains("alpha"),
+            "{first}"
+        );
+        let cursor = first["result"]["next_cursor"].as_u64().unwrap();
+        assert!(cursor > 0, "{first}");
+
+        // 从上一轮游标继续读:没有新输出(不重不漏)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{}","cursor":{cursor}}}}}"#,
+            started.process_id
+        ))
+        .await;
+        let second = read_response(&mut h, 5).await;
+        assert!(second["error"].is_null(), "{second}");
+        assert_eq!(second["result"]["stdout"].as_str().unwrap(), "", "{second}");
+
+        let _ = held.shutdown().await;
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn process_kill_reports_an_unknown_process_as_an_error() {
+        let mut h = Harness::new();
+        let thread_id = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"process/kill","params":{{"thread_id":"{thread_id}","process_id":"proc_999"}}}}"#
+        ))
+        .await;
+        let bad = read_response(&mut h, 3).await;
+        assert!(bad["result"].is_null(), "{bad}");
+        assert!(!bad["error"].is_null());
+
+        h.shutdown().await;
+    }
+
+    /// kill 真的能终止进程,并把状态推到 `exited`/`killed`。
+    ///
+    /// 隔离:`cfg.provider` 设成非 anthropic/openai 时,委派装配会在 `worker_factory`
+    /// 处**确定性**失败(不需要起 daemon、也不看 `/tmp` 残留状态),于是 `thread/start`
+    /// 不会经 `wrap_for_delegation` 把工厂给出的 manager 换成新建的那一份——工厂那一份
+    /// 才是本 thread 生效的 manager,正是本测试要验证的对象。
+    #[tokio::test]
+    async fn process_kill_terminates_a_held_manager_process() {
+        use std::sync::Arc;
+
+        for run in 0..8 {
+            // 修正:既有 API `ProcessManager::new` 已返回 `Arc<Self>`,不能再套 `Arc::new`。
+            let held: Arc<yi_agent_tools::ProcessManager> =
+                yi_agent_tools::ProcessManager::new(std::env::temp_dir());
+            let for_factory = Arc::clone(&held);
+            let mut cfg = test_config();
+            cfg.provider = "t5-isolated".to_string();
+            let mut h = Harness::with_config(
+                cfg,
+                move |session, cwd, mode| {
+                    let mut built = build_test_agent(session, cwd, mode)?;
+                    built.process_manager = Arc::clone(&for_factory);
+                    Ok(built)
+                },
+                PERMISSION_TIMEOUT,
+            );
+            let thread_id = start_thread(&mut h).await;
+
+            let started = held
+                .start(yi_agent_tools::ProcessStartOptions {
+                    command: "sleep 300".into(),
+                    name: Some("t5-probe".into()),
+                    cwd: None,
+                    env: Default::default(),
+                    on_exit: Default::default(),
+                    ready_pattern: None,
+                    ready_timeout_sec: None,
+                })
+                .await
+                .expect("start");
+
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"process/kill","params":{{"thread_id":"{thread_id}","process_id":"{}"}}}}"#,
+                started.process_id
+            ))
+            .await;
+            let killed = read_response(&mut h, 3).await;
+            assert!(killed["error"].is_null(), "run {run}: {killed}");
+            assert_eq!(killed["result"]["ok"], true, "run {run}");
+
+            // 状态必须落到终态之一,而不是仍显示 running。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let snap = held
+                    .list()
+                    .into_iter()
+                    .find(|p| p.process_id == started.process_id)
+                    .expect("process must still be listed after kill");
+                let state = serde_json::to_value(&snap.status).unwrap();
+                let label = state["state"].as_str().unwrap_or("").to_string();
+                if label == "killed" || label == "exited" {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "process never reached a terminal state: {state}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            let _ = held.shutdown().await;
+            h.shutdown().await;
+        }
+    }
+
+    /// 回归(Task 5 缺陷):resume 一个**仍在内存的活 thread** 时,该 thread 生效的
+    /// manager 会被新工厂产出的一份替换;守望者必须跟着换到新 manager 上。
+    ///
+    /// 修复前:`thread/resume` 的守望者启动被 `if !process_watches.contains_key(..)`
+    /// 拦住,仍旧订阅**旧的、已被丢弃**的 manager。于是 `process/list` 读得到新
+    /// manager 的进程,`process/updated` 却永远不来——面板静默失联。本测试正是抓这个:
+    /// 对新建后未起 turn 的活 thread 直接 resume(得到生效 manager 数组下标 1),在其上
+    /// 起进程,断言能从客户端流里读到 process_id 匹配的 `process/updated`。
+    ///
+    /// 隔离:`cfg.provider` 设成非 anthropic/openai,委派装配确定性失败,`thread/start`
+    /// 与 `thread/resume` 都不会经 `wrap_for_delegation` 换掉工厂给出的 manager,因此
+    /// 「工厂第 N 次产出的 manager 即该路径生效的 manager」成立。
+    ///
+    /// 收敛读带超时(见 `await_notification`),修复前是「等不到」而非挂死。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_live_thread_rebinds_process_watcher_to_the_effective_manager() {
+        use std::sync::Arc;
+
+        // 工厂每次被调用都把「本次生效的 manager」推进这里:start 产出下标 0,
+        // resume 产出下标 1(即 resume 后生效的那一份)。
+        let seen: Arc<std::sync::Mutex<Vec<Arc<yi_agent_tools::ProcessManager>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_factory = Arc::clone(&seen);
+
+        let mut cfg = test_config();
+        cfg.provider = "t5-isolated".to_string();
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                let built = build_test_agent(session, cwd, mode)?;
+                let manager = Arc::clone(&built.process_manager);
+                for_factory.lock().unwrap().push(manager);
+                Ok(built)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        let thread_id = start_thread(&mut h).await;
+
+        // 活 thread:未起 turn 时直接 resume,走的是「仍在内存中的活 thread」那条分支。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .await;
+        let resumed = read_response(&mut h, 3).await;
+        assert_eq!(resumed["result"]["thread_id"], thread_id.as_str(), "{resumed}");
+
+        //resume 之后该 thread 生效的 manager 就是工厂第二次产出的那一份。
+        let managers = seen.lock().unwrap().clone();
+        assert_eq!(
+            managers.len(),
+            2,
+            "factory must run once for start and once for resume: {}",
+            managers.len()
+        );
+        let effective = Arc::clone(&managers[1]);
+
+        // 在生效 manager 上起一个进程;守望者若正确重订,应推送 process/updated。
+        let started = effective
+            .start(yi_agent_tools::ProcessStartOptions {
+                command: "sleep 300".into(),
+                name: Some("t5-resume-probe".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: None,
+                ready_timeout_sec: None,
+            })
+            .await
+            .expect("start");
+
+        let note = await_notification(&mut h, "process/updated", Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "resume 后仍未重订守望者:等不到 process/updated(process_id={})",
+                    started.process_id
+                )
+            });
+        assert_eq!(
+            note["params"]["process_id"], started.process_id.as_str(),
+            "{note}"
+        );
+        assert_eq!(note["params"]["thread_id"], thread_id.as_str(), "{note}");
+        // `start` 返回时进程已在运行,守望者至少应报出一个非终态标签。
+        let state = note["params"]["state"].as_str().unwrap_or("");
+        assert!(
+            matches!(state, "starting" | "running" | "ready"),
+            "unexpected state on a running process: {note}"
+        );
+
+        let _ = effective.shutdown().await;
+        h.shutdown().await;
+    }
+
+    fn pin_test_config(dir: &std::path::Path) -> RuntimeConfig {
+        let mut c = test_config();
+        c.workdir = dir.to_path_buf();
+        c
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_pinned_puts_thread_on_top_of_list_all_pinned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+
+        let start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}});
+        h.send(&start.to_string()).await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        let pin = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/setPinned",
+            "params":{"threadId": tid, "pinned": true}});
+        h.send(&pin.to_string()).await;
+        let resp = read_response(&mut h, 3).await;
+        assert!(
+            resp.get("error").is_none(),
+            "setPinned must succeed: {resp}"
+        );
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        let pinned = v["result"]["pinned"].as_array().expect("顶层 pinned 数组");
+        assert_eq!(pinned.len(), 1, "恰一个置顶: {v}");
+        assert_eq!(pinned[0]["thread_id"].as_str().unwrap(), tid);
+        assert_eq!(pinned[0]["pinned"], true);
+
+        // 仍在原分组内,且带 pinned:true。
+        let all: Vec<&serde_json::Value> = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .collect();
+        let me = all
+            .iter()
+            .find(|t| t["thread_id"].as_str() == Some(tid.as_str()))
+            .expect("in group");
+        assert_eq!(me["pinned"], true);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_pinned_false_removes_from_pinned_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+        let start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}});
+        h.send(&start.to_string()).await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        for (id, pinned) in [(3u64, true), (4u64, false)] {
+            let req = serde_json::json!({"jsonrpc":"2.0","id":id,"method":"thread/setPinned",
+                "params":{"threadId": tid, "pinned": pinned}});
+            h.send(&req.to_string()).await;
+            let r = read_response(&mut h, id).await;
+            assert!(r.get("error").is_none(), "{r}");
+        }
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert_eq!(v["result"]["pinned"].as_array().unwrap().len(), 0);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_pinned_rejects_non_boolean_and_unknown_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/setPinned","params":{"threadId":"thread-x","pinned":"yes"}}"#).await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["error"]["code"], -32602, "非布尔 → invalid_params: {v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/setPinned","params":{"threadId":"thread-x","pinned":true}}"#).await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["error"]["code"], -32011, "未知 id → unknown_thread: {v}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reorder_pinned_rewrites_order_and_rejects_bad_input() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(
+            cfg,
+            |s, p, m| build_test_agent(s, p, m),
+            Duration::from_secs(5),
+        );
+        initialize(&mut h).await;
+
+        let mut tids = Vec::new();
+        for id in [2u64, 3u64] {
+            let start =
+                serde_json::json!({"jsonrpc":"2.0","id":id,"method":"thread/start","params":{}});
+            h.send(&start.to_string()).await;
+            tids.push(read_thread_start_response(&mut h, id).await);
+        }
+        // 两个都置顶(后置顶的 tids[1] 在顶)。
+        for (i, tid) in tids.iter().enumerate() {
+            let req = serde_json::json!({"jsonrpc":"2.0","id":10+i as u64,"method":"thread/setPinned",
+                "params":{"threadId": tid, "pinned": true}});
+            h.send(&req.to_string()).await;
+            let r = read_response(&mut h, 10 + i as u64).await;
+            assert!(r.get("error").is_none(), "{r}");
+        }
+        // 反转顺序：tids[0] 放到最顶。
+        let rev = serde_json::json!({"jsonrpc":"2.0","id":20,"method":"thread/reorderPinned",
+            "params":{"threadIds": tids}});
+        h.send(&rev.to_string()).await;
+        let r = read_response(&mut h, 20).await;
+        assert!(r.get("error").is_none(), "reorder must succeed: {r}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":21,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 21).await;
+        let pinned = v["result"]["pinned"].as_array().unwrap();
+        assert_eq!(pinned[0]["thread_id"].as_str().unwrap(), tids[0]);
+
+        // 含未置顶 id → invalid_params。
+        let bad = serde_json::json!({"jsonrpc":"2.0","id":22,"method":"thread/reorderPinned",
+            "params":{"threadIds": ["thread-nope"]}});
+        h.send(&bad.to_string()).await;
+        let v = read_response(&mut h, 22).await;
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "未置顶 id → invalid_params: {v}"
+        );
+
+        // 重复 id → invalid_params。
+        let dup = serde_json::json!({"jsonrpc":"2.0","id":23,"method":"thread/reorderPinned",
+            "params":{"threadIds": [tids[0].clone(), tids[0].clone()]}});
+        h.send(&dup.to_string()).await;
+        let v = read_response(&mut h, 23).await;
+        assert_eq!(v["error"]["code"], -32602, "重复 id → invalid_params: {v}");
         h.shutdown().await;
     }
 }

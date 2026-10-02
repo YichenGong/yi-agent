@@ -209,6 +209,19 @@ pub enum Notification {
         thread_id: String,
         children: Vec<AgentChild>,
     },
+    /// 该 thread 的某个受管进程状态发生了变化。
+    ///
+    /// 只由 `Started / Ready / Exited / Killed` 触发，**不含 `Output`**：stdout
+    /// 是高频流，只在用户打开详情时经 `process/read` 增量拉取，不灌进事件通道。
+    /// 客户端收到本通知即重拉 `process/list` — 它是**提示刷新**，不是权威数据。
+    #[serde(rename = "process/updated")]
+    ProcessUpdated {
+        thread_id: String,
+        process_id: String,
+        /// `ProcessStatus` 的 serde 标签：starting / running / ready / exited /
+        /// killed / failed_to_start。
+        state: String,
+    },
     #[serde(rename = "error")]
     Error { message: String },
 }
@@ -469,5 +482,19 @@ mod tests {
         assert_eq!(v["method"], "thread/status/updated");
         assert_eq!(v["params"]["thread_id"], "t1");
         assert_eq!(v["params"]["status"], "awaiting_approval");
+    }
+
+    #[test]
+    fn process_updated_notification_serializes_with_snake_case_params() {
+        let n = Notification::ProcessUpdated {
+            thread_id: "t1".into(),
+            process_id: "proc_1".into(),
+            state: "running".into(),
+        };
+        let v = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "process/updated");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["process_id"], "proc_1");
+        assert_eq!(v["params"]["state"], "running");
     }
 }

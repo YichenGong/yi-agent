@@ -172,6 +172,8 @@ export interface ThreadSummary {
   permission_mode?: ThreadMode;
   /** 服务端权威状态；旧服务端缺省视为 "idle"。 */
   status?: ThreadStatus;
+  /** 是否置于侧栏顶部的 Pinned 分区。旧服务端缺省视为 false。 */
+  pinned?: boolean;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */
