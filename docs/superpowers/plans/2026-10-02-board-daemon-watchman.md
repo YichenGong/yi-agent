@@ -357,6 +357,7 @@ git commit -m "feat(boards): declare a resident daemon need when a board is crea
 - Produces:
   - `pub fn ensure_daemons(projects: &[PathBuf])` —— 生产：每个项目 `launch_if_absent`。
   - `pub fn ensure_daemons_with(projects: &[PathBuf], launcher: &mut dyn FnMut(&Path) -> Result<bool, String>) -> Vec<PathBuf>` —— 测试用注入；返回「本次真正拉起」的项目（`Ok(true)` 且之前不在跑）。失败只记日志、不中断其余项目。
+  - `pub fn once(resident_dir: &Path, ensure: &mut dyn FnMut(&[PathBuf])) -> usize` —— 读通用登记 → `ensure(&projects)` → 返回登记项目数。**CLI 与 app-server 共用这一个**，避免两处逐字重复的胶水。
 - Consumes: `lifecycle::launch_if_absent`；`resident::list`（调用方传 projects）。
 
 - [ ] **Step 1: 写失败测试**
@@ -376,6 +377,17 @@ mod tests {
             Ok(true)
         });
         assert_eq!(*seen.borrow(), projects);
+    }
+
+    #[test]
+    fn once_reads_the_registry_and_hands_it_to_the_ensurer() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = PathBuf::from("/a");
+        yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let count = once(dir.path(), &mut |projects| seen.extend_from_slice(projects));
+        assert_eq!(count, 1);
+        assert_eq!(seen, vec![a]);
     }
 
     #[test]
@@ -438,6 +450,16 @@ pub fn ensure_daemons_with(
 }
 ```
 
+```rust
+/// 读通用登记并交给 `ensure`；返回登记项目数。CLI 与 app-server 共用这一份，
+/// 不各自复制「读登记 → ensure」的胶水。
+pub fn once(resident_dir: &Path, ensure: &mut dyn FnMut(&[PathBuf])) -> usize {
+    let projects = yi_agent_store::resident::list(resident_dir);
+    ensure(&projects);
+    projects.len()
+}
+```
+
 `lib.rs` 加：`pub mod watch;`
 
 - [ ] **Step 4: 运行确认通过**
@@ -479,7 +501,7 @@ fn boards_watch_parses_with_a_default_interval() {
 }
 
 #[test]
-fn watch_once_ensures_every_registered_project() {
+fn boards_watch_once_ensures_every_registered_project() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
     let b = dir.path().join("b");
@@ -487,7 +509,9 @@ fn watch_once_ensures_every_registered_project() {
     yi_agent_store::resident::require(dir.path(), &b, "superpowers-kanban").unwrap();
 
     let mut seen: Vec<PathBuf> = Vec::new();
-    let count = watch_once(dir.path(), &mut |projects: &[PathBuf]| seen.extend_from_slice(projects));
+    let count = yi_agent_boards::watch::once(dir.path(), &mut |projects: &[PathBuf]| {
+        seen.extend_from_slice(projects)
+    });
     assert_eq!(count, 2);
     assert_eq!(seen, vec![a, b]);
 }
@@ -530,16 +554,6 @@ pub enum BoardsAction {
 ```
 
 ```rust
-/// 跑一轮值守：读通用登记，确保各项目 daemon 存活。返回登记项目数。
-pub(crate) fn watch_once(
-    resident_dir: &std::path::Path,
-    ensure: &mut dyn FnMut(&[std::path::PathBuf]),
-) -> usize {
-    let projects = yi_agent_store::resident::list(resident_dir);
-    ensure(&projects);
-    projects.len()
-}
-
 /// 常驻值守循环。由 launchd 托管，KeepAlive 负责它自己的存活。
 fn run_boards_watch(interval_secs: u64) {
     let Some(resident_dir) = yi_agent_store::resident::default_dir() else {
@@ -548,7 +562,7 @@ fn run_boards_watch(interval_secs: u64) {
     };
     let interval = std::time::Duration::from_secs(interval_secs);
     loop {
-        watch_once(&resident_dir, &mut |projects| {
+        yi_agent_boards::watch::once(&resident_dir, &mut |projects| {
             yi_agent_boards::watch::ensure_daemons(projects);
         });
         std::thread::sleep(interval);
@@ -560,7 +574,7 @@ fn run_boards_watch(interval_secs: u64) {
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `cd yi-agent-rs && cargo test --offline -p yi-agent boards_watch watch_once 2>&1 | tail -20`
+Run: `cd yi-agent-rs && cargo test --offline -p yi-agent boards_watch 2>&1 | tail -20`
 Expected: PASS。
 
 - [ ] **Step 5: Commit**
@@ -958,18 +972,22 @@ git commit -m "feat(app-server): watchman setting RPC and install-on-first-board
 
 **Interfaces:**
 - Consumes: Task 3 的 `watch::ensure_daemons_with`；Task 1 的 `resident::list`。
-- Produces: `fn b_loop_once(resident_dir: &Path, ensure: &mut dyn FnMut(&[PathBuf])) -> usize`（单轮，可测）；server 启动时 `tokio::spawn` 一个每 ~30s 调它的任务，日志化失败。
+- Produces: server 启动时 `tokio::spawn` 一个每 ~30s 的任务；单轮逻辑直接调 `yi_agent_boards::watch::once`（Task 3），**不再另写一份**。
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
 #[test]
 fn the_app_side_loop_ensures_every_registered_project() {
+    // 单轮逻辑是共享的 `watch::once`（Task 3 已在其自身 crate 内测过）；
+    // 这里只断言 app-server 用的是同名同款（覆盖 hooks 见本任务 Step 3）。
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
     yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
     let mut seen: Vec<PathBuf> = Vec::new();
-    let count = b_loop_once(dir.path(), &mut |projects: &[PathBuf]| seen.extend_from_slice(projects));
+    let count = yi_agent_boards::watch::once(dir.path(), &mut |projects: &[PathBuf]| {
+        seen.extend_from_slice(projects)
+    });
     assert_eq!(count, 1);
     assert_eq!(seen, vec![a]);
 }
@@ -977,30 +995,21 @@ fn the_app_side_loop_ensures_every_registered_project() {
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `cd yi-agent-rs && cargo test --offline -p yi-agent-app-server b_loop_once 2>&1 | tail -20`
+Run: `cd yi-agent-rs && cargo test --offline -p yi-agent-app-server app_side_loop 2>&1 | tail -20`
 Expected: 编译失败。
 
 - [ ] **Step 3: 实现**
 
 ```rust
-/// app 侧的会话期自愈单轮：读通用登记，确保各项目 daemon 存活。返回登记数。
-fn b_loop_once(
-    resident_dir: &std::path::Path,
-    ensure: &mut dyn FnMut(&[std::path::PathBuf]),
-) -> usize {
-    let projects = yi_agent_store::resident::list(resident_dir);
-    ensure(&projects);
-    projects.len()
-}
-
 /// 后台自愈循环：app 打开期间每 ~30s 一次，与 watchman 重叠也无害（幂等）。
+/// 单轮逻辑复用 `yi_agent_boards::watch::once`（Task 3），不复制一份胶水。
 fn spawn_board_watchman_loop() {
     let Some(resident_dir) = yi_agent_store::resident::default_dir() else {
         return;
     };
     tokio::spawn(async move {
         loop {
-            b_loop_once(&resident_dir, &mut |projects| {
+            yi_agent_boards::watch::once(&resident_dir, &mut |projects| {
                 yi_agent_boards::watch::ensure_daemons(projects);
             });
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1053,12 +1062,55 @@ fn a_second_instance_cannot_take_the_lock() {
 
 #[test]
 fn a_killed_holder_does_not_deadlock_the_lock() {
-    // 与 lease.rs 同款：SIGKILL 后锁由内核释放（仅验证语义，不起子进程）。
+    // 与 lease.rs 的 `a_slot_held_by_a_dead_process_is_reclaimed` 同款手法：
+    // 把测试二进制自身以 LEASE_HOLD_DIR 重起为持有者，SIGKILL 后轮询到可再取。
+    // 这是「孤儿不会把锁占死」的关键属性，必须真杀进程，不能只测 drop。
     let dir = tempfile::tempdir().unwrap();
-    {
-        let _held = acquire(dir.path()).unwrap();
+    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "single_instance::tests::lock_holder_child", "--nocapture"])
+        .env("LEASE_HOLD_DIR", dir.path())
+        .spawn()
+        .expect("re-invoke the test binary as a lock holder");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut held = false;
+    while std::time::Instant::now() < deadline {
+        if acquire(dir.path()).is_none() {
+            held = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(acquire(dir.path()).is_some(), "flock is released on close, even on crash");
+    assert!(held, "子进程必须在时限内占住锁");
+
+    let status = std::process::Command::new("kill")
+        .args(["-9", &holder.id().to_string()])
+        .status()
+        .expect("kill -9 the holder");
+    assert!(status.success(), "kill -9 必须成功");
+    let _ = holder.wait(); // 收尸，避免僵尸
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut reclaimed = false;
+    while std::time::Instant::now() < deadline {
+        if acquire(dir.path()).is_some() {
+            reclaimed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(reclaimed, "SIGKILL 之后锁必须可再取，否则孤儿会永久占死推进权");
+}
+
+/// 仅在以 LEASE_HOLD_DIR 重起时生效的持有者；正常测试运行立即返回。
+#[test]
+fn lock_holder_child() {
+    let Ok(dir) = std::env::var("LEASE_HOLD_DIR") else {
+        return;
+    };
+    let _lock = acquire(std::path::Path::new(&dir)).expect("holder must take the lock");
+    println!("LOCK-HELD");
+    std::thread::sleep(std::time::Duration::from_secs(30));
 }
 
 #[test]
@@ -1158,16 +1210,22 @@ fn run_daemon(args: Args) {
     // ... 既有实现 ...
 ```
 
-在推进循环里加 daemon 存活探测（每轮一次；连续 3 次失败即退出）：
+在推进循环里加 daemon 存活探测。**必须放在开关判断之前**：否则开关关闭的孤儿插件
+（`continue` 分支）永远发现不了 daemon 已死，就一直留着占锁。
 
 ```rust
     let mut liveness = superpowers_kanban_runner::single_instance::Liveness::default();
     loop {
-        // ... 既有每轮逻辑 ...
+        // 先探 daemon：无论开关开关，孤儿都要有界退出，否则会占着单实例锁不放。
         if liveness.observe(daemon.is_alive(), 3) {
             eprintln!("superpowers-kanban: daemon is gone; exiting so a fresh instance can take over");
             std::process::exit(0);
         }
+        if !board_switch(&args.state_dir).is_enabled() {
+            std::thread::sleep(args.interval);
+            continue;
+        }
+        // ... 既有每轮逻辑 ...
         std::thread::sleep(args.interval);
     }
 ```
