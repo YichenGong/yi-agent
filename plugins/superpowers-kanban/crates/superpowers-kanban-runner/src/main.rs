@@ -1,7 +1,7 @@
 //! Superpowers 看板插件进程入口。
 //!
 //! 用法：
-//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs 60]`
+//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs 10]`
 //! - `superpowers-kanban add <spec> <plan> [--state-dir <d>]`——把一对 spec/plan 投进 `inbox`
 //! - `superpowers-kanban list [--state-dir <d>]`——打印队列与待消费的投递
 //! - `superpowers-kanban on|off [--state-dir <d>]`——写项目层开关
@@ -16,8 +16,10 @@ use std::time::Duration;
 
 use superpowers_kanban_core::calendar::ConcurrencyCalendar;
 use superpowers_kanban_core::card_id::card_id_for;
+use superpowers_kanban_core::layout::{
+    global_preferences_path, project_preferences_path, project_root,
+};
 use superpowers_kanban_core::promotion::validate_promotion;
-use superpowers_kanban_core::layout::{global_preferences_path, project_preferences_path, project_root};
 use superpowers_kanban_core::switch::{BoardSwitch, SwitchValue, read_layer, resolve, write_layer};
 use superpowers_kanban_runner::client::BoardDaemon;
 
@@ -83,10 +85,16 @@ where
         Some("add") => {
             let (state_dir, rest) = parse_state_dir(args)?;
             let mut rest = rest.into_iter();
-            let spec = rest.next().ok_or_else(|| format!("add needs a spec path\n{USAGE}"))?;
-            let plan = rest.next().ok_or_else(|| format!("add needs a plan path\n{USAGE}"))?;
+            let spec = rest
+                .next()
+                .ok_or_else(|| format!("add needs a spec path\n{USAGE}"))?;
+            let plan = rest
+                .next()
+                .ok_or_else(|| format!("add needs a plan path\n{USAGE}"))?;
             if let Some(extra) = rest.next() {
-                return Err(format!("add takes exactly two paths, got an extra: {extra}"));
+                return Err(format!(
+                    "add takes exactly two paths, got an extra: {extra}"
+                ));
             }
             Ok(Subcommand::Add {
                 state_dir,
@@ -159,7 +167,7 @@ where
     let mut runtime_dir = None;
     let mut state_dir = None;
     let mut project_root = None;
-    let mut interval_secs = 60_u64;
+    let mut interval_secs = 10_u64;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -208,7 +216,10 @@ fn command_add(state_dir: &std::path::Path, spec: &str, plan: &str) -> Result<St
     let id = card_id_for(spec, plan);
     superpowers_kanban_core::inbox::deliver_card(state_dir, &id, spec, plan)
         .map_err(|error| format!("could not deliver the card: {error}"))?;
-    Ok(format!("delivered {id} to {}\n{spec}\n{plan}", superpowers_kanban_core::inbox::inbox_dir(state_dir).display()))
+    Ok(format!(
+        "delivered {id} to {}\n{spec}\n{plan}",
+        superpowers_kanban_core::inbox::inbox_dir(state_dir).display()
+    ))
 }
 
 /// `list`：先落盘的队列，再列出尚未被 runner 消费的投递。
@@ -261,13 +272,18 @@ fn command_list(state_dir: &std::path::Path) -> Result<String, String> {
 /// `on`/`off`：只写项目层。全局层留给人显式设置，避免 CLI 悄悄改全局偏好。
 fn command_set_switch(state_dir: &std::path::Path, value: SwitchValue) -> Result<String, String> {
     let path = project_preferences_path(state_dir);
-    write_layer(&path, value).map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    write_layer(&path, value)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
     let now = board_switch(state_dir);
     Ok(format!(
         "superpowers_kanban = {}\nwrote {}\nnow {}",
         matches!(value, SwitchValue::Enabled),
         path.display(),
-        if now.is_enabled() { "enabled" } else { "disabled" }
+        if now.is_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
     ))
 }
 
@@ -313,7 +329,11 @@ struct QueryDispatch {
 }
 
 impl superpowers_kanban_ipc::server::Dispatch for QueryDispatch {
-    fn dispatch(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    fn dispatch(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         superpowers_kanban_runner::dispatch::dispatch(&self.state_dir, method, params)
     }
 }
@@ -336,11 +356,9 @@ fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
     });
     let keep_going = Arc::clone(&stop);
     std::thread::spawn(move || {
-        if let Err(error) = superpowers_kanban_ipc::server::serve_with(
-            &socket,
-            dispatch,
-            || !keep_going.load(Ordering::SeqCst),
-        ) {
+        if let Err(error) = superpowers_kanban_ipc::server::serve_with(&socket, dispatch, || {
+            !keep_going.load(Ordering::SeqCst)
+        }) {
             eprintln!(
                 "superpowers-kanban: query server stopped: {error} (queries will be refused)"
             );
@@ -351,6 +369,19 @@ fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
 
 /// 周期性推进队列，直到进程被杀。
 fn run_daemon(args: Args) {
+    // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到就等旧实例让位——
+    // 旧实例要么正常退出，要么靠 daemon 失联探测自行退出。用轮询避免忙等。
+    // 锁必须在函数存活期间一直持有：`_lock` 绑在这里，函数结束才 drop。
+    let _lock = loop {
+        if let Some(lock) = superpowers_kanban_runner::single_instance::acquire(&args.state_dir) {
+            break lock;
+        }
+        eprintln!(
+            "superpowers-kanban: another instance holds the lock at {}; waiting",
+            args.state_dir.join("plugin.lock").display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     let socket = match superpowers_kanban_ipc::client::socket_path(&args.runtime_dir) {
         Ok(socket) => socket,
@@ -402,7 +433,17 @@ fn run_daemon(args: Args) {
         }
     }
 
+    let mut liveness = superpowers_kanban_runner::single_instance::Liveness::default();
     loop {
+        // 先探 daemon，且必须在开关判断之前：开关关闭的孤儿走 `continue` 分支，
+        // 若把探测放在其后，它永远发现不了 daemon 已死，会一直占着单实例锁。
+        // 阈值 3 × 10s ≈ 30s 让位窗口。
+        if liveness.observe(daemon.is_alive(), 3) {
+            eprintln!(
+                "superpowers-kanban: daemon is gone; exiting so a fresh instance can take over"
+            );
+            std::process::exit(0);
+        }
         if !board_switch(&args.state_dir).is_enabled() {
             // 关掉开关只停止推进，绝不取消已在 daemon 中运行的会话。
             std::thread::sleep(args.interval);
@@ -410,9 +451,11 @@ fn run_daemon(args: Args) {
         }
 
         let mut board = superpowers_kanban_runner::persist::load_board(&board_path);
-        for outcome in
-            superpowers_kanban_runner::inbox::consume(&args.state_dir, &mut board, chrono::Local::now())
-        {
+        for outcome in superpowers_kanban_runner::inbox::consume(
+            &args.state_dir,
+            &mut board,
+            chrono::Local::now(),
+        ) {
             match outcome.result {
                 Ok(()) => eprintln!("superpowers-kanban: enqueued {}", outcome.id),
                 Err(reason) => eprintln!("superpowers-kanban: rejected {} ({reason})", outcome.id),
@@ -467,9 +510,8 @@ fn run_daemon(args: Args) {
                     continue;
                 }
             };
-            let outcome = superpowers_kanban_runner::tick::launch(
-                &mut board, &daemon, &card_id, workdir,
-            );
+            let outcome =
+                superpowers_kanban_runner::tick::launch(&mut board, &daemon, &card_id, workdir);
             eprintln!(
                 "superpowers-kanban: {} -> {:?}",
                 outcome.card_id.0, outcome.action
@@ -522,14 +564,21 @@ mod tests {
 
     #[test]
     fn add_requires_exactly_two_paths() {
-        assert!(parse(&["add", "a.spec.md"]).is_err(), "one path is not enough");
+        assert!(
+            parse(&["add", "a.spec.md"]).is_err(),
+            "one path is not enough"
+        );
         assert!(parse(&["add"]).is_err(), "no path is not enough");
         assert!(
             parse(&["add", "a.spec.md", "a.plan.md", "extra"]).is_err(),
             "a third path must be refused rather than silently dropped"
         );
         match parse(&["add", "a.spec.md", "a.plan.md", "--state-dir", "/s"]) {
-            Ok(Subcommand::Add { state_dir, spec, plan }) => {
+            Ok(Subcommand::Add {
+                state_dir,
+                spec,
+                plan,
+            }) => {
                 assert_eq!(state_dir.to_string_lossy(), "/s");
                 assert_eq!(spec, "a.spec.md");
                 assert_eq!(plan, "a.plan.md");
@@ -541,14 +590,23 @@ mod tests {
     #[test]
     fn list_on_and_off_take_no_positional_arguments() {
         assert!(matches!(parse(&["list"]), Ok(Subcommand::List { .. })));
-        assert!(matches!(parse(&["workdir"]), Ok(Subcommand::Workdir { .. })));
+        assert!(matches!(
+            parse(&["workdir"]),
+            Ok(Subcommand::Workdir { .. })
+        ));
         assert!(matches!(
             parse(&["on"]),
-            Ok(Subcommand::Switch { value: SwitchValue::Enabled, .. })
+            Ok(Subcommand::Switch {
+                value: SwitchValue::Enabled,
+                ..
+            })
         ));
         assert!(matches!(
             parse(&["off"]),
-            Ok(Subcommand::Switch { value: SwitchValue::Disabled, .. })
+            Ok(Subcommand::Switch {
+                value: SwitchValue::Disabled,
+                ..
+            })
         ));
         assert!(parse(&["on", "extra"]).is_err());
         assert!(parse(&["list", "extra"]).is_err());
@@ -563,7 +621,10 @@ mod tests {
 
         let error = command_add(dir.path(), &spec.to_string_lossy(), &plan.to_string_lossy())
             .expect_err("a missing spec must be refused here, not by the runner later");
-        assert!(error.contains("a.spec.md"), "the error must name the file: {error}");
+        assert!(
+            error.contains("a.spec.md"),
+            "the error must name the file: {error}"
+        );
         assert!(
             !dir.path().join("inbox").exists(),
             "nothing may be delivered when validation fails"

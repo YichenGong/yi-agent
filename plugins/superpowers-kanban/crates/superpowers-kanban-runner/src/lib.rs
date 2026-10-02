@@ -6,6 +6,7 @@ pub mod lease;
 pub mod runner;
 pub mod tick;
 
-pub mod persist;
-pub mod worktree;
 pub mod dispatch;
+pub mod persist;
+pub mod single_instance;
+pub mod worktree;
