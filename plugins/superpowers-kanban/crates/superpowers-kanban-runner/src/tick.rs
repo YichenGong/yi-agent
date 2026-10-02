@@ -79,7 +79,21 @@ pub fn reconcile_running(board: &mut Board, daemon: &BoardDaemon) -> Vec<TickOut
         let Some(task_id) = board.get(&card_id).and_then(|card| card.task_id.clone()) else {
             continue;
         };
-        let Ok(Some(state)) = daemon.task_state(&task_id) else {
+        let observed = match daemon.task_state(&task_id) {
+            Ok(observed) => observed,
+            // A query that could not be made is not evidence about the card.
+            Err(_) => continue,
+        };
+        let Some(state) = observed else {
+            // The task is gone entirely: the card can never be reconciled again,
+            // so fail it visibly instead of stranding it in `running` — which
+            // would also hold its slot forever and block every later card.
+            if board.transition(&card_id, CardState::Failed).is_ok() {
+                outcomes.push(TickOutcome {
+                    card_id,
+                    action: TickAction::Transitioned(CardState::Failed),
+                });
+            }
             continue;
         };
         let Some(next) = crate::runner::state_for_task_state(&state) else {
@@ -188,6 +202,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(task_id.to_owned(), state.to_owned());
+        }
+
+        /// Drops a task from the listing, as a daemon that lost or reclaimed the
+        /// task's session would.
+        fn forget(&self, task_id: &str) {
+            self.states.lock().unwrap().remove(task_id);
         }
     }
 
@@ -362,6 +382,34 @@ mod tests {
         fake.set_state(&task_id, "something_brand_new");
         assert!(reconcile_running(&mut board, &daemon).is_empty());
         assert_eq!(board.get(&CardId::new("a")).unwrap().state, CardState::Running);
+        fake.finish();
+    }
+
+    #[test]
+    fn a_card_whose_task_id_is_no_longer_listed_is_failed_not_stranded() {
+        // A recorded task id that the daemon no longer lists (its session was
+        // reclaimed, or the worker died before it was recorded) means the card
+        // can never be reconciled again. Leaving it `Running` strands it
+        // forever and holds a concurrency slot that blocks every later card, so
+        // it must leave `Running` as a visible failure instead.
+        let (fake, socket) = start_fake_daemon();
+        let daemon = BoardDaemon::new(socket);
+        let mut board = board_with(&["a"]);
+        launch(&mut board, &daemon, &CardId::new("a"), PathBuf::from("/tmp/wt/a"));
+        let task_id = board.get(&CardId::new("a")).unwrap().task_id.clone().unwrap();
+
+        // The daemon forgot the task entirely.
+        fake.forget(&task_id);
+
+        let outcomes = reconcile_running(&mut board, &daemon);
+        assert_eq!(outcomes.len(), 1, "the stranded card must be reconciled");
+        assert_eq!(outcomes[0].card_id, CardId::new("a"));
+        assert_eq!(
+            board.get(&CardId::new("a")).unwrap().state,
+            CardState::Failed,
+            "an unknown task id is a failure, not a permanently running card"
+        );
+        assert_eq!(board.running_count(), 0, "the slot is freed for the next card");
         fake.finish();
     }
 
