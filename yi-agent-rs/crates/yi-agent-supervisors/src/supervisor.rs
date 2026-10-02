@@ -104,6 +104,14 @@ impl Supervisor {
 
         for manifest in manifests {
             if !self.desired_on(&manifest) {
+                // A process that must stay reachable to be turned back on is
+                // left running: "off" means "stop working", not "disappear".
+                // Stopping it would remove the query channel that reports and
+                // flips the switch, so off would never be recoverable in-app.
+                if !manifest.stop_when_disabled {
+                    self.ensure_running(&manifest);
+                    continue;
+                }
                 self.stop(&manifest.name);
                 continue;
             }

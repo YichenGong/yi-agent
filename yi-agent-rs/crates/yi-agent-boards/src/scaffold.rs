@@ -16,6 +16,11 @@ const SWITCH_KEY: &str = "superpowers_kanban";
 /// `PATH`. `{command}` is not a placeholder the supervisor expands — only
 /// `{workdir}`, `{state_dir}`, and `{runtime_dir}` are — so the substituted
 /// absolute path passes through untouched.
+///
+/// `stop_when_disabled` is `false` because the plugin serves the query channel
+/// the board UI talks to: stopping it on switch-off would take away the only
+/// way to read the switch and turn it back on. The plugin gates its own work on
+/// the switch instead (see `run_daemon`), so off still means "stop advancing".
 const MANIFEST_TEMPLATE: &str = r#"{
   "name": "superpowers-kanban",
   "command": "{command}",
@@ -31,6 +36,7 @@ const MANIFEST_TEMPLATE: &str = r#"{
     "60"
   ],
   "switch_key": "superpowers_kanban",
+  "stop_when_disabled": false,
   "restart_backoff_ms": 1000,
   "restart_backoff_max_ms": 30000,
   "query_socket": "{state_dir}/superpowers-kanban.sock"
@@ -139,6 +145,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(value["name"], "superpowers-kanban");
         assert_eq!(value["switch_key"], "superpowers_kanban");
+        // The plugin serves the query channel, so it must survive switch-off to
+        // stay re-enable-able; the supervisor must not kill it.
+        assert_eq!(
+            value["stop_when_disabled"], false,
+            "看板插件必须声明开关关闭时不停止"
+        );
         assert_eq!(value["query_socket"], "{state_dir}/superpowers-kanban.sock");
         let command = value["command"].as_str().unwrap();
         assert!(command.ends_with("superpowers-kanban"), "got {command}");

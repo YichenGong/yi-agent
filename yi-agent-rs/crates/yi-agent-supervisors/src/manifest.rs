@@ -35,6 +35,14 @@ pub struct SupervisorManifest {
     pub switch_key: String,
     pub restart_backoff_ms: u64,
     pub restart_backoff_max_ms: u64,
+    /// Whether turning the switch off should stop this process. Defaults to
+    /// `true`.
+    ///
+    /// A process that serves a query channel must set this `false`: stopping it
+    /// on switch-off removes the only channel that can report the switch and
+    /// turn it back on, so "off" would become a one-way door. Such a process
+    /// gates its own work on the switch instead of exiting.
+    pub stop_when_disabled: bool,
     /// Socket this process can be queried on, if it serves one. Generic: the
     /// field names no plugin and the daemon attaches no meaning to the answers.
     /// `None` means "not queryable", so an older manifest keeps loading.
@@ -43,6 +51,12 @@ pub struct SupervisorManifest {
 
 const DEFAULT_BACKOFF_MS: u64 = 1000;
 const DEFAULT_BACKOFF_MAX_MS: u64 = 30_000;
+
+/// A manifest that predates `stop_when_disabled` keeps the historical meaning:
+/// off means stopped.
+fn default_stop_when_disabled() -> bool {
+    true
+}
 
 #[derive(Debug, Deserialize)]
 struct RawManifest {
@@ -53,6 +67,8 @@ struct RawManifest {
     switch_key: String,
     restart_backoff_ms: Option<u64>,
     restart_backoff_max_ms: Option<u64>,
+    #[serde(default = "default_stop_when_disabled")]
+    stop_when_disabled: bool,
     query_socket: Option<String>,
 }
 
@@ -75,6 +91,7 @@ impl SupervisorManifest {
             switch_key: raw.switch_key,
             restart_backoff_ms: raw.restart_backoff_ms.unwrap_or(DEFAULT_BACKOFF_MS),
             restart_backoff_max_ms: raw.restart_backoff_max_ms.unwrap_or(DEFAULT_BACKOFF_MAX_MS),
+            stop_when_disabled: raw.stop_when_disabled,
             query_socket: raw.query_socket,
         })
     }
@@ -215,6 +232,20 @@ mod tests {
         assert_eq!(manifest.switch_key, "demo_on");
         assert_eq!(manifest.restart_backoff_ms, 500);
         assert_eq!(manifest.restart_backoff_max_ms, 4000);
+        // 缺省保持历史语义：开关关闭即停止。只有显式声明才改。
+        assert!(
+            manifest.stop_when_disabled,
+            "没有该字段的旧清单必须仍按「关即停」处理"
+        );
+    }
+
+    #[test]
+    fn a_manifest_can_declare_that_it_survives_being_disabled() {
+        // 声明查询通道的进程要能在开关关闭时继续运行，否则没人能把它打开。
+        let json = r#"{"name":"m","command":"c","args":[],"switch_key":"k",
+            "stop_when_disabled": false}"#;
+        let manifest = SupervisorManifest::parse(json).unwrap();
+        assert!(!manifest.stop_when_disabled);
     }
 
     #[test]
