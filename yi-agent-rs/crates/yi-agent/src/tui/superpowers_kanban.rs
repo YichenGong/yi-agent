@@ -86,8 +86,19 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
         ])
     };
     // 看板读不出来（daemon 不可达、插件拒绝、协议错）时的说法。
+    //
+    // 登记表损坏或缺失都会被读成「空」——对整个过程是好事，但对我这三选一就不是：
+    // 「空」不能同时表示「没有看板」和「登记表坏了」。所以要先把损坏问出来，否则
+    // 一个坏掉的登记表会把我引向 create，而 create 会把它当空表覆盖，抹掉别的项目。
     let unreadable = |message: String| {
-        plain(vec![if board_registered(workdir, global) {
+        plain(vec![if yi_agent_boards::registry::is_corrupt(global) {
+            // 用注入的 global 拼路径，不写死 `~`：测试传的是临时目录，写死会
+            // 指错地方，而这里恰恰是要让用户找到那个文件。
+            format!(
+                "看板登记表已损坏（{}）；请修复后重试。",
+                global.join("boards.json").display()
+            )
+        } else if yi_agent_boards::registry::contains(global, workdir).unwrap_or(false) {
             format!("无法读取看板: {message}")
         } else {
             "本目录尚未创建看板；用 /superpowers-kanban create 创建。".to_string()
@@ -169,15 +180,6 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
                 .to_string(),
         ]),
     }
-}
-
-/// Whether `workdir` already has a board in the global registry.
-///
-/// A registry that cannot be read is treated as "not registered": the caller is
-/// deciding what wording to show, and the create-first guidance is more useful
-/// than "cannot read the registry" when the board is unreadable anyway.
-fn board_registered(workdir: &Path, global: &Path) -> bool {
-    yi_agent_boards::registry::contains(global, workdir).unwrap_or(false)
 }
 
 /// 把插件回的卡片数组渲染成若干行。开关状态由插件给，本地不猜。
@@ -371,6 +373,36 @@ mod tests {
         assert!(
             outcome.lines[0].contains("无法读取看板"),
             "a registered board's read failure must be reported: {:?}",
+            outcome.lines
+        );
+    }
+
+    #[test]
+    fn a_corrupt_registry_is_reported_instead_of_advising_create() {
+        // 登记表坏了 + 本目录连不上：旧的二态判断只看得到「空」，会建议用户
+        // create，而 create 会把坏表当空表覆盖，抹掉其它项目的登记。坏表必须
+        // 单独说出来。
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let workdir = dir.path().join("proj");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("boards.json"), "{ not json").unwrap();
+
+        let outcome = handle_kanban_with(&workdir, "", &global);
+        assert!(
+            outcome.lines[0].contains("损坏"),
+            "a corrupt registry must be named as such: {:?}",
+            outcome.lines
+        );
+        assert!(
+            outcome.lines[0].contains(&global.join("boards.json").display().to_string()),
+            "the message must point at the real registry file: {:?}",
+            outcome.lines
+        );
+        assert!(
+            !outcome.lines[0].contains("尚未创建"),
+            "must not advise create against a corrupt registry: {:?}",
             outcome.lines
         );
     }

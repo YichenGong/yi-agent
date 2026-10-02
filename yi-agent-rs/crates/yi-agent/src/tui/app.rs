@@ -2331,7 +2331,13 @@ fn execute_slash_command(
             // 生命周期子命令（create/remove/status）由宿主直接管本目录的看板
             // （走 `yi_agent_boards::lifecycle`）；其余（on/off/run/add/无参）
             // 仍走插件通道。`global_dir()` 是宿主唯一的全局登记目录来源。
-            let lines = match args.split_whitespace().next() {
+            // 多个词（如 `create garbage`）不当成生命周期：那更可能是打错子命令，
+            // 而 create 会真起一个 daemon——宁可给用法，也不静默执行。
+            let mut words = args.split_whitespace();
+            let first = words.next();
+            let extra = words.next().is_some();
+            let lifecycle_word = if extra { None } else { first };
+            let lines = match lifecycle_word {
                 Some(word @ ("create" | "remove" | "status")) => {
                     match yi_agent_boards::global_dir() {
                         Ok(global) => {
@@ -5645,6 +5651,45 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("usage: /superpowers-kanban") && l.contains("add")),
             "插件通道的 usage 必须保留：{labels:?}"
+        );
+    }
+
+    #[test]
+    fn kanban_lifecycle_with_extra_words_does_not_run_the_lifecycle() {
+        // `create garbage` 是打错了子命令，不是「带着参数去 create」。放它过去会
+        // 真起一个 daemon，所以只能给用法。这里用一个不存在的路径当 workdir：一旦
+        // 真的派给 create，报错会是「看板创建失败」而不是 usage，测试即失败。
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("never-created");
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+
+        execute_slash_command(
+            SlashCommand::Kanban,
+            None,
+            Some("create garbage".into()),
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            missing.as_path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("usage: /superpowers-kanban")),
+            "多余参数必须只给用法：{labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.contains("看板创建")),
+            "多余参数不得触发生命周期：{labels:?}"
         );
     }
 
