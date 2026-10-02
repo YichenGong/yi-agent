@@ -37,6 +37,13 @@ const MANIFEST_TEMPLATE: &str = r#"{
 }
 "#;
 
+/// The plugin this module scaffolds, as the supervisor and the daemon's plugin
+/// registry name it. A query addressed to any other name is refused by the
+/// daemon, so the lifecycle must ask for exactly this one.
+pub fn plugin_name() -> &'static str {
+    SUPERVISOR_NAME
+}
+
 /// Absolute path of the plugin executable the project's supervisor should run.
 ///
 /// The Homebrew prefix is the supported installation; when the plugin is

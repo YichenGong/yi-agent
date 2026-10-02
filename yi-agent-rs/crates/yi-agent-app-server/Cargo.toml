@@ -17,6 +17,8 @@ yi-agent-runtime = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-subagent = { workspace = true }
 yi-agent-tools = { workspace = true }
+# The board RPCs read the global registry and drive the board lifecycle.
+yi-agent-boards = { path = "../yi-agent-boards" }
 anyhow.workspace = true
 futures.workspace = true
 serde = { version = "1", features = ["derive"] }

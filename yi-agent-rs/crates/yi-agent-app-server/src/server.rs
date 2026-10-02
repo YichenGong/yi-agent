@@ -86,7 +86,19 @@ type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 struct RuntimeAttachments {
     runtimes: ProjectRuntimes,
     thread_roots: ThreadRoots,
+    /// Where the board registry lives. Injectable for the same reason
+    /// `WorkspaceIndex` is: the `board/*` RPCs must be testable without
+    /// touching the developer's real `~/.yi-agent`.
+    board_dir: PathBuf,
+    /// How `board/create` starts a project's daemon. Injectable for the same
+    /// reason `board_dir` is: a test must not spawn a real detached process,
+    /// and the app's production launcher is what an integration test would
+    /// otherwise have to reproduce.
+    launcher: BoardLauncher,
 }
+
+/// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
+type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
 /// The key that identifies one project directory across this process.
 ///
@@ -696,6 +708,29 @@ fn plugin_query(workdir: &Path, method: &str, plugin: &str, params: serde_json::
     }
 }
 
+/// The project a `board/*` request names, canonicalized when the directory
+/// exists.
+///
+/// The registry compares paths literally, so one project spelled two ways
+/// (a symlink, a trailing slash, a relative path) would otherwise register
+/// twice and draw two sidebar entries for one board. Returns `None` for a
+/// missing or empty `project`, which every `board/*` handler answers with
+/// `invalid_params`.
+fn project_arg(params: &serde_json::Value) -> Option<PathBuf> {
+    let raw = params.get("project").and_then(|value| value.as_str())?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw)))
+}
+
+/// Serialize a board value for the wire. A value that cannot serialize is the
+/// null case rather than a hang: these shapes are plain data, so this never
+/// fires in practice, but an RPC must always write *some* response.
+fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
 ///
 /// `cfg` 同时用于 `config/read` 响应与(每个 thread 的)`bootstrap_agent`。
@@ -708,6 +743,11 @@ where
     let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+    // A fallback, not a policy: resolution failing (unset HOME) would otherwise
+    // make the whole server fail to start. Board RPCs called in that state
+    // register into a directory nobody lists from, which is the same as having
+    // no board — better than losing every unrelated RPC.
+    let board_dir = yi_agent_boards::global_dir().unwrap_or_default();
     run_with(
         reader,
         writer,
@@ -717,6 +757,8 @@ where
         RuntimeAttachments {
             runtimes,
             thread_roots,
+            board_dir,
+            launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
         },
         move |session, cwd, mode| {
             let mut thread_cfg = cfg_for_factory.clone();
@@ -771,6 +813,8 @@ where
     let RuntimeAttachments {
         runtimes,
         thread_roots,
+        board_dir,
+        launcher: board_launcher,
     } = attachments;
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -930,6 +974,76 @@ where
                             Ok(value) => write_response(&writer, ok_response(id, value)).await?,
                             Err(message) => {
                                 write_response(&writer, err_response(id, RpcError::internal(message)))
+                                    .await?
+                            }
+                        }
+                    }
+                    "board/create" => {
+                        let Some(project) = project_arg(&req.params) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing or empty project")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let mut launcher = |project: &Path| board_launcher(project);
+                        match yi_agent_boards::lifecycle::create_with_project(
+                            &project,
+                            &board_dir,
+                            &mut launcher,
+                        ) {
+                            Ok(status) => {
+                                write_response(&writer, ok_response(id, to_json(&status))).await?
+                            }
+                            Err(message) => {
+                                write_response(&writer, err_response(id, RpcError::internal(message)))
+                                    .await?
+                            }
+                        }
+                    }
+                    "board/remove" => {
+                        let Some(project) = project_arg(&req.params) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing or empty project")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        match yi_agent_boards::lifecycle::remove_in(&project, &board_dir) {
+                            Ok(()) => write_response(&writer, ok_response(id, json!({}))).await?,
+                            Err(message) => {
+                                write_response(&writer, err_response(id, RpcError::internal(message)))
+                                    .await?
+                            }
+                        }
+                    }
+                    "board/list" => {
+                        // The registry is the whole answer: the sidebar decides
+                        // which projects get a board entry from exactly this.
+                        match yi_agent_boards::registry::list(&board_dir) {
+                            Ok(boards) => {
+                                let boards: Vec<serde_json::Value> = boards
+                                    .into_iter()
+                                    .map(|board| {
+                                        json!({
+                                            "project": board.project.to_string_lossy(),
+                                            "created_at": board.created_at,
+                                            "status": to_json(
+                                                &yi_agent_boards::lifecycle::status_with(
+                                                    &board.project,
+                                                    &board_dir,
+                                                ),
+                                            ),
+                                        })
+                                    })
+                                    .collect();
+                                write_response(&writer, ok_response(id, json!({ "boards": boards })))
+                                    .await?
+                            }
+                            Err(message) => {
+                                write_response(&writer, err_response(id, RpcError::internal(message.to_string())))
                                     .await?
                             }
                         }
@@ -2866,6 +2980,146 @@ fn extract_prompt(params: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// The `board/*` RPCs, driven through the real stdio loop.
+///
+/// They are side-effecting commands (a temp dir on disk) rather than pure
+/// functions, so the seam under test is the dispatch itself: request in, frame
+/// out. The harness points the registry at a temp dir, so these never touch the
+/// developer's real `~/.yi-agent`.
+#[cfg(test)]
+mod board_rpc_tests {
+    use super::*;
+
+    async fn rpc(h: &mut tests::Harness, id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+        h.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+        .to_string())
+        .await;
+        loop {
+            let value = h.read_value().await;
+            if value.get("id") == Some(&json!(id)) {
+                return value;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_create_then_remove_lists_the_project_between_the_two() {
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let project_path = project.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+        let created = rpc(&mut h, 2, "board/create", json!({ "project": project_path })).await;
+        assert!(created.get("error").is_none(), "{created}");
+        assert_eq!(created["result"]["registered"], true, "{created}");
+
+        let listed = rpc(&mut h, 3, "board/list", json!({})).await;
+        let boards = listed["result"]["boards"].as_array().unwrap();
+        assert_eq!(boards.len(), 1, "登记表必须恰好一条:{listed}");
+        assert_eq!(boards[0]["project"], project_path);
+        assert_eq!(boards[0]["status"]["registered"], true, "{listed}");
+
+        let removed = rpc(&mut h, 4, "board/remove", json!({ "project": project_path })).await;
+        assert!(removed.get("error").is_none(), "{removed}");
+
+        let listed = rpc(&mut h, 5, "board/list", json!({})).await;
+        assert_eq!(
+            listed["result"]["boards"].as_array().unwrap().len(),
+            0,
+            "移除后不得再出现在登记表:{listed}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_board_created_through_the_rpc_is_written_to_the_injected_registry() {
+        // 侧栏按登记表决定给哪些项目画看板条目,所以「写进注入的那个目录」
+        // 本身就是契约:写错地方等于点创建没反应。
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let project_path = project.path().canonicalize().unwrap();
+
+        rpc(
+            &mut h,
+            2,
+            "board/create",
+            json!({ "project": project_path.to_string_lossy() }),
+        )
+        .await;
+
+        let boards = yi_agent_boards::registry::list(h.board_dir.path()).unwrap();
+        assert_eq!(boards.len(), 1, "登记表必须落在注入的目录里");
+        assert_eq!(boards[0].project, project_path);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_list_of_an_empty_registry_answers_with_no_boards() {
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let listed = rpc(&mut h, 2, "board/list", json!({})).await;
+        assert_eq!(listed["result"]["boards"], json!([]));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_create_without_a_project_is_invalid_params() {
+        // `project` 是必填参数。空串会被当成当前目录，凭空给调用方开一块
+        // 谁都认不出的看板；缺参数必须是 invalid_params，与其它 RPC 一致。
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let response = rpc(&mut h, 2, "board/create", json!({})).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(
+            yi_agent_boards::registry::list(h.board_dir.path())
+                .unwrap()
+                .is_empty(),
+            "缺参数的请求不得登记任何东西"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_remove_without_a_project_is_invalid_params() {
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let response = rpc(&mut h, 2, "board/remove", json!({})).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_create_for_a_missing_directory_reports_an_error_and_registers_nothing() {
+        // 侧栏按登记表画条目，所以「拒绝」必须同时意味着「没登记」：否则
+        // 点一次创建会多出一条点开什么都没有的看板。
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let response = rpc(
+            &mut h,
+            2,
+            "board/create",
+            json!({ "project": missing.to_string_lossy() }),
+        )
+        .await;
+        assert!(response.get("error").is_some(), "{response}");
+        assert!(
+            yi_agent_boards::registry::list(h.board_dir.path())
+                .unwrap()
+                .is_empty(),
+            "被拒绝的创建不得登记"
+        );
+        h.shutdown().await;
+    }
+}
+
 #[cfg(test)]
 mod plugin_query_tests {
     use super::*;
@@ -3524,16 +3778,18 @@ mod tests {
     }
 
     /// 用两条 `duplex` 管道把 server 与测试客户端对接。
-    struct Harness {
+    pub(crate) struct Harness {
         client_w: tokio::io::DuplexStream,
         client_r: BufReader<tokio::io::DuplexStream>,
         handle: tokio::task::JoinHandle<anyhow::Result<()>>,
         /// 隔离的全局目录索引;持有它保证 tempdir 存活到 harness 结束。
         _index_dir: tempfile::TempDir,
+        /// 隔离的看板登记表目录,理由同上:board/* RPC 不得写真的 `~/.yi-agent`。
+        pub(crate) board_dir: tempfile::TempDir,
     }
 
     impl Harness {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::with_factory(build_test_agent, PERMISSION_TIMEOUT)
         }
 
@@ -3565,6 +3821,7 @@ mod tests {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
             let index_dir = tempfile::TempDir::new().unwrap();
+            let board_dir = tempfile::TempDir::new().unwrap();
             let workspaces = Arc::new(WorkspaceIndex::new(
                 index_dir.path().join("workspaces.json"),
             ));
@@ -3577,6 +3834,10 @@ mod tests {
                 RuntimeAttachments {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                    board_dir: board_dir.path().to_path_buf(),
+                    // 测试里不起真进程:`board/create` 走注入的启动器,
+                    // 与 board_dir 注入同一个理由。
+                    launcher: Arc::new(|_project: &Path| Ok(true)),
                 },
                 build,
             ));
@@ -3585,16 +3846,17 @@ mod tests {
                 client_r: BufReader::new(client_r),
                 handle,
                 _index_dir: index_dir,
+                board_dir,
             }
         }
 
-        async fn send(&mut self, line: &str) {
+        pub(crate) async fn send(&mut self, line: &str) {
             self.client_w.write_all(line.as_bytes()).await.unwrap();
             self.client_w.write_all(b"\n").await.unwrap();
             self.client_w.flush().await.unwrap();
         }
 
-        async fn read_value(&mut self) -> serde_json::Value {
+        pub(crate) async fn read_value(&mut self) -> serde_json::Value {
             let mut buf = String::new();
             let n = tokio::time::timeout(Duration::from_secs(5), self.client_r.read_line(&mut buf))
                 .await
@@ -3605,7 +3867,7 @@ mod tests {
         }
 
         /// 关掉客户端写端(触发 EOF)并等待 server 任务结束。
-        async fn shutdown(self) {
+        pub(crate) async fn shutdown(self) {
             let Harness {
                 client_w, handle, ..
             } = self;
@@ -3618,7 +3880,7 @@ mod tests {
         }
     }
 
-    async fn initialize(h: &mut Harness) {
+    pub(crate) async fn initialize(h: &mut Harness) {
         h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
             .await;
         let v = h.read_value().await;
@@ -4114,6 +4376,8 @@ mod tests {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                board_dir: PathBuf::new(),
+                launcher: Arc::new(|_project: &Path| Ok(true)),
             },
             build_test_agent,
         ));
@@ -4171,6 +4435,8 @@ mod tests {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                board_dir: PathBuf::new(),
+                launcher: Arc::new(|_project: &Path| Ok(true)),
             },
             |_s: Option<yi_agent_core::Session>,
              _cwd: &std::path::Path,
@@ -4232,6 +4498,8 @@ mod tests {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                board_dir: PathBuf::new(),
+                launcher: Arc::new(|_project: &Path| Ok(true)),
             },
             build_test_agent,
         ));

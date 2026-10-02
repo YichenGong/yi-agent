@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 
 pub mod board_daemon;
+pub mod lifecycle;
 pub mod registry;
 pub mod scaffold;
 
