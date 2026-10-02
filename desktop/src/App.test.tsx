@@ -27,6 +27,9 @@ const { clients, state } = vi.hoisted(() => ({
     rejectCode: {} as Record<string, number>,
     // Status reported by `thread/listAll` for every seeded thread.
     listStatus: "idle" as "idle" | "running" | "awaiting_approval",
+    // 顶层 pinned 列表（thread_id 顺序即渲染顺序）。服务端把已置顶的会话
+    // 同时留在它自己的分组内（带 pinned:true）并在这个顶层数组里重复一份。
+    pinnedIds: [] as string[],
     // Paths the native file picker hands back, in order. `null` = cancelled.
     // Tests push what they need; an empty queue resolves to `null`.
     picks: [] as (string | null)[],
@@ -84,9 +87,23 @@ vi.mock("./lib/rpc", () => ({
                 title: t.title,
                 permission_mode: t.permission_mode,
                 status: state.listStatus,
+                pinned: state.pinnedIds.includes(t.thread_id),
               })),
             },
           ],
+          // 置顶项照旧留在分组里（服务端为向后兼容不摘除），顶层这里只是重排一份。
+          pinned: state.pinnedIds.map((id) => ({
+            thread_id: id,
+            cwd: "/w",
+            model: "m",
+            created_at: 0,
+            updated_at: 0,
+            // 与分组内该 thread 的 seed 保持一致：summary 是同一个 thread 的
+            // 两种视图，title/permission_mode 不一致会让测试验证到假行为。
+            title: (seeds.find((s) => s.thread_id === id)?.title ?? null),
+            permission_mode: seeds.find((s) => s.thread_id === id)?.permission_mode,
+            pinned: true,
+          })),
         };
       }
       if (method === "workspace/list") return { workspaces: [] };
@@ -124,6 +141,7 @@ beforeEach(() => {
   state.approvalHandlers.length = 0;
   state.rejectCode = {};
   state.listStatus = "idle";
+  state.pinnedIds = [];
   state.picks = [];
   Element.prototype.scrollIntoView = vi.fn();
 });
@@ -728,5 +746,110 @@ describe("App Superpowers 看板 enqueue", () => {
     expect(
       (screen.getByRole("button", { name: "加入看板" }) as HTMLButtonElement).disabled,
     ).toBe(false);
+  });
+});
+
+describe("App session pinning", () => {
+  it("renders a pinned thread in the Pinned section from thread/listAll", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.pinnedIds = ["t2"];
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getAllByText("two").length).toBeGreaterThan(0));
+    // Pinned 分区标题存在。
+    expect(container.textContent).toContain("Pinned");
+  });
+
+  it("sends thread/setPinned and re-lists when the pin button is clicked", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const before = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+    fireEvent.click(container.querySelector('[aria-label="Pin thread"]')!);
+    await waitFor(() => {
+      expect(clients[0].requests.some((r) => r.method === "thread/setPinned")).toBe(true);
+    });
+    await waitFor(() => {
+      const after = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
+  it("auto-selects the first pinned thread on mount", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "yolo" },
+    ];
+    state.pinnedIds = ["t2"];
+    render(<App />);
+    // 服务端给了顺序：置顶的 t2 先于分组的 t1 → 首屏落在 t2 的 yolo 上。
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+    expect(clients[0].requests).toContainEqual({
+      method: "thread/resume",
+      params: { threadId: "t2" },
+    });
+  });
+
+  it("reads a pinned thread's mode back from the top-level pinned list", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "yolo" },
+    ];
+    state.pinnedIds = ["t2"];
+    render(<App />);
+    // 首屏自动选中 t2；resume 后从 listAll 回读权限模式。
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+
+    // 切回 t1 再回 t2（warm，不再 resume）：回读路径必须能扫到顶层 pinned，
+    // 否则 chip 会落空成 unknown，而不是 t2 的 YOLO。
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() => expect(modeTrigger().textContent).toContain("Normal"));
+    // 置顶分区与分组里各有一行 t2（服务端不摘除、前端不隐藏分组的场景由侧栏
+    // 负责），这里点第一行（置顶区）即可。
+    fireEvent.click(screen.getAllByText("two")[0]);
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+  });
+
+  it("renders a pinned thread in the Pinned section and hides it from its group", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.pinnedIds = ["t2"];
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getAllByText("two").length).toBeGreaterThan(0));
+
+    // 服务端把置顶项同时留在分组里；侧栏必须只渲染一次——在置顶分区，不在分组行。
+    const pinnedRows = Array.from(container.querySelectorAll<HTMLElement>("[data-pinned-row]"));
+    expect(pinnedRows.map((r) => r.textContent)).toEqual([expect.stringContaining("two")]);
+    const groupRows = Array.from(container.querySelectorAll<HTMLElement>("[data-group-row]"));
+    expect(groupRows.some((r) => r.textContent!.includes("two"))).toBe(false);
+    expect(screen.getAllByText("two")).toHaveLength(1);
+  });
+
+  it("sends thread/reorderPinned with the new top-to-bottom order on drop", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.pinnedIds = ["t1", "t2"];
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getAllByText("two").length).toBeGreaterThan(0));
+
+    const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
+    expect(rows).toHaveLength(2);
+    // 把第一行拖到第二行位置。
+    fireEvent.dragStart(rows[0]);
+    fireEvent.dragOver(rows[1]);
+    fireEvent.drop(rows[1]);
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/reorderPinned",
+        params: { threadIds: ["t2", "t1"] },
+      }),
+    );
   });
 });

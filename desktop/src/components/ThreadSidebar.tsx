@@ -66,11 +66,14 @@ export function ThreadSidebar({
   groups,
   workspaces,
   currentId,
+  pinned,
   statuses,
   unread,
   onSelect,
   onRename,
   onDelete,
+  onTogglePin,
+  onReorderPinned,
   onNew,
   onRemoveWorkspace,
   onBrowse,
@@ -79,12 +82,17 @@ export function ThreadSidebar({
   /** Recent dirs for the New-thread dropdown. */
   workspaces: Workspace[];
   currentId: string | null;
+  /** 服务端排好序的置顶会话（从顶到底）；置顶分区按此顺序渲染。 */
+  pinned: ThreadSummary[];
   statuses: Map<string, ThreadStatus>;
   /** thread_id → 最近一轮结束状态；含 key 即有未读点。 */
   unread: Map<string, TurnStatus>;
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
+  onTogglePin: (id: string, pinned: boolean) => void;
+  /** 置顶分区拖拽落点：新的从顶到底顺序。 */
+  onReorderPinned: (orderedIds: string[]) => void;
   /** No cwd → App opens the picker; with cwd → create in that dir. */
   onNew: (cwd?: string) => void;
   onRemoveWorkspace: (cwd: string) => void;
@@ -94,6 +102,11 @@ export function ThreadSidebar({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // 置顶分区自身的折叠状态（与工作区分组的折叠互不影响）。
+  const [pinnedCollapsed, setPinnedCollapsed] = useState(false);
+  // 置顶分区内的拖拽：拖动中的 thread_id + 当前悬停的行下标。
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
   // Self-drawn menus: the top "New thread" dropdown and the per-group context
   // menu. A fixed transparent backdrop (rendered with each menu) closes them on
   // an outside click; the two are mutually exclusive.
@@ -183,13 +196,73 @@ export function ThreadSidebar({
     });
   };
 
-  const renderThread = (t: ThreadSummary) => {
+  /**
+   * 落点提交：把拖动中的行移到 `index` 处；顺序真的变了才回调。
+   *
+   * 语义 = 「占住悬停行的位置」：`index` 是悬停行在**原始**列表里的下标。
+   * 先摘下被拖动项再插入，故插入位置就是 `index`（`index` 落在尾部时 clamp）。
+   * 悬停行原本在拖动项下方时会左移一位，于是被拖动项落在它之后；反之落在它之前。
+   * 这样「把第一行拖到第二行」得到交换，而不是原地不动；拖到自己身上是 no-op。
+   */
+  const commitPinDrop = (index: number) => {
+    const from = pinned.findIndex((t) => t.thread_id === dragId);
+    setDragId(null);
+    setDropIndex(null);
+    if (from < 0) return;
+    const ids = pinned.map((t) => t.thread_id);
+    const [moved] = ids.splice(from, 1);
+    const to = Math.min(Math.max(index, 0), ids.length);
+    ids.splice(to, 0, moved);
+    if (ids.join(",") !== pinned.map((t) => t.thread_id).join(",")) onReorderPinned(ids);
+  };
+
+  // 拖动中的行下标：既用于指示线方向（向上/向下），也用于抑制"落在自己身上"的指示线。
+  const dragFromIndex = dragId === null ? -1 : pinned.findIndex((t) => t.thread_id === dragId);
+
+  const renderThread = (
+    t: ThreadSummary,
+    opts: { rowAttr?: "group" | "pinned"; dragIndex?: number } = {},
+  ) => {
     const active = t.thread_id === currentId;
     const st = statuses.get(t.thread_id) ?? "idle";
     const un = unread.get(t.thread_id);
+    const isPinned = t.pinned ?? false;
+    const dragging = opts.rowAttr === "pinned";
+    const dataAttr =
+      opts.rowAttr === "pinned" ? { "data-pinned-row": "" } : { "data-group-row": "" };
     return (
       <div
         key={t.thread_id}
+        {...dataAttr}
+        // 只有置顶分区的行可拖拽；编辑标题态不可拖（否则拖动会打断输入）。
+        draggable={dragging && editingId !== t.thread_id}
+        onDragStart={dragging ? () => setDragId(t.thread_id) : undefined}
+        onDragOver={
+          dragging
+            ? (e) => {
+                if (dragId === null) return;
+                // 必须 preventDefault，否则浏览器不认这个落点（也不发 drop）。
+                e.preventDefault();
+                setDropIndex(opts.dragIndex ?? null);
+              }
+            : undefined
+        }
+        onDrop={
+          dragging
+            ? (e) => {
+                e.preventDefault();
+                commitPinDrop(opts.dragIndex ?? 0);
+              }
+            : undefined
+        }
+        onDragEnd={
+          dragging
+            ? () => {
+                setDragId(null);
+                setDropIndex(null);
+              }
+            : undefined
+        }
         onClick={(e) => {
           if (editingId) return;
           // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
@@ -197,9 +270,9 @@ export function ThreadSidebar({
           if (e.detail > 1) return;
           onSelect(t.thread_id);
         }}
-        className={`group flex items-center justify-between gap-1 px-3 py-2 text-sm ${
-          active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
-        } cursor-pointer`}
+        className={`group relative flex items-center justify-between gap-1 px-3 py-2 text-sm ${
+          dragId === t.thread_id ? "opacity-50" : ""
+        } ${active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"} cursor-pointer`}
       >
         {editingId === t.thread_id ? (
           <input
@@ -220,6 +293,14 @@ export function ThreadSidebar({
           />
         ) : (
           <>
+            {dragging && dropIndex === opts.dragIndex && dragId !== null && dragFromIndex >= 0 && (
+              <div
+                data-pin-drop-indicator=""
+                className={`absolute inset-x-0 h-0.5 bg-amber-400 ${
+                  dragFromIndex < opts.dragIndex! ? "bottom-0" : "top-0"
+                }`}
+              />
+            )}
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <StatusBadge status={st} />
@@ -243,6 +324,25 @@ export function ThreadSidebar({
                 className={`size-2 shrink-0 rounded-full ${unreadDotClass(un)}`}
               />
             )}
+            <button
+              type="button"
+              aria-label={isPinned ? "Unpin thread" : "Pin thread"}
+              aria-pressed={isPinned}
+              title={isPinned ? "Unpin" : "Pin"}
+              onClick={(e) => {
+                e.stopPropagation();
+                onTogglePin(t.thread_id, !isPinned);
+              }}
+              className={`shrink-0 rounded px-1 ${
+                isPinned
+                  ? "text-amber-400 hover:text-amber-300"
+                  : "pointer-events-none text-neutral-500 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-amber-300 focus-visible:pointer-events-auto focus-visible:opacity-100"
+              }`}
+            >
+              <svg viewBox="0 0 16 16" className="size-3.5" fill="currentColor" aria-hidden="true">
+                <path d="M9.5 1 15 6.5l-2.6.6-1 3.1-2.6-2.6L4.3 12 3 13l1-4.4L6.6 6 4 3.4l3.1-1L9.5 1Z" />
+              </svg>
+            </button>
             <button
               type="button"
               onClick={(e) => {
@@ -330,6 +430,24 @@ export function ThreadSidebar({
         {groupCount(groups) === 0 && (
           <p className="px-3 py-2 text-xs text-neutral-600">选择一个目录开始</p>
         )}
+        {pinned.length > 0 && (
+          <div>
+            <div className="flex items-center gap-1 px-2 py-1.5 text-xs text-neutral-500">
+              <button
+                type="button"
+                onClick={() => setPinnedCollapsed((v) => !v)}
+                aria-label={pinnedCollapsed ? "Expand pinned" : "Collapse pinned"}
+                title={pinnedCollapsed ? "Expand" : "Collapse"}
+                className="shrink-0 px-0.5 text-neutral-500 hover:text-neutral-300"
+              >
+                {pinnedCollapsed ? "▸" : "▾"}
+              </button>
+              <div className="min-w-0 flex-1 truncate text-neutral-400">Pinned</div>
+            </div>
+            {!pinnedCollapsed &&
+              pinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
+          </div>
+        )}
         {groups.map((g) => {
           const isCollapsed = collapsed.has(g.workspace);
           return (
@@ -407,7 +525,10 @@ export function ThreadSidebar({
                   </div>
                 </>
               )}
-              {!isCollapsed && g.threads.map(renderThread)}
+              {!isCollapsed &&
+                g.threads
+                  .filter((t) => !t.pinned)
+                  .map((t) => renderThread(t, { rowAttr: "group" }))}
             </div>
           );
         })}
