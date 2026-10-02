@@ -1499,6 +1499,7 @@ fn run_tui_agent(
                         }
                         ControlCommand::Compact => {
                             let session = agent.session();
+                            let old_msg_count = session.messages().len();
                             match yi_agent_core::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
@@ -1507,6 +1508,7 @@ fn run_tui_agent(
                             .await
                             {
                                 Ok(Some(new_session)) => {
+                                    let new_msg_count = new_session.messages().len();
                                     agent = yi_agent_core::Agent::new(
                                         Arc::clone(&rebuild_provider),
                                         Arc::clone(&current_tools),
@@ -1518,14 +1520,30 @@ fn run_tui_agent(
                                         Arc::clone(&rebuild_decision_rx),
                                     );
                                     tracing::info!("agent session compacted via /compact");
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Ok(new_msg_count),
+                                        ))
+                                        .await;
                                 }
                                 Ok(None) => {
                                     tracing::info!("no compactable session history");
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Err("没有可压缩的历史".into()),
+                                        ))
+                                        .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
-                                    let _ =
-                                        agent_tx.send(yi_agent_core::AgentEvent::Error(e)).await;
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Err(e.to_string()),
+                                        ))
+                                        .await;
                                 }
                             }
                         }
@@ -1875,9 +1893,43 @@ pub(crate) enum ControlCommand {
     McpRefresh,
 }
 
+/// 把 `/compact` 的三种结果映射成 driver 回给 TUI 的事件。
+///
+/// `Ok(None)` 表示没有可安全缩减的历史（历史太短），**不是错误**，但对
+/// pending 行「正在压缩对话...」而言它就是一次可报告的终局，因此同样落到
+/// `ManualCompactFailed`，让状态行一定闭环。
+fn manual_compaction_outcome_event(
+    old_msg_count: usize,
+    result: Result<usize, String>,
+) -> yi_agent_core::AgentEvent {
+    match result {
+        Ok(new_msg_count) => yi_agent_core::AgentEvent::ManualCompacted {
+            old_msg_count,
+            new_msg_count,
+        },
+        Err(message) => yi_agent_core::AgentEvent::ManualCompactFailed { message },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_compaction_outcome_events_preserve_counts_and_errors() {
+        use yi_agent_core::AgentEvent;
+        assert!(matches!(
+            manual_compaction_outcome_event(9, Ok(4)),
+            AgentEvent::ManualCompacted {
+                old_msg_count: 9,
+                new_msg_count: 4
+            }
+        ));
+        assert!(matches!(
+            manual_compaction_outcome_event(3, Err("没有可压缩的历史".into())),
+            AgentEvent::ManualCompactFailed { message } if message == "没有可压缩的历史"
+        ));
+    }
 
     #[test]
     fn ensure_stdio_listen_accepts_stdio() {
