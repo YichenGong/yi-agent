@@ -24,6 +24,7 @@ impl std::fmt::Display for CardId {
 #[serde(rename_all = "snake_case")]
 pub enum CardState {
     Queued,
+    Launching,
     Running,
     NeedsYou,
     AwaitingMerge,
@@ -62,6 +63,10 @@ impl CardState {
         }
         match (self, next) {
             (Queued, Running) => true,
+            (Queued, Launching) => true,
+            (Launching, Running) => true,
+            (Launching, Failed) => true,
+            (Launching, Cancelled) => true, // 由上面的 `next == Cancelled` 兜底也行，显式更清楚
             (Running, AwaitingMerge) => true,
             (Running, NeedsYou) => true,
             (Running, Failed) => true,
@@ -92,6 +97,12 @@ pub struct Card {
     /// 完成的卡片让出并发名额。旧状态文件没有此字段 → 反序列化为 `None`。
     #[serde(default)]
     pub task_id: Option<String>,
+    /// 卡片会话在 app-server 里的 thread id。启动后回填。
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// 启动时 worktree 的 HEAD，供对账判断「有无新提交」。
+    #[serde(default)]
+    pub base_commit: Option<String>,
 }
 
 #[cfg(test)]
@@ -164,5 +175,19 @@ mod tests {
     #[test]
     fn a_running_card_cannot_be_started_twice() {
         assert!(!CardState::Running.can_transition_to(CardState::Running));
+    }
+
+    #[test]
+    fn launching_does_not_occupy_a_slot() {
+        assert!(!CardState::Launching.occupies_slot());
+    }
+
+    #[test]
+    fn queued_can_launch_and_launching_can_run_or_fail() {
+        use CardState::*;
+        assert!(Queued.can_transition_to(Launching));
+        assert!(Launching.can_transition_to(Running));
+        assert!(Launching.can_transition_to(Failed));
+        assert!(!Launching.can_transition_to(AwaitingMerge));
     }
 }
