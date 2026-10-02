@@ -104,6 +104,18 @@ impl PairingState {
         Ok((device, token))
     }
 
+    /// 仅供测试:塞入一枚**已过期**的配对码,以覆盖 `redeem` 的过期分支。
+    /// 生产构建不含此方法。
+    #[cfg(test)]
+    fn insert_expired_code(&self, code: &str) {
+        self.codes.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            code.to_string(),
+            PendingCode {
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+    }
+
     /// 校验一枚 token。命中即刷新 `last_seen_at`。
     pub fn authenticate(&self, token: &str) -> Option<Device> {
         let hash = hash_token(token);
@@ -156,6 +168,19 @@ mod tests {
 
         // 同一个码不能再用。
         assert!(pairing.redeem(&code.code, "again").is_err());
+    }
+
+    #[test]
+    fn an_expired_code_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pairing = PairingState::new(DeviceStore::new(dir.path().join("devices.json")));
+        pairing.insert_expired_code("EXPD-1234");
+
+        assert_eq!(
+            pairing.redeem("EXPD-1234", "iPhone").unwrap_err(),
+            PairError::InvalidCode
+        );
+        assert!(pairing.store().list().is_empty(), "过期码不得配出设备");
     }
 
     #[test]
