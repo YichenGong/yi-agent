@@ -83,6 +83,24 @@ impl Broadcaster {
         self.clients.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
+    /// 当前已注册的客户端 id 快照。
+    pub fn clients(&self) -> Vec<ClientId> {
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// 该客户端是否仍注册着。
+    pub fn is_connected(&self, id: &ClientId) -> bool {
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+
     /// 广播给所有客户端。
     ///
     /// 失效或队列已满(慢消费者)的订阅者会被立即摘除——这是**背压**而非无限
@@ -189,5 +207,27 @@ mod tests {
         assert_eq!(hub.client_count(), 1);
         // 最后一帧已成功入队且发送从未阻塞,fast 取到的就是它。
         assert_eq!(fast.try_recv().unwrap()["n"], CLIENT_QUEUE + 7);
+    }
+
+    #[tokio::test]
+    async fn clients_lists_registered_ids() {
+        let hub = Broadcaster::new();
+        let id = ClientId::ws(uuid::Uuid::nil());
+        let _a = hub.register(id.clone());
+        let _b = hub.register(ClientId::local());
+        let mut ids = hub.clients();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(ids.len(), 2);
+        assert!(hub.is_connected(&id));
+        assert!(hub.is_connected(&ClientId::local()));
+    }
+
+    #[tokio::test]
+    async fn is_connected_is_false_after_unregister() {
+        let hub = Broadcaster::new();
+        let id = ClientId::local();
+        let _rx = hub.register(id.clone());
+        hub.unregister(&id);
+        assert!(!hub.is_connected(&id));
     }
 }

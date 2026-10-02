@@ -1,6 +1,8 @@
 //! yi-agent GUI app-server:JSON-RPC 2.0 over stdio。
 
 pub mod broadcast;
+pub mod device_store;
+pub mod pairing;
 pub mod protocol;
 pub mod server;
 pub mod session;

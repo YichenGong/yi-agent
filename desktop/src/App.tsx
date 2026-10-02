@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { isRemoteClient } from "./lib/platform";
 import { RpcClient } from "./lib/rpc";
 import { ThreadStore } from "./lib/threadStore";
-import { tauriTransport } from "./tauriTransport";
+import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
 import { MessageInput } from "./components/MessageInput";
 import { StatusBar } from "./components/StatusBar";
@@ -458,6 +459,8 @@ export default function App() {
 
   /** 打开原生文件夹选择器,返回选中的绝对路径(取消则 null)。 */
   const pickDirectory = async (): Promise<string | null> => {
+    // 远程(iOS)构建没有 Tauri dialog 插件:不动态 import,直接当作取消。
+    if (isRemoteClient()) return null;
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({ directory: true, multiple: false });
     return typeof picked === "string" ? picked : null;
@@ -465,6 +468,7 @@ export default function App() {
 
   /** 原生选择器选一个文件；取消返回 null。与 pickDirectory 同款动态 import。 */
   const pickFile = async (): Promise<string | null> => {
+    if (isRemoteClient()) return null;
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({ directory: false, multiple: false });
     return typeof picked === "string" ? picked : null;
@@ -607,7 +611,7 @@ export default function App() {
   useEffect(() => {
     if (inited.current) return; // guard against React StrictMode double-invoke
     inited.current = true;
-    const client = new RpcClient(tauriTransport());
+    const client = new RpcClient(transportFactory());
     clientRef.current = client;
     client.onNotification((n) => {
       // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。

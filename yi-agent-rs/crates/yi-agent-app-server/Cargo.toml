@@ -24,6 +24,7 @@ axum = { workspace = true, features = ["ws"] }
 futures.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

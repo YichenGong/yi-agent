@@ -125,14 +125,31 @@ echo "解释一下 Makefile 里的 deploy 目标" | yi-agent run
 
 ## 远程连接（实验性）
 
-`app-server` 支持通过 WebSocket 提供服务，供网络客户端连接：
+`app-server` 支持通过 WebSocket 提供服务，供网络客户端连接。**每条连接都要用已配对
+设备 token 认证**（`ws://host/ws?token=<t>` 或 `Authorization: Bearer <t>`；无/错
+token 以 ws close `4401` 拒绝），因此可多客户端同时连接：
 
 ```bash
-yi-agent app-server --listen ws://127.0.0.1:8790
+yi-agent app-server --listen ws://127.0.0.1:8790   # 绑定非回环时会打印认证告警
 ```
 
-**当前版本无认证，只应绑定回环地址。** 这是手机端远程访问的地基；多设备同时连接、
-扫码配对、设备撤销，以及 iOS App 与自建中继，见
+同一批 session 可在多台设备上查看与控制：配对（一次性码 `XXXX-XXXX`、5 分钟有效，
+新设备默认 `control` scope）、设备列表/撤销、审批广播到所有已连接设备。
+
+> **实验性告警**：本页描述的协议与单元测试均已落地，但**扫码配对端到端尚未打通**——
+> 配对码只存于创建它的进程内存（`pair/create` 由桌面 stdio 边车服务，跨中继/跨进程的
+> `?pair=` 兑换是另一个进程），且**目前没有可安装的 iOS 产物**，也**尚无 iOS 首启配对
+> 界面**。因此「手机扫码即用」暂不可用；现状与后续计划见
+> [iOS 远程控制与中继部署](docs/relay-deploy.md) §4.4、§六。
+
+**iOS App 经自建反向 WSS 中继**接入（两端都只发出站连接，电脑侧不开放入站端口）：
+
+```bash
+yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
+```
+
+部署中继、域名与 TLS、iOS 构建与配对、故障排查见
+[iOS 远程控制与中继部署](docs/relay-deploy.md)。设计出处见
 [手机远程访问设计](docs/superpowers/specs/2026-10-02-mobile-remote-access-design.md)（Tier 1）。
 
 ## 配置放在哪

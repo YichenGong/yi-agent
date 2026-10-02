@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -19,9 +20,10 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
+use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
-    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, ThreadStatus,
+    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, ThreadStatus,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -795,7 +797,7 @@ fn plugin_query(
             return Err(BoardQueryError::new(
                 "board_not_created",
                 "this project has no board",
-            ))
+            ));
         }
     }
     // The daemon that runs the plugin lives at the project root, which is also
@@ -803,8 +805,12 @@ fn plugin_query(
     // 复用共享 helper 而不是手写 `.yi-agent/runtime`：它先认 `YI_AGENT_RUNTIME_DIR`，
     // 与工作区其它地方对「runtime socket 在哪」保持同一个定义。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(project);
-    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir)
-        .map_err(|error| BoardQueryError::new("daemon_unavailable", format!("daemon is unavailable: {error}")))?;
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| {
+        BoardQueryError::new(
+            "daemon_unavailable",
+            format!("daemon is unavailable: {error}"),
+        )
+    })?;
     let response = yi_agent_store::ipc::send_request(
         &socket,
         yi_agent_store::ipc::IpcRequest::PluginQuery {
@@ -813,21 +819,24 @@ fn plugin_query(
             params,
         },
     )
-    .map_err(|error| BoardQueryError::new("daemon_unavailable", format!("daemon is unavailable: {error}")))?;
+    .map_err(|error| {
+        BoardQueryError::new(
+            "daemon_unavailable",
+            format!("daemon is unavailable: {error}"),
+        )
+    })?;
     match response {
         yi_agent_store::ipc::IpcResponse::PluginResult { value } => Ok(value),
         // A daemon that is up but has no answer for this plugin is the plugin's
         // absence, not the daemon's: the wording keeps the shape the desktop's
         // `pluginIsUnavailable` matches on.
-        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
-            Err(BoardQueryError::new(
-                "plugin_unavailable",
-                format!(
-                    "the plugin rejected the query: {code:?} {}",
-                    message.unwrap_or_default()
-                ),
-            ))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(BoardQueryError::new(
+            "plugin_unavailable",
+            format!(
+                "the plugin rejected the query: {code:?} {}",
+                message.unwrap_or_default()
+            ),
+        )),
         other => Err(BoardQueryError::new(
             "plugin_unavailable",
             format!("daemon returned an unexpected response: {other:?}"),
@@ -867,6 +876,12 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
+    // 配对状态(配对码 + 设备表)与 workspace 索引同位构造:主循环持有同一个
+    // `Arc`,故 `pair/create` 铸出的码与 `device/list` / `device/revoke` 读写的
+    // 是**同一张**设备表。`run` 的公开签名不因此改变。
+    let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+        crate::device_store::default_path(),
+    )));
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
     // A fallback, not a policy: resolution failing (unset HOME) would otherwise
@@ -880,6 +895,7 @@ where
         cfg.clone(),
         PERMISSION_TIMEOUT,
         workspaces,
+        pairing,
         RuntimeAttachments {
             runtimes,
             thread_roots,
@@ -930,14 +946,61 @@ pub(crate) fn production_factory(
 /// 主循环不再持有 reader/writer;`read_lines` 与 `pump_stdout` 各自独占一条流,
 /// 只与主循环交换 channel 消息(均 cancel-safe)。退出前摘除 `local` 客户端并
 /// 等待出口泵排空,保证最后一个响应总能写出。
+///
+/// stdio 就是桌面:注册为 `local` + `Scope::Admin`,保留全部能力。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_stdio<R, W, F>(
     reader: R,
     writer: W,
     cfg: RuntimeConfig,
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
     attachments: RuntimeAttachments,
     build_agent: F,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>
+        + Send
+        + 'static,
+{
+    serve_scoped(
+        reader,
+        writer,
+        cfg,
+        permission_timeout,
+        workspaces,
+        pairing,
+        attachments,
+        build_agent,
+        // 桌面 stdio 是 Admin:所有既有 RPC 行为不变。
+        Scope::Admin,
+    )
+    .await
+}
+
+/// 与 [`serve_stdio`] 逐字节相同,只多一个 `client_scope`。
+///
+/// 存在的唯一理由是让"低权客户端的门禁"可测:测试经 `Harness::with_scope`
+/// 以 `Control` 注册那个 `local` 客户端。生产路径上 `serve_stdio` 传
+/// `Scope::Admin`,`run` 与 `serve_stdio` 的公开签名都不因此改变。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_scoped<R, W, F>(
+    reader: R,
+    writer: W,
+    cfg: RuntimeConfig,
+    permission_timeout: Duration,
+    workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
+    attachments: RuntimeAttachments,
+    build_agent: F,
+    client_scope: Scope,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -964,14 +1027,21 @@ where
         local.clone(),
     ));
     tokio::spawn(read_lines(reader, local.clone(), inbound_tx));
+    // scope 随连接登记一次;主循环按 `client` id 查它。stdio 会话只此一条,故
+    // 传入的表就是一张只装 `local` 的注册表(与 ws 的动态注册同型,便于共享)。
+    let client_scopes = Arc::new(Mutex::new(HashMap::from([(local.clone(), client_scope)])));
+    let client_initialized: ClientInitialized = Arc::new(Mutex::new(HashMap::new()));
     let result = serve(
         inbound_rx,
         Arc::clone(&hub),
         cfg,
         permission_timeout,
         workspaces,
+        pairing,
         attachments,
         build_agent,
+        client_scopes,
+        client_initialized,
     )
     .await;
     // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
@@ -1039,10 +1109,38 @@ async fn pump_stdout<W>(
     }
 }
 
+/// 每连接的 scope 注册表(共享、可增长)。
+///
+/// ws 在连接建立时登记 `ClientId → device.scope`、断连即摘除;主循环按 id 查。
+/// stdio 路径只装一个 `local` 条目。用 `Arc<Mutex<..>>` 而非启动快照,是因为 ws
+/// 的 `ClientId` 在 upgrade 闭包里才铸造。
+pub(crate) type ClientScopes = Arc<Mutex<HashMap<crate::broadcast::ClientId, Scope>>>;
+
+/// 每客户端的 `initialize` 状态(共享、可增长)。
+///
+/// 与 [`ClientScopes`] 同型、同生命周期:传输层在连接建立时**无须**登记——缺省
+/// 即「未握手」(fail-closed),主循环收到 `initialize` 时置位,连接断连时由传输
+/// 层摘除。用共享表而非主循环里的局部 `HashMap`,是为了能在断连时**回收**条目:
+/// 否则每个 ws 连接都会永久留下一个 `ClientId` 键(连接可来去,表只增不减)。
+pub(crate) type ClientInitialized = Arc<Mutex<HashMap<crate::broadcast::ClientId, bool>>>;
+
 /// 主循环的传输无关核心:agent 工厂由调用方注入(测试用 mock provider)。
 ///
 /// **取消安全**:入站读取由传输层任务负责(`read_lines` / WS 读循环),主循环只在
 /// 一个 channel 上 `recv`。
+///
+/// `client_scopes` 是**每连接一次**的 scope 登记(传输层注册客户端时确定):
+/// stdio 的 `local` 是 `Admin`,WS 连接是它 token 的 scope。scope 不进 channel
+/// 载荷——它不随单条消息变化,而客户端 id 已经是载荷的一部分,用一张表按 id
+/// 查即可。
+///
+/// 这张表是**共享可增长**的注册表(`Arc<Mutex<..>>`)而非启动快照:ws 的
+/// `ClientId` 在 upgrade 闭包里才铸造、且随连接动态来去,启动时的一份 `HashMap`
+/// 根本无法按 id 命中它们。stdio 路径只装一个 `local` 条目,与快照等价。
+///
+/// `pairing` 与 `workspaces` 一样由调用方注入,因为 `pair/create` 的兑现必须
+/// 落在**同一个**设备表上:注入使 `run`(生产)与测试 `Harness` 各自决定表在
+/// 哪里,同时 `pair/create`、`device/list`、`device/revoke` 共享同一个 `Arc`。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<F>(
     mut inbound: mpsc::Receiver<(crate::broadcast::ClientId, anyhow::Result<String>)>,
@@ -1050,8 +1148,13 @@ pub(crate) async fn serve<F>(
     cfg: RuntimeConfig,
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
     attachments: RuntimeAttachments,
     build_agent: F,
+    client_scopes: ClientScopes,
+    // 每客户端 `initialize` 状态的共享表(见 [`ClientInitialized`]):放在主循环
+    // 之外,传输层断连时才摘得掉键。主循环在此处插入/读取,不自己拥有它。
+    client_initialized: ClientInitialized,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -1080,7 +1183,15 @@ where
     // request_id=1 开始,若用 request_id 直接做 key 会跨 thread 碰撞。
     let perm_seq = Arc::new(AtomicU64::new(1));
 
-    let mut initialized = false;
+    // 每客户端 `initialized` 与 scope 登记。Tier 0 只有一个客户端时
+    // `initialized` 等价于一个 bool;Tier 1 起 stdio 与多台 ws 设备共享本主
+    // 循环,「谁 initialize 过了」「谁是什么 scope」都必须按 ClientId 记账,
+    // 否则一台设备握手会替另一台解锁、或低权设备的请求被当成高权。
+    // scope 由传输层在注册时给定(`client_scopes` 参数);这里补一条兜底,
+    // 未登记的客户端按最低权 `Observe` 处理(fail-closed)。
+    // `initialized` 由调用方传入(共享表),理由同 `client_scopes`:断连时传输层
+    // 要能摘键,主循环持有私有 `HashMap` 就够不着它。
+    let initialized = client_initialized;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
@@ -1096,6 +1207,18 @@ where
         tokio::select! {
             line = inbound.recv() => {
                 let Some((client, item)) = line else { break }; // EOF → graceful exit
+                // 早退守卫:某客户端(如被 `device/revoke` 踢掉、或被广播背压
+                // 摘除)在断连后仍可能有一帧已在 channel 里排队。它已经不在 hub
+                // 上,任何按它寻址的响应都写不出去;在主循环里处理它只会走到
+                // `write_response` 的 `Closed` 分支。这里直接丢弃,别再费事。
+                //
+                // 只管**非本地**客户端:stdio 的 `local` 若已注销(出口泵写失败),
+                // 仍要走 `write_response` 的致命分支退出会话——那是改造前的语义
+                // (`oversized_frame_returns_err` / `driver_reports_finished_when_writer_fails`
+                // 钉死的),不能因为这个守卫被悄悄改成优雅退出。
+                if client != crate::broadcast::ClientId::local() && !hub.is_connected(&client) {
+                    continue;
+                }
                 let line = match item {
                     Ok(l) => l,
                     Err(e) => {
@@ -1144,7 +1267,22 @@ where
                         // `result` 或 `error` 才算响应,否则视为畸形帧报错。
                         match serde_json::from_value::<ClientResponse>(value) {
                             Ok(resp) if resp.result.is_some() || resp.error.is_some() => {
-                                route_client_response(resp, &pending).await;
+                                // 首次命中才广播:第二次应答(另一台设备也点了
+                                // "允许")是 no-op 成功,不再产生广播,也就不会
+                                // 来回弹提示。
+                                if let Some((perm_id, decision)) =
+                                    route_client_response(resp, &pending).await
+                                {
+                                    write_notification(
+                                        &hub,
+                                        &Notification::ToolCallApprovalResolved {
+                                            perm_id,
+                                            by: client.as_str().to_string(),
+                                            decision: decision_label(&decision),
+                                        },
+                                    )
+                                    .await?;
+                                }
                             }
                             _ => {
                                 write_response(
@@ -1163,15 +1301,53 @@ where
                 let id = req.id.clone();
                 let method = req.method.clone();
 
-                // 未 initialize 前,除 `initialize` 外的请求一律拒绝。
-                if !initialized && method != "initialize" {
+                // 未 initialize 前,除 `initialize` 外的请求一律拒绝。按客户端
+                // 判断,而非全局一个 bool。
+                let client_initialized = initialized
+                    .lock()
+                    .await
+                    .get(&client)
+                    .copied()
+                    .unwrap_or(false);
+                if !client_initialized && method != "initialize" {
                     write_response(&hub, &client, err_response(id, RpcError::not_initialized())).await?;
+                    continue;
+                }
+
+                // admin 类方法:control/observe 客户端一律拒绝。放在
+                // `!initialized` 检查之后,故未握手的客户端仍先得到
+                // `not_initialized`;scope 缺失按 fail-closed 的 `Observe` 处理。
+                //
+                // `pair/create`(铸出可换设备 token 的配对码)与 `device/revoke`
+                // (踢设备、废 token)是特权桌面操作,一并入闸:低权客户端若能铸
+                // 凭据或踢设备,scope 体系形同虚设。`device/list` 只暴露设备名/
+                // scope/时间戳(无秘密),任何已握手客户端可读,故**不**入闸。
+                const ADMIN_METHODS: [&str; 5] = [
+                    "thread/delete",
+                    "process/kill",
+                    "thread/setPermissionMode",
+                    "pair/create",
+                    "device/revoke",
+                ];
+                let client_scope = client_scopes
+                    .lock()
+                    .await
+                    .get(&client)
+                    .copied()
+                    .unwrap_or(Scope::Observe);
+                if ADMIN_METHODS.contains(&method.as_str()) && client_scope < Scope::Admin {
+                    write_response(
+                        &hub,
+                        &client,
+                        err_response(id, RpcError::insufficient_scope(Scope::Admin)),
+                    )
+                    .await?;
                     continue;
                 }
 
                 match method.as_str() {
                     "initialize" => {
-                        initialized = true;
+                        initialized.lock().await.insert(client.clone(), true);
                         write_response(
                             &hub, &client,
                             ok_response(
@@ -2811,6 +2987,69 @@ where
                             }
                         }
                     }
+                    "pair/create" => {
+                        // 铸一枚一次性配对码,交桌面端渲染二维码。设备注册属于
+                        // `pair/redeem` 的接线(Task 5),这里只铸码。
+                        let code = pairing.create_code();
+                        write_response(
+                            &hub,
+                            &client,
+                            ok_response(
+                                id,
+                                json!({ "code": code.code, "expires_in": code.expires_in }),
+                            ),
+                        )
+                        .await?;
+                    }
+                    "device/list" => {
+                        let devices: Vec<serde_json::Value> = pairing
+                            .store()
+                            .list()
+                            .into_iter()
+                            .map(|d| {
+                                json!({
+                                    "id": d.id,
+                                    "name": d.name,
+                                    "scope": d.scope,
+                                    "created_at": d.created_at,
+                                    "last_seen_at": d.last_seen_at,
+                                })
+                            })
+                            .collect();
+                        write_response(&hub, &client, ok_response(id, json!({ "devices": devices })))
+                            .await?;
+                    }
+                    "device/revoke" => {
+                        let Some(device_id) = req
+                            .params
+                            .get("device_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        else {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::invalid_params("missing device_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let revoked = pairing.revoke(&device_id).unwrap_or(false);
+                        if revoked {
+                            // 先取当前连接:撤销即掉线由「`hub.unregister` + 读循环
+                            // 的 disconnected tick」共同完成。用 `get` + `forget`
+                            // 两步是为了兼顾两种语义——`ws_client_for_device` 仍是
+                            // 「此刻该设备连在哪」的权威读法(测试与将来 RPC 复用),
+                            // `forget_ws_device` 顺带把该映射从全局表摘掉,不留陈旧项。
+                            let cid = ws_client_for_device(&device_id);
+                            forget_ws_device(&device_id);
+                            if let Some(cid) = cid {
+                                hub.unregister(&cid);
+                            }
+                        }
+                        write_response(&hub, &client, ok_response(id, json!({ "revoked": revoked })))
+                            .await?;
+                    }
                     _ => {
                         write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))
                             .await?;
@@ -2850,6 +3089,53 @@ fn apply_session(
     }
 }
 
+/// 把一个设备 id 映射到它当前的 ws `ClientId`——设备被撤销时据此摘除连接。
+///
+/// 这张表在 **ws 传输内部**维护(`ws.rs`):每个已认证的连接把自己
+/// `device_id → ClientId` 登记进去,断连即摘除。主循环(本文件)不能直接持有
+/// 它——`ws.rs` 依赖 `server.rs`,反向依赖会成环——故 ws 层在启动时把
+/// `Arc<Mutex<HashMap<String, ClientId>>>` 交给本函数要读的进程级句柄
+/// ([`install_device_registry`])。表为空(纯 stdio、无 ws,或尚未起 ws)时
+/// 安全返回 `None`。
+fn ws_client_for_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
+    let registry = device_registry().get()?;
+    let guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    guard.get(device_id).cloned()
+}
+
+/// 取出并移除某设备 id 的连接映射(撤销时用)。
+///
+/// 与 [`ws_client_for_device`] 同一张表,但顺带摘掉条目:设备已撤销,它的
+/// `device_id → ClientId` 映射不该留在全局表里等下一个同名设备(或迟到的清理)
+/// 撞上。真正的连接关闭由调用方 `hub.unregister` + ws 读循环的 disconnected
+/// tick 完成;这里只负责让主循环侧不再记得它。
+fn forget_ws_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
+    let registry = device_registry().get()?;
+    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    guard.remove(device_id)
+}
+
+/// 进程级「设备 id → ws `ClientId`」句柄。
+///
+/// 用 `OnceLock` 而非 `RuntimeAttachments` 字段:它天然是**每进程一张表**
+/// (一个 app-server 进程只有一套 ws 连接),且只在 ws 传输启动时被设置一次。
+/// ws 起不来时它保持未设置,`device/revoke` 于是退化为「只改设备表、不摘连接」,
+/// 在纯 stdio 场景下本就没有 ws 连接可摘。
+static DEVICE_REGISTRY: OnceLock<WsDeviceRegistry> = OnceLock::new();
+
+pub(crate) type WsDeviceRegistry = Arc<StdMutex<HashMap<String, crate::broadcast::ClientId>>>;
+
+fn device_registry() -> &'static OnceLock<WsDeviceRegistry> {
+    &DEVICE_REGISTRY
+}
+
+/// 由 ws 传输在启动时登记它的「设备 id → `ClientId`」表(幂等;重复调用保留
+/// 第一张)。返回该表,便于 ws 侧直接持有同一份 `Arc`。
+pub(crate) fn install_device_registry(registry: WsDeviceRegistry) -> WsDeviceRegistry {
+    device_registry().set(Arc::clone(&registry)).ok();
+    device_registry().get().cloned().unwrap_or(registry)
+}
+
 fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
     ResponseEnvelope {
         jsonrpc: Some(JSONRPC_VERSION.to_string()),
@@ -2877,9 +3163,25 @@ async fn write_response(
         .map_err(|e| anyhow::anyhow!("failed to serialize response: {e}"))?;
     // 定向回复:`reply` 会 await 到入队成功,保留 stdio 改造前
     // 「写阻塞直到对端读」的语义。
-    hub.reply(client, frame)
-        .await
-        .map_err(|_| anyhow::anyhow!("client {} disconnected", client.as_str()))
+    match hub.reply(client, frame).await {
+        Ok(()) => Ok(()),
+        // 写失败到**非本地**客户端(ws 手机)不得掀翻共享主循环:那是**多客户端
+        // 共享**的一台服务器,一个被 `device/revoke` 踢掉、或被广播背压摘除
+        // (慢消费者)的连接,不能让所有其它客户端(以及后续连接)一起陪葬。
+        // 摘掉它、让本轮请求就此了结即可(它的读循环靠 `is_connected` 票 tick
+        // 自行收尾)。
+        Err(_) if *client != crate::broadcast::ClientId::local() => {
+            tracing::warn!(
+                client = client.as_str(),
+                "app-server response write failed; dropping the ws client"
+            );
+            hub.unregister(client);
+            Ok(())
+        }
+        // stdio 的 `local` 仍保留改造前的语义:出口泵已死,再写就是错,把错误
+        // 抛出以结束会话(`driver_reports_finished_when_writer_fails` 钉死这条)。
+        Err(_) => Err(anyhow::anyhow!("client {} disconnected", client.as_str())),
+    }
 }
 
 async fn write_notification(
@@ -2966,19 +3268,40 @@ fn thread_summary_json(
 }
 
 /// 把客户端对反向请求的响应路由到等待中的 driver。
+///
+/// 返回 `Some(decision)` 表示本次响应**首次**命中;`None` 表示该审批已被别的
+/// 客户端处理(或根本不存在)。后者不是错误:双端同时点"允许"时,后到者是
+/// no-op 成功,而不是报错——报错会让另一端弹出一个无意义的失败提示。
 async fn route_client_response(
     resp: ClientResponse,
     pending: &Mutex<HashMap<String, oneshot::Sender<Decision>>>,
-) {
+) -> Option<(String, Decision)> {
     let RequestId::Str(key) = resp.id else {
         tracing::warn!("ignoring client response with non-string id");
-        return;
+        return None;
     };
     let Some(tx) = pending.lock().await.remove(&key) else {
-        tracing::warn!("no pending approval request for id {key}");
-        return;
+        // 已被先到的应答取走:安静地当作 no-op,不 warn(双答是预期场景)。
+        tracing::debug!("approval {key} was already resolved");
+        return None;
     };
-    let _ = tx.send(parse_client_decision(resp.result.as_ref()));
+    let decision = parse_client_decision(resp.result.as_ref());
+    let _ = tx.send(decision.clone());
+    Some((key, decision))
+}
+
+/// wire 上的决定标签,与 `parse_client_decision` 接受的取值互逆。
+///
+/// `AlwaysAllowPrefix` 丢掉前缀:本标签只回答"是谁、做了什么类型的决定",
+/// 不含策略细节;需要前缀的客户端可保留自己的弹窗上下文。
+fn decision_label(decision: &Decision) -> String {
+    match decision {
+        Decision::AllowOnce => "allow_once",
+        Decision::AlwaysAllowTool => "always_allow_tool",
+        Decision::AlwaysAllowPrefix(_) => "always_allow_prefix",
+        Decision::Deny => "deny",
+    }
+    .to_string()
 }
 
 /// 解析客户端的权限决定;任何未知/畸形取值一律按 Deny 处理(fail-safe)。
@@ -3187,6 +3510,9 @@ async fn run_thread_driver(
     mut interject_rx: mpsc::Receiver<InterjectionRequest>,
     mut session_rx: mpsc::Receiver<SessionCommand>,
     hub: Arc<crate::broadcast::Broadcaster>,
+    // 发起本 thread 的客户端(取自某次 thread/start)。反向审批请求**广播**给
+    // 所有客户端(决策 5:谁先答谁生效),故这里不再需要它来寻址;保留它是为了
+    // 复刻「发起方断开即收尾本轮」的原判据(见下方 `is_connected` 守卫)。
     client: crate::broadcast::ClientId,
     turn_tx: mpsc::Sender<TurnEvent>,
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
@@ -3332,18 +3658,21 @@ async fn run_thread_driver(
                                     return;
                                 }
                             };
-                            // 反向请求定向发给发起本次 turn 的客户端,不用 broadcast。
+                            // 反向审批请求**广播**给所有客户端(spec §4.4;Tier 1
+                            // 决策 5:审批先到先得)。发起 turn 的是共享的
+                            // app-server,等待决定的设备可能不止一台——每台都要
+                            // 看到弹窗,谁先答谁生效,其余设备靠随后的
+                            // `item/toolCall/approvalResolved` 广播关掉弹窗。
                             //
-                            // 偏差记录(spec §4.4 表格写的是 `hub.broadcast(…)` + 先到先得):
-                            // Tier 0 只有一个客户端,两者投递等价;但 `broadcast` 是
-                            // `try_send`(队列满即静默丢帧),会丢掉这里 `is_err()`「客户端
-                            // 已断开即收尾本轮」的语义——`driver_reports_finished_when_writer_fails`
-                            // 依赖它。更关键的是:审批是**一对一问答**且响应经 `pending` 表按
-                            // `perm_id` 路由,向未发起方广播会诱发先到先得下的错误路由,
-                            // 这正是 Tier 1 才需连同 `approvalResolved` 一起处理的问题。
-                            // 故 Tier 0 保留 `reply`,Tier 1 再改 broadcast。
-                            if hub.reply(&client, frame).await.is_err() {
-                                // 客户端已断开:与旧语义一致(写失败即收尾)。
+                            // 断连语义:`broadcast` 是 `try_send`,不会像旧的
+                            // `reply` 那样在被寻址客户端已注销时返回 `Closed`。
+                            // 若发起客户端已断开,本轮不该继续等一个永远不会到的
+                            // 决定,故这里用 `is_connected` 复刻原判据——但仍要
+                            // 先把帧广播出去,让其它在线客户端(如第二台手机)能
+                            // 应答:发起方断线不等于该审批无人可答。
+                            hub.broadcast(frame);
+                            if !hub.is_connected(&client) {
+                                // 发起客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
                                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                                 return;
@@ -3623,14 +3952,21 @@ fn extract_prompt(params: &serde_json::Value) -> Option<String> {
 mod board_rpc_tests {
     use super::*;
 
-    async fn rpc(h: &mut tests::Harness, id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
-        h.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        })
-        .to_string())
+    async fn rpc(
+        h: &mut tests::Harness,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        h.send(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+        )
         .await;
         loop {
             let value = h.read_value().await;
@@ -3645,9 +3981,20 @@ mod board_rpc_tests {
         let mut h = tests::Harness::new();
         tests::initialize(&mut h).await;
         let project = tempfile::TempDir::new().unwrap();
-        let project_path = project.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let project_path = project
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
 
-        let created = rpc(&mut h, 2, "board/create", json!({ "project": project_path })).await;
+        let created = rpc(
+            &mut h,
+            2,
+            "board/create",
+            json!({ "project": project_path }),
+        )
+        .await;
         assert!(created.get("error").is_none(), "{created}");
         assert_eq!(created["result"]["registered"], true, "{created}");
 
@@ -3657,7 +4004,13 @@ mod board_rpc_tests {
         assert_eq!(boards[0]["project"], project_path);
         assert_eq!(boards[0]["status"]["registered"], true, "{listed}");
 
-        let removed = rpc(&mut h, 4, "board/remove", json!({ "project": project_path })).await;
+        let removed = rpc(
+            &mut h,
+            4,
+            "board/remove",
+            json!({ "project": project_path }),
+        )
+        .await;
         assert!(removed.get("error").is_none(), "{removed}");
 
         let listed = rpc(&mut h, 5, "board/list", json!({})).await;
@@ -3766,7 +4119,11 @@ mod plugin_query_tests {
     fn fake_daemon(
         dir: &Path,
         result: serde_json::Value,
-    ) -> (PathBuf, Arc<StdMutex<serde_json::Value>>, std::thread::JoinHandle<()>) {
+    ) -> (
+        PathBuf,
+        Arc<StdMutex<serde_json::Value>>,
+        std::thread::JoinHandle<()>,
+    ) {
         // The exact path `plugin_query` dials, via the same helper the
         // implementation uses: a fake bound anywhere else would let a
         // wrong-path implementation pass.
@@ -3814,8 +4171,10 @@ mod plugin_query_tests {
     fn a_query_reaches_the_daemon_with_the_plugin_and_method_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let (project, global) = project_and_registry(dir.path(), true);
-        let (_socket, seen, handle) =
-            fake_daemon(&project, json!({ "type": "PluginResult", "value": { "cards": [] } }));
+        let (_socket, seen, handle) = fake_daemon(
+            &project,
+            json!({ "type": "PluginResult", "value": { "cards": [] } }),
+        );
 
         plugin_query(
             &project,
@@ -3861,8 +4220,8 @@ mod plugin_query_tests {
         let dir = tempfile::tempdir().unwrap();
         let (project, global) = project_and_registry(dir.path(), false);
 
-        let error = plugin_query(&project, &global, "list", "superpowers-kanban", json!({}))
-            .unwrap_err();
+        let error =
+            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
         assert_eq!(error.code, "board_not_created", "{error}");
     }
 
@@ -3871,8 +4230,8 @@ mod plugin_query_tests {
         let dir = tempfile::tempdir().unwrap();
         let (project, global) = project_and_registry(dir.path(), true);
 
-        let error = plugin_query(&project, &global, "list", "superpowers-kanban", json!({}))
-            .unwrap_err();
+        let error =
+            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
         assert_eq!(
             error.code, "daemon_unavailable",
             "不能让 UI 误以为是「插件没装」:{error}"
@@ -3901,7 +4260,10 @@ mod plugin_query_tests {
 
         assert_eq!(error.code, "plugin_unavailable", "{error}");
         assert!(error.message.contains("is not available"), "{error}");
-        assert!(error.message.contains("plugin"), "既有措辞形状必须保留:{error}");
+        assert!(
+            error.message.contains("plugin"),
+            "既有措辞形状必须保留:{error}"
+        );
     }
 
     /// The dispatch mapping the UI actually reads. The numeric code is the
@@ -3936,7 +4298,10 @@ mod plugin_query_tests {
                 break value;
             }
         };
-        assert_eq!(value["error"]["data"]["code"], "board_not_created", "{value}");
+        assert_eq!(
+            value["error"]["data"]["code"], "board_not_created",
+            "{value}"
+        );
         assert_eq!(value["error"]["code"], -32020, "{value}");
         h.shutdown().await;
     }
@@ -3948,7 +4313,28 @@ mod plugin_query_tests {
 /// 这里同样只在 test 构建下存在，避免生产构建出现 dead_code。
 #[cfg(test)]
 pub(crate) mod tests_support {
+    use futures::{SinkExt, StreamExt};
+    use serde_json::Value;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use yi_agent_runtime::config::RuntimeConfig;
+
+    /// 对一条已连接的 ws 发 `initialize` 并读回响应。
+    ///
+    /// 跨传输复用(`ws.rs` 的多客户端 E2E 与若干准入测试都要先握手),故放在
+    /// tests_support 里;`#[cfg(test)]` 的 `mod tests` 对其它文件不可见。
+    pub(crate) async fn initialize<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        ws.send(ClientMessage::Text(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let msg = ws.next().await.unwrap().unwrap();
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        assert_eq!(v["id"], 1, "initialize must respond with the request id");
+    }
 
     /// 一份无凭据、无网络的测试配置；provider 只是占位字符串。
     pub(crate) fn test_config() -> RuntimeConfig {
@@ -3975,7 +4361,7 @@ pub(crate) mod tests_support {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -4570,6 +4956,9 @@ mod tests {
         _index_dir: tempfile::TempDir,
         /// 隔离的看板登记表目录,理由同上:board/* RPC 不得写真的 `~/.yi-agent`。
         pub(crate) board_dir: tempfile::TempDir,
+        /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
+        /// 所得设备必须能被同一主循环的 `device/list` 看见。
+        pairing: Arc<PairingState>,
     }
 
     impl Harness {
@@ -4592,7 +4981,36 @@ mod tests {
         }
 
         /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
+        ///
+        /// 生产 stdio 恒为 `Scope::Admin`,故此处固定传 `Admin`;要驱动门禁分支
+        /// 用 [`Harness::with_scope`]。
         fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
+        where
+            F: Fn(
+                    Option<yi_agent_core::Session>,
+                    &std::path::Path,
+                    crate::thread_store::ThreadMode,
+                ) -> anyhow::Result<BuiltAgent>
+                + Send
+                + 'static,
+        {
+            Self::with_config_and_scope(cfg, build, permission_timeout, Scope::Admin)
+        }
+
+        /// 把 `local` 客户端注册为给定 `scope` 的 harness。
+        ///
+        /// 与 [`Harness::new`] 唯一的不同是这对 `serve_scoped` 的 `client_scope`
+        /// 实参;生产路径(`serve_stdio`)恒为 `Admin`,故它只服务门禁测试。
+        pub(crate) async fn with_scope(scope: Scope) -> Self {
+            Self::with_config_and_scope(test_config(), build_test_agent, PERMISSION_TIMEOUT, scope)
+        }
+
+        fn with_config_and_scope<F>(
+            cfg: RuntimeConfig,
+            build: F,
+            permission_timeout: Duration,
+            scope: Scope,
+        ) -> Self
         where
             F: Fn(
                     Option<yi_agent_core::Session>,
@@ -4609,12 +5027,18 @@ mod tests {
             let workspaces = Arc::new(WorkspaceIndex::new(
                 index_dir.path().join("workspaces.json"),
             ));
-            let handle = tokio::spawn(serve_stdio(
+            // 配对状态也落在隔离目录里:`device/list` 从空表起步,且绝不碰用户
+            // 真实的 `~/.yi-agent/devices.json`。
+            let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+                index_dir.path().join("devices.json"),
+            )));
+            let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
                 cfg,
                 permission_timeout,
                 workspaces,
+                Arc::clone(&pairing),
                 RuntimeAttachments {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -4624,6 +5048,7 @@ mod tests {
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                 },
                 build,
+                scope,
             ));
             Self {
                 client_w,
@@ -4631,7 +5056,14 @@ mod tests {
                 handle,
                 _index_dir: index_dir,
                 board_dir,
+                pairing,
             }
+        }
+
+        /// 测试直接驱动的配对状态句柄,与主循环共享同一个 `Arc`:这里 `redeem`
+        /// 出的设备正是 `device/list` 会读到的那一条。
+        pub(crate) fn pairing(&self) -> Arc<PairingState> {
+            Arc::clone(&self.pairing)
         }
 
         pub(crate) async fn send(&mut self, line: &str) {
@@ -5197,12 +5629,16 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            index_dir.path().join("devices.json"),
+        )));
         let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            pairing,
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -5256,12 +5692,16 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            index_dir.path().join("devices.json"),
+        )));
         let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            pairing,
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -5319,12 +5759,16 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            index_dir.path().join("devices.json"),
+        )));
         let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            pairing,
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -5654,6 +6098,44 @@ mod tests {
             .unwrap();
         assert!(matches!(ev, TurnEvent::Finished { .. }));
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Critical 2:往一个已注销的 **ws** 客户端写响应**不得**是致命错误。
+    ///
+    /// 一台手机断连/被撤销、或被广播背压摘除后,主循环仍可能为它手里的一帧去写
+    /// 响应;那是多客户端共享主循环上的常态,不该带走所有其它客户端。回归:
+    /// `write_response(..)?` 曾把 `Closed` 冒泡成 `serve` 的致命错误。
+    ///
+    /// 反向钉死:stdio 的 `local` 仍保持改造前的**致命**语义(出口泵死了,再写
+    /// 就是错),`driver_reports_finished_when_writer_fails` 依赖它。
+    #[tokio::test]
+    async fn write_response_to_a_gone_ws_client_is_not_fatal() {
+        let hub = crate::broadcast::Broadcaster::new();
+        let response = || ResponseEnvelope {
+            jsonrpc: Some(JSONRPC_VERSION.to_string()),
+            id: RequestId::Num(1),
+            result: Some(serde_json::json!({})),
+            error: None,
+        };
+
+        // ws 客户端已走:非致命,返回 Ok(它同时被确认已从 hub 摘除)。
+        let ws_id = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+        let _rx = hub.register(ws_id.clone());
+        hub.unregister(&ws_id);
+        assert!(
+            write_response(&hub, &ws_id, response()).await.is_ok(),
+            "a response to a gone ws client must not be fatal"
+        );
+        assert!(!hub.is_connected(&ws_id), "the ws client must be gone");
+
+        // 反面:stdio 的 `local` 保持致命。
+        let local = crate::broadcast::ClientId::local();
+        let _rx = hub.register(local.clone());
+        hub.unregister(&local);
+        assert!(
+            write_response(&hub, &local, response()).await.is_err(),
+            "the stdio local client must stay fatal on write failure"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5987,6 +6469,18 @@ mod tests {
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         })
+    }
+
+    /// Test-only ws entry: same multi-client server as production, but every
+    /// thread is built by `build_permission_agent` so a `turn/start` triggers a
+    /// real approval round trip. `ws.rs`'s two-client E2E needs this seam.
+    pub(crate) async fn serve_ws_with_permission_agent(
+        listener: tokio::net::TcpListener,
+        cfg: RuntimeConfig,
+        workspaces: Arc<WorkspaceIndex>,
+        pairing: Arc<PairingState>,
+    ) -> anyhow::Result<()> {
+        crate::ws::serve_ws_inner(listener, cfg, workspaces, pairing, build_permission_agent).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8422,5 +8916,167 @@ mod tests {
         let v = read_response(&mut h, 23).await;
         assert_eq!(v["error"]["code"], -32602, "重复 id → invalid_params: {v}");
         h.shutdown().await;
+    }
+
+    /// A `Control` client (a paired phone) must not be able to run admin-class
+    /// RPCs; `thread/delete` is the canonical one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_client_cannot_delete_a_thread() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "admin op from a control client: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// The desktop stdio client is `Admin`: the same call must go through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admin_client_may_delete_a_thread() {
+        let mut h = Harness::with_scope(Scope::Admin).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert!(
+            v["result"].is_object(),
+            "admin client must be allowed to delete: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// The deliberately-extended admin gate: minting a pairing code
+    /// (`pair/create`) or kicking a device (`device/revoke`) is desktop-privileged,
+    /// so a `Control` phone must be rejected from both too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_client_cannot_pair_or_revoke() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"pair/create","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "pair/create from a control client: {v}"
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":10,"method":"device/revoke","params":{"device_id":"d1"}}"#)
+            .await;
+        let v = read_response(&mut h, 10).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "device/revoke from a control client: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// Approval is one-question/one-answer even with many clients: the first
+    /// answer routes to the driver, a second answer for the same `perm_id` is a
+    /// no-op success (not an error — the other device may simply have tapped
+    /// "allow" a beat later).
+    ///
+    /// The full two-client ws round trip (including the `approvalResolved`
+    /// broadcast) belongs to Task 5's E2E; here the routing core is pinned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_second_approval_answer_is_a_noop_and_the_first_wins() {
+        let pending: Mutex<HashMap<String, oneshot::Sender<Decision>>> = Mutex::new(HashMap::new());
+        let (tx, mut rx) = oneshot::channel::<Decision>();
+        pending.lock().await.insert("perm-1".to_string(), tx);
+
+        let resp = ClientResponse {
+            jsonrpc: Some("2.0".to_string()),
+            id: RequestId::Str("perm-1".to_string()),
+            result: Some(json!({ "decision": "allow_once" })),
+            error: None,
+        };
+
+        let first = route_client_response(resp.clone(), &pending)
+            .await
+            .expect("the first answer must route to the waiting driver");
+        assert_eq!(first.0, "perm-1");
+        assert!(matches!(first.1, Decision::AllowOnce));
+
+        // The same client (or a second one) answers again: no-op, not an error.
+        let second = route_client_response(resp, &pending).await;
+        assert!(
+            second.is_none(),
+            "a second answer for an already-resolved approval must be a no-op"
+        );
+
+        // The driver saw exactly one decision.
+        assert!(matches!(rx.try_recv(), Ok(Decision::AllowOnce)));
+        assert!(
+            rx.try_recv().is_err(),
+            "the driver must receive exactly one decision"
+        );
+    }
+
+    /// `pair/create` mints a one-time code, `device/list` reflects the shared
+    /// store, and `device/revoke` kicks the device back out of it. `Harness::new`
+    /// is `Admin`, so the admin gate does not interfere here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pair_create_returns_a_code_and_device_revoke_invalidates_it() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"pair/create","params":{}}"#)
+            .await;
+        let created = h.read_value().await;
+        let code = created["result"]["code"].as_str().unwrap().to_string();
+        assert!(created["result"]["expires_in"].as_u64().unwrap() > 0);
+
+        // 设备表初始为空。
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"device/list","params":{}}"#)
+            .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["result"]["devices"].as_array().unwrap().len(), 0);
+
+        // 用码换 token,设备表出现一条。
+        let (device, _token) = h.pairing().redeem(&code, "iPhone 15").unwrap();
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"device/list","params":{}}"#)
+            .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["result"]["devices"].as_array().unwrap().len(), 1);
+
+        // 撤销。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"device/revoke","params":{{"device_id":"{}"}}}}"#,
+            device.id
+        ))
+        .await;
+        let revoked = h.read_value().await;
+        assert_eq!(revoked["result"]["revoked"], true);
+        h.shutdown().await;
+    }
+
+    /// `device/revoke` 对**在线** ws 设备的映射查找必须真的接上:撤销某设备时,
+    /// 主循环经 `ws_client_for_device` 找到它的 ws 连接并摘除。这里直接验证这条
+    /// 查找路径——ws 的 E2E 里 B 是"另一台设备",它靠这条映射被踢下线。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_client_for_device_resolves_through_the_installed_registry() {
+        let registry: WsDeviceRegistry = Arc::new(StdMutex::new(HashMap::new()));
+        // `install_device_registry` 幂等:进程里若已有 ws server 先设过全局句柄,
+        // 它返回的是那**第一张**表,而不是本次传入的。故必须往返回值里插,才能
+        // 保证 `ws_client_for_device` 读到;往局部 `registry` 里插会在并发测试下
+        // 抖动失败。
+        let global = install_device_registry(registry);
+        let cid = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+        global
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert("dev-abc".to_string(), cid.clone());
+
+        assert!(
+            ws_client_for_device("dev-abc").is_some(),
+            "an online ws device must resolve to its ClientId"
+        );
+        // 未知设备(或连接已摘除)返回 None,`device/revoke` 于是只改设备表。
+        assert!(ws_client_for_device("dev-missing").is_none());
     }
 }

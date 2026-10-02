@@ -136,6 +136,44 @@ echo "explain the deploy target in the Makefile" | yi-agent run
 A native window with conversations, tool-call cards, approval prompts, and
 subagents. See [desktop/README.md](desktop/README.md) for setup and development.
 
+## Remote access (experimental)
+
+`app-server` can serve over WebSocket for network clients. **Every connection must
+authenticate with a paired device token** (`ws://host/ws?token=<t>` or
+`Authorization: Bearer <t>`; a missing/invalid token is closed with ws code
+`4401`), so multiple clients can connect at once:
+
+```bash
+yi-agent app-server --listen ws://127.0.0.1:8790   # warns when bound beyond loopback
+```
+
+The same sessions can be viewed and controlled from several devices: QR-style
+pairing (one-time `XXXX-XXXX` code, valid for 5 minutes, new devices default to
+`control` scope), device listing/revocation, and approvals broadcast to every
+connected device.
+
+> **Experimental caveat**: the protocol and unit tests described here are in
+> place, but **QR pairing is not wired end-to-end** — a pairing code lives only in
+> the in-memory state of the process that created it (`pair/create` is served by
+> the desktop stdio sidecar, while a cross-relay/cross-process `?pair=`
+> redemption is a different process), and there is **no installable iOS build**
+> and **no iOS first-launch pairing screen** yet. So "scan and go" is not
+> available today; see
+> [iOS remote control and relay deployment](docs/relay-deploy.md) §4.4, §六 for
+> status and follow-ups.
+
+**The iOS app connects through a self-hosted reverse WSS relay** (both ends only
+make outbound connections; the computer opens no inbound port):
+
+```bash
+yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
+```
+
+See [iOS remote control and relay deployment](docs/relay-deploy.md) (Chinese) for
+relay deployment, domain + TLS, iOS build and pairing, and troubleshooting. Design
+rationale: [mobile remote access design](docs/superpowers/specs/2026-10-02-mobile-remote-access-design.md)
+(Tier 1).
+
 ## Where configuration lives
 
 Priority, lowest to highest:
