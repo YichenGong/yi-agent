@@ -220,6 +220,36 @@ impl SlashCommand {
         ]
     }
 
+    /// Commands shown in the popup and in the full `/help` listing.
+    ///
+    /// [`Self::all()`] stays the complete catalog so `from_name` keeps resolving
+    /// commands whose backend does not exist yet; this view is what the user browses.
+    /// Cached so the popup's per-keystroke calls do not rebuild (or leak) the list.
+    pub fn completable() -> &'static [SlashCommand] {
+        static COMPLETABLE: std::sync::OnceLock<Vec<SlashCommand>> = std::sync::OnceLock::new();
+        COMPLETABLE.get_or_init(|| {
+            SlashCommand::all()
+                .iter()
+                .copied()
+                .filter(|cmd| cmd.unavailable_reason().is_none())
+                .collect()
+        })
+    }
+
+    /// Why a command has no backend yet, or `None` when it is usable.
+    ///
+    /// The reason is shown when the user explicitly types a hidden command: a bare
+    /// "未知命令" would misreport a known-but-unwired command as a typo.
+    pub fn unavailable_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Approve | Self::Deny => {
+                Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
+            }
+            Self::Budget | Self::Priority => Some("daemon 尚未提供预算/优先级写接口"),
+            _ => None,
+        }
+    }
+
     /// Look up a command by its name (without leading `/`).
     pub fn from_name(name: &str) -> Option<SlashCommand> {
         if name == "?" {
@@ -253,7 +283,7 @@ pub fn help_text(target: Option<&str>) -> String {
         },
         None => {
             let mut text = String::from("可用命令:\n");
-            for command in SlashCommand::all() {
+            for command in SlashCommand::completable() {
                 let usage = command
                     .argument_usage()
                     .map(|usage| format!(" {usage}"))
@@ -866,7 +896,10 @@ mod tests {
 
     #[test]
     fn the_legacy_kanban_name_still_resolves_to_the_command() {
-        assert_eq!(SlashCommand::from_name("kanban"), Some(SlashCommand::Kanban));
+        assert_eq!(
+            SlashCommand::from_name("kanban"),
+            Some(SlashCommand::Kanban)
+        );
         assert_eq!(
             SlashCommand::from_name("superpowers-kanban"),
             Some(SlashCommand::Kanban)
@@ -883,5 +916,44 @@ mod tests {
             command.description()
         );
         assert!(SlashCommand::all().contains(&SlashCommand::Kanban));
+    }
+
+    #[test]
+    fn hidden_commands_are_completable_but_still_resolve() {
+        let completable: Vec<&str> = SlashCommand::completable()
+            .iter()
+            .map(|c| c.name())
+            .collect();
+        for hidden in ["approve", "deny", "budget", "priority"] {
+            assert!(
+                !completable.contains(&hidden),
+                "{hidden} must be hidden from completion"
+            );
+            assert!(
+                SlashCommand::from_name(hidden).is_some(),
+                "{hidden} must still resolve (anchor for re-entry)"
+            );
+        }
+        // `all()` keeps them so `from_name` and the catalog assertions are intact.
+        assert!(SlashCommand::all().iter().any(|c| c.name() == "approve"));
+    }
+
+    #[test]
+    fn hidden_commands_report_a_reason_not_unknown() {
+        assert!(SlashCommand::Approve.unavailable_reason().is_some());
+        assert!(SlashCommand::Deny.unavailable_reason().is_some());
+        assert!(SlashCommand::Budget.unavailable_reason().is_some());
+        assert!(SlashCommand::Priority.unavailable_reason().is_some());
+        assert!(SlashCommand::Quit.unavailable_reason().is_none());
+        assert!(SlashCommand::Cost.unavailable_reason().is_none());
+    }
+
+    #[test]
+    fn full_help_lists_only_completable_commands() {
+        let help = help_text(None);
+        for hidden in ["/approve", "/deny", "/budget", "/priority"] {
+            assert!(!help.contains(hidden), "full help must not list {hidden}");
+        }
+        assert!(help.contains("/config") && help.contains("/model") && help.contains("/daemon"));
     }
 }
