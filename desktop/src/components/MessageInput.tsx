@@ -156,7 +156,7 @@ export function MessageInput({
         disabled={sending || turnActive}
         rows={3}
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-        className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-line-strong focus:outline-none disabled:opacity-50"
+        className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50"
       />
       <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
       <button
