@@ -830,6 +830,7 @@ fn build_headless_root_tools(
         &mut registry,
         binding,
         delegation_controller,
+        crate::tui::subagents::CallerContext::unbound(),
     );
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
@@ -942,6 +943,7 @@ fn build_tui_root_tools(
         &mut registry,
         binding,
         delegation_controller,
+        crate::tui::subagents::CallerContext::unbound(),
     );
     registry
 }

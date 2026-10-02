@@ -106,6 +106,7 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
             yi_agent_tools::SandboxMode::WorkspaceWrite,
             false,
         ),
+        yi_agent_subagent::CallerContext::unbound(),
     );
     assert!(
         registry.names().contains(&"spawn_agent".to_string()),

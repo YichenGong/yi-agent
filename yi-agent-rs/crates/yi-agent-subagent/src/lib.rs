@@ -29,8 +29,8 @@ use yi_agent_core::subagent::worker::{
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_core::{
-    Agent, AgentConfig, AgentError, AgentEvent, ContentBlock, Provider, ProviderError,
-    ProviderTurnGate, Tool, ToolRegistry, ToolResult,
+    Agent, AgentConfig, AgentError, AgentEvent, ContentBlock, Message, Provider, ProviderError,
+    ProviderTurnGate, Session, Tool, ToolRegistry, ToolResult,
 };
 use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
 
@@ -615,6 +615,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 Arc::new(DaemonSpawnAgentTool {
                     root: Arc::clone(&worker_root),
                     sandbox: effective_sandbox,
+                    // A worker is a short-lived child; its own delegation tools
+                    // are not wired to a live caller transcript yet.
+                    caller: CallerContext::unbound(),
                 }) as Arc<dyn Tool>,
                 Arc::new(DaemonSendMessageTool {
                     root: Arc::clone(&worker_root),
@@ -1270,6 +1273,40 @@ impl Tool for DaemonSendMessageTool {
     }
 }
 
+/// The live conversation of whoever is calling a delegation tool.
+///
+/// Held by the tools and re-resolved on every call, so a rebuilt Agent (new
+/// tool registry, post-compaction session) never leaves a tool reading a stale
+/// transcript. `bind` is called by the host right after it builds the Agent.
+#[derive(Clone, Default)]
+pub struct CallerContext {
+    session: Arc<Mutex<Option<Arc<Mutex<Session>>>>>,
+}
+
+impl CallerContext {
+    pub fn unbound() -> Self {
+        Self::default()
+    }
+
+    pub fn new(session: Arc<Mutex<Session>>) -> Self {
+        Self {
+            session: Arc::new(Mutex::new(Some(session))),
+        }
+    }
+
+    pub fn bind(&self, session: Arc<Mutex<Session>>) {
+        *self.session.lock().unwrap() = Some(session);
+    }
+
+    /// The caller's provider-valid transcript, or `None` when unbound.
+    pub fn snapshot(&self) -> Option<Vec<Message>> {
+        let guard = self.session.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|session| yi_agent_core::forkable_messages(&session.lock().unwrap()))
+    }
+}
+
 /// The application root a client attached to, plus what it takes to reach it.
 ///
 /// A root is per project: it names the session, the task the daemon schedules
@@ -1287,8 +1324,9 @@ pub fn register_attached_root_tools(
     registry: &mut ToolRegistry,
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
+    caller: CallerContext,
 ) {
-    register_attached_root_tools_in_thread(registry, root, controller, None);
+    register_attached_root_tools_in_thread(registry, root, controller, None, caller);
 }
 
 /// Register the delegation tools with a conversation marker.
@@ -1303,16 +1341,18 @@ pub fn register_attached_root_tools_in_thread(
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
+    caller: CallerContext,
 ) {
-    register_application_subagent_tools_in_thread(registry, root, controller, thread_id);
+    register_application_subagent_tools_in_thread(registry, root, controller, thread_id, caller);
 }
 
 pub fn register_application_subagent_tools(
     registry: &mut ToolRegistry,
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
+    caller: CallerContext,
 ) {
-    register_application_subagent_tools_in_thread(registry, root, controller, None);
+    register_application_subagent_tools_in_thread(registry, root, controller, None, caller);
 }
 
 pub fn register_application_subagent_tools_in_thread(
@@ -1320,11 +1360,13 @@ pub fn register_application_subagent_tools_in_thread(
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
+    caller: CallerContext,
 ) {
     registry.register(Arc::new(DaemonApplicationSpawnAgentTool {
         root: Arc::clone(&root),
         controller,
         thread_id,
+        caller,
     }));
     registry.register(Arc::new(DaemonApplicationSendMessageTool {
         root: Arc::clone(&root),
@@ -1409,6 +1451,12 @@ fn spawn_sandbox(
 struct DaemonSpawnAgentTool {
     root: Arc<crate::thread_root::ThreadRoot>,
     sandbox: yi_agent_tools::SandboxMode,
+    /// The live conversation that owns this tool, so a `fork:true` spawn can
+    /// upload the caller's transcript at call time rather than at assembly.
+    /// Consumed by the `fork` parameter in a follow-up task; kept here so the
+    /// registration path already carries the handle.
+    #[allow(dead_code)]
+    caller: CallerContext,
 }
 
 struct DaemonApplicationSpawnAgentTool {
@@ -1419,6 +1467,12 @@ struct DaemonApplicationSpawnAgentTool {
     /// conversation that asked for them. An older caller leaves it `None` and
     /// the daemon inherits the parent task's marker instead.
     thread_id: Option<String>,
+    /// The live conversation that owns this tool, so a `fork:true` spawn can
+    /// upload the caller's transcript at call time rather than at assembly.
+    /// Consumed by the `fork` parameter in a follow-up task; kept here so the
+    /// registration path already carries the handle.
+    #[allow(dead_code)]
+    caller: CallerContext,
 }
 
 /// Extract the child's text report from its stored terminal payload, using the
@@ -1918,6 +1972,7 @@ mod tests {
                 yi_agent_tools::SandboxMode::WorkspaceWrite,
                 false,
             ),
+            CallerContext::unbound(),
         );
         for name in [
             "spawn_agent",
@@ -1929,6 +1984,28 @@ mod tests {
         ] {
             assert!(registry.get(name).is_some(), "{name} must be registered");
         }
+    }
+
+    #[test]
+    fn a_bound_caller_context_snapshots_the_live_session() {
+        let session = Arc::new(Mutex::new(Session::new()));
+        let caller = CallerContext::new(Arc::clone(&session));
+        session
+            .lock()
+            .unwrap()
+            .push(Message::user("parent history"));
+
+        let snapshot = caller.snapshot().expect("bound context yields a snapshot");
+        assert_eq!(snapshot.len(), 1);
+
+        // 活句柄：绑定后新增的消息，下一次 snapshot 必须看得到
+        session.lock().unwrap().push(Message::user("later"));
+        assert_eq!(caller.snapshot().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unbound_caller_context_has_no_snapshot() {
+        assert!(CallerContext::unbound().snapshot().is_none());
     }
 
     /// A fixed binding over literals, for tools exercised without a live daemon.

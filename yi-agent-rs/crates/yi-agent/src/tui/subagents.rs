@@ -27,7 +27,7 @@ pub enum RuntimeStartupIntent {
 
 pub use yi_agent_subagent::binding::{RuntimeBinding, RuntimeHandle};
 pub use yi_agent_subagent::thread_root::ThreadRoot;
-pub use yi_agent_subagent::{AttachedRoot, register_attached_root_tools};
+pub use yi_agent_subagent::{AttachedRoot, CallerContext, register_attached_root_tools};
 
 /// A root handle for a runtime this process owns for the whole session.
 ///
@@ -147,7 +147,7 @@ mod tests {
         let root = attached_root();
         let binding = root_binding("/tmp/runtime.sock".into(), &root);
         let mut registry = ToolRegistry::new();
-        register_attached_root_tools(&mut registry, binding, controller);
+        register_attached_root_tools(&mut registry, binding, controller, CallerContext::unbound());
         assert!(registry.names().contains(&"spawn_agent".to_string()));
     }
 
@@ -164,6 +164,7 @@ mod tests {
                 yi_agent_tools::SandboxMode::WorkspaceWrite,
                 false,
             ),
+            CallerContext::unbound(),
         );
         let names = registry
             .schemas()

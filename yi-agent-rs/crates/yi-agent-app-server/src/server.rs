@@ -724,6 +724,9 @@ fn build_runtime_tooling(
         Arc::clone(root),
         controller,
         Some(thread_id.to_string()),
+        // The live caller transcript is bound by the host once the Agent is
+        // built (Tasks 8/9); until then any fork request degrades to no context.
+        yi_agent_subagent::CallerContext::unbound(),
     );
     let permission =
         yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
