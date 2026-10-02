@@ -16,6 +16,7 @@ yi-agent-runtime = { workspace = true }
 
 anyhow.workspace = true
 async-trait = "0.1"
+base64 = "0.22"
 futures = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
