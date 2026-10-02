@@ -658,74 +658,79 @@ git commit -m "feat(desktop): render the board in the main area and surface writ
 
 ---
 
-### Task 8: 全局并发租约（Python 侧）—— **本轮不做（人类裁决）**
+### Task 8: 全局并发租约 —— **已完成**
 
-> **状态：延后。** 人类裁示「先做核心 9 个任务，额度留到有第二个看板时再上」。
-> 理由：全局租约是跨进程协调，只有在**同时跑多个看板**时才有意义；本轮单看板场景下
-> 各 daemon 按日历上限（限流 3 / 不限流 10）各自为政已够用。这是有意延后，不是遗漏
-> （见 spec §6 非目标、§7 已知缺口 1）。下面的步骤保留作下一轮的起点。
+> **状态：完成。** 人类决定「上 Task 8，总体策略 FIFO」。全局额度是决策 3 的落地：
+> 同一台机器上同时跑多个看板时，合计并发不得超过服务端限流（限流时段 3 / 不限流 10）。
+
+**为什么必须同时修「对账」**：实现前发现 `BoardDaemon::task_state` 一直**没人调用**——
+卡片置为 `Running` 后再也没有代码把它迁走。后果是名额永不回收：一旦运行数达到上限，
+队列就永久停摆（第 N+1 张卡再也起不来）。所以全局额度必须和对账一起做，否则额度本身
+也没意义（名额只进不出）。这属于 Task 8 的必修范围，不是额外功能。
 
 **Files:**
 - Create: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/lease.rs`
-- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/lib.rs`
-- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/main.rs`（推进循环用租约）
+- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/lib.rs`（注册模块）
+- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/Cargo.toml`（`libc = "0.2"`）
+- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-core/src/card.rs`（`task_id` 字段）
+- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-core/src/board.rs`（`set_task_id`）
+- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/tick.rs`
+  （`launch` / `reconcile_running`，替换原 `run_once`）
+- Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/main.rs`（推进循环持有租约）
 
-**Interfaces:**
-- Produces:
-  - `lease::acquire(project: &Path, limit: usize) -> Option<Lease>` —— 在
-    `~/.yi-agent/superpowers-kanban/leases/` 下找/建一个名额；满了返回 `None`。
-  - `Lease` 持有 flock 与一个名额文件；`Drop` 释放（unlink + 关 fd）。
-- Consumes: `libc`（插件已否？若无则加 `libc = "0.2"`；flock 语义照抄宿主 `InstanceLock`）。
+**Interfaces（实际落地形状，与最初草案的差异一并记录）:**
+- `lease::acquire_in(dir: &Path, limit: usize) -> Option<Lease>` —— 在
+  `~/.yi-agent/superpowers-kanban/leases/` 下遍历 `slot-0.lock .. slot-{limit-1}.lock`，
+  对第一个 `flock(LOCK_EX | LOCK_NB)` 成功的名额建 `Lease`。`EWOULDBLOCK` / `EAGAIN`
+  表示该名额被占，继续看下一个；其它 errno 视为失败返回 `None`。满了返回 `None`。
+- `lease::acquire(limit)` = `acquire_in(global_leases_dir()?, limit)`。
+- `lease::global_leases_dir() -> Option<PathBuf>` —— `$HOME/.yi-agent/superpowers-kanban/leases`。
+- `Lease` 持有 flock 的 fd 与名额文件路径；`Drop` 关 fd（内核自动释放 flock）。
+- `tick::launch(board, daemon, card_id, workdir) -> TickOutcome` —— 建会话、置 `Running`、
+  记下 `task_id` 与 `workdir`。调用方须先领到名额。
+- `tick::reconcile_running(board, daemon) -> Vec<TickOutcome>` —— 逐张查 `Running` 卡片的
+  `task_id`，映射到**不再占名额**的状态才迁移。
 
-- [ ] **Step 1: 写失败测试**
+**与最初草案的偏差（重要）:**
+1. 草案说「`run_once` 领一个额度然后跑一轮」。**实现改为「额度跨 tick 绑定到卡片」**：
+   若只在单轮 tick 内持有，别的项目会在卡片还在跑时抢走名额 → 多板合计仍会超发。
+   现在 `run_daemon` 用 `HashMap<CardId, Lease>` 持有每张运行中卡片的名额，直到对账
+   发现它跑完（或失败）才 `remove` 并释放。
+2. 草案的 `Lease::Drop` 写「unlink + 关 fd」。实现**只关 fd**：unlink 会在并发下
+   产生竞态（A 释放时删掉文件、B 正持有同一路径的 fd），flock 本身就是随 fd 关闭
+   自动释放的，文件留着复用即可。
+3. `run_once` 被拆成 `launch`（单卡）+ `reconcile_running`；`runner::plan_launches`
+   （纯函数，FIFO）保留为唯一的「选哪些卡」逻辑，循环里逐张领名额后启动。
 
-```rust
-#[test]
-fn the_first_n_holders_get_slots_and_the_next_one_waits() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = lease::acquire_in(&dir.path().to_path_buf(), 2).unwrap();
-    let _b = lease::acquire_in(&dir.path().to_path_buf(), 2).unwrap();
-    assert!(lease::acquire_in(&dir.path().to_path_buf(), 2).is_none(), "第 3 个必须等");
-    drop(a);
-    assert!(lease::acquire_in(&dir.path().to_path_buf(), 2).is_some(), "释放后必须能领到");
-}
-
-#[test]
-fn a_slot_held_by_a_dead_process_is_reclaimed() {
-    // 进程被 kill -9 时不会跑 Drop。名额必须能靠 flock 自动回收，
-    // 否则额度会被永久占死。
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().to_path_buf();
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["hold_one_slot", path.to_str().unwrap()])
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(lease::acquire_in(&path, 1).is_none(), "子进程占着唯一的位");
-    std::process::Command::new("kill")
-        .args(["-9", &child.id().to_string()])
-        .status()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(lease::acquire_in(&path, 1).is_some(), "SIGKILL 后名额必须可回收");
-}
-```
-
-（第二个测试用一个隐藏的 `#[test]`-旁路入口：`argv[1] == "hold_one_slot"` 时领一个名额并 `sleep(30)`；
-用 `#[ignore]` 的测试函数承载该逻辑，或加一个 `#[ctor]` 风格分支——**实现选最小可行的那种**，
-若过于绕则退化为单测 flock 语义本身。）
-
-- [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**；`main.rs` 的推进循环：
-  `let limit = calendar.limit_at(now)` 之后，用 `lease::acquire(&project_root, limit)`，
-  `None` 就跳过本轮启动（卡片留在 queued），`Some(_lease)` 才 `run_once`。
-  **先领额度再建 worktree**（建 worktree 不耗模型调用，但省得白建）。
-- [ ] **Step 4: 运行确认通过** → PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 1: 写失败测试**
+  - `lease.rs`：前 N 个获得名额 / 第 N+1 个等待 / 释放后可得；`limit = 0`；名额按
+    `slot-0, slot-1, ...` 复用顺序；`limit = 1`；**SIGKILL 后名额可回收**（用
+    `LEASE_HOLD_DIR` 把测试二进制自身重新起为 holder，`kill -9` 后轮询到重新可领）。
+  - `tick.rs`：用**真实 wire 协议**的假 daemon 覆盖 `launch → reconcile`：
+    跑完的卡片离开 `Running` 且名额立即可被队列复用；失败的任务同样离开 `Running`；
+    未知 daemon 状态保持 `Running`；无 `task_id` 的旧卡片不动。
+- [x] **Step 2: 运行确认失败** → FAIL
+- [x] **Step 3: 实现**
+  - `main.rs` 推进循环：
+    1. `reconcile_running`：跑完的卡片 `leases.remove(id)` 释放名额；
+    2. 按 `runner::plan_launches(&board, limit)` 的 FIFO 顺序逐张尝试：`acquire_in`
+       拿到名额才继续，拿不到就 `break`（后续卡片留在 queued，下轮再试）；
+    3. **先领名额再建 worktree**；启动失败立即 `drop(lease)` 还名额。
+  - 全局池大小 = 当前项目 `calendar.limit_at(now)`（限流 3 / 不限流 10）。
+  - **daemon 重启补领**：进程启动时，对 board 里仍为 `Running` 且带 `task_id` 的卡片
+    尝试补领名额（进程退出 flock 会自动释放，正常重启后这些名额是空的），避免「既留
+    着 Running 的卡片、又为新卡片发新名额」而超发；补不到就记一行日志，交给第一轮对账。
+- [x] **Step 4: 运行确认通过** → PASS（插件 133 全绿，含新增 lease / 对账测试；warning-clean）
+- [x] **Step 5: Commit**
 
 ```bash
 git commit -m "feat(kanban-plugin): global concurrency lease shared across projects"
 ```
+
+> **本次仍不做的（已知缺口，详见 spec §7）**：daemon 崩溃无人重启、每看板一对进程的
+> 进程数线性增长。另有一个已知的小不一致：多个项目日历配置不同时，「每进程各持一份名额」
+> 会把全局池按各项目自己的 `limit` 分别记账，口径不完全统一——本轮各项目共用同一份
+> 日历配置（都是 3 / 10），可接受，下一轮如出现分歧再统一。
 
 ---
 
@@ -787,7 +792,8 @@ git commit -m "feat(tui): /superpowers-kanban create, remove and status for this
 
 - [x] **Step 1: 全量回归**（宿主 / 插件 / 桌面），确认既有能力不回退
   - 宿主：`yi-agent-boards` 28、`yi-agent-app-server` 197、`yi-agent` 556 + 新集成测试 1，全绿、warning-clean
-  - 插件：`plugins/superpowers-kanban` 123 全绿（一处既有 `unused variable: other` 警告，非本轮引入）
+  - 插件：`plugins/superpowers-kanban` 当时 123 全绿（一处既有 `unused variable: other` 警告，非本轮引入；
+    Task 8 之后为 **133 全绿**，且本轮新增代码 warning-clean）
   - 桌面：`npx tsc --noEmit` 干净；`vitest run` 314/33 文件全绿
 - [x] **Step 2: 真机闭环 — 改为非侵入式**（原计划要替换并重签名用户已装的二进制，
   **未执行**；不动 `~/.cargo/bin/yi-agent` 与 `/opt/homebrew/bin/superpowers-kanban`）。
@@ -799,7 +805,8 @@ git commit -m "feat(tui): /superpowers-kanban create, remove and status for this
   3. **退出 app-server → daemon/插件仍在跑**（`is_running` 仍为真、socket 仍在）
   4. 移除 → daemon 停、队列状态删、清单保留
 - [x] **Step 4: 更新 spec**：状态改为「核心已实施并通过端到端验收」；§9 记录实测与偏差。
-  **注意**：原文「改成已由 Task 8 落地」**不成立**——Task 8 本轮按人类裁决延后，§6/§7 保持「延后」。
+  更新记录（如实）：执行本 Step 时 Task 8 **正被延后**，故当时 §6/§7 保持「延后」；
+  随后人类决定「上 Task 8」，Task 8 已单独完成，§6/§7 已随之从「延后」改为「已落地」。
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -816,6 +823,6 @@ git commit -m "test(boards): per-project board end-to-end verification"
 **一处需实现者注意的类型一致性**：Task 5 给 `queryPlugin` 加了 `project` 形参后，
 Task 6/7 所有调用点都要传；漏传会编译不过（这是有意的，好过静默走错目录）。
 
-**已知取舍**：Task 8 第二个测试（SIGKILL 回收）在纯单测里较绕，
-实现若发现不可行，**必须**改为至少覆盖「进程被 kill 后名额可回收」的集成测，
-不得直接删掉——那正是额度会不会被永久占死的关键。
+**已知取舍（已落实）**：Task 8 第二个测试（SIGKILL 回收）最终实现为——把测试二进制
+自身以 `LEASE_HOLD_DIR` 重新起为 holder（`lease_holder_child`），`kill -9` 后轮询到名额
+重新可领；并补上 `holder.wait()` 收尸。这正是「额度会不会被永久占死」的关键测试，未删。

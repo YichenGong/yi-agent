@@ -58,6 +58,7 @@ impl Board {
             enqueued_at: now,
             order,
             workdir: None,
+            task_id: None,
         });
         &self.cards[index]
     }
@@ -100,6 +101,17 @@ impl Board {
             .find(|card| &card.id == id)
             .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
         card.workdir = Some(workdir);
+        Ok(())
+    }
+
+    /// 记下某张卡片启动后 daemon 给它的根任务 id，供之后查询是否跑完。
+    pub fn set_task_id(&mut self, id: &CardId, task_id: String) -> Result<(), TransitionError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        card.task_id = Some(task_id);
         Ok(())
     }
 

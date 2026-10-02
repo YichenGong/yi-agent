@@ -88,6 +88,10 @@ pub struct Card {
     /// `git worktree add` 预建好目录再填入。旧状态文件没有此字段 → 反序列化为 `None`。
     #[serde(default)]
     pub workdir: Option<PathBuf>,
+    /// 该卡片启动后 daemon 给它的根任务 id。用它向 daemon 查这张卡片跑完没有，
+    /// 完成的卡片让出并发名额。旧状态文件没有此字段 → 反序列化为 `None`。
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 #[cfg(test)]

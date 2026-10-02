@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod inbox;
+pub mod lease;
 pub mod runner;
 pub mod tick;
 

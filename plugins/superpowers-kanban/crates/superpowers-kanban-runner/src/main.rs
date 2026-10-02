@@ -366,6 +366,42 @@ fn run_daemon(args: Args) {
     // 查询通道与推进循环互不阻塞：宿主问状态时队列照常在动。
     let _query_server = start_query_server(&args.state_dir);
 
+    // 每张正在运行的卡片各持一个全局名额，跨 tick 一直拿着，直到对账发现它跑完。
+    // 名额必须活到卡片结束：若只在本轮 tick 内持有，别的项目会在卡片还在跑时抢走
+    // 名额，多个看板加起来就超了服务端限流。
+    let mut leases: std::collections::HashMap<
+        superpowers_kanban_core::card::CardId,
+        superpowers_kanban_runner::lease::Lease,
+    > = std::collections::HashMap::new();
+
+    // daemon 重启后，board 里仍标着 `Running` 的卡片需要补领名额（本进程刚起，
+    // 还没有任何租约）。进程退出时 flock 会自动释放，所以正常重启后这些名额是空的；
+    // 补领让「重启」不会既留着 Running 的卡片、又为新卡片发新名额而超发。若此刻
+    // 名额已被别的项目占满则领不到，只做尽力而为：第一轮对账会按卡片真实状态收尾。
+    {
+        let board = superpowers_kanban_runner::persist::load_board(&board_path);
+        if let Some(dir) = superpowers_kanban_runner::lease::global_leases_dir() {
+            let limit = calendar.limit_at(chrono::Local::now());
+            for card in board.cards() {
+                if card.state != superpowers_kanban_core::card::CardState::Running
+                    || card.task_id.is_none()
+                {
+                    continue;
+                }
+                if let Some(lease) =
+                    superpowers_kanban_runner::lease::acquire_in(&dir, limit as usize)
+                {
+                    leases.insert(card.id.clone(), lease);
+                } else {
+                    eprintln!(
+                        "superpowers-kanban: {} is running but no slot could be reclaimed on restart",
+                        card.id.0
+                    );
+                }
+            }
+        }
+    }
+
     loop {
         if !board_switch(&args.state_dir).is_enabled() {
             // 关掉开关只停止推进，绝不取消已在 daemon 中运行的会话。
@@ -384,39 +420,67 @@ fn run_daemon(args: Args) {
         }
         let limit = calendar.limit_at(chrono::Local::now());
 
-        // 启动前为每张待启动卡片预建 worktree（纯本地 git，不消耗模型调用）。
-        let project_root = args.project_root.clone();
-        let mut launch = |card_id: &superpowers_kanban_core::card::CardId| {
-            let branch = format!("kanban/{}", superpowers_kanban_runner::worktree::slugify(card_id));
-            match superpowers_kanban_runner::worktree::ensure_worktree(&project_root, card_id, &branch) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    eprintln!("superpowers-kanban: worktree for {} failed: {error}", card_id.0);
-                    None
-                }
-            }
-        };
-
-        let outcomes = superpowers_kanban_runner::tick::run_once(&mut board, &daemon, limit, &mut launch);
-        for outcome in &outcomes {
-            // 把预建好的 worktree 记进卡片，控制面据此显示「跑在哪里」。
-            if let superpowers_kanban_runner::tick::TickAction::Launched { .. } = &outcome.action {
-                let branch = format!(
-                    "kanban/{}",
-                    superpowers_kanban_runner::worktree::slugify(&outcome.card_id)
-                );
-                if let Ok(path) = superpowers_kanban_runner::worktree::ensure_worktree(
-                    &project_root,
-                    &outcome.card_id,
-                    &branch,
-                ) {
-                    let _ = board.set_workdir(&outcome.card_id, path);
-                }
-            }
+        // 对账：跑完的卡片让出名额，下一轮队列才能继续放行。
+        for outcome in superpowers_kanban_runner::tick::reconcile_running(&mut board, &daemon) {
+            leases.remove(&outcome.card_id);
             eprintln!(
                 "superpowers-kanban: {} -> {:?}",
                 outcome.card_id.0, outcome.action
             );
+        }
+
+        // 启动：按 FIFO 顺序逐张尝试，每张启动前先领一个全局名额。领不到就停在
+        // 这里（后续卡片留在 queued），不做「本轮 plan 已定」那套——名额由本
+        // 进程跨 tick 持有，领不到就是真没空位，等下一轮即可。
+        let project_root = args.project_root.clone();
+        let leases_dir = superpowers_kanban_runner::lease::global_leases_dir();
+        for card_id in superpowers_kanban_runner::runner::plan_launches(&board, limit) {
+            if leases.contains_key(&card_id) {
+                continue;
+            }
+            let Some(dir) = leases_dir.as_deref() else {
+                // 取不到全局目录：退化为「不设全局上限」（仍受本项目日历上限约束），
+                // 而不是凭空造目录——两个不同的猜测会各自发出一池名额，反而更超发。
+                break;
+            };
+            let Some(lease) = superpowers_kanban_runner::lease::acquire_in(dir, limit as usize)
+            else {
+                break;
+            };
+            // 先领名额再建 worktree：建 worktree 是纯本地 git，不消耗模型调用，
+            // 但也不能白建一个注定启动不了的目录。
+            let branch = format!(
+                "kanban/{}",
+                superpowers_kanban_runner::worktree::slugify(&card_id)
+            );
+            let workdir = match superpowers_kanban_runner::worktree::ensure_worktree(
+                &project_root,
+                &card_id,
+                &branch,
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!(
+                        "superpowers-kanban: worktree for {} failed: {error}",
+                        card_id.0
+                    );
+                    continue;
+                }
+            };
+            let outcome = superpowers_kanban_runner::tick::launch(
+                &mut board, &daemon, &card_id, workdir,
+            );
+            eprintln!(
+                "superpowers-kanban: {} -> {:?}",
+                outcome.card_id.0, outcome.action
+            );
+            match outcome.action {
+                superpowers_kanban_runner::tick::TickAction::Launched { .. } => {
+                    leases.insert(card_id, lease);
+                }
+                // 启动失败：立刻把名额还回去，别占着不放。
+                _ => drop(lease),
+            }
         }
 
         if let Err(error) = superpowers_kanban_runner::persist::save_board(&board_path, &board) {
