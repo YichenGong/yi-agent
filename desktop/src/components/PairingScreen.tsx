@@ -208,7 +208,7 @@ export function PairingScreen({
           />
         </label>
 
-        {error !== null && (
+        {error !== null && !scanning && (
           <p role="alert" className="mt-3 text-xs text-red-400">
             {error}
           </p>
@@ -236,12 +236,36 @@ export function PairingScreen({
         )}
 
         {scanning && (
-          <div className="fixed inset-0 z-50 bg-black">
-            {scan ? (
-              <ScanHost scan={scan} onText={handleScanText} onError={handleScanError} />
-            ) : (
-              <QrScanner onText={handleScanText} onError={handleScanError} />
-            )}
+          <div
+            role="dialog"
+            aria-label="扫描二维码"
+            className="fixed inset-0 z-50 flex flex-col bg-black"
+          >
+            <div className="flex items-center justify-between px-4 py-3">
+              <span className="text-xs text-white/70">对准桌面端显示的二维码</span>
+              <button
+                type="button"
+                onClick={() => setScanning(false)}
+                className="rounded px-2 py-1 text-xs text-white/80 hover:text-white"
+              >
+                取消
+              </button>
+            </div>
+            <div className="relative min-h-0 flex-1">
+              {scan ? (
+                <ScanHost scan={scan} onText={handleScanText} onError={handleScanError} />
+              ) : (
+                <QrScanner onText={handleScanText} onError={handleScanError} />
+              )}
+              {error !== null && (
+                <p
+                  role="alert"
+                  className="absolute inset-x-0 bottom-6 mx-auto w-fit rounded bg-black/70 px-3 py-1 text-xs text-red-300"
+                >
+                  {error}
+                </p>
+              )}
+            </div>
           </div>
         )}
       </form>

@@ -234,4 +234,35 @@ describe("PairingScreen QR scan", () => {
     render(<PairingScreen enableScan={false} redeem={vi.fn()} storage={storages()} />);
     expect(screen.queryByRole("button", { name: "扫码" })).toBeNull();
   });
+
+  it("lets the user cancel the scanner and return to the form", async () => {
+    const scan = () => () => {};
+    render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    expect(screen.getByRole("button", { name: "取消" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "取消" })).toBeNull());
+    expect(screen.getByLabelText("配对码")).toBeTruthy(); // 回到可编辑表单
+  });
+
+  it("shows the invalid-QR message over the scanner (not hidden behind it)", async () => {
+    const scan = (onText: (t: string) => void) => {
+      onText("https://example.com/nope");
+      return () => {};
+    };
+    render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+
+    // 错误必须渲染在扫描器覆盖层**内部**，否则会被 z-50 的黑色层盖住、用户看不到。
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe("不是有效的配对二维码"),
+    );
+    const dialog = screen.getByRole("dialog", { name: "扫描二维码" });
+    expect(dialog.contains(screen.getByRole("alert"))).toBe(true);
+    expect(screen.getByRole("button", { name: "取消" })).toBeTruthy(); // 扫描器仍开着
+  });
 });
