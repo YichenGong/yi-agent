@@ -5,6 +5,8 @@ export interface BoardCard {
   state: string;
   progress: string | null;
   detail: string;
+  /** 该卡关联的会话；可为空（插件还没起会话）。 */
+  threadId?: string | null;
 }
 
 export function SuperpowersKanbanView({
@@ -12,12 +14,15 @@ export function SuperpowersKanbanView({
   source,
   cards,
   pluginMissing = false,
+  onOpenThread,
 }: {
   switchOn: boolean;
   source: SwitchSource;
   cards: BoardCard[];
   /** The plugin never answered, so there is no board to render at all. */
   pluginMissing?: boolean;
+  /** 打开某张卡关联的会话；上层接到既有的 thread/resume 入口。 */
+  onOpenThread?: (threadId: string) => void;
 }) {
   if (pluginMissing) {
     return (
@@ -47,6 +52,15 @@ export function SuperpowersKanbanView({
           ) : null}
           {card.detail ? (
             <span className="truncate text-fg-subtle">{card.detail}</span>
+          ) : null}
+          {card.threadId ? (
+            <button
+              type="button"
+              onClick={() => onOpenThread?.(card.threadId as string)}
+              className="ml-auto shrink-0 cursor-pointer font-mono text-fg-muted hover:text-fg hover:underline"
+            >
+              {card.threadId}
+            </button>
           ) : null}
         </li>
       ))}

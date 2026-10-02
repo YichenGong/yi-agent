@@ -38,6 +38,10 @@ export function parseBoard(json: string): BoardCard[] {
     const state = typeof record.state === "string" ? record.state : "";
     const workdir = typeof record.workdir === "string" ? record.workdir : "";
     const order = typeof record.order === "number" ? record.order : 0;
+    const threadId =
+      typeof record.thread_id === "string" && record.thread_id !== ""
+        ? record.thread_id
+        : null;
     if (id === "" || planPath === "" || state === "") continue;
     mapped.push({
       card: {
@@ -45,6 +49,7 @@ export function parseBoard(json: string): BoardCard[] {
         state: state.toLowerCase(),
         progress: null,
         detail: workdir !== "" ? workdir : planPath,
+        threadId,
       },
       order,
     });
