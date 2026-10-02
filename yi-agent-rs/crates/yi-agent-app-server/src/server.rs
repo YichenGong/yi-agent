@@ -134,7 +134,34 @@ type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 /// 生产环境的 `$HOME`。未设置时回退空路径——与 `board_dir` 同一策略：宁可把
 /// 值守装进一个无人读取的目录，也不要因为环境缺失让整个服务起不来。
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// 生产的安装闭包：设置 `YI_AGENT_DISABLE_WATCHMAN` 时退化成 no-op。
+///
+/// 这个开关是为那个**驱动真实二进制**的 e2e（`yi-agent/tests/board_e2e.rs`）而设：
+/// 它以 `YI_AGENT_BOARD_E2E` 为闸、跑的是生产接线，于是 `board/create` 里的
+/// 「首次创建时装值守」会走到这里。不拦的话它会在开发机真实的 launchd 域里执行
+/// `launchctl bootstrap gui/<uid>`，并往真实的 `~/Library/LaunchAgents` 写 plist——
+/// 测试绝不能碰宿主 launchd。为此 e2e 置该环境变量即可让安装/卸载变成空操作。
+///
+/// 只影响生产接线：测试用的 harness 各自注入记账闭包（见 `Harness`），不经过这里。
+pub(crate) fn production_watchman_install() -> WatchmanInstall {
+    if std::env::var_os("YI_AGENT_DISABLE_WATCHMAN").is_some() {
+        return Arc::new(|_exe: &Path, _home: &Path| Ok(()));
+    }
+    Arc::new(yi_agent_boards::watchman::install)
+}
+
+/// 生产的卸载闭包；`YI_AGENT_DISABLE_WATCHMAN` 开关同
+/// [`production_watchman_install`]。
+pub(crate) fn production_watchman_uninstall() -> WatchmanUninstall {
+    if std::env::var_os("YI_AGENT_DISABLE_WATCHMAN").is_some() {
+        return Arc::new(|_home: &Path| Ok(()));
+    }
+    Arc::new(yi_agent_boards::watchman::uninstall)
 }
 
 /// 开关为开、且现有 plist 未指向当前可执行文件时安装值守。
@@ -1058,8 +1085,8 @@ where
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
-            watchman_install: Arc::new(yi_agent_boards::watchman::install),
-            watchman_uninstall: Arc::new(yi_agent_boards::watchman::uninstall),
+            watchman_install: production_watchman_install(),
+            watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
         },
         production_factory(cfg, theme_for_factory),
@@ -4507,7 +4534,10 @@ mod board_rpc_tests {
             json!({ "project": project.path().canonicalize().unwrap().to_string_lossy() }),
         )
         .await;
-        assert!(created.get("error").is_none(), "装值守失败不该拖垮创建:{created}");
+        assert!(
+            created.get("error").is_none(),
+            "装值守失败不该拖垮创建:{created}"
+        );
         assert_eq!(created["result"]["registered"], true, "{created}");
         h.shutdown().await;
     }
@@ -9729,10 +9759,7 @@ pub(crate) mod tests {
             .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["theme"], "dark", "default before any write");
-        assert_eq!(
-            v["result"]["board_watchman_enabled"], true,
-            "缺省为开:{v}"
-        );
+        assert_eq!(v["result"]["board_watchman_enabled"], true, "缺省为开:{v}");
 
         h.send(
             r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"theme":"light"}}"#,
@@ -9826,7 +9853,11 @@ pub(crate) mod tests {
         .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["ok"], true, "{v}");
-        assert_eq!(v["result"]["warning"], json!(null), "注入的卸载不会失败:{v}");
+        assert_eq!(
+            v["result"]["warning"],
+            json!(null),
+            "注入的卸载不会失败:{v}"
+        );
         let recorded = calls.lock().unwrap().clone();
         assert_eq!(recorded.len(), 1, "恰好一次卸载:{recorded:?}");
         assert!(!recorded[0].0, "false triggers uninstall");
@@ -9888,7 +9919,8 @@ pub(crate) mod tests {
 
     /// 每个 thread 的工具集都必须带主题工具——这是「对话切主题」的落点。
     #[test]
-    fn the_theme_tool_is_registered_into_a_thread_registry() {        let dir = tempfile::TempDir::new().unwrap();
+    fn the_theme_tool_is_registered_into_a_thread_registry() {
+        let dir = tempfile::TempDir::new().unwrap();
         let handle = crate::theme_tool::ThemeHandle::new(dir.path().to_path_buf());
         let mut registry = yi_agent_core::ToolRegistry::new();
         register_theme_tool(&mut registry, handle);

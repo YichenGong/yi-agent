@@ -68,6 +68,13 @@ impl AppServer {
         let mut child = Command::new(bin)
             .args(["app-server", "--listen", "stdio://"])
             .env("HOME", home)
+            // Never boot a host LaunchAgent from a test. `board/create` installs
+            // the watchman on first use, and `current_dir("/")` makes `cfg.workdir`
+            // resolve to `/`, so the preference defaults on and the real install
+            // would run `launchctl bootstrap gui/<this uid>` in the developer's
+            // actual launchd domain. The switch degrades production
+            // install/uninstall to no-ops (see `production_watchman_install`).
+            .env("YI_AGENT_DISABLE_WATCHMAN", "1")
             // A bundled app launches from `/`; mirror that so any accidental
             // reliance on the cwd shows up here rather than in production.
             .current_dir("/")

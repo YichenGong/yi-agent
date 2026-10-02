@@ -95,11 +95,7 @@ pub fn save_watchman_enabled(workdir: &Path, enabled: bool) -> std::io::Result<(
 ///
 /// [`save`] 与 [`save_watchman_enabled`] 的唯一实现：两者共处同一文件，若各写
 /// 各的读-改-写，后写的会把先写的键整个抹掉。
-fn set_object_value(
-    workdir: &Path,
-    key: &str,
-    value: serde_json::Value,
-) -> std::io::Result<()> {
+fn set_object_value(workdir: &Path, key: &str, value: serde_json::Value) -> std::io::Result<()> {
     let dir = workdir.join(".yi-agent");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("preferences.json");
@@ -184,7 +180,12 @@ mod tests {
 
     #[test]
     fn the_watchman_preference_falls_back_to_on_for_broken_files() {
-        for body in ["not json", "{\"board_watchman_enabled\":\"yes\"}", "[]", "{}"] {
+        for body in [
+            "not json",
+            "{\"board_watchman_enabled\":\"yes\"}",
+            "[]",
+            "{}",
+        ] {
             let dir = tempfile::TempDir::new().unwrap();
             std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
             std::fs::write(preferences_path(dir.path()), body).unwrap();
