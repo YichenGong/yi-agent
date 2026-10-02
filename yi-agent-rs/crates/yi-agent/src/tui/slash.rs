@@ -940,12 +940,29 @@ mod tests {
 
     #[test]
     fn hidden_commands_report_a_reason_not_unknown() {
-        assert!(SlashCommand::Approve.unavailable_reason().is_some());
-        assert!(SlashCommand::Deny.unavailable_reason().is_some());
-        assert!(SlashCommand::Budget.unavailable_reason().is_some());
-        assert!(SlashCommand::Priority.unavailable_reason().is_some());
-        assert!(SlashCommand::Quit.unavailable_reason().is_none());
-        assert!(SlashCommand::Cost.unavailable_reason().is_none());
+        assert_eq!(
+            SlashCommand::Approve.unavailable_reason(),
+            Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
+        );
+        assert_eq!(
+            SlashCommand::Deny.unavailable_reason(),
+            Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
+        );
+        assert_eq!(
+            SlashCommand::Budget.unavailable_reason(),
+            Some("daemon 尚未提供预算/优先级写接口")
+        );
+        assert_eq!(
+            SlashCommand::Priority.unavailable_reason(),
+            Some("daemon 尚未提供预算/优先级写接口")
+        );
+        // Exactly four commands are hidden: pin the boundary so a regression that
+        // clears one of these reasons, or that marks a wired command unavailable,
+        // fails here instead of slipping through an `is_some()`/`is_none()` check.
+        assert_eq!(SlashCommand::Quit.unavailable_reason(), None);
+        assert_eq!(SlashCommand::Cost.unavailable_reason(), None);
+        assert_eq!(SlashCommand::Daemon.unavailable_reason(), None);
+        assert_eq!(SlashCommand::Kanban.unavailable_reason(), None);
     }
 
     #[test]
