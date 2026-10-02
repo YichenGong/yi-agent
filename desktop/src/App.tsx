@@ -565,7 +565,22 @@ export default function App() {
     const c = clientRef.current;
     if (!c) return;
     try {
-      await c.request("thread/delete", { threadId: id });
+      // 删除是不可逆的，而这个会话可能还有子代理在跑。服务端在未 force 时
+      // 只回答「还有几个」，不动任何东西；据此问一句，用户同意后才带 force
+      // 重发。子代理活在项目 daemon 里，直接删文件会让它们在无人可见的地方
+      // 继续跑。
+      const first = await c.request<{
+        status?: string;
+        active_children?: number;
+      }>("thread/delete", { threadId: id });
+      if (first?.status === "needs_confirmation") {
+        const count = first.active_children ?? 0;
+        const ok = window.confirm(
+          `这个会话还有 ${count} 个子代理正在运行，删除会一并终止它们。继续？`,
+        );
+        if (!ok) return;
+        await c.request("thread/delete", { threadId: id, force: true });
+      }
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);

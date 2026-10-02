@@ -1345,3 +1345,66 @@ describe("App iOS first-launch pairing", () => {
     expect(clients.length).toBe(0);
   });
 });
+
+describe("deleting a thread that still runs subagents", () => {
+  const deleteButton = () => screen.getByRole("button", { name: /delete thread/i });
+
+  /** Reveal the sidebar row's controls, then click its Delete button. */
+  async function clickDelete() {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(true),
+    );
+    const row = screen.getByText("one");
+    fireEvent.mouseEnter(row.closest("[data-thread-id]") ?? row);
+    fireEvent.click(deleteButton());
+  }
+
+  it("asks the user first, and re-sends with force only after they agree", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.dataSources["thread/delete"] = () => ({
+      status: "needs_confirmation",
+      active_children: 2,
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    try {
+      await clickDelete();
+
+      // The backend refused; the UI must have asked, quoting how many are live.
+      await waitFor(() => expect(confirm).toHaveBeenCalled());
+      expect(String(confirm.mock.calls[0][0])).toContain("2");
+
+      // Once agreed, the same delete is re-issued with force — nothing else.
+      await waitFor(() =>
+        expect(clients[0].requests).toContainEqual({
+          method: "thread/delete",
+          params: { threadId: "t1", force: true },
+        }),
+      );
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("leaves the thread alone when the user declines", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.dataSources["thread/delete"] = () => ({
+      status: "needs_confirmation",
+      active_children: 1,
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      await clickDelete();
+
+      await waitFor(() => expect(confirm).toHaveBeenCalled());
+      // Declined: never force, and the thread is still listed.
+      expect(clients[0].requests).not.toContainEqual({
+        method: "thread/delete",
+        params: { threadId: "t1", force: true },
+      });
+      expect(screen.getByText("one")).toBeTruthy();
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+});
