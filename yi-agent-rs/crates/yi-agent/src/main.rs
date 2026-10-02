@@ -129,15 +129,23 @@ fn run_app_server(cli: Cli, listen: &str) -> Result<()> {
             let bound = listener.local_addr()?;
             if !bound.ip().is_loopback() {
                 eprintln!(
-                    "warning: ws app-server is bound to {bound} and has NO authentication; \
-                     expose it only over a trusted tunnel"
+                    "warning: ws app-server is bound to {bound}; every client must now \
+                     authenticate with a paired device token (rejected with ws close 4401)"
                 );
             }
             let workspaces =
                 std::sync::Arc::new(yi_agent_app_server::workspace_index::WorkspaceIndex::new(
                     yi_agent_app_server::workspace_index::default_path(),
                 ));
-            yi_agent_app_server::ws::serve_ws(listener, config, workspaces).await
+            // 与桌面 stdio 同一张设备表:手机在桌面 `pair/create` 铸出的码兑现
+            // 出的 token,必须能被这台 ws server 认证。用 `default_path()` 让二者
+            // 进程内/跨进程都读同一份 `~/.yi-agent/devices.json`。
+            let pairing = std::sync::Arc::new(yi_agent_app_server::pairing::PairingState::new(
+                yi_agent_app_server::device_store::DeviceStore::new(
+                    yi_agent_app_server::device_store::default_path(),
+                ),
+            ));
+            yi_agent_app_server::ws::serve_ws(listener, config, workspaces, pairing).await
         }),
     }
 }
