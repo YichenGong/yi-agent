@@ -3450,9 +3450,8 @@ async fn write_notification(
 ) -> anyhow::Result<()> {
     let frame = serde_json::to_value(NotificationEnvelope::new(n))
         .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
-    // 广播给所有客户端:fan-out 是 Tier 1 的能力,但 Tier 0 立刻走同一条路径,
-    // 避免以后再改一次接线。单客户端下等价于写那一条流。
-    hub.broadcast(frame);
+    // 内容通知按 thread 过滤；全局帧（None）恒放行。无订阅者时等价于全广播。
+    hub.broadcast_for(n.thread_key(), frame);
     Ok(())
 }
 
@@ -3930,7 +3929,9 @@ async fn run_thread_driver(
                             // 决定,故这里用 `is_connected` 复刻原判据——但仍要
                             // 先把帧广播出去,让其它在线客户端(如第二台手机)能
                             // 应答:发起方断线不等于该审批无人可答。
-                            hub.broadcast(frame);
+                            // 只推给"订阅了该 thread"的客户端 + 全收的客户端（桌面）：
+                            // 没打开这个会话的手机不该被它的审批打断。
+                            hub.broadcast_for(Some(&thread_id), frame);
                             if !hub.is_connected(&client) {
                                 // 发起客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
@@ -9327,6 +9328,64 @@ pub(crate) mod tests {
         let v = read_response(&mut h, 10).await;
         assert_eq!(v["error"]["code"], -32602, "超上限必须报错: {v}");
         h.shutdown().await;
+    }
+
+    /// 通知按 thread 键路由：订阅 t1 的客户端只收 t1，未订阅的收全部。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notifications_are_routed_by_thread_key() {
+        let hub = crate::broadcast::Broadcaster::new();
+        let sub = crate::broadcast::ClientId::ws(uuid::Uuid::from_u128(1));
+        let all = crate::broadcast::ClientId::local();
+        let mut sub_rx = hub.register(sub.clone());
+        let mut all_rx = hub.register(all.clone());
+        hub.subscribe(&sub, vec!["t1".to_string()]);
+
+        let content_t1 = serde_json::json!({"method":"turn/started","params":{"thread_id":"t1"}});
+        let content_t2 = serde_json::json!({"method":"turn/started","params":{"thread_id":"t2"}});
+        hub.broadcast_for(Some("t1"), content_t1);
+        hub.broadcast_for(Some("t2"), content_t2);
+
+        assert_eq!(sub_rx.recv().await.unwrap()["params"]["thread_id"], "t1");
+        assert!(sub_rx.try_recv().is_err(), "订阅 t1 不该收到 t2");
+        assert_eq!(all_rx.recv().await.unwrap()["params"]["thread_id"], "t1");
+        assert_eq!(all_rx.recv().await.unwrap()["params"]["thread_id"], "t2");
+    }
+
+    /// `Notification::thread_key` 与协议字段一致（全局帧无键）。
+    #[test]
+    fn notification_thread_key_matches_the_wire() {
+        use crate::protocol::Notification;
+        assert_eq!(
+            Notification::TurnStarted {
+                thread_id: "t1".into(),
+                turn_id: "x".into()
+            }
+            .thread_key(),
+            Some("t1")
+        );
+        assert_eq!(
+            Notification::UiSettingsUpdated {
+                theme: "dark".into()
+            }
+            .thread_key(),
+            None
+        );
+        assert_eq!(
+            Notification::Error {
+                message: "x".into()
+            }
+            .thread_key(),
+            None
+        );
+        assert_eq!(
+            Notification::ToolCallApprovalResolved {
+                perm_id: "p".into(),
+                by: "c".into(),
+                decision: "allow_once".into()
+            }
+            .thread_key(),
+            None
+        );
     }
 
     /// Approval is one-question/one-answer even with many clients: the first

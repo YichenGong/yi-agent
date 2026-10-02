@@ -266,6 +266,30 @@ pub enum Notification {
     Error { message: String },
 }
 
+impl Notification {
+    /// 该通知所属的 thread；`None`＝全局帧（主题/错误/审批已处理），恒放行。
+    pub(crate) fn thread_key(&self) -> Option<&str> {
+        match self {
+            Notification::ThreadStarted { thread_id, .. }
+            | Notification::TurnStarted { thread_id, .. }
+            | Notification::ThreadStatusUpdated { thread_id, .. }
+            | Notification::ItemStarted { thread_id, .. }
+            | Notification::ItemDelta { thread_id, .. }
+            | Notification::ItemCompleted { thread_id, .. }
+            | Notification::TurnCompleted { thread_id, .. }
+            | Notification::InterjectionsReturned { thread_id, .. }
+            | Notification::TurnRetry { thread_id, .. }
+            | Notification::TokenUsage { thread_id, .. }
+            | Notification::AgentTraceEvent { thread_id, .. }
+            | Notification::AgentChildrenUpdated { thread_id, .. }
+            | Notification::ProcessUpdated { thread_id, .. } => Some(thread_id),
+            Notification::ToolCallApprovalResolved { .. }
+            | Notification::UiSettingsUpdated { .. }
+            | Notification::Error { .. } => None,
+        }
+    }
+}
+
 /// 一条子 agent 的列表项。字段沿用 JSON-RPC 的 camelCase。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
