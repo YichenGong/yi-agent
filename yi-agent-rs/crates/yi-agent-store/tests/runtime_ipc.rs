@@ -6270,18 +6270,39 @@ fn cancelling_a_thread_cancels_only_its_own_children() {
         "the child starts live"
     );
 
+    // Without `force`, live children stop the cancellation and nothing is
+    // touched: the caller is expected to ask the user first.
+    let IpcResponse::ThreadHasActiveChildren { count } = send_request(
+        daemon.socket_path(),
+        IpcRequest::CancelThreadTasks {
+            session_id: session_id.clone(),
+            thread_id: "thread-a".into(),
+            force: false,
+        },
+    )
+    .unwrap() else {
+        panic!("a live child must demand confirmation");
+    };
+    assert_eq!(count, 1);
+    assert_ne!(
+        state(&child_of_a),
+        "cancelled",
+        "a refused cancellation must not touch the child"
+    );
+
+    // Forcing reaps exactly the conversation's own child, and nothing else.
     let IpcResponse::ThreadTasksCancelled { task_ids } = send_request(
         daemon.socket_path(),
         IpcRequest::CancelThreadTasks {
             session_id: session_id.clone(),
             thread_id: "thread-a".into(),
+            force: true,
         },
     )
     .unwrap() else {
         panic!("expected a thread-scoped cancellation response");
     };
 
-    // Exactly the conversation's own child, and nothing else.
     assert_eq!(task_ids, vec![child_of_a.clone()]);
     assert_eq!(state(&child_of_a), "cancelled");
     // The sibling conversation's child is untouched: this is the regression the
