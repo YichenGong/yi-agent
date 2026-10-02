@@ -383,10 +383,10 @@ pub struct CommandPopup {
 }
 
 impl CommandPopup {
-    /// Create a new popup with all commands visible.
+    /// Create a new popup with every completable command visible.
     pub fn new() -> Self {
         Self {
-            filtered: SlashCommand::all().to_vec(),
+            filtered: SlashCommand::completable().to_vec(),
             selected: 0,
             offset: 0,
             last_filter: String::new(),
@@ -402,9 +402,9 @@ impl CommandPopup {
         }
         self.last_filter = text.to_string();
         if text.is_empty() {
-            self.filtered = SlashCommand::all().to_vec();
+            self.filtered = SlashCommand::completable().to_vec();
         } else {
-            self.filtered = SlashCommand::all()
+            self.filtered = SlashCommand::completable()
                 .iter()
                 .copied()
                 .filter(|cmd| cmd.name().starts_with(text))
@@ -537,7 +537,15 @@ mod tests {
     #[test]
     fn filter_empty_shows_all() {
         let popup = CommandPopup::new();
-        assert_eq!(popup.filtered().len(), SlashCommand::all().len());
+        assert_eq!(popup.filtered().len(), SlashCommand::completable().len());
+    }
+
+    #[test]
+    fn popup_never_lists_hidden_commands() {
+        let mut popup = CommandPopup::new();
+        popup.filter("a"); // would otherwise match approve
+        let names: Vec<&str> = popup.filtered().iter().map(|c| c.name()).collect();
+        assert!(!names.contains(&"approve"));
     }
 
     #[test]
