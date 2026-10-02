@@ -22,6 +22,8 @@ tokio-util = "0.7"
 futures = { workspace = true }
 toml = "0.8"
 sha2 = "0.10"
+# Fork payloads travel over the IPC as base64 text and are decoded here.
+base64 = "0.22"
 # Advisory file locking for the daemon instance lock (`flock`).
 libc = "0.2"
 # The daemon records why a request failed; `error_response` drops that detail to

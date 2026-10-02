@@ -6,11 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Timelike, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
+use yi_agent_core::Message;
 use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::subagent::mailbox::{
     MailboxMessage, MailboxMessageDraft, MessageKind, ReworkInstruction,
@@ -42,6 +45,13 @@ use crate::repository::{
 use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
 
 const REVIEW_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
+
+/// The largest fork payload a daemon accepts when `YI_AGENT_FORK_MAX_BYTES` is
+/// absent or unparsable.
+pub const DEFAULT_FORK_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Overrides `DEFAULT_FORK_MAX_BYTES` for one daemon process.
+const FORK_MAX_BYTES_ENV: &str = "YI_AGENT_FORK_MAX_BYTES";
 
 /// A root session created to run a single objective autonomously in its own
 /// worktree. Generic on purpose: nothing here knows what the objective is for.
@@ -77,6 +87,10 @@ pub enum RuntimeCoordinatorError {
     QueueCapacityExceeded,
     #[error("runtime is draining and rejects new admissions")]
     Draining,
+    #[error("fork payload of {total} bytes exceeds the {max}-byte limit")]
+    ForkTooLarge { total: u64, max: u64 },
+    #[error("fork upload rejected: {0}")]
+    ForkUpload(String),
 }
 
 /// The `kind` column for a trace fact.
@@ -147,6 +161,20 @@ struct PendingReviewConfirmation {
     expires_at: Instant,
 }
 
+/// One in-flight fork payload. Bytes arrive base64-encoded, one chunk per
+/// request, and are only decoded once the expected length has arrived.
+///
+/// The token is the only handle a caller holds, so the session and caller are
+/// recorded here and re-checked on take: a token leaked to another tenant
+/// cannot claim the conversation.
+struct ForkUpload {
+    session_id: RootSessionId,
+    caller_task_id: TaskId,
+    expected_bytes: u64,
+    next_seq: u64,
+    received: Vec<u8>,
+}
+
 /// Owns all supervisor instances and their worker handles for one daemon.
 ///
 /// The coordinator deliberately receives a factory instead of constructing an
@@ -171,6 +199,10 @@ pub struct RuntimeCoordinator {
     /// Nothing durable owns it: this replaces the retired `task_workspaces` row.
     task_positions: Mutex<HashMap<TaskId, WorkerWorkspace>>,
     application_root_attach_lock: Mutex<()>,
+    /// In-flight fork payloads, keyed by their opaque upload token. Nothing
+    /// durable owns them: an abandoned upload simply vanishes with the process.
+    fork_uploads: Mutex<HashMap<String, ForkUpload>>,
+    fork_max_bytes: u64,
     draining: AtomicBool,
 }
 
@@ -649,6 +681,12 @@ impl RuntimeCoordinator {
                 Arc::clone(&repository),
             ))
         });
+        // A payload limit is daemon policy, so it comes from the environment
+        // rather than any request. A malformed value must not disable the cap.
+        let fork_max_bytes = std::env::var(FORK_MAX_BYTES_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_FORK_MAX_BYTES);
         Ok(Self {
             repository,
             factory,
@@ -665,8 +703,22 @@ impl RuntimeCoordinator {
             review_confirmations: Mutex::new(HashMap::new()),
             task_positions: Mutex::new(HashMap::new()),
             application_root_attach_lock: Mutex::new(()),
+            fork_uploads: Mutex::new(HashMap::new()),
+            fork_max_bytes,
             draining: AtomicBool::new(false),
         })
+    }
+
+    /// Overrides the fork payload ceiling for this coordinator. Tests use it to
+    /// exercise the cap without generating megabytes of history.
+    pub fn with_fork_max_bytes(mut self, bytes: u64) -> Self {
+        self.fork_max_bytes = bytes;
+        self
+    }
+
+    /// The largest fork payload this coordinator accepts.
+    pub fn fork_max_bytes(&self) -> u64 {
+        self.fork_max_bytes
     }
 
     pub fn create_session(&self) -> Result<RootSessionId, RuntimeCoordinatorError> {
@@ -998,6 +1050,134 @@ impl RuntimeCoordinator {
             ));
         }
         Ok(())
+    }
+
+    /// Opens a fork upload for an authorized application root. The payload's
+    /// size is declared up front: an oversized upload is rejected here, before
+    /// any bytes move, rather than being silently truncated later.
+    pub fn begin_fork_upload(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+        total_bytes: u64,
+    ) -> Result<String, RuntimeCoordinatorError> {
+        self.authorize_application_root(session, caller, capability)?;
+        if total_bytes > self.fork_max_bytes {
+            return Err(RuntimeCoordinatorError::ForkTooLarge {
+                total: total_bytes,
+                max: self.fork_max_bytes,
+            });
+        }
+        let token = Uuid::new_v4().to_string();
+        self.fork_uploads
+            .lock()
+            .expect("runtime fork upload mutex poisoned")
+            .insert(
+                token.clone(),
+                ForkUpload {
+                    session_id: session.clone(),
+                    caller_task_id: caller.clone(),
+                    expected_bytes: total_bytes,
+                    next_seq: 0,
+                    received: Vec::new(),
+                },
+            );
+        Ok(token)
+    }
+
+    /// Appends one base64-encoded chunk and returns the cumulative decoded byte
+    /// count. Sequence numbers are strict: `seq` must be exactly the next
+    /// expected ordinal, so a gap, a replay, or a chunk past the declared length
+    /// fails explicitly instead of corrupting the payload.
+    pub fn append_fork_chunk(
+        &self,
+        token: &str,
+        seq: u64,
+        data: &str,
+    ) -> Result<u64, RuntimeCoordinatorError> {
+        let chunk = STANDARD.decode(data).map_err(|error| {
+            RuntimeCoordinatorError::ForkUpload(format!("chunk is not valid base64: {error}"))
+        })?;
+        let mut uploads = self
+            .fork_uploads
+            .lock()
+            .expect("runtime fork upload mutex poisoned");
+        let upload = uploads.get_mut(token).ok_or_else(|| {
+            RuntimeCoordinatorError::ForkUpload("fork upload token is unknown".into())
+        })?;
+        if seq != upload.next_seq {
+            return Err(RuntimeCoordinatorError::ForkUpload(format!(
+                "fork chunk {seq} arrived out of order; expected {}",
+                upload.next_seq
+            )));
+        }
+        if upload.received.len() as u64 + chunk.len() as u64 > upload.expected_bytes {
+            return Err(RuntimeCoordinatorError::ForkUpload(format!(
+                "fork chunk {seq} would exceed the declared {} bytes",
+                upload.expected_bytes
+            )));
+        }
+        upload.received.extend_from_slice(&chunk);
+        upload.next_seq += 1;
+        Ok(upload.received.len() as u64)
+    }
+
+    /// Drops an upload. The token is invalid afterwards, and aborting an unknown
+    /// token is an explicit error rather than a silent no-op.
+    pub fn abort_fork_upload(&self, token: &str) -> Result<(), RuntimeCoordinatorError> {
+        self.fork_uploads
+            .lock()
+            .expect("runtime fork upload mutex poisoned")
+            .remove(token)
+            .map(|_| ())
+            .ok_or_else(|| {
+                RuntimeCoordinatorError::ForkUpload("fork upload token is unknown".into())
+            })
+    }
+
+    /// Consumes a completed upload exactly once. The token alone is not enough:
+    /// the session and caller must match the ones the upload was opened for, and
+    /// every declared byte must have arrived, or the take is refused.
+    ///
+    /// Validation happens before the token is removed: a caller presenting a
+    /// token that is not its own cannot destroy the legitimate owner's upload,
+    /// and a premature take leaves the upload live for the remaining chunks.
+    pub fn take_fork_messages(
+        &self,
+        token: &str,
+        session: &RootSessionId,
+        caller: &TaskId,
+    ) -> Result<Vec<Message>, RuntimeCoordinatorError> {
+        let mut uploads = self
+            .fork_uploads
+            .lock()
+            .expect("runtime fork upload mutex poisoned");
+        {
+            let upload = uploads.get(token).ok_or_else(|| {
+                RuntimeCoordinatorError::ForkUpload("fork upload token is unknown".into())
+            })?;
+            if &upload.session_id != session || &upload.caller_task_id != caller {
+                return Err(RuntimeCoordinatorError::ForkUpload(
+                    "fork upload belongs to a different session or caller".into(),
+                ));
+            }
+            if upload.received.len() as u64 != upload.expected_bytes {
+                return Err(RuntimeCoordinatorError::ForkUpload(format!(
+                    "fork upload is incomplete: received {} of {} bytes",
+                    upload.received.len(),
+                    upload.expected_bytes
+                )));
+            }
+        }
+        let upload = uploads
+            .remove(token)
+            .expect("fork upload token is present while its mutex is held");
+        serde_json::from_slice::<Vec<Message>>(&upload.received).map_err(|error| {
+            RuntimeCoordinatorError::ForkUpload(format!(
+                "fork payload is not a message list: {error}"
+            ))
+        })
     }
 
     pub async fn activate_application_root(
