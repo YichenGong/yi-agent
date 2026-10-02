@@ -250,6 +250,87 @@ async fn a_total_over_the_cap_is_rejected_at_begin() {
 }
 
 #[tokio::test]
+async fn the_cap_boundary_is_inclusive_at_begin() {
+    let fixture = attached_root(Some(8)).await;
+
+    assert!(
+        fixture
+            .coordinator
+            .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 8)
+            .is_ok(),
+        "a declaration of exactly the cap is accepted"
+    );
+
+    let error = fixture
+        .coordinator
+        .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 9)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            RuntimeCoordinatorError::ForkTooLarge { total: 9, max: 8 }
+        ),
+        "one byte over the cap is rejected, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_payload_that_exactly_fills_the_cap_is_accepted_and_a_further_chunk_is_rejected() {
+    let fixture = attached_root(None).await;
+    let (encoded, total) = encoded_history(&[Message::user("parent"), Message::user("more")]);
+
+    // The declared total and the ceiling coincide: the accumulated bound must
+    // reject the first byte past the cap, not just the declared value.
+    let fixture = ForkFixture {
+        coordinator: fixture.coordinator.with_fork_max_bytes(total),
+        ..fixture
+    };
+    let token = fixture
+        .coordinator
+        .begin_fork_upload(
+            &fixture.session,
+            &fixture.caller,
+            &fixture.capability,
+            total,
+        )
+        .unwrap();
+
+    let received = fixture
+        .coordinator
+        .append_fork_chunk(&token, 0, &encoded)
+        .unwrap();
+    assert_eq!(received, total, "the stream exactly fills the declared cap");
+
+    assert!(
+        fixture
+            .coordinator
+            .append_fork_chunk(&token, 1, "AAAA")
+            .is_err(),
+        "a chunk beyond the filled cap is rejected"
+    );
+
+    let messages = fixture
+        .coordinator
+        .take_fork_messages(&token, &fixture.session, &fixture.caller)
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+}
+
+#[tokio::test]
+async fn a_zero_byte_declaration_is_rejected_at_begin() {
+    let fixture = attached_root(None).await;
+
+    let error = fixture
+        .coordinator
+        .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 0)
+        .unwrap_err();
+    assert!(
+        matches!(error, RuntimeCoordinatorError::ForkUpload(_)),
+        "an empty fork payload is refused at begin, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_chunk_that_overflows_the_expected_length_is_rejected() {
     let fixture = attached_root(None).await;
     let (encoded, total) = encoded_history(&[Message::user("parent")]);

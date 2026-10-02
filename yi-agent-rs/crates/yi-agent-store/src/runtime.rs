@@ -1054,7 +1054,9 @@ impl RuntimeCoordinator {
 
     /// Opens a fork upload for an authorized application root. The payload's
     /// size is declared up front: an oversized upload is rejected here, before
-    /// any bytes move, rather than being silently truncated later.
+    /// any bytes move, rather than being silently truncated later. A zero-byte
+    /// declaration is refused too: an empty fork payload is never legitimate,
+    /// and failing here beats failing later at JSON decode.
     pub fn begin_fork_upload(
         &self,
         session: &RootSessionId,
@@ -1063,6 +1065,11 @@ impl RuntimeCoordinator {
         total_bytes: u64,
     ) -> Result<String, RuntimeCoordinatorError> {
         self.authorize_application_root(session, caller, capability)?;
+        if total_bytes == 0 {
+            return Err(RuntimeCoordinatorError::ForkUpload(
+                "fork upload declares zero bytes".into(),
+            ));
+        }
         if total_bytes > self.fork_max_bytes {
             return Err(RuntimeCoordinatorError::ForkTooLarge {
                 total: total_bytes,
