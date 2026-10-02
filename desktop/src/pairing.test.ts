@@ -160,6 +160,27 @@ describe("defaultRedeem", () => {
     await expect(promise).rejects.toMatchObject({ code: -32001 });
   });
 
+  it("rejects on the relay's id-less no-agent error instead of hanging", async () => {
+    const fake = new FakeWebSocket("");
+    fake.send = (() => {}) as unknown as () => void;
+    const promise = defaultRedeem(
+      "wss://relay.test/ws?session=abc",
+      "CODE-123",
+      "iPhone",
+      () => fake as unknown as WebSocket,
+    );
+    fake.open();
+    fake.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }));
+    // The relay sends this with no `id` when no computer is connected.
+    fake.receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "no computer connected for this session" },
+      }),
+    );
+    await expect(promise).rejects.toMatchObject({ code: -32000 });
+  });
+
   it("uses the ?pair= query path for a direct app-server URL", () => {
     let captured = "";
     const fake = new FakeWebSocket("");

@@ -107,7 +107,14 @@ impl PairingState {
             std::fs::create_dir_all(parent)?;
         }
         let body = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
-        let tmp = self.codes_path.with_extension("json.tmp");
+        // Unique temp name: two processes writing at once must not share a temp
+        // path (one rename would ENOENT the other's, and a torn read would look
+        // like "no codes"). pid+uuid is enough entropy for this.
+        let tmp = self.codes_path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &self.codes_path)
     }

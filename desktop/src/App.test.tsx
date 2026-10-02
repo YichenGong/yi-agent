@@ -1237,28 +1237,44 @@ describe("App iOS first-launch pairing", () => {
     expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
   });
 
-  it("leaves the pairing screen and connects after a successful redemption", async () => {
+  it("pairs over the relay by redeeming on a frame, then connects", async () => {
     state.platformUa = IPHONE_UA;
-    // 真实的配对握手会先连一次 ws 只为拿 token。测试里把它换成一个假的
-    // WebSocket，整个流程（配对 → 落盘 → 重建 transport → 握手）才闭环。
+    // The relay URL (?session=) cannot carry ?pair= (the relay forwards frames
+    // but not the upgrade query), so the app must open a tokenless ws to the
+    // relay and redeem via initialize -> pair/redeem. This fake speaks that
+    // protocol and records the URL + frames so the test can assert the path.
+    const opened: string[] = [];
+    const frames: Array<{ id?: number; method?: string; params?: unknown }> = [];
     class FakeSocket {
-      onopen: unknown = null;
+      onopen: (() => void) | null = null;
       onmessage: ((e: { data: unknown }) => void) | null = null;
       onclose: ((e: { code: number }) => void) | null = null;
       onerror: unknown = null;
       constructor(readonly url: string) {
-        // 像真服务端那样在下一次微任务里交付 pair/redeemed 帧。
-        queueMicrotask(() =>
-          this.onmessage?.({
-            data: JSON.stringify({
-              jsonrpc: "2.0",
-              method: "pair/redeemed",
-              params: { device_id: "dev-1", token: "yia_new", scope: "control" },
-            }),
-          }),
-        );
+        opened.push(url);
+        queueMicrotask(() => this.onopen?.());
       }
-      send() {}
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { id?: number; method?: string; params?: unknown };
+        frames.push(frame);
+        if (frame.id === 1) {
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }),
+            }),
+          );
+        } else if (frame.id === 2) {
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                result: { device_id: "dev-1", token: "yia_new", scope: "control" },
+              }),
+            }),
+          );
+        }
+      }
       close() {}
     }
     vi.stubGlobal("WebSocket", FakeSocket);
@@ -1270,7 +1286,15 @@ describe("App iOS first-launch pairing", () => {
       fireEvent.change(screen.getByLabelText("配对码"), { target: { value: "ABCD-EFGH" } });
       fireEvent.click(screen.getByRole("button", { name: "配对" }));
 
-      // 落盘后 App 必须自己重算 transport（版本号）并开始握手，而不是等用户重启。
+      // The pairing socket is the relay URL **without** a ?pair= query.
+      await waitFor(() => expect(opened.length).toBeGreaterThan(0));
+      expect(opened[0]).toBe("wss://relay.test/ws?session=s1");
+      // It redeemed on a frame, in order.
+      expect(frames.map((f) => f.method)).toEqual(["initialize", "pair/redeem"]);
+      expect((frames[1].params as { code: string }).code).toBe("ABCD-EFGH");
+
+      // After persisting, App must rebuild the transport (version bump) and
+      // start handshaking, not wait for a restart.
       await waitFor(() =>
         expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
       );

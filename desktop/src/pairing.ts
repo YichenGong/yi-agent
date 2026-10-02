@@ -160,6 +160,7 @@ export function redeemPairCodeViaRelay(
   code: string,
   deviceName: string,
   factory: WebSocketFactory = (u) => new WebSocket(u),
+  timeoutMs = 15000,
 ): Promise<PairedDevice> {
   const socket = factory(url);
   return new Promise<PairedDevice>((resolve, reject) => {
@@ -167,6 +168,7 @@ export function redeemPairCodeViaRelay(
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
+      if (timer) clearTimeout(timer);
       fn();
       try {
         socket.close();
@@ -174,6 +176,10 @@ export function redeemPairCodeViaRelay(
         /* ignore */
       }
     };
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => finish(() => reject(new Error("pairing timed out"))), timeoutMs)
+        : null;
     let inited = false;
     const send = (id: number, method: string, params: unknown) => {
       socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
@@ -181,10 +187,27 @@ export function redeemPairCodeViaRelay(
 
     socket.onopen = () => send(1, "initialize", { clientInfo: { name: "yi-agent-ios" } });
     socket.onmessage = (e) => {
-      let v: { id?: unknown; method?: string; result?: unknown; error?: { code?: number; message?: string } };
+      let v: {
+        id?: unknown;
+        method?: string;
+        result?: unknown;
+        error?: { code?: number; message?: string };
+      };
       try {
         v = JSON.parse(typeof e.data === "string" ? e.data : String(e.data));
       } catch {
+        return;
+      }
+      // The relay answers "no computer connected for this session" with an
+      // **id-less** error frame (`-32000`, see yi-agent-relay `lib.rs`); a
+      // response frame would carry our id, so treat any error without a
+      // matching id as a terminal failure rather than waiting for the timeout.
+      if (v.error && (v.id === undefined || v.id === 2)) {
+        const err = new Error(v.error.message ?? "pair/redeem failed") as Error & {
+          code?: number;
+        };
+        err.code = v.error.code;
+        finish(() => reject(err));
         return;
       }
       if (v.id === 1 && !inited) {
@@ -193,12 +216,6 @@ export function redeemPairCodeViaRelay(
         return;
       }
       if (v.id === 2) {
-        if (v.error) {
-          const err = new Error(v.error.message ?? "pair/redeem failed") as Error & { code?: number };
-          err.code = v.error.code;
-          finish(() => reject(err));
-          return;
-        }
         const r = (v.result ?? {}) as Partial<PairedDevice>;
         if (typeof r.token !== "string" || typeof r.device_id !== "string") {
           finish(() => reject(new Error("pair/redeem returned an unexpected payload")));

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { RpcClient } from "./lib/rpc";
-import { redeemPairCode } from "./pairing";
+import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
@@ -905,7 +905,7 @@ export default function App() {
         // 存储里已经有 {url, token}；版本号让上面的 effect 重跑，这一次
         // transportFactory 选中的是 ws。
         onPaired={() => setPairingVersion((v) => v + 1)}
-        redeem={redeemPairCode}
+        redeem={defaultRedeem}
       />
     );
   }
