@@ -136,6 +136,10 @@ yi-agent app-server --listen ws://127.0.0.1:8790   # 绑定非回环时会打印
 同一批 session 可在多台设备上查看与控制：配对（一次性码 `XXXX-XXXX`、5 分钟有效，
 新设备默认 `control` scope）、设备列表/撤销、审批广播到所有已连接设备。
 
+客户端可调 `thread/subscribe {threadIds}` **只收自己关心的会话**（未调用者仍全收）；
+已订阅时逐字输出会合并降频（每 100ms 或 4KB 一刷，跨 item 不合并、顺序不变），减少外网
+手机的流量与噪音。见 [按会话订阅过滤设计](docs/superpowers/specs/2026-10-02-thread-subscription-filtering-design.md)。
+
 > **实验性**：配对链路已**端到端打通**——`pair/create` 铸出的码**落盘**到
 > `~/.yi-agent/pairing.json`，因此桌面 stdio 进程铸的码可被 `--relay`/`ws://` 进程
 > 兑换；iOS 首启有配对表单（填中继地址 + 码），桌面设置里有「远程访问」页可铸码与

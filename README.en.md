@@ -152,6 +152,13 @@ pairing (one-time `XXXX-XXXX` code, valid for 5 minutes, new devices default to
 `control` scope), device listing/revocation, and approvals broadcast to every
 connected device.
 
+A client can call `thread/subscribe {threadIds}` to **receive only the sessions
+it cares about** (clients that never call it still receive everything); once
+subscribed, the per-token stream is coalesced (flushed every 100ms or 4KB,
+never merged across items, order preserved) to cut the traffic and noise on a
+phone over the WAN. See the
+[thread-scoped subscription design](docs/superpowers/specs/2026-10-02-thread-subscription-filtering-design.md).
+
 > **Experimental**: the pairing flow is now **wired end-to-end** — a
 > `pair/create` code is **persisted** to `~/.yi-agent/pairing.json`, so a code
 > minted by the desktop stdio process can be redeemed by the separate
