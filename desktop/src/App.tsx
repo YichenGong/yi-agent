@@ -17,6 +17,7 @@ import type {
   AgentCancelPreviewResult,
   AgentChildrenListResult,
   AgentTraceSnapshotResult,
+  Item,
   ThreadStatus,
   ThreadSummary,
   TurnStatus,
@@ -24,6 +25,7 @@ import type {
   WorkspaceGroup,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
+import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanCollapsedBar } from "./components/SuperpowersKanbanCollapsedBar";
@@ -108,6 +110,11 @@ export default function App() {
   // Resume requests currently on the wire, so a rapid second click cannot
   // interleave two histories into one session.
   const inFlightResume = useRef(new Set<string>());
+  // Remote-only (S2): the LRU of threads we keep warm via `thread/subscribe`.
+  // Content notifications are only delivered for subscribed threads, so the
+  // window bounds how many histories stream live; the rest stay cold and are
+  // caught up on demand with `thread/readItems`.
+  const subWindow = useRef(new SubscriptionWindow());
   // Approvals the user has dismissed from the banner; keyed by approval id.
   const dismissedApprovals = useRef(new Set<string>());
   const [currentId, setCurrentId] = useState<string | null>(null);
@@ -364,6 +371,41 @@ export default function App() {
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
     void refreshSubagents(id);
+    // Remote-only (S2): keep this thread in the warm subscription window, and
+    // catch up a cold-but-running thread with the read-only `thread/readItems`
+    // instead of `thread/resume` — resume interrupts the in-flight turn, which
+    // is exactly what a passive "look at it" must not do. Desktop (stdio) never
+    // subscribes: its single client receives everything.
+    if (isRemoteClient()) {
+      const inWindow = subWindow.current.has(id);
+      const win = subWindow.current.touch(id);
+      const view = store.peek(id);
+      const running = view?.status === "running" || view?.status === "awaiting_approval";
+      const c0 = clientRef.current;
+      if (c0) {
+        if (!inWindow && running) {
+          const after = store.peek(id)?.session.lastServerItemId ?? null;
+          void (async () => {
+            try {
+              const r = await c0.request<{ items: Item[] }>(
+                "thread/readItems",
+                after ? { threadId: id, afterItemId: after } : { threadId: id },
+              );
+              const v = store.peek(id);
+              if (v) {
+                v.session.upsertItems(r.items);
+                force((n) => n + 1);
+              }
+            } catch {
+              // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+            }
+          })();
+        }
+        void c0.request("thread/subscribe", { threadIds: win }).catch(() => {});
+      }
+      // Already warm, or caught up via readItems above → view-only swap.
+      if (inWindow || running) return;
+    }
     if (warm.current.has(id) || inFlightResume.current.has(id)) return; // warm → 只切视图
     const c = clientRef.current;
     if (!c) return;
@@ -406,6 +448,15 @@ export default function App() {
       store.select(t.thread_id);
       setCurrentId(t.thread_id);
       force((v) => v + 1);
+      // Remote-only (S2): register the fresh thread in the subscription window
+      // *now*. It picks a new id (not previously warm) and gets `warm` below, so
+      // selectThread would skip it — yet without a subscription its content
+      // notifications would be filtered out and the turn would appear to crawl
+      // in from `thread/listAll` reads alone.
+      if (isRemoteClient()) {
+        const win = subWindow.current.touch(t.thread_id);
+        void clientRef.current?.request("thread/subscribe", { threadIds: win }).catch(() => {});
+      }
       const gs = await refreshThreads();
       if (gs !== null) {
         store.view(t.thread_id).mode = modeForThread(gs, pinned, t.thread_id);
@@ -704,6 +755,9 @@ export default function App() {
         // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
         if (s.state === "exited" && !disposed) {
           warm.current.clear();
+          // 同样的理由:新进程不记得任何订阅,窗口必须清空,否则重连后
+          // 返回"看起来还 warm"的会话时不会再发 subscribe,内容通知被静默过滤。
+          subWindow.current = new SubscriptionWindow();
           if (restartTimer === null) {
             restartTimer = window.setTimeout(() => {
               restartTimer = null;

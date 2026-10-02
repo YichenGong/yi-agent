@@ -1434,3 +1434,61 @@ describe("deleting a thread that still runs subagents", () => {
     }
   });
 });
+
+describe("App remote subscription wiring (S2)", () => {
+  /** Persist a relay binding, which is what makes `isRemoteClient()` true. */
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+
+  it("subscribes to a thread when a remote client selects it", async () => {
+    asRemote();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(true),
+    );
+    const sub = clients[0].requests.find((r) => r.method === "thread/subscribe");
+    // The window holds the selected thread; that is the whole warm set.
+    expect((sub?.params as { threadIds: string[] }).threadIds).toContain("t1");
+  });
+
+  it("never subscribes on the desktop build", async () => {
+    render(<App />); // no persisted config → desktop, even with a phone UA absent
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
+    expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
+  });
+
+  it("catches a cold running thread up with readItems instead of resume", async () => {
+    asRemote();
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    // Every seeded thread reports running: a passive look must not interrupt it.
+    state.listStatus = "running";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(true),
+    );
+
+    fireEvent.click(screen.getByText("two")); // 冷 + running → readItems，不 resume
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/readItems" &&
+            (r.params as { threadId: string }).threadId === "t2",
+        ),
+      ).toBe(true),
+    );
+    // The defining property: looking at a running thread never resumes it.
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+  });
+});
