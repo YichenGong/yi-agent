@@ -1523,6 +1523,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 workdir: workdir.clone(),
                 thread_id: thread_id.clone(),
                 sandbox: sandbox.clone(),
+                fork_token: None,
             },
         );
         match response {
@@ -1883,6 +1884,7 @@ impl Tool for DaemonSpawnAgentTool {
                 model: model.clone(),
                 workdir: workdir.clone(),
                 sandbox: sandbox.clone(),
+                fork_token: None,
             },
         );
         match response {
@@ -3382,6 +3384,7 @@ mod tests {
                 model: None,
 
                 sandbox: None,
+                fork_token: None,
             },
         )
         .unwrap()
@@ -3435,6 +3438,7 @@ mod tests {
                 model: None,
 
                 sandbox: None,
+                fork_token: None,
             },
         )
         .unwrap()

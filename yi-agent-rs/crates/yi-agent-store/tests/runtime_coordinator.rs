@@ -650,6 +650,7 @@ async fn child_recovery_context_uses_the_in_memory_workspace_assignment() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -698,6 +699,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             &root,
             "Complete the delegated task.".into(),
             ChildWriteMode::Coding,
+            None,
             None,
             None,
             None,
@@ -1905,6 +1907,7 @@ async fn delivered_child_coordinator(
             &parent,
             "Complete the delegated task.".into(),
             ChildWriteMode::Coding,
+            None,
             None,
             None,
             None,
@@ -3628,6 +3631,7 @@ async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
             Some(prepared.clone()),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3726,6 +3730,7 @@ async fn mode_only_changes_write_access_not_the_directory() {
             Some(project_root.clone()),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3780,6 +3785,7 @@ async fn a_relative_workdir_resolves_against_the_parents_position() {
             ChildWriteMode::Coding,
             None,
             Some(std::path::PathBuf::from("sub")),
+            None,
             None,
             None,
         )
@@ -4251,6 +4257,7 @@ async fn inherited_sandbox_is_persisted_and_threaded_to_the_worker() {
             None,
             None,
             Some(InheritedSandbox::DangerFullAccess),
+            None,
         )
         .await
         .unwrap();

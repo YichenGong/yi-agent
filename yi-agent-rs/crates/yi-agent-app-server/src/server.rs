@@ -4879,6 +4879,7 @@ pub(crate) mod tests {
                 workdir: None,
                 thread_id: None,
                 sandbox: None,
+                fork_token: None,
             },
         )
         .expect("the runtime socket must answer");
@@ -5004,6 +5005,7 @@ pub(crate) mod tests {
                 workdir: None,
                 thread_id: None,
                 sandbox: None,
+                fork_token: None,
             },
         )
         .expect("the runtime socket answers even when it refuses");

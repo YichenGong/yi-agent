@@ -472,6 +472,7 @@ fn spawn_child(
             model: None,
             thread_id: None,
             sandbox: None,
+            fork_token: None,
         },
     )
     .unwrap();
@@ -529,6 +530,7 @@ fn delivery_review_survives_restart_without_restarting_worker() {
             model: None,
             thread_id: None,
             sandbox: None,
+            fork_token: None,
         },
     )
     .unwrap();

@@ -124,6 +124,7 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
             workdir: None,
             thread_id: None,
             sandbox: None,
+            fork_token: None,
         },
     )
     .expect("the runtime socket must accept a delegated child");
@@ -244,6 +245,7 @@ fn delegation_tools_act_as_the_conversations_own_root() {
             workdir: None,
             thread_id: Some("thread-a".into()),
             sandbox: None,
+            fork_token: None,
         },
     )
     .expect("A's child must be admitted");

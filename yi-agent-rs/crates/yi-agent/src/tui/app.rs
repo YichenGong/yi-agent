@@ -3774,6 +3774,7 @@ mod tests {
                 model: None,
 
                 sandbox: None,
+                fork_token: None,
             },
         )
         .unwrap();

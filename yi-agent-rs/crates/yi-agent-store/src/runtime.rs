@@ -1302,6 +1302,7 @@ impl RuntimeCoordinator {
         workdir: Option<PathBuf>,
         thread_id: Option<String>,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
+        fork_token: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.authorize_application_root(session, parent, capability)?;
         self.spawn_child_and_admit(
@@ -1313,6 +1314,7 @@ impl RuntimeCoordinator {
             workdir,
             thread_id,
             inherited_sandbox,
+            fork_token,
         )
         .await
     }
@@ -1456,8 +1458,9 @@ impl RuntimeCoordinator {
             ChildWriteMode::ReadOnly,
             None,
             None,
-            // No conversation marker and no inherited sandbox: this legacy
-            // wrapper predates both.
+            // No conversation marker, no inherited sandbox, and no fork: this
+            // legacy wrapper predates all three.
+            None,
             None,
             None,
         )
@@ -1471,6 +1474,11 @@ impl RuntimeCoordinator {
     /// wins; otherwise the child inherits its parent's stored marker, read from
     /// the parent row so inheritance is transitive no matter which entry point
     /// created the intermediate task.
+    ///
+    /// `fork_token` names a completed fork upload. It is resolved BEFORE the
+    /// child row is written: an unknown, incomplete, or mismatched token fails
+    /// the spawn outright rather than admitting a child that silently lost its
+    /// context.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child_with_objective(
         &self,
@@ -1482,6 +1490,7 @@ impl RuntimeCoordinator {
         workdir: Option<PathBuf>,
         thread_id: Option<String>,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
+        fork_token: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         if self
@@ -1510,6 +1519,15 @@ impl RuntimeCoordinator {
                 .ok()
                 .flatten()
         });
+        // Taken before the child row so an unusable token is an explicit refusal
+        // rather than a child that exists without the context it was promised.
+        // A failed take deliberately leaves the upload untouched on the
+        // coordinator: `take_fork_messages` promises a foreign caller cannot
+        // destroy the owner's live upload, so this path must not blind-abort it.
+        let fork_messages = match fork_token.as_deref() {
+            Some(token) => Some(self.take_fork_messages(token, session, parent)?),
+            None => None,
+        };
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(
@@ -1536,6 +1554,9 @@ impl RuntimeCoordinator {
                 .clone();
             if let Some(inherited_sandbox) = inherited_sandbox {
                 supervisor.set_inherited_sandbox(&child, inherited_sandbox);
+            }
+            if let Some(fork) = fork_messages {
+                supervisor.set_fork_messages(&child, fork);
             }
             (child, depth, attempt)
         };
@@ -1603,6 +1624,7 @@ impl RuntimeCoordinator {
         workdir: Option<PathBuf>,
         thread_id: Option<String>,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
+        fork_token: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         let child = self
             .spawn_child_with_objective(
@@ -1614,6 +1636,7 @@ impl RuntimeCoordinator {
                 workdir,
                 thread_id,
                 inherited_sandbox,
+                fork_token,
             )
             .await?;
         if self.factory.is_available() {
