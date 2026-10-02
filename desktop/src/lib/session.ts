@@ -38,6 +38,13 @@ export class Session {
   retrying: { attempt: number; max: number; cause: RetryCause } | null = null;
 
   /**
+   * 服务端 item 流里最新的、带服务端 id 的 item id（本地生成的用户气泡/通知
+   * 不计入）。它同时是"续读游标"：远程客户端从冷会话返回时，用 `thread/readItems`
+   * 带 `afterItemId` 只补齐这之后的内容。`null` 表示还没有任何服务端 item。
+   */
+  lastServerItemId: string | null = null;
+
+  /**
    * Drop all accumulated state. Must be called *before* issuing
    * `thread/resume`, because replay notifications can arrive before the resume
    * response — resetting after would wipe the freshly replayed history.
@@ -52,6 +59,7 @@ export class Session {
     this.lastError = null;
     this.usage = null;
     this.returnedInterjections = [];
+    this.lastServerItemId = null;
   }
 
   addUserMessage(text: string): void {
@@ -61,6 +69,29 @@ export class Session {
   /** Append a command-output line (never sent to the agent). */
   notice(text: string): void {
     this.items.push({ type: "notice", id: nextLocalId(), text });
+  }
+
+  /**
+   * Merge a batch of server items fetched via `thread/readItems` (cold-return
+   * catch-up). De-duplicates by protocol `id` — an item already rendered
+   * (because it arrived live or was fetched before) is replaced in place, an
+   * unseen one is appended — so replaying an overlap is harmless. Advances
+   * {@link lastServerItemId} to the last incoming id, keeping the cursor
+   * monotonic with what the transcript now holds.
+   */
+  upsertItems(items: Item[]): void {
+    for (const item of items) {
+      // Same normalisation as `apply`: a mid-turn interjection renders as a user
+      // bubble, so a cold replay must not introduce a second shape.
+      const normalized: Item =
+        item.type === "user_interjection"
+          ? { type: "userMessage", id: item.id, text: item.text }
+          : item;
+      const index = this.items.findIndex((i) => i.id === normalized.id);
+      if (index >= 0) this.items[index] = normalized;
+      else this.items.push(normalized);
+      this.lastServerItemId = normalized.id;
+    }
   }
 
   apply(notification: Notification): void {
@@ -79,12 +110,14 @@ export class Session {
         const index = this.items.findIndex((i) => i.id === item.id);
         if (index >= 0) this.items[index] = item;
         else this.items.push(item);
+        this.lastServerItemId = item.id;
         break;
       }
       case "item/delta": {
         // Text resumed: the retry succeeded, so the notice has served its purpose.
         this.retrying = null;
         const { item_id, delta } = notification.params;
+        this.lastServerItemId = item_id;
         const index = this.items.findIndex((i) => i.id === item_id);
         if (index < 0) {
           this.items.push({ type: "agentMessage", id: item_id, text: delta });

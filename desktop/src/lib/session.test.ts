@@ -295,4 +295,82 @@ describe("Session", () => {
       expect(s.items).toHaveLength(0);
     });
   });
+
+  describe("lastServerItemId", () => {
+    it("tracks the id of the newest server item", () => {
+      const s = new Session();
+      expect(s.lastServerItemId).toBeNull();
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+      });
+      expect(s.lastServerItemId).toBe("a1");
+      s.apply({
+        method: "item/completed",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "hi" } },
+      });
+      expect(s.lastServerItemId).toBe("a1");
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "toolCall", id: "i2", call_id: "c2", name: "bash", input: {}, status: "running" } },
+      });
+      expect(s.lastServerItemId).toBe("i2");
+    });
+
+    it("tracks deltas keyed by item_id and clears on reset", () => {
+      const s = new Session();
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a9", delta: "x" } });
+      expect(s.lastServerItemId).toBe("a9");
+      s.reset();
+      expect(s.lastServerItemId).toBeNull();
+    });
+
+    it("ignores locally minted ids (user message / notice)", () => {
+      const s = new Session();
+      s.addUserMessage("hi");
+      s.notice("out");
+      expect(s.lastServerItemId).toBeNull();
+    });
+  });
+
+  describe("upsertItems", () => {
+    it("appends unseen items and replaces seen ones by id", () => {
+      const s = new Session();
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+      });
+      s.upsertItems([
+        { type: "agentMessage", id: "a1", text: "hello" },
+        { type: "agentMessage", id: "a2", text: "world" },
+      ]);
+      expect(s.items).toHaveLength(2);
+      expect(s.items[0]).toMatchObject({ id: "a1", text: "hello" });
+      expect(s.items[1]).toMatchObject({ id: "a2", text: "world" });
+      // 去重：重复 id 不新增。
+      s.upsertItems([{ type: "agentMessage", id: "a2", text: "world again" }]);
+      expect(s.items).toHaveLength(2);
+      expect(s.items[1]).toMatchObject({ id: "a2", text: "world again" });
+    });
+
+    it("advances lastServerItemId to the last incoming id", () => {
+      const s = new Session();
+      s.upsertItems([
+        { type: "agentMessage", id: "a1", text: "1" },
+        { type: "toolCall", id: "i2", call_id: "c2", name: "bash", input: {}, status: "running" },
+      ]);
+      expect(s.lastServerItemId).toBe("i2");
+    });
+
+    it("is a no-op for an empty list", () => {
+      const s = new Session();
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+      });
+      s.upsertItems([]);
+      expect(s.items).toHaveLength(1);
+      expect(s.lastServerItemId).toBe("a1");
+    });
+  });
 });
