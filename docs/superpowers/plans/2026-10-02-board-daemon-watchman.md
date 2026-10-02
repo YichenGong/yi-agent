@@ -771,13 +771,26 @@ pub fn install_with(
     launchctl: &mut dyn FnMut(&[String]) -> Result<(), String>,
 ) -> Result<(), String> {
     write_plist(home, &plist_contents(exe, home))?;
-    // 已加载过则先 bootout，避免 bootstrap 报 already bootstrapped。
-    let _ = launchctl(&["bootout".into(), format!("{}/{}", uid_domain(), LABEL)]);
-    launchctl(&[
+    // 单次 bootstrap，不做前置 bootout：`install_writes_the_plist_and_bootstraps_it`
+    // 断言恰好一次 `bootstrap`。重复安装时 launchctl 会报 already bootstrapped，
+    // 那时目标已达成，按成功处理而不是先 bootout（否则每次安装多一次调用、
+    // 重装还可能打断正在跑的值守）。
+    match launchctl(&[
         "bootstrap".into(),
         uid_domain(),
         plist_path(home).display().to_string(),
-    ])
+    ]) {
+        Ok(()) => Ok(()),
+        Err(error) if is_already_loaded(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// launchctl 对「服务已加载」的报错措辞随 macOS 版本变化，按常见措辞匹配；
+/// 匹配不到的错误照常上抛，绝不吞掉真正的失败。
+fn is_already_loaded(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("already bootstrapped") || lower.contains("service already loaded")
 }
 
 pub fn uninstall(home: &Path) -> Result<(), String> {
