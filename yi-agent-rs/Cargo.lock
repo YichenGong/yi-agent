@@ -4012,6 +4012,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "uuid",
  "yi-agent-app-server",
+ "yi-agent-boards",
  "yi-agent-core",
  "yi-agent-mcp",
  "yi-agent-runtime",

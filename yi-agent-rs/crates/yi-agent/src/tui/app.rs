@@ -2327,8 +2327,22 @@ fn execute_slash_command(
                     width,
                 );
             }
-            let outcome = crate::tui::superpowers_kanban::handle_kanban(workdir, args.as_deref().unwrap_or(""));
-            for line in outcome.lines {
+            let args = args.as_deref().unwrap_or("");
+            // 生命周期子命令（create/remove/status）由宿主直接管本目录的看板
+            // （走 `yi_agent_boards::lifecycle`）；其余（on/off/run/add/无参）
+            // 仍走插件通道。`global_dir()` 是宿主唯一的全局登记目录来源。
+            let lines = match args.split_whitespace().next() {
+                Some(word @ ("create" | "remove" | "status")) => {
+                    match yi_agent_boards::global_dir() {
+                        Ok(global) => {
+                            crate::tui::board::handle_board(workdir, &global, word).lines
+                        }
+                        Err(error) => vec![format!("无法定位看板登记目录: {error}")],
+                    }
+                }
+                _ => crate::tui::superpowers_kanban::handle_kanban(workdir, args).lines,
+            };
+            for line in lines {
                 history.push(HistoryCell::Separator { label: Some(line) }, width);
             }
             KeyOutcome::None
@@ -5508,6 +5522,161 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ----- /superpowers-kanban dispatch tests -----
+
+    /// 建一个 command 的通道与 history，返回可复用的前置件。
+    fn kanban_harness() -> (
+        HistoryState,
+        CostTracker,
+        tokio::sync::mpsc::Sender<String>,
+        tokio::sync::mpsc::Sender<()>,
+        tokio::sync::mpsc::Sender<String>,
+        tokio::sync::mpsc::Sender<crate::ControlCommand>,
+        crate::tui::queued::DeliveredInterjections,
+    ) {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        (
+            HistoryState::new(),
+            CostTracker::default(),
+            input_tx,
+            interrupt_tx,
+            kill_tx,
+            control_tx,
+            crate::tui::queued::DeliveredInterjections::new(),
+        )
+    }
+
+    #[test]
+    fn kanban_status_for_a_directory_without_a_board_points_at_create() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Kanban,
+            None,
+            Some("status".into()),
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        assert_eq!(outcome, KeyOutcome::None);
+        let labels = separator_labels(&history);
+        assert!(
+            labels.iter().any(|l| l.contains("未创建")),
+            "status 走进生命周期、如实报告没有看板：{labels:?}"
+        );
+    }
+
+    #[test]
+    fn kanban_create_is_dispatched_to_the_board_lifecycle() {
+        // 用一个「不是目录」的 workdir 让 create 在起 daemon 之前就被拒：既不
+        // 碰真实 $HOME 登记表，也钉住 create 确实被派给了生命周期。
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Kanban,
+            None,
+            Some("create".into()),
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            file.as_path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        assert_eq!(outcome, KeyOutcome::None);
+        let labels = separator_labels(&history);
+        assert!(
+            labels.iter().any(|l| l.contains("看板创建失败")),
+            "create 必须走生命周期并如实报告失败：{labels:?}"
+        );
+    }
+
+    #[test]
+    fn kanban_plugin_arguments_still_go_through_the_plugin_channel() {
+        // 非生命周期子命令（这里是拼错的 sideways）仍归插件通道：它给的是
+        // 插件那条 usage，而不是生命周期的 usage——两条通道各管各的。
+        let project = tempfile::TempDir::new().unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+
+        execute_slash_command(
+            SlashCommand::Kanban,
+            None,
+            Some("sideways".into()),
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("usage: /superpowers-kanban") && l.contains("add")),
+            "插件通道的 usage 必须保留：{labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_legacy_kanban_alias_still_prints_the_rename_notice() {
+        // `/kanban` 作为过渡别名仍可用，但命中时先提示规范名——这条逻辑不能被
+        // 新子命令的分发挤掉。
+        let project = tempfile::TempDir::new().unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+
+        execute_slash_command(
+            SlashCommand::Kanban,
+            Some("kanban".to_string()),
+            Some("sideways".into()),
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+        );
+
+        assert_eq!(
+            separator_labels(&history)[0],
+            "已更名为 /superpowers-kanban",
+            "旧别名的改名提示必须还在"
+        );
     }
 
     #[test]

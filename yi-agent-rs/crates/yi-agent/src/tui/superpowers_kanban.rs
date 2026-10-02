@@ -57,12 +57,24 @@ fn query_plugin(workdir: &Path, method: &str, params: Value) -> Result<Value, Qu
     }
 }
 
-/// Handles `/kanban [on|off|run]`.
+/// Handles `/superpowers-kanban [on|off|run|add <spec> <plan>]`.
 ///
 /// The board is *disabled by default*, so an accidental invocation cannot start
 /// a queue. `run` is intentionally refused while disabled: the switch is the
 /// user's explicit consent to let the board act.
 pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
+    let global = yi_agent_boards::global_dir().unwrap_or_default();
+    handle_kanban_with(workdir, args, &global)
+}
+
+/// 与 [`handle_kanban`] 相同，但把**全局看板登记目录**注入进来。
+///
+/// daemon 对「插件没装」和「本目录压根没建看板」回的话可以一样，只有登记表
+/// 能把两者分开。所以看板读不出来时要拿它来分辨：未登记的目录要说「用
+/// /superpowers-kanban create 创建」，而不是甩一句 `daemon is unavailable`
+/// 的连接错误——那句话对用户毫无下一步可言。生产入口 [`handle_kanban`] 传
+/// [`yi_agent_boards::global_dir`]；注入形参只为让测试不碰真实 `$HOME`。
+pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOutcome {
     let argument = args.trim();
     let plain = |lines: Vec<String>| KanbanOutcome {
         lines,
@@ -73,6 +85,14 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
             "Superpowers 看板插件未安装。看板由插件提供，装上它这里才有卡片。".to_string(),
         ])
     };
+    // 看板读不出来（daemon 不可达、插件拒绝、协议错）时的说法。
+    let unreadable = |message: String| {
+        plain(vec![if board_registered(workdir, global) {
+            format!("无法读取看板: {message}")
+        } else {
+            "本目录尚未创建看板；用 /superpowers-kanban create 创建。".to_string()
+        }])
+    };
 
     match argument {
         "" => match query_plugin(workdir, "list", json!({})) {
@@ -81,7 +101,7 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
                 Err(message) => plain(vec![message]),
             },
             Err(QueryFailure::PluginMissing) => unavailable(),
-            Err(QueryFailure::Other(message)) => plain(vec![format!("无法读取看板: {message}")]),
+            Err(QueryFailure::Other(message)) => unreadable(message),
         },
         "on" | "off" => {
             let on = argument == "on";
@@ -139,11 +159,25 @@ pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
                         }
                     }
                 }
-                _ => plain(vec!["usage: /kanban add <spec> <plan>".to_string()]),
+                _ => plain(vec![
+                    "usage: /superpowers-kanban add <spec> <plan>".to_string(),
+                ]),
             }
         }
-        _ => plain(vec!["usage: /kanban [on|off|run|add <spec> <plan>]".to_string()]),
+        _ => plain(vec![
+            "usage: /superpowers-kanban [on|off|create|remove|status|run|add <spec> <plan>]"
+                .to_string(),
+        ]),
     }
+}
+
+/// Whether `workdir` already has a board in the global registry.
+///
+/// A registry that cannot be read is treated as "not registered": the caller is
+/// deciding what wording to show, and the create-first guidance is more useful
+/// than "cannot read the registry" when the board is unreadable anyway.
+fn board_registered(workdir: &Path, global: &Path) -> bool {
+    yi_agent_boards::registry::contains(global, workdir).unwrap_or(false)
 }
 
 /// 把插件回的卡片数组渲染成若干行。开关状态由插件给，本地不猜。
@@ -256,6 +290,7 @@ mod tests {
                 { "id": "card-1", "state": "running", "plan_path": "a.plan.md" }
             ]})),
             "enqueue" => Ok(json!({ "id": "a-spec-a-plan" })),
+            "import_plugin" => Ok(json!({ "ok": true })),
             other => Err(format!("unknown method: {other}")),
         }
     }
@@ -271,6 +306,73 @@ mod tests {
             "switch.read" => Ok(json!({ "on": false, "source": "default" })),
             other => installed(other, params),
         }
+    }
+
+    /// daemon 活着、应答正常，但它的插件没起来：这可能是「插件没装」，也可能是
+    /// 「本目录没建看板」——回的话一样，只有登记表能分辨。
+    fn runtime_up_plugin_down(_method: &str, _params: &Value) -> Result<Value, String> {
+        Err("plugin superpowers-kanban is not available".to_string())
+    }
+
+    #[test]
+    fn a_missing_plugin_still_says_so_even_in_an_unregistered_directory() {
+        // 「插件没装」和「本目录没建看板」是两回事：前者要先把插件装上，
+        // 所以即便本目录没登记，也不能改口成创建指引（既有测试也钉死这一点）。
+        // 只有「连不上 / 插件拒绝」这类读不到，才轮到登记表分辨。
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let workdir = dir.path().join("proj");
+        std::fs::create_dir_all(&workdir).unwrap();
+        fake_daemon(&workdir, runtime_up_plugin_down);
+
+        let outcome = handle_kanban_with(&workdir, "", &global);
+        assert!(
+            outcome.lines[0].contains("插件未安装"),
+            "expected the uninstalled notice, got {:?}",
+            outcome.lines
+        );
+    }
+
+    #[test]
+    fn an_unreadable_board_in_an_unregistered_directory_points_at_create() {
+        // 本目录没建看板，而且没有 daemon 应答——正是「连不上」的那种读不到。
+        // 以前这里甩一句 `daemon is unavailable` 的连接错误，用户没有下一步；
+        // 现在给创建指引。故意不起 fake_daemon：连接失败本身就是这个场景。
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let workdir = dir.path().join("proj");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let outcome = handle_kanban_with(&workdir, "", &global);
+        assert_eq!(outcome.toggled_to, None);
+        assert!(
+            outcome.lines[0].contains("未创建"),
+            "expected the create-first guidance, got {:?}",
+            outcome.lines
+        );
+        assert!(
+            outcome.lines[0].contains("/superpowers-kanban create"),
+            "guidance must name the command: {:?}",
+            outcome.lines
+        );
+    }
+
+    #[test]
+    fn an_unreadable_board_in_a_registered_directory_still_reports_the_failure() {
+        // 反向：本目录**已登记**看板，读不出来就是真故障（daemon 挂了 / 插件
+        // 拒绝），必须报错而不是让用户去 create 一个已经存在的看板。
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let workdir = dir.path().join("proj");
+        std::fs::create_dir_all(&workdir).unwrap();
+        yi_agent_boards::registry::register(&global, &workdir).unwrap();
+
+        let outcome = handle_kanban_with(&workdir, "", &global);
+        assert!(
+            outcome.lines[0].contains("无法读取看板"),
+            "a registered board's read failure must be reported: {:?}",
+            outcome.lines
+        );
     }
 
     #[test]

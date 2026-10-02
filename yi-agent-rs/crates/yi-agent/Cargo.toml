@@ -22,6 +22,7 @@ yi-agent-runtime = { workspace = true }
 yi-agent-app-server = { workspace = true }
 yi-agent-subagent = { workspace = true }
 yi-agent-supervisors = { path = "../yi-agent-supervisors" }
+yi-agent-boards = { path = "../yi-agent-boards" }
 
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }

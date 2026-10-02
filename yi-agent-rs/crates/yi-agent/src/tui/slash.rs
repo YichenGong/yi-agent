@@ -149,7 +149,7 @@ impl SlashCommand {
             SlashCommand::Daemon => "管理本地 runtime daemon",
             SlashCommand::Mcp => "管理 MCP server 开关",
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
-            SlashCommand::Kanban => "Superpowers 看板：查看状态与开关",
+            SlashCommand::Kanban => "Superpowers 看板：查看 / 开关 / 创建 / 移除本目录的看板",
         }
     }
 
@@ -168,7 +168,7 @@ impl SlashCommand {
             SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => Some("<task-id>"),
             SlashCommand::Priority => Some("<task-id> <level>"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
-            SlashCommand::Kanban => Some("[on|off|add <spec> <plan>]"),
+            SlashCommand::Kanban => Some("[on|off|create|remove|status|run|add <spec> <plan>]"),
             SlashCommand::Approve => Some("<request-id> [once|task]"),
             SlashCommand::Deny => Some("<request-id>"),
             SlashCommand::Review => Some("<task-id>"),
