@@ -1000,6 +1000,7 @@ where
         PERMISSION_TIMEOUT,
         workspaces,
         pairing,
+        Arc::new(crate::broadcast::Broadcaster::new()),
         RuntimeAttachments {
             runtimes,
             thread_roots,
@@ -1058,6 +1059,7 @@ pub(crate) async fn serve_stdio<R, W, F>(
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
+    hub: Arc<crate::broadcast::Broadcaster>,
     attachments: RuntimeAttachments,
     build_agent: F,
 ) -> anyhow::Result<()>
@@ -1079,6 +1081,7 @@ where
         permission_timeout,
         workspaces,
         pairing,
+        hub,
         attachments,
         build_agent,
         // 桌面 stdio 是 Admin:所有既有 RPC 行为不变。
@@ -1100,6 +1103,7 @@ pub(crate) async fn serve_scoped<R, W, F>(
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
+    hub: Arc<crate::broadcast::Broadcaster>,
     attachments: RuntimeAttachments,
     build_agent: F,
     client_scope: Scope,
@@ -1115,7 +1119,6 @@ where
         + Send
         + 'static,
 {
-    let hub = Arc::new(crate::broadcast::Broadcaster::new());
     let local = crate::broadcast::ClientId::local();
     // 可靠登记:stdio 只有这一条出站流,广播的背压**不得**摘除它。桌面 host
     // 一旦来不及读 stdout,旧的 lossy `broadcast` 会把它当慢消费者摘掉,主循环
@@ -3301,6 +3304,51 @@ where
                         write_response(&hub, &client, ok_response(id, json!({ "revoked": revoked })))
                             .await?;
                     }
+                    "thread/subscribe" => {
+                        // 整体替换该客户端的订阅集合。**不在 ADMIN_METHODS 内**:
+                        // 任何已初始化客户端都能收窄自己的 feed。未调用过的客户端
+                        // 保持 `Feed::All`(桌面行为不变)。
+                        let ids: Option<Vec<String>> = req
+                            .params
+                            .get("threadIds")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            });
+                        let Some(ids) = ids else {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::invalid_params("missing threadIds")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        if ids.len() > crate::broadcast::MAX_SUBSCRIPTIONS {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(format!(
+                                        "at most {} threadIds",
+                                        crate::broadcast::MAX_SUBSCRIPTIONS
+                                    )),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        hub.subscribe(&client, ids.clone());
+                        write_response(
+                            &hub,
+                            &client,
+                            ok_response(id, json!({ "subscribed": ids })),
+                        )
+                        .await?;
+                    }
                     _ => {
                         write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))
                             .await?;
@@ -3441,10 +3489,51 @@ async fn write_notification(
 ) -> anyhow::Result<()> {
     let frame = serde_json::to_value(NotificationEnvelope::new(n))
         .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
-    // 广播给所有客户端:fan-out 是 Tier 1 的能力,但 Tier 0 立刻走同一条路径,
-    // 避免以后再改一次接线。单客户端下等价于写那一条流。
-    hub.broadcast(frame);
+    // 内容通知按 thread 过滤；全局帧（None）恒放行。无订阅者时等价于全广播。
+    hub.broadcast_for(n.thread_key(), frame);
     Ok(())
+}
+
+/// 逐字流合并器：按 thread 攒 `(item_id, text)`。跨 item_id 不合并（顺序优先）。
+#[derive(Default)]
+struct DeltaCoalescer {
+    /// thread → 当前正在累加的 (item_id, text)。
+    pending: std::collections::HashMap<String, (String, String)>,
+}
+
+impl DeltaCoalescer {
+    const FLUSH_BYTES: usize = 4096;
+
+    /// 追加一段 delta，返回**此刻应当立即发出去的**若干条（跨 item 或超限时）。
+    fn push(&mut self, thread: &str, item_id: &str, delta: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        match self.pending.get_mut(thread) {
+            Some((pid, text)) if pid == item_id => text.push_str(delta),
+            _ => {
+                if let Some(prev) = self.pending.remove(thread) {
+                    out.push(prev);
+                }
+                self.pending
+                    .insert(thread.to_string(), (item_id.to_string(), delta.to_string()));
+            }
+        }
+        if self.pending.get(thread).map(|(_, t)| t.len()).unwrap_or(0) >= Self::FLUSH_BYTES {
+            if let Some(p) = self.pending.remove(thread) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// 取出并清空该 thread 的待发（屏障/tick 调用）。
+    fn take(&mut self, thread: &str) -> Option<(String, String)> {
+        self.pending.remove(thread)
+    }
+
+    /// 取出全部待发（tick 用）。
+    fn take_all(&mut self) -> Vec<(String, (String, String))> {
+        self.pending.drain().collect()
+    }
 }
 
 /// 更新共享状态句柄并推送 `thread/status/updated`。
@@ -3874,6 +3963,12 @@ async fn run_thread_driver(
         // 同一次 run 的投递句柄;run() 结束即失效,下一轮重新取。
         let inbox = agent.inbox_handle();
         let mut cancel_sent = false;
+        // 逐字流合并器（仅在本轮驱动内有效）。当存在订阅者时，`item/delta`
+        // 先按 thread 攒批，再由 100ms tick 或非 delta 屏障刷出；无订阅者时
+        // 走原来的直发路径，字节不变。
+        let mut coalescer = DeltaCoalescer::default();
+        let mut delta_tick = tokio::time::interval(Duration::from_millis(100));
+        delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -3921,7 +4016,9 @@ async fn run_thread_driver(
                             // 决定,故这里用 `is_connected` 复刻原判据——但仍要
                             // 先把帧广播出去,让其它在线客户端(如第二台手机)能
                             // 应答:发起方断线不等于该审批无人可答。
-                            hub.broadcast(frame);
+                            // 只推给"订阅了该 thread"的客户端 + 全收的客户端（桌面）：
+                            // 没打开这个会话的手机不该被它的审批打断。
+                            hub.broadcast_for(Some(&thread_id), frame);
                             if !hub.is_connected(&client) {
                                 // 发起客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
@@ -3992,15 +4089,75 @@ async fn run_thread_driver(
                                         cache_read_input_tokens: *cache_read_input_tokens,
                                     });
                                 }
-                                if write_notification(&hub, &n).await.is_err() {
-                                    // 客户端可能已断开;先上报 Finished,
-                                    // 避免 active_turn_id 永久卡住。
-                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
-                                    return;
+                                // 逐字流：仅当存在订阅者时合并；否则走原来的直发。
+                                // 非 delta 通知前先刷该 thread 的待发，保证顺序。
+                                let mut to_send: Vec<Notification> = Vec::new();
+                                match &n {
+                                    Notification::ItemDelta { thread_id: t, item_id, delta }
+                                        if hub.has_subscribed_clients() =>
+                                    {
+                                        for (pid, text) in coalescer.push(t, item_id, delta) {
+                                            to_send.push(Notification::ItemDelta {
+                                                thread_id: t.clone(),
+                                                item_id: pid,
+                                                delta: text,
+                                            });
+                                        }
+                                    }
+                                    _ => {
+                                        if let Notification::ItemDelta { thread_id: t, .. } = &n {
+                                            if let Some((pid, text)) = coalescer.take(t) {
+                                                to_send.push(Notification::ItemDelta {
+                                                    thread_id: t.clone(),
+                                                    item_id: pid,
+                                                    delta: text,
+                                                });
+                                            }
+                                        }
+                                        to_send.push(n.clone());
+                                    }
+                                }
+                                for out in to_send {
+                                    if write_notification(&hub, &out).await.is_err() {
+                                        // 客户端可能已断开;先上报 Finished,
+                                        // 避免 active_turn_id 永久卡住。
+                                        let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                        return;
+                                    }
                                 }
                             }
                         }
-                        None => break,
+                        None => {
+                            // 流结束：把该 thread 攒下的逐字流刷出，避免丢尾
+                            // （最后一个 tick 之后、流结束之前可能仍有待发 delta）。
+                            if let Some((pid, text)) = coalescer.take(&thread_id) {
+                                let _ = write_notification(
+                                    &hub,
+                                    &Notification::ItemDelta {
+                                        thread_id: thread_id.clone(),
+                                        item_id: pid,
+                                        delta: text,
+                                    },
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = delta_tick.tick() => {
+                    // 100ms 兜底刷出：即便没有后续非 delta 通知，攒下的逐字流
+                    // 也必须按时送达。
+                    for (t, (pid, text)) in coalescer.take_all() {
+                        let _ = write_notification(
+                            &hub,
+                            &Notification::ItemDelta {
+                                thread_id: t,
+                                item_id: pid,
+                                delta: text,
+                            },
+                        )
+                        .await;
                     }
                 }
                 Some(target) = interrupt_rx.recv(), if !cancel_sent => {
@@ -5221,6 +5378,8 @@ pub(crate) mod tests {
         /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
         /// 所得设备必须能被同一主循环的 `device/list` 看见。
         pairing: Arc<PairingState>,
+        /// 与主循环**共享**的扇出中心:测试经 [`Harness::hub`] 断言订阅状态。
+        hub: Arc<crate::broadcast::Broadcaster>,
     }
 
     impl Harness {
@@ -5294,6 +5453,9 @@ pub(crate) mod tests {
             let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
                 index_dir.path().join("devices.json"),
             )));
+            // 与主循环共享同一个扇出中心,便于测试直接断言订阅状态
+            // (`thread/subscribe` 的效果)。
+            let hub = Arc::new(crate::broadcast::Broadcaster::new());
             // 主题句柄与 `cfg.workdir` 一致：`ui/settings/read` 从 `cfg.workdir`
             // 读、`write` 经句柄落盘，两者不同则会各看各的。
             let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
@@ -5304,6 +5466,7 @@ pub(crate) mod tests {
                 permission_timeout,
                 workspaces,
                 Arc::clone(&pairing),
+                Arc::clone(&hub),
                 RuntimeAttachments {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -5323,7 +5486,14 @@ pub(crate) mod tests {
                 _index_dir: index_dir,
                 board_dir,
                 pairing,
+                hub,
             }
+        }
+
+        /// 与主循环共享的扇出中心句柄:测试据此断言 `thread/subscribe` 是否
+        /// 真的把订阅写进了服务端的 `Broadcaster`。
+        pub(crate) fn hub(&self) -> Arc<crate::broadcast::Broadcaster> {
+            Arc::clone(&self.hub)
         }
 
         /// 测试直接驱动的配对状态句柄,与主循环共享同一个 `Arc`:这里 `redeem`
@@ -5905,6 +6075,7 @@ pub(crate) mod tests {
             PERMISSION_TIMEOUT,
             workspaces,
             pairing,
+            Arc::new(crate::broadcast::Broadcaster::new()),
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -5969,6 +6140,7 @@ pub(crate) mod tests {
             PERMISSION_TIMEOUT,
             workspaces,
             pairing,
+            Arc::new(crate::broadcast::Broadcaster::new()),
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -6037,6 +6209,7 @@ pub(crate) mod tests {
             PERMISSION_TIMEOUT,
             workspaces,
             pairing,
+            Arc::new(crate::broadcast::Broadcaster::new()),
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -9282,6 +9455,110 @@ pub(crate) mod tests {
         let v = read_response(&mut h, 10).await;
         assert_eq!(v["error"]["code"], -32001, "bad code must be refused: {v}");
         h.shutdown().await;
+    }
+
+    /// `thread/subscribe` 整体替换订阅集合并回显;超上限报 invalid_params。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_can_subscribe_to_a_thread_set() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"thread/subscribe","params":{"threadIds":["t1","t2"]}}"#)
+            .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(v["result"]["subscribed"].as_array().unwrap().len(), 2);
+        assert!(h.hub().has_subscribed_clients(), "订阅后 hub 必须认得");
+
+        // 超过 16 → invalid_params。
+        let many: Vec<String> = (0..17).map(|i| format!("t{i}")).collect();
+        let req = serde_json::json!({"jsonrpc":"2.0","id":10,"method":"thread/subscribe","params":{"threadIds":many}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 10).await;
+        assert_eq!(v["error"]["code"], -32602, "超上限必须报错: {v}");
+        h.shutdown().await;
+    }
+
+    /// 通知按 thread 键路由：订阅 t1 的客户端只收 t1，未订阅的收全部。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notifications_are_routed_by_thread_key() {
+        let hub = crate::broadcast::Broadcaster::new();
+        let sub = crate::broadcast::ClientId::ws(uuid::Uuid::from_u128(1));
+        let all = crate::broadcast::ClientId::local();
+        let mut sub_rx = hub.register(sub.clone());
+        let mut all_rx = hub.register(all.clone());
+        hub.subscribe(&sub, vec!["t1".to_string()]);
+
+        let content_t1 = serde_json::json!({"method":"turn/started","params":{"thread_id":"t1"}});
+        let content_t2 = serde_json::json!({"method":"turn/started","params":{"thread_id":"t2"}});
+        hub.broadcast_for(Some("t1"), content_t1);
+        hub.broadcast_for(Some("t2"), content_t2);
+
+        assert_eq!(sub_rx.recv().await.unwrap()["params"]["thread_id"], "t1");
+        assert!(sub_rx.try_recv().is_err(), "订阅 t1 不该收到 t2");
+        assert_eq!(all_rx.recv().await.unwrap()["params"]["thread_id"], "t1");
+        assert_eq!(all_rx.recv().await.unwrap()["params"]["thread_id"], "t2");
+    }
+
+    /// `Notification::thread_key` 与协议字段一致（全局帧无键）。
+    #[test]
+    fn notification_thread_key_matches_the_wire() {
+        use crate::protocol::Notification;
+        assert_eq!(
+            Notification::TurnStarted {
+                thread_id: "t1".into(),
+                turn_id: "x".into()
+            }
+            .thread_key(),
+            Some("t1")
+        );
+        assert_eq!(
+            Notification::UiSettingsUpdated {
+                theme: "dark".into()
+            }
+            .thread_key(),
+            None
+        );
+        assert_eq!(
+            Notification::Error {
+                message: "x".into()
+            }
+            .thread_key(),
+            None
+        );
+        assert_eq!(
+            Notification::ToolCallApprovalResolved {
+                perm_id: "p".into(),
+                by: "c".into(),
+                decision: "allow_once".into()
+            }
+            .thread_key(),
+            None
+        );
+    }
+
+    /// 合并器：同一 item_id 的相邻 delta 拼接；跨 item_id 先刷旧的。
+    #[test]
+    fn delta_coalescer_concat_within_an_item_and_flush_across_items() {
+        let mut c = DeltaCoalescer::default();
+        // 同一 item 连续追加不立即发。
+        assert!(c.push("t1", "i1", "Hel").is_empty());
+        assert!(c.push("t1", "i1", "lo").is_empty());
+        // 取出即 "Hello"。
+        assert_eq!(c.take("t1"), Some(("i1".to_string(), "Hello".to_string())));
+        assert_eq!(c.take("t1"), None, "取走后为空");
+
+        // 跨 item_id：追新的之前先把旧的返回（顺序优先）。
+        assert!(c.push("t1", "i1", "a").is_empty());
+        assert_eq!(
+            c.push("t1", "i2", "b"),
+            vec![("i1".to_string(), "a".to_string())]
+        );
+        assert_eq!(c.take("t1"), Some(("i2".to_string(), "b".to_string())));
+
+        // 超过 4KB 自动刷出。
+        let big = "x".repeat(DeltaCoalescer::FLUSH_BYTES);
+        let flushed = c.push("t1", "i3", &big);
+        assert_eq!(flushed.len(), 1, "超上限必须立即返回: {flushed:?}");
+        assert_eq!(c.take("t1"), None);
     }
 
     /// Approval is one-question/one-answer even with many clients: the first
