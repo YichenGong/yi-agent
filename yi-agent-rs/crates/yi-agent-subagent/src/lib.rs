@@ -87,14 +87,14 @@ impl DaemonAgentWorkerFactory {
         }
     }
 
-    /// The child's model: the request's override when present, else the
-    /// factory's configured model.
-    fn worker_config_model(&self, requested: &str) -> String {
-        if requested.trim().is_empty() {
-            self.config.model.clone()
-        } else {
-            requested.to_owned()
-        }
+    /// The child's model: always the factory's configured model.
+    ///
+    /// A caller-supplied model is deliberately ignored. Letting a child run on
+    /// an arbitrary string means an orchestration agent can name a model the
+    /// provider does not serve (e.g. `haiku` on a DeepSeek endpoint); the
+    /// worker then fails with a 404 and its card is stranded in `running`.
+    fn worker_config_model(&self, _requested: &str) -> String {
+        self.config.model.clone()
     }
 
     pub fn with_sandbox(
@@ -1383,14 +1383,18 @@ fn spawn_workdir(args: &Value) -> Result<Option<String>, ToolResult> {
 }
 
 /// Resolves the optional `model` argument for a daemon `spawn_agent` call.
-/// An omitted model means the child inherits its parent's; a blank or
-/// non-string value is rejected rather than silently ignored.
+///
+/// A child always inherits the configured model, so the only accepted shape is
+/// an omitted `model`. An explicit one is refused here rather than forwarded to
+/// the provider: a name the endpoint does not serve (`haiku` on a DeepSeek
+/// endpoint) fails the worker with a 404 and strands its card in `running`
+/// forever, which is exactly the failure this guard exists to prevent.
 fn spawn_model(args: &Value) -> Result<Option<String>, ToolResult> {
     match args.get("model") {
         None => Ok(None),
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
-        Some(Value::String(_)) => Err(ToolResult::error("model must not be blank")),
-        Some(_) => Err(ToolResult::error("model must be a string")),
+        Some(_) => Err(ToolResult::error(
+            "model is not caller-selectable: omit `model` so the child inherits the configured model",
+        )),
     }
 }
 
@@ -1466,10 +1470,6 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                     "type": "string",
                     "enum": ["coding", "read_only"],
                     "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional model for this child. Omit to inherit yours."
                 },
                 "workdir": {
                     "type": "string",
@@ -1830,10 +1830,6 @@ impl Tool for DaemonSpawnAgentTool {
                     "enum": ["coding", "read_only"],
                     "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
                 },
-                "model": {
-                    "type": "string",
-                    "description": "Optional model for this child. Omit to inherit yours."
-                },
                 "workdir": {
                     "type": "string",
                     "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
@@ -2021,7 +2017,11 @@ mod tests {
     }
 
     #[test]
-    fn worker_config_uses_the_requested_model_and_falls_back_to_the_factory_default() {
+    fn a_spawn_ignores_a_requested_model_and_runs_on_the_configured_one() {
+        // A child that runs on an arbitrary model string can be pointed at one
+        // the provider does not serve (`haiku` on a DeepSeek endpoint), which
+        // fails the worker with a 404 and strands its card. The configured
+        // model is the only truthful choice.
         let directory = tempfile::TempDir::new().unwrap();
         let factory_config = AgentConfig {
             model: "factory-model".into(),
@@ -2036,13 +2036,13 @@ mod tests {
 
         assert_eq!(
             factory.worker_config_model("small-model"),
-            "small-model",
-            "a requested model overrides the factory default"
+            "factory-model",
+            "a requested model must never override the configured one"
         );
         assert_eq!(
             factory.worker_config_model(""),
             "factory-model",
-            "an empty request inherits the factory default"
+            "an empty request inherits the configured model"
         );
     }
 
@@ -2167,20 +2167,18 @@ mod tests {
     }
 
     #[test]
-    fn spawn_model_accepts_a_model_and_rejects_a_blank_one() {
-        assert_eq!(
-            spawn_model(&json!({"model": "small-model"})).unwrap(),
-            Some("small-model".to_string())
+    fn spawn_model_rejects_any_explicit_model() {
+        // Children inherit the configured model; an explicit `model` is refused
+        // at the tool boundary rather than forwarded to the provider, where an
+        // unknown name would fail the worker with a 404.
+        let rejected = spawn_model(&json!({"model": "small-model"}))
+            .expect_err("an explicit model must be rejected");
+        assert!(
+            format!("{rejected:?}").contains("model"),
+            "the error must name the offending field: {rejected:?}"
         );
+        // Omitting `model` remains the only accepted shape.
         assert_eq!(spawn_model(&json!({})).unwrap(), None);
-        assert!(
-            spawn_model(&json!({"model": "   "})).is_err(),
-            "a blank model is not a valid request"
-        );
-        assert!(
-            spawn_model(&json!({"model": 7})).is_err(),
-            "a non-string model is not a valid request"
-        );
     }
 
     #[test]
