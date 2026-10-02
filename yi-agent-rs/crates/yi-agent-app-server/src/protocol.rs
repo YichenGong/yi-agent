@@ -7,6 +7,18 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// 已配对遥控设备被授予的权限级。
+///
+/// `Ord` 从弱到强：`Observe < Control < Admin`。新配对设备默认 `Control`
+/// （决策 A）。Task 3 会围绕它扩展配对/设备 RPC。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    Observe,
+    Control,
+    Admin,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
