@@ -1218,6 +1218,36 @@ pub(crate) type ClientScopes = Arc<Mutex<HashMap<crate::broadcast::ClientId, Sco
 /// 否则每个 ws 连接都会永久留下一个 `ClientId` 键(连接可来去,表只增不减)。
 pub(crate) type ClientInitialized = Arc<Mutex<HashMap<crate::broadcast::ClientId, bool>>>;
 
+/// 主题变化守望者:把 [`crate::theme_tool::ThemeHandle`] 的广播翻译成
+/// `ui/settings/updated`,经 hub 扇出——stdio 的 `local` 与每个 ws 客户端都要收到。
+///
+/// 单独成形是为了可测:测试直接驱动这段生产循环,而不是照抄一份。
+///
+/// `Lagged` 必须当作**继续**:它只是订阅者一时落后(客户端读得慢),`recv()` 仍可
+/// 继续调用;若像旧写法那样把它与 `Closed` 一并 `return`,一次背压就会杀掉守望者,
+/// 此后本进程再也推不出主题通知。只有 `Closed`(所有发送端都没了)才结束。
+async fn pump_theme_notifications(
+    mut rx: tokio::sync::broadcast::Receiver<crate::settings_store::Theme>,
+    hub: Arc<crate::broadcast::Broadcaster>,
+) {
+    loop {
+        let theme = match rx.recv().await {
+            Ok(theme) => theme,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "theme watcher lagged; continuing");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let n = Notification::UiSettingsUpdated {
+            theme: theme.as_str().to_string(),
+        };
+        if write_notification(&hub, &n).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// 主循环的传输无关核心:agent 工厂由调用方注入(测试用 mock provider)。
 ///
 /// **取消安全**:入站读取由传输层任务负责(`read_lines` / WS 读循环),主循环只在
@@ -1300,20 +1330,10 @@ where
 
     // 主题变化 → ui/settings/updated(全局一条流,与 thread 无关)。经 hub 广播:
     // stdio 的 `local` 与任意 ws 设备都能收到并切 `data-theme`。
-    {
-        let hub = Arc::clone(&hub);
-        let mut rx = theme.subscribe();
-        tokio::spawn(async move {
-            while let Ok(theme) = rx.recv().await {
-                let n = Notification::UiSettingsUpdated {
-                    theme: theme.as_str().to_string(),
-                };
-                if write_notification(&hub, &n).await.is_err() {
-                    return;
-                }
-            }
-        });
-    }
+    tokio::spawn(pump_theme_notifications(
+        theme.subscribe(),
+        Arc::clone(&hub),
+    ));
     // 写路径仍需 theme 句柄;`set` 会落盘 + 广播,由上面的 watcher 推通知。
     let theme_handle = theme.clone();
 
@@ -9537,5 +9557,85 @@ pub(crate) mod tests {
             rebuilt.agent.decision_rx().is_some(),
             "the rebuilt agent must keep the decision receiver"
         );
+    }
+}
+
+/// 主题守望者的回归测试。
+///
+/// 这些测试直接驱动生产里的 [`pump_theme_notifications`],不再照抄一份循环体:
+/// 「Lagged 后仍存活」只有在真正跑被 spawn 的那段代码时才算数。
+#[cfg(test)]
+mod theme_watcher_tests {
+    use super::*;
+
+    /// 快进:让订阅者跑赢容量 16 的广播、把订阅者落在后面,`recv()` 就会返回
+    /// `Lagged`(`ThemeHandle::new` 用的正是 `broadcast::channel(16)`)。
+    ///
+    /// 先 `yield_now` 保证 spawn 的守望者已挂上订阅:否则 17 次 `send` 一场空,
+    /// 之后再订阅只会收到第 201 次的值,测不出 Lagged。
+    async fn lag_the_subscriber(theme: &crate::theme_tool::ThemeHandle) {
+        tokio::task::yield_now().await;
+        for i in 0..(16 + 200) {
+            theme.set(if i % 2 == 0 {
+                crate::settings_store::Theme::Light
+            } else {
+                crate::settings_store::Theme::Dark
+            });
+        }
+    }
+
+    /// 回归:`Lagged` 不得终结守望者。
+    ///
+    /// 旧写法 `while let Ok(theme) = rx.recv().await` 把 `Lagged` 与 `Closed` 一并
+    /// 当作退出条件;一次背压(客户端一时读得慢)就把守望者杀掉,此后本进程再也
+    /// 推不出 `ui/settings/updated`——对话框或 `set_theme` 工具改的主题静默丢失。
+    #[tokio::test]
+    async fn theme_watcher_survives_a_lagged_broadcast() {
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let local = crate::broadcast::ClientId::local();
+        let mut out = hub.register_reliable(local);
+        let theme = crate::theme_tool::ThemeHandle::new(std::env::temp_dir());
+        let pump = tokio::spawn(pump_theme_notifications(theme.subscribe(), Arc::clone(&hub)));
+
+        lag_the_subscriber(&theme).await;
+
+        // 让守望者重新比发送者快:它必须先处理 `Lagged`(不退出),再收到这次值。
+        let mut saw_light_after_the_lag = false;
+        for _ in 0..200 {
+            theme.set(crate::settings_store::Theme::Light);
+            match tokio::time::timeout(Duration::from_secs(5), out.recv()).await {
+                Ok(Some(frame)) => {
+                    if frame["method"] == "ui/settings/updated"
+                        && frame["params"]["theme"] == "light"
+                    {
+                        saw_light_after_the_lag = true;
+                        break;
+                    }
+                }
+                Ok(None) => panic!("the local client's outbound queue closed unexpectedly"),
+                Err(_) => break,
+            }
+        }
+        pump.abort();
+        assert!(
+            saw_light_after_the_lag,
+            "the theme watcher must stay alive across a Lagged broadcast and still push \
+             ui/settings/updated; `while let Ok` returns instead"
+        );
+    }
+
+    /// 守住的另一半语义:`Closed`(所有发送端都没了)才终止。
+    ///
+    /// 这条防止把守望者改成「永不退出」的忙循环。
+    #[tokio::test]
+    async fn theme_watcher_ends_when_the_broadcast_closes() {
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let (tx, rx) = tokio::sync::broadcast::channel::<crate::settings_store::Theme>(16);
+        let pump = tokio::spawn(pump_theme_notifications(rx, Arc::clone(&hub)));
+        drop(tx);
+        let finished = tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the watcher must exit once the broadcast is closed");
+        assert!(finished.is_ok());
     }
 }
