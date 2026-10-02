@@ -203,6 +203,11 @@ pub enum Notification {
         /// killed / failed_to_start。
         state: String,
     },
+    /// 桌面端 UI 偏好（当前只有主题）发生变化。
+    ///
+    /// 只由 `ThemeHandle` 的广播触发；客户端收到即把 `data-theme` 换成新值。
+    #[serde(rename = "ui/settings/updated")]
+    UiSettingsUpdated { theme: String },
     #[serde(rename = "error")]
     Error { message: String },
 }
@@ -477,5 +482,15 @@ mod tests {
         assert_eq!(v["params"]["thread_id"], "t1");
         assert_eq!(v["params"]["process_id"], "proc_1");
         assert_eq!(v["params"]["state"], "running");
+    }
+
+    #[test]
+    fn ui_settings_notification_uses_its_wire_shape() {
+        let n = Notification::UiSettingsUpdated {
+            theme: "light".into(),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "ui/settings/updated");
+        assert_eq!(v["params"]["theme"], "light");
     }
 }

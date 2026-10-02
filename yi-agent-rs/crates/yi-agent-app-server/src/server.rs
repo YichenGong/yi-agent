@@ -91,6 +91,7 @@ type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 struct RuntimeAttachments {
     runtimes: ProjectRuntimes,
     thread_roots: ThreadRoots,
+    theme: crate::theme_tool::ThemeHandle,
 }
 
 /// The key that identifies one project directory across this process.
@@ -777,6 +778,7 @@ where
     let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+    let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     run_with(
         reader,
         writer,
@@ -786,6 +788,7 @@ where
         RuntimeAttachments {
             runtimes,
             thread_roots,
+            theme,
         },
         move |session, cwd, mode| {
             let mut thread_cfg = cfg_for_factory.clone();
@@ -841,6 +844,7 @@ where
     let RuntimeAttachments {
         runtimes,
         thread_roots,
+        theme,
     } = attachments;
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
@@ -889,6 +893,24 @@ where
     let mut children_watches: HashMap<String, ChildrenWatch> = HashMap::new();
     // 每个 thread 一个进程状态守望者,建立 thread 时拉起。
     let mut process_watches: HashMap<String, ProcessWatch> = HashMap::new();
+
+    // 主题变化 → ui/settings/updated(全局一条流,与 thread 无关)。
+    {
+        let writer = Arc::clone(&writer);
+        let mut rx = theme.subscribe();
+        tokio::spawn(async move {
+            while let Ok(theme) = rx.recv().await {
+                let n = Notification::UiSettingsUpdated {
+                    theme: theme.as_str().to_string(),
+                };
+                if write_notification(&writer, &n).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    // 写路径仍需 theme 句柄;`set` 会落盘 + 广播,由上面的 watcher 推通知。
+    let theme_handle = theme.clone();
 
     loop {
         tokio::select! {
@@ -981,6 +1003,40 @@ where
                     }
                     "config/read" => {
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
+                    }
+                    "ui/settings/read" => {
+                        let theme = crate::settings_store::load(&cfg.workdir);
+                        write_response(
+                            &writer,
+                            ok_response(id, json!({ "theme": theme.as_str() })),
+                        )
+                        .await?;
+                    }
+                    "ui/settings/write" => {
+                        let requested = req
+                            .params
+                            .get("theme")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let theme = match requested.trim().to_ascii_lowercase().as_str() {
+                            "dark" => crate::settings_store::Theme::Dark,
+                            "light" => crate::settings_store::Theme::Light,
+                            other => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!(
+                                            "unsupported theme '{other}': expected 'dark' or 'light'"
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        theme_handle.set(theme);
+                        write_response(&writer, ok_response(id, json!({ "ok": true }))).await?;
                     }
                     "plugin/query" => {
                         let plugin = req
@@ -3933,6 +3989,11 @@ mod tests {
         })
     }
 
+    /// 测试用的主题句柄：不落盘的临时 workdir，也不可被生产路径读到。
+    fn test_theme() -> crate::theme_tool::ThemeHandle {
+        crate::theme_tool::ThemeHandle::new(std::env::temp_dir())
+    }
+
     fn test_config() -> RuntimeConfig {
         RuntimeConfig {
             provider: "anthropic".to_string(),
@@ -4000,6 +4061,7 @@ mod tests {
             let workspaces = Arc::new(WorkspaceIndex::new(
                 index_dir.path().join("workspaces.json"),
             ));
+            let run_with_workdir = cfg.workdir.clone();
             let handle = tokio::spawn(run_with(
                 server_r,
                 server_w,
@@ -4009,6 +4071,9 @@ mod tests {
                 RuntimeAttachments {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                    // 句柄必须与 `cfg.workdir` 一致：`ui/settings/read` 从
+                    // `cfg.workdir` 读、`write` 经句柄落盘，两者不同则会各看各的。
+                    theme: crate::theme_tool::ThemeHandle::new(run_with_workdir.clone()),
                 },
                 build,
             ));
@@ -4592,6 +4657,7 @@ mod tests {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                theme: test_theme(),
             },
             build_test_agent,
         ));
@@ -4649,6 +4715,7 @@ mod tests {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                theme: test_theme(),
             },
             |_s: Option<yi_agent_core::Session>,
              _cwd: &std::path::Path,
@@ -4710,6 +4777,7 @@ mod tests {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                theme: test_theme(),
             },
             build_test_agent,
         ));
@@ -7783,6 +7851,93 @@ mod tests {
         h.send(&dup.to_string()).await;
         let v = read_response(&mut h, 23).await;
         assert_eq!(v["error"]["code"], -32602, "重复 id → invalid_params: {v}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_read_and_write_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["theme"], "dark", "default before any write");
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"theme":"light"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["result"]["ok"], true);
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        assert_eq!(v["result"]["theme"], "light");
+
+        // 落盘可被另一个进程读回
+        assert_eq!(
+            crate::settings_store::load(dir.path()),
+            crate::settings_store::Theme::Light
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_rejects_an_unknown_theme() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"theme":"sepia"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert!(
+            v.get("error").is_some(),
+            "unsupported theme must be rejected"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_notifies_subscribers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"theme":"light"}}"#,
+        )
+        .await;
+        // 响应(主循环写)与通知(watcher 任务写)共用一路流,到达顺序不定;
+        // 逐帧收敛,两者都必须见到。
+        let mut responded = false;
+        let mut notified = None;
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                assert_eq!(v["result"]["ok"], true);
+                responded = true;
+            } else if v.get("method").and_then(|m| m.as_str()) == Some("ui/settings/updated") {
+                notified = Some(v);
+            }
+            if responded && notified.is_some() {
+                break;
+            }
+        }
+        assert!(responded, "ui/settings/write must respond");
+        let n = notified.expect("theme change must push ui/settings/updated");
+        assert_eq!(n["params"]["theme"], "light");
         h.shutdown().await;
     }
 }
