@@ -66,6 +66,14 @@ impl Session {
         self.messages = messages;
     }
 
+    /// Build a session from an already-complete transcript. Used to seed a
+    /// forked child with the caller's history.
+    pub fn from_messages(messages: Vec<Message>) -> Self {
+        let mut session = Self::new();
+        session.replace_messages(messages);
+        session
+    }
+
     pub fn truncate(&mut self, len: usize) {
         self.messages.truncate(len);
     }
@@ -491,6 +499,24 @@ impl Agent {
         }
     }
 
+    /// The live session handle, so a tool can read the caller's *current*
+    /// conversation at call time. Rebuilds must reuse this Arc (see
+    /// `with_session_arc`) or a held handle goes stale.
+    pub fn session_handle(&self) -> Arc<Mutex<Session>> {
+        Arc::clone(&self.session)
+    }
+
+    /// Rebuild the agent around an existing session handle, preserving identity.
+    pub fn with_session_arc(self, session: Arc<Mutex<Session>>) -> Self {
+        Self { session, ..self }
+    }
+
+    /// Replace the session's contents in place, keeping the Arc (and therefore
+    /// any held handle) valid. Used by compaction instead of swapping sessions.
+    pub fn set_session_messages(&mut self, messages: Vec<Message>) {
+        self.session.lock().unwrap().replace_messages(messages);
+    }
+
     /// Restrict provider turns through the daemon-owned admission gate.
     pub fn with_provider_turn_gate(mut self, gate: Arc<dyn ProviderTurnGate>) -> Self {
         self.provider_turn_gate = Some(gate);
@@ -665,16 +691,16 @@ impl Agent {
     }
 }
 
-/// Rollback length for a cancelled run under the "preserve completed work"
-/// policy: keep this run's user prompt plus every assistant/tool round-trip that
-/// already completed, and drop only a trailing assistant message whose tool_use
-/// has no matching tool_result.
+/// How many leading messages of `session` form a provider-valid transcript:
+/// everything, minus a trailing assistant message whose `tool_use` has no
+/// matching `tool_result` (which the provider would reject).
 ///
 /// A cancel during THINK leaves the session ending on the user message (nothing
 /// is dropped); a cancel during ACT leaves a trailing `assistant(tool_use)` whose
 /// results were never observed, which must go or the next provider request is
-/// rejected for an unpaired tool_use.
-fn safe_cancel_truncate_len(session: &Session) -> usize {
+/// rejected for an unpaired tool_use. A forked child inherits the same
+/// constraint, so both paths share this single rule.
+pub fn fork_prefix_len(session: &Session) -> usize {
     let messages = session.messages();
     match messages.last() {
         Some(last) if last.role == Role::Assistant && has_tool_use(last) => messages.len() - 1,
@@ -682,6 +708,19 @@ fn safe_cancel_truncate_len(session: &Session) -> usize {
         // paired tool_result round-trip: everything present is safe to keep.
         _ => messages.len(),
     }
+}
+
+/// The messages safe to seed a forked child session with.
+pub fn forkable_messages(session: &Session) -> Vec<Message> {
+    session.messages()[..fork_prefix_len(session)].to_vec()
+}
+
+/// Rollback length for a cancelled run under the "preserve completed work"
+/// policy: keep this run's user prompt plus every assistant/tool round-trip that
+/// already completed, and drop only a trailing assistant message whose tool_use
+/// has no matching tool_result. Shares the rule with [`fork_prefix_len`].
+fn safe_cancel_truncate_len(session: &Session) -> usize {
+    fork_prefix_len(session)
 }
 
 /// Whether a message carries any `tool_use` block (and therefore needs a
@@ -4876,5 +4915,73 @@ mod tests {
             estimate_prefill_tokens(&req),
             crate::compact::IMAGE_TOKEN_ESTIMATE as u32
         );
+    }
+
+    #[test]
+    fn fork_prefix_drops_a_trailing_unpaired_tool_use() {
+        use crate::message::{ContentBlock, Message};
+
+        let mut session = Session::new();
+        session.push(Message::user("hi"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "working".into(),
+        )]));
+        // 末尾 assistant(tool_use) 尚未配对，fork 必须丢掉它
+        session.push(Message::assistant(vec![ContentBlock::ToolUse {
+            id: "call-1".into(),
+            name: "spawn_agent".into(),
+            input: serde_json::json!({"task": "x", "fork": true}),
+        }]));
+
+        assert_eq!(
+            fork_prefix_len(&session),
+            2,
+            "unpaired tool_use must be dropped"
+        );
+        assert_eq!(forkable_messages(&session).len(), 2);
+    }
+
+    #[test]
+    fn fork_prefix_keeps_a_paired_tool_round_trip() {
+        use crate::message::{ContentBlock, Message};
+
+        let mut session = Session::new();
+        session.push(Message::user("hi"));
+        session.push(Message::assistant(vec![ContentBlock::ToolUse {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        }]));
+        session.push(Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: vec![ContentBlock::Text("ok".into())],
+            is_error: false,
+        }]));
+
+        assert_eq!(
+            fork_prefix_len(&session),
+            3,
+            "a paired round-trip is complete history"
+        );
+    }
+
+    #[test]
+    fn session_handle_stays_the_same_across_with_session_arc() {
+        use crate::message::Message;
+
+        let agent = Agent::new(
+            Arc::new(ScriptedProvider::new(vec![])),
+            Arc::new(crate::ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        let handle = agent.session_handle();
+        handle.lock().unwrap().push(Message::user("kept"));
+
+        let rebuilt = agent.with_session_arc(handle.clone());
+        assert!(
+            Arc::ptr_eq(&handle, &rebuilt.session_handle()),
+            "with_session_arc must reuse the caller's Arc, not mint a new one"
+        );
+        assert_eq!(rebuilt.session().messages().len(), 1);
     }
 }

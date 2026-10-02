@@ -12,7 +12,8 @@ pub mod tool;
 // Re-export most-used types at crate root.
 pub use agent::{
     Agent, AgentConfig, AgentError, AgentEvent, DoneReason, Inbox, InboxHandle, InterjectError,
-    Interjection, ProviderTurnGate, ProviderTurnLease, RetryCause, Session,
+    Interjection, ProviderTurnGate, ProviderTurnLease, RetryCause, Session, fork_prefix_len,
+    forkable_messages,
 };
 pub use compact::{
     CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
