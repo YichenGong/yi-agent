@@ -15,7 +15,7 @@ use super::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
     InheritedSandbox, IntegrationValidation, MessageId, PauseReason, PermissionDecision,
     PermissionRequestId, RecoveryEvidence, RootSessionId, TaskAttempt, TaskEvent, TaskFailure,
-    TaskId, TaskState, TimeoutKind, WatchdogEvidence, WorkspaceLeaseId,
+    TaskId, TaskState, TimeoutKind, TransitionResult, WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::trace::TraceFact;
 use super::worker::{
@@ -1771,7 +1771,7 @@ impl AgentSupervisor {
             .ok_or_else(|| "task does not exist".to_string())?
             .active_attempt_id()
             .clone();
-        self.reduce_task(
+        let (_affected, transition) = self.reduce_task_returning_transition(
             task_id,
             TaskEvent::ReviewRework {
                 attempt_id,
@@ -1779,15 +1779,9 @@ impl AgentSupervisor {
                 feedback,
             },
         )?;
-        // `ReviewRework` always installs a successor attempt as the task's
-        // active attempt, so that is the attempt this method reports.
-        let successor = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?
-            .active_attempt()
-            .clone();
-        Ok(successor)
+        transition
+            .new_attempt
+            .ok_or_else(|| "rework did not create a successor attempt".to_string())
     }
 
     /// Rejects the exact reviewed delivery through reducer-owned state.
@@ -1893,14 +1887,13 @@ impl AgentSupervisor {
             .ok_or_else(|| "task does not exist".to_string())?
             .active_attempt_id()
             .clone();
-        self.reduce_task(task_id, TaskEvent::RetryRequested { attempt_id })?;
-        // `RetryRequested` installs the successor as the active attempt.
-        let next = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?
-            .active_attempt()
-            .clone();
+        let (_affected, transition) = self
+            .reduce_task_returning_transition(task_id, TaskEvent::RetryRequested { attempt_id })?;
+        // `RetryRequested` installs the successor as the active attempt; read it
+        // from the reducer's transition so the invariant is typed, not implied.
+        let next = transition
+            .new_attempt
+            .expect("retry creates a successor attempt");
         self.notify_update();
         Ok(next)
     }
@@ -2018,18 +2011,33 @@ impl AgentSupervisor {
         task_id: &TaskId,
         event: TaskEvent,
     ) -> Result<Vec<TaskId>, String> {
-        {
+        self.reduce_task_returning_transition(task_id, event)
+            .map(|(changed, _transition)| changed)
+    }
+
+    /// Same single choke point as [`Self::reduce_task`], but additionally returns
+    /// the reducer's [`TransitionResult`]. Callers that need the successor
+    /// attempt created by an event must use this: read `TransitionResult::new_attempt`
+    /// rather than re-deriving it from `active_attempt()` after the fact, so a
+    /// reducer change that stops installing the successor as active cannot
+    /// silently hand back the wrong attempt id.
+    pub fn reduce_task_returning_transition(
+        &mut self,
+        task_id: &TaskId,
+        event: TaskEvent,
+    ) -> Result<(Vec<TaskId>, TransitionResult), String> {
+        let transition = {
             let task = self
                 .tasks
                 .get_mut(task_id)
                 .ok_or_else(|| "task does not exist".to_string())?;
             task.reduce(event, chrono::Utc::now())
-                .map_err(|error| error.to_string())?;
-        }
+                .map_err(|error| error.to_string())?
+        };
         let mut changed = vec![task_id.clone()];
         changed.extend(self.settle_terminal(task_id));
         self.notify_update();
-        Ok(changed)
+        Ok((changed, transition))
     }
 }
 
@@ -2711,5 +2719,28 @@ mod tests {
             &TaskState::Running,
             "a retried (queued) parent must not cascade its live children"
         );
+    }
+
+    #[test]
+    fn retry_task_returns_the_installed_successor_attempt() {
+        // Pins the typed invariant restored at the reduce choke point:
+        // `retry_task` reports exactly the successor `TransitionResult::new_attempt`
+        // names, which `start_next_attempt` installs as the active attempt.
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let task = supervisor.root_task_id().clone();
+        supervisor.start_task(&task).unwrap();
+        let previous = supervisor.task(&task).unwrap().active_attempt_id().clone();
+        supervisor.fail_task(&task, "boom").unwrap();
+
+        let next = supervisor.retry_task(&task).unwrap();
+
+        assert_ne!(next.id, previous);
+        assert_eq!(next.number, 2);
+        assert_eq!(
+            supervisor.task(&task).unwrap().active_attempt_id(),
+            &next.id,
+            "the successor reported by retry_task must be the installed active attempt"
+        );
+        assert_eq!(supervisor.task(&task).unwrap().state(), &TaskState::Queued);
     }
 }
