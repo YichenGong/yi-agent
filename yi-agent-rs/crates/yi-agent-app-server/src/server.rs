@@ -21,7 +21,7 @@ use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
-    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, ThreadStatus,
+    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, ThreadStatus,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -795,7 +795,7 @@ fn plugin_query(
             return Err(BoardQueryError::new(
                 "board_not_created",
                 "this project has no board",
-            ))
+            ));
         }
     }
     // The daemon that runs the plugin lives at the project root, which is also
@@ -803,8 +803,12 @@ fn plugin_query(
     // 复用共享 helper 而不是手写 `.yi-agent/runtime`：它先认 `YI_AGENT_RUNTIME_DIR`，
     // 与工作区其它地方对「runtime socket 在哪」保持同一个定义。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(project);
-    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir)
-        .map_err(|error| BoardQueryError::new("daemon_unavailable", format!("daemon is unavailable: {error}")))?;
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| {
+        BoardQueryError::new(
+            "daemon_unavailable",
+            format!("daemon is unavailable: {error}"),
+        )
+    })?;
     let response = yi_agent_store::ipc::send_request(
         &socket,
         yi_agent_store::ipc::IpcRequest::PluginQuery {
@@ -813,21 +817,24 @@ fn plugin_query(
             params,
         },
     )
-    .map_err(|error| BoardQueryError::new("daemon_unavailable", format!("daemon is unavailable: {error}")))?;
+    .map_err(|error| {
+        BoardQueryError::new(
+            "daemon_unavailable",
+            format!("daemon is unavailable: {error}"),
+        )
+    })?;
     match response {
         yi_agent_store::ipc::IpcResponse::PluginResult { value } => Ok(value),
         // A daemon that is up but has no answer for this plugin is the plugin's
         // absence, not the daemon's: the wording keeps the shape the desktop's
         // `pluginIsUnavailable` matches on.
-        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
-            Err(BoardQueryError::new(
-                "plugin_unavailable",
-                format!(
-                    "the plugin rejected the query: {code:?} {}",
-                    message.unwrap_or_default()
-                ),
-            ))
-        }
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(BoardQueryError::new(
+            "plugin_unavailable",
+            format!(
+                "the plugin rejected the query: {code:?} {}",
+                message.unwrap_or_default()
+            ),
+        )),
         other => Err(BoardQueryError::new(
             "plugin_unavailable",
             format!("daemon returned an unexpected response: {other:?}"),
@@ -930,6 +937,8 @@ pub(crate) fn production_factory(
 /// 主循环不再持有 reader/writer;`read_lines` 与 `pump_stdout` 各自独占一条流,
 /// 只与主循环交换 channel 消息(均 cancel-safe)。退出前摘除 `local` 客户端并
 /// 等待出口泵排空,保证最后一个响应总能写出。
+///
+/// stdio 就是桌面:注册为 `local` + `Scope::Admin`,保留全部能力。
 pub(crate) async fn serve_stdio<R, W, F>(
     reader: R,
     writer: W,
@@ -938,6 +947,47 @@ pub(crate) async fn serve_stdio<R, W, F>(
     workspaces: Arc<WorkspaceIndex>,
     attachments: RuntimeAttachments,
     build_agent: F,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>
+        + Send
+        + 'static,
+{
+    serve_scoped(
+        reader,
+        writer,
+        cfg,
+        permission_timeout,
+        workspaces,
+        attachments,
+        build_agent,
+        // 桌面 stdio 是 Admin:所有既有 RPC 行为不变。
+        Scope::Admin,
+    )
+    .await
+}
+
+/// 与 [`serve_stdio`] 逐字节相同,只多一个 `client_scope`。
+///
+/// 存在的唯一理由是让"低权客户端的门禁"可测:测试经 `Harness::with_scope`
+/// 以 `Control` 注册那个 `local` 客户端。生产路径上 `serve_stdio` 传
+/// `Scope::Admin`,`run` 与 `serve_stdio` 的公开签名都不因此改变。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_scoped<R, W, F>(
+    reader: R,
+    writer: W,
+    cfg: RuntimeConfig,
+    permission_timeout: Duration,
+    workspaces: Arc<WorkspaceIndex>,
+    attachments: RuntimeAttachments,
+    build_agent: F,
+    client_scope: Scope,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -964,6 +1014,8 @@ where
         local.clone(),
     ));
     tokio::spawn(read_lines(reader, local.clone(), inbound_tx));
+    // scope 随连接登记一次;主循环按 `client` id 查它。
+    let client_scopes = HashMap::from([(local.clone(), client_scope)]);
     let result = serve(
         inbound_rx,
         Arc::clone(&hub),
@@ -972,6 +1024,7 @@ where
         workspaces,
         attachments,
         build_agent,
+        client_scopes,
     )
     .await;
     // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
@@ -1043,6 +1096,11 @@ async fn pump_stdout<W>(
 ///
 /// **取消安全**:入站读取由传输层任务负责(`read_lines` / WS 读循环),主循环只在
 /// 一个 channel 上 `recv`。
+///
+/// `client_scopes` 是**每连接一次**的 scope 登记(传输层注册客户端时确定):
+/// stdio 的 `local` 是 `Admin`,WS 连接是它 token 的 scope。scope 不进 channel
+/// 载荷——它不随单条消息变化,而客户端 id 已经是载荷的一部分,用一张表按 id
+/// 查即可。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<F>(
     mut inbound: mpsc::Receiver<(crate::broadcast::ClientId, anyhow::Result<String>)>,
@@ -1052,6 +1110,7 @@ pub(crate) async fn serve<F>(
     workspaces: Arc<WorkspaceIndex>,
     attachments: RuntimeAttachments,
     build_agent: F,
+    client_scopes: HashMap<crate::broadcast::ClientId, Scope>,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -1080,7 +1139,13 @@ where
     // request_id=1 开始,若用 request_id 直接做 key 会跨 thread 碰撞。
     let perm_seq = Arc::new(AtomicU64::new(1));
 
-    let mut initialized = false;
+    // 每客户端 `initialized` 与 scope 登记。Tier 0 只有一个客户端时
+    // `initialized` 等价于一个 bool;Tier 1 起 stdio 与多台 ws 设备共享本主
+    // 循环,「谁 initialize 过了」「谁是什么 scope」都必须按 ClientId 记账,
+    // 否则一台设备握手会替另一台解锁、或低权设备的请求被当成高权。
+    // scope 由传输层在注册时给定(`client_scopes` 参数);这里补一条兜底,
+    // 未登记的客户端按最低权 `Observe` 处理(fail-closed)。
+    let mut initialized: HashMap<crate::broadcast::ClientId, bool> = HashMap::new();
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
@@ -1144,7 +1209,22 @@ where
                         // `result` 或 `error` 才算响应,否则视为畸形帧报错。
                         match serde_json::from_value::<ClientResponse>(value) {
                             Ok(resp) if resp.result.is_some() || resp.error.is_some() => {
-                                route_client_response(resp, &pending).await;
+                                // 首次命中才广播:第二次应答(另一台设备也点了
+                                // "允许")是 no-op 成功,不再产生广播,也就不会
+                                // 来回弹提示。
+                                if let Some((perm_id, decision)) =
+                                    route_client_response(resp, &pending).await
+                                {
+                                    write_notification(
+                                        &hub,
+                                        &Notification::ToolCallApprovalResolved {
+                                            perm_id,
+                                            by: client.as_str().to_string(),
+                                            decision: decision_label(&decision),
+                                        },
+                                    )
+                                    .await?;
+                                }
                             }
                             _ => {
                                 write_response(
@@ -1163,15 +1243,39 @@ where
                 let id = req.id.clone();
                 let method = req.method.clone();
 
-                // 未 initialize 前,除 `initialize` 外的请求一律拒绝。
-                if !initialized && method != "initialize" {
+                // 未 initialize 前,除 `initialize` 外的请求一律拒绝。按客户端
+                // 判断,而非全局一个 bool。
+                let client_initialized = initialized.get(&client).copied().unwrap_or(false);
+                if !client_initialized && method != "initialize" {
                     write_response(&hub, &client, err_response(id, RpcError::not_initialized())).await?;
+                    continue;
+                }
+
+                // admin 类方法:control/observe 客户端一律拒绝。放在
+                // `!initialized` 检查之后,故未握手的客户端仍先得到
+                // `not_initialized`;scope 缺失按 fail-closed 的 `Observe` 处理。
+                const ADMIN_METHODS: [&str; 3] = [
+                    "thread/delete",
+                    "process/kill",
+                    "thread/setPermissionMode",
+                ];
+                let client_scope = client_scopes
+                    .get(&client)
+                    .copied()
+                    .unwrap_or(Scope::Observe);
+                if ADMIN_METHODS.contains(&method.as_str()) && client_scope < Scope::Admin {
+                    write_response(
+                        &hub,
+                        &client,
+                        err_response(id, RpcError::insufficient_scope(Scope::Admin)),
+                    )
+                    .await?;
                     continue;
                 }
 
                 match method.as_str() {
                     "initialize" => {
-                        initialized = true;
+                        initialized.insert(client.clone(), true);
                         write_response(
                             &hub, &client,
                             ok_response(
@@ -2966,19 +3070,40 @@ fn thread_summary_json(
 }
 
 /// 把客户端对反向请求的响应路由到等待中的 driver。
+///
+/// 返回 `Some(decision)` 表示本次响应**首次**命中;`None` 表示该审批已被别的
+/// 客户端处理(或根本不存在)。后者不是错误:双端同时点"允许"时,后到者是
+/// no-op 成功,而不是报错——报错会让另一端弹出一个无意义的失败提示。
 async fn route_client_response(
     resp: ClientResponse,
     pending: &Mutex<HashMap<String, oneshot::Sender<Decision>>>,
-) {
+) -> Option<(String, Decision)> {
     let RequestId::Str(key) = resp.id else {
         tracing::warn!("ignoring client response with non-string id");
-        return;
+        return None;
     };
     let Some(tx) = pending.lock().await.remove(&key) else {
-        tracing::warn!("no pending approval request for id {key}");
-        return;
+        // 已被先到的应答取走:安静地当作 no-op,不 warn(双答是预期场景)。
+        tracing::debug!("approval {key} was already resolved");
+        return None;
     };
-    let _ = tx.send(parse_client_decision(resp.result.as_ref()));
+    let decision = parse_client_decision(resp.result.as_ref());
+    let _ = tx.send(decision.clone());
+    Some((key, decision))
+}
+
+/// wire 上的决定标签,与 `parse_client_decision` 接受的取值互逆。
+///
+/// `AlwaysAllowPrefix` 丢掉前缀:本标签只回答"是谁、做了什么类型的决定",
+/// 不含策略细节;需要前缀的客户端可保留自己的弹窗上下文。
+fn decision_label(decision: &Decision) -> String {
+    match decision {
+        Decision::AllowOnce => "allow_once",
+        Decision::AlwaysAllowTool => "always_allow_tool",
+        Decision::AlwaysAllowPrefix(_) => "always_allow_prefix",
+        Decision::Deny => "deny",
+    }
+    .to_string()
 }
 
 /// 解析客户端的权限决定;任何未知/畸形取值一律按 Deny 处理(fail-safe)。
@@ -3623,14 +3748,21 @@ fn extract_prompt(params: &serde_json::Value) -> Option<String> {
 mod board_rpc_tests {
     use super::*;
 
-    async fn rpc(h: &mut tests::Harness, id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
-        h.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        })
-        .to_string())
+    async fn rpc(
+        h: &mut tests::Harness,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        h.send(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+        )
         .await;
         loop {
             let value = h.read_value().await;
@@ -3645,9 +3777,20 @@ mod board_rpc_tests {
         let mut h = tests::Harness::new();
         tests::initialize(&mut h).await;
         let project = tempfile::TempDir::new().unwrap();
-        let project_path = project.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let project_path = project
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
 
-        let created = rpc(&mut h, 2, "board/create", json!({ "project": project_path })).await;
+        let created = rpc(
+            &mut h,
+            2,
+            "board/create",
+            json!({ "project": project_path }),
+        )
+        .await;
         assert!(created.get("error").is_none(), "{created}");
         assert_eq!(created["result"]["registered"], true, "{created}");
 
@@ -3657,7 +3800,13 @@ mod board_rpc_tests {
         assert_eq!(boards[0]["project"], project_path);
         assert_eq!(boards[0]["status"]["registered"], true, "{listed}");
 
-        let removed = rpc(&mut h, 4, "board/remove", json!({ "project": project_path })).await;
+        let removed = rpc(
+            &mut h,
+            4,
+            "board/remove",
+            json!({ "project": project_path }),
+        )
+        .await;
         assert!(removed.get("error").is_none(), "{removed}");
 
         let listed = rpc(&mut h, 5, "board/list", json!({})).await;
@@ -3766,7 +3915,11 @@ mod plugin_query_tests {
     fn fake_daemon(
         dir: &Path,
         result: serde_json::Value,
-    ) -> (PathBuf, Arc<StdMutex<serde_json::Value>>, std::thread::JoinHandle<()>) {
+    ) -> (
+        PathBuf,
+        Arc<StdMutex<serde_json::Value>>,
+        std::thread::JoinHandle<()>,
+    ) {
         // The exact path `plugin_query` dials, via the same helper the
         // implementation uses: a fake bound anywhere else would let a
         // wrong-path implementation pass.
@@ -3814,8 +3967,10 @@ mod plugin_query_tests {
     fn a_query_reaches_the_daemon_with_the_plugin_and_method_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let (project, global) = project_and_registry(dir.path(), true);
-        let (_socket, seen, handle) =
-            fake_daemon(&project, json!({ "type": "PluginResult", "value": { "cards": [] } }));
+        let (_socket, seen, handle) = fake_daemon(
+            &project,
+            json!({ "type": "PluginResult", "value": { "cards": [] } }),
+        );
 
         plugin_query(
             &project,
@@ -3861,8 +4016,8 @@ mod plugin_query_tests {
         let dir = tempfile::tempdir().unwrap();
         let (project, global) = project_and_registry(dir.path(), false);
 
-        let error = plugin_query(&project, &global, "list", "superpowers-kanban", json!({}))
-            .unwrap_err();
+        let error =
+            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
         assert_eq!(error.code, "board_not_created", "{error}");
     }
 
@@ -3871,8 +4026,8 @@ mod plugin_query_tests {
         let dir = tempfile::tempdir().unwrap();
         let (project, global) = project_and_registry(dir.path(), true);
 
-        let error = plugin_query(&project, &global, "list", "superpowers-kanban", json!({}))
-            .unwrap_err();
+        let error =
+            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
         assert_eq!(
             error.code, "daemon_unavailable",
             "不能让 UI 误以为是「插件没装」:{error}"
@@ -3901,7 +4056,10 @@ mod plugin_query_tests {
 
         assert_eq!(error.code, "plugin_unavailable", "{error}");
         assert!(error.message.contains("is not available"), "{error}");
-        assert!(error.message.contains("plugin"), "既有措辞形状必须保留:{error}");
+        assert!(
+            error.message.contains("plugin"),
+            "既有措辞形状必须保留:{error}"
+        );
     }
 
     /// The dispatch mapping the UI actually reads. The numeric code is the
@@ -3936,7 +4094,10 @@ mod plugin_query_tests {
                 break value;
             }
         };
-        assert_eq!(value["error"]["data"]["code"], "board_not_created", "{value}");
+        assert_eq!(
+            value["error"]["data"]["code"], "board_not_created",
+            "{value}"
+        );
         assert_eq!(value["error"]["code"], -32020, "{value}");
         h.shutdown().await;
     }
@@ -4592,7 +4753,36 @@ mod tests {
         }
 
         /// 用自定义 config + agent 工厂搭建 harness(持久化测试需要自定义 workdir)。
+        ///
+        /// 生产 stdio 恒为 `Scope::Admin`,故此处固定传 `Admin`;要驱动门禁分支
+        /// 用 [`Harness::with_scope`]。
         fn with_config<F>(cfg: RuntimeConfig, build: F, permission_timeout: Duration) -> Self
+        where
+            F: Fn(
+                    Option<yi_agent_core::Session>,
+                    &std::path::Path,
+                    crate::thread_store::ThreadMode,
+                ) -> anyhow::Result<BuiltAgent>
+                + Send
+                + 'static,
+        {
+            Self::with_config_and_scope(cfg, build, permission_timeout, Scope::Admin)
+        }
+
+        /// 把 `local` 客户端注册为给定 `scope` 的 harness。
+        ///
+        /// 与 [`Harness::new`] 唯一的不同是这对 `serve_scoped` 的 `client_scope`
+        /// 实参;生产路径(`serve_stdio`)恒为 `Admin`,故它只服务门禁测试。
+        pub(crate) async fn with_scope(scope: Scope) -> Self {
+            Self::with_config_and_scope(test_config(), build_test_agent, PERMISSION_TIMEOUT, scope)
+        }
+
+        fn with_config_and_scope<F>(
+            cfg: RuntimeConfig,
+            build: F,
+            permission_timeout: Duration,
+            scope: Scope,
+        ) -> Self
         where
             F: Fn(
                     Option<yi_agent_core::Session>,
@@ -4609,7 +4799,7 @@ mod tests {
             let workspaces = Arc::new(WorkspaceIndex::new(
                 index_dir.path().join("workspaces.json"),
             ));
-            let handle = tokio::spawn(serve_stdio(
+            let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
                 cfg,
@@ -4624,6 +4814,7 @@ mod tests {
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                 },
                 build,
+                scope,
             ));
             Self {
                 client_w,
@@ -8422,5 +8613,81 @@ mod tests {
         let v = read_response(&mut h, 23).await;
         assert_eq!(v["error"]["code"], -32602, "重复 id → invalid_params: {v}");
         h.shutdown().await;
+    }
+
+    /// A `Control` client (a paired phone) must not be able to run admin-class
+    /// RPCs; `thread/delete` is the canonical one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_client_cannot_delete_a_thread() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "admin op from a control client: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// The desktop stdio client is `Admin`: the same call must go through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admin_client_may_delete_a_thread() {
+        let mut h = Harness::with_scope(Scope::Admin).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert!(
+            v["result"].is_object(),
+            "admin client must be allowed to delete: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// Approval is one-question/one-answer even with many clients: the first
+    /// answer routes to the driver, a second answer for the same `perm_id` is a
+    /// no-op success (not an error — the other device may simply have tapped
+    /// "allow" a beat later).
+    ///
+    /// The full two-client ws round trip (including the `approvalResolved`
+    /// broadcast) belongs to Task 5's E2E; here the routing core is pinned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_second_approval_answer_is_a_noop_and_the_first_wins() {
+        let pending: Mutex<HashMap<String, oneshot::Sender<Decision>>> = Mutex::new(HashMap::new());
+        let (tx, mut rx) = oneshot::channel::<Decision>();
+        pending.lock().await.insert("perm-1".to_string(), tx);
+
+        let resp = ClientResponse {
+            jsonrpc: Some("2.0".to_string()),
+            id: RequestId::Str("perm-1".to_string()),
+            result: Some(json!({ "decision": "allow_once" })),
+            error: None,
+        };
+
+        let first = route_client_response(resp.clone(), &pending)
+            .await
+            .expect("the first answer must route to the waiting driver");
+        assert_eq!(first.0, "perm-1");
+        assert!(matches!(first.1, Decision::AllowOnce));
+
+        // The same client (or a second one) answers again: no-op, not an error.
+        let second = route_client_response(resp, &pending).await;
+        assert!(
+            second.is_none(),
+            "a second answer for an already-resolved approval must be a no-op"
+        );
+
+        // The driver saw exactly one decision.
+        assert!(matches!(rx.try_recv(), Ok(Decision::AllowOnce)));
+        assert!(
+            rx.try_recv().is_err(),
+            "the driver must receive exactly one decision"
+        );
     }
 }

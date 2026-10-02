@@ -117,6 +117,14 @@ impl RpcError {
     pub fn not_running() -> Self {
         Self::new(-32013, "no turn is running".to_string())
     }
+    /// The client's [`Scope`] is below what the method requires.
+    ///
+    /// Distinct from `method_not_found`: the method exists and the caller is
+    /// authenticated, it is simply not allowed to run *this* method on *its*
+    /// connection. The required scope is in the message so a UI can explain it.
+    pub fn insufficient_scope(required: Scope) -> Self {
+        Self::new(-32014, format!("insufficient scope: requires {required:?}"))
+    }
     /// A board query that reached no answer.
     ///
     /// The numeric code is only a coarse fallback for clients that read nothing
@@ -233,6 +241,16 @@ pub enum Notification {
         /// `ProcessStatus` 的 serde 标签：starting / running / ready / exited /
         /// killed / failed_to_start。
         state: String,
+    },
+    /// 某次审批已被**任一**客户端处理;其余客户端据此关闭弹窗。
+    ///
+    /// 广播而非定向,因为发起审批的 turn 属于共享的 app-server,而等待的
+    /// 设备可能不止一台:谁先答谁生效,其余设备需要知道「这个弹窗已经没用了」。
+    #[serde(rename = "item/toolCall/approvalResolved")]
+    ToolCallApprovalResolved {
+        perm_id: String,
+        by: String,
+        decision: String,
     },
     #[serde(rename = "error")]
     Error { message: String },

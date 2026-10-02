@@ -31,6 +31,10 @@ pub async fn serve_ws(
     let serve_task = tokio::spawn(async move {
         use std::collections::HashMap;
         use std::sync::Mutex as StdMutex;
+        // Tier 0 的 ws 连接还不携带设备 scope(Tier 1 的 token→device 绑定尚未
+        // 接上)。空表 = 未登记,主循环按 fail-closed 的 `Observe` 处理;这比
+        // 假装成 `Admin` 安全。接线时这里换成 `device.scope`。
+        let client_scopes = HashMap::new();
         serve(
             inbound_rx,
             serve_hub,
@@ -44,6 +48,7 @@ pub async fn serve_ws(
                 launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             },
             production_factory(serve_cfg),
+            client_scopes,
         )
         .await
     });
