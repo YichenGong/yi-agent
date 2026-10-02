@@ -105,7 +105,7 @@ fn session_handle_stays_the_same_across_with_session_arc() {
     use crate::message::Message;
 
     let agent = Agent::new(
-        Arc::new(ScriptedProvider::default()),
+        Arc::new(ScriptedProvider::new(vec![])),
         Arc::new(crate::ToolRegistry::new()),
         AgentConfig::default(),
     );
