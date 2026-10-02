@@ -140,6 +140,14 @@ yi-agent app-server --listen ws://127.0.0.1:8790   # 绑定非回环时会打印
 已订阅时逐字输出会合并降频（每 100ms 或 4KB 一刷，跨 item 不合并、顺序不变），减少外网
 手机的流量与噪音。见 [按会话订阅过滤设计](docs/superpowers/specs/2026-10-02-thread-subscription-filtering-design.md)。
 
+投递按 IM 式分三层：**List 层**（`thread/started`、`thread/status/updated`）与 **Global 层**
+（`ui/settings/updated`、`error` 等）**永远投给所有客户端**，所以侧栏的会话列表与运行状态
+在任何设备上都是实时的；**Content 层**（`item/*`、`turn/*` 等正文）才按 `thread/subscribe`
+过滤。远程（iOS）客户端因此只保一个最多 8 条会话的 LRU 热窗口随选择滚动订阅，窗口外的
+冷会话保持安静；当用户切回一个**正在跑**的冷会话时，客户端用只读的
+`thread/readItems {threadId, afterItemId?}` 补齐既有内容，而**不用 `thread/resume`**——
+后者会打断进行中的回合。桌面（stdio）端从不订阅，天然全收。
+
 > **实验性**：配对链路已**端到端打通**——`pair/create` 铸出的码**落盘**到
 > `~/.yi-agent/pairing.json`，因此桌面 stdio 进程铸的码可被 `--relay`/`ws://` 进程
 > 兑换；iOS 首启有配对表单（填中继地址 + 码），桌面设置里有「远程访问」页可铸码与

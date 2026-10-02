@@ -159,6 +159,19 @@ never merged across items, order preserved) to cut the traffic and noise on a
 phone over the WAN. See the
 [thread-scoped subscription design](docs/superpowers/specs/2026-10-02-thread-subscription-filtering-design.md).
 
+Delivery is split into three IM-style layers: the **list layer**
+(`thread/started`, `thread/status/updated`) and the **global layer**
+(`ui/settings/updated`, `error`, …) always reach every client, so the sidebar's
+session list and run status stay live on any device; only the **content layer**
+(`item/*`, `turn/*`, and the rest of the transcript) is filtered by
+`thread/subscribe`. A remote (iOS) client therefore keeps just an LRU warm
+window of at most 8 threads, rolling its subscription as the user selects them;
+threads outside the window stay quiet. When the user returns to a **running**
+cold thread the client catches it up with the read-only
+`thread/readItems {threadId, afterItemId?}` instead of `thread/resume`, which
+would interrupt the in-flight turn. The desktop (stdio) client never subscribes
+and so always receives everything.
+
 > **Experimental**: the pairing flow is now **wired end-to-end** — a
 > `pair/create` code is **persisted** to `~/.yi-agent/pairing.json`, so a code
 > minted by the desktop stdio process can be redeemed by the separate
