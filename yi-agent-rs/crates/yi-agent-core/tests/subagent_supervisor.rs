@@ -65,10 +65,14 @@ async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
 /// A coding child delivers a commit to its parent over the mailbox. If that
 /// parent is already terminal (a recovered root is parked in
 /// `recovery_required`, which is terminal), the notification can never be
-/// accepted — but that is not the child's fault and must not throw away the
-/// child's completion fact. Before the fix this `Delivered` event failed, the
-/// error aborted the whole reconciliation pass, and the child stayed `running`
-/// forever with no completion event.
+/// accepted. Under the cascade design a settled parent must not keep running
+/// children at all — any live child is cancelled, and a delivery that has no
+/// remaining audience is not kept around. So this test no longer asserts the
+/// child parks in `AwaitingParentReview`; what it still guards is the weaker
+/// but essential invariant that reconciliation never wedges, whether or not the
+/// delivery happens to be accepted before the cascade lands. Before the fix this
+/// `Delivered` event failed, the error aborted the whole reconciliation pass,
+/// and the child stayed `running` forever with no completion event.
 #[tokio::test]
 async fn a_coding_delivery_to_a_terminal_parent_does_not_wedge_reconciliation() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -103,11 +107,8 @@ async fn a_coding_delivery_to_a_terminal_parent_does_not_wedge_reconciliation() 
         "a delivery to a terminal parent must not wedge reconciliation, got {reconciled:?}"
     );
     assert!(
-        matches!(
-            supervisor.task(&child).unwrap().state(),
-            TaskState::AwaitingParentReview(_)
-        ),
-        "the child's delivery must still be recorded, got {:?}",
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "a child of a settled parent must not keep running, got {:?}",
         supervisor.task(&child).unwrap().state()
     );
 }
