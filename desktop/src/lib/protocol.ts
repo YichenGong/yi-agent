@@ -93,6 +93,7 @@ export type Notification =
       method: "agent/trace/event";
       params: { threadId: string; taskId: string; row: AgentTraceRow };
     }
+  | { method: "ui/settings/updated"; params: { theme: string } }
   | { method: "error"; params: { message: string } };
 
 /**

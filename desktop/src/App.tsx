@@ -451,13 +451,9 @@ export default function App() {
         force((v) => v + 1);
         return;
       }
-      // `ui/settings/updated` 是后端新增的通知，尚未进 protocol.ts 的
-      // Notification 联合；按宽松形状读取它（本任务只允许改 App.tsx /
-      // App.test.tsx，不为一条通知动共享类型），其余分支仍走窄类型。
-      const loose = n as { method: string; params?: unknown };
-      if (loose.method === "ui/settings/updated") {
+      if (n.method === "ui/settings/updated") {
         // 对话（set_theme 工具）改了主题：跟随它。
-        setTheme(parseTheme((loose.params as { theme?: unknown } | undefined)?.theme));
+        setTheme(parseTheme(n.params.theme));
         return;
       }
       if (n.method === "agent/trace/event") {
