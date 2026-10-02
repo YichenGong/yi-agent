@@ -242,6 +242,8 @@ device/revoke → 撤销某设备（立即断开其 ws 并使其 token 失效）
 | 反向请求 `requestApproval`（`:3017`） | 单流 | `hub.broadcast(…)`，**先到先得** |
 | `route_client_response`（`:2665`） | 命中即路由 | 未命中（已被别端处理）**静默成功**；命中后广播 `item/toolCall/approvalResolved { perm_id, by, decision }` |
 
+注：Tier 0 反向 `requestApproval` 仍走 `hub.reply(发起者)`（单客户端等价，且保留“客户端断开即收尾本轮”的语义），Tier 1 引入先到先得的多端审批时再改为 `hub.broadcast(…)` 扇出。
+
 `pending` 表按 `perm_id` 全局唯一（现状已如此：id 取自进程级 `perm_seq` 计数器，
 `server.rs:879`），因此**无需改 key**，只需加"双答"处理与已解决广播。
 
