@@ -845,7 +845,7 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
 /// a different remedy from "the daemon is down" and from "the plugin is not
 /// installed", and a bare message collapsed all three into one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoardQueryError {
+pub(crate) struct BoardQueryError {
     code: &'static str,
     message: String,
 }
@@ -942,6 +942,76 @@ fn plugin_query(
             format!("daemon returned an unexpected response: {other:?}"),
         )),
     }
+}
+
+/// The supervised plugin that owns the board.
+const KANBAN_PLUGIN: &str = "superpowers-kanban";
+
+/// Ask the kanban plugin a question.
+///
+/// `board_query` is the board-shaped name for `plugin_query`: it pins the
+/// plugin, so a caller cannot accidentally ask a different plugin a board
+/// question. `method` and `params` still pass through verbatim.
+fn board_query(
+    project: &Path,
+    board_dir: &Path,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, BoardQueryError> {
+    plugin_query(project, board_dir, method, KANBAN_PLUGIN, params)
+}
+
+/// One card, in the shape the desktop needs to draw and act on it.
+///
+/// `thread_id` and `workdir` are optional because a card on a board the
+/// runner has not launched yet has neither; `spec_path` is a plain string
+/// (not a `PathBuf`) because it is copied to the desktop as-is.
+#[derive(Debug, Clone)]
+pub(crate) struct BoardCard {
+    pub id: String,
+    pub state: String,
+    pub thread_id: Option<String>,
+    pub workdir: Option<PathBuf>,
+    pub spec_path: String,
+}
+
+/// Every card on the board, dropped to the fields the desktop works with.
+///
+/// A malformed entry (one with no `id` or `state`) is skipped rather than
+/// failing the whole call: a single bad card must not blank the board. A
+/// missing `cards` key reads as an empty board.
+pub(crate) fn board_cards(
+    project: &Path,
+    board_dir: &Path,
+) -> Result<Vec<BoardCard>, BoardQueryError> {
+    let value = board_query(project, board_dir, "list", json!({}))?;
+    let cards = value
+        .get("cards")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(cards
+        .into_iter()
+        .filter_map(|card| {
+            Some(BoardCard {
+                id: card.get("id")?.as_str()?.to_string(),
+                state: card.get("state")?.as_str()?.to_string(),
+                thread_id: card
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                workdir: card
+                    .get("workdir")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from),
+                spec_path: card
+                    .get("spec_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect())
 }
 
 /// The project a `board/*` request names, canonicalized when the directory
@@ -4684,6 +4754,28 @@ mod plugin_query_tests {
         assert_eq!(request["command"]["plugin"], "superpowers-kanban");
         assert_eq!(request["command"]["method"], "list");
         assert_eq!(request["command"]["params"]["verbose"], true);
+    }
+
+    /// `board_query` is the board-shaped alias for `plugin_query`: it has to
+    /// name the kanban plugin while passing `method`/`params` through
+    /// untouched, or every board call would ask the wrong plugin a question it
+    /// never asked for.
+    #[test]
+    fn board_query_targets_the_kanban_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, global) = project_and_registry(dir.path(), true);
+        let (_socket, seen, handle) = fake_daemon(
+            &project,
+            json!({ "type": "PluginResult", "value": { "cards": [] } }),
+        );
+
+        board_query(&project, &global, "list", json!({})).unwrap();
+        handle.join().unwrap();
+
+        let request = seen.lock().unwrap().clone();
+        assert_eq!(request["command"]["type"], "PluginQuery");
+        assert_eq!(request["command"]["plugin"], "superpowers-kanban");
+        assert_eq!(request["command"]["method"], "list");
     }
 
     #[test]
