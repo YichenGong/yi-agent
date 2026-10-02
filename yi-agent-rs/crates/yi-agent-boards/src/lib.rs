@@ -12,6 +12,7 @@ pub mod board_daemon;
 pub mod lifecycle;
 pub mod registry;
 pub mod scaffold;
+pub mod watch;
 
 /// Directory holding the global board registry and the shared lease slots:
 /// `$HOME/.yi-agent/superpowers-kanban`.
