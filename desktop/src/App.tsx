@@ -40,6 +40,8 @@ import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
+import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
+import { SettingsDialog } from "./components/SettingsDialog";
 
 /**
  * Read the persisted permission mode for a thread from the `thread/listAll`
@@ -115,6 +117,9 @@ export default function App() {
   // Collapsed board panel. Deliberately not persisted: every launch starts
   // expanded, and the switch state is independent of the panel being folded.
   const [kanbanCollapsed, setKanbanCollapsed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
+  const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -446,6 +451,15 @@ export default function App() {
         force((v) => v + 1);
         return;
       }
+      // `ui/settings/updated` 是后端新增的通知，尚未进 protocol.ts 的
+      // Notification 联合；按宽松形状读取它（本任务只允许改 App.tsx /
+      // App.test.tsx，不为一条通知动共享类型），其余分支仍走窄类型。
+      const loose = n as { method: string; params?: unknown };
+      if (loose.method === "ui/settings/updated") {
+        // 对话（set_theme 工具）改了主题：跟随它。
+        setTheme(parseTheme((loose.params as { theme?: unknown } | undefined)?.theme));
+        return;
+      }
       if (n.method === "agent/trace/event") {
         // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
         // 把两个任务的轨迹拼在一起安全。
@@ -466,6 +480,8 @@ export default function App() {
     client.onStatus((s) => setStatus(s.state));
     (async () => {
       await client.request("initialize", {});
+      const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
+      setTheme(parseTheme(settings.theme));
       await refreshWorkspaces();
       const list = await client.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
         "thread/listAll",
@@ -633,6 +649,15 @@ export default function App() {
     });
   };
 
+  const changeTheme = (next: Theme) => {
+    // 立即生效，再落盘；写失败由服务端通知/下次读取纠正。
+    setTheme(next);
+    clientRef.current?.request("ui/settings/write", { theme: next }).catch((e) => {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    });
+  };
+
   // Sidebar badges: server-authoritative status per thread + unread marker for
   // threads that finished a turn while the user was looking elsewhere.
   const statuses = new Map<string, ThreadStatus>();
@@ -650,6 +675,10 @@ export default function App() {
   const bannerItems = store
     .pendingApprovalsElsewhere()
     .filter((r) => !dismissedApprovals.current.has(r.id));
+
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
 
   return (
     <>
@@ -671,6 +700,7 @@ export default function App() {
           onNew={onNew}
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
+          onOpenSettings={() => setSettingsOpen(true)}
         />
         {kanbanCollapsed ? (
           <SuperpowersKanbanCollapsedStrip onExpand={() => setKanbanCollapsed(false)} />
@@ -791,6 +821,12 @@ export default function App() {
         )}
         </div>
       </div>
+      <SettingsDialog
+        open={settingsOpen}
+        theme={theme}
+        onThemeChange={changeTheme}
+        onClose={() => setSettingsOpen(false)}
+      />
     </>
   );
 }
