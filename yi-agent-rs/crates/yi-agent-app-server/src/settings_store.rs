@@ -94,9 +94,29 @@ pub fn save(workdir: &Path, theme: Theme) -> std::io::Result<()> {
     );
     let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
         .map_err(std::io::Error::other)?;
-    let tmp_path = dir.join("preferences.json.tmp");
+    // 临时名逐次唯一:同一目录可能有并发写者(runtime_prefs、kanban 的 scaffold
+    // 写的是同一个 `preferences.json`),固定名会互相截断。
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = temp_path_for(&dir, seq);
     std::fs::write(&tmp_path, &text)?;
     std::fs::rename(&tmp_path, &path)
+}
+
+/// 进程内递增序号,给每次写入的临时文件一个不同的后缀。
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 一次写入所用的临时文件名:`preferences.json.<pid>.<seq>.tmp`。
+///
+/// 与 `thread_store::write_atomic` 同一约定。`preferences.json` 是共享文件
+/// (`runtime_prefs` 与 kanban 的 `scaffold` 也写它):固定的
+/// `preferences.json.tmp` 会让并发写者互相截断、或把对方刚写的内容 rename
+/// 成自己的结果。最终的 `preferences.json` 与「读-改-写 + rename」不变。
+fn temp_path_for(dir: &Path, seq: u64) -> PathBuf {
+    dir.join(format!(
+        "preferences.json.{}.{}.tmp",
+        std::process::id(),
+        seq
+    ))
 }
 
 #[cfg(test)]
@@ -149,6 +169,46 @@ mod tests {
         assert_eq!(Theme::parse("dark"), Theme::Dark);
         assert_eq!(Theme::parse("  light "), Theme::Light);
         assert_eq!(Theme::parse(""), Theme::Dark);
+    }
+
+    /// `save` 之后目录里只该剩最终的 `preferences.json`,不留临时文件。
+    #[test]
+    fn saving_leaves_no_temp_file_behind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save(dir.path(), Theme::Light).unwrap();
+        save(dir.path(), Theme::Dark).unwrap();
+        assert_eq!(load(dir.path()), Theme::Dark);
+        let stray: Vec<String> = std::fs::read_dir(dir.path().join(".yi-agent"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "preferences.json")
+            .collect();
+        assert!(stray.is_empty(), "no temp file may survive a save: {stray:?}");
+    }
+
+    /// 每次写入用的临时名必须唯一:固定名会让同一目录的并发写者互相截断。
+    ///
+    /// 断言的是 `save` 真正调用的 [`temp_path_for`] 本身,不是复制一份命名规则。
+    #[test]
+    fn each_write_uses_a_unique_temp_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = temp_path_for(dir.path(), 0);
+        let second = temp_path_for(dir.path(), 1);
+        assert_ne!(
+            first, second,
+            "the temp name must differ per write or concurrent writers clobber each other"
+        );
+        let name = first.to_string_lossy().into_owned();
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "the temp name must carry the pid: {name}"
+        );
+        assert!(name.ends_with(".tmp"), "the temp name must stay *.tmp: {name}");
+        assert_ne!(
+            first,
+            preferences_path(dir.path()),
+            "the temp name must not be the final file name"
+        );
     }
 }
 
