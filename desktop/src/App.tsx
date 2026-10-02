@@ -170,6 +170,10 @@ export default function App() {
   // 挂载后主题是否已被更新的选择触碰过（ui/settings/updated 通知或用户
   // changeTheme）。首屏 read 在途时若被触碰，read 返回的旧值不得覆盖它。
   const themeTouchedRef = useRef(false);
+  // 值守同理：一旦用户拨过开关（onToggleWatchman 会写回宿主），后续任何一趟
+  // 在途的 read——尤其是重启后的重放握手——都不得用旧值把它覆盖回去。与主题
+  // 不同，值守没有 ui/settings/updated 通知，所以触碰后只认写入的返回值。
+  const watchmanTouchedRef = useRef(false);
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -731,7 +735,11 @@ export default function App() {
         if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
         // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
         // `ui/settings/read`。缺省口径由 parseBoardWatchman 与 readBoardWatchman 共享。
-        setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
+        // 同样只在用户还没拨过开关时采纳：重启重放握手时面板已在屏上，read 在途
+        // 期间拨下的开关不能被这趟迟到的旧值悄悄覆盖回原样。
+        if (!watchmanTouchedRef.current) {
+          setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
+        }
         await refreshWorkspaces();
         const list = await client.request<{
           groups: WorkspaceGroup[];
@@ -903,6 +911,9 @@ export default function App() {
    * 的告知（warning）原样摆到面板上——静默会让用户以为已经生效。
    */
   const onToggleWatchman = async (next: boolean) => {
+    // 先标记已触碰，再发写入（与 changeTheme 对 theme 的做法一致）：此刻若还有
+    // 一趟 ui/settings/read 在途（如重启重放的握手），它回来时必须让位。
+    watchmanTouchedRef.current = true;
     try {
       const result = await writeBoardWatchman(boardRpc, next);
       setWatchmanEnabled(next);

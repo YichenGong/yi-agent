@@ -140,6 +140,10 @@ export function parseBoardWatchman(value: unknown): boolean {
  * daemon（随宿主起停），因此直接走 `ui/settings/*`，与主题同一条通道，
  * 不经 `plugin/query`——那条通道带 `project`，答的是「这个项目的队列」，
  * 与「宿主上有没有一个值守进程」是两码事。
+ *
+ * 也是给需要专门读一次开关的调用方用的公开读入口；App 握手时已从同一趟
+ * `ui/settings/read` 里拿到 settings，直接套用 `parseBoardWatchman`，不再
+ * 多发这一趟。
  */
 export async function readBoardWatchman(rpc: BoardRpc): Promise<boolean> {
   const settings = await rpc<{ board_watchman_enabled?: unknown }>("ui/settings/read", {});

@@ -1147,14 +1147,15 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
   });
 
-  /** Defer `ui/settings/read` so a test can interleave a newer theme choice. */
+  /** Defer `ui/settings/read` so a test can interleave a newer choice (theme 或值守). */
   function deferRead() {
-    let resolveRead: (v: { theme?: unknown }) => void = () => {};
+    type ReadValue = { theme?: unknown; board_watchman_enabled?: unknown };
+    let resolveRead: (v: ReadValue) => void = () => {};
     state.dataSources["ui/settings/read"] = () =>
       new Promise((resolve) => {
         resolveRead = resolve;
       });
-    return async (value: { theme?: unknown }) => {
+    return async (value: ReadValue) => {
       await act(async () => resolveRead(value));
     };
   }
@@ -1204,7 +1205,8 @@ describe("App settings & theme wiring", () => {
 
   it("reads board_watchman_enabled and writes it back when the panel toggles it", async () => {
     // 值守是宿主级设置，与主题同走 ui/settings/*（而不是带 project 的
-    // plugin/query）：默认关、读到的值为 false，点一下要写回 true。
+    // plugin/query）：这里只是把这趟 read 的值 stub 成 false；默认口径其实是开
+    // （配置里没这个键也当开），点一下要写回 true。
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
     state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: false });
@@ -1247,6 +1249,50 @@ describe("App settings & theme wiring", () => {
         method: "ui/settings/write",
         params: { board_watchman_enabled: false },
       }),
+    );
+  });
+
+  it("does not let an in-flight re-handshake read clobber a fresh watchman toggle", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    // 两趟 read 都返回 true：迟到的旧值一旦被采纳，开关会弹回 true，断言即红。
+    const resolveRead = deferRead();
+    render(<App />);
+    await settle();
+    // 首屏 read 在途，面板还没法开——先把 handshake 放过去把面板拿到屏上。
+    await resolveRead({ theme: "dark", board_watchman_enabled: true });
+    await openBoardFor("/proj");
+    const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+
+    // 新一轮 read 在途（这正是重启后重放握手发的那趟），此时面板已在屏上。
+    const resolveStale = deferRead();
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+    await waitFor(() => expect(clients.length).toBe(2));
+    await waitFor(() =>
+      expect(clients[1].requests.some((r) => r.method === "ui/settings/read")).toBe(true),
+    );
+
+    // read 在途：用户把值守关掉（写入返回成功，界面随之变为关）。
+    fireEvent.click(screen.getByLabelText("后台值守（开机自启）开关"));
+    await waitFor(() =>
+      expect(clients[1].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { board_watchman_enabled: false },
+      }),
+    );
+    await waitFor(() =>
+      expect((screen.getByLabelText("后台值守（开机自启）开关") as HTMLInputElement).checked).toBe(
+        false,
+      ),
+    );
+
+    // 迟到的权威 read 带回旧值 true，必须被忽略：用户的选择才是当前选择。
+    await resolveStale({ theme: "dark", board_watchman_enabled: true });
+    expect((screen.getByLabelText("后台值守（开机自启）开关") as HTMLInputElement).checked).toBe(
+      false,
     );
   });
 
