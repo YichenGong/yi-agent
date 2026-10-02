@@ -4,13 +4,14 @@ use futures::future::BoxFuture;
 use std::time::Duration;
 
 use serde_json::json;
+use tracing_subscriber::layer::SubscriberExt as _;
 use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
 };
 use yi_agent_core::subagent::task::{
     DeliveryReport, InheritedSandbox, IntegrationValidation, PauseReason, PermissionRequestId,
-    RootSessionId, TaskDepth, TaskId, TaskState,
+    RecoveryEvidence, RootSessionId, TaskDepth, TaskId, TaskEvent, TaskState,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, SpawnRequest, WorkerError, WorkerHandle, WorkerStart,
@@ -1244,5 +1245,107 @@ fn non_recursive_cancel_still_reports_descendants_cascaded_in_memory() {
         ),
         "the grandchild must actually be cancelled, got {:?}",
         supervisor.task(&grandchild).unwrap().state()
+    );
+}
+
+/// Test-time capture of WARN-level log messages emitted while the test's
+/// default subscriber is installed. Used to lock the cascade warning behavior.
+#[derive(Clone, Default)]
+struct CaptureWarns(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureWarns {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        struct V(String);
+        impl tracing::field::Visit for V {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut v = V(String::new());
+        event.record(&mut v);
+        self.0.lock().unwrap().push(v.0);
+    }
+}
+
+#[tokio::test]
+async fn a_completed_parent_with_a_live_child_warns_and_cascades() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+
+    let captured = CaptureWarns::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // The root completes normally while the child is still running.
+    supervisor.start_task(&root).unwrap();
+    supervisor
+        .reduce_task(
+            &root,
+            TaskEvent::WorkerCompletedNoChanges {
+                attempt_id: supervisor.task(&root).unwrap().active_attempt_id().clone(),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "the live child must be cascaded, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+    assert!(
+        captured
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("live descendants")),
+        "a successful terminal with a live child must warn, got {:?}",
+        captured.0.lock().unwrap()
+    );
+}
+
+#[test]
+fn a_recovery_required_parent_does_not_cascade() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    supervisor.start_task(&root).unwrap();
+    supervisor.start_task(&child).unwrap();
+
+    let attempt_id = supervisor.task(&root).unwrap().active_attempt_id().clone();
+    supervisor
+        .reduce_task(
+            &root,
+            TaskEvent::RuntimeInterrupted {
+                attempt_id,
+                evidence: RecoveryEvidence("safe checkpoint grace deadline elapsed".into()),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        matches!(
+            supervisor.task(&root).unwrap().state(),
+            TaskState::RecoveryRequired(_)
+        ),
+        "fixture requires a recovery-required root, got {:?}",
+        supervisor.task(&root).unwrap().state()
+    );
+    assert!(
+        !supervisor.task(&child).unwrap().state().is_terminal(),
+        "recovery-required must not cascade, got {:?}",
+        supervisor.task(&child).unwrap().state()
     );
 }
