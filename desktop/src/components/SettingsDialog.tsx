@@ -1,21 +1,35 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { Theme } from "../lib/theme";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
+import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
 
-/** 左侧 Tab 栏。目前只有「通用」，后续 Tab 只需往这张表里加项。 */
-const TABS = [{ id: "general", label: "通用" }] as const;
+/** 左侧 Tab 栏。加一个 Tab 只需往这张表里加项，再在下面渲染它的面板。 */
+const TABS = [
+  { id: "general", label: "通用" },
+  { id: "remote", label: "远程访问" },
+] as const;
+
+type TabId = (typeof TABS)[number]["id"];
 
 export function SettingsDialog({
   open,
   theme,
   onThemeChange,
   onClose,
+  remoteCall,
+  relayUrl,
 }: {
   open: boolean;
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
   onClose: () => void;
+  /** 「远程访问」Tab 的 RPC 接缝，由宿主注入；缺省时该 Tab 只读。 */
+  remoteCall?: RemoteCall;
+  /** 中继地址预填。 */
+  relayUrl?: string;
 }) {
+  const [active, setActive] = useState<TabId>("general");
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -49,7 +63,8 @@ export function SettingsDialog({
             <button
               key={t.id}
               role="tab"
-              aria-selected="true"
+              aria-selected={t.id === active}
+              onClick={() => setActive(t.id)}
               className="rounded px-3 py-1.5 text-left text-sm text-fg-muted hover:bg-raised/50 aria-selected:text-fg"
             >
               {t.label}
@@ -69,7 +84,11 @@ export function SettingsDialog({
             </button>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
+            {active === "general" ? (
+              <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
+            ) : (
+              <SettingsRemoteTab call={remoteCall} initialRelayUrl={relayUrl} />
+            )}
           </div>
         </div>
       </div>

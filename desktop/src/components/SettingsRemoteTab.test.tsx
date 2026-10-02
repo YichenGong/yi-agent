@@ -1,0 +1,156 @@
+/** @vitest-environment jsdom */
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { ADMIN_REQUIRED_TEXT, SettingsRemoteTab } from "./SettingsRemoteTab";
+
+afterEach(cleanup);
+
+const DEVICES = [
+  { id: "d1", name: "iPhone 15", scope: "control", created_at: 1, last_seen_at: 2 },
+  { id: "d2", name: "iPad Air", scope: "control", created_at: 3, last_seen_at: 4 },
+];
+
+/** 假 RPC：按方法名派发，未登记的方法视为测试写错。 */
+function rpcStub(handlers: Record<string, (params: unknown) => unknown>) {
+  return vi.fn(async (method: string, params: unknown) => {
+    const handler = handlers[method];
+    if (!handler) throw new Error(`unexpected method ${method}`);
+    return handler(params);
+  });
+}
+
+describe("SettingsRemoteTab", () => {
+  it("mints a pairing code and renders it", async () => {
+    const call = rpcStub({
+      "device/list": () => ({ devices: [] }),
+      "pair/create": () => ({ code: "ABCD-EFGH", expires_in: 300 }),
+    });
+    render(<SettingsRemoteTab call={call} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成配对码" }));
+
+    expect(await screen.findByText("ABCD-EFGH")).toBeTruthy();
+    expect(call).toHaveBeenCalledWith("pair/create", {});
+  });
+
+  it("counts the code lifetime down and clears the interval on unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const call = rpcStub({
+        "device/list": () => ({ devices: [] }),
+        "pair/create": () => ({ code: "ABCD-EFGH", expires_in: 300 }),
+      });
+      const { unmount } = render(<SettingsRemoteTab call={call} />);
+      await act(async () => {});
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "生成配对码" }));
+      });
+
+      expect(screen.getByText("剩余 300 秒")).toBeTruthy();
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(screen.getByText("剩余 299 秒")).toBeTruthy();
+
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lists the paired devices from device/list", async () => {
+    const call = rpcStub({ "device/list": () => ({ devices: DEVICES }) });
+    render(<SettingsRemoteTab call={call} />);
+
+    expect(await screen.findByText("iPhone 15")).toBeTruthy();
+    expect(screen.getByText("iPad Air")).toBeTruthy();
+    expect(screen.getAllByText("control")).toHaveLength(2);
+    expect(call).toHaveBeenCalledWith("device/list", {});
+  });
+
+  it("revokes a device and drops its row", async () => {
+    const call = rpcStub({
+      "device/list": () => ({ devices: DEVICES }),
+      "device/revoke": () => ({ removed: true }),
+    });
+    render(<SettingsRemoteTab call={call} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "撤销 iPhone 15" }));
+
+    await waitFor(() => expect(screen.queryByText("iPhone 15")).toBeNull());
+    expect(call).toHaveBeenCalledWith("device/revoke", { device_id: "d1" });
+    expect(screen.getByText("iPad Air")).toBeTruthy();
+  });
+
+  it("keeps the row when the server reports removed:false", async () => {
+    const call = rpcStub({
+      "device/list": () => ({ devices: DEVICES }),
+      "device/revoke": () => ({ removed: false }),
+    });
+    render(<SettingsRemoteTab call={call} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "撤销 iPhone 15" }));
+
+    await waitFor(() => expect(call).toHaveBeenCalledWith("device/revoke", { device_id: "d1" }));
+    expect(screen.getByText("iPhone 15")).toBeTruthy();
+  });
+
+  it("shows the permission notice when device/list is refused with -32014", async () => {
+    const call = rpcStub({
+      "device/list": () => {
+        throw { code: -32014, message: "admin scope required" };
+      },
+    });
+    render(<SettingsRemoteTab call={call} />);
+
+    expect(await screen.findByText(ADMIN_REQUIRED_TEXT)).toBeTruthy();
+  });
+
+  it("shows the permission notice when pair/create is refused with -32014", async () => {
+    const call = rpcStub({
+      "device/list": () => ({ devices: [] }),
+      "pair/create": () => {
+        throw { code: -32014, message: "admin scope required" };
+      },
+    });
+    render(<SettingsRemoteTab call={call} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成配对码" }));
+
+    expect(await screen.findByText(ADMIN_REQUIRED_TEXT)).toBeTruthy();
+    expect(screen.queryByText("-32014")).toBeNull();
+  });
+
+  it("shows other failures inline with the server message", async () => {
+    const call = rpcStub({
+      "device/list": () => ({ devices: [] }),
+      "pair/create": () => {
+        throw { code: -32603, message: "internal error" };
+      },
+    });
+    render(<SettingsRemoteTab call={call} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成配对码" }));
+
+    expect(await screen.findByText("internal error")).toBeTruthy();
+  });
+
+  it("names the relay address field for the phone operator", () => {
+    render(<SettingsRemoteTab call={vi.fn()} initialRelayUrl="wss://relay.example.com/ws" />);
+
+    const field = screen.getByLabelText("中继地址") as HTMLInputElement;
+    expect(field.value).toBe("wss://relay.example.com/ws");
+    fireEvent.change(field, { target: { value: "wss://other.example.com/ws" } });
+    expect(field.value).toBe("wss://other.example.com/ws");
+  });
+
+  it("degrades gracefully without an RPC seam", async () => {
+    render(<SettingsRemoteTab />);
+
+    const mint = screen.getByRole("button", { name: "生成配对码" }) as HTMLButtonElement;
+    expect(mint.disabled).toBe(true);
+    expect(screen.getByLabelText("中继地址")).toBeTruthy();
+  });
+});
