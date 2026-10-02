@@ -43,6 +43,20 @@ const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 // timeout used to detect half-open readers, so the write side gets its own,
 // much looser budget.
 const COMMAND_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+// The client-side mirror of the server's loose command budget. The daemon
+// bounds its own reads (1s) and writes (30s), and the plugin hop bounds both,
+// but the client->daemon hop was the only one left unbounded: a daemon that
+// accepted a connection and then stalled -- e.g. a reconcile wedged on the
+// per-session supervisor mutex -- turned every caller, including a tokio worker
+// thread that called `send_request` directly, into an infinite block.
+//
+// The value is deliberately not "as small as possible": a mutating command
+// (spawn, attach, cancel) may legitimately do real I/O before it answers, so a
+// tight bound would abort healthy work. This is the same 30s the server already
+// treats as the loose ceiling for one command; it exists to turn a *permanent*
+// hang into a bounded, typed error, which is the actual defect. Callers that
+// know they are probing a heartbeat want the shorter `_timeout` variant.
+const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // Invalid JSON has no trustworthy request ID to echo, so its error frame uses
 // this documented stable empty identifier.
 const MISSING_REQUEST_ID: &str = "";
@@ -1163,7 +1177,31 @@ pub fn send_request_with_version(
     protocol_version: u32,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
+    send_request_with_version_timeout(
+        socket_path,
+        protocol_version,
+        request,
+        CLIENT_REQUEST_TIMEOUT,
+    )
+}
+
+/// `send_request_with_version` with an explicit reply deadline.
+///
+/// Factored out so the deadline is a *required argument* of the last hop rather
+/// than an optional builder method a call site could forget, and so a test can
+/// drive a near-instant deadline instead of waiting out the production one.
+pub fn send_request_with_version_timeout(
+    socket_path: impl AsRef<Path>,
+    protocol_version: u32,
+    request: IpcRequest,
+    reply_timeout: Duration,
+) -> Result<IpcResponse, IpcError> {
     let mut stream = UnixStream::connect(socket_path)?;
+    // Bounded on the client too, not only on the server: a daemon that reads the
+    // request and then never answers must not block the caller forever. A
+    // timeout, like any other read error, surfaces through `read_limited_frame`
+    // as a typed `IpcError`.
+    stream.set_read_timeout(Some(reply_timeout))?;
     let request_id = next_request_id();
     write_request(&mut stream, protocol_version, request_id.clone(), request)?;
     let response = read_limited_frame(&mut BufReader::new(stream))?.ok_or_else(|| {
@@ -3945,6 +3983,48 @@ mod socket_path_tests {
         let second = socket_path_for(shared).expect("resolves");
 
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod client_request_timeout_tests {
+    use super::*;
+
+    /// A client must never block forever on a daemon that accepts the
+    /// connection but never answers. The server side already bounds its reads
+    /// (1s) and writes (30s), and the plugin hop bounds both; the client->daemon
+    /// hop was the only one left unbounded, so a wedged daemon turned into an
+    /// infinite hang for every caller (and for any tokio thread that called it).
+    #[test]
+    fn a_daemon_that_never_answers_fails_the_client_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Accept in the background and then deliberately say nothing: this is a
+        // daemon that is up (connect succeeds) but wedged (no reply).
+        let server = std::thread::spawn(move || {
+            let (_stream, _addr) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let started = Instant::now();
+        let result = send_request_with_version_timeout(
+            &socket,
+            PROTOCOL_VERSION,
+            IpcRequest::Status,
+            Duration::from_millis(150),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a silent daemon must surface an error, not block: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the client must give up promptly, took {elapsed:?}"
+        );
+        drop(server);
     }
 }
 
