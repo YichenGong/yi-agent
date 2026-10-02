@@ -300,6 +300,44 @@ pub fn help_text(target: Option<&str>) -> String {
     }
 }
 
+/// Read-only, secret-free view of the running session's configuration.
+///
+/// Assembled once in `main.rs` from `RuntimeConfig` / `AgentConfig` / the MCP
+/// manager / the persisted runtime preference. The model is **not** stored here:
+/// `/model` can change it mid-session, so `render` takes the live value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiConfigSnapshot {
+    pub provider: String,
+    pub workdir: std::path::PathBuf,
+    pub sandbox: String,
+    pub yolo: bool,
+    pub max_turns: u32,
+    pub compact_threshold: u32,
+    pub mcp_master: bool,
+    pub runtime_preference: String,
+    pub runtime_preference_path: std::path::PathBuf,
+}
+
+impl TuiConfigSnapshot {
+    /// Render the config for the transcript. `model` is the live model, so a
+    /// `/model` switch shows up here without re-reading anything.
+    pub fn render(&self, model: &str) -> String {
+        format!(
+            "当前配置:\n  provider: {}\n  model: {}\n  workdir: {}\n  sandbox: {}\n  yolo: {}\n  max_turns: {}\n  compact_threshold: {}\n  mcp master: {}\n  subagent runtime: {}（{}）",
+            self.provider,
+            model,
+            self.workdir.display(),
+            self.sandbox,
+            if self.yolo { "on" } else { "off" },
+            self.max_turns,
+            self.compact_threshold,
+            if self.mcp_master { "on" } else { "off" },
+            self.runtime_preference,
+            self.runtime_preference_path.display(),
+        )
+    }
+}
+
 /// A parsed `/runtime` action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeAction {
@@ -980,5 +1018,30 @@ mod tests {
             assert!(!help.contains(hidden), "full help must not list {hidden}");
         }
         assert!(help.contains("/config") && help.contains("/model") && help.contains("/daemon"));
+    }
+
+    #[test]
+    fn config_snapshot_renders_key_fields_without_secrets() {
+        let snap = TuiConfigSnapshot {
+            provider: "anthropic".into(),
+            workdir: std::path::PathBuf::from("/tmp/proj"),
+            sandbox: "workspace-write".into(),
+            yolo: false,
+            max_turns: 200,
+            compact_threshold: 160_000,
+            mcp_master: true,
+            runtime_preference: "ask".into(),
+            runtime_preference_path: std::path::PathBuf::from(
+                "/tmp/proj/.yi-agent/preferences.json",
+            ),
+        };
+        let text = snap.render("claude-sonnet-4-5");
+        assert!(text.contains("anthropic"));
+        assert!(text.contains("claude-sonnet-4-5"));
+        assert!(text.contains("/tmp/proj"));
+        assert!(text.contains("workspace-write"));
+        assert!(text.contains("160000") || text.contains("160_000"));
+        assert!(!text.to_lowercase().contains("api_key"));
+        assert!(!text.to_lowercase().contains("api-key"));
     }
 }

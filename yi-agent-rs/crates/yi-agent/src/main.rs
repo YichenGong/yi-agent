@@ -1459,6 +1459,28 @@ fn run_tui_agent(
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let mcp_for_driver = Arc::clone(&mcp);
         let mcp_for_teardown = Arc::clone(&mcp);
+
+        // `workdir` is moved into the driver closure below, and `config` is moved
+        // into it too, so both the snapshot and the TUI call site need values built
+        // before the closure and a cloned workdir.
+        let snapshot_workdir = workdir.clone();
+        let runtime_preference = match crate::tui::runtime_prefs::load(&snapshot_workdir) {
+            crate::tui::runtime_prefs::RuntimePreference::Ask => "ask",
+            crate::tui::runtime_prefs::RuntimePreference::Always => "always",
+            crate::tui::runtime_prefs::RuntimePreference::Never => "never",
+        };
+        let tui_config = crate::tui::slash::TuiConfigSnapshot {
+            provider: config.provider.clone(),
+            workdir: snapshot_workdir.clone(),
+            sandbox: config.sandbox.as_str().to_string(),
+            yolo: config.yolo,
+            max_turns: config.max_turns,
+            compact_threshold: config.compact_threshold,
+            mcp_master: mcp.master(),
+            runtime_preference: runtime_preference.to_string(),
+            runtime_preference_path: crate::tui::runtime_prefs::preferences_path(&snapshot_workdir),
+        };
+
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -1841,6 +1863,7 @@ fn run_tui_agent(
                 process_manager,
                 workdir.clone(),
                 mcp,
+                tui_config,
             )
         });
 
