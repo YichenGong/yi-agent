@@ -26,7 +26,7 @@
 | yi-agent-subagent | 5 / 5 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 24 / 24 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 42 / 49 | [详情](./subagent-runtime.md) |
-| desktop | 28 / 41 | [详情](./desktop.md) |
+| desktop | 30 / 43 | [详情](./desktop.md) |
 
 ## 已知问题
 
