@@ -1615,7 +1615,7 @@ where
                             crate::thread_store::assign_pin_seqs(&ids, &current_seq);
                         let mut err: Option<RpcError> = None;
                         for (tid, seq) in assignments {
-                            let store = store_for(&workspaces, &cfg, &tid);
+                            let store = store_lookup(&threads, &workspaces, &cfg, &tid);
                             match store.set_pin_seq(&tid, Some(seq)) {
                                 Ok(true) => {}
                                 Ok(false) => {
