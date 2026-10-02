@@ -1836,11 +1836,18 @@ impl AgentSupervisor {
         Ok((attempt_id, affected))
     }
 
+    /// Records a recovery conflict as a settled `Blocked` state.
+    ///
+    /// `Blocked` is a settled terminal, so the reduction can cascade live
+    /// descendants. The returned id list (the task first, then any cascade
+    /// victims) is the only report those victims will ever produce — the
+    /// reconciler skips tasks it already finds terminal — so every caller that
+    /// owns a repository must persist and release them.
     pub fn record_recovery_conflict(
         &mut self,
         task_id: &TaskId,
         message: impl Into<String>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<TaskId>, String> {
         if matches!(
             self.task(task_id).map(AgentTask::state),
             Some(TaskState::Queued)
@@ -1853,7 +1860,7 @@ impl AgentSupervisor {
             .ok_or_else(|| "task does not exist".to_string())?
             .active_attempt_id()
             .clone();
-        self.reduce_task(
+        let affected = self.reduce_task(
             task_id,
             TaskEvent::RecoveryConflict {
                 attempt_id,
@@ -1861,7 +1868,7 @@ impl AgentSupervisor {
             },
         )?;
         self.notify_update();
-        Ok(())
+        Ok(affected)
     }
 
     /// Creates a fresh attempt only after a terminal outcome, preserving the
@@ -1954,6 +1961,7 @@ impl AgentSupervisor {
                 worker.cancel();
             }
             let attempt_id = task.active_attempt_id().clone();
+            let cancel_state = task.state().clone();
             if task
                 .reduce(
                     TaskEvent::CancelRequested {
@@ -1965,6 +1973,17 @@ impl AgentSupervisor {
                 .is_ok()
             {
                 changed.push(id);
+            } else {
+                // Never skip silently (`留痕而非静默`): a rejected cancellation
+                // leaves a live child under a settled parent with no other
+                // trace. `can_transition_to` currently permits `Cancelled` from
+                // every non-terminal state, so this is defensive, but it must
+                // still be visible if a future state has no legal edge here.
+                tracing::warn!(
+                    task_id = ?id,
+                    state = task_state_label(&cancel_state),
+                    "live descendant of a settled parent rejected cancellation; it remains live with no trace"
+                );
             }
         }
         if !changed.is_empty() {
@@ -2610,5 +2629,87 @@ mod tests {
             .set_workdir(&unknown, PathBuf::from("/tmp/example-worktree"))
             .unwrap_err();
         assert_eq!(error, "task does not exist");
+    }
+
+    #[test]
+    fn record_recovery_conflict_reports_the_cascaded_live_child() {
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let parent = supervisor.root_task_id().clone();
+        let child = supervisor.spawn(parent.clone()).unwrap();
+        supervisor.start_task(&child).unwrap();
+
+        let affected = supervisor
+            .record_recovery_conflict(&parent, "git head moved")
+            .unwrap();
+
+        assert_eq!(
+            supervisor.task(&parent).unwrap().state(),
+            &TaskState::Blocked(BlockReason("recovery_conflict: git head moved".into()))
+        );
+        assert!(
+            affected.contains(&parent),
+            "the reduced task is always reported first"
+        );
+        assert!(
+            affected.contains(&child),
+            "a live descendant cancelled by the settled-parent cascade must be reported"
+        );
+        assert_eq!(
+            supervisor.task(&child).unwrap().state(),
+            &TaskState::Cancelled(CancelReason("parent reached a terminal state".into()))
+        );
+    }
+
+    #[test]
+    fn retry_task_never_reports_cascade_victims() {
+        // `RetryRequested` moves the task to `Queued` (`start_next_attempt`),
+        // which is NonTerminal, so `settle_terminal` cannot fire and the
+        // retried task's live children are deliberately left untouched. The
+        // parent is parked in `RecoveryRequired` (the one terminal state the
+        // cascade excludes) so the retry itself is the only transition at play.
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let parent = supervisor.root_task_id().clone();
+        let child = supervisor.spawn(parent.clone()).unwrap();
+        supervisor.start_task(&parent).unwrap();
+        supervisor.start_task(&child).unwrap();
+        let attempt = supervisor
+            .task(&parent)
+            .unwrap()
+            .active_attempt_id()
+            .clone();
+        supervisor
+            .reduce_task(
+                &parent,
+                TaskEvent::RuntimeInterrupted {
+                    attempt_id: attempt.clone(),
+                    evidence: RecoveryEvidence("interrupted".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            supervisor.task(&child).unwrap().state(),
+            &TaskState::Running,
+            "a recovery-required parent must not cascade its live children"
+        );
+
+        let affected = supervisor
+            .reduce_task(
+                &parent,
+                TaskEvent::RetryRequested {
+                    attempt_id: attempt,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            affected,
+            vec![parent.clone()],
+            "a retry reports only the retried task, never cascade victims"
+        );
+        assert_eq!(
+            supervisor.task(&child).unwrap().state(),
+            &TaskState::Running,
+            "a retried (queued) parent must not cascade its live children"
+        );
     }
 }

@@ -2384,6 +2384,74 @@ async fn recovery_conflict_is_durable_without_factory_start() {
     assert!(terminal["evidence"].as_str().unwrap().contains("Git HEAD"));
 }
 
+/// A recovery conflict settles its parent (`Blocked`), which cascades any live
+/// descendant in memory. The reconciler skips tasks it already finds terminal,
+/// so without wiring `record_recovery_conflict`'s id list the child would stay
+/// `running` in SQLite while its lease was already released in memory.
+#[tokio::test]
+async fn a_recovery_conflicted_parent_cascades_and_releases_its_live_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let parent = TaskId::new();
+    let parent_attempt = AttemptId::new();
+
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&parent, &session, &parent_attempt, 1, "running")
+        .unwrap();
+    // Seed the recovery gate so the restarted daemon routes the parent through
+    // `preflight_recovery` (which this factory answers with `Conflict`).
+    repository
+        .record_recovery_context(
+            &parent,
+            &parent_attempt,
+            "workspace:test-parent",
+            "worktree:test-parent",
+            "{}",
+            "{}",
+        )
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(ConflictReportingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    // A live child under the (recovery-gated) parent. It is started so it holds
+    // a workspace lease, exactly like a normal running subagent.
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "fixture requires the child to hold an active lease before the conflict"
+    );
+
+    coordinator.resume_task(&session, &parent).await.unwrap();
+    assert_eq!(
+        *factory.starts.lock().unwrap(),
+        1,
+        "only the child's worker started; the conflicted parent never starts"
+    );
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&parent).unwrap(), "blocked");
+    assert_eq!(
+        repository.task_state(&child).unwrap(),
+        "cancelled",
+        "the live child of a recovery-conflicted parent must be durably cancelled, not left running"
+    );
+    assert!(
+        !repository
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "the cascaded child must release its workspace lease"
+    );
+}
+
 #[tokio::test]
 async fn recovery_required_task_rejects_direct_start_without_factory_action() {
     let directory = TempDir::new().unwrap();

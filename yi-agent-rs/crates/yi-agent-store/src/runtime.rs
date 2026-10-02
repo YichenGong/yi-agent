@@ -1660,7 +1660,7 @@ impl RuntimeCoordinator {
                         .remove(task);
                 }
                 WorkerRecoveryPreflightResult::Conflict(reason) => {
-                    supervisor
+                    let affected = supervisor
                         .record_recovery_conflict(task, reason.clone())
                         .map_err(RuntimeCoordinatorError::Supervisor)?;
                     let evidence = serde_json::to_string(&serde_json::json!({
@@ -1678,6 +1678,17 @@ impl RuntimeCoordinator {
                             RuntimeEvent::TaskBlocked,
                             &evidence,
                         )?;
+                    // The durable row above covers `task` itself. Reducing the
+                    // conflict also settled the task in memory (`Blocked` is a
+                    // settled terminal), which cascaded its live descendants.
+                    // `reconcile` skips tasks it already finds terminal, so
+                    // these victims would otherwise stay `running` while
+                    // holding leases. Persist and release them while the
+                    // supervisor guard is still held, mirroring the watchdog
+                    // path, so no concurrent retry can swap a victim's active
+                    // attempt and defeat the guarded write.
+                    let victims = affected.into_iter().filter(|id| id != task).collect();
+                    self.persist_cascaded_tasks(victims)?;
                     self.recovery_contexts
                         .lock()
                         .expect("runtime recovery context mutex poisoned")
