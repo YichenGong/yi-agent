@@ -748,8 +748,30 @@ describe("App 主区域看板", () => {
     await openBoardFor("/proj");
 
     expect(await screen.findByText("Superpowers 看板")).toBeTruthy();
-    expect(screen.queryByLabelText("收起看板")).toBeNull();
+    // 看板展开时提供收起按钮（收起 = 不画面板但保留看板本身）。
+    expect(screen.getByLabelText("收起看板")).toBeTruthy();
     expect(screen.getByRole("button", { name: "加入看板" })).toBeTruthy();
+  });
+
+  it("看板可收起、并可从收起横条再展开", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
+
+    fireEvent.click(screen.getByLabelText("收起看板"));
+
+    // 收起后：面板与开关都让位给一条横条，且横条仍记得是哪个项目。
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByLabelText("收起看板")).toBeNull();
+    const expand = screen.getByLabelText("展开看板");
+    expect(expand).toBeTruthy();
+
+    fireEvent.click(expand);
+    expect(await screen.findByLabelText("收起看板")).toBeTruthy();
+    expect(screen.getByRole("checkbox")).toBeTruthy();
   });
 
   it("看板的所有读写都带上该项目的 project", async () => {
