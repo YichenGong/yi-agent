@@ -55,6 +55,10 @@ const { clients, state } = vi.hoisted(() => ({
     // theme read) can be interleaved with a notification or user action. Takes
     // precedence over the canned responses below.
     dataSources: {} as Record<string, (params: unknown) => unknown>,
+    // UA the mocked `platform.isIos()` answers from. Empty → desktop, so every
+    // pre-existing test shape keeps its behavior; the iOS pairing test sets a
+    // phone UA and persists a config where it needs one.
+    platformUa: "",
   },
 }));
 
@@ -168,6 +172,17 @@ vi.mock("./lib/rpc", () => ({
 
 vi.mock("./transportFactory", () => ({ transportFactory: () => ({}) }));
 
+// iOS-vs-desktop 的唯一判定入口。只换掉 `isIos`：其余（`isRemoteClient` 等）
+// 保持真身，否则会连带打断既有的远端分支用例。UA 由 `state.platformUa` 摆布：
+// 空串即桌面，所以既有用例一条都不改道。
+vi.mock("./lib/platform", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lib/platform")>();
+  return {
+    ...actual,
+    isIos: () => /\biPhone\b|\biPad\b|\biPod\b/i.test(state.platformUa),
+  };
+});
+
 import App from "./App";
 
 beforeEach(() => {
@@ -190,6 +205,7 @@ beforeEach(() => {
   state.rpcError = {};
   state.hostError = {};
   state.dataSources = {};
+  state.platformUa = "";
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
   delete document.documentElement.dataset.theme;
@@ -1183,5 +1199,103 @@ describe("App settings & theme wiring", () => {
     await waitFor(() =>
       expect(clients[1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
     );
+  });
+});
+
+describe("App iOS first-launch pairing", () => {
+  const IPHONE_UA =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+
+  it("shows the pairing screen on iOS with no persisted config (never a dead-end transport)", () => {
+    state.platformUa = IPHONE_UA;
+    render(<App />);
+
+    // 死路的定义就是「没有配置还去建 transport」：iOS 上那会落到 tauriTransport。
+    expect(clients.length).toBe(0);
+    expect(screen.getByRole("form", { name: "配对" })).toBeTruthy();
+    expect(screen.getByLabelText("服务器地址")).toBeTruthy();
+    expect(screen.getByLabelText("配对码")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "设置" })).toBeNull();
+  });
+
+  it("keeps the desktop app on the main view even with the same phone UA absent", () => {
+    // 平台分支必须只认 iOS：桌面（UA 为空）照旧走握手，配对表单不出现。
+    render(<App />);
+    expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
+    expect(clients.length).toBe(1);
+  });
+
+  it("goes straight to the main app on iOS once a config is persisted", async () => {
+    state.platformUa = IPHONE_UA;
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+    render(<App />);
+
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true));
+    expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
+  });
+
+  it("leaves the pairing screen and connects after a successful redemption", async () => {
+    state.platformUa = IPHONE_UA;
+    // 真实的配对握手会先连一次 ws 只为拿 token。测试里把它换成一个假的
+    // WebSocket，整个流程（配对 → 落盘 → 重建 transport → 握手）才闭环。
+    class FakeSocket {
+      onopen: unknown = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: ((e: { code: number }) => void) | null = null;
+      onerror: unknown = null;
+      constructor(readonly url: string) {
+        // 像真服务端那样在下一次微任务里交付 pair/redeemed 帧。
+        queueMicrotask(() =>
+          this.onmessage?.({
+            data: JSON.stringify({
+              jsonrpc: "2.0",
+              method: "pair/redeemed",
+              params: { device_id: "dev-1", token: "yia_new", scope: "control" },
+            }),
+          }),
+        );
+      }
+      send() {}
+      close() {}
+    }
+    vi.stubGlobal("WebSocket", FakeSocket);
+    try {
+      render(<App />);
+      fireEvent.change(screen.getByLabelText("服务器地址"), {
+        target: { value: "wss://relay.test/ws?session=s1" },
+      });
+      fireEvent.change(screen.getByLabelText("配对码"), { target: { value: "ABCD-EFGH" } });
+      fireEvent.click(screen.getByRole("button", { name: "配对" }));
+
+      // 落盘后 App 必须自己重算 transport（版本号）并开始握手，而不是等用户重启。
+      await waitFor(() =>
+        expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+      );
+      const persisted = JSON.parse(localStorage.getItem("yi-agent.remote")!);
+      expect(persisted).toEqual({ url: "wss://relay.test/ws?session=s1", token: "yia_new" });
+      expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reports a failed redemption without persisting a config", async () => {
+    state.platformUa = IPHONE_UA;
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("服务器地址"), {
+      target: { value: "wss://relay.test/ws" },
+    });
+    fireEvent.change(screen.getByLabelText("配对码"), { target: { value: "BAD-CODE" } });
+
+    // 兑换必然失败（下面没有可用的 WebSocket）——重点是不能把界面留在"配对中"。
+    fireEvent.click(screen.getByRole("button", { name: "配对" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "配对" })).toBeTruthy());
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(localStorage.getItem("yi-agent.remote")).toBeNull();
+    expect(clients.length).toBe(0);
   });
 });

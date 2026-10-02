@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isRemoteClient } from "./lib/platform";
+import { isIos, isRemoteClient } from "./lib/platform";
 import { RpcClient } from "./lib/rpc";
+import { redeemPairCode } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
@@ -49,6 +50,7 @@ import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
 import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { PairingScreen, needsPairing } from "./components/PairingScreen";
 
 /**
  * 看板失败的四种说法。
@@ -149,6 +151,10 @@ export default function App() {
   const boardTick = useRef<() => void>(() => {});
   /** 看板读取的序号，用来丢掉换项目后落地的过期响应。 */
   const boardSeq = useRef(0);
+  // iOS 首启：没有远端配置时先配对。版本号是「让 transport 重算」的触发器——
+  // 配对落盘后加一，下面那个 effect 才第一次真正建客户端（此前被
+  // `needsPairing` 挡住），这一次读到的是 ws 配置。
+  const [pairingVersion, setPairingVersion] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
   const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
@@ -617,6 +623,10 @@ export default function App() {
   };
 
   useEffect(() => {
+    // iOS 首启还没配对：这一步不能建客户端。`transportFactory` 此时只可能落到
+    // `tauriTransport()`，而 iOS 上根本没有 Tauri IPC——那正是要避开的死路。
+    // 配对把配置落盘并 bump 版本号后本 effect 重跑，这一次才真的去连 ws。
+    if (needsPairing(isIos())) return;
     if (inited.current) return; // guard against React StrictMode double-invoke
     inited.current = true;
     let disposed = false;
@@ -723,7 +733,7 @@ export default function App() {
       window.clearInterval(boardTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [pairingVersion]);
 
   /**
    * Run a slash command. Commands never reach the agent: their output is a
@@ -884,6 +894,21 @@ export default function App() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  // 首启的 iOS 没有远端配置时先配对：此时 transportFactory 会退回
+  // tauriTransport()，而 iOS 上根本没有 Tauri IPC——继续往下渲染就是死路。
+  // 桌面永远不会进这个分支（isIos 为 false）。
+  if (needsPairing(isIos())) {
+    return (
+      <PairingScreen
+        // PairingScreen 保证这个回调发生在 saveRemoteConfig 之后，所以此刻
+        // 存储里已经有 {url, token}；版本号让上面的 effect 重跑，这一次
+        // transportFactory 选中的是 ws。
+        onPaired={() => setPairingVersion((v) => v + 1)}
+        redeem={redeemPairCode}
+      />
+    );
+  }
 
   return (
     <>
