@@ -174,6 +174,28 @@ pub enum Command {
         /// Target shell.
         shell: clap_complete::Shell,
     },
+    /// Pairing helpers: mint a one-time code, list paired devices, or revoke one.
+    ///
+    /// Reads/writes the same `~/.yi-agent/pairing.json` + `devices.json` as the
+    /// app-server, so a code minted here is redeemable by a `--relay`/`ws://`
+    /// app-server on the same machine.
+    Pair {
+        #[command(subcommand)]
+        action: PairAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum PairAction {
+    /// Mint a one-time pairing code and print it (default).
+    Code,
+    /// List paired devices.
+    List,
+    /// Revoke a paired device by id (its token stops authenticating at once).
+    Revoke {
+        /// Device id, as shown by `pair list` (e.g. `dev-…`).
+        device_id: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
