@@ -162,6 +162,10 @@ export default function App() {
   // 挂载后主题是否已被更新的选择触碰过（ui/settings/updated 通知或用户
   // changeTheme）。首屏 read 在途时若被触碰，read 返回的旧值不得覆盖它。
   const themeTouchedRef = useRef(false);
+  // 服务端已确认（或首屏 read 采纳）的主题，即「乐观更新可以回退到」的基线。
+  // 用 ref 而非 state：写失败的回调读到的是最新基线，而不是某次调用时刻的
+  // 陈旧闭包值——否则并发写会退回到中间态（见 changeTheme）。
+  const confirmedThemeRef = useRef<Theme>(readCachedTheme() ?? "dark");
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -654,9 +658,11 @@ export default function App() {
         }
         if (n.method === "ui/settings/updated") {
           // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
-          // 的首屏 read 用旧值把它覆盖回去。
+          // 的首屏 read 用旧值把它覆盖回去。服务端推来的即权威值，记作回退基线。
           themeTouchedRef.current = true;
-          setTheme(parseTheme(n.params.theme));
+          const next = parseTheme(n.params.theme);
+          confirmedThemeRef.current = next;
+          setTheme(next);
           return;
         }
         if (n.method === "agent/trace/event") {
@@ -702,7 +708,11 @@ export default function App() {
         const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
         // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
         // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
-        if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
+        if (!themeTouchedRef.current) {
+          const authoritative = parseTheme(settings.theme);
+          confirmedThemeRef.current = authoritative;
+          setTheme(authoritative);
+        }
         await refreshWorkspaces();
         const list = await client.request<{
           groups: WorkspaceGroup[];
@@ -871,16 +881,21 @@ export default function App() {
 
   const changeTheme = (next: Theme) => {
     // 立即生效，再落盘。
-    const prev = theme;
     themeTouchedRef.current = true;
     setTheme(next);
-    clientRef.current?.request("ui/settings/write", { theme: next }).catch((e) => {
-      // 写失败：回退乐观更新，让 UI 与服务端持久化的权威值保持一致，同时照旧
-      // 报错（无打开的 thread 时 setCurrentError 是 no-op，回退就是唯一的反馈）。
-      setTheme(prev);
-      setCurrentError(formatError(e));
-      force((v) => v + 1);
-    });
+    clientRef.current?.request("ui/settings/write", { theme: next }).then(
+      () => {
+        // 服务端已接受：把它记作新的回退基线。
+        confirmedThemeRef.current = next;
+      },
+      (e) => {
+        // 写失败：回退到**最近一次已确认**的主题，而不是本次调用时刻的闭包值。
+        // 并发写时后者会退回到中间态（例如先浅后深都失败，却停在深）。
+        setTheme(confirmedThemeRef.current);
+        setCurrentError(formatError(e));
+        force((v) => v + 1);
+      },
+    );
   };
 
   // Sidebar badges: server-authoritative status per thread + unread marker for
