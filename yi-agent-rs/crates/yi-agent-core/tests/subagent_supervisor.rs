@@ -1180,3 +1180,28 @@ fn worker_start_carries_inherited_sandbox_from_supervisor() {
         Some(InheritedSandbox::DangerFullAccess)
     );
 }
+
+#[test]
+fn failing_a_parent_cascades_its_live_child_to_terminal() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    supervisor.start_task(&root).unwrap();
+    supervisor.start_task(&child).unwrap();
+
+    supervisor.fail_task(&root, "worker crashed").unwrap();
+
+    assert!(
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "the live child must be cascaded to terminal, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+    assert!(
+        matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::Cancelled(_)
+        ),
+        "cascade must cancel the child, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+}

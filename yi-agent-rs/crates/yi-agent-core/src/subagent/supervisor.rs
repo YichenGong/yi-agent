@@ -502,32 +502,33 @@ impl AgentSupervisor {
     /// can be replayed by this process after shutdown begins.
     pub fn interrupt_unacknowledged_workers(&mut self) -> Result<Vec<TaskId>, String> {
         let task_ids = self.workers.keys().cloned().collect::<Vec<_>>();
+        let mut affected = Vec::new();
         for task_id in &task_ids {
             let worker = self
                 .workers
                 .get(task_id)
                 .expect("worker key was collected from this map");
             worker.cancel();
-            let task = self
+            let attempt_id = self
                 .tasks
-                .get_mut(task_id)
-                .expect("worker task is retained by its supervisor");
-            let attempt_id = task.active_attempt_id().clone();
-            task.reduce(
+                .get(task_id)
+                .expect("worker task is retained by its supervisor")
+                .active_attempt_id()
+                .clone();
+            affected.extend(self.reduce_task(
+                task_id,
                 TaskEvent::RuntimeInterrupted {
                     attempt_id,
                     evidence: RecoveryEvidence("safe checkpoint grace deadline elapsed".into()),
                 },
-                chrono::Utc::now(),
-            )
-            .map_err(|error| error.to_string())?;
+            )?);
             self.workers.remove(task_id);
             self.worker_message_capabilities.remove(task_id);
         }
         if !task_ids.is_empty() {
             self.notify_update();
         }
-        Ok(task_ids)
+        Ok(affected)
     }
 
     /// Quarantines one worker at an ambiguous durable-delivery boundary. The
@@ -542,19 +543,19 @@ impl AgentSupervisor {
             .get(task_id)
             .ok_or_else(|| "worker does not exist".to_string())?
             .cancel();
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
             TaskEvent::RuntimeInterrupted {
                 attempt_id,
                 evidence: RecoveryEvidence(evidence.into()),
             },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let mailbox = self
             .mailboxes
             .get_mut(task_id)
@@ -710,26 +711,36 @@ impl AgentSupervisor {
             if task.state().is_terminal() {
                 continue;
             }
+            let mut affected = Vec::new();
             match event {
                 WorkerEvent::MessageConsumed { .. } => unreachable!("handled before task state"),
                 WorkerEvent::Delivered(delivery) => {
                     let (attempt_id, parent_id) = {
-                        let task = self
+                        let attempt_id = self
                             .tasks
-                            .get_mut(&task_id)
-                            .expect("worker task was checked above");
-                        let attempt_id = task.active_attempt_id().clone();
-                        let parent_id = task.parent_id.clone().ok_or_else(|| {
-                            "root tasks cannot submit parent delivery".to_string()
-                        })?;
-                        task.reduce(
-                            TaskEvent::WorkerDelivered {
-                                attempt_id: attempt_id.clone(),
-                                delivery: delivery.clone(),
-                            },
-                            chrono::Utc::now(),
-                        )
-                        .map_err(|error| error.to_string())?;
+                            .get(&task_id)
+                            .expect("worker task was checked above")
+                            .active_attempt_id()
+                            .clone();
+                        let parent_id = self
+                            .tasks
+                            .get(&task_id)
+                            .expect("worker task was checked above")
+                            .parent_id
+                            .clone()
+                            .ok_or_else(|| {
+                                "root tasks cannot submit parent delivery".to_string()
+                            })?;
+                        affected.extend(
+                            self.reduce_task(
+                                &task_id,
+                                TaskEvent::WorkerDelivered {
+                                    attempt_id: attempt_id.clone(),
+                                    delivery: delivery.clone(),
+                                },
+                            )
+                            .map_err(|error| error.to_string())?,
+                        );
                         (attempt_id, parent_id)
                     };
                     // The child's terminal outcome is normally the parent's next
@@ -757,85 +768,123 @@ impl AgentSupervisor {
                     }
                 }
                 WorkerEvent::Completed { report } => {
-                    let task = self
+                    let attempt_id = self
                         .tasks
-                        .get_mut(&task_id)
-                        .expect("worker task was checked above");
-                    let attempt_id = task.active_attempt_id().clone();
-                    task.reduce(
-                        TaskEvent::WorkerCompletedNoChanges { attempt_id },
-                        chrono::Utc::now(),
-                    )
-                    .map_err(|error| error.to_string())?;
+                        .get(&task_id)
+                        .expect("worker task was checked above")
+                        .active_attempt_id()
+                        .clone();
+                    affected = self
+                        .reduce_task(&task_id, TaskEvent::WorkerCompletedNoChanges { attempt_id })
+                        .map_err(|error| error.to_string())?;
                     self.completion_reports.insert(task_id.clone(), report);
                 }
                 WorkerEvent::BudgetExhausted { report } => {
-                    let task = self
+                    let attempt_id = self
                         .tasks
-                        .get_mut(&task_id)
-                        .expect("worker task was checked above");
-                    let attempt_id = task.active_attempt_id().clone();
-                    task.reduce(
-                        TaskEvent::WorkerBudgetExhausted {
-                            attempt_id,
-                            kind: BudgetKind::Turns,
-                        },
-                        chrono::Utc::now(),
-                    )
-                    .map_err(|error| error.to_string())?;
+                        .get(&task_id)
+                        .expect("worker task was checked above")
+                        .active_attempt_id()
+                        .clone();
+                    affected = self
+                        .reduce_task(
+                            &task_id,
+                            TaskEvent::WorkerBudgetExhausted {
+                                attempt_id,
+                                kind: BudgetKind::Turns,
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
                     // Keep the partial transcript: a truncated report is still
                     // the parent's only window into what the child managed.
                     self.completion_reports.insert(task_id.clone(), report);
                 }
                 WorkerEvent::Paused => {
-                    let task = self
+                    let attempt_id = self
                         .tasks
-                        .get_mut(&task_id)
-                        .expect("worker task was checked above");
-                    let attempt_id = task.active_attempt_id().clone();
-                    task.reduce(
-                        TaskEvent::PauseAcknowledged { attempt_id },
-                        chrono::Utc::now(),
-                    )
-                    .map_err(|error| error.to_string())?;
+                        .get(&task_id)
+                        .expect("worker task was checked above")
+                        .active_attempt_id()
+                        .clone();
+                    affected = self
+                        .reduce_task(&task_id, TaskEvent::PauseAcknowledged { attempt_id })
+                        .map_err(|error| error.to_string())?;
                 }
-                WorkerEvent::Failed(message) => self.fail_task(&task_id, message)?,
-                WorkerEvent::RecoveryConflict(message) => {
-                    let task = self
+                WorkerEvent::Failed(message) => {
+                    let attempt_id = self
                         .tasks
-                        .get_mut(&task_id)
-                        .expect("worker task was checked above");
-                    let attempt_id = task.active_attempt_id().clone();
-                    task.reduce(
-                        TaskEvent::RecoveryConflict {
-                            attempt_id,
-                            reason: BlockReason(format!("recovery_conflict: {message}")),
-                        },
-                        chrono::Utc::now(),
-                    )
-                    .map_err(|error| error.to_string())?;
+                        .get(&task_id)
+                        .expect("worker task was checked above")
+                        .active_attempt_id()
+                        .clone();
+                    affected = self
+                        .reduce_task(
+                            &task_id,
+                            TaskEvent::WorkerFailed {
+                                attempt_id,
+                                failure: TaskFailure::new(message),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                WorkerEvent::RecoveryConflict(message) => {
+                    let attempt_id = self
+                        .tasks
+                        .get(&task_id)
+                        .expect("worker task was checked above")
+                        .active_attempt_id()
+                        .clone();
+                    affected = self
+                        .reduce_task(
+                            &task_id,
+                            TaskEvent::RecoveryConflict {
+                                attempt_id,
+                                reason: BlockReason(format!("recovery_conflict: {message}")),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
                 }
                 WorkerEvent::Cancelled => {
-                    self.cancel_task_tree(&task_id, false)?;
+                    // Cancelling the task reduces it to `Cancelled`, a settled
+                    // terminal, so `reduce_task` inside the tree cancel already
+                    // cascades to its live descendants.
+                    affected = self.cancel_task_tree(&task_id, false)?;
                 }
                 WorkerEvent::CompletedWithoutDelivery => {
-                    self.fail_task(
-                        &task_id,
-                        "worker completed without a structured delivery report",
-                    )?;
+                    let attempt_id = self
+                        .tasks
+                        .get(&task_id)
+                        .expect("worker task was checked above")
+                        .active_attempt_id()
+                        .clone();
+                    affected = self
+                        .reduce_task(
+                            &task_id,
+                            TaskEvent::WorkerFailed {
+                                attempt_id,
+                                failure: TaskFailure::new(
+                                    "worker completed without a structured delivery report",
+                                ),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
                 }
             }
-            if self.tasks.get(&task_id).is_some_and(|task| {
-                task.state().is_terminal()
-                    || matches!(
-                        task.state(),
-                        TaskState::Paused(_) | TaskState::AwaitingParentReview(_)
-                    )
-            }) {
-                self.workers.remove(&task_id);
-                self.worker_message_capabilities.remove(&task_id);
-                changed.push(task_id);
-                self.notify_update();
+            for id in std::iter::once(task_id.clone()).chain(affected) {
+                if self.tasks.get(&id).is_some_and(|task| {
+                    task.state().is_terminal()
+                        || matches!(
+                            task.state(),
+                            TaskState::Paused(_) | TaskState::AwaitingParentReview(_)
+                        )
+                }) {
+                    self.workers.remove(&id);
+                    self.worker_message_capabilities.remove(&id);
+                    if !changed.contains(&id) {
+                        changed.push(id);
+                    }
+                    self.notify_update();
+                }
             }
         }
         Ok(changed)
@@ -916,17 +965,24 @@ impl AgentSupervisor {
             if let Some(worker) = self.workers.get(id) {
                 worker.cancel();
             }
-            let task = self.tasks.get_mut(id).expect("collected task exists");
-            if !task.state().is_terminal() {
-                let attempt_id = task.active_attempt_id().clone();
-                task.reduce(
+            if self
+                .tasks
+                .get(id)
+                .is_some_and(|task| !task.state().is_terminal())
+            {
+                let attempt_id = self
+                    .tasks
+                    .get(id)
+                    .expect("collected task exists")
+                    .active_attempt_id()
+                    .clone();
+                self.reduce_task(
+                    id,
                     TaskEvent::CancelRequested {
                         attempt_id,
                         reason: CancelReason("cancelled by runtime coordinator".into()),
                     },
-                    chrono::Utc::now(),
-                )
-                .map_err(|error| error.to_string())?;
+                )?;
             }
         }
         self.notify_update();
@@ -934,38 +990,33 @@ impl AgentSupervisor {
     }
 
     pub fn pause_task(&mut self, task_id: &TaskId, reason: PauseReason) -> Result<(), String> {
-        let worker = self
-            .workers
-            .get(task_id)
-            .ok_or_else(|| "worker does not exist".to_string())?;
-        let task = self
+        if !self.workers.contains_key(task_id) {
+            return Err("worker does not exist".to_string());
+        }
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
-            TaskEvent::PauseRequested { attempt_id, reason },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
-        worker.request_pause();
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        // A pause request is not a terminal transition, so no cascade can fire
+        // and the handle can be re-fetched after the reduction.
+        self.reduce_task(task_id, TaskEvent::PauseRequested { attempt_id, reason })?;
+        if let Some(worker) = self.workers.get(task_id) {
+            worker.request_pause();
+        }
         self.notify_update();
         Ok(())
     }
 
     pub fn resume_task(&mut self, task_id: &TaskId) -> Result<(), String> {
-        {
-            let task = self
-                .tasks
-                .get_mut(task_id)
-                .ok_or_else(|| "task does not exist".to_string())?;
-            let attempt_id = task.active_attempt_id().clone();
-            task.reduce(
-                TaskEvent::ResumeRequested { attempt_id },
-                chrono::Utc::now(),
-            )
-            .map_err(|error| error.to_string())?;
-        }
+        let attempt_id = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(task_id, TaskEvent::ResumeRequested { attempt_id })?;
         self.workers.remove(task_id);
         self.worker_message_capabilities.remove(task_id);
         self.notify_update();
@@ -1321,22 +1372,28 @@ impl AgentSupervisor {
         task_id: &TaskId,
         reason: PauseReason,
     ) -> Result<(), String> {
-        let task = self
+        if self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        if matches!(task.state(), TaskState::Paused(_)) {
-            return Ok(());
-        }
-        if task.state().is_terminal() {
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .state()
+            .is_terminal()
+        {
             return Err("terminal task cannot be paused".into());
         }
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
-            TaskEvent::PauseRequested { attempt_id, reason },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        if matches!(
+            self.tasks.get(task_id).map(|task| task.state()),
+            Some(TaskState::Paused(_))
+        ) {
+            return Ok(());
+        }
+        let attempt_id = self
+            .tasks
+            .get(task_id)
+            .expect("task existence was checked above")
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(task_id, TaskEvent::PauseRequested { attempt_id, reason })?;
         self.notify_update();
         Ok(())
     }
@@ -1437,19 +1494,19 @@ impl AgentSupervisor {
         task_id: &TaskId,
         message: impl Into<String>,
     ) -> Result<(), String> {
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
             TaskEvent::WorkerFailed {
                 attempt_id,
                 failure: TaskFailure::new(message),
             },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         self.notify_update();
         Ok(())
     }
@@ -1491,28 +1548,25 @@ impl AgentSupervisor {
         if let Some(worker) = self.workers.get(task_id) {
             worker.cancel();
         }
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(event(attempt_id), chrono::Utc::now())
-            .map_err(|error| error.to_string())?;
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(task_id, event(attempt_id))?;
         self.notify_update();
         Ok(())
     }
 
     pub fn start_task(&mut self, task_id: &TaskId) -> Result<(), String> {
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
-            TaskEvent::AdmissionGranted { attempt_id },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(task_id, TaskEvent::AdmissionGranted { attempt_id })?;
         self.notify_update();
         Ok(())
     }
@@ -1523,19 +1577,19 @@ impl AgentSupervisor {
         task_id: &TaskId,
         request: PermissionRequestId,
     ) -> Result<AttemptId, String> {
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
             TaskEvent::PermissionRequested {
                 attempt_id: attempt_id.clone(),
                 request,
             },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         self.notify_update();
         Ok(attempt_id)
     }
@@ -1548,20 +1602,20 @@ impl AgentSupervisor {
         request: PermissionRequestId,
         decision: PermissionDecision,
     ) -> Result<AttemptId, String> {
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
             TaskEvent::PermissionResolved {
                 attempt_id: attempt_id.clone(),
                 request,
                 decision,
             },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         self.notify_update();
         Ok(attempt_id)
     }
@@ -1575,21 +1629,21 @@ impl AgentSupervisor {
         delivery_id: DeliveryId,
         integration: IntegrationValidation,
     ) -> Result<AttemptId, String> {
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
             TaskEvent::ReviewAccepted {
                 attempt_id: attempt_id.clone(),
                 actor: actor.clone(),
                 delivery_id,
                 integration,
             },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         self.notify_update();
         Ok(attempt_id)
     }
@@ -1653,24 +1707,28 @@ impl AgentSupervisor {
         {
             return Err("review actor does not match direct parent".into());
         }
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        let transition = task
-            .reduce(
-                TaskEvent::ReviewRework {
-                    attempt_id,
-                    delivery_id,
-                    feedback,
-                },
-                chrono::Utc::now(),
-            )
-            .map_err(|error| error.to_string())?;
-        let successor = transition
-            .new_attempt
-            .ok_or_else(|| "rework did not create a successor attempt".to_string())?;
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
+            TaskEvent::ReviewRework {
+                attempt_id,
+                delivery_id,
+                feedback,
+            },
+        )?;
+        // `ReviewRework` always installs a successor attempt as the task's
+        // active attempt, so that is the attempt this method reports.
+        let successor = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt()
+            .clone();
         Ok(successor)
     }
 
@@ -1690,20 +1748,20 @@ impl AgentSupervisor {
         {
             return Err("review actor does not match direct parent".into());
         }
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
             TaskEvent::ReviewRejected {
                 attempt_id: attempt_id.clone(),
                 delivery_id,
                 reason: reason.clone(),
             },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         self.stage_persisted_message(MailboxMessageDraft::new_with_id(
             reason.clone(),
             actor.clone(),
@@ -1727,19 +1785,19 @@ impl AgentSupervisor {
         ) {
             self.start_task(task_id)?;
         }
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        task.reduce(
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(
+            task_id,
             TaskEvent::RecoveryConflict {
                 attempt_id,
                 reason: BlockReason(format!("recovery_conflict: {}", message.into())),
             },
-            chrono::Utc::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         self.notify_update();
         Ok(())
     }
@@ -1760,16 +1818,20 @@ impl AgentSupervisor {
         // event is reconciled; a successor attempt must not inherit it.
         self.workers.remove(task_id);
         self.worker_message_capabilities.remove(task_id);
-        let task = self
+        let attempt_id = self
             .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
-        let attempt_id = task.active_attempt_id().clone();
-        let next = task
-            .reduce(TaskEvent::RetryRequested { attempt_id }, chrono::Utc::now())
-            .map_err(|error| error.to_string())?
-            .new_attempt
-            .expect("retry creates a successor attempt");
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt_id()
+            .clone();
+        self.reduce_task(task_id, TaskEvent::RetryRequested { attempt_id })?;
+        // `RetryRequested` installs the successor as the active attempt.
+        let next = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?
+            .active_attempt()
+            .clone();
         self.notify_update();
         Ok(next)
     }
@@ -1785,6 +1847,134 @@ impl AgentSupervisor {
             return Err("recovery resume requires a recovery-required task".into());
         }
         self.retry_task(task_id)
+    }
+
+    /// After `task_id` has been reduced, enforce the tree invariant: a task in a
+    /// settled terminal state must not leave live descendants behind. Returns only
+    /// ids whose state actually changed, so callers persist exactly what moved.
+    fn settle_terminal(&mut self, task_id: &TaskId) -> Vec<TaskId> {
+        let Some(state) = self.tasks.get(task_id).map(|task| task.state().clone()) else {
+            return Vec::new();
+        };
+        if classify_terminal(&state) != TerminalKind::Settled {
+            return Vec::new();
+        }
+        if matches!(state, TaskState::Completed | TaskState::CompletedNoChanges) {
+            let live: Vec<TaskId> = self
+                .collect_subtree(task_id)
+                .into_iter()
+                .filter(|id| {
+                    self.tasks.get(id).is_some_and(|task| {
+                        classify_terminal(task.state()) == TerminalKind::NonTerminal
+                    })
+                })
+                .collect();
+            if !live.is_empty() {
+                tracing::warn!(
+                    ?task_id,
+                    live_children = live.len(),
+                    "task reached a successful terminal state while live descendants remained; cascading cancellation"
+                );
+            }
+        }
+        let mut changed = Vec::new();
+        for id in self.collect_subtree(task_id) {
+            if id == *task_id {
+                continue;
+            }
+            let Some(task) = self.tasks.get_mut(&id) else {
+                continue;
+            };
+            if classify_terminal(task.state()) != TerminalKind::NonTerminal {
+                continue;
+            }
+            if let Some(worker) = self.workers.get(&id) {
+                worker.cancel();
+            }
+            let attempt_id = task.active_attempt_id().clone();
+            if task
+                .reduce(
+                    TaskEvent::CancelRequested {
+                        attempt_id,
+                        reason: CancelReason("parent reached a terminal state".into()),
+                    },
+                    chrono::Utc::now(),
+                )
+                .is_ok()
+            {
+                changed.push(id);
+            }
+        }
+        if !changed.is_empty() {
+            self.notify_update();
+        }
+        changed
+    }
+
+    fn collect_subtree(&self, task_id: &TaskId) -> Vec<TaskId> {
+        let mut out = Vec::new();
+        self.collect_subtree_into(task_id, &mut out);
+        out
+    }
+
+    fn collect_subtree_into(&self, task_id: &TaskId, out: &mut Vec<TaskId>) {
+        out.push(task_id.clone());
+        for child in self.children_of(task_id) {
+            self.collect_subtree_into(child, out);
+        }
+    }
+
+    /// The single entry point every state-changing reduce must go through. It
+    /// performs the reduction, then enforces the parent-terminal cascade. Returns
+    /// every task id whose state changed (the reduced task plus any cascade
+    /// victims), so the runtime coordinator can persist and release each one.
+    ///
+    /// `RecoveryRequired` is deliberately excluded from the cascade: it is
+    /// terminal for bookkeeping but *parked and resumable*, so cancelling its
+    /// descendants would destroy children a resumed attempt still needs.
+    pub fn reduce_task(
+        &mut self,
+        task_id: &TaskId,
+        event: TaskEvent,
+    ) -> Result<Vec<TaskId>, String> {
+        {
+            let task = self
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| "task does not exist".to_string())?;
+            task.reduce(event, chrono::Utc::now())
+                .map_err(|error| error.to_string())?;
+        }
+        let mut changed = vec![task_id.clone()];
+        changed.extend(self.settle_terminal(task_id));
+        self.notify_update();
+        Ok(changed)
+    }
+}
+
+/// Whether a state should trigger the parent-terminal cascade. Deliberately
+/// narrower than `TaskState::is_terminal`: `RecoveryRequired` is terminal for
+/// bookkeeping but is a *parked, resumable* state, so cascading on it would
+/// kill children the parent could still need after a resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalKind {
+    NonTerminal,
+    Settled,
+    RecoveryRequired,
+}
+
+fn classify_terminal(state: &TaskState) -> TerminalKind {
+    match state {
+        TaskState::Completed
+        | TaskState::CompletedNoChanges
+        | TaskState::Blocked(_)
+        | TaskState::Stalled(_)
+        | TaskState::TimedOut(_)
+        | TaskState::BudgetExhausted(_)
+        | TaskState::Failed(_)
+        | TaskState::Cancelled(_) => TerminalKind::Settled,
+        TaskState::RecoveryRequired(_) => TerminalKind::RecoveryRequired,
+        _ => TerminalKind::NonTerminal,
     }
 }
 
