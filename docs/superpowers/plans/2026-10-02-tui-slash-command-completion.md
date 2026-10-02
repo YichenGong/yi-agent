@@ -947,15 +947,24 @@ AgentEvent::Start
 Run: `cd yi-agent-rs && cargo test -p yi-agent-core --lib model_changed_event_is_constructible && cargo test -p yi-agent-app-server`
 Expected: PASS（app-server 编译通过、测试绿）。
 
-- [ ] **Step 5: 写 driver 测试（SetModel 保留 session）**
+- [ ] **Step 5: 写 driver 测试（`SetModel` 辨识载荷）**
 
 在 `main.rs` `mod tests` 加：
 
 ```rust
 #[test]
-fn set_model_control_command_carries_the_new_model() {
-    let cmd = ControlCommand::SetModel("claude-opus-4-1".into());
-    assert_eq!(cmd, ControlCommand::SetModel("claude-opus-4-1".into()));
+fn set_model_control_command_distinguishes_its_payload() {
+    // Guards against a `PartialEq` that ignores the payload (e.g. compares only
+    // the discriminant): two different models must not compare equal, and
+    // `SetModel` must not compare equal to a payload-less variant.
+    let a = ControlCommand::SetModel("claude-opus-4-1".into());
+    let b = ControlCommand::SetModel("claude-sonnet-4-5".into());
+    assert_ne!(a, b);
+    assert_ne!(a, ControlCommand::McpRefresh);
+    assert_eq!(
+        ControlCommand::SetModel("claude-opus-4-1".into()),
+        ControlCommand::SetModel("claude-opus-4-1".into()),
+    );
 }
 ```
 
@@ -1012,7 +1021,7 @@ ControlCommand::SetModel(new_model) => {
 
 - [ ] **Step 7: 跑 driver 测试确认通过**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent -- set_model_control_command_carries_the_new_model`
+Run: `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent -- set_model_control_command_distinguishes_its_payload`
 Expected: PASS，且 `cargo build -p yi-agent` 无 `Copy` 相关错误（`cargo test` 会顺带编译）。
 
 - [ ] **Step 8: 在 TUI 实现 `/model` 与 `current_model`**
