@@ -69,19 +69,26 @@ fn main() -> Result<()> {
         Some(Command::Agents { ref project, all }) => control_agents(&cli, project.clone(), all),
         Some(Command::Agent { ref action }) => control_agent(&cli, action.clone()),
         Some(Command::Schedule { ref action }) => control_schedule(&cli, action),
-        Some(Command::AppServer { ref listen }) => {
+        Some(Command::AppServer {
+            ref listen,
+            ref relay,
+        }) => {
             let listen = listen.clone();
-            run_app_server(cli, &listen)
+            let relay = relay.clone();
+            run_app_server(cli, &listen, relay.as_deref())
         }
         Some(Command::Completions { shell }) => print_completion(shell),
         None => run_agent(cli),
     }
 }
 
-/// 解析 `--listen`。只支持 stdio 与 ws 两种传输。
+/// 解析 `--listen`。支持 stdio、ws,以及 `relay://` 长写法的中继出站模式。
+#[derive(Debug)]
 enum Listen {
     Stdio,
     Ws(std::net::SocketAddr),
+    /// 中继出站模式:值是中继的电脑侧端点(裸 `wss://…/connect?session=…`)。
+    Relay(String),
 }
 
 fn parse_listen(listen: &str) -> Result<Listen> {
@@ -94,9 +101,57 @@ fn parse_listen(listen: &str) -> Result<Listen> {
             .map_err(|e| anyhow::anyhow!("invalid ws address `{rest}`: {e}"))?;
         return Ok(Listen::Ws(addr));
     }
+    if let Some(rest) = listen.strip_prefix("relay://") {
+        if rest.is_empty() {
+            anyhow::bail!("`relay://` needs a ws/wss endpoint after it");
+        }
+        // 中继端点必须是 ws/wss;提前拒绝 http 之类,避免把错误推迟到连接时。
+        if !rest.starts_with("ws://") && !rest.starts_with("wss://") {
+            anyhow::bail!("relay endpoint must start with ws:// or wss://, got `{rest}`");
+        }
+        return Ok(Listen::Relay(rest.to_string()));
+    }
     anyhow::bail!(
-        "unsupported app-server transport `{listen}`: expected `stdio://` or `ws://host:port`"
+        "unsupported app-server transport `{listen}`: expected `stdio://`, \
+         `ws://host:port`, or `relay://wss://host/connect?session=<id>`"
     )
+}
+
+/// 把中继端点拆成「去掉 `session` 的 URL」+「session id」。
+///
+/// `run_client` 会自己补 `?session=<id>`,故这里必须把它摘掉,否则 URL 上会出现
+/// 两个 `session` 参数。不依赖 `url` crate(与 app-server 的依赖面保持一致),
+/// 只做本场景够用的查询串切分。
+fn relay_parts(relay_url: &str) -> Result<(String, String)> {
+    let (base, query) = match relay_url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (relay_url, None),
+    };
+    let session = query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "session")
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "relay endpoint `{relay_url}` is missing `?session=<id>`: \
+                 the phone and the computer must agree on the same session id"
+            )
+        })?;
+
+    let kept: Vec<&str> = query
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("session="))
+        .collect();
+    let url = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    Ok((url, session))
 }
 
 /// Emit a clap-generated shell completion script for `shell` on stdout.
@@ -114,8 +169,13 @@ fn print_completion(shell: clap_complete::Shell) -> Result<()> {
 ///
 /// For stdio, stdout is the protocol channel and must stay free of log lines;
 /// tracing writes to a file (and to stderr only when `YI_LOG` is set).
-fn run_app_server(cli: Cli, listen: &str) -> Result<()> {
-    let listen = parse_listen(listen)?;
+fn run_app_server(cli: Cli, listen: &str, relay: Option<&str>) -> Result<()> {
+    // `--relay <url>` 是 `--listen relay://<url>` 的等价写法;两者都给时以 `--relay` 为准。
+    let requested = match relay {
+        Some(url) => format!("relay://{url}"),
+        None => listen.to_string(),
+    };
+    let listen = parse_listen(&requested)?;
     let config = config::load(&cli)?;
     let rt = tokio::runtime::Runtime::new()?;
     match listen {
@@ -147,7 +207,55 @@ fn run_app_server(cli: Cli, listen: &str) -> Result<()> {
             ));
             yi_agent_app_server::ws::serve_ws(listener, config, workspaces, pairing).await
         }),
+        Listen::Relay(url) => rt.block_on(run_relay_mode(config, url)),
     }
+}
+
+/// 中继出站模式:本地起一个只监听环回的 ws app-server,再把它与中继桥起来。
+///
+/// 电脑侧**不开放入站端口**:本地 listener 绑在 `127.0.0.1:0`(仅本机可达),
+/// 中继客户端作为 ws 客户端出站连它,因此网络路径上没有新增暴露面。
+///
+/// 本地 app-server 仍是「无 token 即 4401」:这里用与它**共享**的 `PairingState`
+/// 现铸一枚本机设备 token(等价于本机走一次正常配对,`seed_local_device`),交给
+/// 中继客户端连接本地 ws。**不**把本地 ws 改成免认证——那会削弱「准入即认证」
+/// 的不变量,而这枚 token 的成本只是一个函数调用。
+async fn run_relay_mode(
+    config: yi_agent_runtime::config::RuntimeConfig,
+    url: String,
+) -> Result<()> {
+    let (relay_url, session) = relay_parts(&url)?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let workspaces =
+        std::sync::Arc::new(yi_agent_app_server::workspace_index::WorkspaceIndex::new(
+            yi_agent_app_server::workspace_index::default_path(),
+        ));
+    let pairing = std::sync::Arc::new(yi_agent_app_server::pairing::PairingState::new(
+        yi_agent_app_server::device_store::DeviceStore::new(
+            yi_agent_app_server::device_store::default_path(),
+        ),
+    ));
+    // 本机中继桥的凭据:直接铸一台 Control 设备(与 spec §5.4「新配对设备默认
+    // control」一致),i.e. 桌面为「中继桥」这个本机客户端发的一张设备卡。
+    let local_token = pairing.seed_local_device("relay-bridge");
+
+    let serve_pairing = std::sync::Arc::clone(&pairing);
+    tokio::spawn(async move {
+        if let Err(e) =
+            yi_agent_app_server::ws::serve_ws(listener, config, workspaces, serve_pairing).await
+        {
+            eprintln!("local app-server for relay stopped: {e}");
+        }
+    });
+
+    let relay_url = url::Url::parse(&relay_url)
+        .map_err(|e| anyhow::anyhow!("invalid relay url `{relay_url}`: {e}"))?;
+    let app_server_ws = url::Url::parse(&format!("ws://{addr}/ws")).expect("loopback ws url");
+    eprintln!("relaying via {relay_url} (session {session}); local app-server on {addr}");
+
+    yi_agent_relay::run_client(relay_url, app_server_ws, session, local_token).await
 }
 
 fn control_agents(cli: &Cli, project: Option<std::path::PathBuf>, all: bool) -> Result<()> {
@@ -1984,6 +2092,37 @@ mod tests {
     fn parse_listen_rejects_other_transports() {
         assert!(parse_listen("tcp://127.0.0.1:9000").is_err());
         assert!(parse_listen("ws://not-an-address").is_err());
+    }
+
+    /// `--listen relay://<ws-url>` 是 `--relay` 的等价长写法:剥掉 `relay://`
+    /// 前缀后应得到裸的 `wss://` 电脑侧端点。
+    #[test]
+    fn parse_listen_accepts_a_relay_url() {
+        match parse_listen("relay://wss://relay.example/connect?session=abc").unwrap() {
+            Listen::Relay(url) => assert_eq!(url, "wss://relay.example/connect?session=abc"),
+            other => panic!("relay:// must parse to a Relay listener, got {other:?}"),
+        }
+    }
+
+    /// `relay://` 后面必须是 `ws://`/`wss://`,且不能为空。
+    #[test]
+    fn parse_listen_rejects_a_malformed_relay_url() {
+        assert!(parse_listen("relay://").is_err());
+        assert!(parse_listen("relay://http://relay.example").is_err());
+    }
+
+    /// 从中继端点里拆出 `session` 参数:返回「去掉 session 的 URL」+「session id」,
+    /// 供 `run_client` 分别使用(它会自己补 `?session=`;若不摘掉就会重复)。
+    #[test]
+    fn relay_parts_extracts_the_session_and_strips_it() {
+        let (url, session) = relay_parts("wss://relay.example/connect?session=abc&pin=1").unwrap();
+        assert_eq!(session, "abc");
+        assert_eq!(url.as_str(), "wss://relay.example/connect?pin=1");
+    }
+
+    #[test]
+    fn relay_parts_requires_a_session() {
+        assert!(relay_parts("wss://relay.example/connect").is_err());
     }
 
     #[test]

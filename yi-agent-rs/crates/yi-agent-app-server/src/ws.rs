@@ -27,6 +27,19 @@ use yi_agent_runtime::config::RuntimeConfig;
 /// 认证失败时用的 ws close code(RFC 6455 的 4000-4999 私有段):未提供或无效 token。
 const UNAUTHORIZED_CLOSE_CODE: u16 = 4401;
 
+/// 一次性配对兑现连接交付 token 后用的 close code。
+///
+/// 兑现连接**不做通用传输**:把 token 交给手机后即关闭,手机须带 token 重连
+/// (见 [`redeem_pair_code`])。用 4403(而非 4401)与「未认证」区分开,便于客户端
+/// 分辨「配对失败」与「配对成功、请用 token 重连」。
+const PAIRING_DELIVERED_CLOSE_CODE: u16 = 4403;
+
+/// `pair/redeemed` 通知的方法名。
+const PAIR_REDEEMED_METHOD: &str = "pair/redeemed";
+
+/// 未提供 `device_name` 时的默认设备名。
+const DEFAULT_DEVICE_NAME: &str = "iPhone";
+
 /// 用一个已绑定的 listener 跑 ws 传输(生产:注入 `production_factory`)。
 ///
 /// `pairing` 由调用方注入,必须与桌面 stdio 主循环是**同一个** `Arc`:桌面铸的
@@ -116,6 +129,16 @@ where
                 let devices = Arc::clone(&router_devices);
                 let pairing = Arc::clone(&pairing);
                 async move {
+                    // Flow A(spec §5.1/§4.3):手机扫到二维码里的是一次性配对码,
+                    // 带外没有 token,必须在握手时用 `?pair=<code>` 兑换。这条路径
+                    // **在准入认证之前**处理,但它自己不做任何鉴权放行——成功只把这
+                    // 条一次性连接的 token 交回手机并立即关闭;失败则原样落到下面的
+                    // 4401 路径(与「无 token」等价,不泄露码是否存在)。
+                    if let Some(code) = query_param(&uri, "pair") {
+                        let name = query_param(&uri, "device_name")
+                            .unwrap_or_else(|| DEFAULT_DEVICE_NAME.to_string());
+                        return redeem_pair_code(upgrade, pairing, code, name).await;
+                    }
                     // 认证:token 取自 `Authorization: Bearer <token>`,或退回
                     // `?token=<token>`(无法设 header 的客户端)。缺 token 或校验失败
                     // 一律 4401 关闭——准入即认证,没有匿名连接。
@@ -171,6 +194,74 @@ async fn close_unauthorized(
     })
 }
 
+/// 一条 `?pair=<code>` 握手:**一次性**兑换配对码并把这台新设备的 token 交回。
+///
+/// 形态(手机侧唯一需要认识的一帧):
+///
+/// ```json
+/// {"jsonrpc":"2.0","method":"pair/redeemed",
+///  "params":{"device_id":"dev-…","token":"yia_…","scope":"control"}}
+/// ```
+///
+/// 为什么是「送完即关」(close after delivery)而不是把这条连接直接当成已认证:
+/// - 配对是**一次性**事件,不是会话:手机拿到 token 后本来就要持久化并以
+///   `?token=`/`Bearer` 走正常连接路径(spec §5.2 流程 B)。把兑现连接并入通用
+///   传输,等于给一条"没有 device scope 登记、也没有走标准认证"的 socket 开一个
+///   特例,徒增状态与风险面。
+/// - 少一层状态 = 少一个绕过点:兑现连接从不注册进 `Broadcaster`、不写 scope 表、
+///   不喂主循环,因此即使逻辑出错也不可能以某台设备的身份消费帧。
+/// - 关帧用 4403,客户端可据此区分「配对失败(4401)」与「配对成功、请带 token
+///   重连(4403)」。
+///
+/// 失败(码不存在/已用过/已过期,或设备表写失败)**一律落到 4401**,与「无 token」
+/// 不可区分——不泄露某个码是否曾经存在。
+async fn redeem_pair_code(
+    upgrade: WebSocketUpgrade,
+    pairing: Arc<PairingState>,
+    code: String,
+    device_name: String,
+) -> axum::response::Response {
+    let redeemed = pairing.redeem(&code, &device_name);
+    match redeemed {
+        Ok((device, token)) => {
+            tracing::info!(device_id = %device.id, "ws pair code redeemed");
+            upgrade.on_upgrade(move |mut socket: WebSocket| async move {
+                let frame = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": PAIR_REDEEMED_METHOD,
+                    "params": {
+                        "device_id": device.id,
+                        "token": token,
+                        "scope": device.scope,
+                    }
+                });
+                let _ = socket.send(Message::Text(frame.to_string().into())).await;
+                // 交付即关:这是一次性兑现通道,不是可用的会话。
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: PAIRING_DELIVERED_CLOSE_CODE,
+                        reason: "paired".into(),
+                    })))
+                    .await;
+            })
+        }
+        Err(_) => close_unauthorized(upgrade, "invalid pair code").await,
+    }
+}
+
+/// 取查询串里的第一个 `key=value`(已 percent-decode)。空值视同不存在。
+fn query_param(uri: &Uri, key: &str) -> Option<String> {
+    let query = uri.query()?;
+    for pair in query.split('&') {
+        if let Some((k, value)) = pair.split_once('=') {
+            if k == key && !value.is_empty() {
+                return Some(percent_decode(value));
+            }
+        }
+    }
+    None
+}
+
 /// 从握手请求里取设备 token:`Authorization: Bearer <token>` 优先,其次
 /// `?token=<token>`。空 token 视同没有。
 fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
@@ -184,15 +275,7 @@ fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
             }
         }
     }
-    let query = uri.query()?;
-    for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == "token" && !value.is_empty() {
-                return Some(percent_decode(value));
-            }
-        }
-    }
-    None
+    query_param(uri, "token")
 }
 
 /// 最小 percent-decoding:token 是 `yia_<hex>`,实践中不含需转义的字符,但
@@ -608,6 +691,95 @@ mod tests {
                 assert_eq!(u16::from(frame.code), 4401, "close code must be 4401");
             }
             other => panic!("expected a 4401 close, got {other:?}"),
+        }
+    }
+
+    /// 连一条**未带 token**的 ws(可带任意查询串),断言服务端以 `code` 关闭。
+    ///
+    /// 用于「配对失败一律落到普通 4401 路径」与「一次性兑现连接送完即关」两类断言。
+    async fn assert_closed_with(addr: SocketAddr, query: &str, code: u16) {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?{query}"))
+            .await
+            .expect("handshake completes; the close follows");
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("server must close the connection")
+            .expect("stream must not end without a close frame")
+            .expect("transport error");
+        match msg {
+            ClientMessage::Close(Some(frame)) => {
+                assert_eq!(u16::from(frame.code), code, "unexpected close code");
+            }
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    }
+
+    /// Flow A(spec §5.1/§4.3):手机扫到的是一次性配对码,带外拿不到 token,
+    /// 必须在 ws 握手时用 `?pair=<code>` 兑换。本测试覆盖完整往返:
+    /// 兑现 → 服务端把 token 回给该连接并以 4403 关闭(一次性,simpler/safer);
+    /// 用该 token 重连能 `initialize`;同一个码再兑必须失败(落到 4401)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pair_code_is_redeemed_over_the_ws_and_yields_a_usable_token() {
+        let WsFixture {
+            addr,
+            pairing,
+            handle,
+            ..
+        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        let code = pairing.create_code();
+
+        // 1. 未认证连接带 `?pair=<code>` 与 `device_name`,服务端必须回 `pair/redeemed`。
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/ws?pair={}&device_name=iPhone%2015",
+            code.code
+        ))
+        .await
+        .expect("pairing ws connect");
+        let v = recv_json(&mut ws).await;
+        assert_eq!(
+            v["method"], "pair/redeemed",
+            "the server must deliver the redeemed token on this connection: {v}"
+        );
+        let token = v["params"]["token"]
+            .as_str()
+            .expect("pair/redeemed must carry a token")
+            .to_string();
+        assert!(token.starts_with("yia_"), "unexpected token form: {token}");
+        assert_eq!(
+            v["params"]["scope"], "control",
+            "a newly paired device must default to control scope"
+        );
+        assert!(
+            v["params"]["device_id"].as_str().is_some(),
+            "pair/redeemed must carry the new device id: {v}"
+        );
+
+        // 2. 兑现连接是一次性的:送完 token 即由服务端关闭(4403)。
+        assert_closed_after_delivery(&mut ws).await;
+
+        // 3. 用换来的 token 重连,正常完成 initialize。
+        let mut authed = connect_authed(addr, &token).await;
+        initialize(&mut authed).await;
+
+        // 4. 同一个码不能二次兑现:失败必须落到普通 4401 路径。
+        assert_closed_with(addr, &format!("pair={}", code.code), 4401).await;
+        handle.abort();
+    }
+
+    /// 断言一条已送出兑现 token 的连接会被服务端以 4403 关闭(或直接 EOF)。
+    async fn assert_closed_after_delivery<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("the server must close a one-shot pairing connection");
+        match closed {
+            Some(Ok(ClientMessage::Close(Some(frame)))) => {
+                assert_eq!(u16::from(frame.code), 4403, "expected a 4403 close");
+            }
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(None))) => {}
+            other => panic!("expected the pairing connection to close, got {other:?}"),
         }
     }
 

@@ -153,11 +153,21 @@ pub enum Command {
     /// Run the JSON-RPC app-server. Used by the desktop GUI sidecar and, over
     /// `ws://`, by network clients.
     AppServer {
-        /// Listen transport: `stdio://` (default) or `ws://host:port`.
-        /// The ws transport has NO authentication in this version and should be
-        /// bound to loopback only.
+        /// Listen transport: `stdio://` (default), `ws://host:port`, or
+        /// `relay://wss://host/connect?session=<id>`.
+        ///
+        /// The ws transport authenticates every client with a paired device
+        /// token (unauthenticated clients are closed with ws code 4401).
         #[arg(long, default_value = "stdio://")]
         listen: String,
+        /// Bridge to a reverse WSS relay instead of opening an inbound port.
+        ///
+        /// Takes the relay's computer-side endpoint, e.g.
+        /// `wss://relay.example/connect?session=<id>`. Equivalent to
+        /// `--listen relay://<same url>`. In this mode the app-server binds a
+        /// loopback ws server on 127.0.0.1:0 and dials the relay outbound.
+        #[arg(long)]
+        relay: Option<String>,
     },
     /// Generate a shell completion script on stdout (bash, zsh, fish, powershell).
     Completions {
@@ -538,7 +548,30 @@ mod tests {
     fn cli_app_server_defaults_to_stdio() {
         let cli = Cli::parse_from(["yi-agent", "app-server"]);
         match cli.command {
-            Some(Command::AppServer { listen }) => assert_eq!(listen, "stdio://"),
+            Some(Command::AppServer { listen, relay }) => {
+                assert_eq!(listen, "stdio://");
+                assert!(relay.is_none(), "no relay unless asked for");
+            }
+            other => panic!("expected AppServer command, got {other:?}"),
+        }
+    }
+
+    /// `--relay <url>` 是 `--listen relay://<url>` 的等价写法,二者都接受的字段。
+    #[test]
+    fn cli_parses_app_server_relay_flag() {
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "app-server",
+            "--relay",
+            "wss://relay.example/connect?session=abc",
+        ]);
+        match cli.command {
+            Some(Command::AppServer { relay, .. }) => {
+                assert_eq!(
+                    relay.as_deref(),
+                    Some("wss://relay.example/connect?session=abc")
+                );
+            }
             other => panic!("expected AppServer command, got {other:?}"),
         }
     }

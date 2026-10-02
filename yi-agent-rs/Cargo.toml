@@ -14,6 +14,7 @@ members = [
     "crates/yi-agent-app-server",
     "crates/yi-agent-subagent",
     "crates/yi-agent-supervisors",
+    "crates/yi-agent-relay",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ yi-agent-runtime = { path = "crates/yi-agent-runtime" }
 yi-agent-app-server = { path = "crates/yi-agent-app-server" }
 yi-agent-subagent = { path = "crates/yi-agent-subagent" }
 yi-agent-supervisors = { path = "crates/yi-agent-supervisors" }
+yi-agent-relay = { path = "crates/yi-agent-relay" }
 
 # 共享公共依赖
 tokio = { version = "1", features = ["full"] }
@@ -51,6 +53,7 @@ crossbeam-channel = "0.5"
 nu-ansi-term = "0.50"
 axum = "0.8"
 dotenvy = "0.15"
+url = "2"
 
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 unicode-width = { version = "0.2", default-features = false, features = ["cjk"] }

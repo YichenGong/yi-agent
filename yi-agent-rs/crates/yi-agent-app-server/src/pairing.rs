@@ -104,13 +104,12 @@ impl PairingState {
         Ok((device, token))
     }
 
-    /// 仅供测试:直接铸一台设备并返回其 id 与明文 token。
+    /// 铸一台设备并落表,返回设备与**明文 token**。
     ///
-    /// 生产只会经 `create_code` + `redeem` 铸设备;但测试要覆盖「已配对的
-    /// Admin 设备」这类**非默认** scope(新配对设备恒为 Control)时,用配对码
-    /// 换不出 Admin,故给一个直接落表的入口。生产构建不含此方法。
-    #[cfg(test)]
-    pub(crate) fn seed_device(&self, name: &str, scope: Scope) -> (Device, String) {
+    /// 生产的正常入口是 `create_code` + `redeem`;此私有用例服务于两类**本机**
+    /// 客户端:测试里要造非默认 scope 的设备,以及 `--relay` 模式下本机中继桥
+    /// 需要的一枚本地凭据。
+    fn mint(&self, name: &str, scope: Scope) -> (Device, String) {
         let token = format!("yia_{}", short_code_secret());
         let now = now_epoch_secs();
         let device = Device {
@@ -123,8 +122,28 @@ impl PairingState {
         };
         self.store
             .add(device.clone())
-            .expect("seed device must persist");
+            .expect("mint device must persist");
         (device, token)
+    }
+
+    /// 铸一枚**本机**设备凭据(scope = `Control`),返回明文 token。
+    ///
+    /// `--relay` 模式下,本机中继桥要作为 ws 客户端连**本机**的环回 app-server,
+    /// 而该 server 仍是「无 token 即 4401」。用本方法在启动时取一枚本地 token,
+    /// 好过把环回 ws 改成免认证(那会削弱「准入即认证」的网络路径不变量)。
+    /// 与 spec §5.4「新配对设备默认 control」一致。
+    pub fn seed_local_device(&self, name: &str) -> String {
+        self.mint(name, Scope::Control).1
+    }
+
+    /// 仅供测试:直接铸一台设备并返回其 id 与明文 token。
+    ///
+    /// 生产只会经 `create_code` + `redeem` 铸设备;但测试要覆盖「已配对的
+    /// Admin 设备」这类**非默认** scope(新配对设备恒为 Control)时,用配对码
+    /// 换不出 Admin,故给一个直接落表的入口。
+    #[cfg(test)]
+    pub(crate) fn seed_device(&self, name: &str, scope: Scope) -> (Device, String) {
+        self.mint(name, scope)
     }
 
     /// 仅供测试:塞入一枚**已过期**的配对码,以覆盖 `redeem` 的过期分支。
