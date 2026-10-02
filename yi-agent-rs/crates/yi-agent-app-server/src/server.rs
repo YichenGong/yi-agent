@@ -278,6 +278,14 @@ fn socket_for_thread(
         .map(|handle| handle.socket_path)
 }
 
+/// What a conversation-scoped cancellation did.
+enum ThreadCancelOutcome {
+    /// Nothing left to cancel, or the caller forced and everything was reaped.
+    Cancelled(usize),
+    /// Live children exist and the caller did not force: nothing was touched.
+    NeedsConfirmation(usize),
+}
+
 /// Cancels every live child a conversation owns, before its files go away.
 ///
 /// The children live in the shared project runtime, where the conversation's
@@ -286,13 +294,15 @@ fn socket_for_thread(
 /// conversation marker rather than the root: several conversations share one
 /// attached root, and a root-scoped cancel would stop a sibling's work too.
 ///
-/// Best effort by construction: the thread is being deleted either way, so an
-/// unreachable daemon is reported to the log and never blocks the deletion.
+/// Unless `force` is set, live children stop the deletion so the caller can ask
+/// the user first: losing running work to one click on a sidebar × is not a
+/// decision the backend should make silently.
 fn cancel_thread_children(
     runtimes: &ProjectRuntimes,
     threads: &HashMap<String, ThreadSession>,
     thread_id: &str,
-) -> Result<usize, String> {
+    force: bool,
+) -> Result<ThreadCancelOutcome, String> {
     let cwd = threads
         .get(thread_id)
         .map(|session| session.cwd.clone())
@@ -307,10 +317,16 @@ fn cancel_thread_children(
         |handle| yi_agent_store::ipc::IpcRequest::CancelThreadTasks {
             session_id: handle.session_id.clone(),
             thread_id: thread_id.to_owned(),
+            force,
         },
     )?;
     match response {
-        yi_agent_store::ipc::IpcResponse::ThreadTasksCancelled { task_ids } => Ok(task_ids.len()),
+        yi_agent_store::ipc::IpcResponse::ThreadTasksCancelled { task_ids } => {
+            Ok(ThreadCancelOutcome::Cancelled(task_ids.len()))
+        }
+        yi_agent_store::ipc::IpcResponse::ThreadHasActiveChildren { count } => {
+            Ok(ThreadCancelOutcome::NeedsConfirmation(count))
+        }
         other => Err(format!(
             "daemon returned a non-cancellation response: {other:?}"
         )),
@@ -2398,25 +2414,48 @@ where
                             .await?;
                             continue;
                         }
+                        // 删除前先问一句:这个会话还有子代理在跑吗?要问在中断 turn
+                        // 之前——被拒的前提是不该动它分毫。子代理跑在项目 daemon 里,
+                        // 对话文件不是它的权威,只删文件会把它留在无人可见的地方继续跑。
+                        // force=true 才真的回收,由客户端在用户确认后携带。
+                        let force = req
+                            .params
+                            .get("force")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        match cancel_thread_children(&runtimes, &threads, &thread_id, force) {
+                            Ok(ThreadCancelOutcome::NeedsConfirmation(count)) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    ok_response(
+                                        id,
+                                        json!({
+                                            "status": "needs_confirmation",
+                                            "active_children": count,
+                                        }),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            Ok(ThreadCancelOutcome::Cancelled(cancelled)) => {
+                                if cancelled > 0 {
+                                    eprintln!(
+                                        "[app-server] cancelled {cancelled} subagent task(s) for {thread_id}"
+                                    );
+                                }
+                            }
+                            Err(cause) => eprintln!(
+                                "[app-server] could not cancel subagents for {thread_id}: {cause}"
+                            ),
+                        }
                         // 活跃 thread:先中断,再等 driver 落盘完成才删文件。若像旧
                         // 实现那样在 driver 落盘前就删文件,driver 的 `append_turn`
                         // (`create(true)`)会把 `<id>.jsonl` 复活,导致删除后
                         // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
                         // 故复用 resume 的等待模式,等落盘后再删。
                         interrupt_and_wait_for_persist(&mut threads, &mut turn_rx, &thread_id).await;
-                        // 在删文件之前先取消该会话名下的子代理。子代理跑在共享的项目
-                        // runtime 里,对话文件不是它的权威,只删文件会把它留在无人可见
-                        // 的地方继续跑。按会话标记取消,不动同目录其它会话的子代理
-                        // (它们共享同一个 root)。
-                        match cancel_thread_children(&runtimes, &threads, &thread_id) {
-                            Ok(cancelled) if cancelled > 0 => eprintln!(
-                                "[app-server] cancelled {cancelled} subagent task(s) for {thread_id}"
-                            ),
-                            Ok(_) => {}
-                            Err(cause) => eprintln!(
-                                "[app-server] could not cancel subagents for {thread_id}: {cause}"
-                            ),
-                        }
                         // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
                         threads.remove(&thread_id);
                         pending_activation.remove(&thread_id);

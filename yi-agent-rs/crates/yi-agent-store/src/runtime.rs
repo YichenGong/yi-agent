@@ -2076,6 +2076,22 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// The live (non-terminal) children a conversation owns.
+    ///
+    /// Exposed so a caller can ask "does this conversation still have work?"
+    /// without cancelling it. Roots are never tagged with a conversation, so a
+    /// shared directory's root is never counted here.
+    pub fn active_thread_children(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
+        Ok(self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .active_children_for_thread(thread_id)?)
+    }
+
     /// Cancels every live child a conversation owns, leaving its directory
     /// siblings and the shared root untouched.
     ///

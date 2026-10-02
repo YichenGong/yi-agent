@@ -251,6 +251,13 @@ pub enum IpcRequest {
     CancelThreadTasks {
         session_id: String,
         thread_id: String,
+        /// Whether the caller has already accepted that live children die with
+        /// the conversation. `false` makes the daemon refuse without cancelling
+        /// anything when children are still running, so the caller can ask the
+        /// user first. The check and the cancellation run in one handler, so no
+        /// child can appear between "may I?" and "go ahead".
+        #[serde(default)]
+        force: bool,
     },
     PreviewCancel {
         task_id: String,
@@ -458,6 +465,14 @@ pub enum IpcResponse {
     /// have finished everything already, and the caller is deleting anyway.
     ThreadTasksCancelled {
         task_ids: Vec<String>,
+    },
+    /// The conversation still owns live children and the caller did not force.
+    ///
+    /// Nothing was cancelled: this is a "please confirm" answer, not a failure,
+    /// so it is a result the caller can render rather than an error it must
+    /// catch. Re-issue the same request with `force` to proceed.
+    ThreadHasActiveChildren {
+        count: usize,
     },
     CancelPreview {
         confirmation_token: String,
@@ -3301,8 +3316,18 @@ fn respond(
         IpcRequest::CancelThreadTasks {
             session_id,
             thread_id,
+            force,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
+            // One handler, one decision: the count and the cancellation are taken
+            // back to back, so a child cannot slip in between "may I?" and the
+            // cancel that follows a `force`.
+            let active = coordinator.active_thread_children(&thread_id)?;
+            if !force && !active.is_empty() {
+                return Ok(IpcResponse::ThreadHasActiveChildren {
+                    count: active.len(),
+                });
+            }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
