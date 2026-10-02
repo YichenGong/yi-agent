@@ -36,6 +36,7 @@ thiserror = "2"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 crossterm = { workspace = true }
+qrcode = "0.14"
 
 dirs = "5"
 
