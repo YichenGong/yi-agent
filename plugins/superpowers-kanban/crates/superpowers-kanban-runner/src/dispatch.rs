@@ -4,7 +4,9 @@
 //! `serde_json::Value` 或一条错误消息。I/O 只发生在这个模块里，socket 层
 //! 只负责编解码，因此全部分支都能用纯函数测试。
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use superpowers_kanban_core::card_id::card_id_for;
@@ -13,6 +15,31 @@ use superpowers_kanban_core::layout::project_preferences_path;
 use superpowers_kanban_core::promotion::validate_promotion;
 use superpowers_kanban_core::switch::{SwitchValue, read_layer, resolve, write_layer};
 
+use crate::service::BoardService;
+
+/// 进程内单例：按 `state_dir` 复用同一个 `Arc<BoardService>`。
+///
+/// 每个查询请求都新建 `BoardService` 会丢掉内存中的 lease——`flock` 随对象
+/// drop 释放，于是 `next_launch` 连调两次都能拿到「同一个」名额，
+/// `mark_running` 之后的槽位记账也随之漂移。所以查询分派与推进循环必须共享
+/// 同一实例，`OnceLock<Mutex<HashMap<…>>>` 就是那个「同一实例」。
+fn service_for(state_dir: &Path) -> Arc<BoardService> {
+    static SERVICES: OnceLock<Mutex<HashMap<PathBuf, Arc<BoardService>>>> = OnceLock::new();
+    let registry = SERVICES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut services = registry.lock().unwrap_or_else(|poison| poison.into_inner());
+    services
+        .entry(state_dir.to_path_buf())
+        .or_insert_with(|| {
+            // project_root 由 state_dir 推导；home 走真实的 `global_leases_dir`。
+            Arc::new(BoardService::new(
+                state_dir.to_path_buf(),
+                superpowers_kanban_core::layout::project_root(state_dir),
+                None,
+            ))
+        })
+        .clone()
+}
+
 /// 处理一条查询。`global` 是全局层开关（由调用方读好传入，测试因此不必碰 `HOME`）。
 pub fn dispatch_with_global(
     state_dir: &Path,
@@ -20,20 +47,20 @@ pub fn dispatch_with_global(
     method: &str,
     params: &Value,
 ) -> Result<Value, String> {
+    dispatch_with_service(&service_for(state_dir), state_dir, global, method, params)
+}
+
+/// 分派入口本体。`service` 必须是推进循环持有的那个实例——`list` 与 `board.*`
+/// 都从它读写看板与槽位租约，换成别的实例会让内存里的 lease 对不上账。
+pub fn dispatch_with_service(
+    service: &BoardService,
+    state_dir: &Path,
+    global: Option<SwitchValue>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
     match method {
-        "list" => Ok(json!({
-            "cards": crate::persist::load_board(&state_dir.join("board.json"))
-                .cards()
-                .iter()
-                .map(|card| json!({
-                    "id": card.id.0,
-                    "state": card.state,
-                    "spec_path": card.spec_path,
-                    "plan_path": card.plan_path,
-                    "workdir": card.workdir,
-                }))
-                .collect::<Vec<_>>(),
-        })),
+        "list" => Ok(service.list()),
         "enqueue" => {
             let spec = params
                 .get("spec_path")
@@ -79,6 +106,60 @@ pub fn dispatch_with_global(
             write_layer(&path, value)
                 .map_err(|error| format!("could not write {}: {error}", path.display()))?;
             Ok(json!({ "on": on }))
+        }
+        "board.next_launch" => {
+            // 日历上限按当前时刻算；服务内不读时钟，交由这里注入。
+            let calendar =
+                superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
+                    state_dir,
+                );
+            let limit = calendar.limit_at(chrono::Local::now());
+            match service.next_launch(limit, chrono::Local::now()) {
+                Ok(Some(claim)) => Ok(json!({
+                    "card_id": claim.card_id,
+                    "workdir": claim.workdir,
+                    "title": claim.title,
+                })),
+                Ok(None) => Ok(Value::Null),
+                Err(error) => Err(error),
+            }
+        }
+        "board.mark_running" => {
+            let card_id = params
+                .get("card_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "board.mark_running needs a card_id".to_string())?;
+            let thread_id = params
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "board.mark_running needs a thread_id".to_string())?;
+            service.mark_running(card_id, thread_id)?;
+            Ok(json!({"ok": true}))
+        }
+        "board.mark_terminal" => {
+            let card_id = params
+                .get("card_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "board.mark_terminal needs a card_id".to_string())?;
+            let outcome = params
+                .get("outcome")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "board.mark_terminal needs an outcome".to_string())?;
+            let detail = params.get("detail").and_then(Value::as_str);
+            service.mark_terminal(card_id, outcome, detail)?;
+            Ok(json!({"ok": true}))
+        }
+        "board.release" => {
+            let card_id = params
+                .get("card_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "board.release needs a card_id".to_string())?;
+            let detail = params
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("launch failed");
+            service.release(card_id, detail)?;
+            Ok(json!({"ok": true}))
         }
         other => Err(format!("unknown method: {other}")),
     }
@@ -225,5 +306,45 @@ mod tests {
         let error = dispatch_with_global(dir.path(), None, "destroy.everything", &json!({}))
             .unwrap_err();
         assert!(error.contains("destroy.everything"), "{error}");
+    }
+
+    #[test]
+    fn next_launch_is_gated_by_the_switch_and_reports_no_claim_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // 未建仓库、未开开关：next_launch 不应抛错，而是回 null（无名额/无卡）。
+        let value = dispatch(dir.path(), "board.next_launch", &serde_json::json!({})).unwrap();
+        assert!(value.is_null());
+    }
+
+    #[test]
+    fn mark_terminal_rejects_an_unknown_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = dispatch(
+            dir.path(),
+            "board.mark_terminal",
+            &serde_json::json!({"card_id":"card-1","outcome":"nonsense"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown outcome"), "{err}");
+    }
+
+    /// 单例是硬约束：`BoardService` 的内存 lease 随对象 drop 释放，若每个查询都新建
+    /// 一个实例，`board.next_launch` 连调就能重复拿到同一名额。这里直接断言
+    /// 同一 `state_dir` 复用同一实例、不同 `state_dir` 互不串用。
+    #[test]
+    fn one_state_directory_gets_one_shared_service_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (
+            dir.path().join(".yi-agent/superpowers-kanban"),
+            dir.path().join("other/.yi-agent/superpowers-kanban"),
+        );
+        assert!(
+            Arc::ptr_eq(&service_for(&a), &service_for(&a)),
+            "a repeated lookup must reuse the same BoardService"
+        );
+        assert!(
+            !Arc::ptr_eq(&service_for(&a), &service_for(&b)),
+            "distinct state dirs must not share leases"
+        );
     }
 }

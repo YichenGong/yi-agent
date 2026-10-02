@@ -19,10 +19,13 @@ use superpowers_kanban_core::card_id::card_id_for;
 use superpowers_kanban_core::promotion::validate_promotion;
 use superpowers_kanban_core::layout::{global_preferences_path, project_preferences_path, project_root};
 use superpowers_kanban_core::switch::{BoardSwitch, SwitchValue, read_layer, resolve, write_layer};
-use superpowers_kanban_runner::client::BoardDaemon;
+use superpowers_kanban_runner::service::BoardService;
 
 #[derive(Debug)]
 struct Args {
+    /// supervisor 清单仍传 `--runtime-dir`，所以 CLI 必须继续接受它；但插件已不再
+    /// 直连 daemon 建会话（改由宿主调度器驱动 `board.*`），此字段暂无用途。
+    #[allow(dead_code)]
     runtime_dir: PathBuf,
     state_dir: PathBuf,
     /// 预建 worktree 的落点。缺省为进程当前目录。
@@ -308,19 +311,33 @@ fn main() {
 }
 
 /// 把插件的查询入口接到 `dispatch` 上。
+///
+/// `service` 与推进循环是**同一个** `Arc<BoardService>`：查询里 `board.next_launch`
+/// 占的槽位、`board.mark_running` 记的 thread，推进循环立刻看得见；反过来推进
+/// 循环 `inbox::consume` 的入队也不会让查询读到过期快照。
 struct QueryDispatch {
+    service: Arc<BoardService>,
     state_dir: PathBuf,
 }
 
 impl superpowers_kanban_ipc::server::Dispatch for QueryDispatch {
     fn dispatch(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-        superpowers_kanban_runner::dispatch::dispatch(&self.state_dir, method, params)
+        let global = global_preferences_path()
+            .as_deref()
+            .and_then(read_layer);
+        superpowers_kanban_runner::dispatch::dispatch_with_service(
+            self.service.as_ref(),
+            &self.state_dir,
+            global,
+            method,
+            params,
+        )
     }
 }
 
 /// 起查询服务线程。跑在自己的线程里，慢客户端不能拖住推进循环；
 /// 进程退出即随之消失，不需要显式 join。
-fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
+fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let socket = match superpowers_kanban_ipc::server::socket_path(state_dir) {
         Ok(socket) => socket,
@@ -332,6 +349,7 @@ fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
     };
     eprintln!("superpowers-kanban: query socket at {}", socket.display());
     let dispatch = Arc::new(QueryDispatch {
+        service,
         state_dir: state_dir.to_path_buf(),
     });
     let keep_going = Arc::clone(&stop);
@@ -350,145 +368,41 @@ fn start_query_server(state_dir: &std::path::Path) -> Arc<AtomicBool> {
 }
 
 /// 周期性推进队列，直到进程被杀。
+///
+/// 这里**不再创建会话**：认领（`board.next_launch`）、起会话、回写终态都由宿主
+/// 调度器负责（plan Task 5/6）。插件只负责消费 inbox 把卡排进队列，并落盘。
 fn run_daemon(args: Args) {
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
-    let socket = match superpowers_kanban_ipc::client::socket_path(&args.runtime_dir) {
-        Ok(socket) => socket,
-        Err(error) => {
-            eprintln!("superpowers-kanban: cannot locate the daemon socket: {error}");
-            return;
-        }
-    };
-    eprintln!("superpowers-kanban: daemon socket at {}", socket.display());
-    let daemon = BoardDaemon::new(socket);
-    let board_path = args.state_dir.join("board.json");
+    // 推进循环与查询服务共享同一实例，槽位租约与看板状态因此只有一份真相。
+    let service = Arc::new(BoardService::new(
+        args.state_dir.clone(),
+        args.project_root.clone(),
+        None,
+    ));
+
+    // 启动迁移：回收重启后已死的卡片（`Running` 无 thread id → `NeedsYou`；
+    // 崩溃留下的 `Launching` 僵尸 → `Failed`），再为仍在 `Running` 的卡片补领
+    // 全局名额——重启后内存 lease 为空，不补领会让全局池少算这些在跑卡片。
+    service.migrate_legacy_running();
+    service.adopt_running_leases(calendar.limit_at(chrono::Local::now()));
 
     // 查询通道与推进循环互不阻塞：宿主问状态时队列照常在动。
-    let _query_server = start_query_server(&args.state_dir);
-
-    // 每张正在运行的卡片各持一个全局名额，跨 tick 一直拿着，直到对账发现它跑完。
-    // 名额必须活到卡片结束：若只在本轮 tick 内持有，别的项目会在卡片还在跑时抢走
-    // 名额，多个看板加起来就超了服务端限流。
-    let mut leases: std::collections::HashMap<
-        superpowers_kanban_core::card::CardId,
-        superpowers_kanban_runner::lease::Lease,
-    > = std::collections::HashMap::new();
-
-    // daemon 重启后，board 里仍标着 `Running` 的卡片需要补领名额（本进程刚起，
-    // 还没有任何租约）。进程退出时 flock 会自动释放，所以正常重启后这些名额是空的；
-    // 补领让「重启」不会既留着 Running 的卡片、又为新卡片发新名额而超发。若此刻
-    // 名额已被别的项目占满则领不到，只做尽力而为：第一轮对账会按卡片真实状态收尾。
-    {
-        let board = superpowers_kanban_runner::persist::load_board(&board_path);
-        if let Some(dir) = superpowers_kanban_runner::lease::global_leases_dir() {
-            let limit = calendar.limit_at(chrono::Local::now());
-            for card in board.cards() {
-                if card.state != superpowers_kanban_core::card::CardState::Running
-                    || card.task_id.is_none()
-                {
-                    continue;
-                }
-                if let Some(lease) =
-                    superpowers_kanban_runner::lease::acquire_in(&dir, limit as usize)
-                {
-                    leases.insert(card.id.clone(), lease);
-                } else {
-                    eprintln!(
-                        "superpowers-kanban: {} is running but no slot could be reclaimed on restart",
-                        card.id.0
-                    );
-                }
-            }
-        }
-    }
+    let _query_server = start_query_server(Arc::clone(&service), &args.state_dir);
 
     loop {
         if !board_switch(&args.state_dir).is_enabled() {
-            // 关掉开关只停止推进，绝不取消已在 daemon 中运行的会话。
+            // 关掉开关只停止推进，绝不取消已在跑的会话。
             std::thread::sleep(args.interval);
             continue;
         }
 
-        let mut board = superpowers_kanban_runner::persist::load_board(&board_path);
-        for outcome in
-            superpowers_kanban_runner::inbox::consume(&args.state_dir, &mut board, chrono::Local::now())
-        {
+        // 插件在这里只做一件事：把 inbox 里的投递排进共享看板并落盘。认领与
+        // 会话推进全部交给宿主调度器经 `board.*` 驱动。
+        for outcome in service.consume_inbox(chrono::Local::now()) {
             match outcome.result {
                 Ok(()) => eprintln!("superpowers-kanban: enqueued {}", outcome.id),
                 Err(reason) => eprintln!("superpowers-kanban: rejected {} ({reason})", outcome.id),
             }
-        }
-        let limit = calendar.limit_at(chrono::Local::now());
-
-        // 对账：跑完的卡片让出名额，下一轮队列才能继续放行。
-        for outcome in superpowers_kanban_runner::tick::reconcile_running(&mut board, &daemon) {
-            leases.remove(&outcome.card_id);
-            eprintln!(
-                "superpowers-kanban: {} -> {:?}",
-                outcome.card_id.0, outcome.action
-            );
-        }
-
-        // 启动：按 FIFO 顺序逐张尝试，每张启动前先领一个全局名额。领不到就停在
-        // 这里（后续卡片留在 queued），不做「本轮 plan 已定」那套——名额由本
-        // 进程跨 tick 持有，领不到就是真没空位，等下一轮即可。
-        let project_root = args.project_root.clone();
-        let leases_dir = superpowers_kanban_runner::lease::global_leases_dir();
-        for card_id in superpowers_kanban_runner::runner::plan_launches(&board, limit) {
-            if leases.contains_key(&card_id) {
-                continue;
-            }
-            let Some(dir) = leases_dir.as_deref() else {
-                // 取不到全局目录：退化为「不设全局上限」（仍受本项目日历上限约束），
-                // 而不是凭空造目录——两个不同的猜测会各自发出一池名额，反而更超发。
-                break;
-            };
-            let Some(lease) = superpowers_kanban_runner::lease::acquire_in(dir, limit as usize)
-            else {
-                break;
-            };
-            // 先领名额再建 worktree：建 worktree 是纯本地 git，不消耗模型调用，
-            // 但也不能白建一个注定启动不了的目录。
-            let branch = format!(
-                "kanban/{}",
-                superpowers_kanban_runner::worktree::slugify(&card_id)
-            );
-            let workdir = match superpowers_kanban_runner::worktree::ensure_worktree(
-                &project_root,
-                &card_id,
-                &branch,
-            ) {
-                Ok(path) => path,
-                Err(error) => {
-                    eprintln!(
-                        "superpowers-kanban: worktree for {} failed: {error}",
-                        card_id.0
-                    );
-                    continue;
-                }
-            };
-            let outcome = superpowers_kanban_runner::tick::launch(
-                &mut board, &daemon, &card_id, workdir,
-            );
-            eprintln!(
-                "superpowers-kanban: {} -> {:?}",
-                outcome.card_id.0, outcome.action
-            );
-            match outcome.action {
-                superpowers_kanban_runner::tick::TickAction::Launched { .. } => {
-                    leases.insert(card_id, lease);
-                }
-                // 启动失败：立刻把名额还回去，别占着不放。
-                _ => drop(lease),
-            }
-        }
-
-        if let Err(error) = superpowers_kanban_runner::persist::save_board(&board_path, &board) {
-            // 落盘失败只记 warning：控制面会看到旧数据，但推进循环不停。
-            eprintln!(
-                "superpowers-kanban: could not persist {}: {error}",
-                board_path.display()
-            );
         }
 
         std::thread::sleep(args.interval);
@@ -518,6 +432,19 @@ mod tests {
     #[test]
     fn run_rejects_an_unknown_flag_instead_of_ignoring_it() {
         assert!(parse(&["run", "--runtime-dir", "/r", "--state-dir", "/s", "--oops"]).is_err());
+    }
+
+    /// `--runtime-dir` 仍被接受（supervisor 清单照传），且解析后无误——插件不再用它
+    /// 建会话，但丢掉这个 flag 会让清单启动直接失败。
+    #[test]
+    fn run_accepts_the_runtime_dir_the_manifest_still_passes() {
+        match parse(&["run", "--runtime-dir", "/r", "--state-dir", "/s"]) {
+            Ok(Subcommand::Run(args)) => {
+                assert_eq!(args.runtime_dir.to_string_lossy(), "/r");
+                assert_eq!(args.state_dir.to_string_lossy(), "/s");
+            }
+            other => panic!("expected a run subcommand, got {other:?}"),
+        }
     }
 
     #[test]

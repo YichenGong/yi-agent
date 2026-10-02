@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use superpowers_kanban_core::board::Board;
 use superpowers_kanban_core::card::{CardId, CardState};
 
+use crate::inbox::{self, InboxOutcome};
 use crate::lease::{self, Lease};
 use crate::persist;
 use crate::worktree::{ensure_worktree, slugify};
@@ -143,6 +144,44 @@ impl BoardService {
         }))
     }
 
+    /// 启动时补领本进程既有 `Running` 卡片的全局名额。
+    ///
+    /// 重启后 `BoardService` 是新进程、内存 lease 为空，而 board.json 里可能仍有
+    /// `Running` 卡片。`next_launch` 的 `free_slots` 只看 `Running` 计数，但全局池
+    /// 是空手起家——别的项目会把本该属于这些在跑卡片的名额抢走。为每张
+    /// `Running` 卡片补领一个 lease 记进 `Inner::leases`，全局池的占用才与实际
+    /// 在跑数量一致。受 `limit` 与 `acquire_in` 约束：领不到就只做尽力而为
+    /// （`limit` 缩小时可能领不全），不 panic。
+    pub fn adopt_running_leases(&self, limit: u16) {
+        let mut inner = self.lock();
+        let Some(dir) = inner.leases_dir.clone() else {
+            return;
+        };
+        let ids: Vec<CardId> = inner
+            .board
+            .cards()
+            .iter()
+            .filter(|card| card.state == CardState::Running)
+            .map(|card| card.id.clone())
+            .collect();
+        for id in ids {
+            if inner.leases.contains_key(&id) {
+                continue;
+            }
+            match lease::acquire_in(&dir, limit as usize) {
+                Some(lease) => {
+                    inner.leases.insert(id, lease);
+                }
+                None => {
+                    eprintln!(
+                        "superpowers-kanban: {} is running but no slot could be re-adopted",
+                        id.0
+                    );
+                }
+            }
+        }
+    }
+
     /// 会话已起来：卡片进入 `Running`（从此由 `Running` 记账占槽），并记下 thread id。
     pub fn mark_running(&self, card_id: &str, thread_id: &str) -> Result<(), String> {
         let mut inner = self.lock();
@@ -196,13 +235,19 @@ impl BoardService {
         Ok(())
     }
 
-    /// 仍是 `running` 但 `thread_id` 为空的历史卡片 → `needs_you`。启动时调用一次。
+    /// 启动迁移：把两类「重启后已死」的卡片收干净，启动时调用一次。
     ///
-    /// 这类卡片占用着一个槽位，但实际上没有会话在跑（旧版本的记录里没有
-    /// thread id），迁移它时必须一并把槽位让出来。
+    /// 1. 仍是 `Running` 但 `thread_id` 为空的历史卡片 → `NeedsYou`。这类卡片占用
+    ///    着一个槽位，但实际上没有会话在跑（旧版本的记录里没有 thread id），迁移
+    ///    它时必须一并把槽位让出来。
+    /// 2. 仍是 `Launching` 的僵尸卡 → `Failed`。崩溃若发生在「save(board →
+    ///    Launching)」之后、「mark_running」之前，board.json 会留下 `Launching`；
+    ///    它既不被本函数（只看 `Running`）回收，也不被 `claim_next_launch`
+    ///    （只选 `Queued`）选中，会永远卡住。启动时收成 `Failed` 并释放其可能
+    ///    存在的 lease。
     pub fn migrate_legacy_running(&self) {
         let mut inner = self.lock();
-        let ids: Vec<CardId> = inner
+        let legacy_running: Vec<CardId> = inner
             .board
             .cards()
             .iter()
@@ -212,12 +257,35 @@ impl BoardService {
             })
             .map(|card| card.id.clone())
             .collect();
-        for id in ids {
+        for id in legacy_running {
             if inner.board.transition(&id, CardState::NeedsYou).is_ok() {
                 inner.leases.remove(&id);
             }
         }
+        let launching_zombies: Vec<CardId> = inner
+            .board
+            .cards()
+            .iter()
+            .filter(|card| card.state == CardState::Launching)
+            .map(|card| card.id.clone())
+            .collect();
+        for id in launching_zombies {
+            if inner.board.transition(&id, CardState::Failed).is_ok() {
+                inner.leases.remove(&id);
+            }
+        }
         self.save(&inner);
+    }
+
+    /// 消费 inbox 把投递排进**内存里的同一份看板**并落盘，返回每张投递的结果。
+    ///
+    /// 推进循环与查询服务共享同一实例，所以这里必须改内存板而不是另 load 一份
+    /// `board.json` 再写回——否则会覆盖掉持有 lease 的卡片状态（`Launching`）。
+    pub fn consume_inbox(&self, now: DateTime<Local>) -> Vec<InboxOutcome> {
+        let mut inner = self.lock();
+        let outcomes = inbox::consume(&self.state_dir, &mut inner.board, now);
+        self.save(&inner);
+        outcomes
     }
 
     /// 看板快照。控制面读的就是这个形状。
@@ -410,5 +478,92 @@ mod tests {
         service.clear_thread_id_for_test("card-1");
         service.migrate_legacy_running();
         assert_eq!(service.list()["cards"][0]["state"], "needs_you");
+    }
+
+    /// Step A：重启后进程内存 lease 为空，board 里仍在 `Running` 的卡片必须补领
+    /// 全局名额；否则全局池少算了它的占用，别的项目会拿到本该属于它的名额而超发。
+    #[test]
+    fn adopt_running_leases_reclaims_the_slot_of_a_card_that_is_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let leases_dir = dir.path().join("home/.yi-agent/superpowers-kanban/leases");
+
+        // board.json：一张正在跑（有 thread id）、一张排队。
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("card-1"),
+            PathBuf::from("a.spec.md"),
+            PathBuf::from("a.plan.md"),
+            at(),
+        );
+        board.enqueue(
+            CardId::new("card-2"),
+            PathBuf::from("b.spec.md"),
+            PathBuf::from("b.plan.md"),
+            at(),
+        );
+        board
+            .transition(&CardId::new("card-1"), CardState::Running)
+            .unwrap();
+        board
+            .set_thread_id(&CardId::new("card-1"), "thread-1".to_string())
+            .unwrap();
+        persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+
+        let service = BoardService::new(state_dir, project, Some(dir.path().join("home")));
+        // 补领之前：全局池是空的，别的领取者能抢到那张在跑卡片本该占的名额。
+        assert!(
+            lease::acquire_in(&leases_dir, 1).is_some(),
+            "restart starts with an empty pool"
+        );
+        service.adopt_running_leases(1);
+        // 补领之后：唯一的名额被在跑的卡片占住。
+        assert!(
+            lease::acquire_in(&leases_dir, 1).is_none(),
+            "the running card's slot is re-adopted"
+        );
+        assert!(
+            service.next_launch(1, at()).unwrap().is_none(),
+            "limit=1 and the running card already fills it"
+        );
+        assert_eq!(
+            service.list()["cards"][1]["state"],
+            "queued",
+            "card-2 must not be claimed while the slot is taken"
+        );
+    }
+
+    /// Step B：崩溃若发生在 save(board → Launching) 之后、mark_running 之前，
+    /// board.json 会留下 `Launching` 僵尸卡；启动迁移必须把它收成 `Failed`，
+    /// 否则 `migrate_legacy_running` 只认 `Running`、`claim_next_launch` 只认
+    /// `Queued`，没人再回收它。
+    #[test]
+    fn a_launching_card_left_by_a_crash_becomes_failed_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("card-1"),
+            PathBuf::from("a.spec.md"),
+            PathBuf::from("a.plan.md"),
+            at(),
+        );
+        board
+            .transition(&CardId::new("card-1"), CardState::Launching)
+            .unwrap();
+        persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+
+        let service = BoardService::new(state_dir, project, Some(dir.path().join("home")));
+        service.migrate_legacy_running();
+        assert_eq!(
+            service.list()["cards"][0]["state"],
+            "failed",
+            "a Launching zombie must be reaped at startup"
+        );
     }
 }
