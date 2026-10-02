@@ -284,11 +284,13 @@ pub fn maybe_with_fork_messages(mut self, messages: Option<Vec<Message>>) -> Sel
 }
 ```
 
-`supervisor.rs`：仿 `inherited_sandbox` 增加存储字段 `fork_messages: Mutex<HashMap<TaskId, Vec<Message>>>`（在 `AgentSupervisor` 构造处初始化空表），加 `set_fork_messages` / `fork_messages`，并在 `start_worker_with_provider_turn_gate`（`supervisor.rs:603-621`）的 builder 链追加：
+`supervisor.rs`：仿 `inherited_sandbox` 增加存储字段 `fork_messages: HashMap<TaskId, Vec<Message>>`（普通 map，与相邻的 `inherited_sandboxes` 一致；`AgentSupervisor` 本身已在 `Arc<Mutex<..>>` 内，不需要内层锁）（在 `AgentSupervisor` 构造处初始化空表），加 `set_fork_messages` / `fork_messages`，并在 `start_worker_with_provider_turn_gate`（`supervisor.rs:603-621`）的 builder 链追加：
 
 ```rust
 .maybe_with_fork_messages(self.fork_messages(task_id))
 ```
+
+再补一个「透传真的发生」的测试：用一个能捕获 `WorkerStart` 的 factory（既有 `start: Arc<Mutex<Option<WorkerStart>>>` 模式，见 `yi-agent-core/tests/subagent_supervisor.rs`），`set_fork_messages` 后调用 `start_worker`，断言 factory 收到的 `WorkerStart.fork_messages` 就是记录的那份；未记录时断言为 `None`。
 
 - [ ] **Step 4: 运行测试确认通过**
 
