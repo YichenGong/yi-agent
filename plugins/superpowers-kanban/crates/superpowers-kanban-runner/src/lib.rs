@@ -7,5 +7,6 @@ pub mod runner;
 pub mod tick;
 
 pub mod persist;
+pub mod service;
 pub mod worktree;
 pub mod dispatch;

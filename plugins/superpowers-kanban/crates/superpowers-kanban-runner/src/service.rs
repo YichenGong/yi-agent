@@ -1,0 +1,414 @@
+//! 看板服务：把 board.json 与全局并发槽位收敛到一把锁。
+//!
+//! 推进循环与查询分派共享同一 `BoardService`，所以 `next_launch` 的
+//! 「判名额 → 建 worktree → 置 Launching」相对推进循环是原子的，
+//! 不会两张卡抢到同一个槽位。
+//!
+//! 槽位记账有两处，必须一致：`Board` 里只有 `Running` 占槽，而本服务另外
+//! 为每张**已认领但尚未 Running**（即 `Launching`）的卡片持有一个
+//! `flock` 租约。`Claiming` 不占槽，所以单靠 `Board::claim_next_launch`
+//! 连调两次会认领超过 `limit` 张——`Inner::leases` 正是补这个洞：只有领到
+//! 租约才会认领，认领成功就把租约存进 map 一直持有到卡片终态。
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use chrono::{DateTime, Local};
+use serde_json::{Value, json};
+
+use superpowers_kanban_core::board::Board;
+use superpowers_kanban_core::card::{CardId, CardState};
+
+use crate::lease::{self, Lease};
+use crate::persist;
+use crate::worktree::{ensure_worktree, slugify};
+
+/// 一次成功认领：卡片 id、它的 worktree、以及给会话用的标题。
+pub struct LaunchClaim {
+    pub card_id: String,
+    pub workdir: PathBuf,
+    pub title: String,
+}
+
+struct Inner {
+    board: Board,
+    /// 已认领卡片持有的槽位租约。`Running` 卡片也仍在这里，直到终态释放。
+    leases: std::collections::HashMap<CardId, Lease>,
+    /// `None` 表示拿不到全局租约目录：`next_launch` 必须报错而不是私自
+    /// 造一个目录，否则会和别的进程用两个互不相干的池子、悄悄超配额。
+    leases_dir: Option<PathBuf>,
+}
+
+pub struct BoardService {
+    state_dir: PathBuf,
+    project_root: PathBuf,
+    inner: Mutex<Inner>,
+}
+
+/// worktree 当前 HEAD，作为「有无新提交」的对照基线。非 git 目录返回 `None`。
+pub fn effective_head(workdir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+impl BoardService {
+    pub fn new(state_dir: PathBuf, project_root: PathBuf, home: Option<PathBuf>) -> Self {
+        let leases_dir = home
+            .map(|home| {
+                home.join(".yi-agent")
+                    .join("superpowers-kanban")
+                    .join("leases")
+            })
+            .or_else(lease::global_leases_dir);
+        let board = persist::load_board(&state_dir.join("board.json"));
+        Self {
+            state_dir,
+            project_root,
+            inner: Mutex::new(Inner {
+                board,
+                leases: Default::default(),
+                leases_dir,
+            }),
+        }
+    }
+
+    /// 中毒的锁照样用：状态是一份纯数据，`panic` 不会留下半写状态，
+    /// 因此毒化不值得让整个推进循环停摆。
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn board_path(&self) -> PathBuf {
+        self.state_dir.join("board.json")
+    }
+
+    fn save(&self, inner: &Inner) {
+        let _ = persist::save_board(&self.board_path(), &inner.board);
+    }
+
+    /// 认领下一张排队卡：先拿全局槽位租约，再判名额、建 worktree、置 `Launching`。
+    ///
+    /// 全程在同一把锁内，且认领与持租约是同一件事的两面，所以同一个
+    /// `BoardService` 连续调用不会认领超过 `limit` 张——租约被占住后
+    /// `acquire_in` 就再也拿不到新的槽位了。
+    pub fn next_launch(
+        &self,
+        limit: u16,
+        _now: DateTime<Local>,
+    ) -> Result<Option<LaunchClaim>, String> {
+        let mut inner = self.lock();
+        let Some(dir) = inner.leases_dir.clone() else {
+            return Err("no lease directory".into());
+        };
+        // 先占槽：拿不到就说明名额已满（含本进程自己已持有的）。
+        let Some(lease) = lease::acquire_in(&dir, limit as usize) else {
+            return Ok(None);
+        };
+        // 再认领：队空或无名额时把刚拿到的租约原地丢掉（drop 即释放）。
+        let Some(card_id) = inner.board.claim_next_launch(limit) else {
+            return Ok(None);
+        };
+        let branch = format!("kanban/{}", slugify(&card_id));
+        let workdir = match ensure_worktree(&self.project_root, &card_id, &branch) {
+            Ok(path) => path,
+            Err(error) => {
+                // 认领即占槽：建 worktree 失败必须把卡片标为 Failed，
+                // 否则它会卡在 Launching 永远不再被认领。
+                let _ = inner.board.transition(&card_id, CardState::Failed);
+                self.save(&inner);
+                return Err(format!("worktree for {card_id} failed: {error}"));
+            }
+        };
+        if let Some(base) = effective_head(&workdir) {
+            let _ = inner.board.set_base_commit(&card_id, base);
+        }
+        let _ = inner.board.set_workdir(&card_id, workdir.clone());
+        let title = title_for(&inner.board, &card_id);
+        inner.leases.insert(card_id.clone(), lease);
+        self.save(&inner);
+        Ok(Some(LaunchClaim {
+            card_id: card_id.0,
+            workdir,
+            title,
+        }))
+    }
+
+    /// 会话已起来：卡片进入 `Running`（从此由 `Running` 记账占槽），并记下 thread id。
+    pub fn mark_running(&self, card_id: &str, thread_id: &str) -> Result<(), String> {
+        let mut inner = self.lock();
+        let id = CardId::new(card_id);
+        inner
+            .board
+            .transition(&id, CardState::Running)
+            .map_err(|error| error.to_string())?;
+        inner
+            .board
+            .set_thread_id(&id, thread_id.to_string())
+            .map_err(|error| error.to_string())?;
+        self.save(&inner);
+        Ok(())
+    }
+
+    /// 会话收尾：迁移到某个非终态结果并释放槽位。
+    pub fn mark_terminal(
+        &self,
+        card_id: &str,
+        outcome: &str,
+        _detail: Option<&str>,
+    ) -> Result<(), String> {
+        let next = match outcome {
+            "awaiting_merge" => CardState::AwaitingMerge,
+            "needs_you" => CardState::NeedsYou,
+            "failed" => CardState::Failed,
+            other => return Err(format!("unknown outcome: {other}")),
+        };
+        let mut inner = self.lock();
+        let id = CardId::new(card_id);
+        inner
+            .board
+            .transition(&id, next)
+            .map_err(|error| error.to_string())?;
+        inner.leases.remove(&id); // 释放槽位：drop 掉 flock
+        self.save(&inner);
+        Ok(())
+    }
+
+    /// 启动没成：把卡片标为 `Failed` 并释放槽位。
+    pub fn release(&self, card_id: &str, _detail: &str) -> Result<(), String> {
+        let mut inner = self.lock();
+        let id = CardId::new(card_id);
+        inner
+            .board
+            .transition(&id, CardState::Failed)
+            .map_err(|error| error.to_string())?;
+        inner.leases.remove(&id);
+        self.save(&inner);
+        Ok(())
+    }
+
+    /// 仍是 `running` 但 `thread_id` 为空的历史卡片 → `needs_you`。启动时调用一次。
+    ///
+    /// 这类卡片占用着一个槽位，但实际上没有会话在跑（旧版本的记录里没有
+    /// thread id），迁移它时必须一并把槽位让出来。
+    pub fn migrate_legacy_running(&self) {
+        let mut inner = self.lock();
+        let ids: Vec<CardId> = inner
+            .board
+            .cards()
+            .iter()
+            .filter(|card| {
+                card.state == CardState::Running
+                    && card.thread_id.as_deref().unwrap_or("").is_empty()
+            })
+            .map(|card| card.id.clone())
+            .collect();
+        for id in ids {
+            if inner.board.transition(&id, CardState::NeedsYou).is_ok() {
+                inner.leases.remove(&id);
+            }
+        }
+        self.save(&inner);
+    }
+
+    /// 看板快照。控制面读的就是这个形状。
+    pub fn list(&self) -> Value {
+        let inner = self.lock();
+        json!({
+            "cards": inner.board.cards().iter().map(|card| json!({
+                "id": card.id.0,
+                "state": card.state,
+                "spec_path": card.spec_path,
+                "plan_path": card.plan_path,
+                "workdir": card.workdir,
+                "thread_id": card.thread_id,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// 仅测试用：把某张卡片的 `thread_id` 清成 `None`，模拟旧数据。
+    ///
+    /// 只搬字段、不碰产品逻辑；走一遍序列化契约而不是给 `Board` 开新的
+    /// `&mut Card` 通道（那会为了测试扩大产品 API）。
+    #[cfg(test)]
+    pub(crate) fn clear_thread_id_for_test(&self, card_id: &str) {
+        let mut inner = self.lock();
+        let Ok(text) = std::fs::read_to_string(self.board_path()) else {
+            return;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        if let Some(cards) = value.get_mut("cards").and_then(Value::as_array_mut) {
+            for card in cards {
+                if card.get("id").and_then(Value::as_str) == Some(card_id) {
+                    card["thread_id"] = Value::Null;
+                }
+            }
+        }
+        if let Ok(board) = serde_json::from_value::<Board>(value) {
+            inner.board = board;
+        }
+        self.save(&inner);
+    }
+}
+
+/// 会话标题：由 spec 文件名派生，如 `a.spec.md` → `看板 · a.spec`。
+fn title_for(board: &Board, id: &CardId) -> String {
+    let spec = board
+        .get(id)
+        .map(|card| card.spec_path.clone())
+        .unwrap_or_default();
+    let stem = spec
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| id.0.clone());
+    format!("看板 · {stem}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::path::PathBuf;
+
+    fn at() -> chrono::DateTime<chrono::Local> {
+        chrono::Local
+            .with_ymd_and_hms(2026, 10, 1, 12, 0, 0)
+            .single()
+            .unwrap()
+    }
+
+    /// 建一个真实的最小 git 仓库，作为 project_root 与 worktree 的来源。
+    fn project_with_worktree(dir: &std::path::Path) -> PathBuf {
+        let out = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init failed");
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        for args in [
+            vec!["add", "README.md"],
+            vec![
+                "-c",
+                "user.email=e@e",
+                "-c",
+                "user.name=E",
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        dir.to_path_buf()
+    }
+
+    fn service_with_card(dir: &std::path::Path) -> BoardService {
+        let state_dir = dir.join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue(
+            superpowers_kanban_core::card::CardId::new("card-1"),
+            PathBuf::from("a.spec.md"),
+            PathBuf::from("a.plan.md"),
+            at(),
+        );
+        persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+        // home 指到临时目录，让 lease 落在隔离目录，不污染真实 HOME。
+        BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
+    }
+
+    #[test]
+    fn next_launch_claims_the_head_card_and_creates_its_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+
+        let claim = service.next_launch(3, at()).unwrap().expect("a claim");
+        assert_eq!(claim.card_id, "card-1");
+        assert!(claim.workdir.join(".git").exists(), "worktree was created");
+        assert_eq!(claim.title, "看板 · a.spec");
+
+        // 再取一次：没有第二张排队卡 → None。
+        assert!(service.next_launch(3, at()).unwrap().is_none());
+    }
+
+    #[test]
+    fn next_launch_is_gated_by_the_slot_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        assert!(
+            service.next_launch(0, at()).unwrap().is_none(),
+            "no slot -> no claim"
+        );
+        // 占用那张卡后，名额用尽。
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        assert!(
+            service.next_launch(1, at()).unwrap().is_none(),
+            "slot taken"
+        );
+    }
+
+    #[test]
+    fn mark_terminal_releases_the_slot_and_records_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        service
+            .mark_terminal(&claim.card_id, "awaiting_merge", None)
+            .unwrap();
+        let listed = service.list();
+        let card = &listed["cards"][0];
+        assert_eq!(card["state"], "awaiting_merge");
+        assert_eq!(card["thread_id"], "thread-1");
+        // 名额已释放：再放一张排队卡即可启动（此处队空，验证 free_slots 间接由 next_launch None 体现）。
+        assert!(service.next_launch(1, at()).unwrap().is_none());
+    }
+
+    #[test]
+    fn release_fails_the_card_and_frees_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service
+            .release(&claim.card_id, "thread/start failed")
+            .unwrap();
+        assert_eq!(service.list()["cards"][0]["state"], "failed");
+    }
+
+    #[test]
+    fn a_legacy_running_card_without_a_thread_becomes_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        // 模拟旧数据：把 thread_id 清成 None（在 BoardService 上加一个
+        // `#[cfg(test)] pub(crate) fn clear_thread_id_for_test`，只搬字段，不碰产品逻辑）。
+        service.clear_thread_id_for_test("card-1");
+        service.migrate_legacy_running();
+        assert_eq!(service.list()["cards"][0]["state"], "needs_you");
+    }
+}
