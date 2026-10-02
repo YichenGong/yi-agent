@@ -19,9 +19,10 @@ pub struct BoardOutcome {
 ///
 /// `message` 只认 `create` / `remove` / `status`；其余（含空串）给 usage。
 pub fn handle_board(project: &Path, global: &Path, message: &str) -> BoardOutcome {
+    let resident = yi_agent_store::resident::default_dir().unwrap_or_default();
     let mut launcher = |project: &Path| lifecycle::launch_if_absent(project);
     let mut stopper = |project: &Path| yi_agent_boards::board_daemon::stop(project);
-    handle_board_with(project, global, message, &mut launcher, &mut stopper)
+    handle_board_with(project, global, &resident, message, &mut launcher, &mut stopper)
 }
 
 /// 与 [`handle_board`] 同一套语义，但把启动/停止 daemon 注入进来。
@@ -33,12 +34,13 @@ pub fn handle_board(project: &Path, global: &Path, message: &str) -> BoardOutcom
 pub fn handle_board_with(
     project: &Path,
     global: &Path,
+    resident: &Path,
     message: &str,
     launcher: &mut dyn FnMut(&Path) -> Result<bool, String>,
     stopper: &mut dyn FnMut(&Path) -> Result<(), String>,
 ) -> BoardOutcome {
     match message.trim() {
-        "create" => match lifecycle::create_with_project(project, global, launcher) {
+        "create" => match lifecycle::create_with_project(project, global, resident, launcher) {
             Ok(status) => BoardOutcome {
                 lines: vec![format!(
                     "看板已创建（{}）",
@@ -47,7 +49,7 @@ pub fn handle_board_with(
             },
             Err(error) => lines(vec![format!("看板创建失败: {error}")]),
         },
-        "remove" => match lifecycle::remove_with(project, global, stopper) {
+        "remove" => match lifecycle::remove_with(project, global, resident, stopper) {
             Ok(()) => lines(vec![
                 "看板已移除（队列已删，清单与开关保留）".to_string(),
             ]),
@@ -143,7 +145,14 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
-        let out = handle_board(&project, &global, "create");
+        // `handle_board`（生产包装）会把常驻登记写进真实的 `$HOME`；测试改走
+        // `_with` 变体，把 resident 也注入临时目录，免得碰开发者本机的登记。
+        let resident = dir.path().join("resident");
+        let mut launcher = |_p: &Path| Ok(false);
+        let mut stopper = noop_stopper();
+        let out = handle_board_with(
+            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+        );
         assert!(out.lines.iter().any(|l| l.contains("看板已创建")), "{:?}", out.lines);
         assert!(yi_agent_boards::registry::contains(&global, &project).unwrap());
     }
@@ -164,8 +173,15 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
-        handle_board(&project, &global, "create");
-        let out = handle_board(&project, &global, "remove");
+        let resident = dir.path().join("resident");
+        let mut launcher = |_p: &Path| Ok(false);
+        let mut stopper = noop_stopper();
+        handle_board_with(
+            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+        );
+        let out = handle_board_with(
+            &project, &global, &resident, "remove", &mut launcher, &mut stopper,
+        );
         assert!(out.lines.iter().any(|l| l.contains("已移除")), "{:?}", out.lines);
         assert!(!yi_agent_boards::registry::contains(&global, &project).unwrap());
         assert!(project.join(".yi-agent/supervisors/superpowers-kanban.json").exists());
@@ -179,10 +195,13 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(false);
         let mut stopper = noop_stopper();
 
-        let out = handle_board_with(&project, &global, "create", &mut launcher, &mut stopper);
+        let out = handle_board_with(
+            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+        );
         assert!(
             out.lines.iter().any(|l| l.contains("看板已创建") && l.contains("未就绪")),
             "{:?}",
@@ -197,10 +216,13 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         let mut launcher = launcher_that_leaves_a_daemon();
         let mut stopper = noop_stopper();
 
-        let out = handle_board_with(&project, &global, "create", &mut launcher, &mut stopper);
+        let out = handle_board_with(
+            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+        );
         assert!(
             out.lines.iter().any(|l| l.contains("看板已创建") && l.contains("就绪")),
             "{:?}",
@@ -242,11 +264,16 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(false);
         let mut stopper = |_p: &Path| Err("daemon 拒绝停止".to_string());
-        handle_board_with(&project, &global, "create", &mut launcher, &mut stopper);
+        handle_board_with(
+            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+        );
 
-        let out = handle_board_with(&project, &global, "remove", &mut launcher, &mut stopper);
+        let out = handle_board_with(
+            &project, &global, &resident, "remove", &mut launcher, &mut stopper,
+        );
         assert!(
             out.lines.iter().any(|l| l.contains("移除失败")),
             "{:?}",

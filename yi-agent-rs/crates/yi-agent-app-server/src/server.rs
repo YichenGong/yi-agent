@@ -97,6 +97,10 @@ pub(crate) struct RuntimeAttachments {
     /// `WorkspaceIndex` is: the `board/*` RPCs must be testable without
     /// touching the developer's real `~/.yi-agent`.
     pub(crate) board_dir: PathBuf,
+    /// Where the generic resident-daemon registry lives (`$HOME/.yi-agent`).
+    /// Injectable for the same reason `board_dir` is: `board/create` must be
+    /// testable without writing the developer's real resident registry.
+    pub(crate) resident_dir: PathBuf,
     /// How `board/create` starts a project's daemon. Injectable for the same
     /// reason `board_dir` is: a test must not spawn a real detached process,
     /// and the app's production launcher is what an integration test would
@@ -989,6 +993,10 @@ where
     // register into a directory nobody lists from, which is the same as having
     // no board — better than losing every unrelated RPC.
     let board_dir = yi_agent_boards::global_dir().unwrap_or_default();
+    // Same fallback policy as `board_dir`: an unset HOME must not stop the
+    // server. Resident RPCs then register where nobody lists from, which is the
+    // same as having no resident need.
+    let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用。
     // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
@@ -1004,6 +1012,7 @@ where
             runtimes,
             thread_roots,
             board_dir,
+            resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
         },
@@ -1279,6 +1288,7 @@ where
         runtimes,
         thread_roots,
         board_dir,
+        resident_dir,
         launcher: board_launcher,
         theme,
     } = attachments;
@@ -1592,6 +1602,7 @@ where
                         match yi_agent_boards::lifecycle::create_with_project(
                             &project,
                             &board_dir,
+                            &resident_dir,
                             &mut launcher,
                         ) {
                             Ok(status) => {
@@ -1612,7 +1623,7 @@ where
                             .await?;
                             continue;
                         };
-                        match yi_agent_boards::lifecycle::remove_in(&project, &board_dir) {
+                        match yi_agent_boards::lifecycle::remove_in(&project, &board_dir, &resident_dir) {
                             Ok(()) => write_response(&hub, &client, ok_response(id, json!({}))).await?,
                             Err(message) => {
                                 write_response(&hub, &client, err_response(id, RpcError::internal(message)))
@@ -5218,6 +5229,9 @@ pub(crate) mod tests {
         _index_dir: tempfile::TempDir,
         /// 隔离的看板登记表目录,理由同上:board/* RPC 不得写真的 `~/.yi-agent`。
         pub(crate) board_dir: tempfile::TempDir,
+        /// 隔离的常驻登记目录,理由同 `board_dir`:board/create|remove 不得写
+        /// 真的 `$HOME/.yi-agent`。字段仅用于持有 tempdir。
+        _resident_dir: tempfile::TempDir,
         /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
         /// 所得设备必须能被同一主循环的 `device/list` 看见。
         pairing: Arc<PairingState>,
@@ -5286,6 +5300,8 @@ pub(crate) mod tests {
             let (server_w, client_r) = tokio::io::duplex(64 * 1024);
             let index_dir = tempfile::TempDir::new().unwrap();
             let board_dir = tempfile::TempDir::new().unwrap();
+            // 常驻登记也落在隔离目录里:`board/create` 不得写真的 `~/.yi-agent`。
+            let resident_dir = tempfile::TempDir::new().unwrap();
             let workspaces = Arc::new(WorkspaceIndex::new(
                 index_dir.path().join("workspaces.json"),
             ));
@@ -5310,6 +5326,7 @@ pub(crate) mod tests {
                     board_dir: board_dir.path().to_path_buf(),
                     // 测试里不起真进程:`board/create` 走注入的启动器,
                     // 与 board_dir 注入同一个理由。
+                    resident_dir: resident_dir.path().to_path_buf(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
                 },
@@ -5322,6 +5339,7 @@ pub(crate) mod tests {
                 handle,
                 _index_dir: index_dir,
                 board_dir,
+                _resident_dir: resident_dir,
                 pairing,
             }
         }
@@ -5909,6 +5927,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
             },
@@ -5973,6 +5992,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
             },
@@ -6041,6 +6061,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
             },
