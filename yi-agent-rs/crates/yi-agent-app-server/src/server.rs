@@ -3509,8 +3509,12 @@ async fn write_notification(
 ) -> anyhow::Result<()> {
     let frame = serde_json::to_value(NotificationEnvelope::new(n))
         .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
-    // 内容通知按 thread 过滤；全局帧（None）恒放行。无订阅者时等价于全广播。
-    hub.broadcast_for(n.thread_key(), frame);
+    // S2：列表层/全局帧恒推（无键）；内容层按 thread 过滤。无订阅者时等价于全广播。
+    let key = match n.delivery() {
+        crate::protocol::Delivery::Content => n.thread_key(),
+        crate::protocol::Delivery::List | crate::protocol::Delivery::Global => None,
+    };
+    hub.broadcast_for(key, frame);
     Ok(())
 }
 
@@ -9953,5 +9957,92 @@ mod theme_watcher_tests {
             .await
             .expect("the watcher must exit once the broadcast is closed");
         assert!(finished.is_ok());
+    }
+
+    /// 投递分层：列表层/全局帧无 thread 键（恒推），内容层按 thread 键过滤。
+    #[test]
+    fn notification_delivery_classifies_list_and_content() {
+        use crate::protocol::{Delivery, Notification};
+        let status = Notification::ThreadStatusUpdated {
+            thread_id: "t2".into(),
+            status: crate::protocol::ThreadStatus::Running,
+        };
+        assert_eq!(status.delivery(), Delivery::List);
+        assert_eq!(
+            Notification::ThreadStarted {
+                thread_id: "t2".into(),
+                cwd: "/w".into(),
+                model: "m".into()
+            }
+            .delivery(),
+            Delivery::List
+        );
+        assert_eq!(
+            Notification::ItemDelta {
+                thread_id: "t2".into(),
+                item_id: "i".into(),
+                delta: "d".into()
+            }
+            .delivery(),
+            Delivery::Content
+        );
+        assert_eq!(
+            Notification::UiSettingsUpdated {
+                theme: "dark".into()
+            }
+            .delivery(),
+            Delivery::Global
+        );
+        assert_eq!(
+            Notification::Error {
+                message: "x".into()
+            }
+            .delivery(),
+            Delivery::Global
+        );
+        assert_eq!(
+            Notification::ToolCallApprovalResolved {
+                perm_id: "p".into(),
+                by: "c".into(),
+                decision: "allow_once".into()
+            }
+            .delivery(),
+            Delivery::Global
+        );
+    }
+
+    /// 订阅 t1 的客户端：仍收到 t2 的 `thread/status/updated`（列表层恒推），
+    /// 但收不到 t2 的 `item/delta`（内容层过滤）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_layer_is_always_delivered_while_content_is_filtered() {
+        let hub = crate::broadcast::Broadcaster::new();
+        let sub = crate::broadcast::ClientId::ws(uuid::Uuid::from_u128(1));
+        let mut rx = hub.register(sub.clone());
+        hub.subscribe(&sub, vec!["t1".to_string()]);
+
+        // 列表层：未订阅的 t2 的状态帧也必须到达。
+        write_notification(
+            &hub,
+            &Notification::ThreadStatusUpdated {
+                thread_id: "t2".into(),
+                status: crate::protocol::ThreadStatus::Running,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap()["params"]["thread_id"], "t2");
+
+        // 内容层：未订阅的 t2 的 delta 必须被挡下。
+        write_notification(
+            &hub,
+            &Notification::ItemDelta {
+                thread_id: "t2".into(),
+                item_id: "i".into(),
+                delta: "leak".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "订阅 t1 不该收到 t2 的内容帧");
     }
 }
