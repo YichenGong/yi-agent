@@ -785,23 +785,21 @@ git commit -m "feat(tui): /superpowers-kanban create, remove and status for this
 
 ### Task 10: 端到端验收 + 文档收尾
 
-- [ ] **Step 1: 全量回归**（宿主 / 插件 / 桌面），确认既有能力不回退
-- [ ] **Step 2: 真机闭环**（替换掉真正的二进制，**覆盖后必须重签名**）：
-
-```bash
-cp yi-agent-rs/target/release/yi-agent ~/.cargo/bin/yi-agent && codesign -f -s - ~/.cargo/bin/yi-agent
-cd plugins/superpowers-kanban && cargo build --release && codesign -f -s - target/release/superpowers-kanban \
-  && cp target/release/superpowers-kanban /opt/homebrew/bin/superpowers-kanban \
-  && codesign -f -s - /opt/homebrew/bin/superpowers-kanban
-```
-
-- [ ] **Step 3: 分四条实测**（记录证据）：
-  1. 桌面右键创建看板 → 登记表有它、清单与开关就位、daemon 在跑、插件在跑
-  2. `plugin/query` 带 `project` → 取到 `switch.read` / `list`
-  3. **退出桌面 app → daemon 仍在跑**（`ps` 看 PPID 与启动时刻）
-  4. 右键移除 → daemon 停、队列状态删、清单保留
-- [ ] **Step 4: 更新 spec**：把 §6/§7 里「额度留到下一轮」改成「已由 Task 8 落地」，
-  并如实记录实测结果
+- [x] **Step 1: 全量回归**（宿主 / 插件 / 桌面），确认既有能力不回退
+  - 宿主：`yi-agent-boards` 28、`yi-agent-app-server` 197、`yi-agent` 556 + 新集成测试 1，全绿、warning-clean
+  - 插件：`plugins/superpowers-kanban` 123 全绿（一处既有 `unused variable: other` 警告，非本轮引入）
+  - 桌面：`npx tsc --noEmit` 干净；`vitest run` 314/33 文件全绿
+- [x] **Step 2: 真机闭环 — 改为非侵入式**（原计划要替换并重签名用户已装的二进制，
+  **未执行**；不动 `~/.cargo/bin/yi-agent` 与 `/opt/homebrew/bin/superpowers-kanban`）。
+  改为用 worktree 构建出的 `yi-agent` 起真 app-server、真脱离式 daemon、真插件，配置隔离在临时 `HOME`。
+- [x] **Step 3: 分四条实测**（脚本化于 `yi-agent-rs/crates/yi-agent/tests/board_e2e.rs`，
+  `YI_AGENT_BOARD_E2E=1` 开启；详细证据见 spec §9）：
+  1. 创建 → 登记表有它、清单与开关就位、daemon 在跑、插件在跑（实测通过）
+  2. `plugin/query` 带 `project` → 取到 `switch.read`（`{on:true,source:"project"}`）/ `list`
+  3. **退出 app-server → daemon/插件仍在跑**（`is_running` 仍为真、socket 仍在）
+  4. 移除 → daemon 停、队列状态删、清单保留
+- [x] **Step 4: 更新 spec**：状态改为「核心已实施并通过端到端验收」；§9 记录实测与偏差。
+  **注意**：原文「改成已由 Task 8 落地」**不成立**——Task 8 本轮按人类裁决延后，§6/§7 保持「延后」。
 - [ ] **Step 5: Commit**
 
 ```bash

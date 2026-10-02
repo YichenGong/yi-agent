@@ -1,7 +1,7 @@
 # 项目级 Superpowers 看板
 
 日期：2026-10-02
-状态：待实施（核心部分）
+状态：核心部分已实施并通过端到端验收（Task 8 全局额度延后，见 §6/§7）
 
 ## 1. 背景
 
@@ -194,3 +194,34 @@ TUI 要按它判断当前目录有没有看板。跨项目的事放全局，项�
 | 移除看板删数据不可逆 | UI 二次确认；清单/开关保留以便重建 |
 | 登记表与实际状态不一致（手删了目录、daemon 已死） | 以「登记表 + 实时探测」为准，探测失败即视为未就绪并可见 |
 | 删全局左列影响既有用户习惯 | 折叠条与开关一并迁入项目看板，能力不减 |
+
+## 9. 端到端验收记录（2026-10-02）
+
+以**真实二进制**跑通闭环（`yi-agent app-server` + 脱离式 `daemon serve` + 真插件
+`/opt/homebrew/bin/superpowers-kanban`），配置隔离在临时 `HOME`，脚本化复现于
+`yi-agent-rs/crates/yi-agent/tests/board_e2e.rs`（`YI_AGENT_BOARD_E2E=1` 开启；
+缺插件时报告原因并跳过，不让外部工具缺失污染测试套件）。
+
+四条验收（均实测通过，非推测）：
+
+0. **说明**：Step 3 的四条以 `board/create`、`board/remove`、`plugin/query` 三条 RPC
+   直接驱动——这正是桌面右键与侧栏调用它们的同一条路径；**未**做 UI 层合成点击
+   （无无头桌面 harness），故不声称「点过那个菜单」。UI 自身由桌面单测覆盖。
+
+1. **创建**：`board/create` → 登记表出现该项目、`supervisors/superpowers-kanban.json`
+   与 `preferences.json` 的 `superpowers_kanban:true` 就位、daemon 就绪
+   （`daemon_running:true`，实测约 0.3s）。
+2. **查询**：`plugin/query` 带 `project` → `switch.read` 回 `{on:true,source:"project"}`、
+   `list` 回 `{cards:[]}`；不带 `project` 回 `-32602`（数字码，无 `data.code`）。
+3. **脱离存活**：app-server 以 rc 0 退出后，`daemon serve` 与插件进程仍在、
+   `runtime.sock` 仍在应答。
+4. **移除**：`board/remove` → daemon/插件停止、队列目录 `.yi-agent/superpowers-kanban`
+   删除、清单保留、登记表清空。
+
+**与计划的一处偏差（如实记录）**：计划 Task 10 Step 2/4 假定「替换真实二进制 +
+Task 8 已落地」。实际：
+
+- **未**覆盖 `~/.cargo/bin/yi-agent` 与 `/opt/homebrew/bin/superpowers-kanban`
+  （不动用户已安装的二进制）；改为对 worktree 构建出的二进制做非侵入式验收。
+- **Task 8（全局并发额度）本轮未做**（人类裁决），故 Step 4 原文「改为已由 Task 8
+  落地」不成立；§6/§7 保持「延后」。
