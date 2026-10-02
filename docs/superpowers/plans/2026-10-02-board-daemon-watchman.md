@@ -216,7 +216,7 @@ git commit -m "feat(store): generic resident-daemon registry"
 ### Task 2: 看板生命周期写通用登记
 
 **Files:**
-- Modify: `yi-agent-rs/crates/yi-agent-boards/src/lifecycle.rs`（`create_with_project` / `remove_with_project` 内）
+- Modify: `yi-agent-rs/crates/yi-agent-boards/src/lifecycle.rs`（`create_with_project` / `remove_with` 内）
 - Test: `yi-agent-rs/crates/yi-agent-boards/src/lifecycle.rs` 的 `#[cfg(test)] mod tests`
 
 **Interfaces:**
@@ -315,7 +315,7 @@ pub fn create_with_project(
 }
 ```
 
-`remove` / `remove_in` / `remove_with_project` 对称地加 `resident_dir` 形参，并在成功移除后：
+`remove` / `remove_in` / `remove_with` 对称地加 `resident_dir` 形参，并在成功移除后：
 
 ```rust
     resident::release(resident_dir, project, REQUESTER)
@@ -1357,6 +1357,6 @@ git commit -m "test(boards): end-to-end watchman and orphan-plugin verification"
 
 **类型一致性：** `resident::{require, release, list, default_dir}`（Task 1）在 Task 2/4/7 一致引用；`watch::ensure_daemons{,_with}`（Task 3）在 Task 4/7 一致；`watchman::{PREFERENCE_KEY, LABEL, plist_path, plist_contents, install{,_with}, uninstall{,_with}, is_installed{,_for}}`（Task 5）在 Task 6/9 一致；`single_instance::{acquire, InstanceLock, Liveness}`（Task 8）在 main.rs 一致。
 
-**签名变更需同步的调用点（有意让其编译失败以强制更新）：** Task 2 给 `create_with_project`/`remove_with_project` 加 `resident_dir` 形参——涉及 app-server、tui/board、各测试；Task 8 把插件 `run` 默认间隔由 60s 改为 10s——涉及 `USAGE` 与既有解析测试。
+**签名变更需同步的调用点（有意让其编译失败以强制更新）：** Task 2 给 `create_with_project`/`remove_with` 加 `resident_dir` 形参——涉及 app-server、tui/board、各测试；Task 8 把插件 `run` 默认间隔由 60s 改为 10s——涉及 `USAGE` 与既有解析测试。
 
 **已知取舍：** 孤儿插件是「有界退出」而非「即时感知」；让位窗口 ≈ 3×探测间隔（约 30s）。期间旧插件已无法连上死掉的 daemon，推进循环只会失败重试，**不会重复启动卡片**；新插件在窗口内取锁失败会等待。这是可接受的简单实现，kqueue 即时感知列为非目标。
