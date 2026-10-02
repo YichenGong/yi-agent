@@ -180,17 +180,21 @@ npx tauri ios build     # 产出 iOS 构建（需 Xcode + iOS 平台组件 + 签
 
 ### 4.2 构建状态（如实说明）
 
-`tauri ios init` 已成功并提交；但**本机目前产不出 iOS 构建**：
+`tauri ios init` 已成功并提交；**iOS SDK 已就绪，但本机仍产不出可安装的 iOS 构建**。
+（2026-10-03 实跑 `tauri ios build` 核实；此前记录为"iOS platform not installed"，已过时。）
 
-- Xcode 缺少 **iOS 26.5 Simulator 运行时**组件。`npx tauri ios build` 会报
-  `iOS platform not installed`；直接 `xcodebuild` 也失败：`CoreSimulator is out of
-  date. Current version (1051.54.0) is older than build version (1051.55.0)`。
-- 解决路径：**Xcode → Settings → Components** 安装 iOS 平台（或
-  `xcodebuild -downloadPlatform iOS`，约 8.5 GB），并把 macOS 的 CoreSimulator
-  更新到 `1051.55.0` 以上。
-- 装到真机另需 Apple 开发者签名配置。
+- **iOS 26.5 SDK 已装**（Xcode 26.6，`iphoneos26.5` + `iphonesimulator26.5` 都在）。
+  实跑能走完编译/链接/资源/Rust 构建脚本。
+- **当前卡在签名**：构建最后一步报
+  `Signing for "desktop_iOS" requires a development team.`——`tauri.conf.json` 未配
+  `developmentTeam`。解决：Apple 开发者账号 + 在 `tauri.conf.json` 的 `bundle.iOS.
+  developmentTeam`（或 Xcode 的 Signing & Capabilities）选择团队。
+- **无模拟器运行时**：`xcrun simctl list runtimes` 为空，故模拟器也跑不起来。解决：
+  `xcodebuild -downloadPlatform iOS`（约 8.5 GB）安装运行时。
+- **无连接设备**：`xcrun devicectl list devices` = "No devices found"。
 
-一句话：**Tier 1 未产出 `.ipa`/`.app`**，只落地了工程与前端接缝。
+一句话：**Tier 1 未产出 `.ipa`/`.app`**。障碍已从"缺 SDK"变为"缺签名/运行时"——即
+分发与账号问题，不是代码问题。
 
 ### 4.3 App 如何选择远端传输
 
