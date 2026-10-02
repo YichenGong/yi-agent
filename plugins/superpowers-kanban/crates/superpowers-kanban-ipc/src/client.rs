@@ -135,7 +135,8 @@ mod tests {
     #[test]
     fn the_socket_lives_beside_its_runtime_directory() {
         assert_eq!(
-            socket_path(std::path::Path::new("/project/.yi-agent/runtime")).expect("short path stays"),
+            socket_path(std::path::Path::new("/project/.yi-agent/runtime"))
+                .expect("short path stays"),
             std::path::PathBuf::from("/project/.yi-agent/runtime/runtime.sock")
         );
     }
@@ -155,7 +156,9 @@ mod tests {
         let text = std::str::from_utf8(&frame[..frame.len() - 1]).unwrap();
         assert_eq!(
             text,
-            format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"7","command":{{"type":"ListTaskSummaries","session_id":null,"active_only":false}}}}"#)
+            format!(
+                r#"{{"protocol_version":{PROTOCOL_VERSION},"request_id":"7","command":{{"type":"ListTaskSummaries","session_id":null,"active_only":false}}}}"#
+            )
         );
     }
 

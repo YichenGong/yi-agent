@@ -1,9 +1,9 @@
 use std::path::Path;
 
+use chrono::{DateTime, Local};
 use superpowers_kanban_core::board::Board;
 use superpowers_kanban_core::card::CardId;
 use superpowers_kanban_core::promotion::validate_promotion;
-use chrono::{DateTime, Local};
 
 /// 一张投递文件的处理结果。
 #[derive(Debug, Clone, PartialEq, Eq)]

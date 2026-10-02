@@ -105,7 +105,10 @@ mod tests {
         let plan = dir.join("2026-10-01-feature.plan.md");
         std::fs::write(&spec, "# spec").unwrap();
         std::fs::write(&plan, "# plan").unwrap();
-        (spec.to_string_lossy().into_owned(), plan.to_string_lossy().into_owned())
+        (
+            spec.to_string_lossy().into_owned(),
+            plan.to_string_lossy().into_owned(),
+        )
     }
 
     #[test]
@@ -120,11 +123,12 @@ mod tests {
             plan.clone().into(),
             chrono::Local::now(),
         );
-        crate::persist::save_board(&dir.path().join("board.json"), &board)
-            .unwrap();
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
 
         let result = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
-        let cards = result["cards"].as_array().expect("list returns a `cards` array");
+        let cards = result["cards"]
+            .as_array()
+            .expect("list returns a `cards` array");
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0]["id"], "card-1");
         assert_eq!(cards[0]["state"], "queued");
@@ -145,7 +149,10 @@ mod tests {
             &json!({"spec_path": dir.path().join("missing.spec.md"), "plan_path": plan}),
         )
         .unwrap_err();
-        assert!(error.contains("missing.spec.md"), "the error must name the file: {error}");
+        assert!(
+            error.contains("missing.spec.md"),
+            "the error must name the file: {error}"
+        );
         assert!(
             !superpowers_kanban_core::inbox::inbox_dir(dir.path()).exists(),
             "a rejected enqueue must not leave a delivery behind"
@@ -164,7 +171,10 @@ mod tests {
             &json!({"spec_path": spec, "plan_path": plan}),
         )
         .unwrap();
-        let id = result.get("id").and_then(Value::as_str).expect("enqueue must return an id");
+        let id = result
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("enqueue must return an id");
         let delivered = superpowers_kanban_core::inbox::enqueue_path(dir.path(), id);
         assert!(delivered.is_file(), "expected a delivery at {delivered:?}");
     }
@@ -185,9 +195,13 @@ mod tests {
         assert_eq!(result["source"], "default");
 
         // 只有全局层 -> 来源是 global。
-        let result =
-            dispatch_with_global(&state, Some(SwitchValue::Enabled), "switch.read", &json!({}))
-                .unwrap();
+        let result = dispatch_with_global(
+            &state,
+            Some(SwitchValue::Enabled),
+            "switch.read",
+            &json!({}),
+        )
+        .unwrap();
         assert_eq!(result["on"], true);
         assert_eq!(result["source"], "global");
 
@@ -197,9 +211,13 @@ mod tests {
             SwitchValue::Disabled,
         )
         .unwrap();
-        let result =
-            dispatch_with_global(&state, Some(SwitchValue::Enabled), "switch.read", &json!({}))
-                .unwrap();
+        let result = dispatch_with_global(
+            &state,
+            Some(SwitchValue::Enabled),
+            "switch.read",
+            &json!({}),
+        )
+        .unwrap();
         assert_eq!(result["on"], false);
         assert_eq!(result["source"], "project");
     }
@@ -222,8 +240,8 @@ mod tests {
     #[test]
     fn an_unknown_method_is_an_error_not_a_silent_null() {
         let dir = tempfile::tempdir().unwrap();
-        let error = dispatch_with_global(dir.path(), None, "destroy.everything", &json!({}))
-            .unwrap_err();
+        let error =
+            dispatch_with_global(dir.path(), None, "destroy.everything", &json!({})).unwrap_err();
         assert!(error.contains("destroy.everything"), "{error}");
     }
 }

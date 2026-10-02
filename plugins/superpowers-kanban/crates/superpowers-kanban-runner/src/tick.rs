@@ -307,21 +307,37 @@ mod tests {
         let daemon = BoardDaemon::new(socket);
         let mut board = board_with(&["a", "b"]);
 
-        let outcome = launch(&mut board, &daemon, &CardId::new("a"), PathBuf::from("/tmp/wt/a"));
+        let outcome = launch(
+            &mut board,
+            &daemon,
+            &CardId::new("a"),
+            PathBuf::from("/tmp/wt/a"),
+        );
         assert!(
             matches!(outcome.action, TickAction::Launched { .. }),
             "{:?}",
             outcome.action
         );
-        assert_eq!(board.get(&CardId::new("a")).unwrap().state, CardState::Running);
+        assert_eq!(
+            board.get(&CardId::new("a")).unwrap().state,
+            CardState::Running
+        );
         assert_eq!(board.running_count(), 1);
 
         // daemon 说还在跑：对账不动它，名额仍被占着。
         assert!(reconcile_running(&mut board, &daemon).is_empty());
-        assert_eq!(board.get(&CardId::new("a")).unwrap().state, CardState::Running);
+        assert_eq!(
+            board.get(&CardId::new("a")).unwrap().state,
+            CardState::Running
+        );
 
         // daemon 说跑完了：卡片离开 Running，名额被让出来。
-        let task_id = board.get(&CardId::new("a")).unwrap().task_id.clone().unwrap();
+        let task_id = board
+            .get(&CardId::new("a"))
+            .unwrap()
+            .task_id
+            .clone()
+            .unwrap();
         fake.set_state(&task_id, "completed");
         let freed = reconcile_running(&mut board, &daemon);
         assert_eq!(freed.len(), 1);
@@ -332,7 +348,10 @@ mod tests {
         );
         assert_eq!(board.running_count(), 0, "the slot is free again");
         // 空出来的名额立刻能被队列用上。
-        assert_eq!(crate::runner::plan_launches(&board, 1), vec![CardId::new("b")]);
+        assert_eq!(
+            crate::runner::plan_launches(&board, 1),
+            vec![CardId::new("b")]
+        );
         fake.finish();
     }
 
@@ -341,13 +360,26 @@ mod tests {
         let (fake, socket) = start_fake_daemon();
         let daemon = BoardDaemon::new(socket);
         let mut board = board_with(&["a"]);
-        launch(&mut board, &daemon, &CardId::new("a"), PathBuf::from("/tmp/wt/a"));
+        launch(
+            &mut board,
+            &daemon,
+            &CardId::new("a"),
+            PathBuf::from("/tmp/wt/a"),
+        );
 
-        let task_id = board.get(&CardId::new("a")).unwrap().task_id.clone().unwrap();
+        let task_id = board
+            .get(&CardId::new("a"))
+            .unwrap()
+            .task_id
+            .clone()
+            .unwrap();
         fake.set_state(&task_id, "failed");
         let freed = reconcile_running(&mut board, &daemon);
         assert_eq!(freed.len(), 1);
-        assert_eq!(board.get(&CardId::new("a")).unwrap().state, CardState::Failed);
+        assert_eq!(
+            board.get(&CardId::new("a")).unwrap().state,
+            CardState::Failed
+        );
         fake.finish();
     }
 
@@ -356,12 +388,25 @@ mod tests {
         let (fake, socket) = start_fake_daemon();
         let daemon = BoardDaemon::new(socket);
         let mut board = board_with(&["a"]);
-        launch(&mut board, &daemon, &CardId::new("a"), PathBuf::from("/tmp/wt/a"));
+        launch(
+            &mut board,
+            &daemon,
+            &CardId::new("a"),
+            PathBuf::from("/tmp/wt/a"),
+        );
 
-        let task_id = board.get(&CardId::new("a")).unwrap().task_id.clone().unwrap();
+        let task_id = board
+            .get(&CardId::new("a"))
+            .unwrap()
+            .task_id
+            .clone()
+            .unwrap();
         fake.set_state(&task_id, "something_brand_new");
         assert!(reconcile_running(&mut board, &daemon).is_empty());
-        assert_eq!(board.get(&CardId::new("a")).unwrap().state, CardState::Running);
+        assert_eq!(
+            board.get(&CardId::new("a")).unwrap().state,
+            CardState::Running
+        );
         fake.finish();
     }
 
@@ -371,9 +416,14 @@ mod tests {
         let (fake, socket) = start_fake_daemon();
         let daemon = BoardDaemon::new(socket);
         let mut board = board_with(&["a"]);
-        board.transition(&CardId::new("a"), CardState::Running).unwrap();
+        board
+            .transition(&CardId::new("a"), CardState::Running)
+            .unwrap();
         assert!(reconcile_running(&mut board, &daemon).is_empty());
-        assert_eq!(board.get(&CardId::new("a")).unwrap().state, CardState::Running);
+        assert_eq!(
+            board.get(&CardId::new("a")).unwrap().state,
+            CardState::Running
+        );
         fake.finish();
     }
 }

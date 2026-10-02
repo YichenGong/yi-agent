@@ -146,11 +146,7 @@ mod tests {
     fn a_slot_held_by_a_dead_process_is_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "lease::tests::lease_holder_child",
-                "--nocapture",
-            ])
+            .args(["--exact", "lease::tests::lease_holder_child", "--nocapture"])
             .env("LEASE_HOLD_DIR", dir.path())
             .spawn()
             .expect("re-invoke the test binary as a slot holder");
@@ -186,7 +182,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(reclaimed, "SIGKILL 之后名额必须可回收，否则额度会被永久占死");
+        assert!(
+            reclaimed,
+            "SIGKILL 之后名额必须可回收，否则额度会被永久占死"
+        );
     }
 
     /// The slot holder, run only when re-invoked with `LEASE_HOLD_DIR` set.

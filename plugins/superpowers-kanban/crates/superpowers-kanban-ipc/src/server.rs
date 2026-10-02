@@ -192,7 +192,11 @@ mod tests {
     #[test]
     fn malformed_frames_are_refused_instead_of_panicking() {
         let dispatch = fake();
-        for request in ["not json", r#"{"type":"plugin.query"}"#, r#"{"type":"other"}"#] {
+        for request in [
+            "not json",
+            r#"{"type":"plugin.query"}"#,
+            r#"{"type":"other"}"#,
+        ] {
             let reply = round_trip(&dispatch, request);
             assert_eq!(reply["type"], "plugin.error", "for {request}");
         }
@@ -223,8 +227,10 @@ mod tests {
         let flag = Arc::clone(&stop);
         let path = socket.clone();
         let handle = std::thread::spawn(move || {
-            serve_with(&path, dispatch, || !flag.load(std::sync::atomic::Ordering::SeqCst))
-                .expect("bind 必须成功——这正是深路径下原来失败的那一步")
+            serve_with(&path, dispatch, || {
+                !flag.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .expect("bind 必须成功——这正是深路径下原来失败的那一步")
         });
 
         for _ in 0..100 {
@@ -259,7 +265,10 @@ mod tests {
         let flag = Arc::clone(&stop);
         let path = socket.clone();
         let handle = std::thread::spawn(move || {
-            serve_with(&path, dispatch, || !flag.load(std::sync::atomic::Ordering::SeqCst)).unwrap()
+            serve_with(&path, dispatch, || {
+                !flag.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap()
         });
 
         // 等 socket 出现，再连一个空连接（不发任何字节就断开）。
