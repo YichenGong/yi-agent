@@ -92,9 +92,10 @@ pub struct AgentSupervisor {
     inherited_sandboxes: HashMap<TaskId, InheritedSandbox>,
     /// The caller's conversation a forked child should start from, keyed by the
     /// child task. Written after a spawn resolves its fork token and read when
-    /// the worker starts. A `Mutex` (rather than a plain map) keeps the field
-    /// settable while the supervisor is held behind `Arc<Mutex<..>>`.
-    fork_messages: Mutex<HashMap<TaskId, Vec<Message>>>,
+    /// the worker starts. Mirrors the sibling `inherited_sandboxes` field: a
+    /// plain map is enough because the whole supervisor is held behind
+    /// `Arc<Mutex<..>>`.
+    fork_messages: HashMap<TaskId, Vec<Message>>,
     workdirs: HashMap<TaskId, Option<PathBuf>>,
     models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
@@ -137,7 +138,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
-            fork_messages: Mutex::new(HashMap::new()),
+            fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -177,7 +178,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
-            fork_messages: Mutex::new(HashMap::new()),
+            fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -232,7 +233,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
-            fork_messages: Mutex::new(HashMap::new()),
+            fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -381,20 +382,13 @@ impl AgentSupervisor {
 
     /// Records the caller's conversation a forked child should start from.
     pub fn set_fork_messages(&mut self, task_id: &TaskId, messages: Vec<Message>) {
-        self.fork_messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(task_id.clone(), messages);
+        self.fork_messages.insert(task_id.clone(), messages);
     }
 
     /// The forked conversation prefix recorded for a task, if any. Read when
     /// the task's worker starts so the worker can seed its session.
     pub fn fork_messages(&self, task_id: &TaskId) -> Option<Vec<Message>> {
-        self.fork_messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(task_id)
-            .cloned()
+        self.fork_messages.get(task_id).cloned()
     }
 
     /// Binds a directory to a task. A root has no workdir by default, so this is
@@ -2410,5 +2404,80 @@ mod tests {
                 .fork_messages(&supervisor.root_task_id().clone())
                 .is_none()
         );
+    }
+
+    struct CapturingWorkerFactory {
+        start: Arc<Mutex<Option<WorkerStart>>>,
+    }
+
+    impl AgentWorkerFactory for CapturingWorkerFactory {
+        fn start(
+            &self,
+            request: WorkerStart,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<WorkerHandle, crate::subagent::worker::WorkerError>,
+        > {
+            let handle = WorkerHandle::new(request.cancellation.clone());
+            *self.start.lock().unwrap() = Some(request);
+            Box::pin(async move { Ok(handle) })
+        }
+    }
+
+    fn spawn_child(supervisor: &mut AgentSupervisor) -> TaskId {
+        supervisor
+            .spawn_with_objective(
+                supervisor.root_task_id().clone(),
+                crate::subagent::worker::SpawnRequest::new(
+                    "child".into(),
+                    ChildWriteMode::ReadOnly,
+                    None,
+                ),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn supervisor_forwards_recorded_fork_messages_to_the_worker() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = spawn_child(&mut supervisor);
+        supervisor.set_fork_messages(&child, vec![Message::user("parent said")]);
+
+        let captured = Arc::new(Mutex::new(None));
+        let factory = CapturingWorkerFactory {
+            start: captured.clone(),
+        };
+        supervisor.start_worker(&factory, &child).await.unwrap();
+
+        let request = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the factory received a WorkerStart");
+        assert_eq!(
+            request.fork_messages,
+            Some(vec![Message::user("parent said")])
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_forwards_no_fork_messages_by_default() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = spawn_child(&mut supervisor);
+
+        let captured = Arc::new(Mutex::new(None));
+        let factory = CapturingWorkerFactory {
+            start: captured.clone(),
+        };
+        supervisor.start_worker(&factory, &child).await.unwrap();
+
+        let request = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the factory received a WorkerStart");
+        assert!(request.fork_messages.is_none(), "fork is opt-in");
     }
 }
