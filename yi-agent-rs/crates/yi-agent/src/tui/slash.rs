@@ -387,6 +387,23 @@ pub fn parse_mcp_args(args: &str) -> Result<McpAction, String> {
     }
 }
 
+/// A parsed `/daemon` action. `start` is deliberately absent: the TUI embeds
+/// its own daemon, so starting a detached one from here would be ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    Status,
+    Stop,
+}
+
+/// Parse `/daemon` arguments. Returns a user-facing usage error on bad input.
+pub fn parse_daemon_args(args: &str) -> Result<DaemonAction, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] | ["status"] => Ok(DaemonAction::Status),
+        ["stop"] => Ok(DaemonAction::Stop),
+        _ => Err("用法: /daemon [status|stop]".into()),
+    }
+}
+
 /// Render `/mcp status` output. Pure so it is unit-testable without a manager.
 pub fn render_mcp_status(master: bool, servers: &[(String, bool)]) -> String {
     if servers.is_empty() {
@@ -930,6 +947,25 @@ mod tests {
     #[test]
     fn render_mcp_status_without_servers_says_unconfigured() {
         assert_eq!(render_mcp_status(true, &[]), "未配置 MCP server");
+    }
+
+    #[test]
+    fn parse_daemon_args_defaults_to_status() {
+        assert_eq!(parse_daemon_args(""), Ok(DaemonAction::Status));
+        assert_eq!(parse_daemon_args("status"), Ok(DaemonAction::Status));
+        assert_eq!(parse_daemon_args("stop"), Ok(DaemonAction::Stop));
+    }
+
+    #[test]
+    fn parse_daemon_args_rejects_start_and_unknown() {
+        assert!(parse_daemon_args("start").is_err());
+        assert!(parse_daemon_args("bogus").is_err());
+    }
+
+    #[test]
+    fn daemon_usage_advertises_only_status_and_stop() {
+        let usage = SlashCommand::Daemon.argument_usage().unwrap();
+        assert_eq!(usage, "[status|stop]");
     }
 
     #[test]

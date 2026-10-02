@@ -2311,8 +2311,7 @@ fn execute_slash_command(
         SlashCommand::Approve
         | SlashCommand::Deny
         | SlashCommand::Budget
-        | SlashCommand::Priority
-        | SlashCommand::Daemon => {
+        | SlashCommand::Priority => {
             history.push(
                 HistoryCell::Separator {
                     label: Some(format!(
@@ -2322,6 +2321,25 @@ fn execute_slash_command(
                 },
                 width,
             );
+            KeyOutcome::None
+        }
+        SlashCommand::Daemon => {
+            let label = match crate::tui::slash::parse_daemon_args(args.as_deref().unwrap_or("")) {
+                Ok(action) => {
+                    let result = crate::runtime_socket_for(workdir)
+                        .map_err(|error| error.to_string())
+                        .and_then(|socket| match action {
+                            crate::tui::slash::DaemonAction::Status => daemon_status_at(&socket),
+                            crate::tui::slash::DaemonAction::Stop => daemon_stop_at(&socket),
+                        });
+                    match result {
+                        Ok(message) => message,
+                        Err(error) => format!("无法联系本地 daemon runtime: {error}"),
+                    }
+                }
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
         SlashCommand::Runtime => {
@@ -3122,6 +3140,35 @@ fn daemon_review_decision_at(
             format_ipc_error(code, message)
         )),
         _ => Err("daemon 返回了非审查决策响应".into()),
+    }
+}
+
+fn daemon_status_at(socket: &std::path::Path) -> Result<String, String> {
+    let response =
+        yi_agent_store::ipc::send_request(socket, yi_agent_store::ipc::IpcRequest::Status)
+            .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::Status {
+            high_water_event_id,
+        } => Ok(format!(
+            "daemon 运行中（event high-water: {high_water_event_id}）"
+        )),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            Err(format!("daemon 拒绝请求: {code:?} {message:?}"))
+        }
+        other => Err(format!("daemon 返回了非预期响应: {other:?}")),
+    }
+}
+
+fn daemon_stop_at(socket: &std::path::Path) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(socket, yi_agent_store::ipc::IpcRequest::Stop)
+        .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::Stopping => Ok("daemon 正在停止".to_string()),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            Err(format!("daemon 拒绝请求: {code:?} {message:?}"))
+        }
+        other => Err(format!("daemon 返回了非预期响应: {other:?}")),
     }
 }
 
@@ -8808,6 +8855,75 @@ mod tests {
             control_rx.try_recv(),
             Ok(crate::ControlCommand::Clear)
         ));
+    }
+
+    #[test]
+    fn daemon_command_reports_unavailable_runtime() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = execute_slash_command(
+            SlashCommand::Daemon,
+            None,
+            Some("status".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            dir.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("无法联系本地 daemon runtime")),
+            "expected an unreachable-daemon message, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_command_rejects_unknown_subcommand() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let _ = execute_slash_command(
+            SlashCommand::Daemon,
+            None,
+            Some("start".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("用法: /daemon [status|stop]"))
+        );
     }
 
     #[test]
