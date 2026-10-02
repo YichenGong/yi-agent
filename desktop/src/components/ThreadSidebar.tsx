@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
+import { kanbanItemFor } from "../lib/boardIndex";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 
@@ -74,6 +75,12 @@ export function ThreadSidebar({
   onNew,
   onRemoveWorkspace,
   onBrowse,
+  boards,
+  boardSummaries,
+  selectedBoard,
+  onCreateBoard,
+  onRemoveBoard,
+  onOpenBoard,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -90,6 +97,15 @@ export function ThreadSidebar({
   onRemoveWorkspace: (cwd: string) => void;
   /** Open the native folder picker (App adds the dir + creates a thread). */
   onBrowse: () => void;
+  /** 登记了看板的项目路径；决定哪些分组画看板条目、菜单给创建还是移除。 */
+  boards: string[];
+  /** 项目路径 → 卡片摘要（如 "2 排队 · 1 运行中"）。 */
+  boardSummaries: Record<string, string>;
+  /** 当前在主区域展示看板的项目；与 currentId 相互独立。 */
+  selectedBoard: string | null;
+  onCreateBoard: (path: string) => void;
+  onRemoveBoard: (path: string) => void;
+  onOpenBoard: (path: string) => void;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -261,6 +277,30 @@ export function ThreadSidebar({
     );
   };
 
+  const renderBoardEntry = (workspace: string) => {
+    const active = selectedBoard === workspace;
+    return (
+      <div
+        key={`board:${workspace}`}
+        aria-label="看板"
+        title={workspace}
+        onClick={(e) => {
+          if (e.detail > 1) return;
+          onOpenBoard(workspace);
+        }}
+        className={`flex cursor-pointer items-center gap-2 px-3 py-2 text-sm ${
+          active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
+        }`}
+      >
+        <span className="shrink-0">看板</span>
+        {/* 摘要是这一眼要看的全部：排队几件、在跑几件。 */}
+        {boardSummaries[workspace] ? (
+          <span className="truncate text-xs text-neutral-500">{boardSummaries[workspace]}</span>
+        ) : null}
+      </div>
+    );
+  };
+
   return (
     <aside
       className="relative flex shrink-0 flex-col border-r border-neutral-800 bg-neutral-900"
@@ -398,6 +438,20 @@ export function ThreadSidebar({
                       role="menuitem"
                       onClick={() => {
                         closeMenus();
+                        if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
+                        else onCreateBoard(g.workspace);
+                      }}
+                      className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                    >
+                      {kanbanItemFor(g.workspace, boards)
+                        ? "移除看板"
+                        : "创建 Superpowers 看板"}
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        closeMenus();
                         onRemoveWorkspace(g.workspace);
                       }}
                       className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
@@ -407,6 +461,7 @@ export function ThreadSidebar({
                   </div>
                 </>
               )}
+              {!isCollapsed && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
               {!isCollapsed && g.threads.map(renderThread)}
             </div>
           );

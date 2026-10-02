@@ -46,6 +46,12 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onNew: vi.fn(),
     onRemoveWorkspace: vi.fn(),
     onBrowse: vi.fn(),
+    boards: [],
+    boardSummaries: {},
+    selectedBoard: null,
+    onCreateBoard: vi.fn(),
+    onRemoveBoard: vi.fn(),
+    onOpenBoard: vi.fn(),
     ...overrides,
   };
   return props;
@@ -399,5 +405,112 @@ describe("ThreadSidebar status", () => {
   it("renders no status badge for an idle thread", () => {
     const { container } = renderSidebar({ statuses: new Map([["1", "idle"]]) });
     expect(container.querySelector('[aria-label="Thread status"]')).toBeNull();
+  });
+});
+
+/**
+ * 看板条目：只给已登记的项目显示，右键菜单按登记状态二选一。
+ *
+ * 用例自带一份最小 groups，避免改动上面共享的 fixture（那会让既有断言跟着
+ * 漂移）。路径用 /proj，与计划里的验收片段一致。
+ */
+const boardGroups: WorkspaceGroup[] = [
+  { workspace: "/proj", exists: true, threads: [thread("b1", "board-thread", "/proj")] },
+];
+
+/** 在某个工作区分组头上打开右键菜单（与键盘路径同一条处理链）。 */
+function openWorkspaceMenu(container: HTMLElement, workspace: string) {
+  const title = container.querySelector(`[title="${workspace}"]`)!;
+  const header = title.closest<HTMLElement>("div[tabindex]")!;
+  fireEvent.contextMenu(header);
+}
+
+describe("ThreadSidebar 看板", () => {
+  it("项目右键菜单提供创建看板", () => {
+    const onCreateBoard = vi.fn();
+    const { container } = renderSidebar({ groups: boardGroups, boards: [], onCreateBoard });
+
+    openWorkspaceMenu(container, "/proj");
+    const item = screen.getByText("创建 Superpowers 看板");
+    fireEvent.click(item);
+
+    expect(onCreateBoard).toHaveBeenCalledWith("/proj");
+  });
+
+  it("已登记的项目右键菜单改为移除看板，且不再提供创建", () => {
+    const onRemoveBoard = vi.fn();
+    const onCreateBoard = vi.fn();
+    const { container } = renderSidebar({
+      groups: boardGroups,
+      boards: ["/proj"],
+      onCreateBoard,
+      onRemoveBoard,
+    });
+
+    openWorkspaceMenu(container, "/proj");
+    expect(screen.queryByText("创建 Superpowers 看板")).toBeNull();
+    fireEvent.click(screen.getByText("移除看板"));
+
+    expect(onRemoveBoard).toHaveBeenCalledWith("/proj");
+    expect(onCreateBoard).not.toHaveBeenCalled();
+  });
+
+  it("已登记的项目显示看板条目并可打开", () => {
+    const onOpenBoard = vi.fn();
+    const { container } = renderSidebar({
+      groups: boardGroups,
+      boards: ["/proj"],
+      boardSummaries: { "/proj": "2 排队 · 1 运行中" },
+      selectedBoard: null,
+      onOpenBoard,
+    });
+
+    // aria-label 与可见文字都是「看板」，条目本身带完整路径的 title。
+    const entry = container.querySelector<HTMLElement>('[aria-label="看板"]')!;
+    expect(entry.getAttribute("title")).toBe("/proj");
+    expect(entry.textContent).toContain("2 排队 · 1 运行中");
+
+    fireEvent.click(screen.getByText("看板"));
+    expect(onOpenBoard).toHaveBeenCalledWith("/proj");
+  });
+
+  it("未登记的项目没有看板条目", () => {
+    const { container } = renderSidebar({ groups: boardGroups, boards: [] });
+    expect(screen.queryByText("看板")).toBeNull();
+    expect(container.querySelector('[aria-label="看板"]')).toBeNull();
+  });
+
+  it("只给已登记的那个项目画条目", () => {
+    const onOpenBoard = vi.fn();
+    const groups2: WorkspaceGroup[] = [
+      ...boardGroups,
+      { workspace: "/other", exists: true, threads: [thread("o1", "other-thread", "/other")] },
+    ];
+    const { container } = renderSidebar({
+      groups: groups2,
+      boards: ["/other"],
+      boardSummaries: { "/other": "空" },
+      onOpenBoard,
+    });
+
+    const entries = container.querySelectorAll('[aria-label="看板"]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].getAttribute("title")).toBe("/other");
+
+    fireEvent.click(screen.getByText("看板"));
+    expect(onOpenBoard).toHaveBeenCalledWith("/other");
+  });
+
+  it("选中的看板条目用与线程一致的底色", () => {
+    const selected = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: "/proj" });
+    const selectedClasses = selected.container
+      .querySelector('[aria-label="看板"]')!
+      .className.split(/\s+/);
+    expect(selectedClasses).toContain("bg-neutral-800");
+
+    const idle = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: null });
+    const idleClasses = idle.container.querySelector('[aria-label="看板"]')!.className.split(/\s+/);
+    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-neutral-800/50 被当选中态。
+    expect(idleClasses).not.toContain("bg-neutral-800");
   });
 });

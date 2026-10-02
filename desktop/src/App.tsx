@@ -35,6 +35,8 @@ import {
   readBoardSwitch,
   setBoardSwitch,
 } from "./lib/superpowersKanbanSwitch";
+import { summarize } from "./lib/boardIndex";
+import { createBoard, listBoards, removeBoard } from "./lib/superpowersKanbanBoards";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
@@ -117,10 +119,47 @@ export default function App() {
     [],
   );
 
-  // 看板 RPC 现在按项目问话（`project` 进 plugin/query 的参数）。侧栏的
-  // 选中态由 Task 6 引入，这一步先留空占位：空 project 与宿主现在的行为
-  // 一致（宿主仍按自己的 cwd 路由），不会比改动前更糟。
-  const boardProject = "";
+  /**
+   * 拉一次「哪些项目有看板」以及各项目的摘要。
+   *
+   * 摘要逐个项目单独读、单独失败：一个项目的 daemon 没起来不该让整张表消失
+   * （条目照画，摘要留空）。整张表读不到才当作没有看板——侧栏据此不画条目。
+   */
+  const refreshBoards = useCallback(async () => {
+    try {
+      const list = await listBoards(boardRpc);
+      setBoards(list);
+      const entries = await Promise.all(
+        list.map(async (path): Promise<[string, string]> => {
+          try {
+            return [path, summarize(await fetchBoard(boardRpc, path))];
+          } catch {
+            return [path, ""];
+          }
+        }),
+      );
+      setBoardSummaries(Object.fromEntries(entries));
+    } catch {
+      setBoards([]);
+      setBoardSummaries({});
+    }
+  }, [boardRpc]);
+
+  // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
+  // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
+  const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
+  // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
+  const [boards, setBoards] = useState<string[]>([]);
+  // 项目路径 → 摘要。挂在侧栏条目上，扫一眼就知道各项目积压多少。
+  const [boardSummaries, setBoardSummaries] = useState<Record<string, string>>({});
+
+  /**
+   * 看板 RPC 的 project 参数。
+   *
+   * Task 6 把它接到侧栏的选中态；空串是「没选」时的退路，Task 7 之后主区域
+   * 只在选中时渲染看板，这条退路随之消失。
+   */
+  const boardProject = selectedBoard ?? "";
 
   const current = currentId ? store.view(currentId) : null;
 
@@ -275,6 +314,42 @@ export default function App() {
       force((v) => v + 1);
     }
   };
+
+  /**
+   * 登记一个项目的看板并立刻刷新侧栏。
+   *
+   * 失败写进当前会话的错误位（与其它侧栏动作一致），刷新仍然执行：宿主可能
+   * 已经建了一半，界面必须与它保持一致，而不是停在「看起来什么都没发生」。
+   */
+  const onCreateBoard = async (path: string) => {
+    try {
+      await createBoard(boardRpc, path);
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    }
+    await refreshBoards();
+  };
+
+  /**
+   * 移除看板。决策 5 说这一下不可逆（队列状态会被删掉），所以先问一句；
+   * 用户说不，就连 RPC 都不发。
+   */
+  const onRemoveBoard = async (path: string) => {
+    if (!window.confirm(`移除看板会删除 ${path} 的队列状态，且不可恢复。继续？`)) return;
+    try {
+      await removeBoard(boardRpc, path);
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    }
+    // 正在看的看板被移除了：主区域不能再展示一个已经不存在的看板。
+    if (selectedBoard === path) setSelectedBoard(null);
+    await refreshBoards();
+  };
+
+  /** 打开看板只改 selectedBoard，不动 currentId。 */
+  const onOpenBoard = (path: string) => setSelectedBoard(path);
 
   /** 打开原生文件夹选择器,返回选中的绝对路径(取消则 null)。 */
   const pickDirectory = async (): Promise<string | null> => {
@@ -454,6 +529,7 @@ export default function App() {
       }
     };
     void refreshBoard();
+    void refreshBoards();
     const boardTimer = window.setInterval(refreshBoard, 2000);
     return () => window.clearInterval(boardTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -618,6 +694,12 @@ export default function App() {
           onNew={onNew}
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
+          boards={boards}
+          boardSummaries={boardSummaries}
+          selectedBoard={selectedBoard}
+          onCreateBoard={(path) => void onCreateBoard(path)}
+          onRemoveBoard={(path) => void onRemoveBoard(path)}
+          onOpenBoard={onOpenBoard}
         />
         {kanbanCollapsed ? (
           <SuperpowersKanbanCollapsedStrip onExpand={() => setKanbanCollapsed(false)} />
