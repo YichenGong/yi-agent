@@ -1202,6 +1202,32 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
   });
 
+  it("reverts to the last confirmed theme, not a stale optimistic value, when overlapping writes fail", async () => {
+    // 两次写入都挂起，由测试按序决定各自的结局。
+    const deferred: Array<{ reject: (e: unknown) => void }> = [];
+    state.dataSources["ui/settings/write"] = () =>
+      new Promise((_resolve, reject) => {
+        deferred.push({ reject });
+      });
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "浅色" }));
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
+    fireEvent.click(screen.getByRole("button", { name: "深色" }));
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+    await waitFor(() => expect(deferred.length).toBe(2));
+
+    // 两次都失败，且旧的那次先回。服务端从未接受过任何一个写入，故权威值
+    // 仍是 read 回来的 dark；UI 绝不能停在第二次调用时刻的乐观值 light 上。
+    await act(async () => deferred[0].reject({ code: -32000, message: "first failed" }));
+    await act(async () => deferred[1].reject({ code: -32000, message: "second failed" }));
+
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+  });
+
   it("re-handshakes on a fresh client after the sidecar exits and the host restarts it", async () => {
     render(<App />);
     await settle();
