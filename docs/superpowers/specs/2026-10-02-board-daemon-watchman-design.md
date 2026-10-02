@@ -1,6 +1,6 @@
 # 看板 daemon 的持续值守（watchman）— Design
 
-状态：待实现（本 spec 已通过人类评审）。
+状态：已实施并通过验收（2026-10-03；端到端验证见 §5 各条证据）。
 上游决策：本文回答 spec §7 已知缺口 2「daemon 崩溃无人重启」。
 
 ## 1. 问题
@@ -133,6 +133,40 @@ daemon 本身**。于是：
 7. **重启恢复**：杀死带运行中卡片的 daemon 后重启，卡片被对账移出 `Running`、名额释放、
    队列继续。
 8. **回归**：宿主、插件、桌面全绿。
+
+### 5.1 验收证据（2026-10-03）
+
+环境：`PATH=<rustup stable>`、`TMPDIR=/Users/gongyichen/.yi-agent-tmp`、cargo 一律
+`--offline`；全部在临时 `HOME` + 真二进制下运行，绝不触碰真实 `$HOME`/launchd。
+
+| 条目 | 证据（命令 → 观察） |
+|---|---|
+| 1、3、4 | `YI_AGENT_BOARD_E2E=1 cargo test -p yi-agent --test board_watchman_e2e` → **2 passed**。`killing_a_board_daemon_is_healed_by_the_watchman`：真 `board/create` 拉起真 daemon，SIGKILL 它，跑一次 watchman 循环体（`yi-agent boards watch --interval-secs 1`，即 `watch::once` + `ensure_daemons`），在有界轮询内 daemon 重新应答 `Status`，且 `runtime.lock` 恒定只有一个持有者（不双起）。`an_orphan_plugin_exits_after_the_daemon_dies`：第二个 `plugin run` 拿不到 `plugin.lock`（等待中）；SIGKILL daemon 后孤儿在 ~3s（3×1s 阈值）内自行退出并释放锁（`lsof` 该锁的持有者归零）；重启 daemon 后新插件立刻拿锁，锁持有者恰为 1。 |
+| 2 | 同一 e2e 的第一个测试用**同一份** `watch::once`/`ensure_daemons`（B 与 A 共用），证明登记在有 daemon 死掉时会被重新确保；app-server 会话期循环有独立单测：`cargo test -p yi-agent-app-server app_side_loop` → `the_app_side_loop_ensures_every_registered_project ... ok`（crate 全量 281 passed / 0 failed）。真实 launchd 未驱动，见「未竟驱动项」。 |
+| 3 | 由 §4.1 daemon 的独占 `runtime.lock`（`flock`）担保：e2e 断言锁持有者数恒为 1；watchman 多轮 tick 后仍为 1。 |
+| 5 | `cargo test -p yi-agent-boards watchman::` → **4 passed**（plist 内容/装/卸/路径不符判未装）。create/remove 的登记写入/摘除由 lifecycle 单测覆盖（`creating_a_board_registers_a_resident_daemon_need` / `removing_a_board_releases_the_resident_daemon_need`）；e2e 直接断言 `resident::list` 含该项目。watchman 只经 `watch::once` 读 `resident-daemons.json`，代码路径不触及 `boards.json`。 |
+| 6 | `cargo test -p yi-agent-app-server` → **281 passed / 0 failed**，含 `creating_a_board_ensures_the_watchman_is_installed`、`creating_a_board_leaves_the_watchman_alone_when_the_switch_is_off`、`a_failing_watchman_install_does_not_fail_board_creation`、`writing_the_watchman_setting_installs_or_uninstalls_it`。桌面：`npx tsc --noEmit` 干净、`npx vitest run` → 45 files / **449 tests passed**（含 Task 9 的 watchman 开关与竞态守卫测试）。 |
+| 7 | 复用既有 `reconcile_running`；插件单测覆盖对账（`a_card_whose_task_finished_leaves_running_and_frees_its_slot`、`a_failed_task_also_leaves_running`），`cargo test -p superpowers-kanban` → **137 passed / 0 failed**（core 63 + ipc 27 + runner 39 + bin 8）。 |
+| 8 | 宿主：`cargo test --workspace --no-fail-fast` → **2137 passed / 1 failed**；唯一失败是既有、与本计划无关的易抖测试 `yi-agent-supervisors::tests::supervisor::a_switch_on_spawns_the_child`（见下）。插件 137 passed；桌面 tsc 干净 + 449 passed。 |
+
+**未竟驱动项（诚实声明）：**
+
+- e2e 的两个测试都**不驱动真实 launchd**。`app-server` 以 `YI_AGENT_DISABLE_WATCHMAN=1`
+  启动（Task 6 的生产 kill-switch），故 `board/create` 的安装退化为 no-op；watchman 由
+  「跑一次其循环体」而非真实 LaunchAgent 触发。理由：本条验收要的是「daemon 会回来」，
+  而这正是 `watch::once` + `ensure_daemons` 的职责；launchd 本身（plist 内容、装/卸、
+  `RunAtLoad`/`KeepAlive`）由 `yi-agent-boards::watchman` 的 4 个单测覆盖。launchd 对
+  watchman **自身**的重启属 Task 5/6 范畴，不在 e2e 断言内。
+- 孤儿感知是**有界退出**（阈值 3×探测间隔），非 kqueue 即时感知（非目标，§4.6/§6）。
+  e2e 把间隔设为 1s 使窗口约 3s；断言的是「有界内让位」这一充分不变量。
+- 「重启后停在 `Running` 的卡被对账移走」由插件单测覆盖（对账逻辑不因重启而变），
+  e2e 未造真实运行中卡片（需要真模型调用），故列为单测覆盖而非 e2e。
+- 已知与本计划无关的易抖测试：`yi-agent-supervisors` 的 `tests/supervisor.rs` 里
+  进程起停类测试（先见 `a_switch_on_spawns_the_child`，复跑又见 `stop_all_reaps_every_child`）。
+  该文件在本计划内**零改动**（`git diff <base> HEAD -- yi-agent-supervisors/` 为空），
+  单独复跑 3 次中 2 次全绿、1 次复现；全并行下受机器负载影响。任务简述里点名的
+  `yi-agent-core::agent::tests::cancel_returns_unconsumed_interjections_before_cancelled`
+  在本轮全量运行中**通过**。
 
 ## 6. 非目标（本轮）
 
