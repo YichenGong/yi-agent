@@ -653,10 +653,14 @@ export default function App() {
   };
 
   const changeTheme = (next: Theme) => {
-    // 立即生效，再落盘；写失败由服务端通知/下次读取纠正。
+    // 立即生效，再落盘。
+    const prev = theme;
     themeTouchedRef.current = true;
     setTheme(next);
     clientRef.current?.request("ui/settings/write", { theme: next }).catch((e) => {
+      // 写失败：回退乐观更新，让 UI 与服务端持久化的权威值保持一致，同时照旧
+      // 报错（无打开的 thread 时 setCurrentError 是 no-op，回退就是唯一的反馈）。
+      setTheme(prev);
       setCurrentError(formatError(e));
       force((v) => v + 1);
     });

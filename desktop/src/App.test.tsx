@@ -948,4 +948,22 @@ describe("App settings & theme wiring", () => {
     await resolveRead({ theme: "dark" });
     expect(document.documentElement.dataset.theme).toBe("light");
   });
+
+  it("reverts the theme when ui/settings/write rejects", async () => {
+    state.dataSources["ui/settings/write"] = () =>
+      Promise.reject({ code: -32000, message: "disk full" });
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "浅色" }));
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { theme: "light" },
+      }),
+    );
+    // 写失败：UI 必须回退到之前的值，不能停在服务端并未接受的浅色上。
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+  });
 });
