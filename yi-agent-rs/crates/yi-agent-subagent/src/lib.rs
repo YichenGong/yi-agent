@@ -1463,14 +1463,91 @@ fn spawn_fork(args: &Value) -> Result<bool, ToolResult> {
     }
 }
 
+/// How a fork upload talks to the daemon: one request in, one response or a
+/// transport error out.
+///
+/// A seam rather than a socket, so the failure handling can be unit tested
+/// without a live daemon.
+type ForkTransport<'a> = dyn FnMut(
+        yi_agent_store::ipc::IpcRequest,
+    ) -> Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>
+    + 'a;
+
+/// Drops a half-received upload. Best effort and silent: this runs on a path
+/// that is already failing, and aborting an unknown or already-consumed token
+/// is itself an error.
+fn abort_fork_upload(transport: &mut ForkTransport<'_>, token: &str) {
+    let _ = transport(yi_agent_store::ipc::IpcRequest::AbortForkUpload {
+        fork_token: token.to_string(),
+    });
+}
+
+/// Opens an upload, pushes `payload` as base64 chunks, and returns the token the
+/// spawn request names.
+///
+/// Every failure after `BeginForkUpload` succeeds aborts the upload before
+/// returning. A chunk rejected by the daemon arrives as
+/// `Ok(IpcResponse::Error { .. })` -- `send_request` hands back whatever frame
+/// the daemon sent and only transport faults become `Err` -- so the `Ok(other)`
+/// arm is the normal rejection channel (bad base64, a seq gap, an over-length
+/// chunk, an unknown token), not an exotic one. The store keeps abandoned
+/// uploads until process exit with no TTL and no eviction, so a token dropped
+/// here would leak its payload for the daemon's lifetime. The
+/// `BeginForkUpload` request itself is the one failure with no token to abort.
+fn drive_fork_upload(
+    transport: &mut ForkTransport<'_>,
+    session_id: String,
+    caller_task_id: String,
+    capability: String,
+    payload: Vec<u8>,
+) -> Result<String, ToolResult> {
+    let token = match transport(yi_agent_store::ipc::IpcRequest::BeginForkUpload {
+        session_id,
+        caller_task_id,
+        capability,
+        total_bytes: payload.len() as u64,
+    }) {
+        Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted { fork_token }) => fork_token,
+        Ok(other) => {
+            return Err(ToolResult::error(format_ipc_rejection(
+                "fork upload",
+                &other,
+            )));
+        }
+        Err(error) => return Err(ToolResult::error(format!("daemon is unavailable: {error}"))),
+    };
+    for (seq, chunk) in payload.chunks(FORK_CHUNK_BYTES).enumerate() {
+        let data = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let response = transport(yi_agent_store::ipc::IpcRequest::AppendForkChunk {
+            fork_token: token.clone(),
+            seq: seq as u64,
+            data,
+        });
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::ForkChunkAccepted { .. }) => {}
+            Ok(other) => {
+                abort_fork_upload(transport, &token);
+                return Err(ToolResult::error(format_ipc_rejection(
+                    "fork chunk",
+                    &other,
+                )));
+            }
+            Err(error) => {
+                abort_fork_upload(transport, &token);
+                return Err(ToolResult::error(format!("daemon is unavailable: {error}")));
+            }
+        }
+    }
+    Ok(token)
+}
+
 /// Uploads the caller's current transcript as a forked-context payload and
 /// returns the token the spawn request names.
 ///
 /// The snapshot is taken here, at call time, so the child inherits the caller's
 /// history as of this delegation rather than at tool-assembly time. An unbound
 /// caller is an explicit error: a caller that asked for `fork:true` must never
-/// silently receive a contextless child. A chunk that fails to send aborts the
-/// upload so the daemon does not hold a dangling payload open.
+/// silently receive a contextless child.
 fn upload_forked_context(
     socket: &Path,
     handle: &crate::binding::RuntimeHandle,
@@ -1483,54 +1560,33 @@ fn upload_forked_context(
     };
     let payload = serde_json::to_vec(&messages)
         .map_err(|error| ToolResult::error(format!("could not encode forked context: {error}")))?;
-    let total = payload.len() as u64;
-    let token = match yi_agent_store::ipc::send_request(
-        socket,
-        yi_agent_store::ipc::IpcRequest::BeginForkUpload {
-            session_id: handle.session_id.clone(),
-            caller_task_id: handle.task_id.clone(),
-            capability: handle.capability.clone(),
-            total_bytes: total,
-        },
-    ) {
-        Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted { fork_token }) => fork_token,
-        Ok(other) => {
-            return Err(ToolResult::error(format_ipc_rejection(
-                "fork upload",
-                &other,
-            )));
-        }
-        Err(error) => return Err(ToolResult::error(format!("daemon is unavailable: {error}"))),
-    };
-    for (seq, chunk) in payload.chunks(FORK_CHUNK_BYTES).enumerate() {
-        let data = base64::engine::general_purpose::STANDARD.encode(chunk);
-        match yi_agent_store::ipc::send_request(
+    let mut transport = |request| yi_agent_store::ipc::send_request(socket, request);
+    drive_fork_upload(
+        &mut transport,
+        handle.session_id.clone(),
+        handle.task_id.clone(),
+        handle.capability.clone(),
+        payload,
+    )
+}
+
+/// Aborts a forked-context upload whose token a spawn request was meant to
+/// consume but did not.
+///
+/// Reaching the failure arms of a spawn means no child was created, so nothing
+/// will ever take the token: the store would retain the payload until process
+/// exit. Best effort, like `abort_fork_upload`: a token already consumed by a
+/// spawn that failed later is simply no longer there to abort. A `None` token
+/// means the call did not fork, and there is nothing to clean up.
+fn abort_unconsumed_fork(socket: &Path, fork_token: &Option<String>) {
+    if let Some(token) = fork_token {
+        let _ = yi_agent_store::ipc::send_request(
             socket,
-            yi_agent_store::ipc::IpcRequest::AppendForkChunk {
+            yi_agent_store::ipc::IpcRequest::AbortForkUpload {
                 fork_token: token.clone(),
-                seq: seq as u64,
-                data,
             },
-        ) {
-            Ok(yi_agent_store::ipc::IpcResponse::ForkChunkAccepted { .. }) => {}
-            Ok(other) => {
-                return Err(ToolResult::error(format_ipc_rejection(
-                    "fork chunk",
-                    &other,
-                )));
-            }
-            Err(error) => {
-                let _ = yi_agent_store::ipc::send_request(
-                    socket,
-                    yi_agent_store::ipc::IpcRequest::AbortForkUpload {
-                        fork_token: token.clone(),
-                    },
-                );
-                return Err(ToolResult::error(format!("daemon is unavailable: {error}")));
-            }
-        }
+        );
     }
-    Ok(token)
 }
 
 /// Resolves the `fork_token` a spawn request should carry: uploading the
@@ -1678,15 +1734,21 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 workdir: workdir.clone(),
                 thread_id: thread_id.clone(),
                 sandbox: sandbox.clone(),
-                fork_token,
+                fork_token: fork_token.clone(),
             },
         );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
             ),
-            Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
-            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+            Ok(other) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format_ipc_rejection("spawn request", &other))
+            }
+            Err(error) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format!("daemon is unavailable: {error}"))
+            }
         }
     }
 }
@@ -2048,15 +2110,21 @@ impl Tool for DaemonSpawnAgentTool {
                 model: model.clone(),
                 workdir: workdir.clone(),
                 sandbox: sandbox.clone(),
-                fork_token,
+                fork_token: fork_token.clone(),
             },
         );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
             ),
-            Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
-            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+            Ok(other) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format_ipc_rejection("spawn request", &other))
+            }
+            Err(error) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format!("daemon is unavailable: {error}"))
+            }
         }
     }
 }
@@ -2188,6 +2256,136 @@ mod tests {
             [yi_agent_core::ContentBlock::Text(text)]
                 if text.contains("fork requested but no caller context available")
         ));
+    }
+
+    /// A daemon-side chunk rejection arrives as `Ok(IpcResponse::Error { .. })`:
+    /// `send_request` only turns transport faults into `Err`. That arm is the
+    /// normal rejection channel, and it must abort the upload rather than leave
+    /// the store holding a payload it has no TTL or eviction for.
+    #[test]
+    fn a_rejected_chunk_aborts_the_fork_upload_instead_of_leaking_it() {
+        let mut requests = Vec::new();
+        let mut transport = |request: yi_agent_store::ipc::IpcRequest| -> Result<
+            yi_agent_store::ipc::IpcResponse,
+            yi_agent_store::ipc::IpcError,
+        > {
+            let response = match &request {
+                yi_agent_store::ipc::IpcRequest::BeginForkUpload { total_bytes, .. } => {
+                    assert_eq!(*total_bytes, 4, "the declared length is the payload's");
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted {
+                        fork_token: "tok".into(),
+                    })
+                }
+                yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::Error {
+                        code: yi_agent_store::ipc::IpcErrorCode::Validation,
+                        message: Some("chunk is not valid base64".into()),
+                    })
+                }
+                yi_agent_store::ipc::IpcRequest::AbortForkUpload { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadAborted)
+                }
+                other => panic!("unexpected request after the rejection: {other:?}"),
+            };
+            requests.push(request);
+            response
+        };
+
+        let result = drive_fork_upload(
+            &mut transport,
+            "session".into(),
+            "caller".into(),
+            "capability".into(),
+            vec![1, 2, 3, 4],
+        );
+
+        let error = result.expect_err("a rejected chunk must fail the upload");
+        assert!(error.is_error);
+        assert!(
+            matches!(
+                error.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(text)]
+                    if text.contains("daemon rejected fork chunk")
+                        && text.contains("chunk is not valid base64")
+            ),
+            "the daemon's rejection must surface: {:?}",
+            error.content
+        );
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [
+                    yi_agent_store::ipc::IpcRequest::BeginForkUpload { .. },
+                    yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. },
+                    yi_agent_store::ipc::IpcRequest::AbortForkUpload { fork_token },
+                ] if fork_token == "tok"
+            ),
+            "the rejected upload must be aborted, got {requests:?}"
+        );
+    }
+
+    /// The transport-fault arm keeps aborting the upload, and must do so without
+    /// the abort's own reply being mistaken for a chunk acknowledgement.
+    #[test]
+    fn a_transport_fault_on_a_chunk_still_aborts_the_fork_upload() {
+        let mut requests = Vec::new();
+        let mut transport = |request: yi_agent_store::ipc::IpcRequest| -> Result<
+            yi_agent_store::ipc::IpcResponse,
+            yi_agent_store::ipc::IpcError,
+        > {
+            let response = match &request {
+                yi_agent_store::ipc::IpcRequest::BeginForkUpload { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted {
+                        fork_token: "tok".into(),
+                    })
+                }
+                yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. } => {
+                    Err(yi_agent_store::ipc::IpcError::Json(serde_json::Error::io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "simulated transport failure",
+                        ),
+                    )))
+                }
+                yi_agent_store::ipc::IpcRequest::AbortForkUpload { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadAborted)
+                }
+                other => panic!("unexpected request after the fault: {other:?}"),
+            };
+            requests.push(request);
+            response
+        };
+
+        let result = drive_fork_upload(
+            &mut transport,
+            "session".into(),
+            "caller".into(),
+            "capability".into(),
+            vec![1, 2, 3, 4],
+        );
+
+        let error = result.expect_err("a transport fault must fail the upload");
+        assert!(error.is_error);
+        assert!(
+            matches!(
+                error.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(text)]
+                    if text.contains("daemon is unavailable")
+            ),
+            "the transport fault must surface: {:?}",
+            error.content
+        );
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [
+                    yi_agent_store::ipc::IpcRequest::BeginForkUpload { .. },
+                    yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. },
+                    yi_agent_store::ipc::IpcRequest::AbortForkUpload { fork_token },
+                ] if fork_token == "tok"
+            ),
+            "the faulted upload must be aborted, got {requests:?}"
+        );
     }
 
     /// A fixed binding over literals, for tools exercised without a live daemon.
