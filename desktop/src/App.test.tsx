@@ -684,6 +684,9 @@ describe("App Superpowers 看板 enqueue", () => {
         method: "plugin/query",
         params: {
           plugin: "superpowers-kanban",
+          // Task 5 把 project 加进了 plugin/query 的参数；侧栏的选中态还没接上
+          // （Task 6），这一步先留空占位。
+          project: "",
           method: "enqueue",
           params: { spec_path: "/p/a.spec.md", plan_path: "/p/a.plan.md" },
         },

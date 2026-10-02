@@ -43,9 +43,10 @@ describe("board RPC wrappers", () => {
 
   it("routes every call through the generic plugin channel", async () => {
     const inner = vi.fn(async () => ({ cards: [] }));
-    await fetchBoard(asRpc(inner));
+    await fetchBoard(asRpc(inner), "/proj");
     expect(inner).toHaveBeenCalledWith("plugin/query", {
       plugin: "superpowers-kanban",
+      project: "/proj",
       method: "list",
       params: {},
     });
@@ -55,25 +56,26 @@ describe("board RPC wrappers", () => {
     const rpc = asRpc(vi.fn(async () => ({
       cards: [{ id: "c1", state: "queued", progress: null, detail: "/w" }],
     })));
-    const cards = await fetchBoard(rpc);
+    const cards = await fetchBoard(rpc, "/proj");
     expect(cards).toHaveLength(1);
     expect(cards[0].id).toBe("c1");
   });
 
   it("fetchBoard tolerates a missing cards field", async () => {
-    expect(await fetchBoard(asRpc(vi.fn(async () => ({}))))).toEqual([]);
+    expect(await fetchBoard(asRpc(vi.fn(async () => ({}))), "/proj")).toEqual([]);
   });
 
   it("readBoardSwitch returns the resolved switch", async () => {
     const rpc = asRpc(vi.fn(async () => ({ on: true, source: "project" })));
-    expect(await readBoardSwitch(rpc)).toEqual({ on: true, source: "project" });
+    expect(await readBoardSwitch(rpc, "/proj")).toEqual({ on: true, source: "project" });
   });
 
   it("readBoardSwitch asks for switch.read", async () => {
     const inner = vi.fn(async () => ({ on: true, source: "project" }));
-    await readBoardSwitch(asRpc(inner));
+    await readBoardSwitch(asRpc(inner), "/proj");
     expect(inner).toHaveBeenCalledWith("plugin/query", {
       plugin: "superpowers-kanban",
+      project: "/proj",
       method: "switch.read",
       params: {},
     });
@@ -81,9 +83,10 @@ describe("board RPC wrappers", () => {
 
   it("setBoardSwitch writes the requested value", async () => {
     const inner = vi.fn(async () => ({ on: true }));
-    await setBoardSwitch(asRpc(inner), true);
+    await setBoardSwitch(asRpc(inner), "/proj", true);
     expect(inner).toHaveBeenCalledWith("plugin/query", {
       plugin: "superpowers-kanban",
+      project: "/proj",
       method: "switch.write",
       params: { on: true },
     });
@@ -91,12 +94,35 @@ describe("board RPC wrappers", () => {
 
   it("enqueueBoardCard passes both paths through the channel", async () => {
     const inner = vi.fn(async () => ({ id: "c1" }));
-    await enqueueBoardCard(asRpc(inner), "a.spec.md", "a.plan.md");
+    await enqueueBoardCard(asRpc(inner), "/proj", "a.spec.md", "a.plan.md");
     expect(inner).toHaveBeenCalledWith("plugin/query", {
       plugin: "superpowers-kanban",
+      project: "/proj",
       method: "enqueue",
       params: { spec_path: "a.spec.md", plan_path: "a.plan.md" },
     });
+  });
+
+  it("每个项目各自成问：project 是参数不是环境", async () => {
+    // 同一个客户端连问两个项目，两次请求的 project 必须不同——否则两个项目
+    // 会读到同一个看板（这正是「点了没反应」的根因）。
+    const inner = vi.fn(async (_method: string, _params: unknown) => ({ on: false, source: "default" }));
+    const rpc = asRpc(inner);
+    await readBoardSwitch(rpc, "/a");
+    await readBoardSwitch(rpc, "/b");
+    expect(inner.mock.calls.map((call) => (call[1] as { project: string }).project)).toEqual([
+      "/a",
+      "/b",
+    ]);
+  });
+});
+
+describe("queryPlugin", () => {
+  it("把 project 带进 plugin/query 的参数", async () => {
+    const calls: unknown[] = [];
+    const rpc = async <T,>(m: string, p: unknown) => { calls.push([m, p]); return {} as T; };
+    await readBoardSwitch(rpc, "/proj");
+    expect(calls[0]).toEqual(["plugin/query", { plugin: "superpowers-kanban", project: "/proj", method: "switch.read", params: {} }]);
   });
 });
 

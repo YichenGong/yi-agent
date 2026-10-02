@@ -39,13 +39,22 @@ type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
  */
 export const KANBAN_PLUGIN = "superpowers-kanban";
 
-/** One query through the generic channel, tagged with the plugin it is meant for. */
+/**
+ * One query through the generic channel, tagged with the plugin it is meant for
+ * *and the project it is about*.
+ *
+ * The project is a parameter, not ambient state: the host routes the query to
+ * that project's runtime socket, and the plugin answers about its own queue.
+ * Without it every project would read the same board — the app's own cwd —
+ * which is exactly the "clicked and nothing happened" bug.
+ */
 async function queryPlugin<T>(
   rpc: BoardRpc,
+  project: string,
   method: string,
   params: unknown,
 ): Promise<T> {
-  return rpc<T>("plugin/query", { plugin: KANBAN_PLUGIN, method, params });
+  return rpc<T>("plugin/query", { plugin: KANBAN_PLUGIN, project, method, params });
 }
 
 /**
@@ -63,29 +72,38 @@ export function pluginIsUnavailable(error: unknown): boolean {
   return text.includes("is not available") || text.includes("PluginUnavailable");
 }
 
-/** 经插件读看板卡片。 */
-export async function fetchBoard(rpc: BoardRpc): Promise<BoardCardDto[]> {
-  const result = await queryPlugin<{ cards?: BoardCardDto[] }>(rpc, "list", {});
+/** 经插件读某项目的看板卡片。 */
+export async function fetchBoard(rpc: BoardRpc, project: string): Promise<BoardCardDto[]> {
+  const result = await queryPlugin<{ cards?: BoardCardDto[] }>(rpc, project, "list", {});
   return result?.cards ?? [];
 }
 
-/** 经插件读两层解析后的开关与来源。 */
+/** 经插件读某项目两层解析后的开关与来源。 */
 export async function readBoardSwitch(
   rpc: BoardRpc,
+  project: string,
 ): Promise<{ on: boolean; source: SwitchSource }> {
-  return queryPlugin<{ on: boolean; source: SwitchSource }>(rpc, "switch.read", {});
+  return queryPlugin<{ on: boolean; source: SwitchSource }>(rpc, project, "switch.read", {});
 }
 
-/** 经插件写项目层开关。 */
-export async function setBoardSwitch(rpc: BoardRpc, on: boolean): Promise<void> {
-  await queryPlugin(rpc, "switch.write", { on });
+/** 经插件写某项目层开关。 */
+export async function setBoardSwitch(
+  rpc: BoardRpc,
+  project: string,
+  on: boolean,
+): Promise<void> {
+  await queryPlugin(rpc, project, "switch.write", { on });
 }
 
-/** 经插件投递一张卡片。 */
+/** 经插件给某项目投递一张卡片。 */
 export async function enqueueBoardCard(
   rpc: BoardRpc,
+  project: string,
   specPath: string,
   planPath: string,
 ): Promise<void> {
-  await queryPlugin(rpc, "enqueue", { spec_path: specPath, plan_path: planPath });
+  await queryPlugin(rpc, project, "enqueue", {
+    spec_path: specPath,
+    plan_path: planPath,
+  });
 }

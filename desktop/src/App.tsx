@@ -117,6 +117,11 @@ export default function App() {
     [],
   );
 
+  // 看板 RPC 现在按项目问话（`project` 进 plugin/query 的参数）。侧栏的
+  // 选中态由 Task 6 引入，这一步先留空占位：空 project 与宿主现在的行为
+  // 一致（宿主仍按自己的 cwd 路由），不会比改动前更糟。
+  const boardProject = "";
+
   const current = currentId ? store.view(currentId) : null;
 
   /** Write an error onto the current thread's session (if any). */
@@ -435,8 +440,8 @@ export default function App() {
     const refreshBoard = async () => {
       try {
         const [sw, cards] = await Promise.all([
-          readBoardSwitch(boardRpc),
-          fetchBoard(boardRpc),
+          readBoardSwitch(boardRpc, boardProject),
+          fetchBoard(boardRpc, boardProject),
         ]);
         setBoardOn(sw.on);
         setBoardSource(sw.source);
@@ -622,7 +627,7 @@ export default function App() {
               switchOn={boardOn}
               source={boardSource}
               onToggle={(next) => {
-                void setBoardSwitch(boardRpc, next)
+                void setBoardSwitch(boardRpc, boardProject, next)
                   .then(() => {
                     setBoardOn(next);
                     setBoardSource("project");
@@ -635,7 +640,7 @@ export default function App() {
             />
             <SuperpowersKanbanEnqueue
               pickFile={pickFile}
-              enqueue={(spec, plan) => enqueueBoardCard(boardRpc, spec, plan)}
+              enqueue={(spec, plan) => enqueueBoardCard(boardRpc, boardProject, spec, plan)}
             />
             <SuperpowersKanbanView
               switchOn={boardOn}
