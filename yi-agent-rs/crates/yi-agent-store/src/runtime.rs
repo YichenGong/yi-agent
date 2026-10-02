@@ -21,7 +21,7 @@ use yi_agent_core::subagent::scheduler::{
 };
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, CompletedChildReport, ReviewPersistenceError, SpawnError, WaitMode,
-    WaitOutcome,
+    WaitOutcome, WorkerStartError,
 };
 use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
@@ -317,35 +317,53 @@ impl RuntimeCoordinator {
             .remove(task);
     }
 
-    /// Persists one parent-terminal cascade victim and releases its resident
-    /// lease, mirroring the per-id treatment `reconcile_worker_events` and the
-    /// direct cancel path already apply to every id a supervisor reduction
-    /// reports. `terminal_json` keeps the caller's terminal-shape semantics:
-    /// pass `None` for the plain per-state transition (as the cancel path does).
-    fn persist_cascaded_task(
-        &self,
-        task: &TaskId,
-        attempt: &AttemptId,
-        state: &str,
-        event: RuntimeEvent,
-        terminal_json: Option<&str>,
-    ) -> Result<(), RuntimeCoordinatorError> {
+    /// Persists every parent-terminal cascade victim in one repository
+    /// transaction and releases each victim's resident lease.
+    ///
+    /// Holding the repository lock across the batch keeps the task rows and the
+    /// release stop in step. Attempt ids are re-read through
+    /// `RuntimeRepository::active_attempt_id` at commit time rather than
+    /// captured before the write, so a retry that swapped the victim's active
+    /// attempt after the supervisor lock was dropped can no longer make the
+    /// guarded update fail and strand a victim with an active lease. A victim
+    /// that has since moved on is skipped rather than mis-persisted, and is
+    /// still released because the cascade has already ended it in memory
+    /// (release is idempotent for a task that never held a lease).
+    fn persist_cascaded_tasks(&self, victims: Vec<TaskId>) -> Result<(), RuntimeCoordinatorError> {
+        if victims.is_empty() {
+            return Ok(());
+        }
         let mut repository = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned");
-        match terminal_json {
-            Some(terminal_json) => repository.transition_task_and_attempt_with_terminal(
-                task,
-                attempt,
-                state,
-                event,
-                terminal_json,
-            )?,
-            None => repository.transition_task_and_attempt(task, attempt, state, event)?,
-        };
+        let mut releases = Vec::with_capacity(victims.len());
+        for victim in victims {
+            let attempt = match repository.active_attempt_id(&victim) {
+                Ok(attempt) => attempt,
+                Err(RepositoryError::TaskNotFound { .. }) => {
+                    releases.push(victim);
+                    continue;
+                }
+                Err(error) => return Err(RuntimeCoordinatorError::Repository(error)),
+            };
+            match repository.transition_task_and_attempt(
+                &victim,
+                &attempt,
+                "cancelled",
+                RuntimeEvent::TaskCancelled,
+            ) {
+                Ok(_) => releases.push(victim),
+                Err(RepositoryError::TaskNotFound { .. }) => {
+                    releases.push(victim);
+                }
+                Err(error) => return Err(RuntimeCoordinatorError::Repository(error)),
+            }
+        }
         drop(repository);
-        self.release_resident_lease(task);
+        for victim in releases {
+            self.release_resident_lease(&victim);
+        }
         Ok(())
     }
 
@@ -1535,37 +1553,21 @@ impl RuntimeCoordinator {
                         RuntimeEvent::TaskFailed,
                         &evidence,
                     )?;
-                // The failure reduces an already-terminal task, so the cascade
-                // cannot fire again. Its returned ids still have to be consumed:
-                // `reduce_task` is the choke point, and a later change that
-                // widens the cascade must not silently lose a victim here. A
-                // reduce error is not actionable (the task is already durably
-                // failed above) and must not mask the real provisioning error.
+                // The failed row was written above, but the in-memory task is
+                // still non-terminal: this reduce is what fails it, and it is
+                // exactly that transition which can fire the parent-terminal
+                // cascade. The returned ids therefore matter — a live
+                // descendant is cancelled in memory here and no reconcile event
+                // will ever report it again, so it must be persisted below or
+                // it stays `running` while holding its leases. A reduce error
+                // is not actionable (the task is already durably failed above)
+                // and must not mask the real provisioning error.
                 let cascaded = supervisor
                     .fail_task(task, error.to_string())
                     .unwrap_or_default();
-                let cascaded_attempts = cascaded
-                    .into_iter()
-                    .filter(|id| *id != *task)
-                    .map(|id| {
-                        let victim_attempt = supervisor
-                            .task(&id)
-                            .expect("cascaded task exists")
-                            .active_attempt_id()
-                            .clone();
-                        (id, victim_attempt)
-                    })
-                    .collect::<Vec<_>>();
+                let victims = cascaded.into_iter().filter(|id| *id != *task).collect();
                 drop(supervisor);
-                for (cascaded_id, victim_attempt) in cascaded_attempts {
-                    self.persist_cascaded_task(
-                        &cascaded_id,
-                        &victim_attempt,
-                        "cancelled",
-                        RuntimeEvent::TaskCancelled,
-                        None,
-                    )?;
-                }
+                self.persist_cascaded_tasks(victims)?;
                 return Err(RuntimeCoordinatorError::Supervisor(error.to_string()));
             }
         };
@@ -1756,13 +1758,17 @@ impl RuntimeCoordinator {
             .as_ref()
             .map(|factory| factory as &dyn AgentWorkerFactory)
             .unwrap_or_else(|| self.factory.as_ref());
-        if let Err(error) = supervisor
+        let start_outcome = supervisor
             .start_worker_with_provider_turn_gate(worker_factory, task, provider_turn_gate)
-            .await
-        {
+            .await;
+        if let Err(error) = start_outcome {
+            let (message, affected) = match error {
+                WorkerStartError::Factory { message, affected } => (message, affected),
+                WorkerStartError::Catalogue(message) => (message, Vec::new()),
+            };
             let terminal = serde_json::to_string(&serde_json::json!({
                 "reason": "worker_start_failed",
-                "error": error.as_str(),
+                "error": message,
             }))
             .expect("worker start failure payload is serializable");
             self.repository
@@ -1775,10 +1781,16 @@ impl RuntimeCoordinator {
                     RuntimeEvent::TaskFailed,
                     &terminal,
                 )?;
+            // The factory failure cascaded every live descendant of `task` in
+            // memory. `reconcile` skips tasks already terminal, so no event will
+            // ever report them again: persist each victim from the id list the
+            // supervisor returned, or it stays `running` while holding leases.
+            let victims = affected.into_iter().filter(|id| id != task).collect();
+            self.persist_cascaded_tasks(victims)?;
             if is_subagent {
                 self.release_resident_lease(task);
             }
-            return Err(RuntimeCoordinatorError::Supervisor(error));
+            return Err(RuntimeCoordinatorError::Supervisor(message));
         }
         let acknowledgement = self
             .repository
@@ -2029,8 +2041,8 @@ impl RuntimeCoordinator {
         // The repository transaction above durably recorded the watchdog
         // terminal for `task` itself; this reduction additionally settles the
         // parent-terminal cascade in memory. Its tail (the cascade victims) has
-        // never been persisted, so capture each victim's attempt, drop the
-        // supervisor borrow, and commit + release every one. `affected` always
+        // never been persisted, so collect the victims while the supervisor
+        // borrow is live and persist + release each one below. `affected` always
         // contains `task` first, which the transaction above already handled.
         let affected = match terminal {
             WatchdogTerminal::Stalled => supervisor.stall_task(
@@ -2048,28 +2060,17 @@ impl RuntimeCoordinator {
             WatchdogTerminal::BudgetExhausted(kind) => supervisor.exhaust_task_budget(task, kind),
         }
         .map_err(RuntimeCoordinatorError::Supervisor)?;
-        let cascaded = affected
-            .into_iter()
-            .filter(|id| id != task)
-            .map(|id| {
-                let victim_attempt = supervisor
-                    .task(&id)
-                    .expect("cascaded task exists")
-                    .active_attempt_id()
-                    .clone();
-                (id, victim_attempt)
-            })
-            .collect::<Vec<_>>();
+        // Drop the guard only after the victims are persisted. A concurrent
+        // `retry_task` / `resume_task` for a victim needs the same supervisor,
+        // so it cannot install a successor attempt in the window between the
+        // reduction above and the guarded writes below. Releasing the guard
+        // first would let the retry rewrite the victim's active attempt before
+        // the write, failing its `active_attempt_id = ?` guard and stranding the
+        // victim `running` with an active lease — the same shape `cancel_task`
+        // avoids by holding its guard until the writes are done.
+        let victims = affected.into_iter().filter(|id| id != task).collect();
+        self.persist_cascaded_tasks(victims)?;
         drop(supervisor);
-        for (victim, victim_attempt) in cascaded {
-            self.persist_cascaded_task(
-                &victim,
-                &victim_attempt,
-                "cancelled",
-                RuntimeEvent::TaskCancelled,
-                None,
-            )?;
-        }
         self.release_resident_lease(task);
         Ok(true)
     }
@@ -4465,6 +4466,57 @@ mod provider_turn_admission_tests {
             Some(128),
             "the configured capacity must reach the coordinator, not just the constant"
         );
+    }
+
+    /// The cascade write resolves each victim's attempt at commit time, so a
+    /// retry that swapped the victim's active attempt after the supervisor lock
+    /// was dropped cannot make the guarded update fail. Releasing the guard
+    /// before the writes (the bug) captured the stale attempt id and left the
+    /// victim `running` with an active lease; re-reading it here cancels the
+    /// successor attempt's row instead.
+    #[test]
+    fn a_cascade_write_re_reads_the_victims_active_attempt_at_commit_time() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let coordinator =
+            RuntimeCoordinator::open(&database, Arc::new(CapacityFactory { units: 8 })).unwrap();
+        let root = RootSessionId::new();
+        let victim = TaskId::new();
+        let stale_attempt = AttemptId::new();
+        let successor_attempt = AttemptId::new();
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .create_task_with_attempt(&victim, &root, &stale_attempt, 1, "running")
+                .unwrap();
+            // A concurrent retry replaced the victim's active attempt while the
+            // supervisor guard was dropped in the buggy ordering.
+            repository
+                .activate_successor_attempt(
+                    &victim,
+                    &successor_attempt,
+                    2,
+                    "queued",
+                    RuntimeEvent::TaskQueued,
+                )
+                .unwrap();
+        }
+
+        coordinator
+            .persist_cascaded_tasks(vec![victim.clone()])
+            .unwrap();
+
+        let repository = RuntimeRepository::open(&database).unwrap();
+        assert_eq!(
+            repository.task_state(&victim).unwrap(),
+            "cancelled",
+            "the successor attempt's row must be ended, not left queued"
+        );
+        assert_eq!(
+            repository.active_attempt_id(&victim).unwrap(),
+            successor_attempt
+        );
+        assert_ne!(repository.active_attempt_id(&victim).unwrap(), stale_attempt);
     }
 
     #[test]

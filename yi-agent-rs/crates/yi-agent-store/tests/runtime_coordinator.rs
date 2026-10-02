@@ -83,6 +83,51 @@ impl AgentWorkerFactory for FailingFactory {
     }
 }
 
+/// Fails `start_with_provider_turn_gate` only for tasks named in `failing`, so a
+/// test can start a parent and its child successfully (each claiming a resident
+/// lease) and then drive a later start of the parent into the factory-failure
+/// branch with a live descendant still present.
+#[derive(Clone, Default)]
+struct ScopedStartupErrorFactory {
+    failing: Arc<Mutex<Vec<TaskId>>>,
+    handles: Arc<Mutex<Vec<WorkerHandle>>>,
+}
+
+impl ScopedStartupErrorFactory {
+    fn fail_for(&self, task: &TaskId) {
+        self.failing.lock().unwrap().push(task.clone());
+    }
+
+    fn tracks(&self, task: &TaskId) -> bool {
+        self.failing.lock().unwrap().contains(task)
+    }
+}
+
+impl AgentWorkerFactory for ScopedStartupErrorFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation);
+        self.handles.lock().unwrap().push(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+
+    fn start_with_provider_turn_gate(
+        &self,
+        request: WorkerStart,
+        _gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        if self.tracks(&request.task_id) {
+            return Box::pin(async {
+                Err(WorkerError::Startup("provider bootstrap failed".into()))
+            });
+        }
+        self.start(request)
+    }
+}
+
 #[derive(Clone, Default)]
 struct MessageRecordingFactory {
     starts: Arc<Mutex<Vec<WorkerStart>>>,
@@ -3284,6 +3329,60 @@ async fn a_watchdog_timed_out_parent_cascades_and_releases_its_childs_lease() {
 
     assert_eq!(coordinator.task_state(&parent).unwrap(), "timed_out");
     assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
+    assert!(
+        !RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "the cascaded child must release its workspace lease"
+    );
+}
+
+/// A later start of a non-terminal parent must not strand a live descendant.
+///
+/// The parent is paused (pausing never cascades) and then resumed, which sends
+/// it back through `start_worker`. When that provider start fails, the
+/// supervisor fails the parent and cascades the still-live child; the child's
+/// worker is gone, so no reconcile event can ever report it again. The
+/// coordinator must persist the child as `cancelled` and release its lease from
+/// the id list the supervisor returns, not discard it.
+#[tokio::test]
+async fn a_factory_start_failure_on_a_resumed_parent_persists_and_releases_its_cascade() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ScopedStartupErrorFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let parent = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    // Both start successfully, so the coding child claims its workspace lease.
+    coordinator.start_worker(&session, &parent).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "fixture requires the child to hold a workspace lease"
+    );
+
+    // Pausing is not a terminal transition, so the live child survives it.
+    coordinator.pause_task(&session, &parent).await.unwrap();
+    factory.handles.lock().unwrap()[0].report_paused();
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(coordinator.task_state(&parent).unwrap(), "paused");
+    assert_eq!(coordinator.task_state(&child).unwrap(), "running");
+
+    // The resumed parent re-enters the factory, which now fails for it.
+    factory.fail_for(&parent);
+    assert!(coordinator.resume_task(&session, &parent).await.is_err());
+
+    assert_eq!(coordinator.task_state(&parent).unwrap(), "failed");
+    assert_eq!(
+        coordinator.task_state(&child).unwrap(),
+        "cancelled",
+        "the cascaded child must be durably cancelled, not left running"
+    );
     assert!(
         !RuntimeRepository::open(&database)
             .unwrap()

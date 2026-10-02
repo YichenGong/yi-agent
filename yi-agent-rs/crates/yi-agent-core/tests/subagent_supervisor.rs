@@ -7,7 +7,7 @@ use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt as _;
 use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
-    AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
+    AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools, WorkerStartError,
 };
 use yi_agent_core::subagent::task::{
     DeliveryReport, InheritedSandbox, IntegrationValidation, PauseReason, PermissionRequestId,
@@ -809,6 +809,61 @@ async fn worker_startup_failure_is_recorded_after_admission_without_a_handle() {
         supervisor.task(&child).unwrap().state(),
         TaskState::Failed(_)
     ));
+}
+
+/// A factory start failure on a task with live descendants must hand the
+/// cascade victims to the caller. The descendants have already had their
+/// workers removed, so no reconcile event can ever report them again: a caller
+/// that discards the list strands them mid-flight.
+#[tokio::test]
+async fn a_factory_start_failure_reports_the_cascaded_descendants_it_cancelled() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCollectingWorkerFactory::default();
+    supervisor.start_worker(&factory, &root).await.unwrap();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+
+    // Pause the root, deliver the acknowledgement, then resume: pausing is not
+    // terminal, so the live child survives and the root re-enters the factory.
+    supervisor
+        .pause_task(&root, PauseReason("paused for the test".into()))
+        .unwrap();
+    factory.handle_for(&root).unwrap().report_paused();
+    supervisor.reconcile_worker_events().unwrap();
+    assert!(matches!(
+        supervisor.task(&root).unwrap().state(),
+        TaskState::Paused(_)
+    ));
+    assert!(
+        !supervisor.task(&child).unwrap().state().is_terminal(),
+        "the fixture needs a live descendant when the parent re-enters the factory"
+    );
+
+    supervisor.resume_task(&root).unwrap();
+    let outcome = supervisor.start_worker(&FailingWorkerFactory, &root).await;
+    let affected = match outcome {
+        Err(WorkerStartError::Factory { affected, .. }) => affected,
+        other => panic!("expected a factory failure carrying its cascade, got {other:?}"),
+    };
+    assert_eq!(affected.first(), Some(&root));
+    assert!(
+        affected.contains(&child),
+        "the factory failure must report the cascaded child so the caller persists it, got {affected:?}"
+    );
+    assert!(
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "the child was cancelled in memory"
+    );
+    // Even if the cancelled child's worker reports an event, `reconcile` skips it
+    // because its in-memory state is already terminal. Nothing downstream will
+    // ever report this row again, so the caller must consume `affected` itself.
+    factory.handle_for(&child).unwrap().report_cancelled();
+    let reconciled = supervisor.reconcile_worker_events().unwrap();
+    assert!(
+        !reconciled.contains(&child),
+        "reconcile must not be expected to report the cascaded child, got {reconciled:?}"
+    );
 }
 
 #[tokio::test]

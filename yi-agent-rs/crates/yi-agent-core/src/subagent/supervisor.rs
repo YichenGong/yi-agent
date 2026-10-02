@@ -56,6 +56,34 @@ pub enum MessageDeliveryError {
     RecipientTerminal,
 }
 
+/// Why `start_worker` could not install a worker.
+///
+/// `Factory` carries every id whose state changed. That is usually just the
+/// task itself, but a non-terminal task may still own live descendants when a
+/// later start attempt fails (for example a paused parent that was resumed, so
+/// its children were never cascaded). The supervisor cancels those descendants
+/// in memory, and `reconcile_worker_events` skips any task already terminal, so
+/// no event will ever report them again. A caller with a repository (the
+/// runtime coordinator) must therefore persist each cascaded id and release its
+/// lease; discarding the list strands them in `running` while holding active
+/// leases.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorkerStartError {
+    #[error("{message}")]
+    Factory {
+        message: String,
+        affected: Vec<TaskId>,
+    },
+    #[error("{0}")]
+    Catalogue(String),
+}
+
+impl From<String> for WorkerStartError {
+    fn from(message: String) -> Self {
+        Self::Catalogue(message)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum WaitMode {
     Any,
@@ -574,7 +602,7 @@ impl AgentSupervisor {
         &mut self,
         factory: &dyn AgentWorkerFactory,
         task_id: &TaskId,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorkerStartError> {
         self.start_worker_with_provider_turn_gate(factory, task_id, None)
             .await
     }
@@ -585,17 +613,19 @@ impl AgentSupervisor {
         factory: &dyn AgentWorkerFactory,
         task_id: &TaskId,
         provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorkerStartError> {
         if self.workers.contains_key(task_id) {
-            return Err("task already owns a worker".into());
+            return Err(WorkerStartError::Catalogue(
+                "task already owns a worker".into(),
+            ));
         }
         let task = self
             .tasks
             .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?;
+            .ok_or_else(|| WorkerStartError::Catalogue("task does not exist".into()))?;
         let objective = self
             .objective(task_id)
-            .ok_or_else(|| "task objective does not exist".to_string())?;
+            .ok_or_else(|| WorkerStartError::Catalogue("task objective does not exist".into()))?;
         let initial_user_messages = self
             .mailboxes
             .get(task_id)
@@ -635,22 +665,16 @@ impl AgentSupervisor {
         {
             Ok(handle) => handle,
             Err(error) => {
-                let affected = self.fail_task(task_id, error.to_string())?;
-                // The task crashed before it owned a worker, so the usual case
-                // is `[task_id]`: the catalogue layer has no repository and the
-                // coordinator persists `task_id` as failed from this returned
-                // error. A descendant spawned before this start could in
-                // principle be cascaded here, so surface it rather than let it
-                // disappear silently; wiring that (rarer) victim to the
-                // repository is out of this path's scope.
-                if affected.len() > 1 {
-                    tracing::warn!(
-                        ?task_id,
-                        cascaded = affected.len() - 1,
-                        "worker start failure cascaded live descendants the caller must persist"
-                    );
-                }
-                return Err(error.to_string());
+                // `fail_task` returns the failed task plus any live descendants
+                // the parent-terminal cascade just cancelled. `reconcile` skips
+                // tasks that are already terminal, so those descendants will
+                // never be reported again: the caller must carry the list to the
+                // repository, or they stay `running` while holding leases.
+                let message = error.to_string();
+                let affected = self
+                    .fail_task(task_id, message.clone())
+                    .map_err(WorkerStartError::Catalogue)?;
+                return Err(WorkerStartError::Factory { message, affected });
             }
         };
         self.worker_message_capabilities
