@@ -292,8 +292,10 @@ git commit -m "feat(boards): detached per-project daemon start and stop"
 **Interfaces:**
 - Consumes: Task 1（registry/scaffold）、Task 2（board_daemon）。
 - Produces:
-  - `boards::lifecycle::create(project: &Path, exe: &Path) -> Result<BoardStatus, String>`
-    幂等：scaffold → 若 daemon 未跑则 `spawn_detached` + `wait_ready` → `register`。
+  - `boards::lifecycle::create(project: &Path) -> Result<BoardStatus, String>`
+    幂等**按 daemon 判断**：scaffold → 若 `is_running` 为假则 `spawn_detached` + `wait_ready` → `register`。
+    登记表只记录意图；一个已登记但 daemon 已死的项目必须能被 `create` 重新拉起（决策 1/4）。
+    真实启动器 `launch_if_absent` 自身幂等（`is_running` 即早返回），所以不会起第二个 daemon。
   - `boards::lifecycle::remove(project: &Path) -> Result<(), String>`
     `stop` → 删 `<project>/.yi-agent/superpowers-kanban/` → `unregister`（清单与开关保留）。
   - `boards::lifecycle::status(project: &Path) -> BoardStatus`
@@ -322,12 +324,51 @@ fn create_scaffolds_registers_and_is_idempotent() {
     std::fs::create_dir_all(&project).unwrap();
     let global = dir.path().join("global");
 
-    let mut launched = 0;
-    let mut launcher = |_p: &Path| { launched += 1; Ok(true) };
+    // 注入的「启动器」按真实启动器的语义工作：第一次被调用时绑定项目的
+    // runtime socket 并起一个线程在那里回答 Status（用同一个 listener 复活，
+    // 绝不绑第二个）。于是第二次 create 的 is_running 探测为真、短路，
+    // 「重复创建不该再起一个 daemon」由 daemon 的存在担保，而不是由登记表。
+    // 幂等按 daemon 判断，登记表只记录意图——这样「daemon 已死但仍在登记表」
+    // 的项目才能被 create 重新拉起。
+    let socket = runtime_socket(&project).unwrap();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let mut listener: Option<std::os::unix::net::UnixListener> = None;
+    let mut daemon: Option<std::thread::JoinHandle<usize>> = None;
+    let launched = std::cell::Cell::new(0);
+    let mut launcher = |_p: &Path| {
+        launched.set(launched.get() + 1);
+        if listener.is_none() {
+            let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener = Some(bound.try_clone().unwrap());
+            daemon = Some(std::thread::spawn(move || {
+                // 两次 create 各探一次 Status，收两条连接后结束。
+                let mut served = 0usize;
+                for _ in 0..2 {
+                    let (stream, _) = bound.accept().unwrap();
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["command"]["type"].as_str(), Some("Status"));
+                    let reply = serde_json::json!({
+                        "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                        "request_id": request["request_id"],
+                        "result": { "type": "Status", "high_water_event_id": 0 },
+                    });
+                    let mut stream = stream;
+                    std::io::Write::write_all(&mut stream, reply.to_string().as_bytes()).unwrap();
+                    std::io::Write::write_all(&mut stream, b"\n").unwrap();
+                    served += 1;
+                }
+                served
+            }));
+        }
+        Ok(true)
+    };
 
     let first = create_with_project(&project, &global, &mut launcher).unwrap();
     assert!(first.registered);
-    assert_eq!(launched, 1);
+    assert_eq!(launched.get(), 1);
     // 清单与开关就位
     assert!(project.join(".yi-agent/supervisors/superpowers-kanban.json").exists());
     let prefs: serde_json::Value = serde_json::from_str(
@@ -339,7 +380,10 @@ fn create_scaffolds_registers_and_is_idempotent() {
     // 再创建一次：不重复起进程
     let second = create_with_project(&project, &global, &mut launcher).unwrap();
     assert!(second.registered);
-    assert_eq!(launched, 1, "重复创建不该再起一个 daemon");
+    assert_eq!(launched.get(), 1, "重复创建不该再起一个 daemon");
+
+    drop(listener);
+    daemon.unwrap().join().unwrap();
 }
 
 #[test]

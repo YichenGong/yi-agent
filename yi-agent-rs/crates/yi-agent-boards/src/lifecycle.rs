@@ -117,13 +117,14 @@ pub fn launch_if_absent(project: &Path) -> Result<bool, String> {
 
 /// Create with an injected launcher and global directory.
 ///
-/// Idempotence is keyed on the registry, not on the daemon: a project that is
-/// already registered already had its daemon ensured once, so a second `create`
-/// must not start another one. An injected launcher cannot report liveness the
-/// way the real one does, and "two daemons for one project" is the failure this
-/// guards against. The launcher is therefore called only for a project that is
-/// not yet registered and has no daemon answering; its `bool` is whether a
-/// daemon is running afterwards.
+/// Idempotence is keyed on the daemon, not on the registry: the launcher runs
+/// whenever no daemon answers for the project. A project that is already
+/// registered but whose daemon has died (the app was closed, the machine
+/// rebooted) is therefore relaunched rather than reported dead forever — the
+/// registry is a record of intent, not a reason to skip recovery. "Two daemons
+/// for one project" still cannot happen: the real launcher is itself idempotent
+/// (it returns early when `is_running`), and an injected launcher used in tests
+/// is expected to leave a daemon answering, exactly as the real one does.
 pub fn create_with_project(
     project: &Path,
     global: &Path,
@@ -142,11 +143,8 @@ pub fn create_with_project(
     scaffold::install_manifest(project).map_err(|error| error.to_string())?;
     scaffold::enable_switch(project).map_err(|error| error.to_string())?;
 
-    let already_registered = registry::contains(global, project).map_err(|error| error.to_string())?;
     let daemon_running = if board_daemon::is_running(project) {
         true
-    } else if already_registered {
-        false
     } else {
         launcher(project)?
     };
@@ -256,9 +254,57 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
 
+        // 注入的「启动器」按真实启动器的语义工作：第一次调用时绑定项目的
+        // runtime socket 并派一个线程在那里回答 Status（之后复用同一个
+        // listener，绝不绑第二个）。于是第一次 create 真的把一个 daemon
+        // 「拉起来了」，第二次 create 的 is_running 探测为真、从而短路。这样
+        // 「重复创建不该再起一个 daemon」由 daemon 的存在担保，而不是由登记
+        // 表——一个 daemon 已死但仍在登记表里的项目才能被 create 重新拉起。
+        let socket = runtime_socket(&project).unwrap();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let mut listener: Option<std::os::unix::net::UnixListener> = None;
+        let mut daemon: Option<std::thread::JoinHandle<usize>> = None;
+
         let launched = std::cell::Cell::new(0);
-        let mut launcher = |_p: &Path| {
+        let mut launcher = |p: &Path| {
             launched.set(launched.get() + 1);
+            if listener.is_none() {
+                let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                listener = Some(bound.try_clone().unwrap());
+                daemon = Some(std::thread::spawn(move || {
+                    // create #1 的探测发生在 socket 出现之前（那时 is_running
+                    // 为假、不建连）；只有 create #2 会真正连上来探一次。
+                    let mut served = 0usize;
+                    for _ in 0..1 {
+                        let Ok((stream, _)) = bound.accept() else {
+                            return served;
+                        };
+                        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                            return served;
+                        }
+                        let request: serde_json::Value =
+                            serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                        assert_eq!(
+                            request["command"]["type"].as_str(),
+                            Some("Status"),
+                            "create 只应探 Status：{request}"
+                        );
+                        let reply = serde_json::json!({
+                            "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                            "request_id": request["request_id"],
+                            "result": { "type": "Status", "high_water_event_id": 0 },
+                        });
+                        let mut stream = stream;
+                        std::io::Write::write_all(&mut stream, reply.to_string().as_bytes()).unwrap();
+                        std::io::Write::write_all(&mut stream, b"\n").unwrap();
+                        served += 1;
+                    }
+                    served
+                }));
+            }
+            let _ = p;
             Ok(true)
         };
 
@@ -281,6 +327,45 @@ mod tests {
         let second = create_with_project(&project, &global, &mut launcher).unwrap();
         assert!(second.registered);
         assert_eq!(launched.get(), 1, "重复创建不该再起一个 daemon");
+
+        drop(listener);
+        assert_eq!(
+            daemon.unwrap().join().unwrap(),
+            1,
+            "daemon 应被 create #2 探一次 Status（create #1 时 socket 尚不存在）"
+        );
+    }
+
+    #[test]
+    fn create_relaunches_a_registered_board_whose_daemon_died() {
+        // 项目已在登记表里，但 daemon 没在跑（app 关过、机器重启过：socket 不在，
+        // is_running 为假）。create 必须把它重新拉起来，而不是返回
+        // daemon_running:false 就把这个项目永远钉死。登记表记录的是意图，不是
+        // 「不许再启动」——否则看板会静默死掉，唯一的补救是手改 boards.json。
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let global = dir.path().join("global");
+        crate::registry::register(&global, &project).unwrap();
+        assert!(
+            crate::registry::contains(&global, &project).unwrap(),
+            "前置条件：项目已登记"
+        );
+
+        let launched = std::cell::Cell::new(0);
+        let mut launcher = |_p: &Path| {
+            launched.set(launched.get() + 1);
+            Ok(true)
+        };
+
+        let created = create_with_project(&project, &global, &mut launcher).unwrap();
+        assert_eq!(
+            launched.get(),
+            1,
+            "已登记但 daemon 已死的项目必须被重新拉起"
+        );
+        assert!(created.registered);
+        assert!(created.daemon_running, "{created:?}");
     }
 
     #[test]
