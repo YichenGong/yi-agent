@@ -1101,7 +1101,11 @@ where
 {
     let hub = Arc::new(crate::broadcast::Broadcaster::new());
     let local = crate::broadcast::ClientId::local();
-    let outbound = hub.register(local.clone());
+    // 可靠登记:stdio 只有这一条出站流,广播的背压**不得**摘除它。桌面 host
+    // 一旦来不及读 stdout,旧的 lossy `broadcast` 会把它当慢消费者摘掉,主循环
+    // 随即写响应失败、sidecar 以错误退出——用户看到的就是「打开很多页面后
+    // broken pipe (os error 32)」。真正断连由 `pump_stdout` 写失败时显式摘除。
+    let outbound = hub.register_reliable(local.clone());
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
     let (inbound_tx, inbound_rx) =
@@ -1189,6 +1193,10 @@ async fn pump_stdout<W>(
     while let Some(frame) = outbound.recv().await {
         if let Err(e) = writer.write_value(&frame).await {
             tracing::error!("app-server stdout write failed: {e}");
+            // 出口泵写失败 = 对端真的没了(stdout 管道断裂)。这是 stdio 会话的
+            // **唯一**断连判据:可靠登记不会被背压摘除,故此处必须显式摘除,
+            // 让主循环随后的 `reply`/`write_response` 拿到 `Closed` 并按既有
+            // 致命语义结束会话(`driver_reports_finished_when_writer_fails`)。
             hub.unregister(&client);
             break;
         }
@@ -5007,7 +5015,8 @@ pub(crate) mod tests {
     {
         let hub = Arc::new(crate::broadcast::Broadcaster::new());
         let client = crate::broadcast::ClientId::local();
-        let outbound = hub.register(client.clone());
+        // 与生产的 stdio 接线同款:可靠登记,背压不摘除(见 `serve_scoped`)。
+        let outbound = hub.register_reliable(client.clone());
         tokio::spawn(pump_stdout(
             outbound,
             writer,
