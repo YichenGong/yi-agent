@@ -65,11 +65,26 @@ async function queryPlugin<T>(
  * string-based because the failure crosses a JSON-RPC boundary as a message.
  */
 export function pluginIsUnavailable(error: unknown): boolean {
-  const text = error instanceof Error ? error.message : String(error ?? "");
+  // The RPC client rejects with a raw `RpcError` object for JSON-RPC errors, not
+  // an `Error`, so `instanceof Error` alone would stringify it to
+  // `[object Object]` and never match. Read `message` (and the structured
+  // `data.code`) off whatever shape we were handed.
+  const record = error as { message?: unknown; data?: { code?: unknown } } | null;
+  const code = typeof record?.data?.code === "string" ? record.data.code : "";
+  const text =
+    typeof record?.message === "string"
+      ? record.message
+      : error instanceof Error
+        ? error.message
+        : String(error ?? "");
   // The daemon answers `plugin <name> is not available` when it does not
   // supervise the plugin (or the plugin never declared a query socket). The
   // structured code is kept as a second signal in case the wording changes.
-  return text.includes("is not available") || text.includes("PluginUnavailable");
+  return (
+    code === "plugin_unavailable" ||
+    text.includes("is not available") ||
+    text.includes("PluginUnavailable")
+  );
 }
 
 /** 经插件读某项目的看板卡片。 */

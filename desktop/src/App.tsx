@@ -34,7 +34,12 @@ import {
   readBoardSwitch,
   setBoardSwitch,
 } from "./lib/superpowersKanbanSwitch";
-import { type BoardErrorKind, boardErrorKind, summarize } from "./lib/boardIndex";
+import {
+  type BoardErrorKind,
+  BOARD_SUMMARY_UNREADABLE,
+  boardErrorKind,
+  summarize,
+} from "./lib/boardIndex";
 import { createBoard, listBoards, removeBoard } from "./lib/superpowersKanbanBoards";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
@@ -166,7 +171,9 @@ export default function App() {
           try {
             return [path, summarize(await fetchBoard(boardRpc, path))];
           } catch {
-            return [path, ""];
+            // 摘要读不到就明说「无法读取」，别留空：留空和「空看板」长得一样，
+            // 而这两件事对用户是两码事（一个要去看 daemon/插件，一个什么都不用做）。
+            return [path, BOARD_SUMMARY_UNREADABLE];
           }
         }),
       );
@@ -589,14 +596,16 @@ export default function App() {
       }
       // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
       setStatus("connected");
+      // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
+      // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
+      // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
+      await refreshBoards();
     })().catch((e) => {
       const msg = formatError(e);
       setCurrentError(msg);
       setStatus(`error: ${msg}`);
     });
-    // 看板：登记表随挂载拉一次；选中项目的具体内容由 boardTick 每 2 秒刷新，
-    // 读失败绝不影响主流程。
-    void refreshBoards();
+    // 看板内容由 boardTick 每 2 秒刷新选中项目，读失败绝不影响主流程。
     const boardTimer = window.setInterval(() => boardTick.current(), 2000);
     return () => window.clearInterval(boardTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -12,6 +12,15 @@
  * 精确匹配：登记表里存的是项目根路径，而 `/a` 的看板不该让 `/a/b` 也冒出
  * 一个条目——点进子目录却看见父项目的队列，比没有条目更让人困惑。
  */
+/** The summary shown when a project's board could not be read at all. */
+export const BOARD_SUMMARY_UNREADABLE = "无法读取";
+
+/**
+ * 只给已登记的项目显示看板条目。
+ *
+ * 精确匹配而非前缀：登记 `/a` 不能让 `/a/b` 也长出看板条目——那是另一个项目，
+ * 有它自己的登记表条目。
+ */
 export function kanbanItemFor(workspace: string, boards: string[]): boolean {
   return boards.includes(workspace);
 }

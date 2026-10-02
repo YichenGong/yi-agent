@@ -695,6 +695,18 @@ describe("App 主区域看板", () => {
     expect(screen.queryByRole("checkbox")).toBeNull();
   });
 
+  it("看板列表读不到时明说「无法读取」，而不是留空", async () => {
+    // 摘要是侧栏那一眼的全部。读失败若留空，就和「空看板」长得一模一样——
+    // 而这两件事对用户是两码事：一个要去看 daemon/插件，一个什么都不用做。
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.rpcError["list"] = new Error("daemon is unavailable: connection refused");
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+
+    expect(await screen.findByText("无法读取")).toBeTruthy();
+  });
+
   it("选中看板时主区域显示该项目看板，且不再有全局左列", async () => {
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];

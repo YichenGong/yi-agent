@@ -142,6 +142,19 @@ describe("pluginIsUnavailable", () => {
     expect(pluginIsUnavailable(new Error("PluginUnavailable { plugin: \"x\" }"))).toBe(true);
   });
 
+  it("recognises a raw RpcError object (the client does not wrap it in Error)", () => {
+    // RpcClient 对 JSON-RPC 错误抛的是裸 RpcError 对象，不是 Error 实例。
+    expect(
+      pluginIsUnavailable({
+        code: -32022,
+        message: "the plugin rejected the query: NotFound plugin superpowers-kanban is not available",
+        data: { code: "plugin_unavailable" },
+      }),
+    ).toBe(true);
+    // 结构化码单独也够：宿主之后改写措辞也不会漏判。
+    expect(pluginIsUnavailable({ code: -32022, message: "no", data: { code: "plugin_unavailable" } })).toBe(true);
+  });
+
   it("does not mistake an unrelated failure for a missing plugin", () => {
     expect(pluginIsUnavailable(new Error("daemon is unavailable: connection refused"))).toBe(
       false,
