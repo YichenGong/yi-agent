@@ -150,9 +150,12 @@ pub enum Command {
         #[command(subcommand)]
         action: ScheduleAction,
     },
-    /// Run the JSON-RPC app-server (stdio transport). Used by the desktop GUI sidecar.
+    /// Run the JSON-RPC app-server. Used by the desktop GUI sidecar and, over
+    /// `ws://`, by network clients.
     AppServer {
-        /// Listen transport. Only `stdio://` is supported.
+        /// Listen transport: `stdio://` (default) or `ws://host:port`.
+        /// The ws transport has NO authentication in this version and should be
+        /// bound to loopback only.
         #[arg(long, default_value = "stdio://")]
         listen: String,
     },

@@ -33,7 +33,7 @@ use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
-const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// driver task → 主循环的完成事件。
 enum TurnEvent {
@@ -89,8 +89,8 @@ type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 /// 两者成对传递,调用点无法只更新一半——只换了 daemon 映射、忘了 root 映射,
 /// 正是「每个会话应当有自己的 root」这条不变量最危险的破坏方式。
 pub(crate) struct RuntimeAttachments {
-    runtimes: ProjectRuntimes,
-    thread_roots: ThreadRoots,
+    pub(crate) runtimes: ProjectRuntimes,
+    pub(crate) thread_roots: ThreadRoots,
 }
 
 /// The key that identifies one project directory across this process.
@@ -3478,6 +3478,38 @@ mod plugin_query_tests {
     }
 }
 
+/// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。
+///
+/// 放在 `mod tests` 之外，因为 `#[cfg(test)]` 的 `mod tests` 对其它文件不可见；
+/// 这里同样只在 test 构建下存在，避免生产构建出现 dead_code。
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use yi_agent_runtime::config::RuntimeConfig;
+
+    /// 一份无凭据、无网络的测试配置；provider 只是占位字符串。
+    pub(crate) fn test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            provider: "anthropic".to_string(),
+            api_url: "https://api.anthropic.com".to_string(),
+            api_key: String::new(),
+            model: "test-model".to_string(),
+            max_turns: 20,
+            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
+            workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -4062,25 +4094,7 @@ mod tests {
     }
 
     fn test_config() -> RuntimeConfig {
-        RuntimeConfig {
-            provider: "anthropic".to_string(),
-            api_url: "https://api.anthropic.com".to_string(),
-            api_key: String::new(),
-            model: "test-model".to_string(),
-            max_turns: 20,
-            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
-            workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
-            system_prompt: None,
-            compact_threshold: 160_000,
-            compact_user_budget_tokens: 20_000,
-            compact_tool_budget_tokens: 12_000,
-            yolo: false,
-            sandbox_promotable: true,
-            sandbox: yi_agent_tools::SandboxMode::default(),
-            sandbox_writable_roots: Vec::new(),
-            skills_catalog_budget: 8192,
-            skills_catalog_budget_explicit: false,
-        }
+        super::tests_support::test_config()
     }
 
     /// 用两条 `duplex` 管道把 server 与测试客户端对接。
