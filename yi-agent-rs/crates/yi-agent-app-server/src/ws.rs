@@ -75,6 +75,7 @@ where
             crate::thread_store::ThreadMode,
         ) -> anyhow::Result<crate::server::BuiltAgent>
         + Send
+        + Sync
         + 'static,
 {
     let hub = Arc::new(Broadcaster::new());

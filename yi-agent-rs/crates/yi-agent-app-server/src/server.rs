@@ -28,6 +28,7 @@ use crate::protocol::{
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
+use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -36,6 +37,13 @@ use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
 pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 看板调度器在主循环里跑一轮的间隔。
+///
+/// 采用「serve 主循环内周期性 tick」而非让调度器并发访问 `threads`(见 Task 6c
+/// brief 的设计约束):整张 `threads` 表是主循环的局部量,重构成可共享结构会
+/// 把改动面扩散到全部 RPC 分支。3s 足够跟上卡片状态流转,又远短于卡片的生命周期。
+const CARD_SCHEDULER_TICK: Duration = Duration::from_secs(3);
 
 /// driver task → 主循环的完成事件。
 enum TurnEvent {
@@ -1101,6 +1109,7 @@ pub(crate) fn production_factory(
     crate::thread_store::ThreadMode,
 ) -> anyhow::Result<BuiltAgent>
 + Send
++ Sync
 + 'static {
     move |session, cwd, mode| {
         let mut thread_cfg = cfg.clone();
@@ -1150,6 +1159,7 @@ where
             crate::thread_store::ThreadMode,
         ) -> anyhow::Result<BuiltAgent>
         + Send
+        + Sync
         + 'static,
 {
     serve_scoped(
@@ -1195,6 +1205,7 @@ where
             crate::thread_store::ThreadMode,
         ) -> anyhow::Result<BuiltAgent>
         + Send
+        + Sync
         + 'static,
 {
     let local = crate::broadcast::ClientId::local();
@@ -1384,6 +1395,7 @@ where
             crate::thread_store::ThreadMode,
         ) -> anyhow::Result<BuiltAgent>
         + Send
+        + Sync
         + 'static,
 {
     let RuntimeAttachments {
@@ -1424,6 +1436,22 @@ where
     let mut children_watches: HashMap<String, ChildrenWatch> = HashMap::new();
     // 每个 thread 一个进程状态守望者,建立 thread 时拉起。
     let mut process_watches: HashMap<String, ProcessWatch> = HashMap::new();
+
+    // 看板调度器状态:本进程为哪些卡片起了会话(`card_id → TrackedThread`)。
+    // 只被主循环的 tick 分支读写,与 `threads` 同属主循环局部量。
+    let mut tracked: HashMap<String, TrackedThread> = HashMap::new();
+    // 启动恢复:插件里 `running` 但本进程无法接手的卡片回写 `needs_you`,否则
+    // 重启后它们会永久占着槽位(见 `recover_orphan_cards`)。在进主循环前跑一次:
+    // 此刻进程内确定没有任何会话,判定不会误伤。
+    recover_orphan_cards(&board_dir);
+    // 调度器 tick:3s 一次。`interval` 的第一个 tick **立即就绪**——若就这么进
+    // 循环,任何在 3s 门限前到达的请求都会先被一整轮阻塞式看板 I/O 排队。这里把
+    // 首个 tick 推到 3s 之后:启动瞬间「看板立刻动起来」的收益,不值得让第一个
+    // 请求等一轮 tick。
+    let mut card_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + CARD_SCHEDULER_TICK,
+        CARD_SCHEDULER_TICK,
+    );
 
     // 主题变化 → ui/settings/updated(全局一条流,与 thread 无关)。经 hub 广播:
     // stdio 的 `local` 与任意 ws 设备都能收到并切 `data-theme`。
@@ -3350,6 +3378,30 @@ where
                     }
                 }
             }
+            _ = card_ticker.tick() => {
+                // 看板调度器内联跑一轮:启动(queued → 起可见会话)与对账
+                // (会话结束 → 卡片终态)。所有局部量按顺序借用,不与 RPC 分支
+                // 并发,故 `threads` 无需改成共享状态(见 Task 6c brief)。
+                card_scheduler_tick(
+                    &board_dir,
+                    &mut tracked,
+                    &mut threads,
+                    &mut pending_activation,
+                    &mut process_watches,
+                    &runtimes,
+                    &thread_roots,
+                    &cfg,
+                    &hub,
+                    &turn_tx,
+                    &pending,
+                    permission_timeout,
+                    &perm_seq,
+                    &theme,
+                    &workspaces,
+                    &build_agent,
+                )
+                .await;
+            }
         }
     }
 
@@ -4279,6 +4331,303 @@ fn item_id(item: &crate::protocol::Item) -> Option<&str> {
     }
 }
 
+/// 看板调度器的一轮:对每个已登记项目跑一次 `run_once`(启动 + 对账)。
+///
+/// **内联在主循环里**(3s interval tick),不与任何 RPC 分支并发——`threads`
+/// 等仍是主循环的局部量,`&mut` 借用按顺序发生(见 Task 6c brief 的设计约束:
+/// 不让调度器另起任务并发访问 `threads`)。
+///
+/// 每个项目的 thread 状态快照(`flags`)在**循环内**采集:一轮 tick 里若刚起了
+/// 一个会话,下一张卡的快照才看得到它,且闭包持有的是 owned `HashMap`,不与
+/// launcher 需要的 `&mut threads` 冲突。
+///
+/// 单个项目的失败(daemon 掉线、坏看板)只记日志:一台项目的 daemon 不可用
+/// 不得影响其它项目,更不得影响 RPC。
+#[allow(clippy::too_many_arguments)]
+async fn card_scheduler_tick<F>(
+    board_dir: &Path,
+    tracked: &mut HashMap<String, TrackedThread>,
+    threads: &mut HashMap<String, ThreadSession>,
+    pending_activation: &mut HashMap<String, Option<Arc<ThreadRoot>>>,
+    process_watches: &mut HashMap<String, ProcessWatch>,
+    runtimes: &ProjectRuntimes,
+    thread_roots: &ThreadRoots,
+    cfg: &RuntimeConfig,
+    hub: &Arc<crate::broadcast::Broadcaster>,
+    turn_tx: &mpsc::Sender<TurnEvent>,
+    pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
+    permission_timeout: Duration,
+    perm_seq: &Arc<AtomicU64>,
+    theme: &crate::theme_tool::ThemeHandle,
+    workspaces: &WorkspaceIndex,
+    build_agent: &F,
+) where
+    F: Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>,
+{
+    let projects = match yi_agent_boards::registry::list(board_dir) {
+        Ok(projects) => projects,
+        Err(error) => {
+            eprintln!("[app-server] could not list boards for the card scheduler: {error}");
+            return;
+        }
+    };
+    for board in projects {
+        // 先快照 flags(owned `HashMap`):闭包因此不再借用 `threads`,与下面
+        // launcher 的 `&mut threads` 不冲突(brief Step 2 的借用手法)。
+        let snapshot: HashMap<String, ThreadFlags> = threads
+            .iter()
+            .map(|(thread_id, session)| {
+                let idle = matches!(
+                    *session.status.lock().unwrap_or_else(|p| p.into_inner()),
+                    ThreadStatus::Idle
+                ) && session.active_turn_id.is_none();
+                (
+                    thread_id.clone(),
+                    ThreadFlags {
+                        idle,
+                        // failed / needs_you 目前无生产来源(见报告「已知限制」):
+                        // `TurnEvent::Finished` 不带终态,故不在此处伪造判定。
+                        failed: false,
+                        needs_you: false,
+                    },
+                )
+            })
+            .collect();
+        let flags = move |thread_id: &str| snapshot.get(thread_id).copied();
+        let mut launcher = ServeLauncher {
+            threads,
+            pending_activation,
+            process_watches,
+            runtimes,
+            thread_roots,
+            cfg,
+            hub,
+            turn_tx,
+            pending,
+            permission_timeout,
+            perm_seq,
+            theme,
+            workspaces,
+            build_agent,
+        };
+        crate::card_scheduler::run_once(
+            &board.project,
+            board_dir,
+            tracked,
+            &mut launcher,
+            &flags,
+        )
+        .await;
+    }
+}
+
+/// 调度器起会话的真实实现:复用 6a/6b 的无帧内核(`start_thread_core` +
+/// `prepare_turn_core`),**不**调用会向客户端发帧的 `start_turn_core`。
+///
+/// 它借用主循环的局部量(`threads` / `pending_activation` / `process_watches`)
+/// 直接登记会话,故调度器无需另起一个并发访问它们的任务(见 Task 6c brief)。
+///
+/// `build_agent` 是 `serve` 的工厂参数(按引用借入,不要求 `'static`,也不要求
+/// launcher 自己拥有它)——与 `thread/start` 分支用同一个工厂,因此看板会话与
+/// 手工会话的 agent 构造完全同源。
+struct ServeLauncher<'a, F> {
+    threads: &'a mut HashMap<String, ThreadSession>,
+    pending_activation: &'a mut HashMap<String, Option<Arc<ThreadRoot>>>,
+    process_watches: &'a mut HashMap<String, ProcessWatch>,
+    runtimes: &'a ProjectRuntimes,
+    thread_roots: &'a ThreadRoots,
+    cfg: &'a RuntimeConfig,
+    hub: &'a Arc<crate::broadcast::Broadcaster>,
+    turn_tx: &'a mpsc::Sender<TurnEvent>,
+    pending: &'a Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
+    permission_timeout: Duration,
+    perm_seq: &'a Arc<AtomicU64>,
+    theme: &'a crate::theme_tool::ThemeHandle,
+    workspaces: &'a WorkspaceIndex,
+    build_agent: &'a F,
+}
+
+impl<F> CardLauncher for ServeLauncher<'_, F>
+where
+    F: Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>,
+{
+    async fn launch(&mut self, request: &LaunchRequest) -> anyhow::Result<String> {
+        self.launch_inner(request).await.inspect_err(|error| {
+            // 调度器把失败翻成 `board.release`,而插件只记终态、不留 detail;
+            // 不在这里说清原因,一张卡为什么没起来就没有任何线索。
+            eprintln!(
+                "[app-server] could not launch a session for board card {}: {error}",
+                request.card_id
+            );
+        })
+    }
+}
+
+impl<F> ServeLauncher<'_, F>
+where
+    F: Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>,
+{
+    async fn launch_inner(&mut self, request: &LaunchRequest) -> anyhow::Result<String> {
+        // 会话与 RPC 起的 thread 完全同型:同一内核、同一 driver、同一侧栏视角。
+        // 唯一的不同是 mode(看板会话跑 Yolo)与「不发任何 RPC 帧」。
+        let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
+        let built = (self.build_agent)(
+            None,
+            Path::new(&request.workdir),
+            crate::thread_store::ThreadMode::Yolo,
+        )?;
+
+        let hub = Arc::clone(self.hub);
+        let client = crate::broadcast::ClientId::local();
+        start_thread_core(
+            self.threads,
+            self.pending_activation,
+            self.process_watches,
+            self.runtimes,
+            self.thread_roots,
+            self.cfg,
+            &request.workdir,
+            crate::thread_store::ThreadMode::Yolo,
+            thread_id.clone(),
+            built,
+            &hub,
+            &client,
+            self.turn_tx,
+            self.pending,
+            self.permission_timeout,
+            self.perm_seq,
+            self.theme,
+            self.workspaces,
+        )
+        .await?;
+
+        // 侧栏显示的名片:插件给的 `看板 · <spec stem>`。不设的话,这个会话在
+        // 首轮落盘前标题为空、用户只看到一串 thread id——「可见会话」就不成立了。
+        // 失败只记日志:标题是展示层信息,不该让一张看板卡起不来。
+        if !request.title.is_empty() {
+            if let Some(session) = self.threads.get(&thread_id) {
+                if let Err(error) = session.store.rename(&thread_id, &request.title) {
+                    eprintln!(
+                        "[app-server] could not title board thread {thread_id}: {error}"
+                    );
+                }
+            }
+        }
+
+        // 无帧地占好首个 turn,再自行投递 prompt——`start_turn_core` 会发
+        // `turn/started`/状态/响应,调度器一个都不该发。
+        let params = json!({
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": request.objective }],
+        });
+        let prepared = match prepare_turn_core(self.threads, self.pending_activation, &params).await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // 准备失败:把占位清掉,否则该 thread 的 `active_turn_id` 永久卡住。
+                if let Some(session) = self.threads.get_mut(&thread_id) {
+                    session.active_turn_id = None;
+                }
+                // 把具体原因带上:调度器只把它写进 `board.release` 的 detail,
+                // 「准备失败」四个字不足以定位(是 thread 不在?还是 turn 撞车?)。
+                return Err(anyhow::anyhow!(
+                    "could not prepare the first turn for {}: {}",
+                    request.card_id,
+                    turn_prepare_rpc_error(error).message
+                ));
+            }
+        };
+        // 状态走 `thread/status/updated`(通知),不是向某个 client 的响应,故可发:
+        // 侧栏据此看到该会话正在跑。用 prepared 的句柄,保证与 `active_turn_id`
+        // 的占位来自同一个 session。
+        let _ = update_status(
+            &hub,
+            &prepared.status_handle,
+            &prepared.thread_id,
+            ThreadStatus::Running,
+        )
+        .await;
+        if prepared
+            .prompt_tx
+            .send(TurnPrompt {
+                turn_id: prepared.turn_id,
+                prompt: prepared.prompt,
+                activate: prepared.activate,
+            })
+            .await
+            .is_err()
+        {
+            return Err(anyhow::anyhow!(
+                "thread driver for {} is gone before its first prompt",
+                prepared.thread_id
+            ));
+        }
+        Ok(thread_id)
+    }
+}
+
+/// 启动恢复:插件此刻报 `running`、但本进程并未跟踪的卡片,一律回写
+/// `needs_you`。
+///
+/// 重启后内存里的 `threads`/`tracked` 都空了,而 board.json 里仍有 `running`
+/// 卡片:它们既不会被 `next_launch`(只认 `queued`)再次启动,也不会被 `plan`
+/// 对账(没有 thread 可查),会永久占着槽位。本任务**不做真实 resume**
+/// (那要走完整的 thread/resume 机制,复杂度单独评估),按 plan 的兜底约定把它
+/// 置为 `needs_you`,让用户决定下一步。
+///
+/// 只有卡片**没有 thread_id** 才在这里兜底:有 thread_id 的卡片是「本进程稍后
+/// 会接手对账的活会话」或「需要用户决定的会话」,启动瞬间无法区分二者,故留给
+/// 主循环的第一步 tick(对账路径)处理,免得把活会话误判成孤儿。
+fn recover_orphan_cards(board_dir: &Path) {
+    let projects = match yi_agent_boards::registry::list(board_dir) {
+        Ok(projects) => projects,
+        Err(error) => {
+            eprintln!("[app-server] could not list boards for orphan recovery: {error}");
+            return;
+        }
+    };
+    for board in projects {
+        // 项目 daemon 没起来就跳过:此刻没有 `running` 卡片可言,而本函数的目的
+        // 只是清理「重启后残留的 running」。绝不在这里顺手拉起 daemon——启动
+        // 项目 daemon 是 `board/create` 的职责。
+        if !yi_agent_boards::board_daemon::is_running(&board.project) {
+            continue;
+        }
+        let cards = match board_cards(&board.project, board_dir) {
+            Ok(cards) => cards,
+            Err(_) => continue,
+        };
+        for card in cards {
+            if card.state != "running" || card.thread_id.is_some() {
+                continue;
+            }
+            eprintln!(
+                "[app-server] board card {} is running without a thread_id and this process \
+                 cannot resume it; marking it needs_you",
+                card.id
+            );
+            let _ = board_query(
+                &board.project,
+                board_dir,
+                "board.mark_terminal",
+                json!({ "card_id": card.id, "outcome": "needs_you" }),
+            );
+        }
+    }
+}
+
 /// 起一个 thread 的内核:attach_delegation → 建 driver 通道 → 登记进 `threads`
 /// → spawn 进程守望者与 driver task。
 ///
@@ -5033,6 +5382,529 @@ mod plugin_query_tests {
     }
 }
 
+/// 看板调度器接进 `serve` 之后的集成测试:真 `ServeLauncher` 起**可见**会话、
+/// 调度器对账终态、启动孤儿恢复。
+///
+/// 夹具尽量走**真实路径**:真 socket(按请求转发到绑定的假看板 daemon)、真
+/// `ThreadStore`、真 `run_once`、真 launcher 起的会话。假的只有模型与「插件怎么
+/// 回答看板问题」。
+#[cfg(test)]
+mod card_scheduling_tests {
+    use super::*;
+    use crate::server::tests::{build_test_agent, test_config};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::card_scheduler::{CardLauncher, LaunchRequest};
+
+    /// 一台听在项目 runtime socket 上的假 daemon。
+    ///
+    /// 它做生产 daemon 对 `PluginQuery` 做的那一件事——把查询转给绑定
+    /// (`on_query`)的看板回答——并把每次插件调用记录在案,供断言。其余请求
+    /// (`Status` 探活、daemon attach 等)统一回 `internal`:这既是诚实的「我不是
+    /// 真 daemon」,也让 `attach_cwd_runtime` 按生产里的降级路径失败,而不必起一
+    /// 个真 daemon。
+    struct FakeDaemon {
+        socket: PathBuf,
+        calls: Arc<StdMutex<Vec<serde_json::Value>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+        _dir: tempfile::TempDir,
+        project: PathBuf,
+        #[allow(dead_code)]
+        runtime_dir: PathBuf,
+    }
+
+    impl FakeDaemon {
+        fn bind(
+            on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
+                + Send
+                + 'static,
+        ) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let project = dir.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&project);
+            std::fs::create_dir_all(&runtime_dir).unwrap();
+            let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let query_project = project.clone();
+
+            let calls: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
+            let recorded = Arc::clone(&calls);
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(stream) = stream else { break };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    let request: serde_json::Value =
+                        serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                    let command = &request["command"];
+                    let method = command["method"].as_str().unwrap_or_default().to_string();
+                    let value = if command["type"] == "PluginQuery" {
+                        let plugin = command["plugin"].as_str().unwrap_or_default();
+                        let params = command["params"].clone();
+                        recorded.lock().unwrap().push(json!({
+                            "method": method,
+                            "params": params.clone(),
+                        }));
+                        if plugin == "superpowers-kanban" {
+                            match on_query(&query_project, &method, &params) {
+                                Ok(result) => json!({ "type": "PluginResult", "value": result }),
+                                // 被拒的查询在宿主侧呈现为传输错误(与「daemon 没有
+                                // 该插件的路由」同型)——正是 `run_once` 退出本轮
+                                // 启动循环的条件。
+                                Err(_) => {
+                                    json!({ "type": "Error", "code": "internal", "message": "refused" })
+                                }
+                            }
+                        } else {
+                            json!({ "type": "Error", "code": "internal", "message": "unrouted plugin" })
+                        }
+                    } else if command["type"] == "Status" {
+                        // `is_running` 靠这个探活。诚实回答它,否则恢复路径会把
+                        // 「我没有真 daemon」误读成「项目没有看板」。
+                        json!({ "type": "Status", "high_water_event_id": 0 })
+                    } else {
+                        json!({ "type": "Error", "code": "internal", "message": "not a real daemon" })
+                    };
+                    let reply = json!({
+                        "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                        "request_id": request["request_id"],
+                        "result": value,
+                    });
+                    let mut stream = stream;
+                    let _ = stream.write_all(reply.to_string().as_bytes());
+                    let _ = stream.write_all(b"\n");
+                }
+            });
+            Self {
+                socket,
+                calls,
+                stop,
+                handle: Some(handle),
+                _dir: dir,
+                project,
+                runtime_dir,
+            }
+        }
+
+        fn calls(&self) -> Vec<serde_json::Value> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn calls_to(&self, method: &str) -> Vec<serde_json::Value> {
+            self.calls()
+                .into_iter()
+                .filter(|call| call["method"] == method)
+                .collect()
+        }
+    }
+
+    impl Drop for FakeDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// `ServeLauncher` 需要的全部主循环局部量,一次性备齐。
+    struct Host {
+        threads: HashMap<String, ThreadSession>,
+        pending_activation: HashMap<String, Option<Arc<ThreadRoot>>>,
+        process_watches: HashMap<String, ProcessWatch>,
+        runtimes: ProjectRuntimes,
+        thread_roots: ThreadRoots,
+        cfg: RuntimeConfig,
+        hub: Arc<crate::broadcast::Broadcaster>,
+        turn_tx: mpsc::Sender<TurnEvent>,
+        turn_rx: mpsc::Receiver<TurnEvent>,
+        pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
+        perm_seq: Arc<AtomicU64>,
+        theme: crate::theme_tool::ThemeHandle,
+        workspaces: WorkspaceIndex,
+        workdir: PathBuf,
+        _workdir_dir: tempfile::TempDir,
+        _theme_dir: tempfile::TempDir,
+        _workspace_dir: tempfile::TempDir,
+    }
+
+    impl Host {
+        fn new() -> Self {
+            let workdir_dir = tempfile::TempDir::new().unwrap();
+            let workdir = workdir_dir.path().to_path_buf();
+            let theme_dir = tempfile::TempDir::new().unwrap();
+            let workspace_dir = tempfile::TempDir::new().unwrap();
+            let (turn_tx, turn_rx) = mpsc::channel::<TurnEvent>(8);
+            Self {
+                threads: HashMap::new(),
+                pending_activation: HashMap::new(),
+                process_watches: HashMap::new(),
+                runtimes: Arc::new(StdMutex::new(HashMap::new())),
+                thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                cfg: test_config(),
+                hub: Arc::new(crate::broadcast::Broadcaster::new()),
+                turn_tx,
+                turn_rx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                perm_seq: Arc::new(AtomicU64::new(1)),
+                theme: crate::theme_tool::ThemeHandle::new(theme_dir.path().to_path_buf()),
+                workspaces: WorkspaceIndex::new(workspace_dir.path().join("workspaces.json")),
+                workdir,
+                _workdir_dir: workdir_dir,
+                _theme_dir: theme_dir,
+                _workspace_dir: workspace_dir,
+            }
+        }
+
+        fn launcher<'a, F>(&'a mut self, build_agent: &'a F) -> ServeLauncher<'a, F>
+        where
+            F: Fn(
+                Option<yi_agent_core::Session>,
+                &Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>,
+        {
+            ServeLauncher {
+                threads: &mut self.threads,
+                pending_activation: &mut self.pending_activation,
+                process_watches: &mut self.process_watches,
+                runtimes: &self.runtimes,
+                thread_roots: &self.thread_roots,
+                cfg: &self.cfg,
+                hub: &self.hub,
+                turn_tx: &self.turn_tx,
+                pending: &self.pending,
+                permission_timeout: PERMISSION_TIMEOUT,
+                perm_seq: &self.perm_seq,
+                theme: &self.theme,
+                workspaces: &self.workspaces,
+                build_agent,
+            }
+        }
+
+        /// 像真主循环那样收 `TurnEvent::Finished`:清除该 thread 的
+        /// `active_turn_id`,直到看到目标 thread 的完成事件。
+        ///
+        /// 不这样做,`active_turn_id` 永远不会被清——在 `serve` 里那是主循环的
+        /// 活儿,这条测试没有主循环,必须自己复刻。
+        async fn settle_turn(&mut self, thread_id: &str, timeout: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return self.is_idle(thread_id);
+                }
+                match tokio::time::timeout(remaining, self.turn_rx.recv()).await {
+                    Ok(Some(TurnEvent::Finished { thread_id: id, turn_id })) => {
+                        if let Some(session) = self.threads.get_mut(&id) {
+                            if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+                                session.active_turn_id = None;
+                            }
+                        }
+                        if id == thread_id {
+                            return true;
+                        }
+                    }
+                    Ok(None) => return false,
+                    Err(_) => return self.is_idle(thread_id),
+                }
+            }
+        }
+
+        /// 该 thread 此刻是否**空闲**(`Idle` 且无活跃 turn)——与调度器快照
+        /// 用的是同一条判据。
+        fn is_idle(&self, thread_id: &str) -> bool {
+            self.threads.get(thread_id).is_some_and(|session| {
+                matches!(
+                    *session.status.lock().unwrap_or_else(|p| p.into_inner()),
+                    ThreadStatus::Idle
+                ) && session.active_turn_id.is_none()
+            })
+        }
+    }
+
+    fn request(card_id: &str, workdir: &str) -> LaunchRequest {
+        LaunchRequest {
+            card_id: card_id.to_string(),
+            workdir: workdir.to_string(),
+            title: format!("看板 · {card_id}"),
+            objective: format!("Implement the plan for {card_id}"),
+        }
+    }
+
+    /// 并发等一个条件,最多 `timeout`;返回是否等到。
+    async fn eventually(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if check() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 核心行为:launcher 为一张卡起一个**登记在册、driver 活着、首轮已投递、
+    /// 标题已落盘**的会话。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_launcher_starts_a_registered_session_with_a_title_and_a_first_turn() {
+        let mut host = Host::new();
+        let workdir = host.workdir.clone();
+        let thread_id = {
+            let mut launcher = host.launcher(&build_test_agent);
+            launcher
+                .launch(&request("card-1", &workdir.to_string_lossy()))
+                .await
+                .expect("the launch must succeed for a healthy factory")
+        };
+
+        assert_eq!(host.threads.len(), 1, "the board thread is registered");
+        let session = host.threads.get(&thread_id).expect("the session is visible");
+        assert_eq!(session.cwd, workdir.to_string_lossy());
+        assert!(
+            session.active_turn_id.is_some(),
+            "the first turn must be占位, otherwise the card looks idle instantly"
+        );
+        assert_eq!(
+            session
+                .store
+                .load(&thread_id)
+                .unwrap()
+                .and_then(|loaded| loaded.meta.title),
+            Some("看板 · card-1".to_string()),
+            "the sidebar needs a name, not a raw thread id"
+        );
+
+        // driver 真的收了首轮并收尾:主循环会收到 `Finished`,清除占位。
+        assert!(
+            host.settle_turn(&thread_id, Duration::from_secs(10)).await,
+            "the driver must consume the prompt and finish"
+        );
+        assert!(host.pending_activation.contains_key(&thread_id));
+    }
+
+    /// build 失败时绝不谎报:没有 thread 被登记。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_build_leaves_no_session_behind() {
+        let mut host = Host::new();
+        let workdir = host.workdir.clone();
+        let build_failure = |_s: Option<yi_agent_core::Session>,
+                             _cwd: &Path,
+                             _m: crate::thread_store::ThreadMode| {
+            Err::<BuiltAgent, _>(anyhow::anyhow!("no model for you"))
+        };
+        {
+            let mut launcher = host.launcher(&build_failure);
+            let error = launcher
+                .launch(&request("card-1", &workdir.to_string_lossy()))
+                .await
+                .expect_err("a factory failure must surface, not be swallowed");
+            assert!(error.to_string().contains("no model"), "{error}");
+        }
+        assert!(host.threads.is_empty(), "a failed launch registers nothing");
+    }
+
+    /// 看板调度器端到端:一张 `next_launch` 交出的卡被起成可见会话 → 插件收到
+    /// `board.mark_running(thread_id)`;会话收尾后,宿主把它对账成
+    /// `board.mark_terminal(awaiting_merge)` 并从跟踪表移除。
+    ///
+    /// 走**真 `run_once` + 真 `ServeLauncher` + 真 socket 转发**,是 6c
+    /// 「接线」的最小完整闭环。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claimed_card_becomes_a_visible_session_then_awaits_merge() {
+        let handed_out = Arc::new(AtomicBool::new(false));
+        let thread_id = Arc::new(StdMutex::new(None::<String>));
+        let seen = Arc::clone(&thread_id);
+        let handed = Arc::clone(&handed_out);
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "board.next_launch" => {
+                if handed.swap(true, Ordering::SeqCst) {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Ok(json!({ "card_id": "card-1", "title": "看板 · card-1" }))
+                }
+            }
+            "list" => Ok(json!({ "cards": [{
+                "id": "card-1",
+                "state": "running",
+                "thread_id": seen.lock().unwrap().clone(),
+                "spec_path": "card-1.spec.md",
+                "plan_path": "card-1.plan.md",
+            }] })),
+            _ => Ok(json!({ "ok": true })),
+        });
+
+        let mut host = Host::new();
+        let board_dir = tempfile::TempDir::new().unwrap();
+        yi_agent_boards::registry::register(board_dir.path(), &daemon.project).unwrap();
+
+        let flags = Arc::new(StdMutex::new(HashMap::<String, ThreadFlags>::new()));
+        let mut tracked: HashMap<String, TrackedThread> = HashMap::new();
+
+        // 第一轮:启动。
+        {
+            let snapshot = Arc::clone(&flags);
+            let flags_fn = move |id: &str| snapshot.lock().unwrap().get(id).copied();
+            let mut launcher = host.launcher(&build_test_agent);
+            crate::card_scheduler::run_once(
+                &daemon.project,
+                board_dir.path(),
+                &mut tracked,
+                &mut launcher,
+                &flags_fn,
+            )
+            .await;
+        }
+
+        let running = daemon.calls_to("board.mark_running");
+        assert_eq!(
+            running.len(),
+            1,
+            "the plugin must learn the card is running: {:?}",
+            daemon.calls()
+        );
+        let launched = running[0]["params"]["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        *thread_id.lock().unwrap() = Some(launched.clone());
+        assert_eq!(host.threads.len(), 1, "exactly one visible session");
+        assert!(host.threads.contains_key(&launched));
+        assert!(tracked.contains_key("card-1"), "the card is tracked");
+
+        // 等 driver 跑完首轮(主循环语义:收 Finished → 清占位)→ 下一轮对账
+        // 应回写终态。
+        assert!(
+            host.settle_turn(&launched, Duration::from_secs(10)).await,
+            "the board thread must finish its first turn"
+        );
+        {
+            // 把真实快照灌进共享表(与主循环 tick 里 owned 快照同源)。
+            let snapshot = Arc::clone(&flags);
+            {
+                let mut table = snapshot.lock().unwrap();
+                for (id, session) in &host.threads {
+                    let idle = matches!(
+                        *session.status.lock().unwrap_or_else(|p| p.into_inner()),
+                        ThreadStatus::Idle
+                    ) && session.active_turn_id.is_none();
+                    table.insert(
+                        id.clone(),
+                        ThreadFlags { idle, failed: false, needs_you: false },
+                    );
+                }
+            }
+            let flags_fn = move |id: &str| snapshot.lock().unwrap().get(id).copied();
+            let mut launcher = host.launcher(&build_test_agent);
+            crate::card_scheduler::run_once(
+                &daemon.project,
+                board_dir.path(),
+                &mut tracked,
+                &mut launcher,
+                &flags_fn,
+            )
+            .await;
+        }
+
+        let terminal = daemon.calls_to("board.mark_terminal");
+        assert_eq!(
+            terminal.len(),
+            1,
+            "an idle session must reconcile its card: {:?}",
+            daemon.calls()
+        );
+        assert_eq!(terminal[0]["params"]["card_id"], "card-1");
+        assert_eq!(
+            terminal[0]["params"]["outcome"], "awaiting_merge",
+            "failed/needs_you have no production source yet, so awaiting_merge is the only outcome"
+        );
+        assert!(tracked.is_empty(), "the reconciled card stops being tracked");
+    }
+
+    /// 孤儿恢复:插件报 `running` 但**没有 thread_id**(本进程无法接手)的卡被
+    /// 回写 `needs_you`;有 thread_id 的卡留给对账路径,不被误伤。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_recovery_marks_only_threadless_running_cards_needs_you() {
+        let daemon = FakeDaemon::bind(|_project, method, _params| match method {
+            "list" => Ok(json!({ "cards": [
+                { "id": "orphan", "state": "running", "spec_path": "s", "plan_path": "p" },
+                { "id": "live", "state": "running", "thread_id": "thread-x",
+                  "spec_path": "s", "plan_path": "p" },
+                { "id": "queued", "state": "queued", "spec_path": "s", "plan_path": "p" },
+            ] })),
+            _ => Ok(json!({ "ok": true })),
+        });
+        let board_dir = tempfile::TempDir::new().unwrap();
+        yi_agent_boards::registry::register(board_dir.path(), &daemon.project).unwrap();
+
+        recover_orphan_cards(board_dir.path());
+
+        let terminal = daemon.calls_to("board.mark_terminal");
+        assert_eq!(
+            terminal.len(),
+            1,
+            "only the orphan is recovered: {:?}",
+            daemon.calls()
+        );
+        assert_eq!(terminal[0]["params"]["card_id"], "orphan");
+        assert_eq!(terminal[0]["params"]["outcome"], "needs_you");
+    }
+
+    /// 真主循环接线:启动 `serve` 后,3s tick(首个立即触发)把看板卡起成会话
+    /// 并让插件看到 `board.mark_running`——证明调度器确实挂在主循环上。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_serve_loop_tick_launches_a_claimed_card() {
+        let handed_out = Arc::new(AtomicBool::new(false));
+        let handed = Arc::clone(&handed_out);
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "board.next_launch" => {
+                if handed.swap(true, Ordering::SeqCst) {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Ok(json!({ "card_id": "card-1", "title": "看板 · card-1" }))
+                }
+            }
+            "list" => Ok(json!({ "cards": [{
+                "id": "card-1", "state": "queued",
+                "spec_path": "card-1.spec.md", "plan_path": "card-1.plan.md",
+            }] })),
+            _ => Ok(json!({ "ok": true })),
+        });
+
+        let mut h = crate::server::tests::Harness::new();
+        yi_agent_boards::registry::register(h.board_dir.path(), &daemon.project).unwrap();
+        crate::server::tests::initialize(&mut h).await;
+
+        assert!(
+            eventually(Duration::from_secs(15), || {
+                !daemon.calls_to("board.mark_running").is_empty()
+            })
+            .await,
+            "the serve tick must launch the claimed card: {:?}",
+            daemon.calls()
+        );
+        let running = daemon.calls_to("board.mark_running");
+        assert_eq!(running[0]["params"]["card_id"], "card-1");
+
+        h.shutdown().await;
+    }
+}
+
 /// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。
 ///
 /// 放在 `mod tests` 之外，因为 `#[cfg(test)]` 的 `mod tests` 对其它文件不可见；
@@ -5597,7 +6469,7 @@ pub(crate) mod tests {
         (hub, client)
     }
 
-    fn build_test_agent(
+    pub(crate) fn build_test_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
@@ -5680,7 +6552,7 @@ pub(crate) mod tests {
         crate::theme_tool::ThemeHandle::new(std::env::temp_dir())
     }
 
-    fn test_config() -> RuntimeConfig {
+    pub(crate) fn test_config() -> RuntimeConfig {
         super::tests_support::test_config()
     }
 
@@ -5714,6 +6586,7 @@ pub(crate) mod tests {
                     crate::thread_store::ThreadMode,
                 ) -> anyhow::Result<BuiltAgent>
                 + Send
+                + Sync
                 + 'static,
         {
             Self::with_config(test_config(), build, permission_timeout)
@@ -5731,6 +6604,7 @@ pub(crate) mod tests {
                     crate::thread_store::ThreadMode,
                 ) -> anyhow::Result<BuiltAgent>
                 + Send
+                + Sync
                 + 'static,
         {
             Self::with_config_and_scope(cfg, build, permission_timeout, Scope::Admin)
@@ -5757,6 +6631,7 @@ pub(crate) mod tests {
                     crate::thread_store::ThreadMode,
                 ) -> anyhow::Result<BuiltAgent>
                 + Send
+                + Sync
                 + 'static,
         {
             let (client_w, server_r) = tokio::io::duplex(64 * 1024);
