@@ -33,3 +33,7 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile = "3"
 tokio-tungstenite = "0.29"
+# Capture `tracing` output in tests for the preference-loading warnings. Same
+# dev-dependency and pattern already used by `yi-agent-store`'s
+# `error_logging_tests`; the shared workspace dependency avoids a new version.
+tracing-subscriber = { workspace = true }
