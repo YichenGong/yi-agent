@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
+use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
     RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, ThreadStatus,
@@ -874,6 +875,12 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
+    // 配对状态(配对码 + 设备表)与 workspace 索引同位构造:主循环持有同一个
+    // `Arc`,故 `pair/create` 铸出的码与 `device/list` / `device/revoke` 读写的
+    // 是**同一张**设备表。`run` 的公开签名不因此改变。
+    let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+        crate::device_store::default_path(),
+    )));
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
     // A fallback, not a policy: resolution failing (unset HOME) would otherwise
@@ -887,6 +894,7 @@ where
         cfg.clone(),
         PERMISSION_TIMEOUT,
         workspaces,
+        pairing,
         RuntimeAttachments {
             runtimes,
             thread_roots,
@@ -945,6 +953,7 @@ pub(crate) async fn serve_stdio<R, W, F>(
     cfg: RuntimeConfig,
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
     attachments: RuntimeAttachments,
     build_agent: F,
 ) -> anyhow::Result<()>
@@ -965,6 +974,7 @@ where
         cfg,
         permission_timeout,
         workspaces,
+        pairing,
         attachments,
         build_agent,
         // 桌面 stdio 是 Admin:所有既有 RPC 行为不变。
@@ -985,6 +995,7 @@ pub(crate) async fn serve_scoped<R, W, F>(
     cfg: RuntimeConfig,
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
     attachments: RuntimeAttachments,
     build_agent: F,
     client_scope: Scope,
@@ -1022,6 +1033,7 @@ where
         cfg,
         permission_timeout,
         workspaces,
+        pairing,
         attachments,
         build_agent,
         client_scopes,
@@ -1101,6 +1113,10 @@ async fn pump_stdout<W>(
 /// stdio 的 `local` 是 `Admin`,WS 连接是它 token 的 scope。scope 不进 channel
 /// 载荷——它不随单条消息变化,而客户端 id 已经是载荷的一部分,用一张表按 id
 /// 查即可。
+///
+/// `pairing` 与 `workspaces` 一样由调用方注入,因为 `pair/create` 的兑现必须
+/// 落在**同一个**设备表上:注入使 `run`(生产)与测试 `Harness` 各自决定表在
+/// 哪里,同时 `pair/create`、`device/list`、`device/revoke` 共享同一个 `Arc`。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<F>(
     mut inbound: mpsc::Receiver<(crate::broadcast::ClientId, anyhow::Result<String>)>,
@@ -1108,6 +1124,7 @@ pub(crate) async fn serve<F>(
     cfg: RuntimeConfig,
     permission_timeout: Duration,
     workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
     attachments: RuntimeAttachments,
     build_agent: F,
     client_scopes: HashMap<crate::broadcast::ClientId, Scope>,
@@ -1254,10 +1271,17 @@ where
                 // admin 类方法:control/observe 客户端一律拒绝。放在
                 // `!initialized` 检查之后,故未握手的客户端仍先得到
                 // `not_initialized`;scope 缺失按 fail-closed 的 `Observe` 处理。
-                const ADMIN_METHODS: [&str; 3] = [
+                //
+                // `pair/create`(铸出可换设备 token 的配对码)与 `device/revoke`
+                // (踢设备、废 token)是特权桌面操作,一并入闸:低权客户端若能铸
+                // 凭据或踢设备,scope 体系形同虚设。`device/list` 只暴露设备名/
+                // scope/时间戳(无秘密),任何已握手客户端可读,故**不**入闸。
+                const ADMIN_METHODS: [&str; 5] = [
                     "thread/delete",
                     "process/kill",
                     "thread/setPermissionMode",
+                    "pair/create",
+                    "device/revoke",
                 ];
                 let client_scope = client_scopes
                     .get(&client)
@@ -2915,6 +2939,62 @@ where
                             }
                         }
                     }
+                    "pair/create" => {
+                        // 铸一枚一次性配对码,交桌面端渲染二维码。设备注册属于
+                        // `pair/redeem` 的接线(Task 5),这里只铸码。
+                        let code = pairing.create_code();
+                        write_response(
+                            &hub,
+                            &client,
+                            ok_response(
+                                id,
+                                json!({ "code": code.code, "expires_in": code.expires_in }),
+                            ),
+                        )
+                        .await?;
+                    }
+                    "device/list" => {
+                        let devices: Vec<serde_json::Value> = pairing
+                            .store()
+                            .list()
+                            .into_iter()
+                            .map(|d| {
+                                json!({
+                                    "id": d.id,
+                                    "name": d.name,
+                                    "scope": d.scope,
+                                    "created_at": d.created_at,
+                                    "last_seen_at": d.last_seen_at,
+                                })
+                            })
+                            .collect();
+                        write_response(&hub, &client, ok_response(id, json!({ "devices": devices })))
+                            .await?;
+                    }
+                    "device/revoke" => {
+                        let Some(device_id) = req
+                            .params
+                            .get("device_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        else {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::invalid_params("missing device_id")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let revoked = pairing.revoke(&device_id).unwrap_or(false);
+                        if revoked {
+                            if let Some(cid) = ws_client_for_device(&device_id) {
+                                hub.unregister(&cid);
+                            }
+                        }
+                        write_response(&hub, &client, ok_response(id, json!({ "revoked": revoked })))
+                            .await?;
+                    }
                     _ => {
                         write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))
                             .await?;
@@ -2952,6 +3032,15 @@ fn apply_session(
         Some(s) => agent.with_session(s),
         None => agent,
     }
+}
+
+/// 把一个设备 id 映射到它当前的 ws `ClientId`——设备被撤销时据此摘除连接。
+///
+/// Tier 1 的 ws 层登记 `ClientId → device_id` 的映射属于 Task 5;本任务先接一个
+/// 返回 `None` 的桩,`device/revoke` 的调用形状先按最终形态写死,Task 5 只需填
+/// 这张表,不必再动 `device/revoke`。
+fn ws_client_for_device(_device_id: &str) -> Option<crate::broadcast::ClientId> {
+    None
 }
 
 fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
@@ -4731,6 +4820,9 @@ mod tests {
         _index_dir: tempfile::TempDir,
         /// 隔离的看板登记表目录,理由同上:board/* RPC 不得写真的 `~/.yi-agent`。
         pub(crate) board_dir: tempfile::TempDir,
+        /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
+        /// 所得设备必须能被同一主循环的 `device/list` 看见。
+        pairing: Arc<PairingState>,
     }
 
     impl Harness {
@@ -4799,12 +4891,18 @@ mod tests {
             let workspaces = Arc::new(WorkspaceIndex::new(
                 index_dir.path().join("workspaces.json"),
             ));
+            // 配对状态也落在隔离目录里:`device/list` 从空表起步,且绝不碰用户
+            // 真实的 `~/.yi-agent/devices.json`。
+            let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+                index_dir.path().join("devices.json"),
+            )));
             let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
                 cfg,
                 permission_timeout,
                 workspaces,
+                Arc::clone(&pairing),
                 RuntimeAttachments {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -4822,7 +4920,14 @@ mod tests {
                 handle,
                 _index_dir: index_dir,
                 board_dir,
+                pairing,
             }
+        }
+
+        /// 测试直接驱动的配对状态句柄,与主循环共享同一个 `Arc`:这里 `redeem`
+        /// 出的设备正是 `device/list` 会读到的那一条。
+        pub(crate) fn pairing(&self) -> Arc<PairingState> {
+            Arc::clone(&self.pairing)
         }
 
         pub(crate) async fn send(&mut self, line: &str) {
@@ -5388,12 +5493,16 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            index_dir.path().join("devices.json"),
+        )));
         let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            pairing,
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -5447,12 +5556,16 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            index_dir.path().join("devices.json"),
+        )));
         let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            pairing,
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -5510,12 +5623,16 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            index_dir.path().join("devices.json"),
+        )));
         let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
             PERMISSION_TIMEOUT,
             workspaces,
+            pairing,
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
@@ -8689,5 +8806,42 @@ mod tests {
             rx.try_recv().is_err(),
             "the driver must receive exactly one decision"
         );
+    }
+
+    /// `pair/create` mints a one-time code, `device/list` reflects the shared
+    /// store, and `device/revoke` kicks the device back out of it. `Harness::new`
+    /// is `Admin`, so the admin gate does not interfere here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pair_create_returns_a_code_and_device_revoke_invalidates_it() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"pair/create","params":{}}"#)
+            .await;
+        let created = h.read_value().await;
+        let code = created["result"]["code"].as_str().unwrap().to_string();
+        assert!(created["result"]["expires_in"].as_u64().unwrap() > 0);
+
+        // 设备表初始为空。
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"device/list","params":{}}"#)
+            .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["result"]["devices"].as_array().unwrap().len(), 0);
+
+        // 用码换 token,设备表出现一条。
+        let (device, _token) = h.pairing().redeem(&code, "iPhone 15").unwrap();
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"device/list","params":{}}"#)
+            .await;
+        let listed = h.read_value().await;
+        assert_eq!(listed["result"]["devices"].as_array().unwrap().len(), 1);
+
+        // 撤销。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"device/revoke","params":{{"device_id":"{}"}}}}"#,
+            device.id
+        ))
+        .await;
+        let revoked = h.read_value().await;
+        assert_eq!(revoked["result"]["revoked"], true);
+        h.shutdown().await;
     }
 }

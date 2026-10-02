@@ -9,6 +9,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::broadcast::{Broadcaster, ClientId};
+use crate::pairing::PairingState;
 use crate::protocol::MAX_FRAME_BYTES;
 use crate::server::{PERMISSION_TIMEOUT, RuntimeAttachments, production_factory, serve};
 use crate::workspace_index::WorkspaceIndex;
@@ -35,12 +36,20 @@ pub async fn serve_ws(
         // 接上)。空表 = 未登记,主循环按 fail-closed 的 `Observe` 处理;这比
         // 假装成 `Admin` 安全。接线时这里换成 `device.scope`。
         let client_scopes = HashMap::new();
+        // Task 4:这里的配对状态是 ws 传输自建的一份,尚未与桌面 stdio 主循环
+        // 共享。Task 5 会换成从上层注入的**同一个**实例(桌面铸码、手机兑现
+        // 必须落同一张表),此处先以 `default_path()` 保证 ws 侧的 `device/list`
+        // 至少读的是真实设备表。
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            crate::device_store::default_path(),
+        )));
         serve(
             inbound_rx,
             serve_hub,
             serve_cfg.clone(),
             PERMISSION_TIMEOUT,
             workspaces,
+            pairing,
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
