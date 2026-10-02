@@ -38,6 +38,25 @@
 //! `flock`s, so ownership is decided by the kernel and released on `SIGKILL`).
 //! We therefore ask `lsof -t` which process holds each lock file. That is the
 //! same kernel state the product relies on.
+//!
+//! `lsof` alone is not enough for cleanup: the daemon's command line carries no
+//! project path (`yi-agent daemon serve` runs with the project as its cwd), so a
+//! sweep that only asks "who holds `runtime.lock`" cannot see the daemon if the
+//! lock file is missing or `lsof` reports nothing. Cleanup therefore also
+//! identifies the daemon by the `HOME=<temp home>` token in its environment
+//! (macOS `ps -E`) and the plugin by its argv, then *asserts* the locks came
+//! back empty rather than trusting the kill.
+//!
+//! # What the tests do and do not claim
+//!
+//! The second `plugin run` in [`an_orphan_plugin_exits_after_the_daemon_dies`] is
+//! observed to stay alive yet never appear as a lock holder: that is a liveness /
+//! identity check, not an in-process `flock` contention proof (which lives in the
+//! plugin's `single_instance::tests::a_second_instance_cannot_take_the_lock`).
+//! Neither test ever starts a card, so neither observes card-level de-duplication
+//! directly; "no card is launched twice" is inferred from the single-advancer
+//! lock plus the plugin's queued-launch unit tests, and is stated as such in the
+//! spec's evidence table.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -47,7 +66,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 /// The plugin executable a production board's scaffold resolves to (Homebrew
-/// first, then `PATH`). Mirrors `board_e2e::PLUGIN_BIN`.
+/// first, then `PATH`). Mirrors `board_e2e::PLUGIN_BIN`. Only
+/// [`killing_a_board_daemon_is_healed_by_the_watchman`] depends on it, because
+/// only that test drives the real `board/create` scaffolding path.
 const PUBLISHED_PLUGIN_BIN: &str = "/opt/homebrew/bin/superpowers-kanban";
 
 /// How long `board/create` may take to report a ready daemon (mirrors
@@ -86,10 +107,21 @@ fn yi_agent_bin() -> PathBuf {
 }
 
 /// The opt-in gate common to both tests. `Some(reason)` means "report and skip".
+///
+/// The Homebrew check is *not* here: only the test that drives `board/create`
+/// needs the installed plugin (its scaffold resolves the Homebrew binary), so it
+/// lives in [`needs_published_plugin`]. The orphan test builds and runs the
+/// worktree plugin and must be able to run on a machine without Homebrew.
 fn gate_reason() -> Option<String> {
     if std::env::var_os("YI_AGENT_BOARD_E2E").is_none() {
         return Some("set YI_AGENT_BOARD_E2E=1 to run the watchman end-to-end tests".into());
     }
+    None
+}
+
+/// The per-test addition to [`gate_reason`] for tests that go through the real
+/// `board/create` scaffolding.
+fn needs_published_plugin() -> Option<String> {
     if !Path::new(PUBLISHED_PLUGIN_BIN).is_file() {
         return Some(format!("{PUBLISHED_PLUGIN_BIN} is not installed"));
     }
@@ -225,10 +257,6 @@ impl ChildGuard {
         self.0.id() as i32
     }
 
-    fn is_running(&mut self) -> bool {
-        matches!(self.0.try_wait(), Ok(None))
-    }
-
     fn kill(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -241,10 +269,11 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Sweeps every process tied to a project on drop, so even a panicking
-/// assertion cannot leak a fixture daemon or plugin onto the developer's
-/// machine. Declared at the top of each test, so it runs after the process
-/// guards and the tempdir are torn down.
+/// Sweeps every process tied to a project on drop, so even a panicking assertion
+/// cannot leak a fixture daemon or plugin onto the developer's machine. Declared
+/// at the top of each test, so it runs after the process guards and the tempdir
+/// are torn down. Best-effort only: the explicit path in each test also asserts
+/// the sweep drained the locks (see [`verify_no_project_processes`]).
 struct ProjectSweeper(PathBuf);
 
 impl Drop for ProjectSweeper {
@@ -291,6 +320,39 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// One `ps` row: the pid and everything after it (command line *and* `-E`'s
+/// environment blob). `-E` puts the environment after the command, and the split
+/// between the two is not worth reconstructing: matching the combined text is
+/// enough to see both a plugin's project-bearing argv and any process's
+/// `HOME=<temp home>` env token.
+struct PsRow {
+    pid: i32,
+    /// Everything after the pid: command line followed by `VAR=value ...`.
+    rest: String,
+}
+
+/// Every visible process's pid + command + environment. `-E` is how macOS
+/// exposes the env (there is no `-o env=` keyword); `-A` lists all processes,
+/// `-w -w` defeats the width truncation that would clip a long temp path out of
+/// the line.
+fn ps_rows() -> Vec<PsRow> {
+    let output = Command::new("/bin/ps")
+        .args(["-A", "-w", "-w", "-o", "pid=,command=", "-E"])
+        .output()
+        .expect("run ps to identify project processes");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start();
+            let (pid, after_pid) = rest.split_once(char::is_whitespace)?;
+            Some(PsRow {
+                pid: pid.parse::<i32>().ok()?,
+                rest: after_pid.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Poll `condition` until it holds or `timeout` elapses. Never a fixed sleep:
 /// the caller asserts the *outcome*, the poll only avoids racing a slow step.
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
@@ -307,44 +369,63 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// Kill every process belonging to `project`: the daemon(s) and the plugin(s),
-/// including an orphan whose daemon was `SIGKILL`ed and which has not yet
-/// noticed. A test must never leave a fixture process on the developer's
-/// machine.
+/// Best-effort sweep: `SIGKILL` every process belonging to `project` — the
+/// daemon(s), the plugin(s) (including an orphan whose daemon was `SIGKILL`ed and
+/// which has not yet noticed), and (as a fallback) the `boards watch` loop. Never
+/// asserts: it also runs from `Drop`, so it must not panic while unwinding.
 ///
-/// The daemon's command line carries no project path (`yi-agent daemon serve`
-/// runs with the project as its cwd), so it is found by the runtime lock. The
-/// plugin's command line *does* embed the project's state/runtime/root paths, so
-/// `ps` finds even an orphan that still holds the lock.
+/// A test must never leave a fixture process on the developer's machine, so the
+/// daemon cannot be identified by `lsof` alone. Its command line carries no
+/// project path (`yi-agent daemon serve` runs with the project as its cwd), so
+/// three independent signals are combined:
+///   1. `lsof -t` on `runtime.lock` / `plugin.lock` (kernel state, the same the
+///      product relies on);
+///   2. the plugin's argv, which embeds the project's runtime/state/root paths
+///      (so even an orphan that still holds the lock is found);
+///   3. the `HOME=<temp home>` token in a process's environment (`ps -E`), which
+///      for this test is the app-server's temp home and therefore identifies the
+///      daemon regardless of whether `lsof` reported it.
+///
+/// [`verify_no_project_processes`] turns this into a real guarantee.
 fn kill_project_processes(project: &Path) {
-    for pid in daemon_pids(project) {
+    // The app-server is always started with `HOME=<temp home>`, and the daemon it
+    // (or any second launcher) spawns inherits it. Using it as a signal means the
+    // daemon is found even with the lock file missing.
+    let home_token = format!(
+        "HOME={}",
+        project
+            .parent()
+            .map(|dir| dir.join("home").to_string_lossy().to_string())
+            .unwrap_or_default()
+    );
+    let needle = project.to_string_lossy().to_string();
+
+    let mut victims: Vec<i32> = daemon_pids(project);
+    victims.extend(plugin_pids(project));
+    for row in ps_rows() {
+        let owns_project = row.rest.contains(&needle) && row.rest.contains("superpowers-kanban");
+        let owns_temp_home = row.rest.contains(&home_token);
+        if owns_project || owns_temp_home {
+            victims.push(row.pid);
+        }
+    }
+    for pid in victims {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
     }
-    for pid in plugin_pids(project) {
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-    }
-    let output = Command::new("/bin/ps")
-        .args(["-A", "-w", "-w", "-o", "pid=,command="])
-        .output()
-        .expect("run ps to sweep project processes");
-    let needle = project.to_string_lossy();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line.contains(needle.as_ref()) && line.contains("superpowers-kanban") {
-            if let Some(pid) = line
-                .split_whitespace()
-                .next()
-                .and_then(|pid| pid.parse::<i32>().ok())
-            {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        }
-    }
+}
+
+/// Assert the sweep really drained `project`: nothing still holds its runtime or
+/// plugin lock. Called explicitly, never from `Drop`, so a leak fails the test
+/// instead of being claimed as handled.
+fn verify_no_project_processes(project: &Path) {
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            daemon_pids(project).is_empty() && plugin_pids(project).is_empty()
+        }),
+        "the sweep must leave no process holding {project:?}'s runtime/plugin locks"
+    );
 }
 
 /// Spawn `yi-agent boards watch --interval-secs 1` against `home`.
@@ -469,7 +550,7 @@ fn wait_for_plugin(project: &Path, timeout: Duration) -> i32 {
 /// processes.
 #[test]
 fn killing_a_board_daemon_is_healed_by_the_watchman() {
-    if let Some(reason) = gate_reason() {
+    if let Some(reason) = gate_reason().or_else(needs_published_plugin) {
         eprintln!("skipping watchman end-to-end: {reason}");
         return;
     }
@@ -564,12 +645,25 @@ fn killing_a_board_daemon_is_healed_by_the_watchman() {
         "exactly one daemon may hold the project's runtime lock"
     );
 
-    // No matter how many watchman ticks fire, the heal is idempotent: let the
-    // loop tick a few more times and re-assert the single-daemon invariant.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Idempotence must be observed, not assumed: no fixed sleep. Kill the healed
+    // daemon and poll until the watchman has demonstrably ticked again (it brings
+    // up a *third* daemon). That tick is the proof the heal is idempotent across
+    // ticks — the daemon came back and exactly one process holds the lock — without
+    // depending on the loop having completed a tick after 1.5s.
+    unsafe {
+        libc::kill(healed_pid, libc::SIGKILL);
+    }
+    let ticked = wait_until(HEAL_TIMEOUT, || {
+        let held = daemon_pids(&project);
+        held.len() == 1 && held[0] != healed_pid
+    });
+    assert!(
+        ticked,
+        "the watchman must have run another tick and healed {healed_pid} within {HEAL_TIMEOUT:?}"
+    );
     assert!(
         yi_agent_boards::board_daemon::is_running(&project),
-        "the daemon must still be answering after further watchman ticks"
+        "the daemon must be answering after the second heal"
     );
     assert_eq!(
         daemon_pids(&project).len(),
@@ -581,9 +675,11 @@ fn killing_a_board_daemon_is_healed_by_the_watchman() {
     // plugin holds the queue's advance right. The daemon was started detached
     // (not our child), so it cannot be reaped — stop it, then sweep every
     // remaining project process (including a plugin orphaned by the SIGKILL
-    // above), so no fixture outlives the test.
+    // above), so no fixture outlives the test. The sweep is then verified: a leak
+    // fails the test rather than being quietly tolerated.
     let _ = yi_agent_boards::board_daemon::stop(&project);
     kill_project_processes(&project);
+    verify_no_project_processes(&project);
 }
 
 // ---------------------------------------------------------------------------
@@ -607,12 +703,23 @@ fn killing_a_board_daemon_is_healed_by_the_watchman() {
 /// observable invariant is the weaker, sufficient one: the orphan exits within
 /// a bounded number of probe intervals, releasing the lock so the next plugin
 /// can advance.
+///
+/// Scope of the "single instance" observation: the second `plugin run` is seen to
+/// stay *alive* yet never appear as a lock holder. That is a liveness / identity
+/// check on real processes — it is **not** an in-process proof that `flock`
+/// refuses a second holder (that proof is the plugin's own
+/// `single_instance::tests::a_second_instance_cannot_take_the_lock`). Likewise
+/// this test never starts a card, so "no card is launched twice" is inferred from
+/// the single-advancer lock plus the plugin's queued-launch unit tests, not
+/// observed here.
 #[test]
 fn an_orphan_plugin_exits_after_the_daemon_dies() {
     if let Some(reason) = gate_reason() {
         eprintln!("skipping orphan-plugin end-to-end: {reason}");
         return;
     }
+    // No Homebrew requirement here: this test drives the worktree-built plugin,
+    // so it must run on a machine without the published binary installed.
     let plugin = worktree_plugin_bin();
     if !plugin.is_file() {
         eprintln!(
@@ -642,8 +749,9 @@ fn an_orphan_plugin_exits_after_the_daemon_dies() {
     let first_plugin = wait_for_plugin(&project, Duration::from_secs(10));
 
     // (2) Single-instance: a second `plugin run` on the same state directory
-    //     cannot take the lock. It waits (the production contract), so it stays
-    //     alive while the first holder keeps the lock.
+    //     cannot take the lock (the plugin's own unit test proves the `flock`
+    //     refusal; here we observe the consequence). It waits (the production
+    //     contract), so it stays alive while the first holder keeps the lock.
     let mut second = Command::new(&plugin);
     second
         .args([
@@ -661,12 +769,21 @@ fn an_orphan_plugin_exits_after_the_daemon_dies() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut second = ChildGuard::spawn(second);
+    let second_pid = second.spawn().expect("spawn the second plugin").id() as i32;
 
-    // Let the second instance attempt the lock; it must fail and keep waiting.
-    std::thread::sleep(Duration::from_millis(1000));
+    // No fixed settle: poll observable state. The second instance is alive until
+    // the very end, so a bounded wait that keeps seeing it alive and out of the
+    // lock-holder set is exactly the invariant (a live process the kernel refused
+    // the lock), not a guess about how long the attempt takes.
+    let stable = wait_until(Duration::from_secs(2), || {
+        pid_alive(second_pid) && plugin_pids(&project) == vec![first_plugin]
+    });
     assert!(
-        second.is_running(),
+        stable,
+        "the second plugin must stay alive and out of the lock while the first holds it"
+    );
+    assert!(
+        pid_alive(second_pid),
         "a second plugin must wait for the lock, not exit"
     );
     assert_eq!(
@@ -674,7 +791,9 @@ fn an_orphan_plugin_exits_after_the_daemon_dies() {
         vec![first_plugin],
         "the second plugin must not acquire the lock while the first holds it"
     );
-    second.kill();
+    unsafe {
+        libc::kill(second_pid, libc::SIGKILL);
+    }
 
     // (3) Kill the daemon with SIGKILL. Its plugin is NOT in the same process
     //     group (`Command::spawn` without setsid), so the plugin is left as an
@@ -718,8 +837,10 @@ fn an_orphan_plugin_exits_after_the_daemon_dies() {
     );
 
     // Cleanup: stop the daemon; its plugin becomes an orphan and will exit on
-    // its own, but sweep it explicitly so nothing outlives the test.
+    // its own, but sweep it explicitly so nothing outlives the test, then verify
+    // the sweep really drained the locks (a leak fails the test).
     let _ = yi_agent_boards::board_daemon::stop(&project);
-    kill_project_processes(&project);
     daemon2.kill();
+    kill_project_processes(&project);
+    verify_no_project_processes(&project);
 }

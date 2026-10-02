@@ -141,7 +141,7 @@ daemon 本身**。于是：
 
 | 条目 | 证据（命令 → 观察） |
 |---|---|
-| 1、3、4 | `YI_AGENT_BOARD_E2E=1 cargo test -p yi-agent --test board_watchman_e2e` → **2 passed**。`killing_a_board_daemon_is_healed_by_the_watchman`：真 `board/create` 拉起真 daemon，SIGKILL 它，跑一次 watchman 循环体（`yi-agent boards watch --interval-secs 1`，即 `watch::once` + `ensure_daemons`），在有界轮询内 daemon 重新应答 `Status`，且 `runtime.lock` 恒定只有一个持有者（不双起）。`an_orphan_plugin_exits_after_the_daemon_dies`：第二个 `plugin run` 拿不到 `plugin.lock`（等待中）；SIGKILL daemon 后孤儿在 ~3s（3×1s 阈值）内自行退出并释放锁（`lsof` 该锁的持有者归零）；重启 daemon 后新插件立刻拿锁，锁持有者恰为 1。 |
+| 1、3、4 | `YI_AGENT_BOARD_E2E=1 cargo test --offline -p yi-agent --test board_watchman_e2e` → **2 passed**。`killing_a_board_daemon_is_healed_by_the_watchman`：真 `board/create` 拉起真 daemon，SIGKILL 它，跑 watchman 循环体（`yi-agent boards watch --interval-secs 1`，即 `watch::once` + `ensure_daemons`），在有界轮询内 daemon 重新应答 `Status` 且是新 pid；随后**再** SIGKILL 已恢复的 daemon，并**轮询到 watchman 确实又 tick 了一次**（第三个 daemon 起来）——不依赖固定 sleep 的时长。两次都断言 `runtime.lock` 恰有一个持有者（不双起、多次 tick 不叠加）。`an_orphan_plugin_exits_after_the_daemon_dies`：第二个 `plugin run` 保持存活、但始终**不出现在** `plugin.lock` 持有者中（这是**活性/身份核对，不是进程内 flock 争用证明**；`flock` 拒绝的进程内证明见插件单测 `a_second_instance_cannot_take_the_lock`）；SIGKILL daemon 后孤儿在有界轮询（~3s，3×1s 阈值）内自行退出并释放锁（`lsof` 该锁持有者归零）；重启 daemon 后新插件拿锁，锁持有者恰为 1。两个测试收尾都清扫并**断言** `runtime.lock`/`plugin.lock` 持有者归零（泄漏即失败，而非「尽力而为」）。 |
 | 2 | 同一 e2e 的第一个测试用**同一份** `watch::once`/`ensure_daemons`（B 与 A 共用），证明登记在有 daemon 死掉时会被重新确保；app-server 会话期循环有独立单测：`cargo test -p yi-agent-app-server app_side_loop` → `the_app_side_loop_ensures_every_registered_project ... ok`（crate 全量 281 passed / 0 failed）。真实 launchd 未驱动，见「未竟驱动项」。 |
 | 3 | 由 §4.1 daemon 的独占 `runtime.lock`（`flock`）担保：e2e 断言锁持有者数恒为 1；watchman 多轮 tick 后仍为 1。 |
 | 5 | `cargo test -p yi-agent-boards watchman::` → **4 passed**（plist 内容/装/卸/路径不符判未装）。create/remove 的登记写入/摘除由 lifecycle 单测覆盖（`creating_a_board_registers_a_resident_daemon_need` / `removing_a_board_releases_the_resident_daemon_need`）；e2e 直接断言 `resident::list` 含该项目。watchman 只经 `watch::once` 读 `resident-daemons.json`，代码路径不触及 `boards.json`。 |
@@ -151,12 +151,22 @@ daemon 本身**。于是：
 
 **未竟驱动项（诚实声明）：**
 
+- **「同一时刻只有一个插件在推进队列 / 无重复启动同一张卡」为推断，而非本 e2e 直接观测。**
+  e2e 观测到的是：同一项目**至多一个插件持有推进锁**（`plugin.lock` 的持有者集合恒为单个），
+  且孤儿插件在有界时间内退位。它**从不启动任何卡片**，所以「同一张卡不会被重复启动」是由
+  「单实例锁 + 孤儿让位」**加**插件自身的排队启动单测推断而来（`starts_the_oldest_queued_card_first`、
+  `never_exceeds_the_slot_limit`、`a_terminal_card_is_never_started_again`、
+  `a_successful_launch_moves_the_card_to_running`），不是端到端驱动出来的。要直接观测需要真模型调用
+  启动一张真卡，属本轮非目标。
 - e2e 的两个测试都**不驱动真实 launchd**。`app-server` 以 `YI_AGENT_DISABLE_WATCHMAN=1`
   启动（Task 6 的生产 kill-switch），故 `board/create` 的安装退化为 no-op；watchman 由
-  「跑一次其循环体」而非真实 LaunchAgent 触发。理由：本条验收要的是「daemon 会回来」，
+  「跑其循环体」而非真实 LaunchAgent 触发。理由：本条验收要的是「daemon 会回来」，
   而这正是 `watch::once` + `ensure_daemons` 的职责；launchd 本身（plist 内容、装/卸、
   `RunAtLoad`/`KeepAlive`）由 `yi-agent-boards::watchman` 的 4 个单测覆盖。launchd 对
   watchman **自身**的重启属 Task 5/6 范畴，不在 e2e 断言内。
+- 第二个 `plugin run` 的断言是**活性/身份核对**（它保持存活、且不在锁持有者集合里），
+  不是进程内 `flock` 争用证明。锁层面的进程内证明在插件单测
+  `single_instance::tests::a_second_instance_cannot_take_the_lock`。
 - 孤儿感知是**有界退出**（阈值 3×探测间隔），非 kqueue 即时感知（非目标，§4.6/§6）。
   e2e 把间隔设为 1s 使窗口约 3s；断言的是「有界内让位」这一充分不变量。
 - 「重启后停在 `Running` 的卡被对账移走」由插件单测覆盖（对账逻辑不因重启而变），
