@@ -6,5 +6,6 @@
 
 pub mod ipc;
 pub mod repository;
+pub mod resident;
 pub mod runtime;
 pub mod schedule;
