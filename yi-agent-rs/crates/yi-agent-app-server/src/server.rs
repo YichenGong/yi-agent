@@ -1041,6 +1041,22 @@ fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
+/// 后台自愈循环:app 打开期间每 ~30s 一次,与常驻 watchman 重叠也无害(幂等)。
+///
+/// 单轮逻辑复用 `yi_agent_boards::watch::once`(读通用登记 → 交给 `ensure`),
+/// **不再另写一份**「读登记 → 拉起」的胶水;`ensure_daemons` 同样是 CLI 与
+/// watchman 共用的那一份。`resident_dir` 由调用方传入,循环内不重读 `HOME`。
+fn spawn_board_watchman_loop(resident_dir: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            yi_agent_boards::watch::once(&resident_dir, &mut |projects| {
+                yi_agent_boards::watch::ensure_daemons(projects);
+            });
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
 ///
 /// `cfg` 同时用于 `config/read` 响应与(每个 thread 的)`bootstrap_agent`。
@@ -1067,6 +1083,10 @@ where
     // server. Resident RPCs then register where nobody lists from, which is the
     // same as having no resident need.
     let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
+    // 会话期自愈:app 打开期间后台每 ~30s 重新确保每个登记项目都有活着的 daemon,
+    // 与 launchd watchman 互补。只在生产入口启动;`serve_stdio`/`serve_scoped` 不装,
+    // 故单元测试永远不会拉起真实进程。传入已算好的 `resident_dir`,循环内不重读 HOME。
+    spawn_board_watchman_loop(resident_dir.clone());
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用。
     // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
@@ -4861,6 +4881,21 @@ pub(crate) mod tests_support {
 pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// 单轮逻辑是共享的 `watch::once`(Task 3 已在其自身 crate 内测过);这里只
+    /// 断言 app-server 用的是同名同款:读登记 → 把登记项目交给 ensurer。
+    #[test]
+    fn the_app_side_loop_ensures_every_registered_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
+        let mut seen: Vec<std::path::PathBuf> = Vec::new();
+        let count = yi_agent_boards::watch::once(dir.path(), &mut |projects| {
+            seen.extend_from_slice(projects)
+        });
+        assert_eq!(count, 1);
+        assert_eq!(seen, vec![a]);
+    }
 
     /// A throwaway Git repository. Coding children need one; attaching does not.
     fn init_git_repo(dir: &std::path::Path) {
