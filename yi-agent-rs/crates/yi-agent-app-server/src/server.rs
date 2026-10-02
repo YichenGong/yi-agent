@@ -952,7 +952,7 @@ const KANBAN_PLUGIN: &str = "superpowers-kanban";
 /// `board_query` is the board-shaped name for `plugin_query`: it pins the
 /// plugin, so a caller cannot accidentally ask a different plugin a board
 /// question. `method` and `params` still pass through verbatim.
-fn board_query(
+pub(crate) fn board_query(
     project: &Path,
     board_dir: &Path,
     method: &str,
@@ -973,6 +973,9 @@ pub(crate) struct BoardCard {
     pub thread_id: Option<String>,
     pub workdir: Option<PathBuf>,
     pub spec_path: String,
+    /// 计划文件路径。看板 objective 要把它拼进首轮文案;老卡片可能没有,
+    /// 故缺省为空串(与 `spec_path` 同款「复制到桌面/文案即用」的语义)。
+    pub plan_path: String,
 }
 
 /// Every card on the board, dropped to the fields the desktop works with.
@@ -1006,6 +1009,11 @@ pub(crate) fn board_cards(
                     .map(PathBuf::from),
                 spec_path: card
                     .get("spec_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                plan_path: card
+                    .get("plan_path")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
@@ -4428,12 +4436,88 @@ async fn start_thread_core(
     Ok(())
 }
 
-/// 起一个 turn 的内核:校验 thread、提取 prompt、占 `active_turn_id`、
-/// 推 `turn/started` 与 Running 状态、回响应,最后把 prompt 投给 driver。
+/// `prepare_turn_core` 的失败。每一种都对应 `turn/start` 的一条固定错误响应,
+/// 由 `start_turn_core` 负责把它写出去(这样「校验」与「写响应」解耦,调度器可以
+/// 只复用前者而不向任何客户端广播)。
+enum TurnPrepareError {
+    MissingThreadId,
+    EmptyInput,
+    UnknownThread(String),
+    TurnInProgress(String),
+}
+
+/// 一个已经「占位」好的 turn,但**尚未向任何客户端发帧**。
 ///
-/// 校验失败(未知 thread / 缺 threadId / 空 input / turn 进行中)在此就地写错误
-/// 响应并返回 `Ok(None)`,调用方据此 continue——与抽取前逐字一致(响应与
-/// `turn/started`/状态的先后顺序不变)。成功返回 `Ok(Some(turn_id))`。
+/// 校验通过后 `active_turn_id` 已被占成 `turn_id`;`prompt_tx` 是投递通道,
+/// `status_handle` 供调用方推 Running 状态。字段全部 `pub(crate)`,以便
+/// `card_scheduler` 复用这条无帧路径。
+pub(crate) struct PreparedTurn {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) prompt_tx: mpsc::Sender<TurnPrompt>,
+    pub(crate) prompt: String,
+    pub(crate) activate: Option<Arc<ThreadRoot>>,
+    pub(crate) status_handle: Arc<std::sync::Mutex<ThreadStatus>>,
+}
+
+/// 起一个 turn 的**无帧准备段**:校验 thread 存在、`active_turn_id` 空闲、
+/// 提取 prompt、占 `active_turn_id = Some(turn_id)`、构造 `TurnPrompt`。
+///
+/// **不写任何通知 / 响应**——正因如此调度器才能「起会话而不向客户端发帧」
+/// (见 Task 6a 评审:调度器不得复用带帧的 `start_turn_core`)。失败返回
+/// `Err(TurnPrepareError)`,由调用方决定怎么写错误响应(或对调度器而言记日志)。
+async fn prepare_turn_core(
+    threads: &mut HashMap<String, ThreadSession>,
+    pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
+    params: &serde_json::Value,
+) -> Result<PreparedTurn, TurnPrepareError> {
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or(TurnPrepareError::MissingThreadId)?
+        .to_string();
+    let prompt = extract_prompt(params).ok_or(TurnPrepareError::EmptyInput)?;
+
+    let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
+    // 内层作用域:让 `&mut threads` 的借用先结束。
+    let (prompt_tx, status_handle) = {
+        let Some(session) = threads.get_mut(&thread_id) else {
+            return Err(TurnPrepareError::UnknownThread(thread_id));
+        };
+        if session.active_turn_id.is_some() {
+            return Err(TurnPrepareError::TurnInProgress(thread_id));
+        }
+        session.active_turn_id = Some(turn_id.clone());
+        (session.prompt_tx.clone(), Arc::clone(&session.status))
+    };
+
+    let activate = pending_activation.get(&thread_id).cloned().flatten();
+    Ok(PreparedTurn {
+        thread_id,
+        turn_id,
+        prompt_tx,
+        prompt,
+        activate,
+        status_handle,
+    })
+}
+
+/// 把 `prepare_turn_core` 的失败翻成 6a 建立的错误响应(逐字不变)。
+fn turn_prepare_rpc_error(error: TurnPrepareError) -> RpcError {
+    match error {
+        TurnPrepareError::MissingThreadId => RpcError::invalid_params("missing threadId"),
+        TurnPrepareError::EmptyInput => RpcError::invalid_params("missing or empty input text"),
+        TurnPrepareError::UnknownThread(thread_id) => RpcError::unknown_thread(&thread_id),
+        TurnPrepareError::TurnInProgress(thread_id) => RpcError::turn_in_progress(&thread_id),
+    }
+}
+
+/// 起一个 turn 的 RPC 包装:调 `prepare_turn_core` → 发 `turn/started` →
+/// 推 Running 状态 → 写响应 → 投递 prompt。
+///
+/// 校验失败时在此就地写错误响应并返回 `Ok(None)`,调用方据此 continue——帧的
+/// 顺序与错误响应语义与 6a 抽取前逐字一致(响应急在 prompt 投递之前)。
+/// 成功返回 `Ok(Some(thread_id))`。
 async fn start_turn_core(
     threads: &mut HashMap<String, ThreadSession>,
     pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
@@ -4442,47 +4526,12 @@ async fn start_turn_core(
     params: &serde_json::Value,
     id: RequestId,
 ) -> anyhow::Result<Option<String>> {
-    // `id` 后续响应仍需使用,故传 clone。
-    let Some(thread_id) = require_thread_id(hub, client, params, id.clone()).await? else {
-        return Ok(None);
-    };
-    let prompt = match extract_prompt(params) {
-        Some(p) => p,
-        None => {
-            write_response(
-                hub,
-                client,
-                err_response(id, RpcError::invalid_params("missing or empty input text")),
-            )
-            .await?;
+    let prepared = match prepare_turn_core(threads, pending_activation, params).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            write_response(hub, client, err_response(id, turn_prepare_rpc_error(error))).await?;
             return Ok(None);
         }
-    };
-
-    let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
-    // 内层作用域:让 `&mut threads` 的借用先结束,后续错误
-    // 路径才能再次 `threads.get_mut`。
-    let (prompt_tx, status_handle) = {
-        let Some(session) = threads.get_mut(&thread_id) else {
-            write_response(
-                hub,
-                client,
-                err_response(id, RpcError::unknown_thread(&thread_id)),
-            )
-            .await?;
-            return Ok(None);
-        };
-        if session.active_turn_id.is_some() {
-            write_response(
-                hub,
-                client,
-                err_response(id, RpcError::turn_in_progress(&thread_id)),
-            )
-            .await?;
-            return Ok(None);
-        }
-        session.active_turn_id = Some(turn_id.clone());
-        (session.prompt_tx.clone(), Arc::clone(&session.status))
     };
 
     // 顺序确定:先 turn/started 通知,再推 Running 状态,再响应,
@@ -4490,36 +4539,42 @@ async fn start_turn_core(
     write_notification(
         hub,
         &Notification::TurnStarted {
-            thread_id: thread_id.clone(),
-            turn_id: turn_id.clone(),
+            thread_id: prepared.thread_id.clone(),
+            turn_id: prepared.turn_id.clone(),
         },
     )
     .await?;
-    update_status(hub, &status_handle, &thread_id, ThreadStatus::Running).await?;
+    update_status(
+        hub,
+        &prepared.status_handle,
+        &prepared.thread_id,
+        ThreadStatus::Running,
+    )
+    .await?;
     write_response(
         hub,
         client,
-        ok_response(id, json!({ "turn_id": turn_id.clone() })),
+        ok_response(id, json!({ "turn_id": prepared.turn_id.clone() })),
     )
     .await?;
 
-    let activate = pending_activation.get(&thread_id).cloned().flatten();
-    if prompt_tx
+    if prepared
+        .prompt_tx
         .send(TurnPrompt {
-            turn_id,
-            prompt,
-            activate,
+            turn_id: prepared.turn_id,
+            prompt: prepared.prompt,
+            activate: prepared.activate,
         })
         .await
         .is_err()
     {
         // driver 已退出(理论上不会):清掉活跃标记,
         // 避免后续 turn 永远报 turn_in_progress。
-        if let Some(s) = threads.get_mut(&thread_id) {
+        if let Some(s) = threads.get_mut(&prepared.thread_id) {
             s.active_turn_id = None;
         }
     }
-    Ok(Some(thread_id))
+    Ok(Some(prepared.thread_id))
 }
 
 /// 解析 `thread/start` 的目标目录:显式 `params.cwd` 优先,缺省用 `cfg.workdir`。
