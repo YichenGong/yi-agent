@@ -300,7 +300,8 @@ ws，`initialize` 后直接发这条 RPC，中继桥把它原样转发到本机 
 control < admin`，新设备默认 `control`，admin 类 RPC 返回 `-32014`）；设备列表/撤销
 （`device/list` 任意已握手客户端可读、`device/revoke` 需 admin，撤销即断连并废 token）；
 审批广播 + `approvalResolved`；反向 WSS 中继；电脑侧 `--relay` 出站桥接；iOS target 与
-前端传输接缝。
+前端传输接缝；按 thread 订阅过滤（`thread/subscribe`：客户端只收自己关心的会话，
+已订阅时逐字流 100ms/4KB 合并降频，未订阅客户端不受影响）。
 
 **Tier 1.5 已打通端到端：** 配对码**落盘**到 `~/.yi-agent/pairing.json`（epoch 秒过期），
 故桌面 stdio 进程铸的码可被 `--relay`/`ws://` 进程兑换。**经中继的 WAN 路径**用**帧级**

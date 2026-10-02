@@ -3,7 +3,7 @@
 //! 所有出站帧（通知、反向请求、响应）都经此转发。stdio 传输只注册一个
 //! `local` 客户端，语义与改造前的单流写一致；WS 传输注册多个客户端并扇出。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as StdMutex;
 
 use serde_json::Value;
@@ -12,6 +12,30 @@ use tokio::sync::mpsc;
 /// 每个客户端的出站队列容量。写满即视为慢消费者,`broadcast` 会摘除它
 /// 而不是阻塞其它客户端。
 pub const CLIENT_QUEUE: usize = 256;
+
+/// 一个客户端可订阅的 thread 上限（防止"订阅全部"退化成"全收"）。
+pub const MAX_SUBSCRIPTIONS: usize = 16;
+
+/// 一个客户端的订阅状态。
+#[derive(Default)]
+enum Feed {
+    /// 未订阅：收全部内容通知（今天的桌面行为）。
+    #[default]
+    All,
+    /// 已订阅：只收这些 thread 的内容通知（可为空集）。
+    Only(HashSet<String>),
+}
+
+impl Feed {
+    /// `key`＝帧所属 thread（`None`＝全局帧，恒放行）。
+    fn accepts(&self, key: Option<&str>) -> bool {
+        match (self, key) {
+            (Feed::All, _) => true,
+            (Feed::Only(_), None) => true,
+            (Feed::Only(set), Some(t)) => set.contains(t),
+        }
+    }
+}
 
 /// 定向回复失败:客户端已注销或其出站队列已关闭。
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +69,7 @@ struct Client {
     /// 可靠客户端(仅 stdio 的 `local`):它的出站队列**永不**因背压被摘除。
     /// 见 [`Broadcaster::broadcast`]。
     reliable: bool,
+    feed: Feed,
 }
 
 /// 服务端 → 客户端的扇出中心。
@@ -93,7 +118,14 @@ impl Broadcaster {
         self.clients
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(id, Client { tx, reliable });
+            .insert(
+                id,
+                Client {
+                    tx,
+                    reliable,
+                    feed: Feed::default(),
+                },
+            );
         rx
     }
 
@@ -128,18 +160,38 @@ impl Broadcaster {
             .contains_key(id)
     }
 
-    /// 广播给所有客户端。
-    ///
-    /// 失效或队列已满(慢消费者)的**普通**订阅者会被立即摘除——这是**背压**
-    /// 而非无限缓冲:一个连不上的手机不能让主循环卡住。**可靠**客户端(stdio 的
-    /// `local`)例外:它队列写满时只丢弃当前帧、保留登记,因为摘除它等于结束
-    /// 整个 stdio 会话(见 [`Broadcaster::register_reliable`])。
+    /// 设置该客户端的订阅集合（**整体替换**）。未注册则无操作。
+    pub fn subscribe(&self, id: &ClientId, thread_ids: Vec<String>) {
+        let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(client) = guard.get_mut(id) {
+            client.feed = Feed::Only(thread_ids.into_iter().collect());
+        }
+    }
+
+    /// 是否存在已订阅的客户端（决定逐字流是否合并）。
+    pub fn has_subscribed_clients(&self) -> bool {
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|c| matches!(c.feed, Feed::Only(_)))
+    }
+
+    /// 广播给所有客户端（无 thread 键，恒放行）。等价于 `broadcast_for(None, …)`。
     pub fn broadcast(&self, frame: Value) {
+        self.broadcast_for(None, frame);
+    }
+
+    /// 按 thread 键广播：`Feed::All` 与订阅命中的客户端收到，其余跳过。
+    ///
+    /// 背压/可靠客户端语义与旧 `broadcast` 完全一致（见其文档）。
+    pub fn broadcast_for(&self, key: Option<&str>, frame: Value) {
         let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
         guard.retain(|_, client| {
+            if !client.feed.accepts(key) {
+                return true; // 未命中：跳过投递，但保留登记。
+            }
             if client.reliable {
-                // 丢弃满队列的当前帧(背压),但保留登记;通道已关闭也保留,
-                // 由出口泵在写失败时摘除——那才是对端真正消失。
                 let _ = client.tx.try_send(frame.clone());
                 true
             } else {
@@ -308,5 +360,64 @@ mod tests {
         let _rx = hub.register(id.clone());
         hub.unregister(&id);
         assert!(!hub.is_connected(&id));
+    }
+
+    /// `Feed::All`（默认）收全部；`None` 键（全局帧）对谁都放行。
+    #[tokio::test]
+    async fn a_default_client_receives_everything() {
+        let hub = Broadcaster::new();
+        let mut rx = hub.register(ClientId::ws(uuid::Uuid::nil()));
+        hub.broadcast_for(Some("t1"), serde_json::json!({"n": 1}));
+        hub.broadcast_for(None, serde_json::json!({"n": 2}));
+        assert_eq!(rx.recv().await.unwrap()["n"], 1);
+        assert_eq!(rx.recv().await.unwrap()["n"], 2);
+    }
+
+    /// 订阅后只收集合内 thread 的内容通知；全局帧仍放行。
+    #[tokio::test]
+    async fn a_subscribed_client_only_gets_its_threads() {
+        let hub = Broadcaster::new();
+        let id = ClientId::ws(uuid::Uuid::nil());
+        let mut rx = hub.register(id.clone());
+        hub.subscribe(&id, vec!["t1".to_string()]);
+
+        hub.broadcast_for(Some("t1"), serde_json::json!({"n": 1})); // 命中
+        hub.broadcast_for(Some("t2"), serde_json::json!({"n": 2})); // 未命中 → 丢
+        hub.broadcast_for(None, serde_json::json!({"n": 3})); // 全局 → 放行
+
+        assert_eq!(rx.recv().await.unwrap()["n"], 1);
+        assert_eq!(rx.recv().await.unwrap()["n"], 3);
+
+        // 未命中那一帧确实没进来：队列里没有 n=2。
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// 订阅（`Only`）与未订阅（`All`）混在一起时各取所需。
+    #[tokio::test]
+    async fn subscription_narrows_one_client_without_affecting_another() {
+        let hub = Broadcaster::new();
+        let sub_id = ClientId::ws(uuid::Uuid::from_u128(1));
+        let all_id = ClientId::local();
+        let mut sub = hub.register(sub_id.clone());
+        let mut all = hub.register(all_id.clone());
+        hub.subscribe(&sub_id, vec!["t1".to_string()]);
+
+        hub.broadcast_for(Some("t2"), serde_json::json!({"n": 9}));
+        assert_eq!(all.recv().await.unwrap()["n"], 9, "All 客户端必须收到 t2");
+        assert!(sub.try_recv().is_err(), "订阅 t1 的客户端不该收到 t2");
+        assert!(hub.has_subscribed_clients());
+    }
+
+    /// 空订阅＝只收全局帧。
+    #[tokio::test]
+    async fn an_empty_subscription_receives_only_global_frames() {
+        let hub = Broadcaster::new();
+        let id = ClientId::ws(uuid::Uuid::nil());
+        let mut rx = hub.register(id.clone());
+        hub.subscribe(&id, vec![]);
+        hub.broadcast_for(Some("t1"), serde_json::json!({"n": 1}));
+        hub.broadcast_for(None, serde_json::json!({"n": 2}));
+        assert_eq!(rx.recv().await.unwrap()["n"], 2);
+        assert!(rx.try_recv().is_err());
     }
 }
