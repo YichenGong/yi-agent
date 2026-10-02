@@ -672,5 +672,3 @@ git commit -m "docs: document thread-scoped subscription filtering"
 **Placeholder scan**：无 TBD/TODO；每个代码步都有实际代码。
 
 **Type consistency**：`Feed`、`MAX_SUBSCRIPTIONS`、`subscribe`、`has_subscribed_clients`、`broadcast_for`、`thread_key`、`DeltaCoalescer::{push,take,take_all}` 在各 Task 间名称一致。
-
-**已知偏差（Task 4 Step 1 内已标注）**：合并器的单测以 `push` 返回值为准（跨 item 边走边发），`drain` 仅示意；实现者按 Step 1 修正版断言。
