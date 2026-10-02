@@ -28,7 +28,8 @@ use super::process_popup::{
     ProcessPopup, RuntimeTab,
 };
 use super::slash::{
-    CommandPopup, McpAction, SlashCommand, help_text, parse_mcp_args, render_mcp_status,
+    CommandPopup, McpAction, SlashCommand, TuiConfigSnapshot, help_text, parse_mcp_args,
+    render_mcp_status,
 };
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar};
@@ -88,6 +89,7 @@ pub fn run_tui(
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
     workdir: std::path::PathBuf,
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
+    config: TuiConfigSnapshot,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -116,6 +118,7 @@ pub fn run_tui(
         process_manager,
         workdir,
         mcp,
+        &config,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -162,6 +165,24 @@ impl EventSource for CrosstermEventSource {
     }
 }
 
+/// A fixed, secret-free snapshot for tests that need the config threaded
+/// through. Preferred single definition: changing the struct's fields only
+/// needs one test-side update.
+#[cfg(test)]
+fn snapshot_for_tests() -> TuiConfigSnapshot {
+    TuiConfigSnapshot {
+        provider: "anthropic".into(),
+        workdir: std::path::PathBuf::from("/tmp/proj"),
+        sandbox: "workspace-write".into(),
+        yolo: false,
+        max_turns: 200,
+        compact_threshold: 160_000,
+        mcp_master: true,
+        runtime_preference: "ask".into(),
+        runtime_preference_path: std::path::PathBuf::from("/tmp/proj/.yi-agent/preferences.json"),
+    }
+}
+
 /// Run the TUI loop with any ratatui backend (used by tests with TestBackend).
 /// Does NOT call enable_raw_mode / EnterAlternateScreen.
 #[cfg(test)]
@@ -198,6 +219,7 @@ pub fn run_tui_with_backend<B: Backend>(
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         workdir.to_path_buf(),
         yi_agent_mcp::McpManager::empty(),
+        &snapshot_for_tests(),
     )
     .map(|_dropped| ())
 }
@@ -215,6 +237,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
     is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: &E,
+    config: &TuiConfigSnapshot,
 ) -> std::io::Result<()> {
     let mut history = HistoryState::new();
     let mut input = InputLine::new();
@@ -236,6 +259,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         std::env::temp_dir(),
         yi_agent_mcp::McpManager::empty(),
+        config,
     )
     .map(|_dropped| ())
 }
@@ -297,7 +321,9 @@ fn run_loop<B: Backend, E: EventSource>(
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
     workdir: std::path::PathBuf,
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
+    config: &TuiConfigSnapshot,
 ) -> std::io::Result<usize> {
+    let mut current_model: String = model.to_string();
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
     let mut queued = crate::tui::queued::DeliveredInterjections::new();
@@ -419,6 +445,9 @@ fn run_loop<B: Backend, E: EventSource>(
             // 把一帧内的多个事件合并处理，退回的文本就会被回合结束分支抢先消费。
             // 顺序固定下来后，两种情形都安全。
             apply_interjection_event(&event, &mut queued, input, history, draw_text_width);
+            if let AgentEvent::ModelChanged { model: new_model } = &event {
+                current_model = new_model.clone();
+            }
             history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
@@ -500,7 +529,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 &statusbar_state,
                 &task_registry,
                 active_process_count,
-                model,
+                &current_model,
                 chunks[2].width,
             );
             f.render_widget(statusbar_line, chunks[2]);
@@ -677,6 +706,8 @@ fn run_loop<B: Backend, E: EventSource>(
                     &mut popup,
                     &workdir,
                     &mcp,
+                    config,
+                    &current_model,
                 ) {
                     KeyOutcome::Quit => break,
                     KeyOutcome::Submit(_) => {
@@ -1753,6 +1784,8 @@ fn handle_key(
     popup: &mut Option<CommandPopup>,
     workdir: &std::path::Path,
     mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
+    config: &TuiConfigSnapshot,
+    model: &str,
 ) -> KeyOutcome {
     // Check if there's a pending permission request. Clone the small fields
     // we need so the immutable borrow ends before we mutate history.
@@ -1923,6 +1956,8 @@ fn handle_key(
                             workdir,
                             queued,
                             mcp,
+                            config,
+                            model,
                         );
                     } else {
                         // No command selected (empty filter) — show error
@@ -2005,6 +2040,8 @@ fn handle_key(
                         workdir,
                         queued,
                         mcp,
+                        config,
+                        model,
                     );
                 } else {
                     // Unknown slash command
@@ -2164,6 +2201,8 @@ fn execute_slash_command(
     workdir: &std::path::Path,
     queued: &mut crate::tui::queued::DeliveredInterjections,
     mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
+    config: &TuiConfigSnapshot,
+    current_model: &str,
 ) -> KeyOutcome {
     match cmd {
         SlashCommand::Quit => KeyOutcome::Quit,
@@ -2205,12 +2244,17 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Config => {
-            history.push(
-                HistoryCell::Separator {
-                    label: Some("当前配置: (暂未实现)".to_string()),
-                },
-                width,
-            );
+            if args.is_some() {
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some("用法: /config".to_string()),
+                    },
+                    width,
+                );
+            } else {
+                let text = config.render(current_model);
+                history.push(HistoryCell::Markdown { text }, width);
+            }
             KeyOutcome::None
         }
         SlashCommand::Compact => {
@@ -2226,20 +2270,21 @@ fn execute_slash_command(
             KeyOutcome::None
         }
         SlashCommand::Model => {
-            if let Some(model) = args {
-                history.push(
-                    HistoryCell::Separator {
-                        label: Some(format!("切换模型到: {} (暂未实现)", model)),
-                    },
-                    width,
-                );
-            } else {
-                history.push(
-                    HistoryCell::Separator {
-                        label: Some("用法: /model <model-name>".to_string()),
-                    },
-                    width,
-                );
+            match args.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(new_model) => {
+                    let _ = control_tx
+                        .blocking_send(crate::ControlCommand::SetModel(new_model.to_string()));
+                    // 确认行由 `ModelChanged` 事件驱动；这里不预写成功行，避免与
+                    // driver 真实结果冲突。
+                }
+                None => {
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some("用法: /model <model-name>".to_string()),
+                        },
+                        width,
+                    );
+                }
             }
             KeyOutcome::None
         }
@@ -2271,17 +2316,33 @@ fn execute_slash_command(
         SlashCommand::Approve
         | SlashCommand::Deny
         | SlashCommand::Budget
-        | SlashCommand::Priority
-        | SlashCommand::Daemon => {
+        | SlashCommand::Priority => {
+            let reason = cmd.unavailable_reason().unwrap_or("暂不支持");
             history.push(
                 HistoryCell::Separator {
-                    label: Some(format!(
-                        "/{} 将由本地 daemon runtime 执行 (控制客户端接入中)",
-                        cmd.name()
-                    )),
+                    label: Some(format!("/{} 暂不支持：{}", cmd.name(), reason)),
                 },
                 width,
             );
+            KeyOutcome::None
+        }
+        SlashCommand::Daemon => {
+            let label = match crate::tui::slash::parse_daemon_args(args.as_deref().unwrap_or("")) {
+                Ok(action) => {
+                    let result = crate::runtime_socket_for(workdir)
+                        .map_err(|error| error.to_string())
+                        .and_then(|socket| match action {
+                            crate::tui::slash::DaemonAction::Status => daemon_status_at(&socket),
+                            crate::tui::slash::DaemonAction::Stop => daemon_stop_at(&socket),
+                        });
+                    match result {
+                        Ok(message) => message,
+                        Err(error) => format!("无法联系本地 daemon runtime: {error}"),
+                    }
+                }
+                Err(error) => error,
+            };
+            history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
         SlashCommand::Runtime => {
@@ -2327,12 +2388,12 @@ fn execute_slash_command(
                     width,
                 );
             }
-            let args = args.as_deref().unwrap_or("");
             // 生命周期子命令（create/remove/status）由宿主直接管本目录的看板
             // （走 `yi_agent_boards::lifecycle`）；其余（on/off/run/add/无参）
             // 仍走插件通道。`global_dir()` 是宿主唯一的全局登记目录来源。
             // 多个词（如 `create garbage`）不当成生命周期：那更可能是打错子命令，
             // 而 create 会真起一个 daemon——宁可给用法，也不静默执行。
+            let args = args.as_deref().unwrap_or("");
             let mut words = args.split_whitespace();
             let first = words.next();
             let extra = words.next().is_some();
@@ -3099,6 +3160,35 @@ fn daemon_review_decision_at(
             format_ipc_error(code, message)
         )),
         _ => Err("daemon 返回了非审查决策响应".into()),
+    }
+}
+
+fn daemon_status_at(socket: &std::path::Path) -> Result<String, String> {
+    let response =
+        yi_agent_store::ipc::send_request(socket, yi_agent_store::ipc::IpcRequest::Status)
+            .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::Status {
+            high_water_event_id,
+        } => Ok(format!(
+            "daemon 运行中（event high-water: {high_water_event_id}）"
+        )),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            Err(format!("daemon 拒绝请求: {code:?} {message:?}"))
+        }
+        other => Err(format!("daemon 返回了非预期响应: {other:?}")),
+    }
+}
+
+fn daemon_stop_at(socket: &std::path::Path) -> Result<String, String> {
+    let response = yi_agent_store::ipc::send_request(socket, yi_agent_store::ipc::IpcRequest::Stop)
+        .map_err(|error| error.to_string())?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::Stopping => Ok("daemon 正在停止".to_string()),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            Err(format!("daemon 拒绝请求: {code:?} {message:?}"))
+        }
+        other => Err(format!("daemon 返回了非预期响应: {other:?}")),
     }
 }
 
@@ -5008,6 +5098,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5090,6 +5181,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5149,6 +5241,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5219,6 +5312,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5331,6 +5425,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5400,6 +5495,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5449,6 +5545,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5505,6 +5602,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5577,6 +5675,8 @@ mod tests {
             project.path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -5611,6 +5711,8 @@ mod tests {
             file.as_path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -5643,6 +5745,8 @@ mod tests {
             project.path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         let labels = separator_labels(&history);
@@ -5678,6 +5782,8 @@ mod tests {
             missing.as_path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         let labels = separator_labels(&history);
@@ -5715,6 +5821,8 @@ mod tests {
             project.path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(
@@ -5722,6 +5830,48 @@ mod tests {
             "已更名为 /superpowers-kanban",
             "旧别名的改名提示必须还在"
         );
+    }
+
+    #[test]
+    fn hidden_commands_explain_themselves_instead_of_unknown() {
+        for (command, needle) in [
+            (SlashCommand::Approve, "暂不支持"),
+            (SlashCommand::Deny, "暂不支持"),
+            (SlashCommand::Budget, "暂不支持"),
+            (SlashCommand::Priority, "暂不支持"),
+        ] {
+            let mut history = HistoryState::new();
+            let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+            let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+            let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+            let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+            let mut queued = crate::tui::queued::DeliveredInterjections::new();
+            let _ = execute_slash_command(
+                command,
+                None,
+                None,
+                &mut history,
+                80,
+                &CostTracker::default(),
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &std::env::temp_dir(),
+                &mut queued,
+                &yi_agent_mcp::McpManager::empty(),
+                &snapshot_for_tests(),
+                "test-model",
+            );
+            let labels = separator_labels(&history);
+            assert!(
+                labels
+                    .iter()
+                    .any(|l| l.contains(needle) && l.contains(command.name())),
+                "{} must explain itself, got {labels:?}",
+                command.name()
+            );
+        }
     }
 
     #[test]
@@ -5815,6 +5965,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5869,6 +6020,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
             project.path().to_path_buf(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5915,6 +6067,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -5958,6 +6111,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         );
         assert!(
             result.is_ok(),
@@ -6033,6 +6187,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6101,6 +6256,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         );
         assert!(
             result.is_ok(),
@@ -6146,6 +6302,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         );
         assert!(
             result.is_ok(),
@@ -6189,6 +6346,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6252,6 +6410,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6311,6 +6470,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6403,6 +6563,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6736,6 +6897,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6778,6 +6940,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6830,6 +6993,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6874,6 +7038,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -6928,6 +7093,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         );
         assert!(
             result.is_ok(),
@@ -6972,6 +7138,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7025,6 +7192,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7059,7 +7227,9 @@ mod tests {
         // The popup is capped at 10 rows, i.e. 8 content rows, so 20 Down presses
         // land the selection far outside the initial window.
         const DOWNS: usize = 20;
-        let target = SlashCommand::all()[DOWNS];
+        // The popup lists `completable()`, so the Nth row after N Down presses is
+        // the Nth completable command (not the Nth entry of the full catalog).
+        let target = SlashCommand::completable()[DOWNS];
 
         // `ScriptedEvents` pops from the back, so push in reverse delivery order.
         let mut script = vec![Event::Key(KeyEvent::new(
@@ -7087,6 +7257,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7120,7 +7291,9 @@ mod tests {
 
         // A 14-row terminal leaves the popup only 8 rows, i.e. 6 content rows.
         const DOWNS: usize = 12;
-        let target = SlashCommand::all()[DOWNS];
+        // See `slash_popup_scrolls_to_keep_selection_visible`: the popup lists
+        // `completable()`, so index into that view.
+        let target = SlashCommand::completable()[DOWNS];
 
         let mut script = vec![Event::Key(KeyEvent::new(
             KeyCode::Char('q'),
@@ -7147,6 +7320,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7197,6 +7371,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7249,6 +7424,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7296,6 +7472,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7348,6 +7525,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7400,6 +7578,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7566,6 +7745,7 @@ mod tests {
             yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             std::env::temp_dir(),
             yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7630,6 +7810,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7675,6 +7856,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7720,6 +7902,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7768,6 +7951,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7813,6 +7997,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7858,6 +8043,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7908,6 +8094,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -7963,6 +8150,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -8042,6 +8230,8 @@ mod tests {
                 &mut popup,
                 &std::env::temp_dir(),
                 &yi_agent_mcp::McpManager::empty(),
+                &snapshot_for_tests(),
+                "test-model",
             );
             assert_eq!(outcome, KeyOutcome::None);
             assert_eq!(history.scroll_offset, expected_offset, "key {key:?}");
@@ -8067,6 +8257,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(history.selected, Some(4));
         assert_eq!(
@@ -8109,6 +8301,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "Esc must not arm process exit");
@@ -8152,6 +8346,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "idle Esc must not arm process exit");
@@ -8195,6 +8391,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(pending_quit);
@@ -8235,6 +8433,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         let result = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
@@ -8255,6 +8455,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(result, KeyOutcome::None);
     }
@@ -8299,6 +8501,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(result, KeyOutcome::Submit(path.to_string()));
@@ -8346,6 +8550,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(result, KeyOutcome::None);
@@ -8396,6 +8602,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight msg");
         let history_len_before = history.cells.len();
@@ -8422,6 +8630,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -8491,6 +8701,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(
@@ -8658,6 +8870,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -8710,6 +8924,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight");
 
@@ -8736,6 +8952,8 @@ mod tests {
                 &mut popup,
                 &std::env::temp_dir(),
                 &yi_agent_mcp::McpManager::empty(),
+                &snapshot_for_tests(),
+                "test-model",
             );
         }
         assert_eq!(
@@ -8776,6 +8994,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(
@@ -8836,6 +9056,8 @@ mod tests {
                 &mut popup,
                 &std::env::temp_dir(),
                 &yi_agent_mcp::McpManager::empty(),
+                &snapshot_for_tests(),
+                "test-model",
             );
         }
         // Both reached the driver already: the first opened the turn, the second
@@ -8887,6 +9109,8 @@ mod tests {
             &std::env::temp_dir(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -8897,6 +9121,139 @@ mod tests {
             control_rx.try_recv(),
             Ok(crate::ControlCommand::Clear)
         ));
+    }
+
+    #[test]
+    fn model_command_sends_set_model_control() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(8);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let _ = execute_slash_command(
+            SlashCommand::Model,
+            None,
+            Some("claude-opus-4-1".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        assert_eq!(
+            control_rx.try_recv(),
+            Ok(crate::ControlCommand::SetModel("claude-opus-4-1".into()))
+        );
+    }
+
+    #[test]
+    fn model_command_without_args_shows_usage() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let _ = execute_slash_command(
+            SlashCommand::Model,
+            None,
+            None,
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("用法: /model <model-name>"))
+        );
+    }
+
+    #[test]
+    fn daemon_command_reports_unavailable_runtime() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = execute_slash_command(
+            SlashCommand::Daemon,
+            None,
+            Some("status".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            dir.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("无法联系本地 daemon runtime")),
+            "expected an unreachable-daemon message, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_command_rejects_unknown_subcommand() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let _ = execute_slash_command(
+            SlashCommand::Daemon,
+            None,
+            Some("start".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+        );
+        let labels = separator_labels(&history);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("用法: /daemon [status|stop]"))
+        );
     }
 
     #[test]
@@ -8931,6 +9288,8 @@ mod tests {
             &std::env::temp_dir(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -8947,6 +9306,46 @@ mod tests {
             }
             other => panic!("expected Markdown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_command_renders_snapshot() {
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+        let snapshot = snapshot_for_tests();
+        let outcome = execute_slash_command(
+            SlashCommand::Config,
+            None,
+            None,
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot,
+            "test-model",
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        let rendered: String = history
+            .cells
+            .iter()
+            .filter_map(|c| match c {
+                HistoryCell::Markdown { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(rendered.contains("anthropic"));
+        assert!(rendered.contains("test-model"));
+        assert!(!rendered.contains("api_key"));
     }
 
     #[test]
@@ -8972,6 +9371,8 @@ mod tests {
             &std::env::temp_dir(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -9013,6 +9414,8 @@ mod tests {
             &std::env::temp_dir(),
             &mut queued,
             &mcp,
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(outcome, KeyOutcome::None);
         assert!(mcp.master(), "/mcp on must set the master switch");
@@ -9047,6 +9450,8 @@ mod tests {
             &std::env::temp_dir(),
             &mut queued,
             &mcp,
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(outcome, KeyOutcome::None);
         // The unknown server must be reported, not silently ignored...
@@ -9090,6 +9495,8 @@ mod tests {
             &std::env::temp_dir(),
             &mut queued,
             &mcp,
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert_eq!(outcome, KeyOutcome::None);
         match history.cells.last().unwrap() {
@@ -9129,6 +9536,8 @@ mod tests {
             project.path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -9168,6 +9577,8 @@ mod tests {
             project.path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -9209,6 +9620,8 @@ mod tests {
             project.path(),
             &mut queued,
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -9556,6 +9969,7 @@ mod tests {
             &decision_tx,
             &is_running,
             &source,
+            &snapshot_for_tests(),
         )
         .unwrap();
 
@@ -9617,6 +10031,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert!(
@@ -9671,6 +10087,8 @@ mod tests {
             &mut popup,
             &std::env::temp_dir(),
             &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert_eq!(

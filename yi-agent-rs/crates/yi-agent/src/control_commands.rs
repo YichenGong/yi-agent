@@ -126,7 +126,13 @@ impl ControlCommand {
                 true,
             ),
             Self::Budget => spec(self, "budget", "<task-id> ...", "查看或收窄任务预算", false),
-            Self::Daemon => spec(self, "daemon", "status", "管理本地 runtime daemon", false),
+            Self::Daemon => spec(
+                self,
+                "daemon",
+                "[status|stop]",
+                "管理本地 runtime daemon",
+                false,
+            ),
             Self::Help => spec(self, "help", "[command]", "显示控制命令帮助", false),
             Self::Mcp => spec(
                 self,

@@ -1605,6 +1605,28 @@ fn run_tui_agent(
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let mcp_for_driver = Arc::clone(&mcp);
         let mcp_for_teardown = Arc::clone(&mcp);
+
+        // `workdir` is moved into the driver closure below, and `config` is moved
+        // into it too, so both the snapshot and the TUI call site need values built
+        // before the closure and a cloned workdir.
+        let snapshot_workdir = workdir.clone();
+        let runtime_preference = match crate::tui::runtime_prefs::load(&snapshot_workdir) {
+            crate::tui::runtime_prefs::RuntimePreference::Ask => "ask",
+            crate::tui::runtime_prefs::RuntimePreference::Always => "always",
+            crate::tui::runtime_prefs::RuntimePreference::Never => "never",
+        };
+        let tui_config = crate::tui::slash::TuiConfigSnapshot {
+            provider: config.provider.clone(),
+            workdir: snapshot_workdir.clone(),
+            sandbox: config.sandbox.as_str().to_string(),
+            yolo: config.yolo,
+            max_turns: config.max_turns,
+            compact_threshold: config.compact_threshold,
+            mcp_master: mcp.master(),
+            runtime_preference: runtime_preference.to_string(),
+            runtime_preference_path: crate::tui::runtime_prefs::preferences_path(&snapshot_workdir),
+        };
+
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -1645,6 +1667,7 @@ fn run_tui_agent(
                         }
                         ControlCommand::Compact => {
                             let session = agent.session();
+                            let old_msg_count = session.messages().len();
                             match yi_agent_core::compact_session(
                                 &rebuild_provider,
                                 &rebuild_config,
@@ -1653,6 +1676,7 @@ fn run_tui_agent(
                             .await
                             {
                                 Ok(Some(new_session)) => {
+                                    let new_msg_count = new_session.messages().len();
                                     agent = yi_agent_core::Agent::new(
                                         Arc::clone(&rebuild_provider),
                                         Arc::clone(&current_tools),
@@ -1664,14 +1688,30 @@ fn run_tui_agent(
                                         Arc::clone(&rebuild_decision_rx),
                                     );
                                     tracing::info!("agent session compacted via /compact");
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Ok(new_msg_count),
+                                        ))
+                                        .await;
                                 }
                                 Ok(None) => {
                                     tracing::info!("no compactable session history");
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Err("没有可压缩的历史".into()),
+                                        ))
+                                        .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "compact failed");
-                                    let _ =
-                                        agent_tx.send(yi_agent_core::AgentEvent::Error(e)).await;
+                                    let _ = agent_tx
+                                        .send(manual_compaction_outcome_event(
+                                            old_msg_count,
+                                            Err(e.to_string()),
+                                        ))
+                                        .await;
                                 }
                             }
                         }
@@ -1690,6 +1730,24 @@ fn run_tui_agent(
                                 Arc::clone(&rebuild_decision_rx),
                             );
                             tracing::info!("MCP tool registry refreshed");
+                        }
+                        ControlCommand::SetModel(new_model) => {
+                            let mut next_config = rebuild_config.clone();
+                            next_config.model = new_model.clone();
+                            agent = yi_agent_core::Agent::new(
+                                Arc::clone(&rebuild_provider),
+                                Arc::clone(&current_tools),
+                                next_config,
+                            )
+                            .with_session(agent.session())
+                            .with_permission(
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                            );
+                            tracing::info!(model = %new_model, "agent model switched via /model");
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::ModelChanged { model: new_model })
+                                .await;
                         }
                     }
                     continue;
@@ -1969,6 +2027,7 @@ fn run_tui_agent(
                 process_manager,
                 workdir.clone(),
                 mcp,
+                tui_config,
             )
         });
 
@@ -2010,15 +2069,35 @@ fn run_tui_agent(
 /// Control commands sent from the TUI to the agent driver task.
 /// Allows the TUI to trigger agent session rebuilds (e.g. /clear, /compact)
 /// without reconstructing the whole agent inline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlCommand {
     /// Clear the agent session (rebuild with empty session).
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
+    /// Rebuild the agent with a new model, preserving the session.
+    SetModel(String),
     /// Rebuild the agent so its tool registry matches the MCP switches the TUI
     /// already applied directly to the shared `McpManager`.
     McpRefresh,
+}
+
+/// 把 `/compact` 的三种结果映射成 driver 回给 TUI 的事件。
+///
+/// `Ok(None)` 表示没有可安全缩减的历史（历史太短），**不是错误**，但对
+/// pending 行「正在压缩对话...」而言它就是一次可报告的终局，因此同样落到
+/// `ManualCompactFailed`，让状态行一定闭环。
+fn manual_compaction_outcome_event(
+    old_msg_count: usize,
+    result: Result<usize, String>,
+) -> yi_agent_core::AgentEvent {
+    match result {
+        Ok(new_msg_count) => yi_agent_core::AgentEvent::ManualCompacted {
+            old_msg_count,
+            new_msg_count,
+        },
+        Err(message) => yi_agent_core::AgentEvent::ManualCompactFailed { message },
+    }
 }
 
 #[cfg(test)]
@@ -2028,6 +2107,37 @@ mod tests {
     #[test]
     fn parse_listen_accepts_stdio() {
         assert!(matches!(parse_listen("stdio://").unwrap(), Listen::Stdio));
+    }
+
+    #[test]
+    fn set_model_control_command_distinguishes_its_payload() {
+        // Guards against a `PartialEq` that ignores the payload (e.g. compares only
+        // the discriminant): two different models must not compare equal, and
+        // `SetModel` must not compare equal to a payload-less variant.
+        let a = ControlCommand::SetModel("claude-opus-4-1".into());
+        let b = ControlCommand::SetModel("claude-sonnet-4-5".into());
+        assert_ne!(a, b);
+        assert_ne!(a, ControlCommand::McpRefresh);
+        assert_eq!(
+            ControlCommand::SetModel("claude-opus-4-1".into()),
+            ControlCommand::SetModel("claude-opus-4-1".into()),
+        );
+    }
+
+    #[test]
+    fn manual_compaction_outcome_events_preserve_counts_and_errors() {
+        use yi_agent_core::AgentEvent;
+        assert!(matches!(
+            manual_compaction_outcome_event(9, Ok(4)),
+            AgentEvent::ManualCompacted {
+                old_msg_count: 9,
+                new_msg_count: 4
+            }
+        ));
+        assert!(matches!(
+            manual_compaction_outcome_event(3, Err("没有可压缩的历史".into())),
+            AgentEvent::ManualCompactFailed { message } if message == "没有可压缩的历史"
+        ));
     }
 
     #[test]

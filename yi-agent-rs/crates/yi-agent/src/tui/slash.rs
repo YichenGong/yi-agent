@@ -220,6 +220,36 @@ impl SlashCommand {
         ]
     }
 
+    /// Commands shown in the popup and in the full `/help` listing.
+    ///
+    /// [`Self::all()`] stays the complete catalog so `from_name` keeps resolving
+    /// commands whose backend does not exist yet; this view is what the user browses.
+    /// Cached so the popup's per-keystroke calls do not rebuild (or leak) the list.
+    pub fn completable() -> &'static [SlashCommand] {
+        static COMPLETABLE: std::sync::OnceLock<Vec<SlashCommand>> = std::sync::OnceLock::new();
+        COMPLETABLE.get_or_init(|| {
+            SlashCommand::all()
+                .iter()
+                .copied()
+                .filter(|cmd| cmd.unavailable_reason().is_none())
+                .collect()
+        })
+    }
+
+    /// Why a command has no backend yet, or `None` when it is usable.
+    ///
+    /// The reason is shown when the user explicitly types a hidden command: a bare
+    /// "未知命令" would misreport a known-but-unwired command as a typo.
+    pub fn unavailable_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Approve | Self::Deny => {
+                Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
+            }
+            Self::Budget | Self::Priority => Some("daemon 尚未提供预算/优先级写接口"),
+            _ => None,
+        }
+    }
+
     /// Look up a command by its name (without leading `/`).
     pub fn from_name(name: &str) -> Option<SlashCommand> {
         if name == "?" {
@@ -253,7 +283,7 @@ pub fn help_text(target: Option<&str>) -> String {
         },
         None => {
             let mut text = String::from("可用命令:\n");
-            for command in SlashCommand::all() {
+            for command in SlashCommand::completable() {
                 let usage = command
                     .argument_usage()
                     .map(|usage| format!(" {usage}"))
@@ -267,6 +297,44 @@ pub fn help_text(target: Option<&str>) -> String {
             }
             text
         }
+    }
+}
+
+/// Read-only, secret-free view of the running session's configuration.
+///
+/// Assembled once in `main.rs` from `RuntimeConfig` / `AgentConfig` / the MCP
+/// manager / the persisted runtime preference. The model is **not** stored here:
+/// `/model` can change it mid-session, so `render` takes the live value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiConfigSnapshot {
+    pub provider: String,
+    pub workdir: std::path::PathBuf,
+    pub sandbox: String,
+    pub yolo: bool,
+    pub max_turns: u32,
+    pub compact_threshold: u32,
+    pub mcp_master: bool,
+    pub runtime_preference: String,
+    pub runtime_preference_path: std::path::PathBuf,
+}
+
+impl TuiConfigSnapshot {
+    /// Render the config for the transcript. `model` is the live model, so a
+    /// `/model` switch shows up here without re-reading anything.
+    pub fn render(&self, model: &str) -> String {
+        format!(
+            "当前配置:\n  provider: {}\n  model: {}\n  workdir: {}\n  sandbox: {}\n  yolo: {}\n  max_turns: {}\n  compact_threshold: {}\n  mcp master: {}\n  subagent runtime: {}（{}）",
+            self.provider,
+            model,
+            self.workdir.display(),
+            self.sandbox,
+            if self.yolo { "on" } else { "off" },
+            self.max_turns,
+            self.compact_threshold,
+            if self.mcp_master { "on" } else { "off" },
+            self.runtime_preference,
+            self.runtime_preference_path.display(),
+        )
     }
 }
 
@@ -319,6 +387,23 @@ pub fn parse_mcp_args(args: &str) -> Result<McpAction, String> {
     }
 }
 
+/// A parsed `/daemon` action. `start` is deliberately absent: the TUI embeds
+/// its own daemon, so starting a detached one from here would be ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    Status,
+    Stop,
+}
+
+/// Parse `/daemon` arguments. Returns a user-facing usage error on bad input.
+pub fn parse_daemon_args(args: &str) -> Result<DaemonAction, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] | ["status"] => Ok(DaemonAction::Status),
+        ["stop"] => Ok(DaemonAction::Stop),
+        _ => Err("用法: /daemon [status|stop]".into()),
+    }
+}
+
 /// Render `/mcp status` output. Pure so it is unit-testable without a manager.
 pub fn render_mcp_status(master: bool, servers: &[(String, bool)]) -> String {
     if servers.is_empty() {
@@ -353,10 +438,10 @@ pub struct CommandPopup {
 }
 
 impl CommandPopup {
-    /// Create a new popup with all commands visible.
+    /// Create a new popup with every completable command visible.
     pub fn new() -> Self {
         Self {
-            filtered: SlashCommand::all().to_vec(),
+            filtered: SlashCommand::completable().to_vec(),
             selected: 0,
             offset: 0,
             last_filter: String::new(),
@@ -372,9 +457,9 @@ impl CommandPopup {
         }
         self.last_filter = text.to_string();
         if text.is_empty() {
-            self.filtered = SlashCommand::all().to_vec();
+            self.filtered = SlashCommand::completable().to_vec();
         } else {
-            self.filtered = SlashCommand::all()
+            self.filtered = SlashCommand::completable()
                 .iter()
                 .copied()
                 .filter(|cmd| cmd.name().starts_with(text))
@@ -507,7 +592,15 @@ mod tests {
     #[test]
     fn filter_empty_shows_all() {
         let popup = CommandPopup::new();
-        assert_eq!(popup.filtered().len(), SlashCommand::all().len());
+        assert_eq!(popup.filtered().len(), SlashCommand::completable().len());
+    }
+
+    #[test]
+    fn popup_never_lists_hidden_commands() {
+        let mut popup = CommandPopup::new();
+        popup.filter("a"); // would otherwise match approve
+        let names: Vec<&str> = popup.filtered().iter().map(|c| c.name()).collect();
+        assert!(!names.contains(&"approve"));
     }
 
     #[test]
@@ -857,6 +950,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_daemon_args_defaults_to_status() {
+        assert_eq!(parse_daemon_args(""), Ok(DaemonAction::Status));
+        assert_eq!(parse_daemon_args("status"), Ok(DaemonAction::Status));
+        assert_eq!(parse_daemon_args("stop"), Ok(DaemonAction::Stop));
+    }
+
+    #[test]
+    fn parse_daemon_args_rejects_start_and_unknown() {
+        assert!(parse_daemon_args("start").is_err());
+        assert!(parse_daemon_args("bogus").is_err());
+    }
+
+    #[test]
+    fn daemon_usage_advertises_only_status_and_stop() {
+        let usage = SlashCommand::Daemon.argument_usage().unwrap();
+        assert_eq!(usage, "[status|stop]");
+    }
+
+    #[test]
     fn render_mcp_status_lists_master_and_each_server() {
         assert_eq!(
             render_mcp_status(true, &[("fs".into(), true), ("gh".into(), false)]),
@@ -866,7 +978,10 @@ mod tests {
 
     #[test]
     fn the_legacy_kanban_name_still_resolves_to_the_command() {
-        assert_eq!(SlashCommand::from_name("kanban"), Some(SlashCommand::Kanban));
+        assert_eq!(
+            SlashCommand::from_name("kanban"),
+            Some(SlashCommand::Kanban)
+        );
         assert_eq!(
             SlashCommand::from_name("superpowers-kanban"),
             Some(SlashCommand::Kanban)
@@ -883,5 +998,86 @@ mod tests {
             command.description()
         );
         assert!(SlashCommand::all().contains(&SlashCommand::Kanban));
+    }
+
+    #[test]
+    fn hidden_commands_are_completable_but_still_resolve() {
+        let completable: Vec<&str> = SlashCommand::completable()
+            .iter()
+            .map(|c| c.name())
+            .collect();
+        for hidden in ["approve", "deny", "budget", "priority"] {
+            assert!(
+                !completable.contains(&hidden),
+                "{hidden} must be hidden from completion"
+            );
+            assert!(
+                SlashCommand::from_name(hidden).is_some(),
+                "{hidden} must still resolve (anchor for re-entry)"
+            );
+        }
+        // `all()` keeps them so `from_name` and the catalog assertions are intact.
+        assert!(SlashCommand::all().iter().any(|c| c.name() == "approve"));
+    }
+
+    #[test]
+    fn hidden_commands_report_a_reason_not_unknown() {
+        assert_eq!(
+            SlashCommand::Approve.unavailable_reason(),
+            Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
+        );
+        assert_eq!(
+            SlashCommand::Deny.unavailable_reason(),
+            Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
+        );
+        assert_eq!(
+            SlashCommand::Budget.unavailable_reason(),
+            Some("daemon 尚未提供预算/优先级写接口")
+        );
+        assert_eq!(
+            SlashCommand::Priority.unavailable_reason(),
+            Some("daemon 尚未提供预算/优先级写接口")
+        );
+        // Exactly four commands are hidden: pin the boundary so a regression that
+        // clears one of these reasons, or that marks a wired command unavailable,
+        // fails here instead of slipping through an `is_some()`/`is_none()` check.
+        assert_eq!(SlashCommand::Quit.unavailable_reason(), None);
+        assert_eq!(SlashCommand::Cost.unavailable_reason(), None);
+        assert_eq!(SlashCommand::Daemon.unavailable_reason(), None);
+        assert_eq!(SlashCommand::Kanban.unavailable_reason(), None);
+    }
+
+    #[test]
+    fn full_help_lists_only_completable_commands() {
+        let help = help_text(None);
+        for hidden in ["/approve", "/deny", "/budget", "/priority"] {
+            assert!(!help.contains(hidden), "full help must not list {hidden}");
+        }
+        assert!(help.contains("/config") && help.contains("/model") && help.contains("/daemon"));
+    }
+
+    #[test]
+    fn config_snapshot_renders_key_fields_without_secrets() {
+        let snap = TuiConfigSnapshot {
+            provider: "anthropic".into(),
+            workdir: std::path::PathBuf::from("/tmp/proj"),
+            sandbox: "workspace-write".into(),
+            yolo: false,
+            max_turns: 200,
+            compact_threshold: 160_000,
+            mcp_master: true,
+            runtime_preference: "ask".into(),
+            runtime_preference_path: std::path::PathBuf::from(
+                "/tmp/proj/.yi-agent/preferences.json",
+            ),
+        };
+        let text = snap.render("claude-sonnet-4-5");
+        assert!(text.contains("anthropic"));
+        assert!(text.contains("claude-sonnet-4-5"));
+        assert!(text.contains("/tmp/proj"));
+        assert!(text.contains("workspace-write"));
+        assert!(text.contains("160000") || text.contains("160_000"));
+        assert!(!text.to_lowercase().contains("api_key"));
+        assert!(!text.to_lowercase().contains("api-key"));
     }
 }
