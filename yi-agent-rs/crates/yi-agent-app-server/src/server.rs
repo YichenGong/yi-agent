@@ -1871,8 +1871,6 @@ where
                             Some(c) => c,
                             None => continue,
                         };
-                        let thread_store =
-                            Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
                         // 新线程一律以 Normal 起步;同一值既用于建 agent,也落盘 meta,
                         // 抽成局部量避免两处字面量漂移。
@@ -1885,132 +1883,33 @@ where
                                 continue;
                             }
                         };
-                        // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
-                        // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
-                        let runtime_dir =
-                            yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
-                        let activation = attach_delegation(
+
+                        // 内核负责「attach_delegation → 建 driver 通道 → insert 到
+                        // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
+                        // 本分支完成,与抽取前逐字一致。
+                        start_thread_core(
+                            &mut threads,
+                            &mut pending_activation,
+                            &mut process_watches,
                             &runtimes,
                             &thread_roots,
-                            &runtime_dir,
                             &cfg,
                             &cwd,
-                            &thread_id,
-                            &theme,
+                            mode,
+                            thread_id.clone(),
                             built,
-                        );
-                        let BuiltAgent {
-                            agent,
-                            provider,
-                            config,
-                            decision_tx,
-                            catalog,
-                            yolo,
-                            process_manager,
-                            ..
-                        } = activation.built;
-                        pending_activation.insert(thread_id.clone(), activation.runtime);
-
-                        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
-                        let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
-                        let (interject_tx, interject_rx) =
-                            mpsc::channel::<InterjectionRequest>(16);
-                        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+                            &hub,
+                            &client,
+                            &turn_tx,
+                            &pending,
+                            permission_timeout,
+                            &perm_seq,
+                            &theme,
+                            &workspaces,
+                        )
+                        .await?;
 
                         let model = cfg.model.clone();
-
-                        let now = crate::thread_store::now_millis();
-                        let meta = crate::thread_store::ThreadMeta {
-                            thread_id: thread_id.clone(),
-                            cwd: cwd.clone(),
-                            model: model.clone(),
-                            created_at: now,
-                            updated_at: now,
-                            title: None,
-                            permission_mode: mode,
-                            pin_seq: None,
-                        };
-                        if let Err(e) = thread_store.create(&meta) {
-                            // 持久化是尽力而为:写失败不阻断 thread 创建。
-                            eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
-                        }
-                        // 记录到全局「最近目录」索引,供 thread/listAll 与侧栏复用。
-                        // 索引键统一为 canonical,与 workspace/remove 的规范化对齐;
-                        // thread 的 cwd / meta 仍保持 `resolve_thread_cwd` 的原样。
-                        let index_path =
-                            std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(&cwd));
-                        if let Err(e) = workspaces.add(&index_path) {
-                            eprintln!(
-                                "[app-server] failed to record workspace {}: {e}",
-                                index_path.display()
-                            );
-                        }
-
-                        // 先建句柄:同一 `Arc` 既存进 session 供 `thread/list` 读,
-                        // 也交给 driver 供其推送 `thread/status/updated`。
-                        let store_status = ThreadSession::new_status();
-                        threads.insert(
-                            thread_id.clone(),
-                            ThreadSession {
-                                thread_id: thread_id.clone(),
-                                cwd: cwd.clone(),
-                                model: model.clone(),
-                                active_turn_id: None,
-                                yolo,
-                                process_manager: Arc::clone(&process_manager),
-                                prompt_tx,
-                                interrupt_tx,
-                                interject_tx,
-                                session_tx,
-                                store: Arc::clone(&thread_store),
-                                status: Arc::clone(&store_status),
-                            },
-                        );
-
-                        // 先停旧守望者、再订阅本次生效的 manager。`thread/start` 通常没有
-                        // 旧守望者(remove 得到 None,no-op),但 `thread/resume` 恢复一个
-                        // 仍在内存的活 thread 时会换掉生效的 manager:旧守望者若被
-                        // `contains_key` 守卫留下,就仍订阅那份已被丢弃的 manager,与
-                        // `process/list` 用的新 manager 脱节,`process/updated` 静默失联。
-                        if let Some(previous) = process_watches.remove(&thread_id) {
-                            previous.stop().await;
-                        }
-                        let rx = process_manager.subscribe();
-                        let handle = tokio::spawn(watch_processes(
-                            Arc::clone(&hub),
-                            thread_id.clone(),
-                            Arc::clone(&process_manager),
-                            rx,
-                        ));
-                        process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
-
-                        // 每个 thread 一个 driver task:独占 agent 与两个 receiver,
-                        // 串行驱动 turn。
-                        let driver_hub = Arc::clone(&hub);
-                        let driver_client = client.clone();
-                        let driver_turn_tx = turn_tx.clone();
-                        let driver_thread_id = thread_id.clone();
-                        tokio::spawn(run_thread_driver(
-                            driver_thread_id,
-                            agent,
-                            prompt_rx,
-                            interrupt_rx,
-                            interject_rx,
-                            session_rx,
-                            driver_hub,
-                            driver_client,
-                            driver_turn_tx,
-                            decision_tx,
-                            Arc::clone(&pending),
-                            permission_timeout,
-                            Arc::clone(&perm_seq),
-                            catalog,
-                            Arc::clone(&thread_store),
-                            Arc::clone(&store_status),
-                            provider,
-                            config,
-                        ));
-
                         write_notification(&hub, &Notification::ThreadStarted {
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
@@ -2683,85 +2582,21 @@ where
                         write_response(&hub, &client, ok_response(id, result)).await?;
                     }
                     "turn/start" => {
-                        // `id` 后续响应仍需使用,故传 clone。
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        let prompt = match extract_prompt(&req.params) {
-                            Some(p) => p,
-                            None => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::invalid_params("missing or empty input text"),
-                                    ),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-
-                        let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
-                        // 内层作用域:让 `&mut threads` 的借用先结束,后续错误
-                        // 路径才能再次 `threads.get_mut`。
-                        let (prompt_tx, status_handle) = {
-                            let Some(session) = threads.get_mut(&thread_id) else {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::unknown_thread(&thread_id)),
-                                )
-                                .await?;
-                                continue;
-                            };
-                            if session.active_turn_id.is_some() {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::turn_in_progress(&thread_id)),
-                                )
-                                .await?;
-                                continue;
-                            }
-                            session.active_turn_id = Some(turn_id.clone());
-                            (session.prompt_tx.clone(), Arc::clone(&session.status))
-                        };
-
-                        // 顺序确定:先 turn/started 通知,再推 Running 状态,再响应,
-                        // 最后投递 prompt。
-                        write_notification(&hub, &Notification::TurnStarted {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                            },
+                        // 校验 / 占 `active_turn_id` / turn/started / Running 状态 /
+                        // 响应 / 投递 prompt 全在 start_turn_core 内,顺序与抽取前一致;
+                        // `Ok(None)` 表示已写过错误响应,这里 continue。
+                        if start_turn_core(
+                            &mut threads,
+                            &pending_activation,
+                            &hub,
+                            &client,
+                            &req.params,
+                            id,
                         )
-                        .await?;
-                        update_status(&hub, &status_handle, &thread_id, ThreadStatus::Running)
-                            .await?;
-                        write_response(
-                            &hub, &client,
-                            ok_response(id, json!({ "turn_id": turn_id.clone() })),
-                        )
-                        .await?;
-
-                        let activate = pending_activation
-                            .get(&thread_id)
-                            .cloned()
-                            .flatten();
-                        if prompt_tx
-                            .send(TurnPrompt {
-                                turn_id,
-                                prompt,
-                                activate,
-                            })
-                            .await
-                            .is_err()
+                        .await?
+                        .is_none()
                         {
-                            // driver 已退出(理论上不会):清掉活跃标记,
-                            // 避免后续 turn 永远报 turn_in_progress。
-                            if let Some(s) = threads.get_mut(&thread_id) {
-                                s.active_turn_id = None;
-                            }
+                            continue;
                         }
                     }
                     "turn/interrupt" => {
@@ -4434,6 +4269,257 @@ fn item_id(item: &crate::protocol::Item) -> Option<&str> {
         | crate::protocol::Item::ToolCall { id, .. }
         | crate::protocol::Item::UserInterjection { id, .. } => Some(id),
     }
+}
+
+/// 起一个 thread 的内核:attach_delegation → 建 driver 通道 → 登记进 `threads`
+/// → spawn 进程守望者与 driver task。
+///
+/// `built` 由调用方先经 `build_agent` 造好(工厂在 `serve`/调度器里同步调用,不在
+/// 本内核内),这样内核不必把 `&F` 跨 await 持有——否则会强加 `F: Sync` 并波及
+/// `serve` 的 Send 边界。只负责「得到一个已登记、driver 已 spawn 的 thread_id」
+/// 这件事;RPC 层的事(`resolve_thread_cwd` 的错误响应、`thread/started` 通知与
+/// 最终响应)留在调用方,以便调度器(Task 6b)复用同一内核而不发 RPC 帧。
+#[allow(clippy::too_many_arguments)]
+async fn start_thread_core(
+    threads: &mut HashMap<String, ThreadSession>,
+    pending_activation: &mut HashMap<String, Option<Arc<ThreadRoot>>>,
+    process_watches: &mut HashMap<String, ProcessWatch>,
+    runtimes: &ProjectRuntimes,
+    thread_roots: &ThreadRoots,
+    cfg: &RuntimeConfig,
+    cwd: &str,
+    mode: crate::thread_store::ThreadMode,
+    thread_id: String,
+    built: BuiltAgent,
+    hub: &Arc<crate::broadcast::Broadcaster>,
+    client: &crate::broadcast::ClientId,
+    turn_tx: &mpsc::Sender<TurnEvent>,
+    pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
+    permission_timeout: Duration,
+    perm_seq: &Arc<AtomicU64>,
+    theme: &crate::theme_tool::ThemeHandle,
+    workspaces: &WorkspaceIndex,
+) -> anyhow::Result<()> {
+    let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
+
+    // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
+    // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(cwd));
+    let activation = attach_delegation(
+        runtimes,
+        thread_roots,
+        &runtime_dir,
+        cfg,
+        cwd,
+        &thread_id,
+        theme,
+        built,
+    );
+    let BuiltAgent {
+        agent,
+        provider,
+        config,
+        decision_tx,
+        catalog,
+        yolo,
+        process_manager,
+        ..
+    } = activation.built;
+    pending_activation.insert(thread_id.clone(), activation.runtime);
+
+    let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+    let (interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
+    let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+
+    let model = cfg.model.clone();
+
+    let now = crate::thread_store::now_millis();
+    let meta = crate::thread_store::ThreadMeta {
+        thread_id: thread_id.clone(),
+        cwd: cwd.to_string(),
+        model: model.clone(),
+        created_at: now,
+        updated_at: now,
+        title: None,
+        permission_mode: mode,
+        pin_seq: None,
+    };
+    if let Err(e) = thread_store.create(&meta) {
+        // 持久化是尽力而为:写失败不阻断 thread 创建。
+        eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
+    }
+    // 记录到全局「最近目录」索引,供 thread/listAll 与侧栏复用。
+    // 索引键统一为 canonical,与 workspace/remove 的规范化对齐;
+    // thread 的 cwd / meta 仍保持 `resolve_thread_cwd` 的原样。
+    let index_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+    if let Err(e) = workspaces.add(&index_path) {
+        eprintln!(
+            "[app-server] failed to record workspace {}: {e}",
+            index_path.display()
+        );
+    }
+
+    // 先建句柄:同一 `Arc` 既存进 session 供 `thread/list` 读,
+    // 也交给 driver 供其推送 `thread/status/updated`。
+    let store_status = ThreadSession::new_status();
+    threads.insert(
+        thread_id.clone(),
+        ThreadSession {
+            thread_id: thread_id.clone(),
+            cwd: cwd.to_string(),
+            model: model.clone(),
+            active_turn_id: None,
+            yolo,
+            process_manager: Arc::clone(&process_manager),
+            prompt_tx,
+            interrupt_tx,
+            interject_tx,
+            session_tx,
+            store: Arc::clone(&thread_store),
+            status: Arc::clone(&store_status),
+        },
+    );
+
+    // 先停旧守望者、再订阅本次生效的 manager。`thread/start` 通常没有
+    // 旧守望者(remove 得到 None,no-op),但 `thread/resume` 恢复一个
+    // 仍在内存的活 thread 时会换掉生效的 manager:旧守望者若被
+    // `contains_key` 守卫留下,就仍订阅那份已被丢弃的 manager,与
+    // `process/list` 用的新 manager 脱节,`process/updated` 静默失联。
+    if let Some(previous) = process_watches.remove(&thread_id) {
+        previous.stop().await;
+    }
+    let rx = process_manager.subscribe();
+    let handle = tokio::spawn(watch_processes(
+        Arc::clone(hub),
+        thread_id.clone(),
+        Arc::clone(&process_manager),
+        rx,
+    ));
+    process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
+
+    // 每个 thread 一个 driver task:独占 agent 与两个 receiver,
+    // 串行驱动 turn。
+    let driver_hub = Arc::clone(hub);
+    let driver_client = client.clone();
+    let driver_turn_tx = turn_tx.clone();
+    let driver_thread_id = thread_id.clone();
+    tokio::spawn(run_thread_driver(
+        driver_thread_id,
+        agent,
+        prompt_rx,
+        interrupt_rx,
+        interject_rx,
+        session_rx,
+        driver_hub,
+        driver_client,
+        driver_turn_tx,
+        decision_tx,
+        Arc::clone(pending),
+        permission_timeout,
+        Arc::clone(perm_seq),
+        catalog,
+        Arc::clone(&thread_store),
+        Arc::clone(&store_status),
+        provider,
+        config,
+    ));
+
+    Ok(())
+}
+
+/// 起一个 turn 的内核:校验 thread、提取 prompt、占 `active_turn_id`、
+/// 推 `turn/started` 与 Running 状态、回响应,最后把 prompt 投给 driver。
+///
+/// 校验失败(未知 thread / 缺 threadId / 空 input / turn 进行中)在此就地写错误
+/// 响应并返回 `Ok(None)`,调用方据此 continue——与抽取前逐字一致(响应与
+/// `turn/started`/状态的先后顺序不变)。成功返回 `Ok(Some(turn_id))`。
+async fn start_turn_core(
+    threads: &mut HashMap<String, ThreadSession>,
+    pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
+    hub: &Arc<crate::broadcast::Broadcaster>,
+    client: &crate::broadcast::ClientId,
+    params: &serde_json::Value,
+    id: RequestId,
+) -> anyhow::Result<Option<String>> {
+    // `id` 后续响应仍需使用,故传 clone。
+    let Some(thread_id) = require_thread_id(hub, client, params, id.clone()).await? else {
+        return Ok(None);
+    };
+    let prompt = match extract_prompt(params) {
+        Some(p) => p,
+        None => {
+            write_response(
+                hub,
+                client,
+                err_response(id, RpcError::invalid_params("missing or empty input text")),
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+
+    let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
+    // 内层作用域:让 `&mut threads` 的借用先结束,后续错误
+    // 路径才能再次 `threads.get_mut`。
+    let (prompt_tx, status_handle) = {
+        let Some(session) = threads.get_mut(&thread_id) else {
+            write_response(
+                hub,
+                client,
+                err_response(id, RpcError::unknown_thread(&thread_id)),
+            )
+            .await?;
+            return Ok(None);
+        };
+        if session.active_turn_id.is_some() {
+            write_response(
+                hub,
+                client,
+                err_response(id, RpcError::turn_in_progress(&thread_id)),
+            )
+            .await?;
+            return Ok(None);
+        }
+        session.active_turn_id = Some(turn_id.clone());
+        (session.prompt_tx.clone(), Arc::clone(&session.status))
+    };
+
+    // 顺序确定:先 turn/started 通知,再推 Running 状态,再响应,
+    // 最后投递 prompt。
+    write_notification(
+        hub,
+        &Notification::TurnStarted {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await?;
+    update_status(hub, &status_handle, &thread_id, ThreadStatus::Running).await?;
+    write_response(
+        hub,
+        client,
+        ok_response(id, json!({ "turn_id": turn_id.clone() })),
+    )
+    .await?;
+
+    let activate = pending_activation.get(&thread_id).cloned().flatten();
+    if prompt_tx
+        .send(TurnPrompt {
+            turn_id,
+            prompt,
+            activate,
+        })
+        .await
+        .is_err()
+    {
+        // driver 已退出(理论上不会):清掉活跃标记,
+        // 避免后续 turn 永远报 turn_in_progress。
+        if let Some(s) = threads.get_mut(&thread_id) {
+            s.active_turn_id = None;
+        }
+    }
+    Ok(Some(thread_id))
 }
 
 /// 解析 `thread/start` 的目标目录:显式 `params.cwd` 优先,缺省用 `cfg.workdir`。
