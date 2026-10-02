@@ -2398,31 +2398,62 @@ impl RuntimeCoordinator {
             ));
         }
         let staged_integration = integration.clone();
-        supervisor
-            .stage_review_with_persistence(
-                |supervisor| {
-                    supervisor.accept_review(
+        // The staging closure writes the reducer's cascade victims into this
+        // side channel as it runs. `stage_review_with_persistence` restores its
+        // in-memory snapshot before returning a persist failure, which would
+        // otherwise discard the id list along with the rolled-back state.
+        let mut stage_victims: Vec<TaskId> = Vec::new();
+        let staged = supervisor.stage_review_with_persistence(
+            |supervisor| {
+                let (_, victims) =
+                    supervisor.accept_review(task, &parent, delivery.id.clone(), staged_integration)?;
+                stage_victims = victims.clone();
+                Ok(victims)
+            },
+            |_| {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .accept_delivery_review(
                         task,
+                        &delivery.id,
                         &parent,
-                        delivery.id.clone(),
-                        staged_integration,
-                    )?;
-                    Ok(())
-                },
-                |_| {
-                    self.repository
-                        .lock()
-                        .expect("runtime repository mutex poisoned")
-                        .accept_delivery_review(
-                            task,
-                            &delivery.id,
-                            &parent,
-                            &integration,
-                            &actor_json,
-                        )
-                },
-            )
-            .map_err(review_persistence_error)?;
+                        &integration,
+                        &actor_json,
+                    )
+            },
+        );
+        let (victims, _) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                // The staging closure may have reduced the review to its
+                // settled `Completed` state and cascaded live descendants in
+                // memory before the repository write failed. Restoring the
+                // snapshot then resurrects those children (with their leases)
+                // while their workers stay cancelled, so no reconcile event can
+                // ever report them again. Persist the cascade durably anyway: a
+                // rolled-back in-memory child must not become a durable orphan.
+                if matches!(error, ReviewPersistenceError::Persistence(_)) {
+                    let message = review_persistence_error(error);
+                    drop(supervisor);
+                    let victims = stage_victims
+                        .into_iter()
+                        .filter(|id| id != task)
+                        .collect();
+                    self.persist_cascaded_tasks(victims)?;
+                    return Err(message);
+                }
+                return Err(review_persistence_error(error));
+            }
+        };
+        // Persist the cascade victims while the supervisor guard is still held,
+        // exactly like the watchdog path: a concurrent retry of a victim needs
+        // the same supervisor, so it cannot swap the victim's active attempt and
+        // defeat the guarded write below. `affected` always lists `task` first,
+        // and the reviewed task's own lease is released at the end of this
+        // function, so it must not be released twice here.
+        let victims = victims.into_iter().filter(|id| id != task).collect();
+        self.persist_cascaded_tasks(victims)?;
         drop(supervisor);
         self.release_resident_lease(task);
         Ok(())
@@ -2736,40 +2767,70 @@ impl RuntimeCoordinator {
             .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
         let reason_message = MessageId::new();
         let parent_notification = MessageId::new();
-        supervisor
-            .stage_review_with_persistence(
-                |supervisor| {
-                    supervisor.reject_review(
+        // Side channel for the reducer's cascade victims, because a persist
+        // failure restores the in-memory snapshot before returning.
+        let mut stage_victims: Vec<TaskId> = Vec::new();
+        let staged = supervisor.stage_review_with_persistence(
+            |supervisor| {
+                let (_, victims) = supervisor.reject_review(
+                    task,
+                    &parent,
+                    delivery.id.clone(),
+                    reason_message.clone(),
+                )?;
+                stage_victims = victims.clone();
+                supervisor
+                    .stage_persisted_message(MailboxMessageDraft::user_override_with_id(
+                        parent_notification.clone(),
+                        parent.clone(),
+                        review_parent_notification("rejected", task, &delivery.id),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                Ok(victims)
+            },
+            |_| {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .reject_delivery_review(
                         task,
+                        &delivery.id,
                         &parent,
-                        delivery.id.clone(),
-                        reason_message.clone(),
-                    )?;
-                    supervisor
-                        .stage_persisted_message(MailboxMessageDraft::user_override_with_id(
-                            parent_notification.clone(),
-                            parent.clone(),
-                            review_parent_notification("rejected", task, &delivery.id),
-                        ))
-                        .map_err(|error| error.to_string())?;
-                    Ok(())
-                },
-                |_| {
-                    self.repository
-                        .lock()
-                        .expect("runtime repository mutex poisoned")
-                        .reject_delivery_review(
-                            task,
-                            &delivery.id,
-                            &parent,
-                            reason,
-                            &reason_message,
-                            &actor_json,
-                            &parent_notification,
-                        )
-                },
-            )
-            .map_err(review_persistence_error)?;
+                        reason,
+                        &reason_message,
+                        &actor_json,
+                        &parent_notification,
+                    )
+            },
+        );
+        let (victims, _) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                // A rejection is a settled terminal state, so the staged reduce
+                // may already have cascaded live descendants whose workers were
+                // cancelled. The failed staging restores the snapshot and
+                // resurrects those children in memory, so persist the cascade
+                // from the captured ids anyway rather than stranding durable
+                // orphans with live leases.
+                if matches!(error, ReviewPersistenceError::Persistence(_)) {
+                    let message = review_persistence_error(error);
+                    drop(supervisor);
+                    let victims = stage_victims
+                        .into_iter()
+                        .filter(|id| id != task)
+                        .collect();
+                    self.persist_cascaded_tasks(victims)?;
+                    return Err(message);
+                }
+                return Err(review_persistence_error(error));
+            }
+        };
+        // Persist the cascade victims before releasing the guard, mirroring the
+        // watchdog path, so no concurrent retry can swap a victim's attempt
+        // between the reduce and the guarded write. `task` is excluded: it is
+        // released explicitly at the end of this function.
+        let victims = victims.into_iter().filter(|id| id != task).collect();
+        self.persist_cascaded_tasks(victims)?;
         supervisor
             .deliver_committed_user_instruction(&parent, &parent_notification)
             .map_err(RuntimeCoordinatorError::Supervisor)?;

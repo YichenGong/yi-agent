@@ -3338,6 +3338,92 @@ async fn a_watchdog_timed_out_parent_cascades_and_releases_its_childs_lease() {
     );
 }
 
+/// Accepting a review is a settled terminal transition, so it cascades the
+/// reviewed task's own live descendants.
+///
+/// The reviewed child here is itself the parent of a running grandchild. When
+/// the review is accepted the reviewed child completes, the reducer cancels the
+/// live grandchild in memory (and cancels its worker), and the returned victim
+/// list is the only report that grandchild will ever produce — `reconcile`
+/// skips tasks it already finds terminal. The coordinator must persist the
+/// grandchild as `cancelled` and release its lease instead of discarding the
+/// list.
+#[tokio::test]
+async fn an_accepted_review_cascades_and_releases_its_childs_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let reviewed = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator.start_worker(&session, &reviewed).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0]
+        .workspace_lease_id
+        .clone()
+        .unwrap();
+    let grandchild = coordinator.spawn_child(&session, &reviewed).await.unwrap();
+    coordinator
+        .start_worker(&session, &grandchild)
+        .await
+        .unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&grandchild, "workspace:")
+            .unwrap(),
+        "fixture requires the grandchild to hold a workspace lease"
+    );
+
+    // The reviewed child delivers a commit and waits for its parent's review.
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p reviewed");
+    factory
+        .handles
+        .lock()
+        .unwrap()
+        .first()
+        .unwrap()
+        .report_delivery(delivery.clone());
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&reviewed)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+
+    // Accepting that review completes the reviewed task, which must cascade the
+    // still-live grandchild.
+    coordinator
+        .accept_review(
+            &reviewed,
+            IntegrationValidation::passed("cargo test -p root"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&reviewed)
+            .unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        coordinator.task_state(&grandchild).unwrap(),
+        "cancelled",
+        "the cascaded grandchild must be durably cancelled, not left running"
+    );
+    assert!(
+        !RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&grandchild, "workspace:")
+            .unwrap(),
+        "the cascaded grandchild must release its workspace lease"
+    );
+}
+
 /// A later start of a non-terminal parent must not strand a live descendant.
 ///
 /// The parent is paused (pausing never cascades) and then resumed, which sends

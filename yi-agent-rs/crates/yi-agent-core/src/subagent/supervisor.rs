@@ -1675,20 +1675,25 @@ impl AgentSupervisor {
 
     /// Applies an accepted delivery through the task reducer. The reducer
     /// verifies both direct-parent ownership and integration evidence.
+    ///
+    /// An accepted delivery reaches `TaskState::Completed`, a settled terminal
+    /// state, so `reduce_task` can fire the parent-terminal cascade. The id list
+    /// is returned alongside the attempt so callers persist the cascade victims
+    /// instead of leaving them running with live leases.
     pub fn accept_review(
         &mut self,
         task_id: &TaskId,
         actor: &TaskId,
         delivery_id: DeliveryId,
         integration: IntegrationValidation,
-    ) -> Result<AttemptId, String> {
+    ) -> Result<(AttemptId, Vec<TaskId>), String> {
         let attempt_id = self
             .tasks
             .get(task_id)
             .ok_or_else(|| "task does not exist".to_string())?
             .active_attempt_id()
             .clone();
-        self.reduce_task(
+        let affected = self.reduce_task(
             task_id,
             TaskEvent::ReviewAccepted {
                 attempt_id: attempt_id.clone(),
@@ -1698,7 +1703,7 @@ impl AgentSupervisor {
             },
         )?;
         self.notify_update();
-        Ok(attempt_id)
+        Ok((attempt_id, affected))
     }
 
     /// Requests rework of the exact reviewed delivery and returns the newly
@@ -1786,13 +1791,17 @@ impl AgentSupervisor {
     }
 
     /// Rejects the exact reviewed delivery through reducer-owned state.
+    ///
+    /// A rejection blocks the reviewed task, which is also a settled terminal
+    /// state, so the reducer's parent-terminal cascade can fire here too; the
+    /// affected ids are returned so the runtime can persist the victims.
     pub fn reject_review(
         &mut self,
         task_id: &TaskId,
         actor: &TaskId,
         delivery_id: DeliveryId,
         reason: MessageId,
-    ) -> Result<AttemptId, String> {
+    ) -> Result<(AttemptId, Vec<TaskId>), String> {
         if self
             .tasks
             .get(task_id)
@@ -1807,7 +1816,7 @@ impl AgentSupervisor {
             .ok_or_else(|| "task does not exist".to_string())?
             .active_attempt_id()
             .clone();
-        self.reduce_task(
+        let affected = self.reduce_task(
             task_id,
             TaskEvent::ReviewRejected {
                 attempt_id: attempt_id.clone(),
@@ -1824,7 +1833,7 @@ impl AgentSupervisor {
         ))
         .map_err(|error| error.to_string())?;
         self.notify_update();
-        Ok(attempt_id)
+        Ok((attempt_id, affected))
     }
 
     pub fn record_recovery_conflict(
