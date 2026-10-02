@@ -577,7 +577,8 @@ fn thread_summary_json(
                             crate::thread_store::assign_pin_seqs(&ids, &current_seq);
                         let mut err: Option<RpcError> = None;
                         for (tid, seq) in assignments {
-                            let store = store_for(&workspaces, &cfg, &tid);
+                            // 活跃线程复用共享 meta_lock;冷线程回退 store_for。
+                            let store = store_lookup(&threads, &workspaces, &cfg, &tid);
                             match store.set_pin_seq(&tid, Some(seq)) {
                                 Ok(true) => {}
                                 Ok(false) => {

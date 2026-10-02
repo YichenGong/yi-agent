@@ -122,7 +122,7 @@ pub fn set_pin_seq(&self, id: &str, seq: Option<i64>) -> io::Result<bool>;
 对齐既有 `thread/setPermissionMode` 的写法：用 `store_lookup` 定位 store，
 错误码用 `RpcError::unknown_thread` / `RpcError::invalid_params` / `RpcError::internal`。
 
-新增共享 helper（`server.rs`）：`collect_pinned(workspaces) -> Vec<(String /*id*/, i64 /*seq*/, i64 /*updated_at*/)>`，
+新增共享 helper（`server.rs`）：`collect_pinned(workspaces: &WorkspaceIndex) -> Vec<crate::thread_store::ThreadMeta>`，
 遍历 `workspaces.list()` 下每个目录的 `ThreadStore`，收集 `pin_seq.is_some()` 的
 thread。`thread/listAll` 的顶层 `pinned` 与该 helper、`thread/reorderPinned` 的校验共用它。
 

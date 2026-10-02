@@ -385,15 +385,20 @@ pub fn now_millis() -> i64 {
 /// 计算重排后的 `pin_seq` 赋值。`order` 为**从顶到底**的完整有序 id 列表，
 /// `current` 为这些 id 当前的 `pin_seq`。
 ///
-/// 算法：取 `current` 中现有 `pin_seq` 的**互异**值升序得 `seqs`；把 `order`
-/// 从顶到底依次赋值为 `seqs` 的从大到小（`order[0]` 拿最大）。复用既有互异
-/// 数值做双射，永不产生新的重复值，且与「数值越大越靠前」的排序契约一致。
+/// 前提：`current` 需覆盖 `order` 中的 id（缺失按未置顶补号处理）。
+///
+/// 算法：取 `order` 中 id 在 `current` 里现有 `pin_seq` 的**互异**值升序得
+/// `seqs`；把 `order` 从顶到底依次赋值为 `seqs` 的从大到小（`order[0]` 拿最大）。
+/// 复用既有互异数值做双射，永不产生新的重复值，且与「数值越大越靠前」的排序契约一致。
 /// 若互异值不够（有 `None` 或历史重复值），从 `max(seqs)+1` 起补足。
 pub(crate) fn assign_pin_seqs(
     order: &[String],
     current: &HashMap<String, Option<i64>>,
 ) -> Vec<(String, i64)> {
-    let mut seqs: Vec<i64> = current.values().filter_map(|v| *v).collect();
+    let mut seqs: Vec<i64> = order
+        .iter()
+        .filter_map(|id| current.get(id).copied().flatten())
+        .collect();
     seqs.sort_unstable();
     seqs.dedup();
     if seqs.len() < order.len() {
@@ -1036,7 +1041,6 @@ mod tests {
 
     #[test]
     fn assign_pin_seqs_reproduces_requested_order_top_to_bottom() {
-        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut cur = HashMap::new();
         cur.insert("a".to_string(), Some(10));
         cur.insert("b".to_string(), Some(20));
@@ -1057,7 +1061,6 @@ mod tests {
         seqs.sort_unstable();
         seqs.dedup();
         assert_eq!(seqs.len(), 3, "不得产生重复 seq");
-        let _ = ids;
     }
 
     #[test]
