@@ -53,6 +53,7 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onNew: vi.fn(),
     onRemoveWorkspace: vi.fn(),
     onBrowse: vi.fn(),
+    onOpenSettings: vi.fn(),
     ...overrides,
   };
   return props;
@@ -517,5 +518,12 @@ describe("ThreadSidebar pinned section", () => {
       (r) => r.getAttribute("draggable") !== "true",
     );
     expect(notDraggable).toBe(true);
+  });
+
+  it("offers a settings button in the footer", () => {
+    const onOpenSettings = vi.fn();
+    renderSidebar({ onOpenSettings });
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
   });
 });

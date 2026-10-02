@@ -77,6 +77,7 @@ export function ThreadSidebar({
   onNew,
   onRemoveWorkspace,
   onBrowse,
+  onOpenSettings,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -98,6 +99,7 @@ export function ThreadSidebar({
   onRemoveWorkspace: (cwd: string) => void;
   /** Open the native folder picker (App adds the dir + creates a thread). */
   onBrowse: () => void;
+  onOpenSettings: () => void;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -532,6 +534,20 @@ export function ThreadSidebar({
             </div>
           );
         })}
+      </div>
+      <div className="mt-auto flex items-center border-t border-line p-2">
+        <button
+          type="button"
+          aria-label="设置"
+          title="设置"
+          onClick={onOpenSettings}
+          className="rounded p-1 text-fg-subtle hover:bg-raised/50 hover:text-fg"
+        >
+          <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden="true">
+            <path d="M8 10.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" />
+            <path d="M6.9 1.3a.7.7 0 0 0-.7.6l-.1.9a5.4 5.4 0 0 0-.9.5l-.9-.3a.7.7 0 0 0-.8.3l-.7 1.2a.7.7 0 0 0 .1.9l.7.6a5.5 5.5 0 0 0 0 1l-.7.6a.7.7 0 0 0-.1.9l.7 1.2a.7.7 0 0 0 .8.3l.9-.3c.3.2.6.4.9.5l.1.9a.7.7 0 0 0 .7.6h1.4a.7.7 0 0 0 .7-.6l.1-.9c.3-.1.6-.3.9-.5l.9.3a.7.7 0 0 0 .8-.3l.7-1.2a.7.7 0 0 0-.1-.9l-.7-.6a5.5 5.5 0 0 0 0-1l.7-.6a.7.7 0 0 0 .1-.9l-.7-1.2a.7.7 0 0 0-.8-.3l-.9.3a5.4 5.4 0 0 0-.9-.5l-.1-.9a.7.7 0 0 0-.7-.6H6.9Zm1.1 8a1.6 1.6 0 1 1 0-3.2 1.6 1.6 0 0 1 0 3.2Z" />
+          </svg>
+        </button>
       </div>
       <div
         role="separator"
