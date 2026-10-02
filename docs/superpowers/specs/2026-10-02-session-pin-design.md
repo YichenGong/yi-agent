@@ -110,7 +110,7 @@ pub fn set_pin_seq(&self, id: &str, seq: Option<i64>) -> io::Result<bool>;
 ```
 
 重排的落盘由 RPC 处理函数完成：对 `assign_pin_seqs` 的每个 `(id, seq)`，用
-`store_for(workspaces, cfg, id)` 定位其 store 后调用 `set_pin_seq`。
+`store_lookup(threads, workspaces, cfg, id)` 定位其 store 后调用 `set_pin_seq`（活跃线程复用其共享 `meta_lock`；冷线程内部回退 `store_for`）。
 
 - 写入条目数取决于位移跨度，最坏 `O(n)`（把最后一项拖到最前，会整体下移）；
   相邻两项交换只改 2 条。置顶集合通常很小，写放大可接受。
@@ -142,7 +142,7 @@ thread。`thread/listAll` 的顶层 `pinned` 与该 helper、`thread/reorderPinn
 - 校验（用 `collect_pinned`）：`threadIds` 中每个 id 均属当前已置顶集合，
   且**无重复**、**集合与当前全部置顶会话完全一致**（不缺、不多）。
   任一不满足返回 `invalid_params`，不做任何写入。
-- 通过后按 §4.2 算法重写 `pin_seq`，跨工作目录逐条用 `store_for` 写盘，返回 `{}`。
+- 通过后按 §4.2 算法重写 `pin_seq`，跨工作目录逐条用 `store_lookup` 写盘（活跃线程复用共享 `meta_lock`，避免与 driver 的 `touch` 互相覆盖），返回 `{}`。
 - 并发说明：若在客户端取列表与提交重排之间，另一客户端改变了置顶集合，
   校验失败 → `invalid_params`；客户端应重拉列表（见 §6）。
 
