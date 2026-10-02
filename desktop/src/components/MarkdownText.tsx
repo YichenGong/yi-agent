@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "highlight.js/styles/github-dark.css";
+import "../lib/highlight-light.css";
 
 /**
  * 外链在系统浏览器打开,避免 webview 被导航走。

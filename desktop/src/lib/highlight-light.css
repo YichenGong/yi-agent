@@ -1,0 +1,26 @@
+/* 浅色主题下的代码高亮。深色由 highlight.js 的 github-dark 主题承担。 */
+[data-theme="light"] .hljs {
+  color: #24292e;
+  background: #f6f8fa;
+}
+[data-theme="light"] .hljs-comment,
+[data-theme="light"] .hljs-quote {
+  color: #6a737d;
+}
+[data-theme="light"] .hljs-keyword,
+[data-theme="light"] .hljs-selector-tag,
+[data-theme="light"] .hljs-built_in {
+  color: #d73a49;
+}
+[data-theme="light"] .hljs-string,
+[data-theme="light"] .hljs-attr {
+  color: #032f62;
+}
+[data-theme="light"] .hljs-number,
+[data-theme="light"] .hljs-literal {
+  color: #005cc5;
+}
+[data-theme="light"] .hljs-title,
+[data-theme="light"] .hljs-function .hljs-title {
+  color: #6f42c1;
+}
