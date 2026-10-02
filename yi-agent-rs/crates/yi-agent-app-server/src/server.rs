@@ -109,10 +109,53 @@ pub(crate) struct RuntimeAttachments {
     /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
     /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
     pub(crate) theme: crate::theme_tool::ThemeHandle,
+    /// 安装常驻值守（macOS LaunchAgent）。可注入的理由同 `launcher`：测试里
+    /// 绝不能真的调 `launchctl`，也绝不能碰用户真实的 `~/Library/LaunchAgents`。
+    pub(crate) watchman_install: WatchmanInstall,
+    /// 卸载常驻值守。可注入的理由同 `watchman_install`。
+    pub(crate) watchman_uninstall: WatchmanUninstall,
+    /// 值守安装/卸载所针对的 home（生产：真实 `$HOME`；测试：tempdir）。
+    /// 它是「往哪个 `Library/LaunchAgents` 写」与「读哪个 plist 判已装」的
+    /// 唯一来源，抽出来测试才不会误判真实 home 里的安装状态。
+    pub(crate) watchman_home: PathBuf,
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
 type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
+
+/// Installs the resident watchman (macOS LaunchAgent) for `exe` under `home`;
+/// see [`yi_agent_boards::watchman::install`].
+type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
+
+/// Removes the resident watchman under `home`; see
+/// [`yi_agent_boards::watchman::uninstall`].
+type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+
+/// 生产环境的 `$HOME`。未设置时回退空路径——与 `board_dir` 同一策略：宁可把
+/// 值守装进一个无人读取的目录，也不要因为环境缺失让整个服务起不来。
+pub(crate) fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+}
+
+/// 开关为开、且现有 plist 未指向当前可执行文件时安装值守。
+///
+/// best-effort：安装失败只记日志。调用方是 `board/create`，创建一个看板不该
+/// 因为装不上开机自启而整体失败。`EXE` 换位置也要重装（升级后常见），故判据是
+/// [`yi_agent_boards::watchman::is_installed_for`] 而非「plist 是否存在」。
+fn ensure_watchman_installed(workdir: &Path, home: &Path, install: &WatchmanInstall) {
+    if !crate::settings_store::load_watchman_enabled(workdir) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if yi_agent_boards::watchman::is_installed_for(home, &exe) {
+        return;
+    }
+    if let Err(error) = install(&exe, home) {
+        tracing::warn!(%error, "failed to install the board watchman");
+    }
+}
 
 /// The key that identifies one project directory across this process.
 ///
@@ -1015,6 +1058,9 @@ where
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
+            watchman_install: Arc::new(yi_agent_boards::watchman::install),
+            watchman_uninstall: Arc::new(yi_agent_boards::watchman::uninstall),
+            watchman_home: home_dir(),
         },
         production_factory(cfg, theme_for_factory),
     )
@@ -1291,6 +1337,9 @@ where
         resident_dir,
         launcher: board_launcher,
         theme,
+        watchman_install,
+        watchman_uninstall,
+        watchman_home,
     } = attachments;
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
@@ -1510,15 +1559,65 @@ where
                     "ui/settings/read" => {
                         // 以共享句柄的当前值为权威（与 `set_theme` 工具同一实例）;
                         // 句柄在构造时已从磁盘载入，故首次读即反映持久化值。
+                        // 值守开关是宿主级偏好，与 theme 同处一个文件，目录取
+                        // 句柄的 workdir 以保证两者读写的是同一个 preferences.json。
                         let theme = theme_handle.current();
+                        let workdir = theme_handle.workdir();
+                        let watchman_enabled =
+                            crate::settings_store::load_watchman_enabled(workdir);
                         write_response(
                             &hub,
                             &client,
-                            ok_response(id, json!({ "theme": theme.as_str() })),
+                            ok_response(
+                                id,
+                                json!({
+                                    "theme": theme.as_str(),
+                                    "board_watchman_enabled": watchman_enabled,
+                                }),
+                            ),
                         )
                         .await?;
                     }
                     "ui/settings/write" => {
+                        if let Some(enabled) =
+                            req.params.get("board_watchman_enabled").and_then(|v| v.as_bool())
+                        {
+                            let workdir = theme_handle.workdir();
+                            // 落盘失败就整体失败：偏好没写成功却去动系统状态，
+                            // 会让开关与磁盘记录不一致。
+                            if let Err(error) =
+                                crate::settings_store::save_watchman_enabled(workdir, enabled)
+                            {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::internal(error.to_string())),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            // 落盘成功但装/卸失败不能静默：开关状态与系统实际
+                            // 状态已经不一致，前端需要拿到原因做内联提示。
+                            let outcome = if enabled {
+                                match std::env::current_exe() {
+                                    Ok(exe) => watchman_install(&exe, &watchman_home),
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            } else {
+                                watchman_uninstall(&watchman_home)
+                            };
+                            let warning = outcome.err();
+                            if let Some(warning) = &warning {
+                                tracing::warn!(%warning, enabled, "board watchman switch did not take effect");
+                            }
+                            write_response(
+                                &hub,
+                                &client,
+                                ok_response(id, json!({ "ok": true, "warning": warning })),
+                            )
+                            .await?;
+                            continue;
+                        }
                         let requested = req
                             .params
                             .get("theme")
@@ -1606,6 +1705,14 @@ where
                             &mut launcher,
                         ) {
                             Ok(status) => {
+                                // 看板建好后确保值守在装：开关为开且 plist 未指向
+                                // 当前 exe 时装上。best-effort——装不上值守不该让
+                                // 「创建成功」变成失败（前端已拿到看板）。
+                                ensure_watchman_installed(
+                                    theme_handle.workdir(),
+                                    &watchman_home,
+                                    &watchman_install,
+                                );
                                 write_response(&hub, &client, ok_response(id, to_json(&status))).await?
                             }
                             Err(message) => {
@@ -4307,6 +4414,104 @@ mod board_rpc_tests {
         h.shutdown().await;
     }
 
+    /// 开关为开（缺省）时，首次 `board/create` 确保值守已装：装的是当前 exe、
+    /// 针对注入的 home。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn creating_a_board_ensures_the_watchman_is_installed() {
+        // 自带 workdir，避免与其它测试共享的默认目录里的偏好互相干扰。
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = tests::default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = tests::Harness::with_cfg(cfg).await;
+        tests::initialize(&mut h).await;
+        let calls = Arc::clone(&h.watchman_calls);
+        let home = h._watchman_home.path().to_path_buf();
+        let project = tempfile::TempDir::new().unwrap();
+
+        let created = rpc(
+            &mut h,
+            2,
+            "board/create",
+            json!({ "project": project.path().canonicalize().unwrap().to_string_lossy() }),
+        )
+        .await;
+        assert!(created.get("error").is_none(), "{created}");
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "开关为开时创建看板要装一次值守: {recorded:?}"
+        );
+        assert!(recorded[0].0, "是安装而不是卸载");
+        assert_eq!(recorded[0].1, home, "必须针对注入的 home");
+        h.shutdown().await;
+    }
+
+    /// 开关为关时 `board/create` 不得装值守：用户明确关掉了开机自启。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn creating_a_board_leaves_the_watchman_alone_when_the_switch_is_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = tests::default_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = tests::Harness::with_cfg(cfg).await;
+        tests::initialize(&mut h).await;
+        let calls = Arc::clone(&h.watchman_calls);
+
+        let off = rpc(
+            &mut h,
+            2,
+            "ui/settings/write",
+            json!({ "board_watchman_enabled": false }),
+        )
+        .await;
+        assert_eq!(off["result"]["ok"], true, "{off}");
+
+        let project = tempfile::TempDir::new().unwrap();
+        let created = rpc(
+            &mut h,
+            3,
+            "board/create",
+            json!({ "project": project.path().canonicalize().unwrap().to_string_lossy() }),
+        )
+        .await;
+        assert!(created.get("error").is_none(), "{created}");
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded.iter().all(|(installed, _)| !installed),
+            "关掉后只应有卸载，不应有安装: {recorded:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 值守安装失败不得让 `board/create` 失败：看板本身已经建好。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_watchman_install_does_not_fail_board_creation() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = tests::default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = tests::Harness::with_watchman(
+            cfg,
+            Arc::new(|_exe: &Path, _home: &Path| Err("launchctl is unavailable".to_string())),
+            Arc::new(|_home: &Path| Ok(())),
+        )
+        .await;
+        tests::initialize(&mut h).await;
+        let project = tempfile::TempDir::new().unwrap();
+
+        let created = rpc(
+            &mut h,
+            2,
+            "board/create",
+            json!({ "project": project.path().canonicalize().unwrap().to_string_lossy() }),
+        )
+        .await;
+        assert!(created.get("error").is_none(), "装值守失败不该拖垮创建:{created}");
+        assert_eq!(created["result"]["registered"], true, "{created}");
+        h.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn board_list_of_an_empty_registry_answers_with_no_boards() {
         let mut h = tests::Harness::new();
@@ -5220,6 +5425,11 @@ pub(crate) mod tests {
         super::tests_support::test_config()
     }
 
+    /// 与 `test_config` 同值，供 `board_rpc_tests` 构造自定义 config 的 harness。
+    pub(crate) fn default_config() -> RuntimeConfig {
+        super::tests_support::test_config()
+    }
+
     /// 用两条 `duplex` 管道把 server 与测试客户端对接。
     pub(crate) struct Harness {
         client_w: tokio::io::DuplexStream,
@@ -5235,11 +5445,25 @@ pub(crate) mod tests {
         /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
         /// 所得设备必须能被同一主循环的 `device/list` 看见。
         pairing: Arc<PairingState>,
+        /// 注入的 watchman 调用记录器:`(是否安装, 使用的 home)`，与
+        /// `launcher` 注入同一个理由——测试绝不能真的调 `launchctl`，也不能
+        /// 碰用户真实的 `~/Library/LaunchAgents`。
+        pub(crate) watchman_calls: WatchmanCalls,
+        /// 注入的 watchman home（tempdir），仅用于持有它。
+        pub(crate) _watchman_home: tempfile::TempDir,
     }
+
+    /// 记录到的 watchman 调用:安装为 `true`、卸载为 `false`，附所针对的 home。
+    pub(crate) type WatchmanCalls = Arc<StdMutex<Vec<(bool, PathBuf)>>>;
 
     impl Harness {
         pub(crate) fn new() -> Self {
             Self::with_factory(build_test_agent, PERMISSION_TIMEOUT)
+        }
+
+        /// 用自定义 config 搭建 harness（持久化测试需要自定义 workdir）。
+        pub(crate) async fn with_cfg(cfg: RuntimeConfig) -> Self {
+            Self::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT)
         }
 
         /// 用自定义 agent 工厂搭建 harness(慢 provider / 中断 / 权限测试需要)。
@@ -5281,11 +5505,76 @@ pub(crate) mod tests {
             Self::with_config_and_scope(test_config(), build_test_agent, PERMISSION_TIMEOUT, scope)
         }
 
+        /// 用注入的 watchman 安装/卸载行为搭建 harness。
+        ///
+        /// 默认 harness 的记录器只记账;要驱动「失败要回传 warning」这类分支,
+        /// 需要一个真的返回 `Err` 的注入点。
+        pub(crate) async fn with_watchman(
+            cfg: RuntimeConfig,
+            install: WatchmanInstall,
+            uninstall: WatchmanUninstall,
+        ) -> Self {
+            Self::with_config_and_scope_and_watchman(
+                cfg,
+                build_test_agent,
+                PERMISSION_TIMEOUT,
+                Scope::Admin,
+                install,
+                uninstall,
+                Arc::new(StdMutex::new(Vec::new())),
+            )
+        }
+
         fn with_config_and_scope<F>(
             cfg: RuntimeConfig,
             build: F,
             permission_timeout: Duration,
             scope: Scope,
+        ) -> Self
+        where
+            F: Fn(
+                    Option<yi_agent_core::Session>,
+                    &std::path::Path,
+                    crate::thread_store::ThreadMode,
+                ) -> anyhow::Result<BuiltAgent>
+                + Send
+                + 'static,
+        {
+            // 默认注入:只记录调用,不碰真实 launchd / home。
+            let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+            let install_calls = Arc::clone(&calls);
+            let uninstall_calls = Arc::clone(&calls);
+            Self::with_config_and_scope_and_watchman(
+                cfg,
+                build,
+                permission_timeout,
+                scope,
+                Arc::new(move |_exe: &Path, home: &Path| {
+                    install_calls
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((true, home.to_path_buf()));
+                    Ok(())
+                }),
+                Arc::new(move |home: &Path| {
+                    uninstall_calls
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((false, home.to_path_buf()));
+                    Ok(())
+                }),
+                calls,
+            )
+        }
+
+        fn with_config_and_scope_and_watchman<F>(
+            cfg: RuntimeConfig,
+            build: F,
+            permission_timeout: Duration,
+            scope: Scope,
+            install: WatchmanInstall,
+            uninstall: WatchmanUninstall,
+            calls: WatchmanCalls,
         ) -> Self
         where
             F: Fn(
@@ -5313,6 +5602,9 @@ pub(crate) mod tests {
             // 主题句柄与 `cfg.workdir` 一致：`ui/settings/read` 从 `cfg.workdir`
             // 读、`write` 经句柄落盘，两者不同则会各看各的。
             let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
+            // 值守的 home 也落在隔离目录里:安装/卸载经调用方注入的闭包,绝不
+            // 触碰真实的 `~/Library/LaunchAgents`。
+            let watchman_home = tempfile::TempDir::new().unwrap();
             let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
@@ -5329,6 +5621,9 @@ pub(crate) mod tests {
                     resident_dir: resident_dir.path().to_path_buf(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
+                    watchman_install: install,
+                    watchman_uninstall: uninstall,
+                    watchman_home: watchman_home.path().to_path_buf(),
                 },
                 build,
                 scope,
@@ -5341,6 +5636,8 @@ pub(crate) mod tests {
                 board_dir,
                 _resident_dir: resident_dir,
                 pairing,
+                watchman_calls: calls,
+                _watchman_home: watchman_home,
             }
         }
 
@@ -5930,6 +6227,10 @@ pub(crate) mod tests {
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
+                // 测试注入:只记录调用,不碰真实 launchd / home。
+                watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
+                watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
+                watchman_home: PathBuf::new(),
             },
             build_test_agent,
         ));
@@ -5995,6 +6296,10 @@ pub(crate) mod tests {
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
+                // 测试注入:只记录调用,不碰真实 launchd / home。
+                watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
+                watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
+                watchman_home: PathBuf::new(),
             },
             |_s: Option<yi_agent_core::Session>,
              _cwd: &std::path::Path,
@@ -6064,6 +6369,10 @@ pub(crate) mod tests {
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
+                // 测试注入:只记录调用,不碰真实 launchd / home。
+                watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
+                watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
+                watchman_home: PathBuf::new(),
             },
             build_test_agent,
         ));
@@ -9420,6 +9729,10 @@ pub(crate) mod tests {
             .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["theme"], "dark", "default before any write");
+        assert_eq!(
+            v["result"]["board_watchman_enabled"], true,
+            "缺省为开:{v}"
+        );
 
         h.send(
             r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"theme":"light"}}"#,
@@ -9495,10 +9808,87 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// `board_watchman_enabled` 的写路径:`false` 卸载、`true` 安装,均经注入的
+    /// 记录器;偏好落盘且读回一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writing_the_watchman_setting_installs_or_uninstalls_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+        let calls = Arc::clone(&h.watchman_calls);
+        let home = h._watchman_home.path().to_path_buf();
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"board_watchman_enabled":false}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        assert_eq!(v["result"]["warning"], json!(null), "注入的卸载不会失败:{v}");
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "恰好一次卸载:{recorded:?}");
+        assert!(!recorded[0].0, "false triggers uninstall");
+        assert_eq!(recorded[0].1, home, "必须针对注入的 home");
+        assert!(!crate::settings_store::load_watchman_enabled(dir.path()));
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"board_watchman_enabled":true}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2, "第二次是安装:{recorded:?}");
+        assert!(recorded[1].0, "true triggers install");
+
+        // 开关与 theme 同处一个文件,互不覆盖。
+        assert!(crate::settings_store::load_watchman_enabled(dir.path()));
+        assert_eq!(
+            crate::settings_store::load(dir.path()),
+            crate::settings_store::Theme::Dark
+        );
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        assert_eq!(v["result"]["board_watchman_enabled"], true, "{v}");
+        h.shutdown().await;
+    }
+
+    /// 安装失败不静默:落盘仍成功,回复带 `warning`,并由 `ok: true` 表明偏好已写入。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_watchman_install_reports_a_warning_without_failing_the_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_watchman(
+            cfg,
+            Arc::new(|_exe: &Path, _home: &Path| Err("launchctl is unavailable".to_string())),
+            Arc::new(|_home: &Path| Ok(())),
+        )
+        .await;
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"board_watchman_enabled":true}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        assert_eq!(
+            v["result"]["warning"], "launchctl is unavailable",
+            "失败原因必须回传给前端:{v}"
+        );
+        // 偏好仍按用户的意图落盘:下次启动会再试。
+        assert!(crate::settings_store::load_watchman_enabled(dir.path()));
+        h.shutdown().await;
+    }
+
     /// 每个 thread 的工具集都必须带主题工具——这是「对话切主题」的落点。
     #[test]
-    fn the_theme_tool_is_registered_into_a_thread_registry() {
-        let dir = tempfile::TempDir::new().unwrap();
+    fn the_theme_tool_is_registered_into_a_thread_registry() {        let dir = tempfile::TempDir::new().unwrap();
         let handle = crate::theme_tool::ThemeHandle::new(dir.path().to_path_buf());
         let mut registry = yi_agent_core::ToolRegistry::new();
         register_theme_tool(&mut registry, handle);

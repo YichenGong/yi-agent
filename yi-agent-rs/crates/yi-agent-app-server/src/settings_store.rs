@@ -58,6 +58,48 @@ pub fn load(workdir: &Path) -> Theme {
 
 /// 写主题：读-改-写，保留无关的顶层键，最后原子替换。
 pub fn save(workdir: &Path, theme: Theme) -> std::io::Result<()> {
+    set_object_value(
+        workdir,
+        "theme",
+        serde_json::Value::String(theme.as_str().to_string()),
+    )
+}
+
+/// 后台值守（常驻 watchman / 登录自启）开关。缺省 `true`——用户没表态时按
+/// 期望行为走，而不是静默地什么都不做。
+///
+/// 坏文件 / 缺键一律回退 `true`，与 [`load`] 对主题的容错策略一致。
+pub fn load_watchman_enabled(workdir: &Path) -> bool {
+    let path = preferences_path(workdir);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get(yi_agent_boards::watchman::PREFERENCE_KEY)
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(true)
+}
+
+/// 写开关：与 [`save`] 同一约定——读-改-写、保留无关键、原子替换。
+pub fn save_watchman_enabled(workdir: &Path, enabled: bool) -> std::io::Result<()> {
+    set_object_value(
+        workdir,
+        yi_agent_boards::watchman::PREFERENCE_KEY,
+        serde_json::Value::Bool(enabled),
+    )
+}
+
+/// 读 `<workdir>/.yi-agent/preferences.json` 的顶层对象、插入一个键、原子替换。
+///
+/// [`save`] 与 [`save_watchman_enabled`] 的唯一实现：两者共处同一文件，若各写
+/// 各的读-改-写，后写的会把先写的键整个抹掉。
+fn set_object_value(
+    workdir: &Path,
+    key: &str,
+    value: serde_json::Value,
+) -> std::io::Result<()> {
     let dir = workdir.join(".yi-agent");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("preferences.json");
@@ -68,10 +110,7 @@ pub fn save(workdir: &Path, theme: Theme) -> std::io::Result<()> {
             .unwrap_or_default(),
         Err(_) => serde_json::Map::new(),
     };
-    object.insert(
-        "theme".to_string(),
-        serde_json::Value::String(theme.as_str().to_string()),
-    );
+    object.insert(key.to_string(), value);
     let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
         .map_err(std::io::Error::other)?;
     let tmp_path = dir.join("preferences.json.tmp");
@@ -129,5 +168,44 @@ mod tests {
         assert_eq!(Theme::parse("dark"), Theme::Dark);
         assert_eq!(Theme::parse("  light "), Theme::Light);
         assert_eq!(Theme::parse(""), Theme::Dark);
+    }
+
+    #[test]
+    fn the_watchman_preference_defaults_to_on_and_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(load_watchman_enabled(dir.path()), "default is on");
+        save_watchman_enabled(dir.path(), false).unwrap();
+        assert!(!load_watchman_enabled(dir.path()));
+        // 与 theme 共处一文件且互不覆盖。
+        save(dir.path(), Theme::Light).unwrap();
+        assert!(!load_watchman_enabled(dir.path()));
+        assert_eq!(load(dir.path()), Theme::Light);
+    }
+
+    #[test]
+    fn the_watchman_preference_falls_back_to_on_for_broken_files() {
+        for body in ["not json", "{\"board_watchman_enabled\":\"yes\"}", "[]", "{}"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+            std::fs::write(preferences_path(dir.path()), body).unwrap();
+            assert!(load_watchman_enabled(dir.path()), "body: {body}");
+        }
+    }
+
+    #[test]
+    fn saving_the_watchman_preference_preserves_unrelated_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            r#"{"theme":"light","subagent_runtime":"never"}"#,
+        )
+        .unwrap();
+        save_watchman_enabled(dir.path(), false).unwrap();
+        let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["board_watchman_enabled"], false);
+        assert_eq!(value["theme"], "light");
+        assert_eq!(value["subagent_runtime"], "never");
     }
 }
