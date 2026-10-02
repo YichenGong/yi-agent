@@ -26,6 +26,7 @@ import type {
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { formatError } from "./lib/errorMessage";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
+import { SuperpowersKanbanCollapsedBar } from "./components/SuperpowersKanbanCollapsedBar";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import {
@@ -175,6 +176,9 @@ export default function App() {
   // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
   // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
   const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
+  // 看板可以「收起」而不「关闭」：收起后轮询与状态照旧，只是不画面板，
+  // 并在原处留一条可展开的横条。收起是纯 UI 选择，不进 store。
+  const [boardCollapsed, setBoardCollapsed] = useState(false);
   // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
   const [boards, setBoards] = useState<string[]>([]);
   // 项目路径 → 摘要。挂在侧栏条目上，扫一眼就知道各项目积压多少。
@@ -446,11 +450,17 @@ export default function App() {
 
   /** 打开看板只改 selectedBoard，不动 currentId。 */
   const onOpenBoard = (path: string) => {
-    if (path === selectedBoard) return;
+    // 打开（或重新打开）一个看板一定展开它：从收起横条点进来、或换项目，都是
+    // 「我现在要看这个看板」的意图，不该还停在收起的横条上。
+    if (path === selectedBoard) {
+      setBoardCollapsed(false);
+      return;
+    }
     // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
     setBoardError(null);
     setBoardCards([]);
     setSelectedBoard(path);
+    setBoardCollapsed(false);
   };
 
   /**
@@ -941,7 +951,13 @@ export default function App() {
         <div className="relative flex min-w-0 flex-1 flex-col">
           {/* 看板是主区域的一个视图，不是一个常驻列：选中才出现，且问的是
               被选中那个项目。没有选中时主区域还是原来的对话。 */}
-          {selectedBoard !== null && (
+          {selectedBoard !== null && boardCollapsed && (
+            <SuperpowersKanbanCollapsedBar
+              board={selectedBoard}
+              onExpand={() => setBoardCollapsed(false)}
+            />
+          )}
+          {selectedBoard !== null && !boardCollapsed && (
             <section
               aria-label="Superpowers 看板"
               className="flex max-h-[60%] shrink-0 flex-col overflow-y-auto border-b border-neutral-800 bg-neutral-925"
@@ -950,6 +966,7 @@ export default function App() {
                 switchOn={boardOn}
                 source={boardSource}
                 onToggle={(next) => void onToggleBoardSwitch(next)}
+                onCollapse={() => setBoardCollapsed(true)}
               />
               {boardError !== null && (
                 <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">

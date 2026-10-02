@@ -114,6 +114,36 @@ fn turning_the_switch_off_stops_a_running_child() {
 }
 
 #[test]
+fn a_manifest_that_must_stay_reachable_runs_even_while_disabled() {
+    // `stop_when_disabled:false` 的进程即便开关关着也必须在跑：它声明了自己是
+    // 查询通道，而通道是唯一能报告开关、并把开关再打开的东西。把它停掉，"关"
+    // 就变成单向门——桌面端正是这样卡在「插件未安装」上的。
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    std::fs::create_dir_all(layout.manifests_dir()).unwrap();
+    std::fs::write(
+        layout.manifests_dir().join("reachable.json"),
+        format!(
+            r#"{{"name":"reachable","command":"{}","args":[],"switch_key":"demo_on","stop_when_disabled":false}}"#,
+            child.display()
+        ),
+    )
+    .unwrap();
+    // 开关缺省即关闭；没有 preferences.json。
+
+    let mut supervisor = Supervisor::new(layout);
+    supervisor.reconcile();
+    assert!(
+        wait_for(&marker, Duration::from_secs(2)),
+        "必须起，否则没法再把开关打开"
+    );
+    supervisor.stop_all();
+}
+
+#[test]
 fn a_crashed_child_is_restarted_after_the_backoff() {
     let dir = tempfile::tempdir().unwrap();
     let workdir = dir.path();

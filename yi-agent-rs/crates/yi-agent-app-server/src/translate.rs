@@ -389,6 +389,7 @@ impl Translator {
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::ManualCompacted { .. }
             | AgentEvent::ManualCompactFailed { .. }
+            | AgentEvent::ModelChanged { .. }
             | AgentEvent::DecodeDelta(_)
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::PermissionResolved { .. } => {}

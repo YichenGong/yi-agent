@@ -41,6 +41,10 @@ daemon 常驻（`yi-agent daemon start`）。daemon 会按清单与开关拉起 
 `superpowers-kanban on|off` 写**项目层**（`<项目>/.yi-agent/preferences.json`）。
 全局层在 `~/.yi-agent/preferences.json`，需自行设置。
 
+`off` 只**停止推进**（已在跑的会话不会被取消）。进程本身继续运行，因为它的查询
+通道是宿主与桌面端读取、改写开关的唯一入口——停掉它，`off` 就无法再被翻回来。
+清单里的 `stop_when_disabled: false` 正是在向监督器声明这一点。
+
 ## 迁移说明（旧名 → 新名）
 旧布局仍被**读取**，不会被修改或删除：
 
