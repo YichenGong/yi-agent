@@ -577,6 +577,13 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let cancellation = request.cancellation.clone();
         let objective = request.objective;
         let initial_user_messages = request.initial_user_messages;
+        // The caller's transcript to seed the worker's session with, when the
+        // caller asked for a fork. Moved into the spawned thread below.
+        let fork_messages = request.fork_messages;
+        // The worker's own live transcript, handed to its delegation tools just
+        // before the runtime starts so a child forking *this* worker reads the
+        // worker's real conversation.
+        let worker_caller = CallerContext::unbound();
         let workspace_service = self.workspace_service.clone();
         let workspace_for_delivery = workspace.clone();
 
@@ -616,9 +623,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 Arc::new(DaemonSpawnAgentTool {
                     root: Arc::clone(&worker_root),
                     sandbox: effective_sandbox,
-                    // A worker is a short-lived child; its own delegation tools
-                    // are not wired to a live caller transcript yet.
-                    caller: CallerContext::unbound(),
+                    // Bound to the worker's own live session below, once the
+                    // Agent (and any forked session) exists.
+                    caller: worker_caller.clone(),
                 }) as Arc<dyn Tool>,
                 Arc::new(DaemonSendMessageTool {
                     root: Arc::clone(&worker_root),
@@ -648,6 +655,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                     };
                     runtime.block_on(async move {
                         let mut agent = Agent::new(provider, worker_tools, config);
+                        if let Some(fork) = fork_messages {
+                            agent = agent.with_session(yi_agent_core::Session::from_messages(fork));
+                        }
+                        // Ordering matters: bind *after* `with_session`, or the
+                        // tool handle would point at the replaced session Arc.
+                        worker_caller.bind(agent.session_handle());
                         if let Some(gate) = provider_turn_gate {
                             agent = agent.with_provider_turn_gate(gate);
                         }
@@ -3719,6 +3732,92 @@ mod tests {
         .expect("worker should report text completion");
 
         assert_eq!(report, "sub-agent 正常完成，结果可读");
+    }
+
+    /// A fork is only worth requesting if the child actually starts from the
+    /// parent's transcript: the very first provider request must carry the
+    /// parent's history ahead of the objective, in that order.
+    #[tokio::test]
+    async fn a_forked_worker_seeds_its_first_request_with_the_parent_history() {
+        let directory = TempDir::new().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("now continue the task")
+            .with_workspace(worker_workspace(directory.path()))
+            .with_workspace_mode(ChildWriteMode::ReadOnly)
+            .with_fork_messages(vec![yi_agent_core::Message::user(
+                "earlier the user asked for X",
+            )]);
+        let handle = factory.start(request).await.unwrap();
+        wait_until(
+            || !provider.requests.lock().unwrap().is_empty(),
+            "the forked worker to call the provider",
+        )
+        .await;
+
+        let requests = provider.requests.lock().unwrap();
+        let texts: Vec<&str> = requests[0]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let history = texts
+            .iter()
+            .position(|t| t.contains("earlier the user asked for X"))
+            .expect("parent history must be seeded");
+        let objective = texts
+            .iter()
+            .position(|t| t.contains("now continue the task"))
+            .expect("objective must follow");
+        assert!(
+            history < objective,
+            "parent history must be a prefix of the objective: {texts:?}"
+        );
+        handle.cancel();
+    }
+
+    /// The fork is opt-in: without `fork_messages` the child's first request is
+    /// exactly the objective and nothing inherited.
+    #[tokio::test]
+    async fn an_unforked_worker_sends_only_its_objective_first() {
+        let directory = TempDir::new().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("standalone objective")
+            .with_workspace(worker_workspace(directory.path()))
+            .with_workspace_mode(ChildWriteMode::ReadOnly);
+        let handle = factory.start(request).await.unwrap();
+        wait_until(
+            || !provider.requests.lock().unwrap().is_empty(),
+            "the worker to call the provider",
+        )
+        .await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].messages.len(),
+            1,
+            "an unforked worker must send only its objective"
+        );
+        handle.cancel();
     }
 
     #[tokio::test]
