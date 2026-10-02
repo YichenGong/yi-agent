@@ -188,7 +188,12 @@ pub enum Command {
 #[derive(clap::Subcommand, Debug)]
 pub enum PairAction {
     /// Mint a one-time pairing code and print it (default).
-    Code,
+    Code {
+        /// Relay URL to embed in the printed QR code (optional). When omitted,
+        /// output is unchanged (text code only).
+        #[arg(long)]
+        relay: Option<String>,
+    },
     /// List paired devices.
     List,
     /// Revoke a paired device by id (its token stops authenticating at once).

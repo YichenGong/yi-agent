@@ -2,6 +2,7 @@
 
 pub mod broadcast;
 pub mod device_store;
+pub mod pair_uri;
 pub mod pairing;
 pub mod protocol;
 pub mod server;

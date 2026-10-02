@@ -174,9 +174,12 @@ fn run_pair(action: &PairAction) -> Result<()> {
 
     let pairing = PairingState::new(DeviceStore::new(devices_path()));
     match action {
-        PairAction::Code => {
+        PairAction::Code { relay } => {
             let code = pairing.create_code();
-            println!("{}", format_pair_code(&code.code, code.expires_in));
+            print!(
+                "{}",
+                format_pair_code_with_qr(&code.code, code.expires_in, relay.as_deref())
+            );
         }
         PairAction::List => {
             let devices = pairing.store().list();
@@ -195,6 +198,23 @@ fn run_pair(action: &PairAction) -> Result<()> {
 /// `ABCD-EFGH` + `(valid 300s)` — pure so it can be unit-tested.
 fn format_pair_code(code: &str, expires_in: u64) -> String {
     format!("{code} (valid {expires_in}s)")
+}
+
+/// 文本码，外加（给了 `relay` 时）一个 Unicode 二维码。纯函数，便于单测。
+fn format_pair_code_with_qr(code: &str, expires_in: u64, relay: Option<&str>) -> String {
+    let mut out = format!("{}\n", format_pair_code(code, expires_in));
+    if let Some(relay) = relay {
+        let uri = yi_agent_app_server::pair_uri::build_pair_uri(relay, code);
+        if let Ok(qr) = qrcode::QrCode::new(uri.as_bytes()) {
+            let art = qr
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build();
+            out.push_str(&art);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// One device per line: `id  name  scope  created`. Pure for testing.
@@ -2297,6 +2317,22 @@ mod tests {
     }
 
     #[test]
+    fn pair_code_without_relay_is_unchanged() {
+        assert_eq!(
+            format_pair_code_with_qr("ABCD-EFGH", 300, None),
+            "ABCD-EFGH (valid 300s)\n"
+        );
+    }
+
+    #[test]
+    fn pair_code_with_relay_appends_a_qr_block() {
+        let out = format_pair_code_with_qr("ABCD-EFGH", 300, Some("wss://r/ws?session=x"));
+        assert!(out.starts_with("ABCD-EFGH (valid 300s)\n"));
+        // Unicode 半块字符是 QR 渲染的标志。
+        assert!(out.contains('█') || out.contains('▀') || out.contains('▄'));
+    }
+
+    #[test]
     fn format_device_list_renders_rows_and_an_empty_notice() {
         use yi_agent_app_server::device_store::Device;
         use yi_agent_app_server::protocol::Scope;
@@ -2334,7 +2370,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Pair {
-                action: PairAction::Code
+                action: PairAction::Code { relay: None }
             })
         ));
         let cli = Cli::try_parse_from(["yi-agent", "pair", "list"]).unwrap();

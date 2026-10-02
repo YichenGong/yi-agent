@@ -153,4 +153,28 @@ describe("SettingsRemoteTab", () => {
     expect(mint.disabled).toBe(true);
     expect(screen.getByLabelText("中继地址")).toBeTruthy();
   });
+
+  it("renders a QR code once a code is minted and a relay url is present", async () => {
+    const call = rpcStub({
+      "device/list": () => ({ devices: [] }),
+      "pair/create": () => ({ code: "ABCD-EFGH", expires_in: 300 }),
+    });
+    render(
+      <SettingsRemoteTab call={call} initialRelayUrl="wss://relay.example.com/ws?session=abc" />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "生成配对码" }));
+    await screen.findByText("ABCD-EFGH");
+    await waitFor(() => expect(screen.getByLabelText("配对二维码")).toBeTruthy());
+  });
+
+  it("omits the QR code when no relay url is entered", async () => {
+    const call = rpcStub({
+      "device/list": () => ({ devices: [] }),
+      "pair/create": () => ({ code: "ABCD-EFGH", expires_in: 300 }),
+    });
+    render(<SettingsRemoteTab call={call} />);
+    fireEvent.click(await screen.findByRole("button", { name: "生成配对码" }));
+    await screen.findByText("ABCD-EFGH");
+    expect(screen.queryByLabelText("配对二维码")).toBeNull();
+  });
 });

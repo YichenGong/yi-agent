@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import QRCode from "qrcode";
+import { buildPairUri } from "../lib/pairUri";
 
 /**
  * 桌面「远程访问」设置页。
@@ -94,6 +96,26 @@ export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabPr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 配对码旁的二维码：码与中继地址都就绪才渲染。地址为空时退回纯文本码（降级）。
+  const [qrSvg, setQrSvg] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (code === null || relayUrl.trim().length === 0) {
+      setQrSvg(null);
+      return;
+    }
+    QRCode.toString(buildPairUri(relayUrl.trim(), code), { type: "svg", margin: 1 })
+      .then((svg) => {
+        if (!cancelled) setQrSvg(svg);
+      })
+      .catch(() => {
+        if (!cancelled) setQrSvg(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [code, relayUrl]);
+
   const mint = async () => {
     if (!call) return;
     setMinting(true);
@@ -161,6 +183,15 @@ export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabPr
             <span className="text-lg tracking-widest text-fg">{code}</span>
             <span className="text-xs text-fg-muted">剩余 {remaining} 秒</span>
           </div>
+        )}
+
+        {qrSvg !== null && (
+          <div
+            aria-label="配对二维码"
+            className="mt-3 h-40 w-40 [&>svg]:h-full [&>svg]:w-full"
+            // QRCode 生成的 SVG 是本地确定性输出（无外部输入拼进标签），故内联安全。
+            dangerouslySetInnerHTML={{ __html: qrSvg }}
+          />
         )}
 
         {codeError !== null && (

@@ -148,6 +148,11 @@ yi-agent app-server --listen ws://127.0.0.1:8790   # 绑定非回环时会打印
 `thread/readItems {threadId, afterItemId?}` 补齐既有内容，而**不用 `thread/resume`**——
 后者会打断进行中的回合。桌面（stdio）端从不订阅，天然全收。
 
+配对支持**扫码**：桌面设置「远程访问」页在填了中继地址时于配对码旁显示二维码，
+`yi-agent pair code --relay <url>` 在终端打印二维码；iOS 配对页的「扫码」按钮用相机扫后
+自动配对。二维码内容是 `yiagent://pair?v=1&relay=<地址>&code=<码>`，只含中继地址与一次性
+配对码，**不含 token**。文本手输路径保留。
+
 > **实验性**：配对链路已**端到端打通**——`pair/create` 铸出的码**落盘**到
 > `~/.yi-agent/pairing.json`，因此桌面 stdio 进程铸的码可被 `--relay`/`ws://` 进程
 > 兑换；iOS 首启有配对表单（填中继地址 + 码），桌面设置里有「远程访问」页可铸码与
