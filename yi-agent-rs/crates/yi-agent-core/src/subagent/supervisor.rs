@@ -951,6 +951,13 @@ impl AgentSupervisor {
     /// Cancels a task and, when requested, every descendant owned by this
     /// supervisor. State reduction accompanies token cancellation so callers
     /// never see a running task after its worker was signalled.
+    ///
+    /// The returned ids are the union of every [`Self::reduce_task`] result,
+    /// not merely the ids the traversal planned to visit. A reduction to a
+    /// settled terminal cascades in memory to descendants the traversal did not
+    /// enumerate (in particular when `recursive == false`), and those cascade
+    /// victims must reach the caller so the coordinator persists them and
+    /// releases their leases.
     pub fn cancel_task_tree(
         &mut self,
         task_id: &TaskId,
@@ -961,6 +968,7 @@ impl AgentSupervisor {
         }
         let mut task_ids = Vec::new();
         self.collect_cancellation_targets(task_id, recursive, &mut task_ids);
+        let mut affected = Vec::new();
         for id in &task_ids {
             if let Some(worker) = self.workers.get(id) {
                 worker.cancel();
@@ -976,17 +984,17 @@ impl AgentSupervisor {
                     .expect("collected task exists")
                     .active_attempt_id()
                     .clone();
-                self.reduce_task(
+                affected.extend(self.reduce_task(
                     id,
                     TaskEvent::CancelRequested {
                         attempt_id,
                         reason: CancelReason("cancelled by runtime coordinator".into()),
                     },
-                )?;
+                )?);
             }
         }
         self.notify_update();
-        Ok(task_ids)
+        Ok(affected)
     }
 
     pub fn pause_task(&mut self, task_id: &TaskId, reason: PauseReason) -> Result<(), String> {

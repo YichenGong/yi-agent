@@ -1205,3 +1205,43 @@ fn failing_a_parent_cascades_its_live_child_to_terminal() {
         supervisor.task(&child).unwrap().state()
     );
 }
+
+#[test]
+fn non_recursive_cancel_still_reports_descendants_cascaded_in_memory() {
+    // Regression lock for the cascade choke point: cancelling a task with a
+    // live grandchild via `cancel_task_tree(&id, /*recursive=*/ false)` reduces
+    // only the target, but that reduction settles the target and therefore
+    // cascades to its live descendants in memory. Those victims must appear in
+    // the returned id list, otherwise the coordinator silently drops them: it
+    // only persists and releases leases for ids it is told about.
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let grandchild = supervisor.spawn(child.clone()).unwrap();
+    supervisor.start_task(&root).unwrap();
+    supervisor.start_task(&child).unwrap();
+    supervisor.start_task(&grandchild).unwrap();
+
+    let affected = supervisor.cancel_task_tree(&root, false).unwrap();
+
+    assert!(
+        affected.contains(&root),
+        "the cancelled target must be reported, got {affected:?}"
+    );
+    assert!(
+        affected.contains(&child),
+        "a descendant cascaded in memory must be reported, got {affected:?}"
+    );
+    assert!(
+        affected.contains(&grandchild),
+        "a grandchild cascaded in memory must be reported, got {affected:?}"
+    );
+    assert!(
+        matches!(
+            supervisor.task(&grandchild).unwrap().state(),
+            TaskState::Cancelled(_)
+        ),
+        "the grandchild must actually be cancelled, got {:?}",
+        supervisor.task(&grandchild).unwrap().state()
+    );
+}
