@@ -18,8 +18,8 @@ use crate::broadcast::{Broadcaster, ClientId};
 use crate::pairing::PairingState;
 use crate::protocol::MAX_FRAME_BYTES;
 use crate::server::{
-    ClientScopes, PERMISSION_TIMEOUT, RuntimeAttachments, install_device_registry,
-    production_factory, serve,
+    ClientInitialized, ClientScopes, PERMISSION_TIMEOUT, RuntimeAttachments,
+    install_device_registry, production_factory, serve,
 };
 use crate::workspace_index::WorkspaceIndex;
 use yi_agent_runtime::config::RuntimeConfig;
@@ -64,6 +64,10 @@ where
     // 循环按 `ClientId` 查它做门禁。缺省 = 未登记,主循环按 fail-closed 的
     // `Observe` 处理。
     let client_scopes: ClientScopes = Arc::new(Mutex::new(HashMap::new()));
+    // 每连接的 `initialize` 状态:与 scope 表同型、同生命周期。主循环持有同一个
+    // `Arc`,在收到 `initialize` 时置位;ws 断连时摘键——否则连接可来可去、这张
+    // 表只增不减(每台设备都永久留一个 `ClientId`)。
+    let client_initialized: ClientInitialized = Arc::new(Mutex::new(HashMap::new()));
     // 设备 id → 连接:供 `device/revoke` 摘掉被踢设备的连接。经进程级句柄暴露给
     // 主循环(见 `server::install_device_registry`),避免 `ws → server → ws` 的
     // 反向依赖成环。
@@ -73,6 +77,7 @@ where
     // 先克隆出主循环要用的 config,再把 cfg 丢给下面的 router 闭包。
     let serve_cfg = cfg.clone();
     let serve_scopes = Arc::clone(&client_scopes);
+    let serve_initialized = Arc::clone(&client_initialized);
     let serve_pairing = Arc::clone(&pairing);
     let serve_task = tokio::spawn(async move {
         use std::sync::Mutex as StdMutex;
@@ -91,12 +96,14 @@ where
             },
             build_agent,
             serve_scopes,
+            serve_initialized,
         )
         .await
     });
 
     let router_hub = Arc::clone(&hub);
     let router_scopes = Arc::clone(&client_scopes);
+    let router_initialized = Arc::clone(&client_initialized);
     let router_devices = Arc::clone(&device_clients);
     let app = Router::new().route(
         "/ws",
@@ -105,6 +112,7 @@ where
                 let hub = Arc::clone(&router_hub);
                 let tx = inbound_tx.clone();
                 let scopes = Arc::clone(&router_scopes);
+                let initialized = Arc::clone(&router_initialized);
                 let devices = Arc::clone(&router_devices);
                 let pairing = Arc::clone(&pairing);
                 async move {
@@ -121,7 +129,17 @@ where
                     let scope = device.scope;
                     let device_id = device.id;
                     upgrade.on_upgrade(move |socket| {
-                        handle_ws(socket, hub, tx, id, scope, scopes, device_id, devices)
+                        handle_ws(
+                            socket,
+                            hub,
+                            tx,
+                            id,
+                            scope,
+                            scopes,
+                            initialized,
+                            device_id,
+                            devices,
+                        )
                     })
                 }
             },
@@ -210,6 +228,11 @@ fn percent_decode(input: &str) -> String {
 }
 
 /// 一个 WS 连接的生命周期:登记客户端与 scope → 出口泵转发帧 → 入站帧喂主循环。
+///
+/// 另起一个低频 `interval` tick 与入站流 `select!`:被 `device/revoke` 踢掉、或
+/// 被广播背压摘除的连接,其读循环仍在等入站帧,不会自己醒;每 tick 检一次
+/// `hub.is_connected` 才能及时 `break`,进而收尾(摘 scope/initialized/device、
+/// abort 出口泵、drop socket)——这就是「撤销即掉线」的实现。
 #[allow(clippy::too_many_arguments)]
 async fn handle_ws(
     socket: WebSocket,
@@ -218,6 +241,7 @@ async fn handle_ws(
     id: ClientId,
     scope: crate::protocol::Scope,
     scopes: ClientScopes,
+    initialized: ClientInitialized,
     device_id: String,
     devices: crate::server::WsDeviceRegistry,
 ) {
@@ -240,8 +264,21 @@ async fn handle_ws(
         }
     });
 
-    // 入站:每个 Text/Binary 帧当作一行 JSONL。
-    while let Some(Ok(msg)) = stream.next().await {
+    // 入站:每个 Text/Binary 帧当作一行 JSONL。低频 tick 用于发现「已被踢」。
+    let mut kick_check = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        let msg = tokio::select! {
+            _ = kick_check.tick() => {
+                if !hub.is_connected(&id) {
+                    break; // 被 `device/revoke` 踢掉(或被背压摘除):收尾关闭。
+                }
+                continue;
+            }
+            next = stream.next() => match next {
+                Some(Ok(msg)) => msg,
+                _ => break, // 对端关闭或传输错误
+            },
+        };
         let line = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => match String::from_utf8(b.to_vec()) {
@@ -261,16 +298,34 @@ async fn handle_ws(
     }
 
     hub.unregister(&id);
-    scopes.lock().await.remove(&id);
-    {
-        let mut guard = devices.lock().unwrap_or_else(|p| p.into_inner());
-        // 只有仍指向本连接的条目才摘除:同一设备可能已重连(新 ClientId),
-        // 迟到关闭的旧连接不得把新连接的映射抹掉。
-        if guard.get(&device_id) == Some(&id) {
-            guard.remove(&device_id);
-        }
-    }
+    teardown_ws_client(&hub, &id, &scopes, &initialized, &devices, &device_id).await;
     pump.abort();
+}
+
+/// 连接收尾:把该 `ClientId` 从**所有**共享表里摘除。
+///
+/// 与 `prepare`(登记)成对:登记了 scope、`device_id → ClientId`、以及主循环懒
+/// 插入的 `initialized`,收尾时都要摘掉。`initialized` 尤其容易漏——它由主循环在
+/// 收到 `initialize` 时才插入,连接可来可去,不摘就是只增不减的表。
+///
+/// 抽成独立函数是为了可测:不需要真 socket,即可验证三张表都被清干净。
+async fn teardown_ws_client(
+    hub: &Broadcaster,
+    id: &ClientId,
+    scopes: &ClientScopes,
+    initialized: &ClientInitialized,
+    devices: &crate::server::WsDeviceRegistry,
+    device_id: &str,
+) {
+    hub.unregister(id);
+    scopes.lock().await.remove(id);
+    initialized.lock().await.remove(id);
+    let mut guard = devices.lock().unwrap_or_else(|p| p.into_inner());
+    // 只有仍指向本连接的条目才摘除:同一设备可能已重连(新 ClientId),
+    // 迟到关闭的旧连接不得把新连接的映射抹掉。
+    if guard.get(device_id) == Some(id) {
+        guard.remove(device_id);
+    }
 }
 
 #[cfg(test)]
@@ -284,18 +339,35 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    /// 起一个只监听 127.0.0.1 的 ws server,返回它的地址、配对的 token 与后台句柄。
+    /// 一台已配对设备(其 token 能认证本 server)的句柄:地址、明文 token、
+    /// 以及**与 server 共享**的那个 `PairingState`。
     ///
-    /// 用隔离的 tempdir `DeviceStore` 铸一枚配对码换 token:`serve_ws` 收的是这个
+    /// `pairing` 返回出来,是因为「撤销后掉线」这类测试既要拿 `device_id` 去
+    /// `device/revoke`,又要在撤销后复查 `pairing.authenticate` 已失败(证明 token
+    /// 真的废了,而不只是 socket 关了)。
+    struct WsFixture {
+        addr: SocketAddr,
+        token: String,
+        pairing: Arc<PairingState>,
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    /// 起一个只监听 127.0.0.1 的 ws server,铸一台默认 `Control` 设备,返回夹具。
+    ///
+    /// 用隔离的 tempdir `DeviceStore` 铸设备:`serve_ws` 收的是这个
     /// `PairingState`,故这台"手机"的 token 正好能认证它。**绝不**碰用户真实的
     /// `~/.yi-agent/devices.json`。
-    async fn spawn_ws_with_token(
+    async fn spawn_ws_with_token(cfg: RuntimeConfig) -> WsFixture {
+        spawn_ws_with_token_for(cfg, crate::protocol::Scope::Control).await
+    }
+
+    /// 同 [`spawn_ws_with_token`],但可指定设备 scope:`device/revoke` 是 Admin
+    /// 门禁内的 RPC,要经 ws 驱动它,连接就必须是一台 Admin 设备(不能用配对码
+    /// 换——新配对设备恒为 Control)。
+    async fn spawn_ws_with_token_for(
         cfg: RuntimeConfig,
-    ) -> (
-        SocketAddr,
-        String,
-        tokio::task::JoinHandle<anyhow::Result<()>>,
-    ) {
+        scope: crate::protocol::Scope,
+    ) -> WsFixture {
         // workdir 与 workspace 索引都落在同一个临时目录里,并刻意让它活到进程
         // 结束(`mem::forget`):索引必须隔离,否则会读写用户真实的
         // `~/.yi-agent/workspaces.json`。
@@ -312,12 +384,16 @@ mod tests {
                 uuid::Uuid::new_v4()
             )),
         )));
-        let code = pairing.create_code();
-        let (_device, token) = pairing.redeem(&code.code, "test-phone").unwrap();
+        let (_device, token) = pairing.seed_device("test-phone", scope);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(serve_ws(listener, cfg, workspaces, pairing));
-        (addr, token, handle)
+        let handle = tokio::spawn(serve_ws(listener, cfg, workspaces, Arc::clone(&pairing)));
+        WsFixture {
+            addr,
+            token,
+            pairing,
+            handle,
+        }
     }
 
     /// 连一条已认证的 ws;token 经 `Authorization: Bearer` 头带上。
@@ -367,8 +443,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ws_client_completes_a_jsonrpc_handshake() {
-        let (addr, token, handle) =
-            spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        let WsFixture {
+            addr,
+            token,
+            handle,
+            ..
+        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
         let mut ws = connect_authed(addr, &token).await;
         initialize(&mut ws).await;
         // config/read
@@ -385,8 +465,12 @@ mod tests {
     /// 查询串形式的 token 也必须被接受(无法设 header 的客户端)。
     #[tokio::test(flavor = "multi_thread")]
     async fn a_query_string_token_is_accepted() {
-        let (addr, token, handle) =
-            spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        let WsFixture {
+            addr,
+            token,
+            handle,
+            ..
+        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={token}"))
             .await
             .expect("query-string token connect");
@@ -397,7 +481,7 @@ mod tests {
     /// 没有 token 的连接必须被以 4401 关闭,且不得进入主循环(连 initialize 都别想)。
     #[tokio::test(flavor = "multi_thread")]
     async fn a_connection_without_a_token_is_closed_with_4401() {
-        let (addr, _token, handle) =
+        let WsFixture { addr, handle, .. } =
             spawn_ws_with_token(crate::server::tests_support::test_config()).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
@@ -419,7 +503,7 @@ mod tests {
     /// 无效 token 与无 token 同等对待:4401。
     #[tokio::test(flavor = "multi_thread")]
     async fn a_connection_with_an_invalid_token_is_closed_with_4401() {
-        let (addr, _token, handle) =
+        let WsFixture { addr, handle, .. } =
             spawn_ws_with_token(crate::server::tests_support::test_config()).await;
         let uri: axum::http::Uri = format!("ws://{addr}/ws").parse().unwrap();
         let request = ClientRequestBuilder::new(uri)
@@ -445,8 +529,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_second_connection_is_accepted_alongside_the_first() {
-        let (addr, token, handle) =
-            spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        let WsFixture {
+            addr,
+            token,
+            handle,
+            ..
+        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
         let mut first = connect_authed(addr, &token).await;
         initialize(&mut first).await;
 
@@ -470,8 +558,12 @@ mod tests {
     /// `initialize`。回归 `serve` 的 inbound `Err` 分支曾无条件 `return Err`。
     #[tokio::test(flavor = "multi_thread")]
     async fn oversized_frame_closes_only_the_offending_connection() {
-        let (addr, token, handle) =
-            spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        let WsFixture {
+            addr,
+            token,
+            handle,
+            ..
+        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
 
         // 第一个连接:推一个超过 MAX_FRAME_BYTES 的帧。
         let mut first = connect_authed(addr, &token).await;
@@ -496,6 +588,171 @@ mod tests {
         handle.abort();
     }
 
+    /// 断言携带 `token` 的连接会被以 4401 关闭。
+    async fn assert_closed_with_4401(addr: SocketAddr, token: &str) {
+        let uri: axum::http::Uri = format!("ws://{addr}/ws").parse().unwrap();
+        let request = ClientRequestBuilder::new(uri)
+            .with_header("Authorization", format!("Bearer {token}"))
+            .into_client_request()
+            .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("handshake completes; the close follows");
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("server must close the connection")
+            .expect("stream must not end without a close frame")
+            .expect("transport error");
+        match msg {
+            ClientMessage::Close(Some(frame)) => {
+                assert_eq!(u16::from(frame.code), 4401, "close code must be 4401");
+            }
+            other => panic!("expected a 4401 close, got {other:?}"),
+        }
+    }
+
+    /// Critical 1:`device/revoke` 必须**真的**断开活着的 socket,并让 token 立即
+    /// 失效(spec §3/§6)。
+    ///
+    /// `device/revoke` 是 Admin 门禁内的 RPC,而新配对设备恒为 `Control`,故本测试
+    /// 用 `seed_device` 直接铸一台 Admin 设备来驱动它。回归:在此之前 `revoke` 只
+    /// 摘 hub 注册,读循环与之无关、照旧吃帧,被撤销的手机仍能以全 scope 发
+    /// `turn/start`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_device_is_disconnected_and_its_token_invalidated() {
+        let WsFixture {
+            addr,
+            token: admin_token,
+            pairing,
+            handle,
+            ..
+        } = spawn_ws_with_token_for(
+            crate::server::tests_support::test_config(),
+            crate::protocol::Scope::Admin,
+        )
+        .await;
+        // 桌面侧:一台 Admin 连接,经它发起 revoke。
+        let mut admin = connect_authed(addr, &admin_token).await;
+        initialize(&mut admin).await;
+
+        // 被撤销的手机:一台 Control 设备,先正常连上并握手。
+        let (victim_device, victim_token) =
+            pairing.seed_device("victim-phone", crate::protocol::Scope::Control);
+        let mut victim = connect_authed(addr, &victim_token).await;
+        initialize(&mut victim).await;
+
+        // 撤销它。
+        send_json(
+            &mut admin,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"device/revoke","params":{{"device_id":"{}"}}}}"#,
+                victim_device.id
+            ),
+        )
+        .await;
+        let ack = loop {
+            let v = recv_json(&mut admin).await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                break v;
+            }
+        };
+        assert_eq!(ack["result"]["revoked"], true, "revoke must ack: {ack}");
+
+        // 被撤销设备的 socket 必须在有界时间内关闭(读循环的 disconnected tick)。
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(3), victim.next()).await;
+        assert!(
+            matches!(
+                closed,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(ClientMessage::Close(_))))
+            ),
+            "a revoked device must be disconnected, got {closed:?}"
+        );
+
+        // token 立即失效:拿旧 token 重连会被 4401 拒绝。
+        assert_closed_with_4401(addr, &victim_token).await;
+        handle.abort();
+    }
+
+    /// Critical 2:一个已离开的客户端(断连、被撤销或被广播背压丢弃)不得掀翻
+    /// **共享**主循环。
+    ///
+    /// 回归:`serve` 的入站循环对任何帧都先为它写响应,`write_response(..)?` 曾把
+    /// 对已注销客户端的 `Closed` 变成致命错误——一个坏掉的同伴会连带杀死所有其它
+    /// 客户端(以及后续连接)。本测试经 `assert!(handle.is_finished())` 断言 run
+    /// 循环**没有**在客户端离开后终止;写响应的非致命语义本身由
+    /// `server::tests::write_response_to_a_gone_ws_client_is_not_fatal` 精确钉死。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_leaving_does_not_kill_the_shared_loop() {
+        let WsFixture {
+            addr,
+            token,
+            handle,
+            ..
+        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        let mut gone = connect_authed(addr, &token).await;
+        initialize(&mut gone).await;
+        let mut live = connect_authed(addr, &token).await;
+        initialize(&mut live).await;
+
+        // `gone` 关闭连接:服务端读到 Close/EOF 即摘除它。此刻它可能仍有一帧在
+        // 共享 channel 里排队——那正是早退守卫要丢掉的。
+        gone.close(None).await.ok();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // 服务器必须仍然存活:`live` 仍被正常服务,且 main loop 没结束。
+        send_json(
+            &mut live,
+            r#"{"jsonrpc":"2.0","id":7,"method":"config/read","params":{}}"#,
+        )
+        .await;
+        let v = recv_json(&mut live).await;
+        assert_eq!(v["id"], 7, "the surviving client must still be served: {v}");
+        assert!(
+            !handle.is_finished(),
+            "the shared main loop must survive one client leaving"
+        );
+        handle.abort();
+    }
+
+    /// `teardown_ws_client` 必须把该连接从**所有**共享表里摘干净:hub 注册、scope、
+    /// 以及主循环在 `initialize` 时懒插入的 `initialized`,还有 `device_id → ClientId`
+    /// 映射。回归:`initialized` 曾由主循环私有持有,连接可来可去、表只增不减。
+    #[tokio::test]
+    async fn teardown_clears_scope_initialized_and_device_registries() {
+        let hub = Arc::new(Broadcaster::new());
+        let id = ClientId::ws(uuid::Uuid::new_v4());
+        let _rx = hub.register(id.clone());
+        let scopes: ClientScopes = Arc::new(Mutex::new(HashMap::new()));
+        let initialized: ClientInitialized = Arc::new(Mutex::new(HashMap::new()));
+        let devices: crate::server::WsDeviceRegistry =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        scopes
+            .lock()
+            .await
+            .insert(id.clone(), crate::protocol::Scope::Control);
+        initialized.lock().await.insert(id.clone(), true);
+        devices
+            .lock()
+            .unwrap()
+            .insert("dev-x".to_string(), id.clone());
+
+        teardown_ws_client(&hub, &id, &scopes, &initialized, &devices, "dev-x").await;
+
+        assert!(!hub.is_connected(&id), "hub registration must be gone");
+        assert!(
+            scopes.lock().await.get(&id).is_none(),
+            "scope entry must be gone"
+        );
+        assert!(
+            initialized.lock().await.get(&id).is_none(),
+            "initialized entry must be gone"
+        );
+        assert!(
+            devices.lock().unwrap().get("dev-x").is_none(),
+            "device mapping must be gone"
+        );
+    }
+
     /// 多客户端 + 审批先到先得(Tier 1 的端到端闭环)。
     ///
     /// A 与 B 都认证连接、都 initialize;A 发起的 turn 触发一次需审批的工具调用。
@@ -504,8 +761,12 @@ mod tests {
     /// 两端都应收到 `item/toolCall/approvalResolved`,turn 正常结束。
     #[tokio::test(flavor = "multi_thread")]
     async fn two_clients_both_see_the_turn_and_only_the_first_approval_counts() {
-        let (addr, token, handle) =
-            spawn_ws_permission(crate::server::tests_support::test_config()).await;
+        let WsFixture {
+            addr,
+            token,
+            handle,
+            ..
+        } = spawn_ws_permission(crate::server::tests_support::test_config()).await;
         let mut a = connect_authed(addr, &token).await;
         let mut b = connect_authed(addr, &token).await;
         crate::server::tests_support::initialize(&mut a).await;
@@ -590,13 +851,7 @@ mod tests {
 
     /// 启动一个 ws server,其 agent 工厂会触发一次 bash 审批(与
     /// `server::tests::build_permission_agent` 同源),供多客户端 E2E 用。
-    async fn spawn_ws_permission(
-        cfg: RuntimeConfig,
-    ) -> (
-        SocketAddr,
-        String,
-        tokio::task::JoinHandle<anyhow::Result<()>>,
-    ) {
+    async fn spawn_ws_permission(cfg: RuntimeConfig) -> WsFixture {
         let dir = tempfile::TempDir::new().unwrap();
         let workdir = dir.path().to_path_buf();
         let index_path = dir.path().join("workspaces.json");
@@ -610,14 +865,21 @@ mod tests {
                 uuid::Uuid::new_v4()
             )),
         )));
-        let code = pairing.create_code();
-        let (_device, token) = pairing.redeem(&code.code, "test-phone").unwrap();
+        let (_device, token) = pairing.seed_device("test-phone", crate::protocol::Scope::Control);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(crate::server::tests::serve_ws_with_permission_agent(
-            listener, cfg, workspaces, pairing,
+            listener,
+            cfg,
+            workspaces,
+            Arc::clone(&pairing),
         ));
-        (addr, token, handle)
+        WsFixture {
+            addr,
+            token,
+            pairing,
+            handle,
+        }
     }
 
     /// 读到 `item/toolCall/requestApproval`,返回其 id。

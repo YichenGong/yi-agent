@@ -104,6 +104,29 @@ impl PairingState {
         Ok((device, token))
     }
 
+    /// 仅供测试:直接铸一台设备并返回其 id 与明文 token。
+    ///
+    /// 生产只会经 `create_code` + `redeem` 铸设备;但测试要覆盖「已配对的
+    /// Admin 设备」这类**非默认** scope(新配对设备恒为 Control)时,用配对码
+    /// 换不出 Admin,故给一个直接落表的入口。生产构建不含此方法。
+    #[cfg(test)]
+    pub(crate) fn seed_device(&self, name: &str, scope: Scope) -> (Device, String) {
+        let token = format!("yia_{}", short_code_secret());
+        let now = now_epoch_secs();
+        let device = Device {
+            id: format!("dev-{}", uuid::Uuid::new_v4()),
+            name: name.to_string(),
+            scope,
+            token_hash: hash_token(&token),
+            created_at: now,
+            last_seen_at: now,
+        };
+        self.store
+            .add(device.clone())
+            .expect("seed device must persist");
+        (device, token)
+    }
+
     /// 仅供测试:塞入一枚**已过期**的配对码,以覆盖 `redeem` 的过期分支。
     /// 生产构建不含此方法。
     #[cfg(test)]

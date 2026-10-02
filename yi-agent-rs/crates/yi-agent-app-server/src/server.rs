@@ -1030,6 +1030,7 @@ where
     // scope 随连接登记一次;主循环按 `client` id 查它。stdio 会话只此一条,故
     // 传入的表就是一张只装 `local` 的注册表(与 ws 的动态注册同型,便于共享)。
     let client_scopes = Arc::new(Mutex::new(HashMap::from([(local.clone(), client_scope)])));
+    let client_initialized: ClientInitialized = Arc::new(Mutex::new(HashMap::new()));
     let result = serve(
         inbound_rx,
         Arc::clone(&hub),
@@ -1040,6 +1041,7 @@ where
         attachments,
         build_agent,
         client_scopes,
+        client_initialized,
     )
     .await;
     // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
@@ -1114,6 +1116,14 @@ async fn pump_stdout<W>(
 /// 的 `ClientId` 在 upgrade 闭包里才铸造。
 pub(crate) type ClientScopes = Arc<Mutex<HashMap<crate::broadcast::ClientId, Scope>>>;
 
+/// 每客户端的 `initialize` 状态(共享、可增长)。
+///
+/// 与 [`ClientScopes`] 同型、同生命周期:传输层在连接建立时**无须**登记——缺省
+/// 即「未握手」(fail-closed),主循环收到 `initialize` 时置位,连接断连时由传输
+/// 层摘除。用共享表而非主循环里的局部 `HashMap`,是为了能在断连时**回收**条目:
+/// 否则每个 ws 连接都会永久留下一个 `ClientId` 键(连接可来去,表只增不减)。
+pub(crate) type ClientInitialized = Arc<Mutex<HashMap<crate::broadcast::ClientId, bool>>>;
+
 /// 主循环的传输无关核心:agent 工厂由调用方注入(测试用 mock provider)。
 ///
 /// **取消安全**:入站读取由传输层任务负责(`read_lines` / WS 读循环),主循环只在
@@ -1142,6 +1152,9 @@ pub(crate) async fn serve<F>(
     attachments: RuntimeAttachments,
     build_agent: F,
     client_scopes: ClientScopes,
+    // 每客户端 `initialize` 状态的共享表(见 [`ClientInitialized`]):放在主循环
+    // 之外,传输层断连时才摘得掉键。主循环在此处插入/读取,不自己拥有它。
+    client_initialized: ClientInitialized,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -1176,7 +1189,9 @@ where
     // 否则一台设备握手会替另一台解锁、或低权设备的请求被当成高权。
     // scope 由传输层在注册时给定(`client_scopes` 参数);这里补一条兜底,
     // 未登记的客户端按最低权 `Observe` 处理(fail-closed)。
-    let mut initialized: HashMap<crate::broadcast::ClientId, bool> = HashMap::new();
+    // `initialized` 由调用方传入(共享表),理由同 `client_scopes`:断连时传输层
+    // 要能摘键,主循环持有私有 `HashMap` 就够不着它。
+    let initialized = client_initialized;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
@@ -1192,6 +1207,18 @@ where
         tokio::select! {
             line = inbound.recv() => {
                 let Some((client, item)) = line else { break }; // EOF → graceful exit
+                // 早退守卫:某客户端(如被 `device/revoke` 踢掉、或被广播背压
+                // 摘除)在断连后仍可能有一帧已在 channel 里排队。它已经不在 hub
+                // 上,任何按它寻址的响应都写不出去;在主循环里处理它只会走到
+                // `write_response` 的 `Closed` 分支。这里直接丢弃,别再费事。
+                //
+                // 只管**非本地**客户端:stdio 的 `local` 若已注销(出口泵写失败),
+                // 仍要走 `write_response` 的致命分支退出会话——那是改造前的语义
+                // (`oversized_frame_returns_err` / `driver_reports_finished_when_writer_fails`
+                // 钉死的),不能因为这个守卫被悄悄改成优雅退出。
+                if client != crate::broadcast::ClientId::local() && !hub.is_connected(&client) {
+                    continue;
+                }
                 let line = match item {
                     Ok(l) => l,
                     Err(e) => {
@@ -1276,7 +1303,12 @@ where
 
                 // 未 initialize 前,除 `initialize` 外的请求一律拒绝。按客户端
                 // 判断,而非全局一个 bool。
-                let client_initialized = initialized.get(&client).copied().unwrap_or(false);
+                let client_initialized = initialized
+                    .lock()
+                    .await
+                    .get(&client)
+                    .copied()
+                    .unwrap_or(false);
                 if !client_initialized && method != "initialize" {
                     write_response(&hub, &client, err_response(id, RpcError::not_initialized())).await?;
                     continue;
@@ -1315,7 +1347,7 @@ where
 
                 match method.as_str() {
                     "initialize" => {
-                        initialized.insert(client.clone(), true);
+                        initialized.lock().await.insert(client.clone(), true);
                         write_response(
                             &hub, &client,
                             ok_response(
@@ -3004,7 +3036,14 @@ where
                         };
                         let revoked = pairing.revoke(&device_id).unwrap_or(false);
                         if revoked {
-                            if let Some(cid) = ws_client_for_device(&device_id) {
+                            // 先取当前连接:撤销即掉线由「`hub.unregister` + 读循环
+                            // 的 disconnected tick」共同完成。用 `get` + `forget`
+                            // 两步是为了兼顾两种语义——`ws_client_for_device` 仍是
+                            // 「此刻该设备连在哪」的权威读法(测试与将来 RPC 复用),
+                            // `forget_ws_device` 顺带把该映射从全局表摘掉,不留陈旧项。
+                            let cid = ws_client_for_device(&device_id);
+                            forget_ws_device(&device_id);
+                            if let Some(cid) = cid {
                                 hub.unregister(&cid);
                             }
                         }
@@ -3064,6 +3103,18 @@ fn ws_client_for_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
     guard.get(device_id).cloned()
 }
 
+/// 取出并移除某设备 id 的连接映射(撤销时用)。
+///
+/// 与 [`ws_client_for_device`] 同一张表,但顺带摘掉条目:设备已撤销,它的
+/// `device_id → ClientId` 映射不该留在全局表里等下一个同名设备(或迟到的清理)
+/// 撞上。真正的连接关闭由调用方 `hub.unregister` + ws 读循环的 disconnected
+/// tick 完成;这里只负责让主循环侧不再记得它。
+fn forget_ws_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
+    let registry = device_registry().get()?;
+    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    guard.remove(device_id)
+}
+
 /// 进程级「设备 id → ws `ClientId`」句柄。
 ///
 /// 用 `OnceLock` 而非 `RuntimeAttachments` 字段:它天然是**每进程一张表**
@@ -3112,9 +3163,25 @@ async fn write_response(
         .map_err(|e| anyhow::anyhow!("failed to serialize response: {e}"))?;
     // 定向回复:`reply` 会 await 到入队成功,保留 stdio 改造前
     // 「写阻塞直到对端读」的语义。
-    hub.reply(client, frame)
-        .await
-        .map_err(|_| anyhow::anyhow!("client {} disconnected", client.as_str()))
+    match hub.reply(client, frame).await {
+        Ok(()) => Ok(()),
+        // 写失败到**非本地**客户端(ws 手机)不得掀翻共享主循环:那是**多客户端
+        // 共享**的一台服务器,一个被 `device/revoke` 踢掉、或被广播背压摘除
+        // (慢消费者)的连接,不能让所有其它客户端(以及后续连接)一起陪葬。
+        // 摘掉它、让本轮请求就此了结即可(它的读循环靠 `is_connected` 票 tick
+        // 自行收尾)。
+        Err(_) if *client != crate::broadcast::ClientId::local() => {
+            tracing::warn!(
+                client = client.as_str(),
+                "app-server response write failed; dropping the ws client"
+            );
+            hub.unregister(client);
+            Ok(())
+        }
+        // stdio 的 `local` 仍保留改造前的语义:出口泵已死,再写就是错,把错误
+        // 抛出以结束会话(`driver_reports_finished_when_writer_fails` 钉死这条)。
+        Err(_) => Err(anyhow::anyhow!("client {} disconnected", client.as_str())),
+    }
 }
 
 async fn write_notification(
@@ -6031,6 +6098,44 @@ pub(crate) mod tests {
             .unwrap();
         assert!(matches!(ev, TurnEvent::Finished { .. }));
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Critical 2:往一个已注销的 **ws** 客户端写响应**不得**是致命错误。
+    ///
+    /// 一台手机断连/被撤销、或被广播背压摘除后,主循环仍可能为它手里的一帧去写
+    /// 响应;那是多客户端共享主循环上的常态,不该带走所有其它客户端。回归:
+    /// `write_response(..)?` 曾把 `Closed` 冒泡成 `serve` 的致命错误。
+    ///
+    /// 反向钉死:stdio 的 `local` 仍保持改造前的**致命**语义(出口泵死了,再写
+    /// 就是错),`driver_reports_finished_when_writer_fails` 依赖它。
+    #[tokio::test]
+    async fn write_response_to_a_gone_ws_client_is_not_fatal() {
+        let hub = crate::broadcast::Broadcaster::new();
+        let response = || ResponseEnvelope {
+            jsonrpc: Some(JSONRPC_VERSION.to_string()),
+            id: RequestId::Num(1),
+            result: Some(serde_json::json!({})),
+            error: None,
+        };
+
+        // ws 客户端已走:非致命,返回 Ok(它同时被确认已从 hub 摘除)。
+        let ws_id = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+        let _rx = hub.register(ws_id.clone());
+        hub.unregister(&ws_id);
+        assert!(
+            write_response(&hub, &ws_id, response()).await.is_ok(),
+            "a response to a gone ws client must not be fatal"
+        );
+        assert!(!hub.is_connected(&ws_id), "the ws client must be gone");
+
+        // 反面:stdio 的 `local` 保持致命。
+        let local = crate::broadcast::ClientId::local();
+        let _rx = hub.register(local.clone());
+        hub.unregister(&local);
+        assert!(
+            write_response(&hub, &local, response()).await.is_err(),
+            "the stdio local client must stay fatal on write failure"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
