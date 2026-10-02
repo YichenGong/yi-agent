@@ -3,11 +3,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { isRemoteClient, openExternalLink } from "../lib/platform";
 import "highlight.js/styles/github-dark.css";
 
 /**
  * 外链在系统浏览器打开,避免 webview 被导航走。
- * 非 Tauri 环境(vitest / 浏览器开发)下 `openUrl` 会 reject,吞掉即可。
+ * 桌面走 Tauri opener;远程(iOS)构建没有该插件,退回 webview 的 window.open。
+ * 非 Tauri 环境(vitest / 浏览器开发)下会 reject,吞掉即可。
  */
 function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
   const isHttp = !!href && /^https?:/i.test(href);
@@ -21,7 +23,7 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
       href={href}
       onClick={(e) => {
         e.preventDefault();
-        void openUrl(href).catch(() => {});
+        void openExternalLink(href, { remote: isRemoteClient(), native: openUrl }).catch(() => {});
       }}
       rel="noreferrer"
     >

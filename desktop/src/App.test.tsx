@@ -151,7 +151,7 @@ vi.mock("./lib/rpc", () => ({
   },
 }));
 
-vi.mock("./tauriTransport", () => ({ tauriTransport: () => ({}) }));
+vi.mock("./transportFactory", () => ({ transportFactory: () => ({}) }));
 
 import App from "./App";
 
