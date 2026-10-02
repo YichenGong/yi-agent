@@ -33,6 +33,11 @@ const { clients, state } = vi.hoisted(() => ({
     // Paths the native file picker hands back, in order. `null` = cancelled.
     // Tests push what they need; an empty queue resolves to `null`.
     picks: [] as (string | null)[],
+    // Per-test RPC override: method -> a data source for its response. Lets a
+    // test hand back a pending promise so an in-flight request (e.g. the startup
+    // theme read) can be interleaved with a notification or user action. Takes
+    // precedence over the canned responses below.
+    dataSources: {} as Record<string, (params: unknown) => unknown>,
   },
 }));
 
@@ -64,6 +69,10 @@ vi.mock("./lib/rpc", () => ({
       this.requests.push({ method, params });
       const forced = state.rejectCode[method];
       if (forced !== undefined) throw { code: forced, message: `forced ${forced}` };
+      // Per-test override hook — see `state.dataSources`. Its return value is
+      // awaited by callers, so returning a pending promise defers the response.
+      const dataSource = state.dataSources[method];
+      if (dataSource) return dataSource(params);
       if (method === "thread/listAll") {
         this.listCalls += 1;
         if (state.failList) throw { code: -1, message: "list failed" };
@@ -145,6 +154,7 @@ beforeEach(() => {
   state.listStatus = "idle";
   state.pinnedIds = [];
   state.picks = [];
+  state.dataSources = {};
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
   delete document.documentElement.dataset.theme;
@@ -900,5 +910,42 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
     notify("ui/settings/updated", { theme: "light" });
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
+  });
+
+  /** Defer `ui/settings/read` so a test can interleave a newer theme choice. */
+  function deferRead() {
+    let resolveRead: (v: { theme?: unknown }) => void = () => {};
+    state.dataSources["ui/settings/read"] = () =>
+      new Promise((resolve) => {
+        resolveRead = resolve;
+      });
+    return async (value: { theme?: unknown }) => {
+      await act(async () => resolveRead(value));
+    };
+  }
+
+  it("does not let the in-flight startup read clobber a ui/settings/updated theme", async () => {
+    const resolveRead = deferRead();
+    render(<App />);
+    await settle();
+    // read 在途：先跟随一条 ui/settings/updated。
+    notify("ui/settings/updated", { theme: "light" });
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
+    // 迟到的权威 read 带回旧值 dark，必须被忽略。
+    await resolveRead({ theme: "dark" });
+    expect(document.documentElement.dataset.theme).toBe("light");
+  });
+
+  it("does not let the in-flight startup read clobber the user's theme choice", async () => {
+    const resolveRead = deferRead();
+    render(<App />);
+    await settle();
+    // read 在途：用户先在设置里选了浅色。
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "浅色" }));
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
+    // 迟到的权威 read 带回旧值 dark，必须被忽略。
+    await resolveRead({ theme: "dark" });
+    expect(document.documentElement.dataset.theme).toBe("light");
   });
 });

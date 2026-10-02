@@ -120,6 +120,9 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
   const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
+  // 挂载后主题是否已被更新的选择触碰过（ui/settings/updated 通知或用户
+  // changeTheme）。首屏 read 在途时若被触碰，read 返回的旧值不得覆盖它。
+  const themeTouchedRef = useRef(false);
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -452,7 +455,9 @@ export default function App() {
         return;
       }
       if (n.method === "ui/settings/updated") {
-        // 对话（set_theme 工具）改了主题：跟随它。
+        // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
+        // 的首屏 read 用旧值把它覆盖回去。
+        themeTouchedRef.current = true;
         setTheme(parseTheme(n.params.theme));
         return;
       }
@@ -477,7 +482,9 @@ export default function App() {
     (async () => {
       await client.request("initialize", {});
       const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
-      setTheme(parseTheme(settings.theme));
+      // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
+      // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
+      if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
       await refreshWorkspaces();
       const list = await client.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
         "thread/listAll",
@@ -647,6 +654,7 @@ export default function App() {
 
   const changeTheme = (next: Theme) => {
     // 立即生效，再落盘；写失败由服务端通知/下次读取纠正。
+    themeTouchedRef.current = true;
     setTheme(next);
     clientRef.current?.request("ui/settings/write", { theme: next }).catch((e) => {
       setCurrentError(formatError(e));
