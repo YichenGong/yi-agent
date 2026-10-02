@@ -4,6 +4,7 @@
 //! - `<thread_id>.jsonl`     只追加,每 turn 一行 `TurnLine::Turn`
 //! - `<thread_id>.meta.json` 可变,整体原子重写
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,10 @@ pub struct ThreadMeta {
     /// 该 thread 的自主权模式;旧 meta 缺失时默认 Normal。
     #[serde(default)]
     pub permission_mode: ThreadMode,
+    /// 置顶顺序键：`Some` 表示已置顶（数值越大越靠前），`None` 表示未置顶。
+    /// 旧 meta 缺字段时默认 `None`。
+    #[serde(default)]
+    pub pin_seq: Option<i64>,
 }
 
 /// 一次 turn 的 token 用量。
@@ -264,6 +269,15 @@ impl ThreadStore {
             .is_some())
     }
 
+    /// 写入置顶顺序键：`Some(seq)` = 置顶，`None` = 取消置顶。
+    ///
+    /// 有意**不**刷新 `updated_at`：置顶属于设置变更而非 thread 活动，不应影响
+    /// 按 `updated_at` 排序的普通列表顺序（与 `set_permission_mode` 同理）。
+    /// 返回 false 表示 thread 不存在或 meta 不可读。
+    pub fn set_pin_seq(&self, id: &str, seq: Option<i64>) -> io::Result<bool> {
+        Ok(self.update_meta(id, |meta| meta.pin_seq = seq)?.is_some())
+    }
+
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
     /// `title_hint`(本轮 prompt)填充。thread 不存在或 meta 不可读时静默返回。
     pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {
@@ -368,6 +382,42 @@ pub fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// 计算重排后的 `pin_seq` 赋值。`order` 为**从顶到底**的完整有序 id 列表，
+/// `current` 为这些 id 当前的 `pin_seq`。
+///
+/// 前提：`current` 需覆盖 `order` 中的 id（缺失按未置顶补号处理）。
+///
+/// 算法：取 `order` 中 id 在 `current` 里现有 `pin_seq` 的**互异**值升序得
+/// `seqs`；把 `order` 从顶到底依次赋值为 `seqs` 的从大到小（`order[0]` 拿最大）。
+/// 复用既有互异数值做双射，永不产生新的重复值，且与「数值越大越靠前」的排序契约一致。
+/// 若互异值不够（有 `None` 或历史重复值），从 `max(seqs)+1` 起补足。
+pub(crate) fn assign_pin_seqs(
+    order: &[String],
+    current: &HashMap<String, Option<i64>>,
+) -> Vec<(String, i64)> {
+    let mut seqs: Vec<i64> = order
+        .iter()
+        .filter_map(|id| current.get(id).copied().flatten())
+        .collect();
+    seqs.sort_unstable();
+    seqs.dedup();
+    if seqs.len() < order.len() {
+        let mut next = seqs
+            .last()
+            .map(|m| m.saturating_add(1))
+            .unwrap_or_else(now_millis);
+        while seqs.len() < order.len() {
+            seqs.push(next);
+            next = next.saturating_add(1);
+        }
+    }
+    order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), seqs[seqs.len() - 1 - i]))
+        .collect()
+}
+
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 用临时文件 + rename 原子替换,避免半写状态。
@@ -431,6 +481,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         updated_at: created,
         title: first_user_text(messages),
         permission_mode: ThreadMode::Normal,
+        pin_seq: None,
     }
 }
 
@@ -454,6 +505,7 @@ mod tests {
             updated_at: 1,
             title: None,
             permission_mode: ThreadMode::Normal,
+            pin_seq: None,
         }
     }
 
@@ -940,5 +992,108 @@ mod tests {
                 "set_permission_mode must reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn new_meta_is_not_pinned() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.pin_seq, None);
+    }
+
+    #[test]
+    fn set_pin_seq_sets_value_without_bumping_updated_at() {
+        let (_d, s) = store();
+        let mut m = meta("thread-a");
+        m.updated_at = 7;
+        s.create(&m).unwrap();
+        assert!(s.set_pin_seq("thread-a", Some(42)).unwrap());
+        let got = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(got.pin_seq, Some(42));
+        assert_eq!(got.updated_at, 7, "置顶不得刷新 updated_at");
+    }
+
+    #[test]
+    fn set_pin_seq_none_clears_it() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.set_pin_seq("thread-a", Some(1)).unwrap();
+        assert!(s.set_pin_seq("thread-a", None).unwrap());
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.pin_seq, None);
+    }
+
+    #[test]
+    fn set_pin_seq_unknown_id_returns_false() {
+        let (_d, s) = store();
+        assert!(!s.set_pin_seq("nope", Some(1)).unwrap());
+    }
+
+    #[test]
+    fn legacy_meta_without_pin_seq_deserializes_unpinned() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        // 旧格式：没有 pin_seq 字段。
+        let legacy = r#"{"thread_id":"thread-a","cwd":"/tmp","model":"m",
+            "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal"}"#;
+        std::fs::write(s.meta_path("thread-a"), legacy).unwrap();
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.pin_seq, None);
+    }
+
+    #[test]
+    fn assign_pin_seqs_reproduces_requested_order_top_to_bottom() {
+        let mut cur = HashMap::new();
+        cur.insert("a".to_string(), Some(10));
+        cur.insert("b".to_string(), Some(20));
+        cur.insert("c".to_string(), Some(30));
+        // 请求顺序：c, a, b（从顶到底）。
+        let order = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let out = assign_pin_seqs(&order, &cur);
+        // 还原顺序：按 seq 降序读出 id，应等于 order。
+        let mut pairs: Vec<(&String, i64)> = out.iter().map(|(i, s)| (i, *s)).collect();
+        pairs.sort_by(|x, y| y.1.cmp(&x.1));
+        let got: Vec<&String> = pairs.iter().map(|(i, _)| *i).collect();
+        assert_eq!(
+            got,
+            vec![&"c".to_string(), &"a".to_string(), &"b".to_string()]
+        );
+        // 互异。
+        let mut seqs: Vec<i64> = out.iter().map(|(_, s)| *s).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 3, "不得产生重复 seq");
+    }
+
+    #[test]
+    fn assign_pin_seqs_pads_none_values_and_stays_unique() {
+        let order = vec!["a".to_string(), "b".to_string()];
+        let mut cur = HashMap::new();
+        cur.insert("a".to_string(), None); // 异常态：声称置顶但无 seq
+        cur.insert("b".to_string(), Some(5));
+        let out = assign_pin_seqs(&order, &cur);
+        let mut seqs: Vec<i64> = out.iter().map(|(_, s)| *s).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 2, "补号后仍须互异");
+        // a 在最顶 → 其 seq 更大。
+        let a = out.iter().find(|(i, _)| i == "a").unwrap().1;
+        let b = out.iter().find(|(i, _)| i == "b").unwrap().1;
+        assert!(a > b);
+    }
+
+    #[test]
+    fn assign_pin_seqs_is_idempotent() {
+        let order = vec!["x".to_string(), "y".to_string()];
+        let mut cur = HashMap::new();
+        cur.insert("x".to_string(), Some(100));
+        cur.insert("y".to_string(), Some(50));
+        let first = assign_pin_seqs(&order, &cur);
+        let cur2: HashMap<String, Option<i64>> =
+            first.iter().map(|(i, s)| (i.clone(), Some(*s))).collect();
+        let second = assign_pin_seqs(&order, &cur2);
+        let mut a: Vec<i64> = first.iter().map(|(_, s)| *s).collect();
+        let mut b: Vec<i64> = second.iter().map(|(_, s)| *s).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "以当前顺序再算一次应稳定");
     }
 }

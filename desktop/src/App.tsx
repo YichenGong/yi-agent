@@ -16,6 +16,7 @@ import type {
   AgentChildrenListResult,
   AgentTraceSnapshotResult,
   ThreadStatus,
+  ThreadSummary,
   TurnStatus,
   Workspace,
   WorkspaceGroup,
@@ -42,13 +43,18 @@ import { estimateCost, formatCost } from "./lib/pricing";
 
 /**
  * Read the persisted permission mode for a thread from the `thread/listAll`
- * groups. `thread/resume`/`thread/start` responses do not carry the mode, so it
+ * response. `thread/resume`/`thread/start` responses do not carry the mode, so it
  * is read back from the listing. Returns `null` when the thread is absent from
  * the listing (so callers never mistake "unknown" for "normal"); a present
  * thread with an omitted `permission_mode` (legacy) is treated as "normal".
+ *
+ * 置顶会话同时存在于顶层 `pinned` 与它自己的分组内（服务端为向后兼容不摘除），
+ * 两个来源都要扫：任一侧缺失都不能让模式回读落空。
  */
-function modeForThread(groups: WorkspaceGroup[], id: string): ThreadMode | null {
-  const t = groups.flatMap((g) => g.threads).find((th) => th.thread_id === id);
+function modeForThread(groups: WorkspaceGroup[], pinned: ThreadSummary[], id: string): ThreadMode | null {
+  const t =
+    pinned.find((th) => th.thread_id === id) ??
+    groups.flatMap((g) => g.threads).find((th) => th.thread_id === id);
   return t ? (t.permission_mode ?? "normal") : null;
 }
 
@@ -82,6 +88,9 @@ export default function App() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [status, setStatus] = useState<string>("connecting");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
+  // 服务端排好序的全部置顶会话（从顶到底）。置顶项仍留在各自的分组内，侧栏
+  // 渲染分组时需自行过滤，否则会重复渲染。
+  const [pinned, setPinned] = useState<ThreadSummary[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
@@ -129,8 +138,14 @@ export default function App() {
     const c = clientRef.current;
     if (!c) return null;
     try {
-      const r = await c.request<{ groups: WorkspaceGroup[] }>("thread/listAll", {});
+      const r = await c.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
+        "thread/listAll",
+        {},
+      );
       setGroups(r.groups);
+      setPinned(r.pinned ?? []);
+      // seed 喂全集：置顶项仍在分组里，所以不会漏；store 的视图与侧栏的分区
+      // 划分无关（状态徽章、未读点都按 thread_id 查 store）。
       store.seed(r.groups.flatMap((g) => g.threads));
       return r.groups;
     } catch {
@@ -232,7 +247,7 @@ export default function App() {
       // thread/resume 响应不带权限模式,从 listAll 回读后写回该 view。
       // 按 thread 存储,切回 warm thread 时 chip 自动反映各自模式。
       const gs = await refreshThreads();
-      if (gs !== null) view.mode = modeForThread(gs, id);
+      if (gs !== null) view.mode = modeForThread(gs, pinned, id);
       force((v) => v + 1);
     } catch (e) {
       // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
@@ -262,7 +277,7 @@ export default function App() {
       force((v) => v + 1);
       const gs = await refreshThreads();
       if (gs !== null) {
-        store.view(t.thread_id).mode = modeForThread(gs, t.thread_id);
+        store.view(t.thread_id).mode = modeForThread(gs, pinned, t.thread_id);
         force((v) => v + 1);
       }
     } catch (e) {
@@ -369,6 +384,41 @@ export default function App() {
     await refreshThreads();
   };
 
+  /** 置顶 / 取消置顶；成功后重拉列表，以服务端顺序为权威。 */
+  const onTogglePin = async (id: string, next: boolean) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("thread/setPinned", { threadId: id, pinned: next });
+      await refreshThreads();
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
+      // 失败也要重拉：本地不做乐观更新，UI 不能停在"看起来置顶了"的状态。
+      await refreshThreads();
+      force((v) => v + 1);
+    }
+  };
+
+  /** 置顶分区内拖拽排序落盘；乐观更新 + 失败回滚重拉。 */
+  const onReorderPinned = async (orderedIds: string[]) => {
+    const c = clientRef.current;
+    if (!c) return;
+    const prev = pinned;
+    const byId = new Map(prev.map((t) => [t.thread_id, t]));
+    // 乐观：先按落点顺序重排，`pin_seq` 的权威值仍由服务端在重拉时给出。
+    setPinned(orderedIds.map((id) => byId.get(id)).filter((t): t is ThreadSummary => !!t));
+    force((v) => v + 1);
+    try {
+      await c.request("thread/reorderPinned", { threadIds: orderedIds });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      setPinned(prev);
+      await refreshThreads();
+      force((v) => v + 1);
+    }
+  };
+
   /** 切换当前 thread 的权限模式;仅当 RPC 成功后才更新本地状态。 */
   const setThreadMode = async (next: ThreadMode) => {
     const c = clientRef.current;
@@ -417,10 +467,15 @@ export default function App() {
     (async () => {
       await client.request("initialize", {});
       await refreshWorkspaces();
-      const list = await client.request<{ groups: WorkspaceGroup[] }>("thread/listAll", {});
+      const list = await client.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
+        "thread/listAll",
+        {},
+      );
       setGroups(list.groups);
+      setPinned(list.pinned ?? []);
       store.seed(list.groups.flatMap((g) => g.threads));
-      const first = list.groups.flatMap((g) => g.threads)[0];
+      // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
+      const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
       if (first) {
         await selectThread(first.thread_id);
       }
@@ -605,11 +660,14 @@ export default function App() {
           groups={groups}
           workspaces={workspaces}
           currentId={currentId}
+          pinned={pinned}
           statuses={statuses}
           unread={unread}
           onSelect={selectThread}
           onRename={renameThread}
           onDelete={deleteThread}
+          onTogglePin={onTogglePin}
+          onReorderPinned={onReorderPinned}
           onNew={onNew}
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
