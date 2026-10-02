@@ -22,20 +22,20 @@ export function SuperpowersKanbanSettings({
             onChange={(event) => onToggle(event.target.checked)}
           />
           <span>Superpowers 看板</span>
-          <span className="text-neutral-500">({source})</span>
+          <span className="text-fg-subtle">({source})</span>
         </label>
         {onCollapse && (
           <button
             type="button"
             aria-label="收起看板"
-            className="text-xs text-neutral-500 hover:text-neutral-300"
+            className="text-xs text-fg-subtle hover:text-fg-muted"
             onClick={onCollapse}
           >
             收起
           </button>
         )}
       </div>
-      <p className="mt-2 text-xs text-neutral-500">
+      <p className="mt-2 text-xs text-fg-subtle">
         Off by default. Turning it off stops the plugin from advancing the queue; it
         does not cancel sessions already running in the daemon.
       </p>

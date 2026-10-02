@@ -58,9 +58,9 @@ export function ApprovalDialog({
       <div
         role="dialog"
         aria-labelledby={headingId}
-        className="w-full max-w-lg rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl"
+        className="w-full max-w-lg rounded-lg border border-line-strong bg-panel p-4 shadow-xl"
       >
-        <h2 id={headingId} className="mb-2 text-sm font-semibold text-neutral-100">
+        <h2 id={headingId} className="mb-2 text-sm font-semibold text-fg">
           Approve tool call: <span className="font-mono">{tool_name}</span>
         </h2>
 
@@ -68,20 +68,20 @@ export function ApprovalDialog({
           {blacklisted !== null ? (
             <span className="font-medium text-red-400">Blacklisted: {blacklisted}</span>
           ) : (
-            <span className="text-neutral-400">Normal</span>
+            <span className="text-fg-muted">Normal</span>
           )}
         </div>
 
         {prefix_suggestion !== null && (
-          <div className="mb-2 text-xs text-neutral-400">
+          <div className="mb-2 text-xs text-fg-muted">
             Prefix:{" "}
-            <code className="rounded bg-neutral-950 px-1 font-mono text-neutral-200">
+            <code className="rounded bg-surface px-1 font-mono text-fg">
               {prefix_suggestion}
             </code>
           </div>
         )}
 
-        <pre className="mb-4 max-h-64 overflow-auto rounded bg-neutral-950 p-2 font-mono text-xs whitespace-pre-wrap text-neutral-300">
+        <pre className="mb-4 max-h-64 overflow-auto rounded bg-surface p-2 font-mono text-xs whitespace-pre-wrap text-fg-muted">
           {JSON.stringify(tool_input, null, 2)}
         </pre>
 
@@ -91,7 +91,7 @@ export function ApprovalDialog({
             type="button"
             disabled={submitted}
             onClick={() => decide({ decision: "deny" })}
-            className="rounded-md border border-neutral-600 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-50"
+            className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50"
           >
             Deny
           </button>
@@ -107,7 +107,7 @@ export function ApprovalDialog({
             type="button"
             disabled={submitted}
             onClick={() => decide({ decision: "always_allow_tool" })}
-            className="rounded-md border border-neutral-600 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-50"
+            className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50"
           >
             Always allow tool
           </button>
@@ -118,7 +118,7 @@ export function ApprovalDialog({
               onClick={() =>
                 decide({ decision: "always_allow_prefix", prefix: prefix_suggestion })
               }
-              className="rounded-md border border-neutral-600 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-50"
+              className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50"
             >
               Always allow <span className="font-mono">{prefix_suggestion}</span>
             </button>

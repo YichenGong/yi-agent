@@ -381,7 +381,7 @@ describe("ThreadSidebar status", () => {
       currentId: null,
     });
     expect(interrupted.container.querySelector('[aria-label="Unread"]')!.className).toContain(
-      "bg-neutral-400",
+      "bg-fg-muted",
     );
   });
 

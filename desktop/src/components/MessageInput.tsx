@@ -66,7 +66,7 @@ export function MessageInput({
   };
 
   return (
-    <div className="relative flex items-end gap-2 border-t border-neutral-800 bg-neutral-900 p-3">
+    <div className="relative flex items-end gap-2 border-t border-line bg-panel p-3">
       {showPopup && <SlashPopup commands={options} selected={selected} />}
       <textarea
         ref={inputRef}
@@ -156,7 +156,7 @@ export function MessageInput({
         disabled={sending || turnActive}
         rows={3}
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-        className="flex-1 resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-500 focus:outline-none disabled:opacity-50"
+        className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-line-strong focus:outline-none disabled:opacity-50"
       />
       <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
       <button

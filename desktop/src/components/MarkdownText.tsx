@@ -39,7 +39,7 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
 export const MarkdownText = memo(
   function MarkdownText({ text }: { text: string }) {
     return (
-      <div className="prose prose-invert max-w-none prose-pre:bg-neutral-900">
+      <div className="prose prose-invert max-w-none prose-pre:bg-panel">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           rehypePlugins={[rehypeHighlight]}

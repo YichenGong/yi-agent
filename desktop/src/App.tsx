@@ -653,7 +653,7 @@ export default function App() {
 
   return (
     <>
-      <div className="flex h-screen flex-col bg-neutral-950 text-neutral-100">
+      <div className="flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
         <div className="flex min-h-0 flex-1 flex-row">
         <ThreadSidebar
@@ -675,7 +675,7 @@ export default function App() {
         {kanbanCollapsed ? (
           <SuperpowersKanbanCollapsedStrip onExpand={() => setKanbanCollapsed(false)} />
         ) : (
-          <div className="flex w-72 flex-col border-r border-neutral-800">
+          <div className="flex w-72 flex-col border-r border-line">
             <SuperpowersKanbanSettings
               switchOn={boardOn}
               source={boardSource}

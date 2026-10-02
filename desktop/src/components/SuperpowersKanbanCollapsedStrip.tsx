@@ -15,12 +15,12 @@ export function SuperpowersKanbanCollapsedStrip({
   return (
     <aside
       aria-label="Superpowers 看板"
-      className="flex w-8 shrink-0 flex-col items-center border-r border-neutral-800 bg-neutral-925 py-3"
+      className="flex w-8 shrink-0 flex-col items-center border-r border-line bg-raised py-3"
     >
       <button
         type="button"
         aria-label="展开看板"
-        className="text-xs text-neutral-500 hover:text-neutral-300"
+        className="text-xs text-fg-subtle hover:text-fg-muted"
         onClick={onExpand}
         title="展开看板"
       >

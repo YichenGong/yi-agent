@@ -19,7 +19,7 @@ function stateColor(state: string): string {
     case "waiting_for_children":
       return "text-amber-400";
     default:
-      return "text-neutral-400";
+      return "text-fg-muted";
   }
 }
 
@@ -38,17 +38,17 @@ export function SubagentRail({
   return (
     <aside
       aria-label="子 agent"
-      className="flex w-72 min-w-0 shrink-0 flex-col border-l border-neutral-800 bg-neutral-925"
+      className="flex w-72 min-w-0 shrink-0 flex-col border-l border-line bg-raised"
     >
       <div className="flex items-center justify-between px-3 py-2">
-        <h2 className="text-xs font-medium uppercase tracking-wide text-neutral-400">
+        <h2 className="text-xs font-medium uppercase tracking-wide text-fg-muted">
           子 agent{rows.length > 0 ? ` (${rows.length})` : ""}
         </h2>
         {onCollapse && (
           <button
             type="button"
             aria-label="收起子 agent"
-            className="text-xs text-neutral-500 hover:text-neutral-300"
+            className="text-xs text-fg-subtle hover:text-fg-muted"
             onClick={onCollapse}
           >
             收起
@@ -57,7 +57,7 @@ export function SubagentRail({
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
         {rows.length === 0 ? (
-          <p className="px-1 py-2 text-sm text-neutral-500">暂无子 agent</p>
+          <p className="px-1 py-2 text-sm text-fg-subtle">暂无子 agent</p>
         ) : (
           <ul className="flex flex-col gap-2">
             {rows.map((row) => (
@@ -67,19 +67,19 @@ export function SubagentRail({
                   aria-label={`查看子 agent ${row.taskId}`}
                   onClick={() => onOpen(row.taskId)}
                   aria-current={selectedTaskId === row.taskId ? "true" : undefined}
-                  className={`w-full rounded border px-3 py-2 text-left hover:border-neutral-600 ${
+                  className={`w-full rounded border px-3 py-2 text-left hover:border-line-strong ${
                     selectedTaskId === row.taskId
-                      ? "border-sky-600 bg-neutral-900"
-                      : "border-neutral-800 bg-neutral-900"
+                      ? "border-sky-600 bg-panel"
+                      : "border-line bg-panel"
                   }`}
                 >
                   <div className="flex items-center gap-2">
                     <span className={`text-xs ${stateColor(row.state)}`}>[{row.state}]</span>
                   </div>
-                  <div className="mt-1 truncate text-sm text-neutral-200">
+                  <div className="mt-1 truncate text-sm text-fg">
                     {row.objective ?? row.taskId}
                   </div>
-                  <div className="mt-1 truncate text-xs text-neutral-500">
+                  <div className="mt-1 truncate text-xs text-fg-subtle">
                     {row.finished ? "已结束" : (row.lastStep ?? "工作中")}
                   </div>
                 </button>
