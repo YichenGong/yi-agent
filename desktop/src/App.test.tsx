@@ -30,6 +30,20 @@ const { clients, state } = vi.hoisted(() => ({
     // Paths the native file picker hands back, in order. `null` = cancelled.
     // Tests push what they need; an empty queue resolves to `null`.
     picks: [] as (string | null)[],
+    // Per-project 看板 (Task 7): what `board/list` reports as registered, and
+    // what the plugin's `list` answers with.
+    boards: [] as unknown,
+    cards: [] as unknown[],
+    // Workspace groups `thread/listAll` reports. `null` → a single "/w", which
+    // is what the pre-board tests assume. Board tests set the real project
+    // paths, since the sidebar only offers a board row for a group it lists.
+    groupWorkspaces: null as string[] | null,
+    // Rejections keyed by RPC method, or by the inner `plugin/query` method
+    // ("switch.write", "list", …) so a test can fail exactly one board call.
+    rpcError: {} as Record<string, unknown>,
+    // Same shape as the host emits around Task 7: the structured board code
+    // rides in `data.code`, with only human wording in `message`.
+    hostError: {} as Record<string, { code: number; message: string; data?: unknown }>,
   },
 }));
 
@@ -70,23 +84,25 @@ vi.mock("./lib/rpc", () => ({
         const seeds =
           state.threads ??
           [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
+        const workspaces = state.groupWorkspaces ?? ["/w"];
         return {
-          groups: [
-            {
-              workspace: "/w",
-              exists: true,
-              threads: seeds.map((t) => ({
-                thread_id: t.thread_id,
-                cwd: "/w",
-                model: "m",
-                created_at: 0,
-                updated_at: 0,
-                title: t.title,
-                permission_mode: t.permission_mode,
-                status: state.listStatus,
-              })),
-            },
-          ],
+          groups: workspaces.map((workspace, index) => ({
+            workspace,
+            exists: true,
+            threads:
+              index === 0
+                ? seeds.map((t) => ({
+                    thread_id: t.thread_id,
+                    cwd: workspace,
+                    model: "m",
+                    created_at: 0,
+                    updated_at: 0,
+                    title: t.title,
+                    permission_mode: t.permission_mode,
+                    status: state.listStatus,
+                  }))
+                : [],
+          })),
         };
       }
       if (method === "workspace/list") return { workspaces: [] };
@@ -104,6 +120,15 @@ vi.mock("./lib/rpc", () => ({
       }
       if (method === "thread/clear") return {};
       if (method === "thread/compact") return { status: "compacted" };
+      if (method === "board/list") return { boards: state.boards };
+      if (method === "plugin/query") {
+        const inner = (params as { method?: string }).method ?? "";
+        const failure = state.hostError[inner] ?? state.rpcError[inner];
+        if (failure !== undefined) throw failure;
+        if (inner === "list") return { cards: state.cards };
+        if (inner === "switch.read") return { on: true, source: "project" };
+        return {};
+      }
       return {};
     }
   },
@@ -125,6 +150,11 @@ beforeEach(() => {
   state.rejectCode = {};
   state.listStatus = "idle";
   state.picks = [];
+  state.boards = [];
+  state.cards = [];
+  state.groupWorkspaces = null;
+  state.rpcError = {};
+  state.hostError = {};
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -637,44 +667,194 @@ describe("App slash commands", () => {
   });
 });
 
-describe("App Superpowers 看板 collapse", () => {
-  it("folds the board panel down to a strip and unfolds it again", async () => {
+/**
+ * 主区域看板（Task 7）。
+ *
+ * 侧栏条目是入口（Task 6 已有自己的用例），这里要的是：点开之后主区域给出的
+ * 是「那个项目」的看板，而不是某个全局左列——后者连同折叠条一起被删掉了。
+ */
+async function openBoardFor(project: string) {
+  // 打开小组右键菜单（与键盘路径同一条处理链）→ 点「看板」条目。
+  const header = document.querySelector<HTMLElement>('div[tabindex][aria-haspopup="menu"]')!;
+  fireEvent.contextMenu(header);
+  await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+  fireEvent.click(screen.getByLabelText("看板"));
+  return project;
+}
+
+describe("App 主区域看板", () => {
+  it("未选中看板时不渲染看板面板，也没有全局左列", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
     render(<App />);
-    // The board is rendered regardless of the switch, so no need to wait for
-    // the poll: the settings panel is part of the initial layout.
-    const collapse = await screen.findByRole("button", { name: "收起看板" });
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
 
-    expect(screen.getByRole("checkbox")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "展开看板" })).toBeNull();
-
-    fireEvent.click(collapse);
-
-    // Collapsed: the column is gone and the expand affordance has taken its place.
-    expect(screen.queryByRole("button", { name: "收起看板" })).toBeNull();
-    const expand = screen.getByRole("button", { name: "展开看板" });
-
-    fireEvent.click(expand);
-
-    // Expanded again: collapse comes back, expand goes away. Collapse and expand
-    // must be a pair, or the panel becomes unreachable once folded.
-    expect(screen.getByRole("button", { name: "收起看板" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "展开看板" })).toBeNull();
+    // 看板只在选中时才进主区域；没点之前一个都不该有。
+    expect(screen.queryByText("Superpowers 看板")).toBeNull();
+    expect(screen.queryByLabelText("收起看板")).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
   });
 
-  it("starts every launch expanded", async () => {
+  it("选中看板时主区域显示该项目看板，且不再有全局左列", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
     render(<App />);
-    expect(await screen.findByRole("button", { name: "收起看板" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "展开看板" })).toBeNull();
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+
+    expect(await screen.findByText("Superpowers 看板")).toBeTruthy();
+    expect(screen.queryByLabelText("收起看板")).toBeNull();
+    expect(screen.getByRole("button", { name: "加入看板" })).toBeTruthy();
+  });
+
+  it("看板的所有读写都带上该项目的 project", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.cards = [{ id: "c1", state: "queued", progress: null, detail: "/w" }];
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
+
+    await waitFor(() => {
+      const queries = clients[0].requests.filter((r) => r.method === "plugin/query");
+      expect(queries.some((r) => (r.params as { method?: string })?.method === "list")).toBe(true);
+      expect(queries.some((r) => (r.params as { method?: string })?.method === "switch.read")).toBe(true);
+    });
+    // 只认带着 project 的那些：漏掉 project 就会读到 app 自己的 cwd。
+    const queries = clients[0].requests.filter((r) => r.method === "plugin/query");
+    expect(queries.every((r) => (r.params as { project?: string }).project === "/proj")).toBe(true);
+    expect(queries.map((r) => (r.params as { method?: string }).method)).toContain("list");
+  });
+
+  it("开关写入失败会显示错误，而不是静默（该项目尚未创建看板）", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    // 宿主在 Task 4 之后把语义码放在 data.code 里，message 只剩人话。
+    state.hostError["switch.write"] = {
+      code: -32603,
+      message: "这个项目还没有看板",
+      data: { code: "board_not_created" },
+    };
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+
+    fireEvent.click(await screen.findByRole("checkbox"));
+
+    expect(await screen.findByText(/该项目尚未创建看板/)).toBeTruthy();
+  });
+
+  it("开关写入失败：daemon 不可达与插件没装各有各的说法", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.hostError["switch.write"] = {
+      code: -32603,
+      message: "daemon is unavailable: connection refused",
+      data: { code: "daemon_unavailable" },
+    };
+    const first = render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    fireEvent.click(await screen.findByRole("checkbox"));
+
+    expect(await screen.findByText(/看板进程不可达/)).toBeTruthy();
+    // 「连不上」绝不能被说成「插件没装」：那会让用户去装一个已经装好的插件。
+    expect(screen.queryByText(/插件未安装/)).toBeNull();
+    first.unmount();
+
+    state.hostError["switch.write"] = {
+      code: -32603,
+      message: "plugin superpowers-kanban is not available",
+      data: { code: "plugin_unavailable" },
+    };
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    fireEvent.click(await screen.findByRole("checkbox"));
+
+    expect(await screen.findByText(/插件未安装/)).toBeTruthy();
+  });
+
+  it("「该项目尚未创建看板」给一条出路：直接创建", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.hostError["switch.write"] = {
+      code: -32603,
+      message: "这个项目还没有看板",
+      data: { code: "board_not_created" },
+    };
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    fireEvent.click(await screen.findByRole("checkbox"));
+    await screen.findByText(/该项目尚未创建看板/);
+
+    fireEvent.click(screen.getByRole("button", { name: "创建看板" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "board/create",
+        params: { project: "/proj" },
+      }),
+    );
+  });
+
+  it("切回同一个看板不会重读（选中同一个不算换项目）", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
+
+    const reads = () =>
+      clients[0].requests.filter(
+        (r) =>
+          r.method === "plugin/query" &&
+          (r.params as { method?: string }).method === "list",
+      ).length;
+    const before = reads();
+    fireEvent.click(screen.getByLabelText("看板"));
+
+    // 再点一次同一个项目只是「还是这个」：重读会白白清空并重画面板。
+    await new Promise((r) => setTimeout(r, 10));
+    expect(reads()).toBe(before);
+  });
+
+  it("切换项目后看板问的是新项目", async () => {
+    state.boards = [{ project: "/proj" }, { project: "/other" }];
+    state.groupWorkspaces = ["/proj", "/other"];
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByLabelText("看板")).toHaveLength(2));
+
+    fireEvent.click(screen.getAllByLabelText("看板")[1]);
+    await waitFor(() => {
+      const queries = clients[0].requests.filter((r) => r.method === "plugin/query");
+      expect(queries.some((r) => (r.params as { project?: string }).project === "/other")).toBe(true);
+    });
   });
 });
 
 describe("App Superpowers 看板 enqueue", () => {
+  beforeEach(() => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+  });
+
   const clickEnqueue = () =>
     fireEvent.click(screen.getByRole("button", { name: "加入看板" }));
 
-  it("sends one enqueue with both picked paths", async () => {
+  /** 选中 /proj 的看板，等主区域把面板画出来。 */
+  const openBoard = async () => {
     render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
     await screen.findByRole("button", { name: "加入看板" });
+  };
+
+  it("sends one enqueue with both picked paths", async () => {
+    await openBoard();
 
     state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
     clickEnqueue();
@@ -684,9 +864,8 @@ describe("App Superpowers 看板 enqueue", () => {
         method: "plugin/query",
         params: {
           plugin: "superpowers-kanban",
-          // Task 5 把 project 加进了 plugin/query 的参数；侧栏的选中态还没接上
-          // （Task 6），这一步先留空占位。
-          project: "",
+          // 主区域渲染的是选中项目的看板，投递也带该项目。
+          project: "/proj",
           method: "enqueue",
           params: { spec_path: "/p/a.spec.md", plan_path: "/p/a.plan.md" },
         },
@@ -702,8 +881,7 @@ describe("App Superpowers 看板 enqueue", () => {
   });
 
   it("sends nothing when the picker is cancelled", async () => {
-    render(<App />);
-    await screen.findByRole("button", { name: "加入看板" });
+    await openBoard();
 
     state.picks = [null];
     clickEnqueue();
@@ -719,9 +897,8 @@ describe("App Superpowers 看板 enqueue", () => {
   });
 
   it("surfaces a rejected enqueue instead of crashing", async () => {
-    state.rejectCode["plugin/query"] = -32000;
-    render(<App />);
-    await screen.findByRole("button", { name: "加入看板" });
+    state.rpcError["enqueue"] = { code: -32000, message: "forced -32000" };
+    await openBoard();
 
     state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
     clickEnqueue();

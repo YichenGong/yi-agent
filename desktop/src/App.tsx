@@ -24,7 +24,6 @@ import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { formatError } from "./lib/errorMessage";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
-import { SuperpowersKanbanCollapsedStrip } from "./components/SuperpowersKanbanCollapsedStrip";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import {
   type BoardCardDto,
@@ -35,12 +34,25 @@ import {
   readBoardSwitch,
   setBoardSwitch,
 } from "./lib/superpowersKanbanSwitch";
-import { summarize } from "./lib/boardIndex";
+import { type BoardErrorKind, boardErrorKind, summarize } from "./lib/boardIndex";
 import { createBoard, listBoards, removeBoard } from "./lib/superpowersKanbanBoards";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
+
+/**
+ * 看板失败的四种说法。
+ *
+ * 三种可操作的状态各自点名下一步：没建看板就点「创建看板」，进程不可达就说
+ * 明是连接问题而不是插件问题，插件没装才让用户去装。`other` 不猜原因。
+ */
+const BOARD_ERROR_TEXT: Record<BoardErrorKind, string> = {
+  not_created: "该项目尚未创建看板",
+  daemon_down: "看板进程不可达",
+  plugin_missing: "插件未安装",
+  other: "看板读写失败",
+};
 
 /**
  * Read the persisted permission mode for a thread from the `thread/listAll`
@@ -105,9 +117,21 @@ export default function App() {
   // The plugin answers every board question, so an unanswered query means it is
   // not installed. Distinct from "installed and empty".
   const [boardPluginMissing, setBoardPluginMissing] = useState(false);
-  // Collapsed board panel. Deliberately not persisted: every launch starts
-  // expanded, and the switch state is independent of the panel being folded.
-  const [kanbanCollapsed, setKanbanCollapsed] = useState(false);
+  // 上一次看板写入的失败：非空即把「为什么没生效」摆在面板上，而不是静默。
+  // 只有下一次写入成功或换了项目才清掉——轮询成功不算，那会让一条刚报出的
+  // 失败在 2 秒内自己消失。
+  const [boardError, setBoardError] = useState<BoardErrorKind | null>(null);
+
+  /**
+   * 一行看板状态，2 秒刷新一次。
+   *
+   * 用 ref 指向「最近一次的刷新函数」：副作用只在挂载时注册一次计时器，换项目
+   * 时换掉里面调的闭包，而不是重建计时器（重建会漏掉切换瞬间的竞态，也会让
+   * 两个项目的响应互相覆盖）。
+   */
+  const boardTick = useRef<() => void>(() => {});
+  /** 看板读取的序号，用来丢掉换项目后落地的过期响应。 */
+  const boardSeq = useRef(0);
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -118,6 +142,14 @@ export default function App() {
     },
     [],
   );
+
+  // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
+  // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
+  const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
+  // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
+  const [boards, setBoards] = useState<string[]>([]);
+  // 项目路径 → 摘要。挂在侧栏条目上，扫一眼就知道各项目积压多少。
+  const [boardSummaries, setBoardSummaries] = useState<Record<string, string>>({});
 
   /**
    * 拉一次「哪些项目有看板」以及各项目的摘要。
@@ -145,21 +177,46 @@ export default function App() {
     }
   }, [boardRpc]);
 
-  // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
-  // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
-  const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
-  // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
-  const [boards, setBoards] = useState<string[]>([]);
-  // 项目路径 → 摘要。挂在侧栏条目上，扫一眼就知道各项目积压多少。
-  const [boardSummaries, setBoardSummaries] = useState<Record<string, string>>({});
-
   /**
-   * 看板 RPC 的 project 参数。
+   * 读选中项目的看板。没选中项目就什么都不问，也把面板清空——否则切走之后
+   * 旧项目的卡片会留在屏幕上，看着像新项目的。
    *
-   * Task 6 把它接到侧栏的选中态；空串是「没选」时的退路，Task 7 之后主区域
-   * 只在选中时渲染看板，这条退路随之消失。
+   * 读取失败不改主流程，也不报错：失败在这里是常态（daemon 没起、插件没装），
+   * 真正需要用户知道的失败是**写入**失败。
    */
-  const boardProject = selectedBoard ?? "";
+  const refreshSelectedBoard = useCallback(async () => {
+    if (selectedBoard === null) {
+      setBoardCards([]);
+      setBoardPluginMissing(false);
+      return;
+    }
+    // 每次读领一个号。切项目后旧项目那次读可能还在路上，落地时必须认出自己
+    // 已经过期——否则 A 的卡片会盖在 B 的看板上，看着像 B 的队列。
+    const seq = ++boardSeq.current;
+    try {
+      const [sw, cards] = await Promise.all([
+        readBoardSwitch(boardRpc, selectedBoard),
+        fetchBoard(boardRpc, selectedBoard),
+      ]);
+      if (seq !== boardSeq.current) return;
+      setBoardOn(sw.on);
+      setBoardSource(sw.source);
+      setBoardCards(cards);
+      setBoardPluginMissing(false);
+    } catch (error) {
+      if (seq !== boardSeq.current) return;
+      // 插件不在就明说：那意味着看板根本没有后端，而不是「装好了但没有卡片」。
+      if (pluginIsUnavailable(error)) setBoardPluginMissing(true);
+    }
+  }, [boardRpc, selectedBoard]);
+
+  useEffect(() => {
+    // 计时器只建一次，每次响都走「当前项目」的读法：重建计时器会漏掉切换
+    // 瞬间在途的那一拍。
+    boardTick.current = () => void refreshSelectedBoard();
+    // 选中项目一落地就读一次，不等下一拍轮询：否则点开看板会有最多 2 秒的空面板。
+    void refreshSelectedBoard();
+  }, [refreshSelectedBoard]);
 
   const current = currentId ? store.view(currentId) : null;
 
@@ -322,6 +379,7 @@ export default function App() {
    * 已经建了一半，界面必须与它保持一致，而不是停在「看起来什么都没发生」。
    */
   const onCreateBoard = async (path: string) => {
+    setBoardError(null);
     try {
       await createBoard(boardRpc, path);
     } catch (e) {
@@ -337,6 +395,7 @@ export default function App() {
    */
   const onRemoveBoard = async (path: string) => {
     if (!window.confirm(`移除看板会删除 ${path} 的队列状态，且不可恢复。继续？`)) return;
+    setBoardError(null);
     try {
       await removeBoard(boardRpc, path);
     } catch (e) {
@@ -349,7 +408,31 @@ export default function App() {
   };
 
   /** 打开看板只改 selectedBoard，不动 currentId。 */
-  const onOpenBoard = (path: string) => setSelectedBoard(path);
+  const onOpenBoard = (path: string) => {
+    if (path === selectedBoard) return;
+    // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
+    setBoardError(null);
+    setBoardCards([]);
+    setSelectedBoard(path);
+  };
+
+  /**
+   * 写开关。失败不再吞掉：把失败翻译成三种可操作的说法摆出来。
+   *
+   * 成功才更新本地状态（服务端是权威），失败保持原状并报出原因——原来那句
+   * `.catch(() => {})` 正是「点了没反应」的来源。
+   */
+  const onToggleBoardSwitch = async (next: boolean) => {
+    if (selectedBoard === null) return;
+    setBoardError(null);
+    try {
+      await setBoardSwitch(boardRpc, selectedBoard, next);
+      setBoardOn(next);
+      setBoardSource("project");
+    } catch (error) {
+      setBoardError(boardErrorKind(error));
+    }
+  };
 
   /** 打开原生文件夹选择器,返回选中的绝对路径(取消则 null)。 */
   const pickDirectory = async (): Promise<string | null> => {
@@ -511,26 +594,10 @@ export default function App() {
       setCurrentError(msg);
       setStatus(`error: ${msg}`);
     });
-    // 看板轮询：读取失败绝不影响主流程。
-    const refreshBoard = async () => {
-      try {
-        const [sw, cards] = await Promise.all([
-          readBoardSwitch(boardRpc, boardProject),
-          fetchBoard(boardRpc, boardProject),
-        ]);
-        setBoardOn(sw.on);
-        setBoardSource(sw.source);
-        setBoardCards(cards);
-        setBoardPluginMissing(false);
-      } catch (error) {
-        // 看板读取失败绝不影响主流程。但「插件不在」值得说清楚：那意味着
-        // 看板根本没有后端，而不是「装好了但没有卡片」。
-        if (pluginIsUnavailable(error)) setBoardPluginMissing(true);
-      }
-    };
-    void refreshBoard();
+    // 看板：登记表随挂载拉一次；选中项目的具体内容由 boardTick 每 2 秒刷新，
+    // 读失败绝不影响主流程。
     void refreshBoards();
-    const boardTimer = window.setInterval(refreshBoard, 2000);
+    const boardTimer = window.setInterval(() => boardTick.current(), 2000);
     return () => window.clearInterval(boardTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -701,38 +768,47 @@ export default function App() {
           onRemoveBoard={(path) => void onRemoveBoard(path)}
           onOpenBoard={onOpenBoard}
         />
-        {kanbanCollapsed ? (
-          <SuperpowersKanbanCollapsedStrip onExpand={() => setKanbanCollapsed(false)} />
-        ) : (
-          <div className="flex w-72 flex-col border-r border-neutral-800">
-            <SuperpowersKanbanSettings
-              switchOn={boardOn}
-              source={boardSource}
-              onToggle={(next) => {
-                void setBoardSwitch(boardRpc, boardProject, next)
-                  .then(() => {
-                    setBoardOn(next);
-                    setBoardSource("project");
-                  })
-                  .catch(() => {
-                    /* 写失败保持原状，下一轮轮询会纠正 */
-                  });
-              }}
-              onCollapse={() => setKanbanCollapsed(true)}
-            />
-            <SuperpowersKanbanEnqueue
-              pickFile={pickFile}
-              enqueue={(spec, plan) => enqueueBoardCard(boardRpc, boardProject, spec, plan)}
-            />
-            <SuperpowersKanbanView
-              switchOn={boardOn}
-              source={boardSource}
-              cards={boardCards}
-              pluginMissing={boardPluginMissing}
-            />
-          </div>
-        )}
         <div className="relative flex min-w-0 flex-1 flex-col">
+          {/* 看板是主区域的一个视图，不是一个常驻列：选中才出现，且问的是
+              被选中那个项目。没有选中时主区域还是原来的对话。 */}
+          {selectedBoard !== null && (
+            <section
+              aria-label="Superpowers 看板"
+              className="flex max-h-[60%] shrink-0 flex-col overflow-y-auto border-b border-neutral-800 bg-neutral-925"
+            >
+              <SuperpowersKanbanSettings
+                switchOn={boardOn}
+                source={boardSource}
+                onToggle={(next) => void onToggleBoardSwitch(next)}
+              />
+              {boardError !== null && (
+                <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">
+                  <span>{BOARD_ERROR_TEXT[boardError]}</span>
+                  {boardError === "not_created" && (
+                    <button
+                      type="button"
+                      onClick={() => void onCreateBoard(selectedBoard)}
+                      className="rounded border border-neutral-700 px-2 py-0.5 text-neutral-300 hover:text-neutral-100"
+                    >
+                      创建看板
+                    </button>
+                  )}
+                </div>
+              )}
+              <SuperpowersKanbanEnqueue
+                pickFile={pickFile}
+                enqueue={(spec, plan) =>
+                  enqueueBoardCard(boardRpc, selectedBoard, spec, plan)
+                }
+              />
+              <SuperpowersKanbanView
+                switchOn={boardOn}
+                source={boardSource}
+                cards={boardCards}
+                pluginMissing={boardPluginMissing}
+              />
+            </section>
+          )}
           <ApprovalBanner
             items={bannerItems}
             onJump={(id) => void selectThread(id)}

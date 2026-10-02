@@ -5,13 +5,18 @@ export function boardJsonPath(stateDir: string): string {
 }
 
 /**
- * Mirrors the Rust `yi_agent_board_ui::state::load_cards` mapping line for line:
- * a non-object root or non-array `cards` yields no cards, each card is validated
- * individually (a card missing id / plan_path / state is skipped, the rest are
- * kept), `state` is lowercased, `detail` falls back from workdir to the plan
- * path (including when workdir is an empty string), and cards are sorted by
+ * Maps the plugin's `list` result — the `board.json` cards the runner owns under
+ * `<project>/.yi-agent/superpowers-kanban/` — onto the card rows the board panel
+ * renders: a non-object root or non-array `cards` yields no cards, each card is
+ * validated individually (a card missing id / plan_path / state is skipped, the
+ * rest are kept), `state` is lowercased, `detail` falls back from workdir to the
+ * plan path (including when workdir is an empty string), and cards are sorted by
  * `order` ascending with ties keeping file order. Corrupt or unexpected input
  * yields no cards rather than throwing.
+ *
+ * The runner's own `dispatch` builds this shape for `list` and deliberately does
+ * not forward `order` (the queue's order is the file's), so the sort below is a
+ * no-op in practice — it stays as the guard for a caller that does send one.
  */
 export function parseBoard(json: string): BoardCard[] {
   let parsed: unknown;
